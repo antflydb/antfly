@@ -1351,7 +1351,12 @@ pub fn handleTableBatch(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
+        error.Backpressured => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"table_backpressured\",\"message\":\"write capacity is temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.DenseRepairBackpressure => return .{
             .status = 429,
             .body = try alloc.dupe(u8, "{\"code\":\"dense_repair_backpressure\",\"message\":\"writes are temporarily limited while a dense index rebuild catches up\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -2921,7 +2926,9 @@ test "public table batch handler maps backend errors" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 429), resp.status);
-    try std.testing.expectEqualStrings("table backpressured", resp.body);
+    try std.testing.expect(resp.json);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "table_backpressured") != null);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
 }
 
 test "public table batch handler returns concise dense repair backpressure" {

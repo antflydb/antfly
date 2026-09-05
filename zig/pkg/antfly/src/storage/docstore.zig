@@ -503,6 +503,16 @@ pub const DocStore = struct {
             return try self.read.?.getManySorted(keys, values);
         }
 
+        /// Fetch values without admitting their source data blocks to the LSM
+        /// cache. Callers should use this only when they retain a decoded or
+        /// otherwise more useful representation of every returned value.
+        pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            if (self.probe) |*probe| {
+                return try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+            }
+            return try self.getManySorted(keys, values);
+        }
+
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
@@ -957,6 +967,20 @@ pub const DocStore = struct {
             .runtime => .{
                 .alloc = self.alloc,
                 .current_scan = try self.runtime_store.beginCurrentScan(),
+            },
+        };
+    }
+
+    /// Open one stable replay-lane generation. Runtime LSM implementations
+    /// narrow the mutable snapshot to this lane; callers may retain the
+    /// transaction and cursor while consuming several bounded replay chunks.
+    pub fn beginReplayLaneScanTxn(self: *DocStore, kind_ordinal: u8, from_sequence: u64) !Txn {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        return switch (self.kind) {
+            .lmdb => try self.beginReadTxn(),
+            .runtime => .{
+                .alloc = self.alloc,
+                .current_scan = try self.runtime_store.beginReplayLaneScan(kind_ordinal, from_sequence),
             },
         };
     }

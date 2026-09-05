@@ -47,6 +47,86 @@ pub const QuantizedSet = union(enum) {
     }
 };
 
+/// One immutable leaf scoring row borrowed from a generation lease. Keeping
+/// membership beside the fixed-width candidate plane removes the packed-node
+/// lookup and copy from the flat-directory search path. The source generation
+/// remains authoritative: adapters decline this view as soon as any leaf
+/// membership, posting state, or quantized payload is shadowed by a delta.
+pub const NativeLeafScanView = struct {
+    member_ids: []const u64,
+    quantized: QuantizedSet,
+    /// Optional source-space float16 rows owned by the same immutable posting
+    /// generation. Rows follow member_ids exactly; per-row metadata makes the
+    /// resulting score interval conservative enough to defer authoritative
+    /// residual reads until the public top-k boundary is known.
+    projections: ?NativeProjectionPlane = null,
+};
+
+pub const NativeProjectionPlane = struct {
+    dims: usize,
+    values: []const f16,
+    scales: []const f32,
+    error_norms: []const f32,
+    decoded_norm_lower_bounds: []const f32,
+    /// Source vector payload CRCs. Version-three posting generations omit
+    /// this column and remain scoreable, but cannot use residual-only exact
+    /// completion without revalidating the projection payload.
+    checksums: []const u32 = &.{},
+    /// Optional generation-bound locations of the lossless residuals in the
+    /// shared exact-vector store. Older posting generations omit this plane;
+    /// callers must then resolve the artifact key through the authoritative
+    /// directory. A location is only a hint until the exact-vector generation
+    /// validates its generation, shard, sequence, projection checksum, and
+    /// residual checksum.
+    residual_locations: ?NativeResidualLocationPlane = null,
+
+    pub fn validFor(self: @This(), count: usize, dims: usize) bool {
+        const expected_values = std.math.mul(usize, count, dims) catch return false;
+        return self.dims == dims and
+            self.values.len == expected_values and
+            self.scales.len == count and
+            self.error_norms.len == count and
+            self.decoded_norm_lower_bounds.len == count and
+            (self.checksums.len == 0 or self.checksums.len == count) and
+            (self.residual_locations == null or self.residual_locations.?.validFor(count));
+    }
+};
+
+pub const NativeResidualLocation = types.NativeResidualLocation;
+pub const NativeResidualLocationPlane = types.NativeResidualLocationPlane;
+
+/// One transient projection returned to an immutable checkpoint builder. The
+/// callback owns the bytes only until it returns; the posting codec copies the
+/// complete leaf plane before the next callback invocation.
+pub const NativeProjectionBuildValue = struct {
+    bytes: []const u8 = &.{},
+    scale: f32 = 1,
+    error_norm: f32 = 0,
+    decoded_norm_lower_bound: f32 = 0,
+    checksum: u32 = 0,
+    residual_location: ?NativeResidualLocation = null,
+};
+
+pub const NativeProjectionBuildLoader = *const fn (
+    ctx: *anyopaque,
+    vector_ids: []const u64,
+    metadata: []const ?[]const u8,
+    values: []NativeProjectionBuildValue,
+    payload_scratch: []u8,
+    dims: usize,
+    source_sequence: u64,
+) anyerror!void;
+
+pub const NativeProjectionBuildBegin = *const fn (ctx: *anyopaque, source_sequence: u64) anyerror!void;
+pub const NativeProjectionBuildEnd = *const fn (ctx: *anyopaque) void;
+
+pub const NativeProjectionBuildSource = struct {
+    ctx: *anyopaque,
+    loader: NativeProjectionBuildLoader,
+    begin: ?NativeProjectionBuildBegin = null,
+    end: ?NativeProjectionBuildEnd = null,
+};
+
 pub const WriteProfile = struct {
     bulk_build_store_ns: u64 = 0,
     bulk_build_tree_ns: u64 = 0,
@@ -573,18 +653,37 @@ pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]con
 
 pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch) |scratch| {
         self.cached_scratch = null;
+        self.scratch_mu.unlock();
         return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
     }
-    const scratch = try SearchScratch.init(
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches")) {
+        if (self.cached_search_scratches.pop()) |scratch| {
+            self.scratch_mu.unlock();
+            return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
+        }
+    }
+    self.scratch_mu.unlock();
+
+    const dims: usize = @intCast(self.metadata.dims);
+    const branching_factor: usize = @intCast(self.metadata.branching_factor);
+    const leaf_size: usize = @intCast(self.metadata.leaf_size);
+    const initial_bytes = try SearchScratch.initialBytes(dims, branching_factor, leaf_size);
+    const pre_admitted = comptime @hasDecl(Index, "admitNewSearchScratchBytes") and
+        @hasDecl(Index, "releaseSearchScratchBytes");
+    if (pre_admitted) try self.admitNewSearchScratchBytes(initial_bytes);
+    errdefer if (pre_admitted) self.releaseSearchScratchBytes(initial_bytes);
+    var scratch = try SearchScratch.init(
         self.alloc,
-        @intCast(self.metadata.dims),
-        @intCast(self.metadata.branching_factor),
-        @intCast(self.metadata.leaf_size),
+        dims,
+        branching_factor,
+        leaf_size,
     );
-    if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+    errdefer scratch.deinit(self.alloc);
+    std.debug.assert(scratch.bytes() == initial_bytes);
+    if (!pre_admitted and comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
         self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + scratch.bytes());
     }
     return .{
@@ -621,16 +720,37 @@ pub fn endSearchEpoch(self: anytype) void {
 
 pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch == null) {
         self.cached_scratch = handle.scratch;
-    } else {
-        var scratch = handle.scratch;
-        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
-            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
-        }
-        scratch.deinit(self.alloc);
+        self.scratch_mu.unlock();
+        return;
     }
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches") and @hasDecl(Index, "searchScratchCacheLimit")) {
+        const cached_count = self.cached_search_scratches.items.len + 1;
+        if (cached_count < self.searchScratchCacheLimit()) {
+            self.cached_search_scratches.append(self.alloc, handle.scratch) catch {
+                self.scratch_mu.unlock();
+                deinitReleasedSearchScratch(self, handle);
+                return;
+            };
+            self.scratch_mu.unlock();
+            return;
+        }
+    }
+    self.scratch_mu.unlock();
+    deinitReleasedSearchScratch(self, handle);
+}
+
+fn deinitReleasedSearchScratch(self: anytype, handle: *ScratchHandle) void {
+    var scratch = handle.scratch;
+    const Index = @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "releaseSearchScratchBytes")) {
+        self.releaseSearchScratchBytes(handle.accounted_bytes);
+    } else if (comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
+    }
+    scratch.deinit(self.alloc);
 }
 
 pub fn transformVector(self: anytype, original: []const f32, transformed: []f32) []const f32 {

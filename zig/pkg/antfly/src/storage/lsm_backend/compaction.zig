@@ -193,7 +193,48 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
         return false;
     };
     defer grant.complete();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+/// Run only the leveled repair/pressure lanes. A size-tiered L0 owner uses
+/// this while its bytes remain below the promotion threshold: physical L0
+/// partition count must not make an otherwise healthy lower level wait, but
+/// neither should it trigger a whole-base L0 -> L1 rewrite.
+pub fn maybeCompactLowerLevelsScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    score: u64,
+) !bool {
+    var selection_stats: CompactionSelectionStats = .{};
+    var best: ?ScoredCompactionPlan = null;
+    maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(
+        backend.runs.items,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ));
+    maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(
+        backend.runs.items,
+        backend.options.level_target_runs_base,
+        backend.options.level_target_runs_multiplier,
+        backend.options.level_target_bytes_base,
+        backend.options.level_target_bytes_multiplier,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ));
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
+    const plan = if (best) |candidate| candidate.plan else return false;
+
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    var grant = backend.acquireCompactionGrant(work) orelse {
+        rememberDeniedCompaction(BackendType, backend, plan, score);
+        return false;
+    };
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -202,9 +243,21 @@ pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !voi
     try compactPlanAt(BackendType, backend, plan);
 }
 
-pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !void {
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
+pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !bool {
+    var selection_stats: CompactionSelectionStats = .{};
+    const plan = selectL0CompactionWithStats(
+        backend.runs.items,
+        l0_limit,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ) orelse {
+        noteCompactionSelectionStats(BackendType, backend, selection_stats);
+        return false;
+    };
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
     try compactPlanAt(BackendType, backend, plan);
+    return true;
 }
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
@@ -229,7 +282,7 @@ pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendTy
         return false;
     };
     defer grant.complete();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -263,8 +316,239 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         return false;
     };
     defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+/// Merge one geometrically compatible set of L0 publication generations back
+/// into L0. Unlike leveled L0->L1 compaction this does not repeatedly rewrite
+/// the overlapping base during a sustained import. The output inherits the
+/// newest selected logical sequence, so intervening newer/older generations
+/// retain exactly the same read precedence.
+pub fn compactBulkL0TierScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+    score: u64,
+) !bool {
+    return compactBulkL0TierScheduledBeforeSequence(BackendType, backend, fan_in, score, 0);
+}
+
+/// Foreground variant used only to relieve hard L0 run-count pressure. It
+/// bypasses optional-maintenance admission/yielding because the write cannot
+/// safely leave the hard envelope, while retaining the same input-size bound
+/// and geometric-growth contract as the background lane.
+pub fn compactBulkL0Tier(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+) !bool {
+    const plan = selectBulkL0Tier(
+        backend.runs.items,
+        fan_in,
+        backend.options.max_compaction_input_bytes,
+        0,
+    ) orelse return false;
     try compactPlanAt(BackendType, backend, plan);
     return true;
+}
+
+/// Collapse the fragmented generations newer than the largest L0 anchor into
+/// one logical generation without promoting into or rewriting the anchor or
+/// lower levels. The output must be at least `min_growth_factor` times its
+/// largest selected generation. Consequently a later seal cannot rewrite this
+/// output until a comparable amount of newer L0 data has accumulated.
+pub fn compactBulkL0DeltaSeal(
+    comptime BackendType: type,
+    backend: *BackendType,
+    min_growth_factor: usize,
+) !bool {
+    if (min_growth_factor < 2) return false;
+    const l0_count = countLeadingL0Runs(backend.runs.items);
+    if (l0_count < 2) return false;
+
+    var anchor_start: usize = 0;
+    var anchor_bytes: u64 = 0;
+    var start: usize = 0;
+    while (start < l0_count) {
+        const end = l0GenerationEnd(backend.runs.items, start, l0_count);
+        const generation_bytes = sumRunBytes(backend.runs.items[start..end]);
+        if (generation_bytes > anchor_bytes) {
+            anchor_start = start;
+            anchor_bytes = generation_bytes;
+        }
+        start = end;
+    }
+
+    // Bulk publications prepend newer generations. Treat the largest
+    // established generation as an immutable anchor and seal only the newer
+    // prefix. An anchor at the front has no newer delta for this lane.
+    if (anchor_start == 0) return false;
+
+    var generation_count: usize = 0;
+    var max_generation_bytes: u64 = 0;
+    var input_bytes: u64 = 0;
+    start = 0;
+    while (start < anchor_start) {
+        const end = l0GenerationEnd(backend.runs.items, start, anchor_start);
+        const generation_bytes = sumRunBytes(backend.runs.items[start..end]);
+        generation_count += 1;
+        max_generation_bytes = @max(max_generation_bytes, generation_bytes);
+        input_bytes +|= generation_bytes;
+        start = end;
+    }
+    if (generation_count < 2 or
+        input_bytes < max_generation_bytes *| @as(u64, @intCast(min_growth_factor))) return false;
+    if (backend.options.max_compaction_input_bytes > 0 and
+        input_bytes > backend.options.max_compaction_input_bytes) return false;
+
+    try compactPlanAt(BackendType, backend, .{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = anchor_start,
+        .target_start = anchor_start,
+        .target_len = 0,
+        .output_level = 0,
+    });
+    return true;
+}
+
+/// Variant used while a bulk window is open. A non-zero sequence ceiling
+/// keeps the tier merger out of the request publications owned by that
+/// window; those are combined exactly once by `compactBulkL0WindowScheduled`.
+pub fn compactBulkL0TierScheduledBeforeSequence(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+    score: u64,
+    before_sequence: u64,
+) !bool {
+    const plan = selectBulkL0Tier(
+        backend.runs.items,
+        fan_in,
+        backend.options.max_compaction_input_bytes,
+        before_sequence,
+    ) orelse return false;
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    var grant = backend.acquireCompactionGrant(work) orelse return false;
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+pub fn hasBulkL0Tier(runs: []const Run, fan_in: usize) bool {
+    return selectBulkL0Tier(runs, fan_in, 0, 0) != null;
+}
+
+pub fn hasBulkL0TierBeforeSequence(runs: []const Run, fan_in: usize, before_sequence: u64) bool {
+    return selectBulkL0Tier(runs, fan_in, 0, before_sequence) != null;
+}
+
+fn selectBulkL0Tier(runs: []const Run, fan_in: usize, max_input_bytes: u64, before_sequence: u64) ?CompactionPlan {
+    if (fan_in < 2) return null;
+    const l0_count = countLeadingL0Runs(runs);
+    if (l0_count < fan_in) return null;
+
+    var best: ?CompactionPlan = null;
+    var candidate_start: usize = 0;
+    while (candidate_start < l0_count) {
+        const first_end = l0GenerationEnd(runs, candidate_start, l0_count);
+        if (before_sequence != 0 and l0Sequence(runs[candidate_start]) >= before_sequence) {
+            candidate_start = first_end;
+            continue;
+        }
+        var source_end = candidate_start;
+        var group_count: usize = 0;
+        var max_group_bytes: u64 = 0;
+        var input_bytes: u64 = 0;
+        while (source_end < l0_count) {
+            const group_end = l0GenerationEnd(runs, source_end, l0_count);
+            const group_bytes = sumRunBytes(runs[source_end..group_end]);
+            group_count += 1;
+            max_group_bytes = @max(max_group_bytes, group_bytes);
+            input_bytes +|= group_bytes;
+            source_end = group_end;
+            const geometric_target = max_group_bytes *| @as(u64, @intCast(fan_in));
+            const geometric = group_count >= fan_in and input_bytes >= geometric_target;
+            const within_budget = max_input_bytes == 0 or input_bytes <= max_input_bytes;
+            if (geometric and within_budget) break;
+            if (!within_budget) break;
+        }
+        const geometric_target = max_group_bytes *| @as(u64, @intCast(fan_in));
+        const geometric = group_count >= fan_in and
+            max_group_bytes > 0 and
+            input_bytes >= geometric_target;
+        const within_budget = max_input_bytes == 0 or input_bytes <= max_input_bytes;
+        if (geometric and within_budget) {
+            // Keep walking so the oldest compatible window wins. Rewriting
+            // older tiers first bounds read amplification without disturbing
+            // the chronology of newer generations. Requiring the output to
+            // be at least `fan_in` times every input prevents an uneven stream
+            // from degenerating into repeated two-way rewrites.
+            best = .{
+                .source_level = 0,
+                .source_start = candidate_start,
+                .source_len = source_end - candidate_start,
+                .target_start = source_end,
+                .target_len = 0,
+                .output_level = 0,
+            };
+        }
+        candidate_start = first_end;
+    }
+    return best;
+}
+
+/// Collapse every publication created by one durable bulk window into a
+/// single logical L0 generation. The existing persisted k-way merger streams
+/// the inputs, so memory is bounded by cursors and one output file rather than
+/// by the size of the window. A crash before publication leaves the original
+/// manifest authoritative.
+pub fn compactBulkL0WindowScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    first_sequence: u64,
+    score: u64,
+) !bool {
+    if (first_sequence == 0) return false;
+    const l0_count = countLeadingL0Runs(backend.runs.items);
+    var source_len: usize = 0;
+    var generation_count: usize = 0;
+    var prior_sequence: u64 = 0;
+    while (source_len < l0_count) : (source_len += 1) {
+        const sequence = l0Sequence(backend.runs.items[source_len]);
+        if (sequence < first_sequence) break;
+        if (sequence != prior_sequence) {
+            generation_count += 1;
+            prior_sequence = sequence;
+        }
+    }
+    if (generation_count < 2) return false;
+
+    const plan: CompactionPlan = .{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = source_len,
+        .target_start = source_len,
+        .target_len = 0,
+        .output_level = 0,
+    };
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    if (backend.options.max_compaction_input_bytes > 0 and
+        work.input_bytes > backend.options.max_compaction_input_bytes) return false;
+    var grant = backend.acquireCompactionGrant(work) orelse return false;
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+fn l0GenerationEnd(runs: []const Run, start: usize, l0_count: usize) usize {
+    const sequence = l0Sequence(runs[start]);
+    var end = start + 1;
+    while (end < l0_count and l0Sequence(runs[end]) == sequence) : (end += 1) {}
+    return end;
 }
 
 pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
@@ -423,7 +707,7 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
 
     backend.remembered_compaction = null;
     backend.compaction_scheduler.noteRememberedHit();
-    try compactPlanAt(BackendType, backend, plan);
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
 }
 
@@ -492,7 +776,12 @@ pub fn sortRuns(runs: []Run) void {
     std.sort.pdq(Run, runs, {}, struct {
         fn lessThan(_: void, lhs: Run, rhs: Run) bool {
             if (lhs.level != rhs.level) return lhs.level < rhs.level;
-            if (lhs.level == 0) return lhs.id > rhs.id;
+            if (lhs.level == 0) {
+                const lhs_sequence = l0Sequence(lhs);
+                const rhs_sequence = l0Sequence(rhs);
+                if (lhs_sequence != rhs_sequence) return lhs_sequence > rhs_sequence;
+                return lhs.id > rhs.id;
+            }
             const bound_order = compareRunBound(
                 lhs.smallest_namespace_name,
                 lhs.smallest_key,
@@ -505,9 +794,37 @@ pub fn sortRuns(runs: []Run) void {
     }.lessThan);
 }
 
+pub fn l0Sequence(run: Run) u64 {
+    return if (run.l0_sequence != 0) run.l0_sequence else run.id;
+}
+
+pub fn setL0Sequence(runs: []Run, sequence: u64) void {
+    for (runs) |*run| {
+        if (run.level == 0) run.l0_sequence = sequence;
+    }
+}
+
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+    return try compactPlanAtWithForegroundPolicy(BackendType, backend, plan, false);
+}
+
+fn compactPlanAtOptionalMaintenance(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+    return try compactPlanAtWithForegroundPolicy(BackendType, backend, plan, true);
+}
+
+fn compactPlanAtWithForegroundPolicy(
+    comptime BackendType: type,
+    backend: *BackendType,
+    plan: CompactionPlan,
+    yield_for_foreground_queries: bool,
+) !void {
     if (comptime supportsUnlockedBackendCompaction(BackendType)) {
-        try compactPlanAtWithUnlockedBuild(BackendType, backend, plan);
+        try compactPlanAtWithUnlockedBuild(
+            BackendType,
+            backend,
+            plan,
+            yield_for_foreground_queries,
+        );
         return;
     }
     try compactPlanAtLockedOnly(BackendType, backend, plan);
@@ -543,6 +860,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     else
         try makeStateRunsFromSelectedRuns(BackendType, backend, selected[0..selected_len], plan.output_level);
     errdefer discardOutputRuns(BackendType, backend, &compacted_runs);
+    inheritL0Sequence(&compacted_runs, selected[0..selected_len], plan.output_level);
 
     var retained = std.ArrayListUnmanaged(Run).empty;
     errdefer {
@@ -594,7 +912,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     if (@hasDecl(BackendType, "recordCompactionWriteStats")) {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
-        backend.recordCompactionWriteStats(compacted_runs.items, elapsed_ns);
+        backend.recordCompactionWriteStats(input_bytes, compacted_runs.items, elapsed_ns);
     }
     disarmRunList(&compacted_runs);
     compacted_runs.deinit(backend.allocator);
@@ -620,7 +938,12 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     obsolete_runs = .empty;
 }
 
-fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+fn compactPlanAtWithUnlockedBuild(
+    comptime BackendType: type,
+    backend: *BackendType,
+    plan: CompactionPlan,
+    yield_for_foreground_queries: bool,
+) !void {
     if (plan.source_len == 0) return;
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
 
@@ -660,11 +983,13 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         plan.output_level,
         reserved_run_id_start,
         reserved_run_id_end,
+        yield_for_foreground_queries,
     ) catch |err| blk: {
         build_err = err;
         break :blk .empty;
     };
     if (build_err == null) {
+        inheritL0Sequence(&build_result, selected, plan.output_level);
         build_result_valid = true;
     }
 
@@ -747,6 +1072,7 @@ fn buildCompactedRunsFromSnapshots(
     output_level: u32,
     reserved_run_id_start: u64,
     reserved_run_id_end: u64,
+    yield_for_foreground_queries: bool,
 ) !std.ArrayListUnmanaged(Run) {
     const BuildBackend = struct {
         allocator: std.mem.Allocator,
@@ -763,7 +1089,13 @@ fn buildCompactedRunsFromSnapshots(
         .next_run_id = reserved_run_id_start,
     };
     const runs = if (backend.root_dir != null)
-        try makePersistedRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level)
+        try makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+            BuildBackend,
+            &build_backend,
+            selected,
+            output_level,
+            yield_for_foreground_queries,
+        )
     else
         try makeStateRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level);
     errdefer {
@@ -804,6 +1136,46 @@ pub fn buildRunsFromStateBorrowedWithReservedIds(
     return runs;
 }
 
+/// Stream a newest-first window of immutable memtables into one persisted L0
+/// publication. The states remain borrowed and independently readable while
+/// the backend lock is released; duplicate keys are resolved in favor of the
+/// lowest (newest) source index without materializing a combined heap state.
+pub fn buildRunsFromStatesBorrowedWithReservedIds(
+    comptime BackendType: type,
+    backend: *BackendType,
+    states_newest_first: []const *const State,
+    reserved_run_id_start: u64,
+    reserved_run_id_end: u64,
+) !std.ArrayListUnmanaged(Run) {
+    if (states_newest_first.len == 0) return error.EmptyRun;
+    const BuildBackend = struct {
+        allocator: std.mem.Allocator,
+        storage: @TypeOf(backend.storage),
+        root_dir: @TypeOf(backend.root_dir),
+        options: @TypeOf(backend.options),
+        next_run_id: u64,
+    };
+    var build_backend = BuildBackend{
+        .allocator = backend.allocator,
+        .storage = backend.storage,
+        .root_dir = backend.root_dir,
+        .options = backend.options,
+        .next_run_id = reserved_run_id_start,
+    };
+    const runs = try makePersistedRunsFromStatesBorrowed(
+        BuildBackend,
+        &build_backend,
+        states_newest_first,
+        0,
+    );
+    errdefer {
+        var owned = runs;
+        discardOutputRuns(BuildBackend, &build_backend, &owned);
+    }
+    if (build_backend.next_run_id > reserved_run_id_end) return error.FlushRunIdReservationExhausted;
+    return runs;
+}
+
 fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selected_run_ids: []const u64) ?CompactionPlan {
     if (selected_run_ids.len != plan.source_len + plan.target_len or plan.source_len == 0) return null;
 
@@ -814,6 +1186,16 @@ fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selec
     // rebuild the target overlap closure against the current run version.
     const source_ids = selected_run_ids[0..plan.source_len];
     const source_start = findContiguousRunIds(runs, plan.source_level, source_ids) orelse return null;
+    if (plan.output_level == plan.source_level and plan.target_len == 0) {
+        return .{
+            .source_level = plan.source_level,
+            .source_start = source_start,
+            .source_len = plan.source_len,
+            .target_start = source_start + plan.source_len,
+            .target_len = 0,
+            .output_level = plan.output_level,
+        };
+    }
     const relocated = buildPlanForSourceRange(runs, plan.source_level, source_start, plan.source_len) orelse return null;
     if (relocated.source_len != plan.source_len or
         relocated.output_level != plan.output_level or
@@ -824,6 +1206,13 @@ fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selec
         if (run.id != expected_id) return null;
     }
     return relocated;
+}
+
+fn inheritL0Sequence(output: *std.ArrayListUnmanaged(Run), inputs: []const *Run, output_level: u32) void {
+    if (output_level != 0 or output.items.len == 0) return;
+    var sequence: u64 = 0;
+    for (inputs) |run| sequence = @max(sequence, l0Sequence(run.*));
+    for (output.items) |*run| run.l0_sequence = sequence;
 }
 
 fn findContiguousRunIds(runs: []const Run, level: u32, ids: []const u64) ?usize {
@@ -897,7 +1286,7 @@ fn installCompactedRuns(
     }
     if (@hasDecl(BackendType, "recordCompactionWriteStats")) {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
-        backend.recordCompactionWriteStats(compacted_runs.items, elapsed_ns);
+        backend.recordCompactionWriteStats(input_bytes, compacted_runs.items, elapsed_ns);
     }
     disarmRunList(compacted_runs);
     compacted_runs.deinit(backend.allocator);
@@ -1707,6 +2096,32 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
     };
 }
 
+test "lsm geometric L0 carry tolerates uneven generations without two-way rewrites" {
+    const mib: u64 = 1024 * 1024;
+    const uneven = [_]Run{
+        testRun(7, 0, "doc:a", "doc:z", mib),
+        testRun(6, 0, "doc:a", "doc:z", mib),
+        testRun(5, 0, "doc:a", "doc:z", mib),
+        testRun(4, 0, "doc:a", "doc:z", 2 * mib),
+        testRun(3, 0, "doc:a", "doc:z", mib),
+        testRun(2, 0, "doc:a", "doc:z", mib),
+        testRun(1, 0, "doc:a", "doc:z", mib),
+    };
+
+    // Four uneven inputs would grow the largest generation by only 2.5x, so
+    // the planner waits. Once adjacent deltas provide a 4x output, it carries
+    // the whole chronological window in one streaming merge.
+    try std.testing.expect(selectBulkL0Tier(uneven[0..4], 4, 0, 0) == null);
+    const plan = selectBulkL0Tier(&uneven, 4, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 7), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 0), plan.output_level);
+
+    // A strict input bound may postpone the carry, but must never silently
+    // select a smaller low-growth rewrite.
+    try std.testing.expect(selectBulkL0Tier(&uneven, 4, 7 * mib, 0) == null);
+}
+
 test "unlocked compaction publication relocates inputs after concurrent L0 prepend" {
     const before = [_]Run{
         testRun(5, 0, "doc:a", "doc:m", 10),
@@ -2025,6 +2440,22 @@ fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendTy
 }
 
 pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32) !std.ArrayListUnmanaged(Run) {
+    return try makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+        BackendType,
+        backend,
+        window_runs,
+        output_level,
+        false,
+    );
+}
+
+fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
+    comptime BackendType: type,
+    backend: *BackendType,
+    window_runs: []const *Run,
+    output_level: u32,
+    yield_for_foreground_queries: bool,
+) !std.ArrayListUnmanaged(Run) {
     const allocator = backend.allocator;
     const expected_entries = countRunPtrEntries(window_runs);
 
@@ -2034,11 +2465,17 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
         for (cursors[0..initialized_cursors]) |*cursor| cursor.deinit();
         allocator.free(cursors);
     }
+    const cold_reader_capacity = backend.storage.?.coldSequentialReaderCapacity();
     for (window_runs, 0..) |run, i| {
         const path = run.path orelse return error.RunStateUnavailable;
-        cursors[i] = try PersistedRunCursor.init(allocator, backend.storage.?, path);
-        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
+        cursors[i] = try PersistedRunCursor.init(
+            allocator,
+            backend.storage.?,
+            path,
+            i < cold_reader_capacity,
+        );
         initialized_cursors += 1;
+        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
     }
 
     var runs = std.ArrayListUnmanaged(Run).empty;
@@ -2055,6 +2492,11 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
     defer heap.deinit();
 
     while (heap.peekSource()) |winner_source| {
+        if (yield_for_foreground_queries and consumed_entries % 256 == 0) {
+            if (backend.options.resource_manager) |manager| {
+                manager.yieldOptionalMaintenanceForForegroundQuery();
+            }
+        }
         const winner = (try cursors[winner_source].currentEntry()) orelse return error.InvalidTableFile;
         const entry_bytes = tableEntryLogicalBytes(winner);
         if (output_active) {
@@ -2115,6 +2557,90 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
     return runs;
 }
 
+fn makePersistedRunsFromStatesBorrowed(
+    comptime BackendType: type,
+    backend: *BackendType,
+    states_newest_first: []const *const State,
+    output_level: u32,
+) !std.ArrayListUnmanaged(Run) {
+    const allocator = backend.allocator;
+    var expected_entries: usize = 0;
+    for (states_newest_first) |state| {
+        if (state.entries.items.len == 0) return error.EmptyRun;
+        expected_entries = std.math.add(usize, expected_entries, state.entries.items.len) catch
+            return error.OutOfMemory;
+    }
+
+    var heap = try StateMergeHeap.init(allocator, states_newest_first);
+    defer heap.deinit();
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    errdefer discardOutputRuns(BackendType, backend, &runs);
+    var output: PersistedOutputRunBuilder(BackendType) = undefined;
+    var output_active = false;
+    defer if (output_active) output.deinit();
+    const target_bytes = targetRunFileBytes(BackendType, backend);
+    const expected_entries_per_output = @max(
+        @as(usize, 1),
+        @min(expected_entries, target_bytes / minimum_table_entry_logical_bytes),
+    );
+    var consumed_entries: usize = 0;
+    var emitted_entries: usize = 0;
+
+    while (heap.peekSource()) |winner_source| {
+        const winner_owned = states_newest_first[winner_source].entries.items[heap.positions[winner_source]];
+        const winner = tableEntryFromOwnedEntry(winner_owned);
+        const entry_bytes = tableEntryLogicalBytes(winner);
+        if (output_active) {
+            const partition_changed = output.entry_count > 0 and !sameRunPartition(
+                output.smallest_namespace_name,
+                output.smallest_key,
+                winner.namespace_name,
+                winner.key,
+                backend.options.run_partition_prefix_bytes,
+            );
+            if (partition_changed or
+                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
+                (output.entry_count > 0 and !output.canAppendEntry(winner)))
+            {
+                try runs.ensureUnusedCapacity(allocator, 1);
+                runs.appendAssumeCapacity(try output.finish());
+                output.deinit();
+                output_active = false;
+            }
+        }
+        if (!output_active) {
+            const remaining_entries = expected_entries - consumed_entries;
+            try output.initInPlace(
+                backend,
+                output_level,
+                @max(@as(usize, 1), @min(remaining_entries, expected_entries_per_output)),
+            );
+            output_active = true;
+        }
+        if (!output.canAppendEntry(winner)) return error.TableFileTooLarge;
+        try output.appendEntry(winner, entry_bytes);
+        emitted_entries += 1;
+        consumed_entries += try heap.advanceTopSourcesAtKey(winner);
+
+        if (output.logical_bytes >= target_bytes) {
+            try runs.ensureUnusedCapacity(allocator, 1);
+            runs.appendAssumeCapacity(try output.finish());
+            output.deinit();
+            output_active = false;
+        }
+    }
+    if (output_active) {
+        try runs.ensureUnusedCapacity(allocator, 1);
+        runs.appendAssumeCapacity(try output.finish());
+        output.deinit();
+        output_active = false;
+    }
+    if (runs.items.len == 0) return error.EmptyRun;
+    if (consumed_entries != expected_entries) return error.InvalidTableFile;
+    if (countRunEntries(runs.items) != emitted_entries) return error.InvalidTableFile;
+    return runs;
+}
+
 fn PersistedOutputRunBuilder(comptime BackendType: type) type {
     return struct {
         backend: *BackendType,
@@ -2151,6 +2677,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.options.table_block_compression,
                 backend.options.table_prefix_extractor,
                 backend.options.resource_manager,
+                .cold_sequential,
             );
             self.writer_active = true;
         }
@@ -2252,24 +2779,35 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
 
 const PersistedRunCursor = struct {
     allocator: std.mem.Allocator,
-    storage: @import("storage_io.zig").Storage,
-    path: []const u8,
+    reader: @import("storage_io.zig").ColdSequentialReader,
     index: lsm_table_file.SequentialTableIndex,
     position: ?usize = null,
     block_index: usize = 0,
     entry_in_block: usize = 0,
     block_offset: usize = 0,
     current_entry_len: usize = 0,
+    /// Heap maintenance compares one cursor against several peers before the
+    /// cursor advances. Keep the decoded slice view stable for that interval
+    /// instead of reparsing the same table bytes for every comparison.
+    current_entry: ?lsm_table_file.Entry = null,
     loaded_window: ?lsm_table_file.EntryDataWindow = null,
     loaded_bytes: ?[]u8 = null,
 
-    fn init(allocator: std.mem.Allocator, storage: @import("storage_io.zig").Storage, path: []const u8) !PersistedRunCursor {
+    fn init(
+        allocator: std.mem.Allocator,
+        storage: @import("storage_io.zig").Storage,
+        path: []const u8,
+        cold: bool,
+    ) !PersistedRunCursor {
         var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path);
         errdefer index.deinit(allocator);
+        const reader = if (cold)
+            try storage.beginColdSequentialRead(allocator, path)
+        else
+            try storage.beginSequentialRead(allocator, path);
         return .{
             .allocator = allocator,
-            .storage = storage,
-            .path = path,
+            .reader = reader,
             .index = index,
             .position = if (index.entry_count > 0) 0 else null,
         };
@@ -2277,18 +2815,21 @@ const PersistedRunCursor = struct {
 
     fn deinit(self: *PersistedRunCursor) void {
         if (self.loaded_bytes) |bytes| self.allocator.free(bytes);
+        self.reader.deinit();
         self.index.deinit(self.allocator);
         self.* = undefined;
     }
 
     fn currentEntry(self: *PersistedRunCursor) !?lsm_table_file.Entry {
         _ = self.position orelse return null;
+        if (self.current_entry) |entry| return entry;
         try self.ensureCurrentWindow();
         const bytes = self.loaded_bytes orelse return error.InvalidTableFile;
         if (self.block_offset >= bytes.len) return error.InvalidTableFile;
         const entry = try lsm_table_file.parseEntryAt(bytes, self.block_offset);
         self.current_entry_len = tableEntryLogicalBytes(entry);
         if (self.current_entry_len > bytes.len - self.block_offset) return error.InvalidTableFile;
+        self.current_entry = entry;
         return entry;
     }
 
@@ -2297,6 +2838,7 @@ const PersistedRunCursor = struct {
         if (self.current_entry_len == 0) _ = (try self.currentEntry()) orelse return error.InvalidTableFile;
         self.block_offset += self.current_entry_len;
         self.current_entry_len = 0;
+        self.current_entry = null;
         self.entry_in_block += 1;
         const block = self.index.blocks[self.block_index];
         if (self.entry_in_block > block.entry_count) return error.InvalidTableFile;
@@ -2334,9 +2876,8 @@ const PersistedRunCursor = struct {
             self.allocator.free(bytes);
             self.loaded_bytes = null;
         }
-        const payload = try self.storage.readFileRangeAlloc(
+        const payload = try self.reader.readRangeAlloc(
             self.allocator,
-            self.path,
             @as(u64, @intCast(self.index.entry_data_start)) + window.physicalRelativeOffset(),
             window.physicalLen(),
         );
@@ -2349,6 +2890,117 @@ const PersistedRunCursor = struct {
             window.checksum,
         );
         self.loaded_window = window;
+    }
+};
+
+const StateMergeHeap = struct {
+    allocator: std.mem.Allocator,
+    states: []const *const State,
+    positions: []usize,
+    sources: []usize,
+    advanced_sources: []usize,
+    len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, states: []const *const State) !StateMergeHeap {
+        const positions = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(positions);
+        @memset(positions, 0);
+        const sources = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(sources);
+        const advanced_sources = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(advanced_sources);
+        var heap = StateMergeHeap{
+            .allocator = allocator,
+            .states = states,
+            .positions = positions,
+            .sources = sources,
+            .advanced_sources = advanced_sources,
+        };
+        errdefer heap.deinit();
+        for (states, 0..) |state, source| {
+            if (state.entries.items.len != 0) try heap.pushSource(source);
+        }
+        return heap;
+    }
+
+    fn deinit(self: *StateMergeHeap) void {
+        self.allocator.free(self.positions);
+        self.allocator.free(self.sources);
+        self.allocator.free(self.advanced_sources);
+        self.* = undefined;
+    }
+
+    fn peekSource(self: *const StateMergeHeap) ?usize {
+        return if (self.len == 0) null else self.sources[0];
+    }
+
+    fn currentEntry(self: *const StateMergeHeap, source: usize) lsm_table_file.Entry {
+        return tableEntryFromOwnedEntry(self.states[source].entries.items[self.positions[source]]);
+    }
+
+    fn advanceTopSourcesAtKey(self: *StateMergeHeap, key_entry: lsm_table_file.Entry) !usize {
+        var advanced_len: usize = 0;
+        while (self.peekSource()) |source| {
+            if (compareTableEntry(self.currentEntry(source), key_entry) != .eq) break;
+            _ = self.popSource();
+            self.positions[source] += 1;
+            self.advanced_sources[advanced_len] = source;
+            advanced_len += 1;
+        }
+        for (self.advanced_sources[0..advanced_len]) |source| {
+            if (self.positions[source] < self.states[source].entries.items.len) try self.pushSource(source);
+        }
+        return advanced_len;
+    }
+
+    fn pushSource(self: *StateMergeHeap, source: usize) !void {
+        std.debug.assert(self.len < self.sources.len);
+        self.sources[self.len] = source;
+        self.len += 1;
+        try self.siftUp(self.len - 1);
+    }
+
+    fn popSource(self: *StateMergeHeap) usize {
+        std.debug.assert(self.len != 0);
+        const source = self.sources[0];
+        self.len -= 1;
+        if (self.len > 0) {
+            self.sources[0] = self.sources[self.len];
+            self.siftDown(0) catch unreachable;
+        }
+        return source;
+    }
+
+    fn siftUp(self: *StateMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!self.sourceLess(self.sources[index], self.sources[parent])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[parent]);
+            index = parent;
+        }
+    }
+
+    fn siftDown(self: *StateMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.len) break;
+            const right = left + 1;
+            var child = left;
+            if (right < self.len and self.sourceLess(self.sources[right], self.sources[left])) child = right;
+            if (!self.sourceLess(self.sources[child], self.sources[index])) break;
+            std.mem.swap(usize, &self.sources[child], &self.sources[index]);
+            index = child;
+        }
+    }
+
+    fn sourceLess(self: *const StateMergeHeap, lhs_source: usize, rhs_source: usize) bool {
+        const order = compareTableEntry(self.currentEntry(lhs_source), self.currentEntry(rhs_source));
+        if (order != .eq) return order == .lt;
+        // Callers pass newest to oldest, so the lower source index wins a
+        // duplicate key and is emitted before all older copies are advanced.
+        return lhs_source < rhs_source;
     }
 };
 
@@ -2714,6 +3366,7 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
             backend.options.table_block_compression,
             backend.options.table_prefix_extractor,
             backend.options.resource_manager,
+            .cold_sequential,
             physicalRunFileLimit(BackendType, backend),
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
@@ -2767,6 +3420,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         backend.options.table_block_compression,
         backend.options.table_prefix_extractor,
         backend.options.resource_manager,
+        .cold_sequential,
     );
     var writer_active = true;
     errdefer if (writer_active) writer.deinit();
@@ -2835,6 +3489,18 @@ fn deinitRunList(allocator: std.mem.Allocator, runs: *std.ArrayListUnmanaged(Run
 }
 
 pub fn appendOwnedRuns(dst: *std.ArrayListUnmanaged(Run), allocator: std.mem.Allocator, src: *std.ArrayListUnmanaged(Run)) !void {
+    // Files emitted by one sorted publication form one precedence generation.
+    // Keeping the generation common is what lets later size-tiered rewrites
+    // preserve chronology even when partitioning produces multiple files.
+    var publication_sequence: u64 = 0;
+    for (src.items) |run| {
+        if (run.level == 0 and run.l0_sequence == 0) publication_sequence = @max(publication_sequence, run.id);
+    }
+    if (publication_sequence != 0) {
+        for (src.items) |*run| {
+            if (run.level == 0 and run.l0_sequence == 0) run.l0_sequence = publication_sequence;
+        }
+    }
     try dst.ensureUnusedCapacity(allocator, src.items.len);
     for (src.items) |*run| {
         dst.appendAssumeCapacity(run.*);

@@ -6855,6 +6855,38 @@ pub const DateRangeStringQuery = struct {
     }
 };
 
+/// Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
+pub const DenseNativeStoragePhase = enum {
+    legacy,
+    native_building,
+    native_validating,
+    native_authoritative,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .legacy => "legacy",
+            .native_building => "native_building",
+            .native_validating => "native_validating",
+            .native_authoritative => "native_authoritative",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "legacy", .legacy },
+            .{ "native_building", .native_building },
+            .{ "native_validating", .native_validating },
+            .{ "native_authoritative", .native_authoritative },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
 pub const DenseRepairBackpressureError = struct {
     code: []const u8,
@@ -8941,6 +8973,9 @@ pub const EmbeddingsIndexStats = struct {
     dense_replay_target_sequence: ?i64 = null,
     /// Whether dense/vector artifacts still need publication before queries see the latest data.
     dense_publish_pending: ?bool = null,
+    /// Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true.
+    dense_vector_projection_pending: ?bool = null,
+    dense_native_storage_phase: ?DenseNativeStoragePhase = null,
     replay_applied_sequence: ?i64 = null,
     replay_target_sequence: ?i64 = null,
     replay_catch_up_required: ?bool = null,
@@ -9020,6 +9055,8 @@ pub const EmbeddingsIndexStats = struct {
         .{ "dense_replay_applied_sequence", "dense_replay_applied_sequence", true },
         .{ "dense_replay_target_sequence", "dense_replay_target_sequence", true },
         .{ "dense_publish_pending", "dense_publish_pending", true },
+        .{ "dense_vector_projection_pending", "dense_vector_projection_pending", true },
+        .{ "dense_native_storage_phase", "dense_native_storage_phase", true },
         .{ "replay_applied_sequence", "replay_applied_sequence", true },
         .{ "replay_target_sequence", "replay_target_sequence", true },
         .{ "replay_catch_up_required", "replay_catch_up_required", true },
@@ -9199,6 +9236,14 @@ pub const EmbeddingsIndexStats = struct {
         }
         if (self.dense_publish_pending) |value| {
             try jw.objectField("dense_publish_pending");
+            try jw.write(value);
+        }
+        if (self.dense_vector_projection_pending) |value| {
+            try jw.objectField("dense_vector_projection_pending");
+            try jw.write(value);
+        }
+        if (self.dense_native_storage_phase) |value| {
+            try jw.objectField("dense_native_storage_phase");
             try jw.write(value);
         }
         if (self.replay_applied_sequence) |value| {

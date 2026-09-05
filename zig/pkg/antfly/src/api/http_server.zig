@@ -5083,6 +5083,8 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .dense_vector_projection_pending = index.dense_vector_projection_pending,
+                .dense_native_storage_phase = index.dense_native_storage_phase,
                 // Metadata already applied its incarnation-scoped TTL cache
                 // before producing this report. Preserve the observation bit
                 // and ordering token together; dropping either makes the API
@@ -38090,6 +38092,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .dense_vector_projection_pending = true,
             .embedding_activity_observed = true,
             .embedding_activity = .{
                 .epoch = 7,
@@ -38110,6 +38113,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(true, index.replay_catch_up_required);
     try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
     try std.testing.expect(!index.index_repair_active_generation_serviceable);
+    try std.testing.expect(index.dense_vector_projection_pending);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);

@@ -391,6 +391,8 @@ pub const DenseSearchProfile = struct {
     hbc_scratch_acquire_ns: u64 = 0,
     hbc_node_cache_lookup_ns: u64 = 0,
     hbc_quantized_cache_lookup_ns: u64 = 0,
+    hbc_child_expand_ns: u64 = 0,
+    hbc_leaf_score_ns: u64 = 0,
     hbc_filter_candidates: u64 = 0,
     hbc_filter_rejected: u64 = 0,
     hbc_filter_metadata_batches: u64 = 0,
@@ -438,6 +440,8 @@ pub const DenseSearchProfile = struct {
     hbc_exact_vectors_scored: u64 = 0,
     hbc_leaf_payload_stale: u64 = 0,
     hbc_leaf_payload_missing: u64 = 0,
+    hbc_native_leaf_scan_hits: u64 = 0,
+    hbc_native_leaf_scan_fallbacks: u64 = 0,
     hbc_reranked_vectors: u64 = 0,
     hbc_approx_candidate_count: u64 = 0,
     hbc_rerank_candidate_count: u64 = 0,
@@ -474,6 +478,16 @@ pub const DenseSearchProfile = struct {
     hbc_rerank_artifact_distance_ns: u64 = 0,
     hbc_rerank_lsm_cache_hits: u64 = 0,
     hbc_rerank_lsm_cache_misses: u64 = 0,
+    hbc_rerank_vector_block_hits: u64 = 0,
+    hbc_rerank_vector_projection_reads: u64 = 0,
+    hbc_rerank_vector_projection_bytes: u64 = 0,
+    hbc_rerank_vector_residual_reads: u64 = 0,
+    hbc_rerank_vector_residual_bytes: u64 = 0,
+    hbc_rerank_vector_physical_reads: u64 = 0,
+    hbc_rerank_vector_physical_bytes: u64 = 0,
+    hbc_rerank_vector_location_reuses: u64 = 0,
+    hbc_rerank_vector_block_misses: u64 = 0,
+    hbc_rerank_vector_block_fallbacks: u64 = 0,
     hbc_rerank_artifact_cache_hits: u64 = 0,
     hbc_rerank_artifact_vectors_loaded: u64 = 0,
     hbc_rerank_distance_ns: u64 = 0,
@@ -13358,6 +13372,8 @@ fn searchDenseInternal(
             profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
             profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
             profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
+            profile.hbc_child_expand_ns = profiled.profile.child_expand_ns;
+            profile.hbc_leaf_score_ns = profiled.profile.leaf_score_ns;
             profile.hbc_filter_candidates = profiled.profile.filter_candidates;
             profile.hbc_filter_rejected = profiled.profile.filter_rejected;
             profile.hbc_filter_metadata_batches = profiled.profile.filter_metadata_batches;
@@ -13378,6 +13394,8 @@ fn searchDenseInternal(
             profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
             profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
             profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
+            profile.hbc_native_leaf_scan_hits = profiled.profile.native_leaf_scan_hits;
+            profile.hbc_native_leaf_scan_fallbacks = profiled.profile.native_leaf_scan_fallbacks;
             profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
             profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
             profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
@@ -13416,6 +13434,16 @@ fn searchDenseInternal(
             profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
             profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
             profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
+            profile.hbc_rerank_vector_block_hits = profiled.profile.rerank_vector_block_hits;
+            profile.hbc_rerank_vector_projection_reads = profiled.profile.rerank_vector_projection_reads;
+            profile.hbc_rerank_vector_projection_bytes = profiled.profile.rerank_vector_projection_bytes;
+            profile.hbc_rerank_vector_residual_reads = profiled.profile.rerank_vector_residual_reads;
+            profile.hbc_rerank_vector_residual_bytes = profiled.profile.rerank_vector_residual_bytes;
+            profile.hbc_rerank_vector_physical_reads = profiled.profile.rerank_vector_physical_reads;
+            profile.hbc_rerank_vector_physical_bytes = profiled.profile.rerank_vector_physical_bytes;
+            profile.hbc_rerank_vector_location_reuses = profiled.profile.rerank_vector_location_reuses;
+            profile.hbc_rerank_vector_block_misses = profiled.profile.rerank_vector_block_misses;
+            profile.hbc_rerank_vector_block_fallbacks = profiled.profile.rerank_vector_block_fallbacks;
             profile.hbc_rerank_artifact_cache_hits = profiled.profile.rerank_artifact_cache_hits;
             profile.hbc_rerank_artifact_vectors_loaded = profiled.profile.rerank_artifact_vectors_loaded;
             profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
@@ -14127,13 +14155,18 @@ test "raw multi-source member search avoids fixed-factor reranking" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 32,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * 2);
     defer alloc.free(vectors);
@@ -14174,7 +14207,10 @@ test "raw multi-source member search avoids fixed-factor reranking" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         alloc: Allocator,
@@ -14420,13 +14456,18 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = 2,
         .leaf_size = 2,
         .branching_factor = 2,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
     try index.bulkBuildWithMetadata(&.{
         .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:keep:a" },
         .{ .vector_id = 2, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:keep:b" },
@@ -14447,7 +14488,10 @@ test "built-in exact dense scorer filters metadata before vector reads" {
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const VectorLoadCounter = struct {
         count: usize = 0,
@@ -14490,13 +14534,18 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 64,
         .branching_factor = 8,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, candidate_count * dims);
     defer alloc.free(vectors);
@@ -14527,7 +14576,10 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, result_count, 32, 64, false, false);
     try std.testing.expect(route.exact_native_filter);
@@ -14595,13 +14647,18 @@ test "one percent native filter routes through integrated dense search exactly" 
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+    const index = try alloc.create(hbc_mod.HBCIndex);
+    errdefer alloc.destroy(index);
+    index.* = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
         .dims = dims,
         .leaf_size = 128,
         .branching_factor = 16,
     });
     var index_owned = true;
-    defer if (index_owned) index.close();
+    defer if (index_owned) {
+        index.close();
+        alloc.destroy(index);
+    };
 
     const vectors = try alloc.alloc(f32, active_count * dims);
     defer alloc.free(vectors);
@@ -14632,7 +14689,10 @@ test "one percent native filter routes through integrated dense search exactly" 
         .index = index,
     };
     index_owned = false;
-    defer entry.index.close();
+    defer {
+        entry.index.close();
+        alloc.destroy(entry.index);
+    }
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
@@ -14904,7 +14964,7 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
+        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} native_leaf_scan_hits={d} native_leaf_scan_fallbacks={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
         .{
             req.index_name orelse "",
             profile.hbc_nodes_visited,
@@ -14913,6 +14973,8 @@ fn logBenchDenseQueryProfile(
             profile.hbc_exact_vectors_scored,
             profile.hbc_leaf_payload_stale,
             profile.hbc_leaf_payload_missing,
+            profile.hbc_native_leaf_scan_hits,
+            profile.hbc_native_leaf_scan_fallbacks,
             profile.hbc_reranked_vectors,
             profile.hbc_approx_candidate_count,
             profile.hbc_rerank_candidate_count,

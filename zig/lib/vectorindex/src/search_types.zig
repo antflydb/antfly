@@ -57,6 +57,8 @@ pub const FlatCentroidProbe = struct {
     error_bound: f32,
     member_lower_bound: f32 = -std.math.inf(f32),
     bound_resolved: bool = false,
+    suffix_member_lower_bound: f32 = -std.math.inf(f32),
+    suffix_bounds_resolved: bool = false,
 };
 
 pub const SearchResult = search_results.SearchResult;
@@ -146,6 +148,30 @@ pub const SearchProfile = struct {
     rerank_artifact_distance_ns: u64 = 0,
     rerank_lsm_cache_hits: u64 = 0,
     rerank_lsm_cache_misses: u64 = 0,
+    /// Candidate or exact-completion scores served directly from the
+    /// table-level immutable vector block generation.
+    rerank_vector_block_hits: u64 = 0,
+    /// Physical compact-plane reads. The bounded pass retains the validated
+    /// generation-leased view so exact completion does not read it twice.
+    rerank_vector_projection_reads: u64 = 0,
+    rerank_vector_projection_bytes: u64 = 0,
+    /// Physical lossless-residual reads, which must track authoritative
+    /// completions rather than the wider bounded candidate shell.
+    rerank_vector_residual_reads: u64 = 0,
+    rerank_vector_residual_bytes: u64 = 0,
+    /// Actual kernel read calls/bytes after optional range coalescing. Mmap
+    /// views report zero because their page faults are not explicit reads.
+    rerank_vector_physical_reads: u64 = 0,
+    rerank_vector_physical_bytes: u64 = 0,
+    /// Exact completions that reused a generation-pinned location discovered
+    /// by the bounded pass instead of repeating key/index lookup.
+    rerank_vector_location_reuses: u64 = 0,
+    /// Candidates for which the matching immutable generation was installed
+    /// but did not contain a usable exact vector.
+    rerank_vector_block_misses: u64 = 0,
+    /// Candidates routed to primary storage because no immutable generation
+    /// matched the search transaction's source boundary.
+    rerank_vector_block_fallbacks: u64 = 0,
     /// Candidates scored without reading an external artifact. This includes
     /// governed decoded residency and a request-local hit when a caller has a
     /// legitimate reuse opportunity.
@@ -187,11 +213,20 @@ pub const SearchProfile = struct {
     approx_nodes_expanded: u64 = 0,
     approx_leaves_scored: u64 = 0,
     approx_vectors_scored: u64 = 0,
+    /// Largest posting presented to the candidate loop. This is intentionally
+    /// measured before request filtering: routing and quantized payload reads
+    /// still consume bandwidth for rejected members.
+    max_leaf_vectors_considered: u64 = 0,
+    /// Largest candidate scoring plane consumed by one leaf after its actual
+    /// encoding path (RaBitQ, float16, or float32 fallback) is known.
+    max_leaf_scan_bytes: u64 = 0,
     exact_vectors_scored: u64 = 0,
     // Leaves that fell back to exact member scoring because their quantized
     // payload was stale (payload_dirty) or absent from storage.
     leaf_payload_stale: u64 = 0,
     leaf_payload_missing: u64 = 0,
+    native_leaf_scan_hits: u64 = 0,
+    native_leaf_scan_fallbacks: u64 = 0,
     reranked_vectors: u64 = 0,
     approx_candidate_count: u64 = 0,
     rerank_candidate_count: u64 = 0,

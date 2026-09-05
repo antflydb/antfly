@@ -82,10 +82,13 @@ pub const Trigger = enum(u8) {
     /// Rebuild the missing coverage in a shadow while retaining query access
     /// until the replacement reaches its fenced activation boundary.
     replay_artifact_unavailable = 8,
+    /// Online physical-format upgrade. The legacy generation remains serving
+    /// while a native v2 shadow is built, caught up, validated, and promoted.
+    storage_format_migration = 9,
     /// A catalog definition was admitted over an existing corpus. The
     /// independent work class determines that this is initial materialization,
     /// not repair; the trigger preserves the exact control-plane cause.
-    catalog_admission = 9,
+    catalog_admission = 10,
 };
 
 /// Durable scheduler work and its user-visible meaning are separate from the

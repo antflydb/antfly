@@ -121,6 +121,7 @@ pub const Credentials = types.Credentials;
 pub const DataShapeDecl = types.DataShapeDecl;
 pub const DataShapeKind = types.DataShapeKind;
 pub const DateRangeStringQuery = types.DateRangeStringQuery;
+pub const DenseNativeStoragePhase = types.DenseNativeStoragePhase;
 pub const DenseRepairBackpressureError = types.DenseRepairBackpressureError;
 pub const DenseVectorPublicationStatus = types.DenseVectorPublicationStatus;
 pub const DerivedCoverageObservationIncompleteReason = types.DerivedCoverageObservationIncompleteReason;

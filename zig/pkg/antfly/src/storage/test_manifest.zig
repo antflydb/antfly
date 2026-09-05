@@ -115,6 +115,7 @@ comptime {
     _ = @import("docstore.zig");
     _ = @import("enrichment.zig");
     _ = @import("filesystem_capacity.zig");
+    _ = @import("generation_publication.zig");
     _ = @import("ha/admin.zig");
     _ = @import("ha/admin_cli.zig");
     _ = @import("ha/admin_exec.zig");
@@ -199,6 +200,7 @@ comptime {
     _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
+    _ = @import("posting_segment_store.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
     _ = @import("rowsource/external.zig");
@@ -210,5 +212,6 @@ comptime {
     _ = @import("sim_runtime.zig");
     _ = @import("transactions.zig");
     _ = @import("ttl.zig");
+    _ = @import("vector_block_store.zig");
     _ = @import("wal.zig");
 }

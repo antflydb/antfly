@@ -2689,7 +2689,13 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_runs_total", "counter", "Runs published through cached write LSM sorted ingest", stats.sorted_ingest_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_bytes_total", "counter", "Run bytes published through cached write LSM sorted ingest", stats.sorted_ingest_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_sorted_ingest_ns_total", "counter", "Nanoseconds spent in cached write LSM sorted ingest", stats.sorted_ingest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compactions_total", "counter", "Completed cached write LSM compaction jobs", stats.compactions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_input_bytes_total", "counter", "Input bytes consumed by cached write LSM compaction jobs", stats.compaction_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_output_bytes_total", "counter", "Output bytes produced by cached write LSM compaction jobs", stats.compaction_output_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_ns_total", "counter", "Nanoseconds spent compacting cached write LSM runs", stats.compaction_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_input_bytes", "gauge", "Largest cached write LSM compaction job input in bytes", stats.compaction_max_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_output_bytes", "gauge", "Largest cached write LSM compaction job output in bytes", stats.compaction_max_output_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_max_ns", "gauge", "Longest completed cached write LSM compaction job in nanoseconds", stats.compaction_max_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_writes_total", "counter", "Cached write LSM manifest writes", stats.manifest_writes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_bytes_total", "counter", "Cached write LSM manifest bytes written", stats.manifest_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_manifest_ns_total", "counter", "Nanoseconds spent writing cached write LSM manifests", stats.manifest_ns);
@@ -2724,6 +2730,7 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_reset_ns_total", "counter", "Nanoseconds spent resetting cached write LSM WAL files", stats.wal_reset_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_rotations_total", "counter", "Cached write LSM mutable-to-immutable rotations", stats.immutable_rotations);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flushes_total", "counter", "Cached write LSM immutable memtable flushes", stats.immutable_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_input_memtables_total", "counter", "Immutable memtable epochs consumed by cached write LSM flush windows", stats.immutable_flush_input_memtables);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_entries_total", "counter", "Entries flushed from cached write LSM immutable memtables", stats.immutable_flush_entries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_ns_total", "counter", "Nanoseconds spent flushing cached write LSM immutable memtables", stats.immutable_flush_ns);
 }
@@ -3004,6 +3011,17 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_rejections_total", "counter", "Aggregate managed host-memory hard-limit rejections", snapshot.memory.hard_limit_rejections);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_accounting_errors_total", "counter", "Fail-closed host-memory release accounting errors", snapshot.memory.accounting_errors);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_pressure", "gauge", "Aggregate managed host-memory pressure state, 0 normal, 1 soft, 2 hard", pressureValue(snapshot.memory.pressure));
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_capacity_bytes", "gauge", "Node-wide candidate-scan bandwidth capacity", snapshot.dense_search_admission.capacity_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_active_bytes", "gauge", "Estimated candidate bytes held by active dense scans", snapshot.dense_search_admission.active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_active_bytes", "gauge", "Peak estimated candidate bytes held by active dense scans", snapshot.dense_search_admission.peak_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_active_queries", "gauge", "Dense queries currently holding candidate-scan permits", snapshot.dense_search_admission.active_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_active_queries", "gauge", "Peak dense queries concurrently holding candidate-scan permits", snapshot.dense_search_admission.peak_active_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_queued_queries", "gauge", "Dense queries waiting for candidate-scan permits", snapshot.dense_search_admission.queued_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_peak_queued_queries", "gauge", "Peak dense queries waiting for candidate-scan permits", snapshot.dense_search_admission.peak_queued_queries);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_grants_total", "counter", "Dense candidate-scan permits granted", snapshot.dense_search_admission.admissions);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_waits_total", "counter", "Dense queries queued for candidate-scan permits", snapshot.dense_search_admission.waits);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_cancellations_total", "counter", "Queued dense searches cancelled before admission", snapshot.dense_search_admission.cancellations);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_wait_ns_total", "counter", "Cumulative nanoseconds dense queries spent queued for candidate-scan permits", snapshot.dense_search_admission.wait_ns);
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
     try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
@@ -3083,6 +3101,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.inference_scratch_working_set,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -3110,6 +3129,7 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_used_bytes", "gauge", "Decoded and physical LSM data-block bytes currently resident", @intCast(stats.data_block_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_peak_used_bytes", "gauge", "Lifetime peak decoded and physical LSM data-block bytes resident at the same instant", @intCast(stats.data_block_peak_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_entries", "gauge", "Shared LSM cache entry count", @intCast(stats.entry_count));
+    try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
     try writeLsmCacheKindMetricFamily(writer, stats, .inserts, "antfly_lsm_cache_inserts_total", "counter", "Shared LSM cache inserts");
@@ -3164,6 +3184,7 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
 }
 
 const LsmCacheMetricField = enum {
+    used_bytes,
     hits,
     misses,
     inserts,
@@ -3172,7 +3193,6 @@ const LsmCacheMetricField = enum {
     evictions,
     invalidations,
     waits,
-    used_bytes,
     peak_used_bytes,
 };
 
@@ -3206,6 +3226,7 @@ fn appendLsmCacheKindSample(
 
 fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMetricField) u64 {
     return switch (field) {
+        .used_bytes => @intCast(stats.used_bytes),
         .hits => stats.hits,
         .misses => stats.misses,
         .inserts => stats.inserts,
@@ -3214,7 +3235,6 @@ fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMet
         .evictions => stats.evictions,
         .invalidations => stats.invalidations,
         .waits => stats.waits,
-        .used_bytes => @intCast(stats.used_bytes),
         .peak_used_bytes => @intCast(stats.peak_used_bytes),
     };
 }
@@ -3335,6 +3355,7 @@ const StoreStatusHeartbeatCache = struct {
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -4176,7 +4197,11 @@ fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u
     };
 }
 
-fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+/// Portable transport failures that can be retried by bounded control-plane
+/// loops. Keep metadata bootstrap and HA replication on one classification so
+/// resolver/platform error additions cannot make one loop terminate while the
+/// other correctly backs off.
+fn isRetryableControlPlaneTransportError(err: anyerror) bool {
     return switch (haStandbyReplicationErrorCode(err)) {
         .HttpConnectionClosing,
         .ConnectionResetByPeer,
@@ -4196,6 +4221,10 @@ fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+fn isHAStandbyUpstreamTransportError(err: anyerror) bool {
+    return isRetryableControlPlaneTransportError(err);
 }
 
 fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
@@ -4328,15 +4357,9 @@ test "data server keeps upstream replication availability failures nonfatal" {
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    if (isRetryableControlPlaneTransportError(err)) return true;
     return switch (err) {
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.ConnectionRefused,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.Timeout,
         error.UnexpectedHttpStatus,
-        error.NotListening,
         error.NotLeader,
         error.ProposalDropped,
         error.LeaderTransferInProgress,
@@ -4408,11 +4431,29 @@ fn chooseStoreStatusReportKind(
 }
 
 test "data runtime treats transient metadata failures as retryable bootstrap failures" {
+    inline for (.{
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.NoAddressReturned,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.NotListening,
+    }) |err| {
+        try std.testing.expect(isRetryableControlPlaneTransportError(err));
+        try std.testing.expect(isRetryableMetadataBootstrapError(err));
+    }
     try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
-    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
-    try std.testing.expect(isRetryableMetadataBootstrapError(error.Timeout));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataSnapshotHeadMismatch));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
@@ -5557,6 +5598,7 @@ pub const DataServer = struct {
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
     dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    vector_block_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
@@ -5575,6 +5617,7 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
+    const vector_block_maintenance_interval_ns = 1 * std.time.ns_per_s;
     // Receiving and applying a fetched batch holds ha_state_mutex so promotion
     // cannot consume the standby while records are in flight. Bound both the
     // durable work count and elapsed apply time: record cost varies with LSM
@@ -7770,7 +7813,11 @@ pub const DataServer = struct {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
-        if (self.resourcePressureDefersBackgroundMaintenance()) {
+        // Exact-vector publication has its own bounded ResourceManager lane
+        // and is part of dense-index readiness. Soft LSM pressure must not
+        // prevent the worker from reaching it; generic maintenance still
+        // yields below.
+        if (self.resourcePressureDefersMaintenanceWake(now_ns)) {
             self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
@@ -7858,6 +7905,10 @@ pub const DataServer = struct {
         return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
     }
 
+    fn vectorBlockMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        return now_ns >= self.vector_block_maintenance_next_eligible_ns.load(.monotonic);
+    }
+
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
         const live_write_source = self.liveRuntimeWriteSource();
@@ -7866,6 +7917,7 @@ pub const DataServer = struct {
             return true;
         }
         if (self.densePostingMaintenanceDue(now_ns)) return true;
+        if (self.vectorBlockMaintenanceDue(now_ns)) return true;
         const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
         if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
         if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
@@ -7892,6 +7944,11 @@ pub const DataServer = struct {
 
     fn resourcePressureDefersBackgroundMaintenance(self: *DataServer) bool {
         return self.provisioned_storage.resource_manager.shouldDeferBackgroundWork(.lsm_compaction_work);
+    }
+
+    fn resourcePressureDefersMaintenanceWake(self: *DataServer, now_ns: u64) bool {
+        return self.resourcePressureDefersBackgroundMaintenance() and
+            !self.vectorBlockMaintenanceDue(now_ns);
     }
 
     fn deferLsmMaintenance(self: *DataServer, now_ns: u64, delay_ns: u64) void {
@@ -7923,6 +7980,37 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
+
+            const live_write_source = self.liveRuntimeWriteSource();
+            // Exact-vector publication is readiness-critical, uses its own
+            // allocation-accounted build lane, and commonly frees a larger
+            // decoded-vector cache when it publishes. Attempt it before the
+            // soft-pressure gate that protects optional LSM maintenance.
+            const vector_now_ns = platform_time.monotonicNs();
+            if (self.vectorBlockMaintenanceDue(vector_now_ns)) {
+                // Projection publication is part of dense-index readiness.
+                // Invalidate the cached status before entering a potentially
+                // long build and again on failure, even when no step commits.
+                // The worker remains best-effort and retries in the
+                // background, but clients must keep seeing `pending` instead
+                // of paying the fallback scan on their first query.
+                self.runtime_status_dirty.store(true, .release);
+                self.markStoreStatusDirtyImmediate();
+                const vector_steps = live_write_source.runVectorBlockMaintenanceRoundBestEffort() catch |err| blk: {
+                    std.log.warn("vector block maintenance round failed: {}", .{err});
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
+                    break :blk 0;
+                };
+                self.vector_block_maintenance_next_eligible_ns.store(
+                    vector_now_ns +| vector_block_maintenance_interval_ns,
+                    .release,
+                );
+                if (vector_steps > 0) {
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
+                }
+            }
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
@@ -7940,7 +8028,6 @@ pub const DataServer = struct {
 
             self.lsm_maintenance_active.store(true, .release);
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
-            const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var maintenance_progressed = false;
             var maintenance_progressed_groups: [lsm_maintenance_worker_max_steps_per_wake]u64 = undefined;
@@ -11930,6 +12017,7 @@ pub const DataServer = struct {
             .reporter_incarnation = try self.reporterIncarnation(),
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -11940,6 +12028,10 @@ pub const DataServer = struct {
         try remote_metadata.registerNode(record);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        self.provisioned_storage.setDenseNativeAuthorityPermitted(
+            snapshot.status.dense_native_storage_protocol_activated_version >=
+                antfly.metadata.table_manager.dense_native_storage_protocol_version,
+        );
         if (!storeRegistrationVisible(snapshot.stores, record)) return error.StoreRegistrationNotVisible;
         self.store_registration_confirmed = true;
         self.clearMetadataBootstrapRetry();
@@ -12523,6 +12615,10 @@ pub const DataServer = struct {
         errdefer if (claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        self.provisioned_storage.setDenseNativeAuthorityPermitted(
+            snapshot.status.dense_native_storage_protocol_activated_version >=
+                antfly.metadata.table_manager.dense_native_storage_protocol_version,
+        );
         const reporter_incarnation = try self.reporterIncarnation();
         if (runtimeStatusReadyForStoreRegistration(snapshot.status.runtime_status_protocol_ready_version) and
             (!storeReporterIncarnationVisible(
@@ -12614,6 +12710,7 @@ pub const DataServer = struct {
             .embedding_activity_sequence = self.embedding_activity_report_sequence.fetchAdd(1, .monotonic),
             .reporter_incarnation = reporter_incarnation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -13329,6 +13426,7 @@ pub const DataServer = struct {
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -13362,6 +13460,7 @@ pub const DataServer = struct {
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = report.dense_native_storage_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -15874,6 +15973,9 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.dense_catch_up.active) return true;
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
+            if (index.dense_vector_projection_pending) return true;
+            if (index.dense_native_storage_phase == .native_building or
+                index.dense_native_storage_phase == .native_validating) return true;
             if (index.backfill_active) return true;
             if (index.catch_up_active) return true;
             if (index.replay_catch_up_required) return true;
@@ -19750,6 +19852,8 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .dense_vector_projection_pending = index.dense_vector_projection_pending,
+        .dense_native_storage_phase = index.dense_native_storage_phase,
         // Retained activity stays visible to local standalone status, but only
         // a direct owner sample may refresh the metadata hop's TTL.
         .embedding_activity_observed = index.embedding_activity_sample_fresh,
@@ -19812,11 +19916,15 @@ test "data runtime report preserves compact managed repair admission state" {
         .index_lifecycle_work_class = .repair,
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
+        .dense_vector_projection_pending = true,
+        .dense_native_storage_phase = .native_validating,
     });
     defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
 
     try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
     try std.testing.expect(!report.repair_active_generation_serviceable);
+    try std.testing.expect(report.dense_vector_projection_pending);
+    try std.testing.expectEqual(antfly.metadata.table_manager.DenseNativeStoragePhase.native_validating, report.dense_native_storage_phase);
     try std.testing.expect(report.publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), report.publication_target_count);
     try std.testing.expect(report.serving_snapshot_ready);
@@ -19825,7 +19933,7 @@ test "data runtime report preserves compact managed repair admission state" {
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"serving_snapshot_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"serving_snapshot_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false,\"dense_vector_projection_pending\":true,\"dense_native_storage_phase\":\"native_validating\"}",
         encoded,
     );
 }
@@ -20070,6 +20178,7 @@ fn storeRegistrationVisible(
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
         if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
+        if (store.dense_native_storage_protocol_version != record.dense_native_storage_protocol_version) continue;
         return true;
     }
     return false;
@@ -20113,13 +20222,17 @@ test "data store registration waits for native generation capability acknowledgm
         .role = "data",
         .reporter_incarnation = 0x1234,
         .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+        .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
     };
     var committed = expected;
     committed.native_generation_restore_version = 0;
+    committed.dense_native_storage_protocol_version = 0;
 
     try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(!storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
     committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
+    try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+    committed.dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version;
     try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
     try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.v0_2_0_record_version));
@@ -29045,7 +29158,10 @@ test "data runtime runRound backs off retryable provision metadata failures" {
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        // runRound may schedule a runtime-status refresh after the injected
+        // metadata failure. Match production construction so that path has a
+        // valid interface instead of invoking undefined test memory.
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
@@ -30167,7 +30283,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try writeLsmCacheMetrics(&writer, cache.snapshotStats());
     const cache_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "# HELP antfly_lsm_cache_hits_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_used_bytes{kind=\"run_table_physical_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_hits_total{kind=\"run_table_index\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_transient_serves_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
@@ -34344,6 +34462,13 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     );
     defer server.provisioned_storage.resource_manager.observeUsage(.lsm_compaction_work, &observed_bytes, 0);
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
+
+    // Soft LSM pressure still suppresses an LSM-only wake, but it cannot
+    // starve the separately-accounted exact-vector readiness lane.
+    server.vector_block_maintenance_next_eligible_ns.store(101, .release);
+    try std.testing.expect(server.resourcePressureDefersMaintenanceWake(100));
+    server.vector_block_maintenance_next_eligible_ns.store(100, .release);
+    try std.testing.expect(!server.resourcePressureDefersMaintenanceWake(100));
 }
 
 test "data runtime background maintenance is due for dense posting cadence without lsm debt" {
@@ -34388,6 +34513,9 @@ test "data runtime background maintenance is due for dense posting cadence witho
 
     try std.testing.expectEqual(@as(u64, 0), server.write_source.lsmMaintenanceScoreBestEffort());
 
+    // Isolate posting cadence from the independently scheduled vector-block
+    // publisher, whose zero-initialized deadline is immediately due.
+    server.vector_block_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .release);
     server.dense_posting_maintenance_next_eligible_ns.store(100, .release);
     try std.testing.expect(server.backgroundMaintenanceDue(100));
     try std.testing.expect(server.backgroundMaintenanceDue(101));

@@ -107,9 +107,18 @@ pub const Cursor = struct {
 };
 
 pub const NamespaceReadTxn = struct {
+    /// Optional lifetime pin owned by a read transaction. Storage adapters
+    /// can use this to keep an immutable auxiliary read generation alive for
+    /// exactly the same snapshot lifetime as the authoritative transaction.
+    pub const ReadLease = struct {
+        ptr: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    };
+
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    read_lease: ?ReadLease = null,
     /// Optional owner-defined epoch captured immediately before this snapshot
     /// opened. HBC uses it to reject cache fills when publication advanced
     /// after the transaction was created; storage backends remain unaware of
@@ -124,8 +133,10 @@ pub const NamespaceReadTxn = struct {
     };
 
     pub fn abort(self: *NamespaceReadTxn) void {
+        const read_lease = self.read_lease;
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+        if (read_lease) |lease| lease.release(lease.ptr);
     }
 
     pub fn get(self: *NamespaceReadTxn, namespace: Namespace, key: []const u8) ![]const u8 {

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const centroid_directory = @import("centroid_directory.zig");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const hbc = @import("hbc.zig");
@@ -23,17 +24,78 @@ const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
 
 pub const FlatCentroidBlock = struct {
-    posting_ids: []u64,
-    covering_radii: []f32,
-    quantized: proto.RaBitQuantizedVectorSet,
+    const Exact = struct {
+        vectors: []const f32,
+        measures: []const f32,
+    };
+
+    const Encoding = union(enum) {
+        rabitq: proto.RaBitQuantizedVectorSet,
+        exact: Exact,
+    };
+
+    posting_ids: []const u64,
+    covering_radii: []const f32,
+    encoding: Encoding,
+    /// Base-generation rows whose posting id is superseded by a native delta
+    /// are left mmap-backed in place and masked during scans. Delta blocks do
+    /// not carry this mask.
+    shadowed_posting_bits: []const u64 = &.{},
+    owned: bool = true,
 
     fn deinit(self: *FlatCentroidBlock, alloc: std.mem.Allocator) void {
-        alloc.free(self.posting_ids);
-        alloc.free(self.covering_radii);
-        self.quantized.deinit(alloc);
+        if (!self.owned) {
+            self.* = undefined;
+            return;
+        }
+        alloc.free(@constCast(self.posting_ids));
+        alloc.free(@constCast(self.covering_radii));
+        switch (self.encoding) {
+            .rabitq => |quantized_value| {
+                var quantized = quantized_value;
+                quantized.deinit(alloc);
+            },
+            .exact => |exact| {
+                alloc.free(@constCast(exact.vectors));
+                alloc.free(@constCast(exact.measures));
+            },
+        }
         self.* = undefined;
     }
 };
+
+pub const FlatCentroidBackingLease = struct {
+    ptr: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn release(self: FlatCentroidBackingLease) void {
+        self.release_fn(self.ptr);
+    }
+};
+
+const RetainedFlatCentroidDirectory = struct {
+    alloc: std.mem.Allocator,
+    directory: *FlatCentroidDirectory,
+
+    fn releaseOpaque(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const alloc = self.alloc;
+        self.directory.release(alloc);
+        alloc.destroy(self);
+    }
+};
+
+/// Retains an immutable directory as backing for a newer layered directory.
+/// Ownership of the returned lease transfers to the caller.
+pub fn retainFlatCentroidDirectoryBacking(
+    alloc: std.mem.Allocator,
+    directory: *FlatCentroidDirectory,
+) !FlatCentroidBackingLease {
+    const backing = try alloc.create(RetainedFlatCentroidDirectory);
+    directory.retain();
+    backing.* = .{ .alloc = alloc, .directory = directory };
+    return .{ .ptr = backing, .release_fn = RetainedFlatCentroidDirectory.releaseOpaque };
+}
 
 pub const FlatCentroidDirectory = struct {
     blocks: []FlatCentroidBlock = &.{},
@@ -42,6 +104,8 @@ pub const FlatCentroidDirectory = struct {
     node_count_snapshot: u64 = 0,
     publish_generation_snapshot: u64 = 0,
     posting_count: usize = 0,
+    owned_shadowed_posting_bits: []u64 = &.{},
+    backing: ?FlatCentroidBackingLease = null,
     missing_node_count: usize = 0,
     invalid_posting_count: usize = 0,
     accounting_context: ?*anyopaque = null,
@@ -64,6 +128,8 @@ pub const FlatCentroidDirectory = struct {
         const accounted_bytes = self.accounted_bytes;
         for (self.blocks) |*block| block.deinit(alloc);
         alloc.free(self.blocks);
+        alloc.free(self.owned_shadowed_posting_bits);
+        if (self.backing) |backing| backing.release();
         self.* = .{};
         if (release_accounting) |release_fn| release_fn(accounting_context.?, accounted_bytes);
     }
@@ -76,18 +142,340 @@ pub const FlatCentroidDirectory = struct {
         var total: u64 = @sizeOf(FlatCentroidDirectory) +|
             @as(u64, @intCast(self.blocks.len * @sizeOf(FlatCentroidBlock)));
         for (self.blocks) |*block| {
+            if (!block.owned) continue;
             total +|= @as(u64, @intCast(block.posting_ids.len * @sizeOf(u64)));
             total +|= @as(u64, @intCast(block.covering_radii.len * @sizeOf(f32)));
-            total +|= @as(u64, @intCast(block.quantized.centroid.len * @sizeOf(f32)));
-            total +|= @as(u64, @intCast(block.quantized.codes.data.len * @sizeOf(u64)));
-            total +|= @as(u64, @intCast(block.quantized.code_counts.len * @sizeOf(u32)));
-            total +|= @as(u64, @intCast(block.quantized.centroid_distances.len * @sizeOf(f32)));
-            total +|= @as(u64, @intCast(block.quantized.quantized_dot_products.len * @sizeOf(f32)));
-            total +|= @as(u64, @intCast(block.quantized.centroid_dot_products.len * @sizeOf(f32)));
+            switch (block.encoding) {
+                .rabitq => |quantized| {
+                    total +|= @as(u64, @intCast(quantized.centroid.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.codes.data.len * @sizeOf(u64)));
+                    total +|= @as(u64, @intCast(quantized.code_counts.len * @sizeOf(u32)));
+                    total +|= @as(u64, @intCast(quantized.centroid_distances.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.quantized_dot_products.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.centroid_dot_products.len * @sizeOf(f32)));
+                },
+                .exact => |exact| {
+                    total +|= @as(u64, @intCast(exact.vectors.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(exact.measures.len * @sizeOf(f32)));
+                },
+            }
         }
+        total +|= @as(u64, @intCast(self.owned_shadowed_posting_bits.len * @sizeOf(u64)));
         return total;
     }
 };
+
+pub const OwnedExactCentroidOverlay = struct {
+    posting_ids: []u64,
+    covering_radii: []f32,
+    measures: []f32,
+    vectors: []f32,
+
+    pub fn deinit(self: *OwnedExactCentroidOverlay, alloc: std.mem.Allocator) void {
+        alloc.free(self.posting_ids);
+        alloc.free(self.covering_radii);
+        alloc.free(self.measures);
+        alloc.free(self.vectors);
+        self.* = undefined;
+    }
+};
+
+fn postingBitIsSet(bits: []const u64, posting_id: u64) bool {
+    const word_u64 = posting_id / 64;
+    const word = std.math.cast(usize, word_u64) orelse return false;
+    if (word >= bits.len) return false;
+    return (bits[word] & (@as(u64, 1) << @intCast(posting_id % 64))) != 0;
+}
+
+/// Creates a zero-copy exact directory over an immutable, externally leased
+/// generation. Ownership of `backing` transfers to the returned directory,
+/// including on error.
+pub fn exactFlatCentroidDirectoryFromReader(
+    alloc: std.mem.Allocator,
+    reader: centroid_directory.Reader,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+    backing: FlatCentroidBackingLease,
+) !FlatCentroidDirectory {
+    errdefer backing.release();
+    var blocks = try alloc.alloc(FlatCentroidBlock, reader.block_count);
+    errdefer alloc.free(blocks);
+    var iter = reader.blocks();
+    var index: usize = 0;
+    while (try iter.next()) |block| : (index += 1) {
+        blocks[index] = .{
+            .posting_ids = block.posting_ids,
+            .covering_radii = block.covering_radii,
+            .encoding = .{ .exact = .{
+                .vectors = block.vectors,
+                .measures = block.measures,
+            } },
+            .owned = false,
+        };
+    }
+    std.debug.assert(index == blocks.len);
+    return .{
+        .blocks = blocks,
+        .root_node_snapshot = root_node,
+        .node_count_snapshot = node_count,
+        .publish_generation_snapshot = publish_generation,
+        .posting_count = reader.posting_count,
+        .backing = backing,
+    };
+}
+
+/// Builds a directory that keeps the complete immutable base zero-copy while
+/// owning only the latest centroids changed above it. `shadowed_posting_ids`
+/// includes both replacements and tombstones. Ownership of the overlay,
+/// shadowed ids, and backing lease transfers to this function on every path.
+pub fn layeredExactFlatCentroidDirectoryFromReader(
+    alloc: std.mem.Allocator,
+    reader: centroid_directory.Reader,
+    overlay_value: OwnedExactCentroidOverlay,
+    shadowed_posting_ids: []u64,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+    backing: FlatCentroidBackingLease,
+) !FlatCentroidDirectory {
+    var overlay = overlay_value;
+    var overlay_owned = true;
+    errdefer if (overlay_owned) overlay.deinit(alloc);
+    defer alloc.free(shadowed_posting_ids);
+    errdefer backing.release();
+    const expected_vector_values = std.math.mul(usize, overlay.posting_ids.len, reader.dims) catch
+        return error.InvalidCentroidDirectory;
+    if (overlay.posting_ids.len != overlay.covering_radii.len or
+        overlay.posting_ids.len != overlay.measures.len or
+        overlay.vectors.len != expected_vector_values)
+    {
+        return error.InvalidCentroidDirectory;
+    }
+
+    const bit_words_u64 = std.math.add(u64, node_count, 64) catch return error.OutOfMemory;
+    const bit_words = std.math.cast(usize, bit_words_u64 / 64) orelse return error.OutOfMemory;
+    const shadowed_bits = try alloc.alloc(u64, bit_words);
+    errdefer alloc.free(shadowed_bits);
+    @memset(shadowed_bits, 0);
+    for (shadowed_posting_ids) |posting_id| {
+        const word = std.math.cast(usize, posting_id / 64) orelse continue;
+        if (word < shadowed_bits.len) shadowed_bits[word] |= @as(u64, 1) << @intCast(posting_id % 64);
+    }
+
+    const overlay_blocks: usize = @intFromBool(overlay.posting_ids.len != 0);
+    var blocks = try alloc.alloc(FlatCentroidBlock, reader.block_count + overlay_blocks);
+    var initialized_blocks: usize = 0;
+    errdefer {
+        for (blocks[0..initialized_blocks]) |*block| block.deinit(alloc);
+        alloc.free(blocks);
+    }
+    var block_index: usize = 0;
+    if (overlay.posting_ids.len != 0) {
+        blocks[0] = .{
+            .posting_ids = overlay.posting_ids,
+            .covering_radii = overlay.covering_radii,
+            .encoding = .{ .exact = .{
+                .vectors = overlay.vectors,
+                .measures = overlay.measures,
+            } },
+        };
+        overlay_owned = false;
+        block_index = 1;
+        initialized_blocks = 1;
+    } else {
+        overlay.deinit(alloc);
+        overlay_owned = false;
+    }
+
+    var visible_base_postings: usize = 0;
+    var iter = reader.blocks();
+    while (try iter.next()) |block| : (block_index += 1) {
+        blocks[block_index] = .{
+            .posting_ids = block.posting_ids,
+            .covering_radii = block.covering_radii,
+            .encoding = .{ .exact = .{
+                .vectors = block.vectors,
+                .measures = block.measures,
+            } },
+            .shadowed_posting_bits = shadowed_bits,
+            .owned = false,
+        };
+        initialized_blocks += 1;
+        for (block.posting_ids) |posting_id| {
+            visible_base_postings += @intFromBool(!postingBitIsSet(shadowed_bits, posting_id));
+        }
+    }
+    std.debug.assert(block_index == blocks.len);
+    return .{
+        .blocks = blocks,
+        .root_node_snapshot = root_node,
+        .node_count_snapshot = node_count,
+        .publish_generation_snapshot = publish_generation,
+        .posting_count = visible_base_postings + overlay.posting_ids.len,
+        .owned_shadowed_posting_bits = shadowed_bits,
+        .backing = backing,
+    };
+}
+
+/// Layers current-generation centroid replacements over an already-built
+/// immutable parent directory. The parent remains zero-copy and retained;
+/// only changed centroids, block descriptors, and compact shadow masks are
+/// allocated. This is the online MVCC path between full native checkpoints.
+pub fn layeredExactFlatCentroidDirectoryFromDirectory(
+    alloc: std.mem.Allocator,
+    parent: *FlatCentroidDirectory,
+    overlay_value: OwnedExactCentroidOverlay,
+    shadowed_posting_ids: []u64,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+) !FlatCentroidDirectory {
+    var overlay = overlay_value;
+    var overlay_owned = true;
+    errdefer if (overlay_owned) overlay.deinit(alloc);
+    defer alloc.free(shadowed_posting_ids);
+    const dims = if (overlay.posting_ids.len == 0)
+        0
+    else
+        overlay.vectors.len / overlay.posting_ids.len;
+    if (overlay.posting_ids.len != overlay.covering_radii.len or
+        overlay.posting_ids.len != overlay.measures.len or
+        (overlay.posting_ids.len != 0 and
+            (dims == 0 or overlay.vectors.len != overlay.posting_ids.len * dims)))
+    {
+        return error.InvalidCentroidDirectory;
+    }
+
+    const bit_words_u64 = std.math.add(u64, node_count, 64) catch return error.OutOfMemory;
+    const bit_words = std.math.cast(usize, bit_words_u64 / 64) orelse return error.OutOfMemory;
+    const mask_words = std.math.mul(usize, bit_words, parent.blocks.len) catch return error.OutOfMemory;
+    const shadowed_masks = try alloc.alloc(u64, mask_words);
+    errdefer alloc.free(shadowed_masks);
+    @memset(shadowed_masks, 0);
+
+    const overlay_blocks: usize = @intFromBool(overlay.posting_ids.len != 0);
+    const blocks = try alloc.alloc(FlatCentroidBlock, parent.blocks.len + overlay_blocks);
+    errdefer alloc.free(blocks);
+    var block_index: usize = 0;
+    if (overlay.posting_ids.len != 0) {
+        blocks[0] = .{
+            .posting_ids = overlay.posting_ids,
+            .covering_radii = overlay.covering_radii,
+            .encoding = .{ .exact = .{
+                .vectors = overlay.vectors,
+                .measures = overlay.measures,
+            } },
+        };
+        overlay_owned = false;
+        block_index = 1;
+    } else {
+        overlay.deinit(alloc);
+        overlay_owned = false;
+    }
+
+    var visible_parent_postings: usize = 0;
+    for (parent.blocks, 0..) |parent_block, parent_index| {
+        const mask = shadowed_masks[parent_index * bit_words ..][0..bit_words];
+        if (parent_block.shadowed_posting_bits.len != 0) {
+            @memcpy(mask[0..@min(mask.len, parent_block.shadowed_posting_bits.len)], parent_block.shadowed_posting_bits[0..@min(mask.len, parent_block.shadowed_posting_bits.len)]);
+        }
+        for (shadowed_posting_ids) |posting_id| {
+            const word = std.math.cast(usize, posting_id / 64) orelse continue;
+            if (word < mask.len) mask[word] |= @as(u64, 1) << @intCast(posting_id % 64);
+        }
+        for (parent_block.posting_ids) |posting_id| {
+            visible_parent_postings += @intFromBool(!postingBitIsSet(mask, posting_id));
+        }
+        blocks[block_index] = parent_block;
+        blocks[block_index].owned = false;
+        blocks[block_index].shadowed_posting_bits = mask;
+        block_index += 1;
+    }
+
+    const backing = try retainFlatCentroidDirectoryBacking(alloc, parent);
+    return .{
+        .blocks = blocks,
+        .root_node_snapshot = root_node,
+        .node_count_snapshot = node_count,
+        .publish_generation_snapshot = publish_generation,
+        .posting_count = visible_parent_postings + overlay.posting_ids.len,
+        .owned_shadowed_posting_bits = shadowed_masks,
+        .backing = backing,
+        .missing_node_count = parent.missing_node_count,
+        .invalid_posting_count = parent.invalid_posting_count,
+    };
+}
+
+pub const FlatCentroidSelection = struct {
+    /// Borrowed from the request scratch and valid until that handle is
+    /// released. Keeping ownership with the governed scratch avoids an
+    /// unaccounted allocation and retains capacity across requests.
+    probes: []FlatCentroidProbe,
+    total_postings: usize,
+};
+
+fn flatSelectionLimit(
+    coverage_policy: search_types.CoveragePolicy,
+    max_postings: usize,
+    posting_count: usize,
+) usize {
+    return if (coverage_policy == .complete_snapshot)
+        posting_count
+    else
+        @min(max_postings, posting_count);
+}
+
+test "approximate flat routing bounds request scratch while complete coverage remains exhaustive" {
+    try std.testing.expectEqual(@as(usize, 2_064), flatSelectionLimit(.best_effort, 2_064, 8_878));
+    try std.testing.expectEqual(@as(usize, 8_878), flatSelectionLimit(.complete_snapshot, 2_064, 8_878));
+    try std.testing.expectEqual(@as(usize, 64), flatSelectionLimit(.best_effort, 2_064, 64));
+}
+
+test "exact flat routing layers changed centroids over a retained MVCC parent" {
+    const alloc = std.testing.allocator;
+    const parent = try alloc.create(FlatCentroidDirectory);
+    parent.* = .{
+        .blocks = try alloc.alloc(FlatCentroidBlock, 1),
+        .root_node_snapshot = 1,
+        .node_count_snapshot = 3,
+        .publish_generation_snapshot = 2,
+        .posting_count = 2,
+    };
+    parent.blocks[0] = .{
+        .posting_ids = try alloc.dupe(u64, &.{ 1, 2 }),
+        .covering_radii = try alloc.dupe(f32, &.{ 0.1, 0.2 }),
+        .encoding = .{ .exact = .{
+            .vectors = try alloc.dupe(f32, &.{ 1, 2 }),
+            .measures = try alloc.dupe(f32, &.{ 1, 4 }),
+        } },
+    };
+    defer parent.release(alloc);
+
+    var layered = try layeredExactFlatCentroidDirectoryFromDirectory(
+        alloc,
+        parent,
+        .{
+            .posting_ids = try alloc.dupe(u64, &.{ 2, 3 }),
+            .covering_radii = try alloc.dupe(f32, &.{ 0.25, 0.3 }),
+            .measures = try alloc.dupe(f32, &.{ 6.25, 9 }),
+            .vectors = try alloc.dupe(f32, &.{ 2.5, 3 }),
+        },
+        try alloc.dupe(u64, &.{2}),
+        1,
+        3,
+        4,
+    );
+    defer layered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), parent.ref_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), layered.blocks.len);
+    try std.testing.expectEqual(@as(usize, 3), layered.posting_count);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, layered.blocks[0].posting_ids);
+    try std.testing.expect(!postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 1));
+    try std.testing.expect(postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 2));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, layered.blocks[1].encoding.exact.vectors);
+}
 
 fn checkedAddMul(total: *u64, count: u64, element_size: u64) !void {
     const bytes = std.math.mul(u64, count, element_size) catch return error.OutOfMemory;
@@ -119,9 +507,13 @@ pub const FlatCentroidBuildOutcome = union(enum) {
 };
 
 /// Conservative peak allocation for a cold flat-directory build. It covers
-/// the retained RaBitQ output for the worst case (every published node is a
-/// leaf), traversal arrays, raw centroid blocks, and RaBitQ's normalization
-/// workspace. ArrayList growth is budgeted at twice its logical capacity.
+/// the larger of the retained RaBitQ output and an exact persisted-generation
+/// overlay for the worst case (every published node is a leaf), traversal
+/// arrays, raw centroid blocks, and quantization/overlay construction
+/// workspace. A native WAL tail may legitimately shadow every base posting;
+/// loading that generation owns a float32 overlay even when new directories
+/// normally use RaBitQ. ArrayList growth is budgeted at twice its logical
+/// capacity.
 pub fn projectedFlatCentroidDirectoryBuildBytes(
     node_count: u64,
     dims: usize,
@@ -137,9 +529,18 @@ pub fn projectedFlatCentroidDirectoryBuildBytes(
     // Retained directory and its worst-case block-array capacity.
     try checkedAddMul(&retained, @max(block_count *| 2, 16), @sizeOf(FlatCentroidBlock));
     try checkedAddMul(&retained, node_count, @sizeOf(u64) + @sizeOf(f32));
-    try checkedAddMul(&retained, node_count, code_width *| @sizeOf(u64));
-    try checkedAddMul(&retained, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
-    try checkedAddMul(&retained, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    var rabit_payload: u64 = 0;
+    try checkedAddMul(&rabit_payload, node_count, code_width *| @sizeOf(u64));
+    try checkedAddMul(&rabit_payload, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
+    try checkedAddMul(&rabit_payload, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    var exact_overlay_payload: u64 = 0;
+    try checkedAddMul(
+        &exact_overlay_payload,
+        node_count,
+        @as(u64, @intCast(dims)) *| @sizeOf(f32) + @sizeOf(f32),
+    );
+    retained = std.math.add(u64, retained, @max(rabit_payload, exact_overlay_payload)) catch
+        return error.OutOfMemory;
     // Traversal and block construction workspace. Quantization temporarily
     // holds a normalized copy alongside the raw centroid block.
     var transient: u64 = 0;
@@ -153,7 +554,24 @@ pub fn projectedFlatCentroidDirectoryBuildBytes(
     try checkedAddMul(&transient, 1, @sizeOf(types.Node));
     try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
     try checkedAddMul(&transient, @intCast(max_node_entries), @sizeOf(u64));
+    // Persisted exact overlays are accumulated in growable arrays before
+    // ownership moves into the directory. Retained admission covers the final
+    // payload; one additional logical payload covers geometric growth and a
+    // potentially allocating shrink-to-owned handoff.
+    transient = std.math.add(u64, transient, exact_overlay_payload) catch
+        return error.OutOfMemory;
     return .{ .transient_bytes = transient, .retained_bytes = retained };
+}
+
+test "flat centroid projection covers a million-scale exact WAL overlay" {
+    const node_count: u64 = 8_950;
+    const dims: usize = 768;
+    const projection = try projectedFlatCentroidDirectoryBuildBytes(node_count, dims, 1_280, 128);
+    const exact_payload = node_count *
+        (@as(u64, dims) * @sizeOf(f32) + @sizeOf(f32));
+
+    try std.testing.expect(projection.retained_bytes >= exact_payload);
+    try std.testing.expect(projection.transient_bytes >= exact_payload);
 }
 
 pub const FlatCentroidProbe = search_types.FlatCentroidProbe;
@@ -201,28 +619,71 @@ fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !vo
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
 }
 
+fn flatProbeScore(probe: FlatCentroidProbe) f32 {
+    // ANN routing follows centroid proximity. Proof bounds are intentionally
+    // separate: RaBitQ uncertainty must not promote a farther posting ahead
+    // of a nearer estimated centroid. The error interval is retained on each
+    // probe for sound suffix stopping, but is not a routing score.
+    return probe.distance;
+}
+
+fn flatProbeWorseThan(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) std.math.Order {
+    if (flatProbeLess({}, rhs, lhs)) return .lt;
+    if (flatProbeLess({}, lhs, rhs)) return .gt;
+    return .eq;
+}
+
+fn siftFlatProbeUp(probes: []FlatCentroidProbe, start_index: usize) void {
+    const child = probes[start_index];
+    var child_index = start_index;
+    while (child_index > 0) {
+        const parent_index = (child_index - 1) >> 1;
+        const parent = probes[parent_index];
+        if (flatProbeWorseThan({}, child, parent) != .lt) break;
+        probes[child_index] = parent;
+        child_index = parent_index;
+    }
+    probes[child_index] = child;
+}
+
+fn siftFlatProbeDown(probes: []FlatCentroidProbe, start_index: usize) void {
+    const parent = probes[start_index];
+    var parent_index = start_index;
+    while (true) {
+        const left_index = parent_index * 2 + 1;
+        if (left_index >= probes.len) break;
+        const right_index = left_index + 1;
+        const worse_child_index = if (right_index < probes.len and
+            flatProbeWorseThan({}, probes[right_index], probes[left_index]) == .lt)
+            right_index
+        else
+            left_index;
+        const worse_child = probes[worse_child_index];
+        if (flatProbeWorseThan({}, worse_child, parent) != .lt) break;
+        probes[parent_index] = worse_child;
+        parent_index = worse_child_index;
+    }
+    probes[parent_index] = parent;
+}
+
+/// Maintain a fixed-capacity max heap whose root is the least desirable
+/// retained probe. Insertion remains O(log k) without allocating a separate
+/// PriorityQueue backing buffer outside the resource governor.
 fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) void {
     if (probes.len == 0) return;
     if (count.* < probes.len) {
         probes[count.*] = candidate;
+        siftFlatProbeUp(probes[0 .. count.* + 1], count.*);
         count.* += 1;
-    } else {
-        var worst_index: usize = 0;
-        var worst_score = flatAnnScore(probes[0]);
-        for (probes[1..], 1..) |probe, i| {
-            const score = flatAnnScore(probe);
-            if (score > worst_score) {
-                worst_score = score;
-                worst_index = i;
-            }
-        }
-        if (flatAnnScore(candidate) >= worst_score) return;
-        probes[worst_index] = candidate;
+        return;
     }
+    if (!flatProbeLess({}, candidate, probes[0])) return;
+    probes[0] = candidate;
+    siftFlatProbeDown(probes, 0);
 }
 
 fn flatAnnScore(probe: FlatCentroidProbe) f32 {
-    return probe.distance - probe.error_bound;
+    return flatProbeScore(probe);
 }
 
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
@@ -235,6 +696,97 @@ fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     if (std.math.isNan(rhs_score)) return true;
     if (lhs_score != rhs_score) return lhs_score < rhs_score;
     return lhs.posting_id < rhs.posting_id;
+}
+
+fn populateFlatProbeSuffixBounds(probes: []FlatCentroidProbe) void {
+    var suffix_lower_bound = std.math.inf(f32);
+    var suffix_resolved = true;
+    var reverse_index = probes.len;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        const probe = &probes[reverse_index];
+        suffix_resolved = suffix_resolved and probe.bound_resolved and std.math.isFinite(probe.member_lower_bound);
+        if (suffix_resolved) suffix_lower_bound = @min(suffix_lower_bound, probe.member_lower_bound);
+        probe.suffix_bounds_resolved = suffix_resolved;
+        probe.suffix_member_lower_bound = if (suffix_resolved) suffix_lower_bound else -std.math.inf(f32);
+    }
+}
+
+test "flat probes route by centroid and retain sound suffix proof bounds" {
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 1, .distance = 0.4, .error_bound = 0, .member_lower_bound = 0.0, .bound_resolved = true },
+        .{ .posting_id = 2, .distance = 0.1, .error_bound = 0, .member_lower_bound = 0.08, .bound_resolved = true },
+        .{ .posting_id = 3, .distance = 0.3, .error_bound = 0, .member_lower_bound = 0.2, .bound_resolved = true },
+    };
+    std.mem.sort(FlatCentroidProbe, &probes, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 2), probes[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), probes[1].posting_id);
+    populateFlatProbeSuffixBounds(&probes);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probes[0].suffix_member_lower_bound, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probes[1].suffix_member_lower_bound, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probes[2].suffix_member_lower_bound, 0.000001);
+}
+
+test "flat probes do not promote uncertain farther centroids" {
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 1, .distance = 0.2, .error_bound = 0.15 },
+        .{ .posting_id = 2, .distance = 0.1, .error_bound = 0.0 },
+    };
+    std.mem.sort(FlatCentroidProbe, &probes, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 2), probes[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 1), probes[1].posting_id);
+}
+
+test "bounded flat probe heap retains the best stable frontier" {
+    var retained: [3]FlatCentroidProbe = undefined;
+    var retained_count: usize = 0;
+    const candidates = [_]FlatCentroidProbe{
+        .{ .posting_id = 5, .distance = 0.5, .error_bound = 0 },
+        .{ .posting_id = 2, .distance = 0.2, .error_bound = 0 },
+        .{ .posting_id = 4, .distance = 0.4, .error_bound = 0 },
+        .{ .posting_id = 1, .distance = 0.1, .error_bound = 0 },
+        .{ .posting_id = 3, .distance = 0.3, .error_bound = 0 },
+        // A non-finite routing score is always worse than a finite candidate.
+        .{ .posting_id = 0, .distance = std.math.nan(f32), .error_bound = 0 },
+    };
+    for (candidates) |candidate| insertFlatProbe(&retained, &retained_count, candidate);
+    try std.testing.expectEqual(retained.len, retained_count);
+    std.mem.sort(FlatCentroidProbe, &retained, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 1), retained[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), retained[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), retained[2].posting_id);
+}
+
+fn flatMemberLowerBound(
+    metric: vec.DistanceMetric,
+    distance: f32,
+    error_bound: f32,
+    covering_radius: f32,
+) ?f32 {
+    if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
+    const centroid_metric_lower = @max(@as(f32, 0), distance - error_bound);
+    if (!std.math.isFinite(centroid_metric_lower)) return null;
+    const centroid_chord_lower = switch (metric) {
+        .l2_squared => @sqrt(centroid_metric_lower),
+        .cosine => @sqrt(2.0 * @min(centroid_metric_lower, 2.0)),
+        .inner_product => return null,
+    };
+    const member_chord_lower = @max(@as(f32, 0), centroid_chord_lower - covering_radius);
+    return switch (metric) {
+        .l2_squared => member_chord_lower * member_chord_lower,
+        .cosine => 0.5 * member_chord_lower * member_chord_lower,
+        .inner_product => unreachable,
+    };
+}
+
+test "flat cosine member bound uses the persisted chord radius" {
+    const centroid_distance: f32 = 0.5;
+    const covering_radius: f32 = 0.25;
+    const lower = flatMemberLowerBound(.cosine, centroid_distance, 0, covering_radius) orelse
+        return error.TestUnexpectedResult;
+    const expected_chord = @sqrt(@as(f32, 2.0) * centroid_distance) - covering_radius;
+    try std.testing.expectApproxEqAbs(0.5 * expected_chord * expected_chord, lower, 0.000001);
+    try std.testing.expect(flatMemberLowerBound(.inner_product, centroid_distance, 0, covering_radius) == null);
 }
 
 fn sortFlatProbesCancellable(
@@ -354,7 +906,7 @@ test "flat frontier cancellable sort preserves deterministic ordering" {
     for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
         try std.testing.expect(!flatProbeLess({}, rhs, lhs));
     }
-    try std.testing.expectEqualSlices(u64, &.{ 5, 1, 3, 7, 9 }, &.{
+    try std.testing.expectEqualSlices(u64, &.{ 5, 1, 7, 3, 9 }, &.{
         probes[0].posting_id,
         probes[1].posting_id,
         probes[2].posting_id,
@@ -544,13 +1096,86 @@ fn appendFlatCentroidBlock(
     errdefer self.alloc.free(ids);
     const radii = try self.alloc.dupe(f32, covering_radii);
     errdefer self.alloc.free(radii);
-    var quantized = try self.quantizer.quantize(zero, centroids, posting_ids.len);
-    errdefer quantized.deinit(self.alloc);
+    const encoding: FlatCentroidBlock.Encoding = switch (self.config.centroid_directory_mode) {
+        .auto, .flat_exact => blk: {
+            const vectors = try self.alloc.dupe(f32, centroids);
+            errdefer self.alloc.free(vectors);
+            const measures = try self.alloc.alloc(f32, posting_ids.len);
+            errdefer self.alloc.free(measures);
+            for (measures, 0..) |*measure, i| {
+                const centroid = vectors[i * dims ..][0..dims];
+                measure.* = switch (self.config.metric) {
+                    .l2_squared => vec.dot(centroid, centroid),
+                    .cosine => vec.norm(centroid),
+                    .inner_product => 0,
+                };
+            }
+            break :blk .{ .exact = .{ .vectors = vectors, .measures = measures } };
+        },
+        .hbc, .flat_rabitq => blk: {
+            var quantized = try self.quantizer.quantize(zero, centroids, posting_ids.len);
+            errdefer quantized.deinit(self.alloc);
+            break :blk .{ .rabitq = quantized };
+        },
+    };
     try blocks.append(self.alloc, .{
         .posting_ids = ids,
         .covering_radii = radii,
-        .quantized = quantized,
+        .encoding = encoding,
     });
+}
+
+/// Chooses the routing representation from index scale, not request effort.
+/// The exact directory wins once topology traversal becomes pointer-heavy;
+/// small indexes keep the tree and avoid paying for a complete centroid scan.
+pub fn usesFlatCentroidDirectory(self: anytype) bool {
+    if (!self.config.use_quantization) return false;
+    return switch (self.config.centroid_directory_mode) {
+        .hbc => false,
+        .flat_rabitq, .flat_exact => true,
+        .auto => blk: {
+            const Index = comptime @TypeOf(self.*);
+            const active_count = if (comptime @hasDecl(Index, "publishedActiveCount"))
+                self.publishedActiveCount()
+            else
+                self.metadata.active_count;
+            const leaf_size = @max(@as(u64, self.config.leaf_size), 1);
+            // Use the completed-leaf scale here. A partially filled final
+            // leaf should not switch the whole index to a flat directory one
+            // batch before the configured posting boundary.
+            const estimated_postings = active_count / leaf_size;
+            break :blk estimated_postings >= self.config.flat_exact_min_postings;
+        },
+    };
+}
+
+test "automatic centroid routing switches only at the posting scale boundary" {
+    const TestIndex = struct {
+        config: types.HBCConfig,
+        active_count: u64,
+
+        pub fn publishedActiveCount(self: *const @This()) u64 {
+            return self.active_count;
+        }
+    };
+
+    var index: TestIndex = .{
+        .config = .{
+            .dims = 8,
+            .leaf_size = 100,
+            .centroid_directory_mode = .auto,
+            .flat_exact_min_postings = 1024,
+        },
+        .active_count = 102_399,
+    };
+    try std.testing.expect(!usesFlatCentroidDirectory(&index));
+    index.active_count = 102_400;
+    try std.testing.expect(usesFlatCentroidDirectory(&index));
+    index.config.centroid_directory_mode = .hbc;
+    try std.testing.expect(!usesFlatCentroidDirectory(&index));
+    index.config.centroid_directory_mode = .flat_exact;
+    index.active_count = 1;
+    try std.testing.expect(usesFlatCentroidDirectory(&index));
 }
 
 fn buildFlatCentroidDirectory(
@@ -670,6 +1295,16 @@ fn buildFlatCentroidDirectory(
     };
 }
 
+fn loadOrBuildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_count: u64, publish_generation: u64) !FlatCentroidDirectory {
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "loadPersistedFlatCentroidDirectory")) {
+        if (try self.loadPersistedFlatCentroidDirectory(txn, root_node, node_count, publish_generation)) |persisted| {
+            return persisted;
+        }
+    }
+    return try buildFlatCentroidDirectory(self, txn, root_node, node_count, publish_generation, null);
+}
+
 pub fn clearFlatCentroidDirectory(self: anytype) void {
     var stale: ?*FlatCentroidDirectory = null;
     lockAtomicMutex(&self.flat_centroid_mu);
@@ -687,23 +1322,41 @@ fn acquireFlatCentroidDirectory(
 ) !*FlatCentroidDirectory {
     const Index = comptime @TypeOf(self.*);
     while (true) {
-        // Complete callers retain the generation-bound transaction supplied by
-        // their snapshot. Best-effort callers open a fresh runtime transaction
-        // for the elected build owner below.
+        // Generation-bound callers retain the transaction supplied by their
+        // snapshot. Legacy callers without an immutable serving generation
+        // open a fresh runtime transaction for the elected build owner below.
         const snapshot = expected_snapshot orelse try loadStablePublishedSnapshot(self, cancellation);
+        const snapshot_is_current = expected_snapshot == null or snapshotStillPublished(self, snapshot);
+        const generation_cache = expected_snapshot != null and
+            comptime @hasDecl(Index, "acquireFlatCentroidDirectoryForTxn") and
+                @hasDecl(Index, "cacheFlatCentroidDirectoryForTxn");
+
+        if (generation_cache) {
+            if (self.acquireFlatCentroidDirectoryForTxn(
+                txn,
+                snapshot.root_node,
+                snapshot.node_count,
+                snapshot.publish_generation,
+            )) |directory| return directory;
+        }
 
         var stale: ?*FlatCentroidDirectory = null;
-        lockAtomicMutex(&self.flat_centroid_mu);
-        if (self.flat_centroid_directory) |directory| {
-            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
-                directory.retain();
-                self.flat_centroid_mu.unlock();
-                return directory;
+        if (!generation_cache) {
+            lockAtomicMutex(&self.flat_centroid_mu);
+            if (self.flat_centroid_directory) |directory| {
+                if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                    directory.retain();
+                    self.flat_centroid_mu.unlock();
+                    return directory;
+                }
             }
+            self.flat_centroid_mu.unlock();
         }
-        self.flat_centroid_mu.unlock();
 
-        if (comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
+        // Publication epochs uniquely identify immutable native generations.
+        // Their generation-owned cache remains valid after CURRENT advances,
+        // so old and current queries can share the same build flight safely.
+        if ((snapshot_is_current or generation_cache) and comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
             switch (try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) {
                 .owner => {},
                 .retry => continue,
@@ -720,7 +1373,7 @@ fn acquireFlatCentroidDirectory(
                 },
             }
         }
-        var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
+        var build_flight_open = (snapshot_is_current or generation_cache) and comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
         var build_outcome: FlatCentroidBuildOutcome = .retry;
         defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
         errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
@@ -744,13 +1397,13 @@ fn acquireFlatCentroidDirectory(
         const built = try self.alloc.create(FlatCentroidDirectory);
         errdefer self.alloc.destroy(built);
         if (expected_snapshot != null) {
-            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
         } else if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
-            built.* = try buildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
         } else {
-            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
         }
         errdefer built.deinit(self.alloc);
         if (comptime @hasDecl(Index, "accountFlatCentroidDirectory")) {
@@ -761,6 +1414,13 @@ fn acquireFlatCentroidDirectory(
                 self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
                 build_reservation_open = false;
             }
+        }
+
+        if (generation_cache) {
+            const cached = self.cacheFlatCentroidDirectoryForTxn(txn, built);
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = cached });
+            build_flight_open = false;
+            return cached;
         }
 
         if (expected_snapshot == null) {
@@ -809,14 +1469,14 @@ fn acquireFlatCentroidDirectory(
     }
 }
 
-/// Scores and returns the complete ordered flat frontier from one retained
-/// directory publication. Allocation capacity is derived from that same
-/// directory, so a concurrent publication cannot make the caller silently
-/// truncate newer postings with an older capacity snapshot.
-pub fn selectFlatRabitqPostingsAlloc(
+/// Scores one immutable flat directory and retains only its best bounded
+/// frontier. This avoids sorting and allocating every posting at large scale;
+/// the caller's ANN effort remains the hard limit on leaves actually scored.
+pub fn selectFlatPostingsAlloc(
     self: anytype,
     txn: anytype,
     query: []const f32,
+    max_postings: usize,
     scratch_handle: anytype,
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
@@ -824,29 +1484,38 @@ pub fn selectFlatRabitqPostingsAlloc(
     cancellation: ?search_types.CancellationToken,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
-) ![]FlatCentroidProbe {
+) !FlatCentroidSelection {
     const scratch = &scratch_handle.scratch;
     const start = now_fn_u64();
     const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot, cancellation);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
-    if (coverage_policy == .complete_snapshot and !directory.complete()) {
-        return error.IncompletePublishedSnapshot;
-    }
 
     var posting_count: usize = 0;
     var max_block_count: usize = 0;
     for (directory.blocks) |*block| {
-        posting_count = std.math.add(usize, posting_count, block.posting_ids.len) catch return error.OutOfMemory;
         max_block_count = @max(max_block_count, block.posting_ids.len);
+        for (block.posting_ids) |posting_id| {
+            if (postingBitIsSet(block.shadowed_posting_bits, posting_id)) continue;
+            posting_count = std.math.add(usize, posting_count, 1) catch return error.OutOfMemory;
+        }
     }
     std.debug.assert(posting_count == directory.posting_count);
-    const needs_merge = cancellation != null and posting_count > cancellable_flat_sort_chunk_size;
+    // Complete-snapshot searches promise exhaustive coverage of the
+    // published directory. Approximate searches retain the bounded ANN
+    // frontier so their latency remains governed by the caller's effort.
+    // Approximate requests retain only their governed ANN frontier. The
+    // complete-directory radius experiment produced no certified stops on
+    // either qualification corpus, while multiplying per-query scratch by
+    // the posting count and exhausting the public query budget under normal
+    // concurrency. Complete-snapshot validation remains exhaustive.
+    const selection_limit = flatSelectionLimit(coverage_policy, max_postings, posting_count);
+    const needs_merge = cancellation != null and selection_limit > cancellable_flat_sort_chunk_size;
     const previous_accounted_bytes = scratch_handle.accounted_bytes;
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
         const target_bytes = try scratch.projectedBytesWithFlatProbeCapacity(
-            posting_count,
+            selection_limit,
             needs_merge,
             max_block_count,
         );
@@ -855,37 +1524,68 @@ pub fn selectFlatRabitqPostingsAlloc(
     errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
         self.rollbackSearchScratchBytes(scratch_handle, previous_accounted_bytes);
     };
-    try scratch.ensureFlatProbeCapacity(self.alloc, posting_count, needs_merge);
-    const probes = scratch.flat_probes[0..posting_count];
-    var probe_count: usize = 0;
+    try scratch.ensureFlatProbeCapacity(self.alloc, selection_limit, needs_merge);
+    const selected = scratch.flat_probes[0..selection_limit];
+    var selected_count: usize = 0;
+    const query_measure: f32 = switch (self.config.metric) {
+        .l2_squared => vec.dot(query, query),
+        .cosine => vec.norm(query),
+        .inner_product => 0,
+    };
+    if (coverage_policy == .complete_snapshot and !directory.complete()) {
+        return error.IncompletePublishedSnapshot;
+    }
 
     for (directory.blocks) |*block| {
         try checkCancellation(cancellation);
         const count = block.posting_ids.len;
-        try scratch.ensureVectorFetchCapacity(self.alloc, count);
+        try scratch.ensureFlatCentroidScoreCapacity(self.alloc, count);
         const distances = scratch.distances[0..count];
         const error_bounds = scratch.error_bounds[0..count];
-        try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
+        switch (block.encoding) {
+            .rabitq => |quantized| try self.quantizer.estimateDistancesWithScratch(&quantized, query, distances, error_bounds, &scratch.estimate),
+            .exact => |exact| {
+                const dims: usize = @intCast(self.config.dims);
+                for (distances, error_bounds, exact.measures, 0..) |*distance, *error_bound, measure, i| {
+                    const centroid = exact.vectors[i * dims ..][0..dims];
+                    const dot = vec.dot(query, centroid);
+                    distance.* = switch (self.config.metric) {
+                        .l2_squared => @max(@as(f32, 0), query_measure + measure - 2.0 * dot),
+                        .cosine => if (query_measure == 0 or measure == 0) 1 else 1.0 - dot / (query_measure * measure),
+                        .inner_product => -dot,
+                    };
+                    error_bound.* = 0;
+                }
+            },
+        }
         for (block.posting_ids, 0..) |posting_id, i| {
             if ((i & 0xff) == 0) try checkCancellation(cancellation);
-            const member_lower_bound = if (self.config.metric == .l2_squared)
-                flatL2MemberLowerBound(distances[i], error_bounds[i], block.covering_radii[i])
-            else
-                null;
-            insertFlatProbe(probes, &probe_count, .{
+            if (postingBitIsSet(block.shadowed_posting_bits, posting_id)) continue;
+            const member_lower_bound = flatMemberLowerBound(
+                self.config.metric,
+                distances[i],
+                error_bounds[i],
+                block.covering_radii[i],
+            );
+            const candidate: FlatCentroidProbe = .{
                 .posting_id = posting_id,
                 .distance = distances[i],
                 .error_bound = error_bounds[i],
                 .member_lower_bound = member_lower_bound orelse -std.math.inf(f32),
                 .bound_resolved = member_lower_bound != null,
-            });
+            };
+            insertFlatProbe(selected, &selected_count, candidate);
         }
     }
 
-    std.debug.assert(probe_count == posting_count);
-    try sortFlatProbesCancellable(probes[0..probe_count], scratch.flat_probe_merge, cancellation);
+    const probes = selected[0..selected_count];
+    try sortFlatProbesCancellable(probes, scratch.flat_probe_merge, cancellation);
+    // A suffix bound proves stopping only when the selection contains the
+    // complete directory. A bounded top frontier deliberately leaves omitted
+    // postings unresolved, preserving approximate-search correctness.
+    if (selection_limit == posting_count) populateFlatProbeSuffixBounds(probes);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
-    return probes;
+    return .{ .probes = probes, .total_postings = posting_count };
 }
 
 fn recomputeAncestorCentroids(
@@ -954,6 +1654,79 @@ pub fn runAutoPostingMaintenanceTxn(self: anytype, txn: anytype) !void {
     const max_postings = self.config.auto_posting_maintenance_max_postings;
     if (max_postings == 0) return;
     _ = try repairDirtyPostingsTxnWithOptions(self, txn, .{ .max_postings = max_postings });
+}
+
+fn postingQuantizedPayloadValid(self: anytype, txn: anytype, node: *const types.Node) !bool {
+    if (!self.config.use_quantization or !node.is_leaf) return true;
+    const Index = switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    // A native immutable generation deliberately omits per-posting protobuf
+    // values from the generic namespace. Validate its borrowed directory view
+    // before falling back to the mutable/WAL overlay representation; treating
+    // that intentional absence as corruption rewrites every leaf at each
+    // stable source tip.
+    if (comptime @hasDecl(Index, "loadNativeQuantizedView")) {
+        if (try self.loadNativeQuantizedView(txn, node.id, node.parent == 0, node.members.len)) |native| {
+            return switch (native) {
+                .nonquant => |set| set.vectors.dims == self.config.dims and
+                    set.getCount() == node.members.len and
+                    set.vectors.data.len == node.members.len * self.config.dims,
+                .rabit => |set| blk: {
+                    const code_width = std.math.cast(usize, set.codes.width) orelse break :blk false;
+                    const expected_codes = std.math.mul(usize, node.members.len, code_width) catch break :blk false;
+                    break :blk set.metric == self.config.metric and
+                        set.centroid.len == self.config.dims and
+                        set.getCount() == node.members.len and
+                        set.codes.count == node.members.len and
+                        set.codes.data.len == expected_codes and
+                        set.code_counts.len == node.members.len and
+                        set.centroid_distances.len == node.members.len and
+                        set.quantized_dot_products.len == node.members.len and
+                        (self.config.metric == .l2_squared or set.centroid_dot_products.len == node.members.len);
+                },
+            };
+        }
+    }
+    var key_buf: [10]u8 = undefined;
+    const data = self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node.id)) catch |err| {
+        // Empty postings have no quantized payload by construction:
+        // refreshQuantizedWithOptions deletes the key when count == 0. Treat
+        // that canonical absence as valid or stable-tip validation repeatedly
+        // "repairs" the empty root back to the same absent state forever.
+        if (isNotFoundGeneric(err)) return node.members.len == 0;
+        return err;
+    };
+    if (node.parent == 0) {
+        var set = proto.NonQuantizedVectorSet.decode(self.alloc, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        defer set.deinit(self.alloc);
+        const dims = std.math.cast(usize, set.vectors.dims) orelse return false;
+        const expected_values = std.math.mul(usize, node.members.len, self.config.dims) catch return false;
+        return dims == self.config.dims and
+            set.getCount() == node.members.len and
+            set.vectors.data.len == expected_values;
+    }
+
+    var set = proto.RaBitQuantizedVectorSet.decode(self.alloc, data) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer set.deinit(self.alloc);
+    const code_width = std.math.cast(usize, set.codes.width) orelse return false;
+    const expected_code_bytes = std.math.mul(usize, node.members.len, code_width) catch return false;
+    return set.metric == self.config.metric and
+        set.centroid.len == self.config.dims and
+        set.getCount() == node.members.len and
+        set.codes.count == node.members.len and
+        set.codes.data.len == expected_code_bytes and
+        set.code_counts.len == node.members.len and
+        set.centroid_distances.len == node.members.len and
+        set.quantized_dot_products.len == node.members.len and
+        (self.config.metric == .l2_squared or set.centroid_dot_products.len == node.members.len);
 }
 
 fn replaceOwnedU64Slice(alloc: std.mem.Allocator, target: *[]u64, replacement: *?[]u64) void {
@@ -1218,6 +1991,13 @@ pub fn repairDirtyPostingsTxnWithOptions(
 
     var node_id: u64 = 1;
     while (node_id <= self.metadata.node_count) : (node_id += 1) {
+        if (options.should_continue) |should_continue| {
+            const context = options.continue_context orelse return error.MissingMaintenanceContinueContext;
+            if (!should_continue(context)) {
+                result.limit_reached = true;
+                break;
+            }
+        }
         var node = self.loadNode(txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 result.skipped_missing += 1;
@@ -1230,6 +2010,13 @@ pub fn repairDirtyPostingsTxnWithOptions(
         result.scanned_nodes += 1;
         if (!node.is_leaf) continue;
         result.scanned_postings += 1;
+
+        if (options.validate_payloads and !try postingQuantizedPayloadValid(self, txn, &node)) {
+            try node.ensureUnbacked(self.alloc);
+            node.posting_state.mutation_version +|= 1;
+            node.posting_state.dirty = true;
+            node.posting_state.payload_dirty = true;
+        }
 
         if (options.rebalance_layout and layout_changes < options.max_layout_changes) {
             if (node.members.len > self.config.leaf_size) {

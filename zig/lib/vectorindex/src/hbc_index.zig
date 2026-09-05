@@ -25,6 +25,7 @@ const search_runtime = @import("search_runtime.zig");
 const search_results = @import("search_results.zig");
 const hbc_runtime = @import("hbc_runtime.zig");
 const posting = @import("posting.zig");
+const store = @import("store.zig");
 const spfresh_index = @import("spfresh_index.zig");
 const proto = @import("antfly_vector").proto;
 const quantizer_mod = @import("antfly_vector").quantizer;
@@ -96,8 +97,20 @@ pub const SplitResult = struct {
 };
 
 const BulkRecursiveScratch = struct {
-    vec_data: []f32,
-    positions: []u64,
+    assignments: []u8,
+    distances: []f32,
+    offsets: []usize,
+    partitioned_indexes: []usize,
+};
+
+const BulkHierarchicalKmeansScratch = struct {
+    points: []kmeans.Point,
+    assignments: []usize,
+    distances: []f32,
+    counts: []usize,
+    centroids: []f32,
+    next_centroids: []f32,
+    entries: []kmeans.Entry,
     partitioned_indexes: []usize,
 };
 
@@ -106,6 +119,20 @@ fn txnSupportsGetManySorted(comptime Txn: type) bool {
         .pointer => |ptr| @hasDecl(ptr.child, "getManySorted"),
         else => @hasDecl(Txn, "getManySorted"),
     };
+}
+
+fn getNamespacedManySorted(
+    self: anytype,
+    txn: anytype,
+    comptime namespace: store.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "getNamespacedManySorted")) {
+        return try self.getNamespacedManySorted(txn, namespace, keys, values);
+    }
+    return try txn.getManySorted(namespace, keys, values);
 }
 
 fn indexHasExternalVectorLoader(self: anytype) bool {
@@ -179,11 +206,16 @@ pub fn CachedQuantizedReadHandle(comptime T: type) type {
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedQuantized")) Index.BorrowedQuantized else void;
     return union(enum) {
         borrowed: Borrowed,
+        /// The value object is request-owned while all of its slices borrow
+        /// from the immutable generation pinned by the surrounding read txn.
+        /// It must therefore never run the protobuf-owned deinitializer.
+        native_borrowed: hbc_runtime.QuantizedSet,
         owned: hbc_runtime.QuantizedSet,
 
         pub fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
+                .native_borrowed => |*qs| qs,
                 .owned => |*qs| qs,
             };
         }
@@ -193,6 +225,7 @@ pub fn CachedQuantizedReadHandle(comptime T: type) type {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
                 },
+                .native_borrowed => {},
                 .owned => |*qs| qs.deinit(alloc),
             }
             self.* = undefined;
@@ -403,6 +436,14 @@ fn borrowCachedMetadataHandle(self: anytype, vector_id: u64) ?CachedMetadataRead
     return null;
 }
 
+fn txnUsesImmutableGeneration(self: anytype, txn: anytype) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "txnUsesImmutableGeneration")) {
+        return self.txnUsesImmutableGeneration(txn);
+    }
+    return false;
+}
+
 pub fn loadNodeReadHandleProfiled(
     self: anytype,
     txn: anytype,
@@ -484,6 +525,42 @@ fn loadMutationNodeReadHandle(
     return .{ .owned = loaded };
 }
 
+fn loadNativeQuantizedReadView(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+) !?hbc_runtime.QuantizedSet {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "loadNativeQuantizedView")) return null;
+    return self.loadNativeQuantizedView(txn, node_id, is_root, expected_count) catch |err| {
+        // Deferred batch maintenance may intentionally leave a quantized
+        // payload behind its posting membership. Read handles have always
+        // treated that as an unavailable acceleration and fallen back to
+        // exact vectors; the native borrowed fast path must preserve the same
+        // contract as decoded and cached payloads.
+        if (err == error.Corrupted) return null;
+        return err;
+    };
+}
+
+fn loadNativeLeafScanReadView(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+) !?hbc_runtime.NativeLeafScanView {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "loadNativeLeafScanView")) return null;
+    return self.loadNativeLeafScanView(txn, node_id) catch |err| {
+        // A stale or structurally inconsistent acceleration must preserve the
+        // established packed-node path. Complete-snapshot validation still
+        // checks the authoritative membership/assignment relation there.
+        if (err == error.Corrupted) return null;
+        return err;
+    };
+}
+
 pub fn loadQuantizedReadHandleProfiled(
     self: anytype,
     txn: anytype,
@@ -523,6 +600,10 @@ fn loadQuantizedReadHandleProfiledWithCachePolicy(
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
     const lookup_start = now_fn();
+    if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
+        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
+        return .{ .native_borrowed = native };
+    }
     if (use_cache and comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
@@ -576,6 +657,9 @@ pub fn loadQuantizedReadHandle(
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
+    if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
+        return .{ .native_borrowed = native };
+    }
     if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             var handle = borrowed;
@@ -723,6 +807,135 @@ fn getBatchVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: [
         }
     }
     return try self.getVectorScratch(txn, vector_id, scratch);
+}
+
+fn splitWorkspaceContains(self: anytype, vector_id: u64) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "bulkSplitVectorWorkspaceContains")) {
+        return self.bulkSplitVectorWorkspaceContains(vector_id);
+    }
+    return false;
+}
+
+fn loadSplitWorkspaceVector(self: anytype, vector_id: u64, out: []f32) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "bulkSplitVectorWorkspaceLookup")) {
+        return self.bulkSplitVectorWorkspaceLookup(vector_id, out);
+    }
+    return false;
+}
+
+fn noteSplitWorkspaceLeafPayloadCoverage(self: anytype, member_ids: []const u64) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "noteBulkSplitLeafPayloadCoverage")) {
+        self.noteBulkSplitLeafPayloadCoverage(member_ids);
+    }
+}
+
+fn copyNonQuantizedLeafPayloadPrefix(
+    self: anytype,
+    txn: anytype,
+    leaf_id: u64,
+    leaf_member_count: usize,
+    vectors: []f32,
+) !?usize {
+    const Copier = struct {
+        fn copy(index: anytype, set: *const proto.NonQuantizedVectorSet, max_count: usize, out: []f32) ?usize {
+            const set_dims: usize = @intCast(set.vectors.dims);
+            const count: usize = @intCast(set.vectors.count);
+            const floats = std.math.mul(usize, count, set_dims) catch return null;
+            if (set_dims != index.config.dims or count > max_count or
+                set.vectors.data.len != floats or out.len < floats) return null;
+            @memcpy(out[0..floats], set.vectors.data);
+            return count;
+        }
+    };
+
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
+        if (self.borrowCachedQuantized(leaf_id)) |borrowed| {
+            var handle = borrowed;
+            defer handle.deinit();
+            switch (handle.ptr().*) {
+                .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
+                .rabit => {},
+            }
+        }
+    } else if (comptime @hasDecl(Index, "getCachedQuantizedPtr")) {
+        if (self.getCachedQuantizedPtr(leaf_id)) |cached| switch (cached.*) {
+            .nonquant => |*set| if (Copier.copy(self, set, leaf_member_count, vectors)) |count| return count,
+            .rabit => {},
+        };
+    }
+
+    var key_buf: [10]u8 = undefined;
+    const encoded = self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, leaf_id)) catch return null;
+    var decoded = proto.NonQuantizedVectorSet.decode(self.alloc, encoded) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer decoded.deinit(self.alloc);
+    return Copier.copy(self, &decoded, leaf_member_count, vectors);
+}
+
+/// Reconstruct an append-only oversized leaf from its last durable nonquant
+/// payload plus the vectors owned by the current mutation session. Leaf members
+/// are append ordered, so an all-delta suffix identifies the exact boundary
+/// covered by the old payload. This keeps tree mutation on HBC-native data and
+/// avoids fetching every old leaf member from the primary document LSM merely
+/// to split the leaf. Any ambiguous ordering or stale/missing payload falls
+/// back to the ordinary exact-vector loader.
+fn loadAppendedLeafVectorsFromNonQuantizedPayload(
+    self: anytype,
+    txn: anytype,
+    leaf: *const types.Node,
+    vectors: []f32,
+    options: anytype,
+) !bool {
+    // Inspect the payload that belongs to the pre-mutation leaf. The enlarged
+    // leaf can cross the RaBit threshold even though its durable predecessor
+    // still has the exact nonquantized prefix needed for this split.
+    if (!self.config.use_quantization or !leaf.is_leaf) return false;
+    const lookup = batchVectorLookup(options);
+    const dims: usize = @intCast(self.config.dims);
+    if (vectors.len < leaf.members.len * dims or leaf.members.len == 0) return false;
+
+    var suffix_start = leaf.members.len;
+    while (suffix_start > 0) {
+        const member_id = leaf.members[suffix_start - 1];
+        const in_current_batch = if (lookup) |batch| batch.get(member_id) != null else false;
+        if (!in_current_batch and !splitWorkspaceContains(self, member_id)) break;
+        suffix_start -= 1;
+    }
+    if (suffix_start == leaf.members.len) return false;
+
+    const persisted_count = try copyNonQuantizedLeafPayloadPrefix(
+        self,
+        txn,
+        leaf.id,
+        leaf.members.len,
+        vectors,
+    ) orelse return false;
+    if (suffix_start > persisted_count) return false;
+
+    // A current-batch member inside the persisted prefix means this is an
+    // update/replacement rather than a pure append. The adapter clears its
+    // persistent split delta before any batch that is not known-new.
+    for (leaf.members[0..persisted_count]) |member_id| {
+        const in_current_batch = if (lookup) |batch| batch.get(member_id) != null else false;
+        if (in_current_batch) return false;
+    }
+
+    for (leaf.members[persisted_count..], persisted_count..) |member_id, member_index| {
+        const transformed = vectors[member_index * dims ..][0..dims];
+        if (lookup) |batch| if (batch.get(member_id)) |original| {
+            if (original.len != dims) return error.InvalidVectorDimensions;
+            _ = self.transformVector(original, transformed);
+            continue;
+        };
+        if (!loadSplitWorkspaceVector(self, member_id, transformed)) return false;
+    }
+    return true;
 }
 
 fn shouldDeferQuantizedRebuildToBulkFinish(self: anytype, options: hbc_runtime.BatchInsertOptions) bool {
@@ -1159,12 +1372,18 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
-    node.covering_radius = if (self.config.metric == .l2_squared)
-        l2CoveringRadiusForMatrix(node.centroid, vectors, node.members.len)
-    else
-        std.math.nan(f32);
+    node.covering_radius = coveringRadiusForMatrix(
+        self.config.metric,
+        node.centroid,
+        vectors,
+        node.members.len,
+    );
     try savePackedNodeValue(self, txn, node);
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
+    // Only an exact nonquantized payload can replace the rolling split
+    // workspace. RaBit state is query-complete but cannot reconstruct the
+    // source vectors required by a later structural split.
+    if (usesNonQuantizedPayload(node)) noteSplitWorkspaceLeafPayloadCoverage(self, node.members);
     clearDeferredQuantizedNode(self, node.id);
     try self.cacheNode(node);
 }
@@ -1654,7 +1873,7 @@ pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Nod
     const values = try self.alloc.alloc(?[]const u8, lookups.len);
     defer self.alloc.free(values);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try txn.getManySorted(.nodes, keys, values);
+        try getNamespacedManySorted(self, txn, .nodes, keys, values);
     } else {
         @memset(values, null);
         for (keys, values) |key, *value| {
@@ -2028,7 +2247,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const miss_start = if (now_fn_u64) |now| now() else 0;
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try txn.getManySorted(.vecs, key_views, values);
+        try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     } else {
         for (key_views, 0..) |key, i| {
             values[i] = txn.get(.vecs, key) catch |err| switch (err) {
@@ -2158,7 +2377,7 @@ pub fn searchProfiledRequest(
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     if (!search_types.requiresExhaustiveCoverage(req)) {
-        return try searchProfiledRequestAttempt(self, req, null, false, null, now_fn_u64, elapsed_fn_u64);
+        return try searchProfiledRequestAttempt(self, req, null, false, null, null, now_fn_u64, elapsed_fn_u64);
     }
 
     const Index = comptime childType(@TypeOf(self));
@@ -2178,6 +2397,7 @@ pub fn searchProfiledRequest(
                 null,
                 true,
                 &durable_generation,
+                null,
                 now_fn_u64,
                 elapsed_fn_u64,
             ) catch |err| {
@@ -2194,12 +2414,14 @@ pub fn searchProfiledRequest(
             .mutation_epoch = publishedMutationEpoch(self),
         };
 
+        var native_search_view_bound = false;
         const profiled = searchProfiledRequestAttempt(
             self,
             req,
             token.snapshot,
             false,
             null,
+            &native_search_view_bound,
             now_fn_u64,
             elapsed_fn_u64,
         ) catch |err| {
@@ -2221,7 +2443,13 @@ pub fn searchProfiledRequest(
             return err;
         };
 
-        if (completeSnapshotAttemptStillCurrent(self, token)) return profiled;
+        // A native generation lease is already a complete MVCC snapshot. Its
+        // query remains valid when a later writer toggles the broader cache /
+        // publication epoch; retrying would discard useful work and can
+        // starve reads under sustained ingestion. Legacy storage still needs
+        // the broad-epoch validation because its topology and values are
+        // captured independently.
+        if (native_search_view_bound or completeSnapshotAttemptStillCurrent(self, token)) return profiled;
 
         var stale = profiled;
         stale.results.deinit();
@@ -2252,9 +2480,11 @@ fn searchProfiledRequestAttempt(
     expected_snapshot: ?SearchPublishedSnapshot,
     comptime capture_durable_snapshot: bool,
     captured_generation_out: ?*?u64,
+    native_search_view_bound_out: ?*bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) anyerror!search_types.ProfiledSearchResults {
+    if (native_search_view_bound_out) |out| out.* = false;
     var profile = search_types.SearchProfile{};
     const Index = comptime childType(@TypeOf(self));
     defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
@@ -2275,27 +2505,69 @@ fn searchProfiledRequestAttempt(
         try loadStableSearchPublishedSnapshot(self, req.cancellation)
     else
         expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
+    // A stable empty generation performs no scan and must never queue behind
+    // unrelated dense bandwidth. Its immutable snapshot is the query's
+    // linearization point. Complete-coverage callers retry only when that
+    // snapshot was invalidated before the empty result could be returned.
+    while (published_snapshot.active_count == 0) {
+        if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
+        if (snapshot_fence_held) {
+            self.endCompleteSnapshotRead();
+            snapshot_fence_held = false;
+        } else if (exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+            published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
+            continue;
+        }
+        var empty = search_results.SearchResults.init(self.alloc, req.k);
+        empty.candidate_coverage = .exhausted;
+        profile.total_ns = elapsed_fn_u64(total_start);
+        return .{
+            .results = empty,
+            .profile = profile,
+        };
+    }
+    // Legacy/tree admission obtains its conservative scan permit here before
+    // retaining a transaction or request workspace. Native flat admission
+    // instead pins one immutable SearchView now and defers its scan permit
+    // until routing has identified the exact posting set.
+    try search_types.checkCancelled(req);
+    var search_admission = if (comptime @hasDecl(Index, "acquireSearchAdmission"))
+        try self.acquireSearchAdmission(published_snapshot.active_count, published_snapshot.node_count, req)
+    else {};
+    defer if (comptime @hasDecl(Index, "releaseSearchAdmission")) {
+        self.releaseSearchAdmission(&search_admission);
+    };
+    // Native storage binds query topology and posting contents in one
+    // immutable serving generation. Admission may have waited across one or
+    // more publications, so replace the earlier lock-free estimate with the
+    // topology owned by the generation that the transaction will consume.
+    var search_view_bound = false;
+    if (comptime @hasDecl(Index, "searchViewFromAdmission")) {
+        if (self.searchViewFromAdmission(&search_admission)) |view| {
+            published_snapshot.root_node = view.root_node;
+            published_snapshot.active_count = view.active_count;
+            published_snapshot.node_count = view.node_count;
+            published_snapshot.publish_generation = view.publish_generation;
+            published_snapshot.routing_generation = view.routing_generation;
+            search_view_bound = true;
+            if (native_search_view_bound_out) |out| out.* = true;
+        }
+    }
     if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
     if (published_snapshot.active_count == 0) {
         if (snapshot_fence_held) {
             self.endCompleteSnapshotRead();
             snapshot_fence_held = false;
-            const empty = search_results.SearchResults.init(self.alloc, req.k);
-            profile.total_ns = elapsed_fn_u64(total_start);
-            var exhausted = empty;
-            exhausted.candidate_coverage = .exhausted;
-            return .{ .results = exhausted, .profile = profile };
+        } else if (exhaustive_coverage and !search_view_bound and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+            return error.StalePublishedSnapshot;
         }
-        if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
-            var empty = search_results.SearchResults.init(self.alloc, req.k);
-            empty.candidate_coverage = .exhausted;
-            profile.total_ns = elapsed_fn_u64(total_start);
-            return .{
-                .results = empty,
-                .profile = profile,
-            };
-        }
-        published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
+        var empty = search_results.SearchResults.init(self.alloc, req.k);
+        empty.candidate_coverage = .exhausted;
+        profile.total_ns = elapsed_fn_u64(total_start);
+        return .{
+            .results = empty,
+            .profile = profile,
+        };
     }
     var coverage_tracker = CompleteCoverageTracker.init(
         .{ .enabled = false, .held = false },
@@ -2320,18 +2592,19 @@ fn searchProfiledRequestAttempt(
             published_snapshot.active_count,
         );
     }
-    // A waiter may have spent time behind the generation validator. Do not
-    // retain an MVCC snapshot or request workspace while waiting, and honor a
-    // disconnect before acquiring either resource.
+    // The admission lease either already owns bandwidth (legacy/tree) or owns
+    // the native generation whose exact flat-route cost will be admitted below.
     try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
+    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverageWithAdmission"))
+        try self.beginRuntimeSearchTxnForCoverageWithAdmission(&search_admission, exhaustive_coverage)
+    else if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
         try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
     else
         try self.beginRuntimeSearchTxn();
     defer txn.abort();
-    if (!capture_durable_snapshot and exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+    if (!capture_durable_snapshot and exhaustive_coverage and !search_view_bound and !publishedSnapshotStillCurrent(self, published_snapshot)) {
         return error.StalePublishedSnapshot;
     }
     if (snapshot_fence_held) {
@@ -2353,15 +2626,8 @@ fn searchProfiledRequestAttempt(
             published_snapshot.active_count,
         );
     }
-    hbc_runtime.beginSearchEpoch(self);
-    defer hbc_runtime.endSearchEpoch(self);
     const use_search_cache = !capture_durable_snapshot;
     profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
-    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
-        try self.pinUpperTreeCache(&txn);
-    }
-    var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
-    defer filter_state.deinit(self.alloc);
     const scratch_start = now_fn_u64();
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
@@ -2392,6 +2658,10 @@ fn searchProfiledRequestAttempt(
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
 
+    // Complete-snapshot validation has index-sized workspace. Admit it before
+    // route scratch can grow so a rejected exhaustive request leaves no new
+    // retained buffers behind. Ordinary ANN skips this block and preserves
+    // the compact route-then-scan admission shape.
     const previous_accounted_bytes = scratch_handle.accounted_bytes;
     if (exhaustive_coverage) {
         if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
@@ -2414,67 +2684,144 @@ fn searchProfiledRequestAttempt(
     try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 
-    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
-    defer candidates.deinit(self.alloc);
-    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
-
-    var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
-    errdefer approx_results.deinit();
-    profile.setup_ns += elapsed_fn_u64(setup_start);
-
-    if (self.config.centroid_directory_mode == .flat_rabitq and self.config.use_quantization) {
-        const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
-            self.config.flat_centroid_probe_count
-        else
-            @as(usize, @intCast(search_width));
-        const requested_probe_limit = @max(configured_probe_count, @as(usize, 1));
-        // The flat directory is compact (one id/radius plus a quantized
-        // centroid per posting). Keep the full ordered frontier so selective
-        // filters can advance without rebuilding it and stopping can be based
-        // on a real lower bound instead of the old fixed probe cutoff.
-        const probes = try spfresh_index.selectFlatRabitqPostingsAlloc(
+    // Native flat routing is the bounded first admission phase. It reads only
+    // the compact generation-owned centroid directory. Once the immutable
+    // frontier is known, the adapter sums its authenticated per-posting costs
+    // and obtains scan bandwidth before any candidate payload is touched.
+    var prepared_flat_selection: ?spfresh_index.FlatCentroidSelection = null;
+    if (spfresh_index.usesFlatCentroidDirectory(self)) {
+        const search_width_usize: usize = @intCast(search_width);
+        const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
+        prepared_flat_selection = try spfresh_index.selectFlatPostingsAlloc(
             self,
             &txn,
             transformed_query,
+            search_width_usize +| missing_posting_slack,
             &scratch_handle,
             &profile,
             coverage_policy,
-            if (exhaustive_coverage) .{
+            if (exhaustive_coverage or search_view_bound) .{
                 .root_node = published_snapshot.root_node,
                 .node_count = published_snapshot.node_count,
-                .publish_generation = published_snapshot.publish_generation,
+                .publish_generation = published_snapshot.routing_generation,
             } else null,
             req.cancellation,
             now_fn_u64,
             elapsed_fn_u64,
         );
+        if (comptime @hasDecl(Index, "finalizeFlatSearchAdmission")) {
+            try self.finalizeFlatSearchAdmission(
+                &search_admission,
+                &txn,
+                prepared_flat_selection.?.probes,
+                req,
+            );
+        }
+    }
+
+    hbc_runtime.beginSearchEpoch(self);
+    defer hbc_runtime.endSearchEpoch(self);
+    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
+        try self.pinUpperTreeCache(&txn);
+    }
+    var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
+    defer filter_state.deinit(self.alloc);
+
+    var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
+    errdefer approx_results.deinit();
+    profile.setup_ns += elapsed_fn_u64(setup_start);
+
+    if (spfresh_index.usesFlatCentroidDirectory(self)) {
+        const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
+            self.config.flat_centroid_probe_count
+        else
+            @as(usize, @intCast(search_width));
+        const initial_probe_limit = @max(configured_probe_count, @as(usize, 1));
+        // The flat directory is compact (one id/radius plus a quantized
+        // centroid per posting). Keep a bounded ordered frontier with slack so
+        // selective filters can advance without rebuilding it; complete
+        // snapshot requests retain the entire directory for their coverage
+        // contract.
+        const search_width_usize: usize = @intCast(search_width);
+        const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
+        const selection = prepared_flat_selection orelse try spfresh_index.selectFlatPostingsAlloc(
+            self,
+            &txn,
+            transformed_query,
+            search_width_usize +| missing_posting_slack,
+            &scratch_handle,
+            &profile,
+            coverage_policy,
+            if (exhaustive_coverage or search_view_bound) .{
+                .root_node = published_snapshot.root_node,
+                .node_count = published_snapshot.node_count,
+                .publish_generation = published_snapshot.routing_generation,
+            } else null,
+            req.cancellation,
+            now_fn_u64,
+            elapsed_fn_u64,
+        );
+        const probes = selection.probes;
         const probe_count = probes.len;
-        const initial_probe_limit = if (exhaustive_coverage)
+        const effective_initial_probe_limit = if (exhaustive_coverage)
             probe_count
         else
-            @min(requested_probe_limit, probe_count);
+            @min(initial_probe_limit, probe_count);
 
         var flat_leaves_scored: usize = 0;
         var previous_wave_end: usize = 0;
-        var next_wave_end: usize = @min(initial_probe_limit, probe_count);
+        var next_wave_end: usize = effective_initial_probe_limit;
         profile.traversal_initial_wave_leaves = @intCast(@min(next_wave_end, std.math.maxInt(u32)));
         for (probes[0..probe_count], 0..) |probe, i| {
+            // Flat routing replaces the tree directory, not the caller's ANN
+            // effort contract. Proof bounds may stop before search_width, but
+            // weak spheres must not silently turn an approximate query into a
+            // full posting scan. Filters retain the same bounded-effort
+            // semantics as tree traversal.
+            if (!exhaustive_coverage and flat_leaves_scored >= @as(usize, @intCast(search_width))) {
+                profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
+                break;
+            }
             if (i == next_wave_end and next_wave_end < probe_count) {
                 profile.traversal_waves += 1;
                 profile.traversal_max_wave_leaves = @max(
                     profile.traversal_max_wave_leaves,
                     @as(u64, @intCast(next_wave_end - previous_wave_end)),
                 );
-                // Covering-radius bounds remain shadow telemetry until their
-                // end-to-end certification includes payload freshness and
-                // quantized candidate retention. Preserve the ANN budget as a
-                // floor, then expand only when filters or sparse postings have
-                // not filled the requested rerank pool.
-                if (!exhaustive_coverage and approx_results.items.items.len >= candidate_limit) {
-                    profile.traversal_frontier_remaining = @intCast(probe_count - i);
-                    break;
+                // The complete immutable directory carries a suffix minimum
+                // over conservative posting-ball bounds. Compare it with the
+                // kth-smallest upper endpoint already retained by the
+                // quantized candidate shell: when the former is strictly
+                // larger, no unseen vector can enter the public top-k. Dirty
+                // or unresolved radii leave suffix_bounds_resolved false and
+                // retain the established effort/fill behavior.
+                if (!exhaustive_coverage and probe.suffix_bounds_resolved) {
+                    profile.traversal_bound_resolutions += 1;
+                    try scratch.ensureVectorFetchCapacity(self.alloc, approx_results.items.items.len);
+                    if (approxTopKUpperBound(
+                        approx_results.items.items,
+                        req.k,
+                        scratch.distances,
+                    )) |top_k_upper| {
+                        profile.traversal_stop_lower_bound = probe.suffix_member_lower_bound;
+                        profile.traversal_stop_result_upper_bound = top_k_upper;
+                        if (probe.suffix_member_lower_bound > top_k_upper) {
+                            profile.traversal_bound_stops += 1;
+                            profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
+                            break;
+                        }
+                    } else {
+                        profile.traversal_bound_fallbacks += 1;
+                    }
+                } else if (!exhaustive_coverage) {
+                    profile.traversal_bound_resolutions += 1;
+                    profile.traversal_bound_fallbacks += 1;
                 }
-
+                // A full candidate heap is not evidence that the selected
+                // leaves contain the nearest neighbors. It only bounds the
+                // retained shell. Continue honoring the caller's leaf-effort
+                // budget unless the conservative suffix radius above proves
+                // that every unseen posting is unable to cross public top-k.
                 const explored = @max(flat_leaves_scored, 1);
                 const eligible = @max(profile.traversal_eligible_vectors, 1);
                 const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
@@ -2490,6 +2837,36 @@ fn searchProfiledRequestAttempt(
             }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
+            if (try loadNativeLeafScanReadView(self, &txn, probe.posting_id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                try coverage_tracker.observe(self, &txn, scratch, probe.posting_id, native_scan.member_ids);
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    probe.posting_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                profile.leaves_explored += 1;
+                flat_leaves_scored += 1;
+                continue;
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             var leaf_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, probe.posting_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
                 try handleTraversalNodeLoadError(err, coverage_policy);
                 continue;
@@ -2511,9 +2888,16 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             leaf_handle.deinit(self.alloc);
             leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
+        }
+
+        if (!exhaustive_coverage and
+            profile.traversal_frontier_remaining == 0 and
+            probe_count < selection.total_postings)
+        {
+            profile.traversal_frontier_remaining = @intCast(selection.total_postings - probe_count);
         }
 
         if (flat_leaves_scored > previous_wave_end) {
@@ -2544,6 +2928,14 @@ fn searchProfiledRequestAttempt(
         }
     }
 
+    // Flat-directory searches return above whenever they have a usable
+    // frontier. Allocate the tree heap only for the tree route (or a genuinely
+    // empty flat directory), avoiding redundant ungoverned work on the common
+    // native flat path.
+    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
+    defer candidates.deinit(self.alloc);
+    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
+
     const root_start = now_fn_u64();
     var root_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, root_node_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
         error.NotFound => {
@@ -2569,6 +2961,49 @@ fn searchProfiledRequestAttempt(
     {
         const root = root_handle.ptr();
         if (root.is_leaf) {
+            if (try loadNativeLeafScanReadView(self, &txn, root.id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                try coverage_tracker.observe(self, &txn, scratch, root.id, native_scan.member_ids);
+                const leaf_id = root.id;
+                root_handle.deinit(self.alloc);
+                root_handle_active = false;
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    leaf_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+                if (should_rerank) {
+                    const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+                    approx_results.deinit();
+                    profile.total_ns = elapsed_fn_u64(total_start);
+                    return .{ .results = reranked, .profile = profile };
+                }
+                var results = try approx_results.toFinalResults();
+                approx_results.deinit();
+                results.sort();
+                if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
+                profile.total_ns = elapsed_fn_u64(total_start);
+                return .{ .results = results, .profile = profile };
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             const root_posting = try posting.PostingStore.view(root);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, root_posting);
             try coverage_tracker.observe(self, &txn, scratch, root_posting.id, member_ids);
@@ -2577,7 +3012,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
             root_handle.deinit(self.alloc);
             root_handle_active = false;
-            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
                     if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
@@ -2676,7 +3111,13 @@ fn searchProfiledRequestAttempt(
             // ancestor chain. Resolve/expand those internal nodes first, then
             // order the resulting leaf frontier by durable posting radii.
             if (node.is_leaf and self.config.metric == .l2_squared) {
-                if (l2SubtreeLowerBound(candidate, node.covering_radius)) |lower_bound| {
+                if (subtreeLowerBound(
+                    self.config.metric,
+                    transformed_query_measure,
+                    candidate,
+                    node.centroid,
+                    node.covering_radius,
+                )) |lower_bound| {
                     candidate.lower_bound = lower_bound;
                     candidate.bound_resolved = true;
                     candidate.is_leaf = node.is_leaf;
@@ -2708,6 +3149,39 @@ fn searchProfiledRequestAttempt(
                 node_handle_active = false;
                 continue;
             }
+            if (try loadNativeLeafScanReadView(self, &txn, node.id)) |native_scan| {
+                profile.native_leaf_scan_hits += 1;
+                const leaf_id = node.id;
+                node_handle.deinit(self.alloc);
+                node_handle_active = false;
+                try coverage_tracker.observe(self, &txn, scratch, leaf_id, native_scan.member_ids);
+                try @This().scoreLeafMemberIds(
+                    self,
+                    &txn,
+                    leaf_id,
+                    false,
+                    true,
+                    native_scan.member_ids,
+                    &native_scan.quantized,
+                    native_scan.projections,
+                    transformed_query,
+                    transformed_query_measure,
+                    req.query,
+                    exact_query_measure,
+                    req,
+                    &filter_state,
+                    &approx_results,
+                    scratch,
+                    &profile,
+                    use_search_cache,
+                    now_fn_u64,
+                    elapsed_fn_u64,
+                );
+                search_mod.noteLeafExplored(&beam_state);
+                profile.leaves_explored += 1;
+                continue;
+            }
+            profile.native_leaf_scan_fallbacks += 1;
             const leaf_posting = try posting.PostingStore.view(node);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
             try coverage_tracker.observe(self, &txn, scratch, leaf_posting.id, member_ids);
@@ -2716,7 +3190,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             search_mod.noteLeafExplored(&beam_state);
             profile.leaves_explored += 1;
         } else {
@@ -2812,6 +3286,7 @@ const SearchPublishedSnapshot = struct {
     active_count: u64,
     node_count: u64,
     publish_generation: u64,
+    routing_generation: u64,
 };
 
 fn waitForStableSearchPublicationIfSupported(
@@ -2842,6 +3317,7 @@ fn loadStableSearchPublishedSnapshot(
             .active_count = self.metadata.active_count,
             .node_count = self.metadata.node_count,
             .publish_generation = 0,
+            .routing_generation = 0,
         };
     }
 
@@ -2856,6 +3332,7 @@ fn loadStableSearchPublishedSnapshot(
             .active_count = self.publishedActiveCount(),
             .node_count = self.publishedNodeCount(),
             .publish_generation = generation,
+            .routing_generation = generation,
         };
         const generation_after = self.publishedGeneration();
         if (generation == generation_after and (generation_after & 1) == 0) return snapshot;
@@ -2987,7 +3464,7 @@ const CompleteCoverageTracker = struct {
 
         for (member_ids) |member_id| {
             if (self.assignment_count == assignment_batch_size) {
-                try self.flushAssignments(txn, scratch);
+                try self.flushAssignments(index, txn, scratch);
             }
             scratch.coverage_members[self.assignment_count] = .{
                 .vector_id = member_id,
@@ -2997,7 +3474,7 @@ const CompleteCoverageTracker = struct {
         }
     }
 
-    fn flushAssignments(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+    fn flushAssignments(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
         if (self.assignment_count == 0) return;
         const assignments = scratch.coverage_members[0..self.assignment_count];
         std.mem.sort(search_runtime.CoverageMember, assignments, {}, struct {
@@ -3017,7 +3494,7 @@ const CompleteCoverageTracker = struct {
             _ = hbc.encodeVecLeafKey(&lookups[i].key, assignment.vector_id);
             key_views[i] = lookups[i].key[0..];
         }
-        try txn.getManySorted(.vecs, key_views, values);
+        try getNamespacedManySorted(index, txn, .vecs, key_views, values);
         for (assignments, values) |assignment, maybe_value| {
             const value = maybe_value orelse return error.IncompletePublishedSnapshot;
             if (value.len < @sizeOf(u64) or std.mem.readInt(u64, value[0..8], .little) != assignment.leaf_id) {
@@ -3027,10 +3504,10 @@ const CompleteCoverageTracker = struct {
         self.assignment_count = 0;
     }
 
-    fn validate(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+    fn validate(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
         if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
-        return self.flushAssignments(txn, scratch);
+        return self.flushAssignments(index, txn, scratch);
     }
 };
 
@@ -3041,7 +3518,7 @@ fn validateCompleteCoverage(
     tracker: *CompleteCoverageTracker,
     generation: u64,
 ) !void {
-    try tracker.validate(txn, scratch);
+    try tracker.validate(self, txn, scratch);
     if (!tracker.enabled) return;
     finishCompleteCoverageValidationIfSupported(self, generation, true);
     tracker.claim_held = false;
@@ -3161,7 +3638,16 @@ pub fn scoreLeafMembers(
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
     const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+}
+
+fn noteLeafScanBytes(
+    profile: *search_types.SearchProfile,
+    vector_count: usize,
+    bytes_per_vector: u64,
+) void {
+    const bytes = @as(u64, @intCast(vector_count)) *| bytes_per_vector;
+    profile.max_leaf_scan_bytes = @max(profile.max_leaf_scan_bytes, bytes);
 }
 
 fn scoreLeafMemberIds(
@@ -3171,6 +3657,8 @@ fn scoreLeafMemberIds(
     leaf_uses_nonquantized_payload: bool,
     leaf_has_fresh_stored_payload: bool,
     member_ids: []const u64,
+    native_quantized: ?*const hbc_runtime.QuantizedSet,
+    native_projections: ?hbc_runtime.NativeProjectionPlane,
     approx_query: []const f32,
     approx_query_measure: f32,
     exact_query: []const f32,
@@ -3186,6 +3674,10 @@ fn scoreLeafMemberIds(
 ) !void {
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
+    profile.max_leaf_vectors_considered = @max(
+        profile.max_leaf_vectors_considered,
+        @as(u64, @intCast(member_ids.len)),
+    );
     const coverage_policy = search_types.coveragePolicy(req);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
 
@@ -3251,19 +3743,155 @@ fn scoreLeafMemberIds(
     scoring_req.filter_ids = &.{};
     scoring_req.exclude_ids = &.{};
     const empty_filter_state = search_types.RequestFilterState{};
-    if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
-        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
-            defer {
-                var handle = quantized_handle;
-                handle.deinit(self.alloc);
+    if (native_projections) |projection_plane| {
+        const dims: usize = @intCast(self.config.dims);
+        if (projection_plane.validFor(member_ids.len, dims)) {
+            // The immutable leaf already co-locates RaBitQ and float16. Use
+            // the compact code as a first-stage heap admission, retain a
+            // generation-leased projection only for admitted candidates, and
+            // complete those candidates from float16 before rerank. This
+            // avoids decoding every wide projection in the routed shell while
+            // preserving the established RaBitQ recall/error-bound contract.
+            if (!filters_active and
+                !has_extra_filters and
+                self.config.use_quantization and
+                leaf_has_fresh_stored_payload and
+                native_quantized != null and
+                projection_plane.checksums.len == member_ids.len)
+            {
+                const count = member_ids.len;
+                const distances = scratch.distances[0..count];
+                const error_bounds = scratch.error_bounds[0..count];
+                try self.estimateQuantizedDistances(
+                    native_quantized.?,
+                    approx_query,
+                    approx_query_measure,
+                    distances,
+                    error_bounds,
+                    &scratch.estimate,
+                );
+                results.addApproxResultsWithDeferredProjectionPlane(
+                    member_ids,
+                    distances,
+                    error_bounds,
+                    projection_plane.values,
+                    projection_plane.scales,
+                    projection_plane.error_norms,
+                    projection_plane.decoded_norm_lower_bounds,
+                    projection_plane.checksums,
+                    projection_plane.residual_locations,
+                    original_positions,
+                    dims,
+                );
+                profile.approx_leaves_scored += 1;
+                profile.approx_vectors_scored += count;
+                noteLeafScanBytes(
+                    profile,
+                    count,
+                    std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+                );
+                return;
             }
-            const quantized = quantized_handle.ptr();
+            const query_norm: f32 = switch (self.config.metric) {
+                .inner_product => vec.norm(exact_query),
+                .cosine => exact_query_measure,
+                .l2_squared => 0,
+            };
+            const distances = scratch.distances[0..filtered_count];
+            const error_bounds = scratch.error_bounds[0..filtered_count];
+            for (original_positions, 0..) |original_position, i| {
+                if (i % 256 == 0) try search_types.checkCancelled(req);
+                const row = projection_plane.values[original_position * dims ..][0..dims];
+                const distance = vec.distanceToQueryF16(
+                    exact_query,
+                    exact_query_measure,
+                    row,
+                    projection_plane.scales[original_position],
+                    self.config.metric,
+                );
+                const bounded = vec.boundedDistanceFromProjectionMetadata(
+                    distance,
+                    query_norm,
+                    projection_plane.error_norms[original_position],
+                    projection_plane.decoded_norm_lower_bounds[original_position],
+                    self.config.metric,
+                );
+                distances[i] = bounded.distance;
+                error_bounds[i] = bounded.error_bound;
+            }
+            if (!has_extra_filters) {
+                if (projection_plane.checksums.len == member_ids.len) {
+                    results.addApproxResultsWithProjectionPlane(
+                        scoring_member_ids,
+                        distances,
+                        error_bounds,
+                        projection_plane.values,
+                        projection_plane.scales,
+                        projection_plane.error_norms,
+                        projection_plane.decoded_norm_lower_bounds,
+                        projection_plane.checksums,
+                        projection_plane.residual_locations,
+                        original_positions,
+                        dims,
+                    );
+                } else {
+                    results.addApproxResultsWithProjection(scoring_member_ids, distances, error_bounds, true);
+                }
+            } else {
+                for (scoring_member_ids, 0..) |member_id, i| {
+                    if (!try memberMatchesRequestWithCachePolicy(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true, use_search_cache)) continue;
+                    const original_position = original_positions[i];
+                    results.addApproxResultWithProjectionValue(
+                        member_id,
+                        distances[i],
+                        error_bounds[i],
+                        true,
+                        if (projection_plane.checksums.len == member_ids.len) .{
+                            .values = projection_plane.values[original_position * dims ..][0..dims],
+                            .scale = projection_plane.scales[original_position],
+                            .error_norm = projection_plane.error_norms[original_position],
+                            .decoded_norm_lower_bound = projection_plane.decoded_norm_lower_bounds[original_position],
+                            .checksum = projection_plane.checksums[original_position],
+                            .residual_location = if (projection_plane.residual_locations) |locations|
+                                locations.at(original_position)
+                            else
+                                null,
+                        } else null,
+                    );
+                }
+            }
+            profile.approx_leaves_scored += 1;
+            profile.approx_vectors_scored += filtered_count;
+            noteLeafScanBytes(profile, filtered_count, @as(u64, self.config.dims) *| @sizeOf(f16));
+            return;
+        }
+    }
+    if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
+        var loaded_quantized = if (native_quantized == null)
+            try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)
+        else
+            null;
+        defer if (loaded_quantized) |*handle| handle.deinit(self.alloc);
+        const quantized = native_quantized orelse if (loaded_quantized) |*handle| handle.ptr() else null;
+        if (quantized) |quantized_set| {
             profile.approx_leaves_scored += 1;
             const count = member_ids.len;
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
-            try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
-            if (!has_extra_filters) {
+            try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            if (!has_extra_filters and !filters_active) {
+                var cancellation_index: usize = 0;
+                while (cancellation_index < scoring_member_ids.len) : (cancellation_index += 256) {
+                    try search_types.checkCancelled(req);
+                }
+                // The common unfiltered path preserves the posting-local
+                // column layout through heap admission. ApproxSearchResults
+                // rejects eight candidates at once when all conservative
+                // lower bounds are beyond the retained frontier, then replays
+                // any possibly competitive group scalar to preserve exact
+                // tie and interval semantics.
+                results.addApproxResults(scoring_member_ids, distances, error_bounds);
+            } else if (!has_extra_filters) {
                 for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
@@ -3276,6 +3904,11 @@ fn scoreLeafMemberIds(
                 }
             }
             profile.approx_vectors_scored += count;
+            noteLeafScanBytes(
+                profile,
+                count,
+                std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+            );
             return;
         }
     }
@@ -3288,6 +3921,7 @@ fn scoreLeafMemberIds(
         }
     }
 
+    noteLeafScanBytes(profile, scoring_member_ids.len, @as(u64, self.config.dims) *| @sizeOf(f32));
     const fetch_member_ids = scratch.vector_ids[0..scoring_member_ids.len];
     var fetch_count: usize = 0;
     for (scoring_member_ids, 0..) |member_id, i| {
@@ -3325,6 +3959,7 @@ fn scoreLeafMemberIds(
                 exact_query_measure,
                 exact_distances,
                 scratch.metadata,
+                scratch.vector_views,
                 scratch.lookups,
                 scratch.key_views,
                 scratch.values,
@@ -3338,6 +3973,7 @@ fn scoreLeafMemberIds(
                 exact_query_measure,
                 exact_distances,
                 scratch.metadata,
+                scratch.vector_views,
                 scratch.lookups,
                 scratch.key_views,
                 scratch.values,
@@ -3424,6 +4060,74 @@ pub fn rerankResults(
     return rerankResultsWithCachePolicy(self, txn, approx_results, query, query_measure, req, filter_state, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
+fn completeDeferredProjectionScores(
+    config: types.HBCConfig,
+    query: []const f32,
+    query_measure: f32,
+    items: []search_results.ApproxSearchResult,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const query_norm: f32 = switch (config.metric) {
+        .inner_product => vec.norm(query),
+        .cosine => query_measure,
+        .l2_squared => 0,
+    };
+    for (items, 0..) |*item, i| {
+        if ((i & 0xff) == 0) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        }
+        if (item.bounded_projection) continue;
+        const projection = item.projection orelse continue;
+        const distance = vec.distanceToQueryF16(
+            query,
+            query_measure,
+            projection.values,
+            projection.scale,
+            config.metric,
+        );
+        const bounded = vec.boundedDistanceFromProjectionMetadata(
+            distance,
+            query_norm,
+            projection.error_norm,
+            projection.decoded_norm_lower_bound,
+            config.metric,
+        );
+        item.distance = bounded.distance;
+        item.error_bound = bounded.error_bound;
+        item.bounded_projection = true;
+    }
+}
+
+test "deferred posting projection completes a RaBit-admitted score" {
+    const projection_values = [_]f16{ 1, 2 };
+    var items = [_]search_results.ApproxSearchResult{.{
+        .vector_id = 7,
+        .distance = 123,
+        .error_bound = 9,
+        .bounded_projection = false,
+        .projection = .{
+            .values = &projection_values,
+            .scale = 1,
+            .error_norm = 0,
+            .decoded_norm_lower_bound = 0,
+            .checksum = 42,
+        },
+    }};
+    try completeDeferredProjectionScores(
+        .{ .dims = 2, .metric = .inner_product },
+        &.{ 3, 4 },
+        0,
+        &items,
+        null,
+    );
+    try std.testing.expect(items[0].bounded_projection);
+    try std.testing.expectApproxEqAbs(@as(f32, -11), items[0].distance, 0.0001);
+    // The projection bound retains the small floating-point arithmetic guard
+    // even when the persisted reconstruction error itself is zero.
+    try std.testing.expect(items[0].error_bound >= 0);
+    try std.testing.expect(items[0].error_bound < 0.001);
+}
+
 fn rerankResultsWithCachePolicy(
     self: anytype,
     txn: anytype,
@@ -3446,6 +4150,11 @@ fn rerankResultsWithCachePolicy(
     try scratch.ensureRerankCapacity(self.alloc, ranked_items.len);
 
     const prepare_start = now_fn_u64();
+    // Candidates admitted by posting-local RaBitQ carry a generation-leased
+    // float16 projection. Complete only that bounded heap before ordering;
+    // authoritative residual completion below remains limited to intervals
+    // that can cross the public top-k boundary.
+    try completeDeferredProjectionScores(self.config, query, query_measure, ranked_items, req.cancellation);
     search_mod.sortApproxResultsByDistance(ranked_items);
 
     const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
@@ -3477,15 +4186,171 @@ fn rerankResultsWithCachePolicy(
     const rerank_count = rerank_selection.rerank_candidate_count;
     if (rerank_count > 0) {
         const select_start = now_fn_u64();
-        const rerank_positions = selectedRerankCandidatePositionsInto(ranked_items, rerank_selection.flags, scratch.positions[0..rerank_count]);
+        var rerank_positions = selectedRerankCandidatePositionsInto(ranked_items, rerank_selection.flags, scratch.positions[0..rerank_count]);
         profile.rerank_select_positions_ns += elapsed_fn_u64(select_start);
-        const vector_views = scratch.vector_views[0..rerank_count];
-        const exact_distances = scratch.distances[0..rerank_count];
+        // The bounded pass can prove that candidates outside the original
+        // quantized rerank window overlap the exact top-k boundary. Reserve
+        // the full result shell so expanding the completion set remains
+        // allocation-free and cannot overrun a rerank-sized view.
+        const vector_views = scratch.vector_views[0..ranked_items.len];
+        const exact_distances = scratch.distances[0..ranked_items.len];
 
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
+        if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratch")) bounded: {
+            // Candidate admission is ordered by the RaBitQ plane, while this
+            // pass replaces those estimates with the tighter float16 plane.
+            // RaBitQ's stochastic error interval is a rerank-selection policy,
+            // not a proof that an unread candidate cannot cross a float16
+            // boundary. Refining only a prefix lost 3.4 recall points on the
+            // public 50K workload even with exhaustive leaf coverage. Load the
+            // complete selected shell before applying the float16 overlap
+            // policy below. The external loader still sorts physical reads by
+            // shard/offset, so retaining vector-id order here avoids a second
+            // query-local sort without sacrificing I/O locality.
+            // Posting-local float16 rows already carry this deterministic
+            // interval. Compact only the unresolved subset in place; the
+            // selection flags retain the complete shell for boundary proof.
+            var unresolved_count: usize = 0;
+            for (rerank_positions) |index| {
+                if (ranked_items[index].bounded_projection) continue;
+                rerank_positions[unresolved_count] = index;
+                unresolved_count += 1;
+            }
+            rerank_positions = rerank_positions[0..unresolved_count];
+            const max_external_rerank_batch = rerank_positions.len;
+            var offset: usize = 0;
+            while (offset < rerank_positions.len) {
+                const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
+                const batch_positions = rerank_positions[offset..batch_end];
+                const batch_distances = exact_distances[0..batch_positions.len];
+                const batch_bounds = scratch.error_bounds[0..batch_positions.len];
+                const handled = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratchUncached"))
+                    try self.scoreExternalRerankCandidatesSortedWithScratchUncached(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        batch_bounds,
+                        scratch.vector_ids,
+                        scratch.bounded_projections,
+                        scratch.metadata,
+                        scratch.vector_views,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.score_bounds[0..batch_positions.len],
+                        scratch.score_bounds[batch_positions.len .. 2 * batch_positions.len],
+                        profile,
+                    )
+                else
+                    try self.scoreExternalRerankCandidatesSortedWithScratch(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        batch_bounds,
+                        scratch.vector_ids,
+                        scratch.bounded_projections,
+                        scratch.metadata,
+                        scratch.vector_views,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.score_bounds[0..batch_positions.len],
+                        scratch.score_bounds[batch_positions.len .. 2 * batch_positions.len],
+                        profile,
+                    );
+                if (!handled) break :bounded;
+                var batch_is_authoritative = true;
+                for (batch_positions, 0..) |index, slot| {
+                    const item = &ranked_items[index];
+                    item.distance = batch_distances[slot];
+                    item.error_bound = batch_bounds[slot];
+                    item.bounded_projection = true;
+                    if (!std.math.isFinite(item.distance)) {
+                        if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(
+                        self,
+                        txn,
+                        item.vector_id,
+                        item.distance,
+                        item.error_bound,
+                        req,
+                        filter_state,
+                        item.error_bound > 0,
+                        use_search_cache,
+                    )) {
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (item.error_bound == 0) {
+                        profile.exact_vectors_scored += 1;
+                        profile.reranked_vectors += 1;
+                    } else {
+                        batch_is_authoritative = false;
+                    }
+                }
+                // A primary/cache-backed candidate batch has already done the
+                // complete exact rerank. Preserve the established profiling
+                // semantics without counting a float16 candidate-plane scan
+                // as an authoritative completion batch.
+                if (batch_is_authoritative) {
+                    profile.rerank_batches += 1;
+                    profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, batch_positions.len);
+                }
+                offset = batch_end;
+                if (offset < rerank_positions.len) {
+                    const top_k_upper = approxTopKUpperBound(
+                        ranked_items,
+                        rerank_selection.top_k_count,
+                        scratch.distances,
+                    ) orelse continue;
+                    const next = ranked_items[rerank_positions[offset]];
+                    if (next.distance - next.error_bound > top_k_upper) {
+                        profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                        for (rerank_positions[offset..]) |index| {
+                            rerank_selection.flags[index] = false;
+                            ranked_items[index].distance = std.math.inf(f32);
+                            ranked_items[index].error_bound = 0;
+                        }
+                        break;
+                    }
+                }
+            }
+            external_scored = true;
+            search_mod.sortApproxResultsByDistance(ranked_items);
+            const completion_count = markAuthoritativeCompletionCandidates(
+                rerank_selection.flags,
+                ranked_items,
+                rerank_selection.top_k_count,
+                req,
+                scratch.score_bounds,
+            );
+            rerank_positions = selectedRerankCandidatePositionsInto(
+                ranked_items,
+                rerank_selection.flags,
+                scratch.positions[0..completion_count],
+            );
+        }
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratch")) {
-            const max_external_rerank_batch: usize = 128;
+            // Most exact rerank sets fit in a small, already-reserved scratch
+            // window. Score those as one physical-read unit so the external
+            // store can order the complete set by file/offset and pay one
+            // lease, arena, and sort. Large sets retain 128-entry checkpoints
+            // so the boundary proof can still stop before loading a long tail.
+            const max_external_rerank_batch = externalRerankBatchSize(self.config.dims, rerank_positions.len);
             var offset: usize = 0;
             while (offset < rerank_positions.len) {
                 const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
@@ -3501,7 +4366,9 @@ fn rerankResultsWithCachePolicy(
                         query_measure,
                         batch_distances,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
+                        scratch.vector_views,
                         scratch.lookups,
                         scratch.key_views,
                         scratch.values,
@@ -3518,7 +4385,9 @@ fn rerankResultsWithCachePolicy(
                         query_measure,
                         batch_distances,
                         scratch.vector_ids,
+                        scratch.bounded_projections,
                         scratch.metadata,
+                        scratch.vector_views,
                         scratch.lookups,
                         scratch.key_views,
                         scratch.values,
@@ -3531,6 +4400,10 @@ fn rerankResultsWithCachePolicy(
                 profile.rerank_vector_load_ns += score_elapsed;
                 if (!handled) {
                     if (offset != 0) return error.ExternalRerankCapabilityChanged;
+                    // A generation may change between bounded and exact
+                    // scoring. Fall back to the authoritative source loader
+                    // for this completion set instead of exposing f16 scores.
+                    external_scored = false;
                     break;
                 }
                 external_scored = true;
@@ -3569,6 +4442,7 @@ fn rerankResultsWithCachePolicy(
                     scratch.distances,
                 )) {
                     profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                    discardPendingRerankCandidates(ranked_items, rerank_selection.flags);
                     break;
                 }
             }
@@ -3658,6 +4532,32 @@ fn rerankResultsWithCachePolicy(
         profile.rerank_metadata_ns += elapsed_fn_u64(metadata_start);
     }
     return exact_results;
+}
+
+const external_rerank_locality_target_bytes: usize = 2 * 1024 * 1024;
+const external_rerank_large_set_batch: usize = 128;
+
+fn externalRerankBatchSize(dims: usize, candidate_count: usize) usize {
+    if (candidate_count == 0) return 0;
+    const vector_bytes = std.math.mul(usize, @max(dims, 1), @sizeOf(f32)) catch return external_rerank_large_set_batch;
+    // Keep exact reranking interruptible and bound every external fetch by
+    // both candidate count and decoded-vector bytes. In particular, small
+    // dimensions must not turn an ambiguous full shell into one arbitrarily
+    // large request merely because its payload happens to fit in 2 MiB.
+    const byte_bounded = @max(external_rerank_locality_target_bytes / vector_bytes, 1);
+    return @min(candidate_count, @min(external_rerank_large_set_batch, byte_bounded));
+}
+
+test "external rerank batches are bounded by candidates and decoded bytes" {
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(768, 447));
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(768, 900));
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(1536, 341));
+    // Very wide vectors remain byte bounded below the ordinary count limit.
+    try std.testing.expectEqual(@as(usize, 32), externalRerankBatchSize(16_384, 128));
+    // Low-dimensional sets retain the latency/cancellation checkpoint.
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(2, 1025));
+    try std.testing.expectEqual(@as(usize, 31), externalRerankBatchSize(2, 31));
+    try std.testing.expectEqual(@as(usize, 0), externalRerankBatchSize(768, 0));
 }
 
 fn selectRerankCandidates(
@@ -3850,6 +4750,118 @@ fn countSelectedRerankCandidates(flags: []const bool) usize {
     return count;
 }
 
+/// Selects the minimal provably sufficient float32 completion set after a
+/// bounded candidate plane has scored the corpus shell. The kth-smallest
+/// upper endpoint is an upper bound on the true kth score; therefore every
+/// non-exact candidate whose lower endpoint can cross it is completed. Once
+/// those candidates are exact, every omitted interval starts strictly beyond
+/// a known top-k witness and cannot change membership or public ordering.
+fn markAuthoritativeCompletionCandidates(
+    flags: []bool,
+    ranked_items: []const search_results.ApproxSearchResult,
+    top_k: usize,
+    req: search_types.SearchRequest,
+    upper_storage: []f32,
+) usize {
+    @memset(flags, false);
+    if (top_k == 0 or ranked_items.len == 0 or upper_storage.len < ranked_items.len) return 0;
+    var upper_count: usize = 0;
+    for (ranked_items) |item| {
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[upper_count] = upper;
+        upper_count += 1;
+    }
+    if (upper_count < @min(top_k, ranked_items.len)) {
+        var count: usize = 0;
+        for (ranked_items, flags) |item, *selected| {
+            selected.* = item.error_bound > 0;
+            if (selected.*) count += 1;
+        }
+        return count;
+    }
+    std.mem.sort(f32, upper_storage[0..upper_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    const kth_upper = upper_storage[@min(top_k, upper_count) - 1];
+    var count: usize = 0;
+    for (ranked_items, flags) |item, *selected| {
+        if (item.error_bound <= 0) continue;
+        const crosses_membership = item.distance - item.error_bound <= kth_upper;
+        const crosses_over = if (req.distance_over) |threshold|
+            item.distance - item.error_bound <= threshold and
+                item.distance + item.error_bound >= threshold
+        else
+            false;
+        const crosses_under = if (req.distance_under) |threshold|
+            item.distance - item.error_bound <= threshold and
+                item.distance + item.error_bound >= threshold
+        else
+            false;
+        selected.* = crosses_membership or crosses_over or crosses_under;
+        if (selected.*) count += 1;
+    }
+    return count;
+}
+
+/// Returns a conservative upper bound on the true kth score among an already
+/// retained bounded candidate shell. A routing lower bound strictly beyond
+/// this value proves that an unseen posting cannot contribute to top-k.
+fn approxTopKUpperBound(
+    ranked_items: []const search_results.ApproxSearchResult,
+    top_k: usize,
+    upper_storage: []f32,
+) ?f32 {
+    if (top_k == 0 or ranked_items.len < top_k or upper_storage.len < ranked_items.len) return null;
+    var upper_count: usize = 0;
+    for (ranked_items) |item| {
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[upper_count] = upper;
+        upper_count += 1;
+    }
+    if (upper_count < top_k) return null;
+    std.mem.sort(f32, upper_storage[0..upper_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    return upper_storage[top_k - 1];
+}
+
+test "flat routing top-k upper bound is conservative" {
+    const items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 0.10, .error_bound = 0.02 },
+        .{ .vector_id = 2, .distance = 0.20, .error_bound = 0.03 },
+        .{ .vector_id = 3, .distance = 0.15, .error_bound = 0.01 },
+    };
+    var storage: [items.len]f32 = undefined;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.16), approxTopKUpperBound(&items, 2, &storage).?, 0.000001);
+    try std.testing.expect(approxTopKUpperBound(items[0..1], 2, &storage) == null);
+}
+
+test "bounded candidate completion selects every possible top-k crossover" {
+    var items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0.01 },
+        .{ .vector_id = 2, .distance = 2.0, .error_bound = 0.05 },
+        .{ .vector_id = 3, .distance = 2.08, .error_bound = 0.08 },
+        .{ .vector_id = 4, .distance = 9.0, .error_bound = 0.1 },
+    };
+    var flags: [items.len]bool = undefined;
+    var upper: [items.len]f32 = undefined;
+    const count = markAuthoritativeCompletionCandidates(&flags, &items, 2, .{ .query = &.{}, .k = 2 }, &upper);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &flags);
+
+    // Once the first three values are authoritative, the far bounded tail is
+    // still omitted and every public top-k score is exact.
+    for (items[0..3]) |*item| item.error_bound = 0;
+    const complete = markAuthoritativeCompletionCandidates(&flags, &items, 2, .{ .query = &.{}, .k = 2 }, &upper);
+    try std.testing.expectEqual(@as(usize, 0), complete);
+}
+
 /// Returns true only when `top_k` already-scored/permanently-retained
 /// candidates have upper bounds strictly below every still-selected
 /// candidate's lower bound. This lets external reranking stop between sorted
@@ -3929,6 +4941,32 @@ fn selectedRerankCandidatePositionsInto(
         }
     }.lessThan);
     return used;
+}
+
+fn discardPendingRerankCandidates(
+    ranked_items: []search_results.ApproxSearchResult,
+    pending_flags: []bool,
+) void {
+    for (ranked_items, pending_flags) |*item, *pending| {
+        if (!pending.*) continue;
+        item.distance = std.math.inf(f32);
+        item.error_bound = 0;
+        pending.* = false;
+    }
+}
+
+test "bound-skipped rerank candidates cannot re-enter final approximate sort" {
+    var items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0 },
+        .{ .vector_id = 2, .distance = 1.1, .error_bound = 0.2 },
+        .{ .vector_id = 3, .distance = 1.2, .error_bound = 0.2 },
+    };
+    var pending = [_]bool{ false, true, true };
+    discardPendingRerankCandidates(&items, &pending);
+    try std.testing.expect(std.math.isInf(items[1].distance));
+    try std.testing.expect(std.math.isInf(items[2].distance));
+    try std.testing.expectEqual(@as(f32, 0), items[1].error_bound);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, &pending);
 }
 
 fn loadRerankVectorsSorted(
@@ -4101,11 +5139,15 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    const vector_namespace = if (comptime @hasDecl(Index, "vectorArtifactReadNamespace"))
-        self.vectorArtifactReadNamespace()
-    else
-        .vecs;
-    try txn.getManySorted(vector_namespace, key_views, values);
+    if (comptime @hasDecl(Index, "vectorArtifactReadNamespace")) {
+        switch (self.vectorArtifactReadNamespace()) {
+            .vecs => try getNamespacedManySorted(self, txn, .vecs, key_views, values),
+            .vecs_transient => try getNamespacedManySorted(self, txn, .vecs_transient, key_views, values),
+            else => unreachable,
+        }
+    } else {
+        try getNamespacedManySorted(self, txn, .vecs, key_views, values);
+    }
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (use_cache) {
@@ -4182,6 +5224,16 @@ fn loadTransformedVectorIdsIntoMatrix(
     const matrix_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
     if (matrix.len < matrix_floats) return error.BufferTooSmall;
 
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "loadTransformedVectorIdsIntoMatrixWithWorkspace")) {
+        if (try self.loadTransformedVectorIdsIntoMatrixWithWorkspace(
+            txn,
+            vector_ids,
+            matrix,
+            options,
+        )) return;
+    }
+
     const missing_ids = try self.alloc.alloc(u64, vector_ids.len);
     defer self.alloc.free(missing_ids);
     const missing_positions = try self.alloc.alloc(usize, vector_ids.len);
@@ -4212,7 +5264,6 @@ fn loadTransformedVectorIdsIntoMatrix(
     const vector_scratch = try self.alloc.alloc(f32, dims);
     defer self.alloc.free(vector_scratch);
 
-    const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "loadExternalVectorsTransformedIntoMatrix")) {
         if (try self.loadExternalVectorsTransformedIntoMatrix(
             txn,
@@ -4679,6 +5730,22 @@ test "estimate quantized distances rejects stale quantized count" {
     );
 }
 
+test "native quantized read view declines stale payloads" {
+    const TestIndex = struct {
+        fn loadNativeQuantizedView(
+            _: *@This(),
+            _: void,
+            _: u64,
+            _: bool,
+            _: usize,
+        ) !?hbc_runtime.QuantizedSet {
+            return error.Corrupted;
+        }
+    };
+    var index: TestIndex = .{};
+    try std.testing.expect((try loadNativeQuantizedReadView(&index, {}, 840, false, 169)) == null);
+}
+
 test "only root nodes use nonquantized payloads" {
     var root_leaf = types.Node{
         .id = 1,
@@ -4743,7 +5810,7 @@ test "dirty leaf payloads are not fresh stored payloads" {
     try std.testing.expect(hasFreshStoredPayload(&leaf));
 }
 
-test "kmeans bulk builder packs bounded leaves" {
+test "kmeans bulk builders pack bounded leaves" {
     const go_rand = @import("antfly_vector").go_rand;
     const MockIndex = struct {
         alloc: Allocator,
@@ -4754,6 +5821,13 @@ test "kmeans bulk builder packs bounded leaves" {
         max_leaf_members: usize = 0,
         internal_count: usize = 0,
         max_internal_children: usize = 0,
+        nodes: std.AutoHashMapUnmanaged(u64, types.Node) = .empty,
+
+        fn deinit(self: *@This()) void {
+            var iterator = self.nodes.valueIterator();
+            while (iterator.next()) |node| node.deinit(self.alloc);
+            self.nodes.deinit(self.alloc);
+        }
 
         fn nextNodeId(self: *@This()) u64 {
             const id = self.next_id;
@@ -4771,18 +5845,26 @@ test "kmeans bulk builder packs bounded leaves" {
                 self.internal_count += 1;
                 self.max_internal_children = @max(self.max_internal_children, node.children.len);
             }
+            var cloned = try node.clone(self.alloc);
+            errdefer cloned.deinit(self.alloc);
+            if (try self.nodes.fetchPut(self.alloc, node.id, cloned)) |previous| {
+                var old = previous.value;
+                old.deinit(self.alloc);
+            }
         }
 
         fn putNodeSplitRange(_: *@This(), _: anytype, _: u64, _: anytype) !void {}
 
         fn updateParent(_: *@This(), _: anytype, _: u64, _: u64) !void {}
 
-        fn getCachedNodeClone(_: *@This(), _: u64) !?types.Node {
-            return null;
+        fn getCachedNodeClone(self: *@This(), node_id: u64) !?types.Node {
+            const node = self.nodes.get(node_id) orelse return null;
+            return try node.clone(self.alloc);
         }
 
-        fn loadNodeFromStorage(_: *@This(), _: anytype, _: u64) !types.Node {
-            return error.UnexpectedNodeLoad;
+        fn loadNodeFromStorage(self: *@This(), _: anytype, node_id: u64) !types.Node {
+            const node = self.nodes.get(node_id) orelse return error.UnexpectedNodeLoad;
+            return try node.clone(self.alloc);
         }
 
         fn cacheNode(_: *@This(), _: *const types.Node) !void {}
@@ -4821,6 +5903,7 @@ test "kmeans bulk builder packs bounded leaves" {
         },
         .rng = go_rand.GoPcg.init(42, 1024),
     };
+    defer mock.deinit();
 
     var built = try buildBulkKmeansFromInputs(&mock, {}, &inputs);
     defer built.deinit(std.testing.allocator);
@@ -4830,6 +5913,21 @@ test "kmeans bulk builder packs bounded leaves" {
     try std.testing.expect(mock.internal_count > 1);
     try std.testing.expect(mock.max_internal_children <= 2);
     try std.testing.expectEqual(@as(usize, inputs.len), built.member_count);
+
+    var hierarchical = MockIndex{
+        .alloc = std.testing.allocator,
+        .config = mock.config,
+        .rng = go_rand.GoPcg.init(42, 1024),
+    };
+    defer hierarchical.deinit();
+    var hierarchical_built = try buildBulkHierarchicalKmeansFromInputs(&hierarchical, {}, &inputs);
+    defer hierarchical_built.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), hierarchical.leaf_count);
+    try std.testing.expect(hierarchical.max_leaf_members <= 2);
+    try std.testing.expect(hierarchical.internal_count > 0);
+    try std.testing.expect(hierarchical.max_internal_children <= 2);
+    try std.testing.expectEqual(@as(usize, inputs.len), hierarchical_built.member_count);
 }
 
 pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
@@ -4913,7 +6011,12 @@ fn populateMetadataBatchedWithScratch(
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
-    try txn.getManySorted(.vecs, key_views, values);
+    // The index wrapper may layer an immutable native generation over the
+    // compatibility transaction (or use a transaction shell after fully
+    // detaching it). Point metadata reads already honor that ownership map;
+    // keep the batched fast path on the same snapshot rather than bypassing
+    // it through the raw backend transaction.
+    try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (use_cache) _ = try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill);
@@ -4983,7 +6086,13 @@ fn normalizeCentroidForMetric(self: anytype, centroid: []f32) void {
     }
 }
 
-fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count: usize) f32 {
+fn coveringRadiusForMatrix(
+    metric: vec.DistanceMetric,
+    centroid: []const f32,
+    vectors: []const f32,
+    count: usize,
+) f32 {
+    if (metric == .inner_product) return std.math.nan(f32);
     if (count == 0) return 0;
     if (centroid.len == 0 or vectors.len < count * centroid.len) return std.math.nan(f32);
     var max_squared: f32 = 0;
@@ -4996,7 +6105,117 @@ fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count:
         }
         max_squared = @max(max_squared, squared);
     }
-    return @sqrt(max_squared);
+    const radius = @sqrt(max_squared);
+    return if (metric == .cosine) conservativeCosineRadius(radius) else radius;
+}
+
+fn conservativeCosineRadius(radius: f32) f32 {
+    if (!std.math.isFinite(radius) or radius < 0) return std.math.nan(f32);
+    // Radius values become proof objects. Expand them slightly so f32 dot,
+    // norm, and sqrt rounding can only make pruning more conservative.
+    return std.math.nextAfter(f32, radius * 1.000001 + 0.000001, std.math.inf(f32));
+}
+
+fn updateWeightedCentroidAndMeasureCosineShift(
+    self: anytype,
+    centroid: []f32,
+    old_weight: f32,
+    new_weight: f32,
+    added_sum: []const f32,
+) f32 {
+    var old_norm_squared: f32 = 0;
+    var new_norm_squared: f32 = 0;
+    var old_new_dot: f32 = 0;
+    for (centroid, added_sum) |*center, added| {
+        const old_center = center.*;
+        const new_center = (old_center * old_weight + added) / new_weight;
+        old_norm_squared += old_center * old_center;
+        new_norm_squared += new_center * new_center;
+        old_new_dot += old_center * new_center;
+        center.* = new_center;
+    }
+    normalizeCentroidForMetric(self, centroid);
+    if (self.config.metric != .cosine) return 0;
+    if (!(new_norm_squared > 0) or !std.math.isFinite(new_norm_squared)) return std.math.nan(f32);
+    const shift_squared = @max(
+        @as(f32, 0),
+        old_norm_squared + 1.0 - 2.0 * old_new_dot / @sqrt(new_norm_squared),
+    );
+    return conservativeCosineRadius(@sqrt(shift_squared));
+}
+
+fn expandCosineRadiusAfterBatchAppend(
+    node: *types.Node,
+    appended: []const f32,
+    added_count: usize,
+    centroid_shift: f32,
+) void {
+    if (added_count == 0) return;
+    if (node.members.len == added_count) {
+        node.covering_radius = coveringRadiusForMatrix(.cosine, node.centroid, appended, added_count);
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or
+        node.covering_radius < 0 or
+        !std.math.isFinite(centroid_shift) or
+        centroid_shift < 0 or
+        appended.len < added_count * node.centroid.len)
+    {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+
+    var radius = node.covering_radius + centroid_shift;
+    for (0..added_count) |row| {
+        const candidate = appended[row * node.centroid.len ..][0..node.centroid.len];
+        var squared: f32 = 0;
+        for (node.centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        radius = @max(radius, @sqrt(squared));
+    }
+    node.covering_radius = conservativeCosineRadius(radius);
+}
+
+test "cosine append preserves a conservative moving-centroid radius" {
+    const TestIndex = struct {
+        config: struct { metric: vec.DistanceMetric },
+    };
+    const index: TestIndex = .{ .config = .{ .metric = .cosine } };
+    const old_members = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const appended = [_]f32{ -1.0, 0.0 };
+    var centroid = [_]f32{ 1.0, 1.0 };
+    _ = vec.normalize(&centroid);
+    var member_ids = [_]u64{ 1, 2, 3 };
+    var node: types.Node = .{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &centroid,
+        .covering_radius = coveringRadiusForMatrix(.cosine, &centroid, &old_members, 2),
+        .children = &.{},
+        .members = &member_ids,
+    };
+
+    const shift = updateWeightedCentroidAndMeasureCosineShift(
+        index,
+        &centroid,
+        2.0,
+        3.0,
+        &appended,
+    );
+    expandCosineRadiusAfterBatchAppend(&node, &appended, 1, shift);
+
+    for (0..2) |row| {
+        const member = old_members[row * 2 ..][0..2];
+        try std.testing.expect(@sqrt(vec.l2SquaredDistanceToQuery(&centroid, member)) <= node.covering_radius);
+    }
+    try std.testing.expect(@sqrt(vec.l2SquaredDistanceToQuery(&centroid, &appended)) <= node.covering_radius);
 }
 
 fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
@@ -5023,7 +6242,7 @@ fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
 fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, added_count: usize) void {
     if (added_count == 0) return;
     if (node.members.len == added_count) {
-        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, appended, added_count);
+        node.covering_radius = coveringRadiusForMatrix(.l2_squared, node.centroid, appended, added_count);
         return;
     }
     if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len < added_count * node.centroid.len) {
@@ -5054,24 +6273,107 @@ fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, adde
     node.covering_radius = radius;
 }
 
-fn l2SubtreeLowerBound(candidate: types.PriorityItem, covering_radius: f32) ?f32 {
+fn subtreeLowerBound(
+    metric: vec.DistanceMetric,
+    query_measure: f32,
+    candidate: types.PriorityItem,
+    centroid: []const f32,
+    covering_radius: f32,
+) ?f32 {
     if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
-    const centroid_squared_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
-    if (!std.math.isFinite(centroid_squared_lower)) return null;
-    const vector_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
-    return vector_distance_lower * vector_distance_lower;
+    const centroid_metric_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    if (!std.math.isFinite(centroid_metric_lower)) return null;
+    const centroid_chord_lower = switch (metric) {
+        .l2_squared => @sqrt(centroid_metric_lower),
+        .cosine => blk: {
+            // The cosine transform and centroid maintenance normalize both
+            // query and centroid. On the unit sphere cosine distance equals
+            // half squared Euclidean chord distance, so the ordinary metric
+            // ball triangle inequality gives a sound member lower bound.
+            // Degenerate/non-unit centroids retain the width fallback.
+            if (!(query_measure > 0) or centroid.len == 0) return null;
+            const centroid_norm = vec.norm(centroid);
+            if (!std.math.isFinite(centroid_norm) or @abs(centroid_norm - 1.0) > 0.001) return null;
+            break :blk @sqrt(2.0 * @min(centroid_metric_lower, 2.0));
+        },
+        .inner_product => return null,
+    };
+    const member_chord_lower = @max(@as(f32, 0), centroid_chord_lower - covering_radius);
+    return switch (metric) {
+        .l2_squared => member_chord_lower * member_chord_lower,
+        .cosine => 0.5 * member_chord_lower * member_chord_lower,
+        .inner_product => unreachable,
+    };
+}
+
+test "cosine subtree chord bound is admissible" {
+    const query = [_]f32{ 1.0, 0.0, 0.0 };
+    const centroid = [_]f32{ 0.8, 0.6, 0.0 };
+    const members = [_]f32{
+        0.6,  0.8,  0.0,
+        0.96, 0.28, 0.0,
+        0.8,  0.48, 0.36,
+    };
+    const radius = coveringRadiusForMatrix(.cosine, &centroid, &members, 3);
+    const centroid_distance = vec.distanceToQuery(&query, 1.0, &centroid, .cosine);
+    const candidate: types.PriorityItem = .{
+        .id = 1,
+        .distance = centroid_distance,
+        .error_bound = 0.001,
+    };
+    const lower = subtreeLowerBound(.cosine, 1.0, candidate, &centroid, radius) orelse
+        return error.TestUnexpectedResult;
+    for (0..3) |row| {
+        const member = members[row * 3 ..][0..3];
+        const exact = vec.distanceToQuery(&query, 1.0, member, .cosine);
+        try std.testing.expect(lower <= exact + 0.000001);
+    }
+}
+
+test "cosine subtree chord bound rejects degenerate centroid" {
+    const candidate: types.PriorityItem = .{ .id = 1, .distance = 1.0 };
+    try std.testing.expect(subtreeLowerBound(
+        .cosine,
+        1.0,
+        candidate,
+        &[_]f32{ 0.0, 0.0 },
+        1.0,
+    ) == null);
+}
+
+fn retainedResultUpperBound(results: *const search_results.ApproxSearchResults) f32 {
+    var upper: f32 = -std.math.inf(f32);
+    for (results.items.items) |item| upper = @max(upper, item.distance + item.error_bound);
+    return upper;
+}
+
+fn candidateFrontierHasOnlyResolvedBounds(candidates: anytype) bool {
+    for (candidates.items) |candidate| {
+        if (!candidate.bound_resolved or !std.math.isFinite(candidate.lower_bound)) return false;
+    }
+    return true;
 }
 
 fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
-    if (self.config.metric != .l2_squared) return std.math.nan(f32);
+    if (self.config.metric == .inner_product) return std.math.nan(f32);
     if (node.children.len == 0) return 0;
     var radius: f32 = 0;
     for (node.children) |child_id| {
         var child = try loadNode(self, txn, child_id);
         defer child.deinit(self.alloc);
         if (!std.math.isFinite(child.covering_radius) or child.covering_radius < 0) return std.math.nan(f32);
-        const center_squared = vec.distanceToQuery(node.centroid, vec.dot(node.centroid, node.centroid), child.centroid, .l2_squared);
-        radius = @max(radius, @sqrt(@max(center_squared, 0)) + child.covering_radius);
+        const center_distance = vec.distanceToQuery(
+            node.centroid,
+            queryMeasureForMetric(self.config.metric, node.centroid),
+            child.centroid,
+            self.config.metric,
+        );
+        const center_chord = switch (self.config.metric) {
+            .l2_squared => @sqrt(@max(center_distance, 0)),
+            .cosine => @sqrt(2.0 * @min(@max(center_distance, 0), 2.0)),
+            .inner_product => unreachable,
+        };
+        radius = @max(radius, center_chord + child.covering_radius);
     }
     return radius;
 }
@@ -5168,6 +6470,15 @@ fn updateInternalCentroidForLeafSplit(
 }
 
 pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u64) !void {
+    try collapseSingleChildParentsOptions(self, txn, start_node_id, .{});
+}
+
+fn collapseSingleChildParentsOptions(
+    self: anytype,
+    txn: anytype,
+    start_node_id: u64,
+    options: hbc_runtime.BatchInsertOptions,
+) !void {
     var node_id = start_node_id;
     while (node_id != 0) {
         var node = try loadNode(self, txn, node_id);
@@ -5179,7 +6490,7 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
         defer child.deinit(self.alloc);
         const parent_id = node.parent;
         child.parent = parent_id;
-        try self.saveNode(txn, &child);
+        try self.saveNodeWithOptions(txn, &child, options);
 
         if (parent_id == 0) {
             self.metadata.root_node = child_id;
@@ -5197,7 +6508,7 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
             }
         }
         try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNode(txn, &parent);
+        try self.saveNodeWithOptions(txn, &parent, options);
         try deleteNode(self, txn, node_id);
         node_id = parent_id;
     }
@@ -5247,9 +6558,13 @@ fn lessPreparedBatchDelete(_: void, lhs: PreparedBatchDelete, rhs: PreparedBatch
 }
 
 fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
+    try batchDeleteTxnOptions(self, txn, vector_ids, .{});
+}
+
+fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     if (vector_ids.len == 0) return;
-    if (vector_ids.len == 1) return deleteTxn(self, txn, vector_ids[0]) catch |err| switch (err) {
+    if (vector_ids.len == 1) return deleteTxnOptions(self, txn, vector_ids[0], options) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
     };
@@ -5321,15 +6636,15 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
                 try parent.ensureUnbacked(self.alloc);
                 if (try removeChildLink(self, &parent, leaf_id)) {
                     try recomputeInternalCentroid(self, txn, &parent);
-                    try self.saveNode(txn, &parent);
+                    try self.saveNodeWithOptions(txn, &parent, options);
                     try deleteNode(self, txn, leaf_id);
-                    try collapseSingleChildParents(self, txn, leaf.parent);
+                    try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
                 } else {
                     try deleteNode(self, txn, leaf_id);
                 }
             }
         } else {
-            try self.saveNode(txn, &leaf);
+            try self.saveNodeWithOptions(txn, &leaf, options);
         }
 
         for (group) |entry| deleteVectorKeys(self, txn, entry.vector_id);
@@ -5666,6 +6981,10 @@ fn deleteVectorKeys(self: anytype, txn: anytype, vector_id: u64) void {
 }
 
 pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
+    try deleteTxnOptions(self, txn, vector_id, .{});
+}
+
+fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     var leaf_id = self.getVecLeaf(txn, vector_id) catch |err| blk: {
         if (!isNotFoundGeneric(err)) return err;
@@ -5716,14 +7035,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
         try parent.ensureUnbacked(self.alloc);
         if (try removeChildLink(self, &parent, leaf_id)) {
             try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNode(txn, &parent);
+            try self.saveNodeWithOptions(txn, &parent, options);
             try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
+            try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
         } else {
             try deleteNode(self, txn, leaf_id);
         }
     } else {
-        try self.saveNode(txn, &leaf);
+        try self.saveNodeWithOptions(txn, &leaf, options);
 
         if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
             var parent = loadNode(self, txn, leaf.parent) catch |err| {
@@ -5766,14 +7085,14 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
                 self.alloc.free(sibling.members);
                 sibling.members = merged;
                 try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
-                try self.saveNode(txn, &sibling);
+                try self.saveNodeWithOptions(txn, &sibling, options);
                 for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
                 if (try removeChildLink(self, &parent, leaf_id)) {
                     try recomputeInternalCentroid(self, txn, &parent);
-                    try self.saveNode(txn, &parent);
+                    try self.saveNodeWithOptions(txn, &parent, options);
                     try deleteNode(self, txn, leaf_id);
-                    try collapseSingleChildParents(self, txn, leaf.parent);
+                    try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
                 } else {
                     try deleteNode(self, txn, leaf_id);
                 }
@@ -6039,6 +7358,7 @@ pub fn insertWithMetadataTxnOptions(
     _ = try posting.PostingStore.appendMember(self.alloc, &leaf, vector_id);
 
     const n = leaf.members.len;
+    var cosine_centroid_shift: f32 = 0;
     if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (leaf.centroid.len == 0) {
@@ -6047,16 +7367,19 @@ pub fn insertWithMetadataTxnOptions(
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     } else {
         const nf: f32 = @floatFromInt(n);
-        for (leaf.centroid, 0..) |*c, i| {
-            c.* = c.* * (nf - 1.0) / nf + effective_transformed[i] / nf;
-        }
-        normalizeCentroidForMetric(self, leaf.centroid);
+        cosine_centroid_shift = updateWeightedCentroidAndMeasureCosineShift(
+            self,
+            leaf.centroid,
+            nf - 1.0,
+            nf,
+            effective_transformed,
+        );
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     }
-    if (self.config.metric == .l2_squared) {
-        expandL2RadiusAfterAppend(&leaf, effective_transformed);
-    } else {
-        leaf.covering_radius = std.math.nan(f32);
+    switch (self.config.metric) {
+        .l2_squared => expandL2RadiusAfterAppend(&leaf, effective_transformed),
+        .cosine => expandCosineRadiusAfterBatchAppend(&leaf, effective_transformed, 1, cosine_centroid_shift),
+        .inner_product => leaf.covering_radius = std.math.nan(f32),
     }
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
@@ -6543,7 +7866,9 @@ fn rebuildOversizedLeafAsSubtree(
     }
 
     const vector_load_start = now_fn();
-    try loadTransformedVectorIdsIntoMatrix(self, txn, leaf.members, matrix, options);
+    if (!try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, matrix, options)) {
+        try loadTransformedVectorIdsIntoMatrix(self, txn, leaf.members, matrix, options);
+    }
     self.write_profile.split_leaf_vector_load_ns += elapsed_fn(vector_load_start);
 
     const metadata = try self.alloc.alloc(?[]const u8, count);
@@ -6571,20 +7896,19 @@ fn rebuildOversizedLeafAsSubtree(
     const indexes = try self.alloc.alloc(usize, count);
     defer self.alloc.free(indexes);
     for (indexes, 0..) |*index, i| index.* = i;
-    const positions = try self.alloc.alloc(u64, count);
-    defer self.alloc.free(positions);
+    const assignments = try self.alloc.alloc(u8, count);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, count);
+    defer self.alloc.free(distances);
+    const offsets = try self.alloc.alloc(usize, count);
+    defer self.alloc.free(offsets);
     const partitioned_indexes = try self.alloc.alloc(usize, count);
     defer self.alloc.free(partitioned_indexes);
-    addApplyWorkspaceBytes(self, @intCast(matrix_bytes));
-    const recursive_vec_data = try self.alloc.alloc(f32, matrix_floats);
-    defer {
-        self.alloc.free(recursive_vec_data);
-        releaseApplyWorkspaceBytes(self, @intCast(matrix_bytes));
-    }
 
     var scratch = BulkRecursiveScratch{
-        .vec_data = recursive_vec_data,
-        .positions = positions,
+        .assignments = assignments,
+        .distances = distances,
+        .offsets = offsets,
         .partitioned_indexes = partitioned_indexes,
     };
 
@@ -6659,15 +7983,18 @@ pub fn splitLeafWithOptions(
     const vec_data = try self.alloc.alloc(f32, matrix_floats);
     defer self.alloc.free(vec_data);
     const vector_load_start = now_fn();
-    var used_cached_nonquant = false;
-    var quantized_handle = try loadQuantizedReadHandle(
-        self,
-        txn,
-        leaf.id,
-        usesNonQuantizedPayload(leaf),
-        count,
-        isNotFoundGeneric,
-    );
+    var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, vec_data, options);
+    var quantized_handle = if (!used_cached_nonquant)
+        try loadQuantizedReadHandle(
+            self,
+            txn,
+            leaf.id,
+            usesNonQuantizedPayload(leaf),
+            count,
+            isNotFoundGeneric,
+        )
+    else
+        null;
     defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
     if (quantized_handle) |*handle| {
         switch (handle.ptr().*) {
@@ -6754,13 +8081,13 @@ pub fn splitLeafWithOptions(
     defer if (left_vectors.len > 0) self.alloc.free(left_vectors);
     var right_vectors: []f32 = &.{};
     defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
-    if (publish_known_quantized_now or self.config.metric == .l2_squared) {
+    if (publish_known_quantized_now or self.config.metric != .inner_product) {
         left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
         right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
     }
-    if (self.config.metric == .l2_squared) {
-        left_node.covering_radius = l2CoveringRadiusForMatrix(left_node.centroid, left_vectors, left_node.members.len);
-        right_node.covering_radius = l2CoveringRadiusForMatrix(right_node.centroid, right_vectors, right_node.members.len);
+    if (self.config.metric != .inner_product) {
+        left_node.covering_radius = coveringRadiusForMatrix(self.config.metric, left_node.centroid, left_vectors, left_node.members.len);
+        right_node.covering_radius = coveringRadiusForMatrix(self.config.metric, right_node.centroid, right_vectors, right_node.members.len);
     }
 
     if (splitting_root) {
@@ -6877,15 +8204,18 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
     defer self.alloc.free(transformed_scratch);
 
     const vector_load_start = now_fn();
-    var used_cached_nonquant = false;
-    var quantized_handle = try loadQuantizedReadHandle(
-        self,
-        txn,
-        leaf.id,
-        usesNonQuantizedPayload(leaf),
-        leaf.members.len,
-        isNotFoundGeneric,
-    );
+    var used_cached_nonquant = try loadAppendedLeafVectorsFromNonQuantizedPayload(self, txn, leaf, dense_vectors, options);
+    var quantized_handle = if (!used_cached_nonquant)
+        try loadQuantizedReadHandle(
+            self,
+            txn,
+            leaf.id,
+            usesNonQuantizedPayload(leaf),
+            leaf.members.len,
+            isNotFoundGeneric,
+        )
+    else
+        null;
     defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
     if (quantized_handle) |*handle| {
         switch (handle.ptr().*) {
@@ -7004,10 +8334,12 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
                 .members = members,
             };
             defer node.deinit(self.alloc);
-            node.covering_radius = if (self.config.metric == .l2_squared)
-                l2CoveringRadiusForMatrix(node.centroid, group_vectors, node.members.len)
-            else
-                std.math.nan(f32);
+            node.covering_radius = coveringRadiusForMatrix(
+                self.config.metric,
+                node.centroid,
+                group_vectors,
+                node.members.len,
+            );
             if (publish_known_quantized_now) {
                 try saveLeafNodeWithKnownVectors(self, txn, &node, group_vectors, now_fn, elapsed_fn);
             } else {
@@ -7105,7 +8437,7 @@ pub fn batchApplyOptions(
 ) !void {
     if (writes.len == 0 and deletes.len == 0) return;
     if (writes.len == 0) {
-        if (deletes.len == 1) return self.delete(deletes[0]);
+        if (deletes.len == 1 and !options.defer_quantized_rebuild) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
         const publishing = try beginPublishSearchStateIfSupported(self);
@@ -7116,7 +8448,7 @@ pub fn batchApplyOptions(
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
-        try batchDeleteTxn(self, &batch, deletes);
+        try batchDeleteTxnOptions(self, &batch, deletes, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
         try markPublishSearchStateCommittingIfSupported(self, publishing);
@@ -7140,12 +8472,26 @@ pub fn batchApplyOptions(
     try batchDeleteTxn(self, &batch, deletes);
 
     var insert_options = options;
+    // Replacement batches change membership before adding vectors back. Do
+    // not repeatedly rewrite or append to quantized payloads whose centroid
+    // and membership changed earlier in this transaction. Queue every source
+    // and destination posting and rebuild each final payload once at commit.
+    if (insert_options.defer_quantized_rebuild) {
+        insert_options.suppress_quantized_payload_persist = true;
+    }
+    try batchDeleteTxnOptions(self, &batch, deletes, insert_options);
+
+    const caller_assumed_absent = insert_options.assume_absent_ids;
     if (!insert_options.assume_absent_ids and
         try batchWritesAreUniqueAndCoveredByDeletes(self.alloc, writes, deletes))
     {
         insert_options.assume_absent_ids = true;
     }
-    const grouped = if (writes.len > 1 and insert_options.assume_absent_ids and insert_options.coalesce_leaf_writes)
+    // A replacement is absent only because this transaction deleted it. Keep
+    // the cheap per-item absent lookup, but do not bulk-route all replacements
+    // against the pre-insert topology; sequential routing preserves materially
+    // better ANN quality after large replacement batches.
+    const grouped = if (writes.len > 1 and caller_assumed_absent and insert_options.coalesce_leaf_writes)
         try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, writes, insert_options, now_fn, elapsed_fn)
     else
         false;
@@ -7710,6 +9056,7 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         }
 
         const new_len = leaf.members.len;
+        var cosine_centroid_shift: f32 = 0;
         if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
         } else if (leaf.centroid.len == 0) {
@@ -7721,14 +9068,19 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         } else {
             const old_f: f32 = @floatFromInt(old_len);
             const new_f: f32 = @floatFromInt(new_len);
-            for (leaf.centroid, 0..) |*c, dim| c.* = (c.* * old_f + centroid_sum[dim]) / new_f;
-            normalizeCentroidForMetric(self, leaf.centroid);
+            cosine_centroid_shift = updateWeightedCentroidAndMeasureCosineShift(
+                self,
+                leaf.centroid,
+                old_f,
+                new_f,
+                centroid_sum,
+            );
             posting.PostingStore.noteCentroidRefreshed(&leaf);
         }
-        if (self.config.metric == .l2_squared) {
-            expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len);
-        } else {
-            leaf.covering_radius = std.math.nan(f32);
+        switch (self.config.metric) {
+            .l2_squared => expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len),
+            .cosine => expandCosineRadiusAfterBatchAppend(&leaf, added_vectors, group_len, cosine_centroid_shift),
+            .inner_product => leaf.covering_radius = std.math.nan(f32),
         }
 
         const leaf_overflows = leaf.members.len > self.config.leaf_size;
@@ -8038,17 +9390,19 @@ pub fn buildBulkRecursiveFromInputs(
     const indexes = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(indexes);
     for (indexes, 0..) |*index, i| index.* = i;
-    const dims: usize = @intCast(self.config.dims);
-    const vec_data = try self.alloc.alloc(f32, inputs.len * dims);
-    defer self.alloc.free(vec_data);
-    const positions = try self.alloc.alloc(u64, inputs.len);
-    defer self.alloc.free(positions);
+    const assignments = try self.alloc.alloc(u8, inputs.len);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, inputs.len);
+    defer self.alloc.free(distances);
+    const offsets = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(offsets);
     const partitioned_indexes = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(partitioned_indexes);
 
     var scratch = BulkRecursiveScratch{
-        .vec_data = vec_data,
-        .positions = positions,
+        .assignments = assignments,
+        .distances = distances,
+        .offsets = offsets,
         .partitioned_indexes = partitioned_indexes,
     };
     return try buildBulkSubtreeRecursive(self, txn, inputs, indexes, &scratch, 0, 0);
@@ -8259,19 +9613,27 @@ pub fn buildBulkKmeansFromInputs(
     const cluster_count = std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable;
     const dims: usize = @intCast(self.config.dims);
 
-    const dense_vectors = try self.alloc.alloc(f32, inputs.len * dims);
-    defer self.alloc.free(dense_vectors);
     const points = try self.alloc.alloc(kmeans.Point, inputs.len);
     defer self.alloc.free(points);
-    for (points, inputs, 0..) |*point, input, i| {
-        const vector = dense_vectors[i * dims ..][0..dims];
-        @memcpy(vector, input.transformed);
+    for (points, inputs) |*point, input| {
         point.* = .{
             .stable_id = input.vector_id,
-            .vector = vector,
+            .vector = input.transformed,
             .weight = 1,
         };
     }
+
+    // Prepared bulk callers normally own one contiguous transformed matrix.
+    // Preserve the Metal assignment fast path without cloning that entire
+    // matrix; non-contiguous callers remain correct through the CPU backend.
+    const dense_vectors: ?[]const f32 = blk: {
+        if (inputs.len == 0 or inputs[0].transformed.len != dims) break :blk null;
+        const base = inputs[0].transformed.ptr;
+        for (inputs, 0..) |input, i| {
+            if (input.transformed.len != dims or input.transformed.ptr != base + i * dims) break :blk null;
+        }
+        break :blk base[0 .. inputs.len * dims];
+    };
 
     const assignments = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(assignments);
@@ -8332,6 +9694,229 @@ pub fn buildBulkKmeansFromInputs(
     }
 
     return try buildBulkKmeansParentLevels(self, txn, current, current_count);
+}
+
+/// Builds a learned k-way hierarchy without comparing every vector against
+/// every final leaf. This is the in-memory quality oracle for the bounded
+/// production builder: the latter can stream each level through bucket spools
+/// while retaining the same partition and publication semantics.
+pub fn buildBulkHierarchicalKmeansFromInputs(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+) !BuiltBulkNode {
+    if (inputs.len == 0) return error.TooFewVectors;
+    const dims: usize = @intCast(self.config.dims);
+    const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
+    const max_clusters = @min(
+        @max(@as(usize, 2), self.config.branching_factor),
+        std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable,
+    );
+
+    const indexes = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(indexes);
+    for (indexes, 0..) |*index, i| index.* = i;
+
+    const points = try self.alloc.alloc(kmeans.Point, inputs.len);
+    defer self.alloc.free(points);
+    const assignments = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, inputs.len);
+    defer self.alloc.free(distances);
+    const counts = try self.alloc.alloc(usize, max_clusters);
+    defer self.alloc.free(counts);
+    const centroids = try self.alloc.alloc(f32, max_clusters * dims);
+    defer self.alloc.free(centroids);
+    const next_centroids = try self.alloc.alloc(f32, max_clusters * dims);
+    defer self.alloc.free(next_centroids);
+    const entries = try self.alloc.alloc(kmeans.Entry, inputs.len);
+    defer self.alloc.free(entries);
+    const partitioned_indexes = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(partitioned_indexes);
+    var scratch: BulkHierarchicalKmeansScratch = .{
+        .points = points,
+        .assignments = assignments,
+        .distances = distances,
+        .counts = counts,
+        .centroids = centroids,
+        .next_centroids = next_centroids,
+        .entries = entries,
+        .partitioned_indexes = partitioned_indexes,
+    };
+
+    const target_leaf_count = std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable;
+    return try buildBulkHierarchicalKmeansSubtree(self, txn, inputs, indexes, target_leaf_count, &scratch);
+}
+
+fn buildBulkHierarchicalKmeansSubtree(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    target_leaf_count: usize,
+    scratch: *BulkHierarchicalKmeansScratch,
+) !BuiltBulkNode {
+    const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
+    if (target_leaf_count == 1) {
+        if (indexes.len > leaf_size) return error.UnbalancedBulkSplit;
+        const selected = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, indexes.len);
+        defer self.alloc.free(selected);
+        for (selected, indexes) |*out, input_index| out.* = inputs[input_index];
+        return try buildBulkLeaf(self, txn, self.nextNodeId(), selected, 0, 0);
+    }
+
+    const dims: usize = @intCast(self.config.dims);
+    const cluster_count = @min(
+        @max(@as(usize, 2), self.config.branching_factor),
+        target_leaf_count,
+    );
+    const points = scratch.points[0..indexes.len];
+    for (points, indexes) |*point, input_index| point.* = .{
+        .stable_id = inputs[input_index].vector_id,
+        .vector = inputs[input_index].transformed,
+        .weight = 1,
+    };
+
+    const stats = try kmeans.run(.{
+        .dims = dims,
+        .metric = self.config.metric,
+        .max_iter = self.config.kmeans_max_iter,
+        // Subtrees are index views over the caller-owned matrix. The CPU
+        // backend accepts those views without cloning them; a future streamed
+        // builder can batch the same assignments through an accelerator.
+        .backend = .cpu,
+        .update_strategy = self.config.kmeans_update_strategy,
+        .dense_vectors = null,
+    }, points, self.rng.intN(points.len), scratch.centroids[0 .. cluster_count * dims], scratch.next_centroids[0 .. cluster_count * dims], scratch.assignments[0..indexes.len], scratch.distances[0..indexes.len], scratch.counts[0..cluster_count], scratch.entries[0..indexes.len]);
+    recordKmeansRunStats(self, stats);
+
+    const child_leaf_counts = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(child_leaf_counts);
+    const group_sizes = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(group_sizes);
+    const base_leaf_count = target_leaf_count / cluster_count;
+    const extra_leaf_count = target_leaf_count % cluster_count;
+    var leaf_cursor: usize = 0;
+    const base_leaf_size = indexes.len / target_leaf_count;
+    const extra_vector_count = indexes.len % target_leaf_count;
+    for (child_leaf_counts, group_sizes, 0..) |*child_leaves, *group_size, cluster| {
+        child_leaves.* = base_leaf_count + @intFromBool(cluster < extra_leaf_count);
+        const next_leaf_cursor = leaf_cursor + child_leaves.*;
+        group_size.* = child_leaves.* * base_leaf_size +
+            @min(next_leaf_cursor, extra_vector_count) - @min(leaf_cursor, extra_vector_count);
+        leaf_cursor = next_leaf_cursor;
+    }
+    if (leaf_cursor != target_leaf_count) return error.UnbalancedBulkSplit;
+
+    try assignBalancedHierarchicalKmeansGroups(
+        self,
+        points,
+        scratch.centroids[0 .. cluster_count * dims],
+        group_sizes,
+        scratch.assignments[0..indexes.len],
+        scratch.distances[0..indexes.len],
+        scratch.counts[0..cluster_count],
+        scratch.partitioned_indexes[0..indexes.len],
+    );
+    const write_positions = try self.alloc.alloc(usize, cluster_count);
+    defer self.alloc.free(write_positions);
+    var write_cursor: usize = 0;
+    for (write_positions, group_sizes) |*position, group_size| {
+        position.* = write_cursor;
+        write_cursor += group_size;
+    }
+    if (write_cursor != indexes.len) return error.UnbalancedBulkSplit;
+    for (scratch.assignments[0..indexes.len], 0..) |cluster, local_index| {
+        if (cluster >= cluster_count or write_positions[cluster] >= indexes.len) return error.UnbalancedBulkSplit;
+        scratch.partitioned_indexes[write_positions[cluster]] = indexes[local_index];
+        write_positions[cluster] += 1;
+    }
+    @memcpy(indexes, scratch.partitioned_indexes[0..indexes.len]);
+
+    const children = try self.alloc.alloc(BuiltBulkNode, cluster_count);
+    var child_count: usize = 0;
+    defer {
+        for (children[0..child_count]) |*child| child.deinit(self.alloc);
+        self.alloc.free(children);
+    }
+    var index_start: usize = 0;
+    var parent_level: u16 = 1;
+    for (group_sizes, child_leaf_counts) |group_size, child_target_leaf_count| {
+        children[child_count] = try buildBulkHierarchicalKmeansSubtree(
+            self,
+            txn,
+            inputs,
+            indexes[index_start .. index_start + group_size],
+            child_target_leaf_count,
+            scratch,
+        );
+        parent_level = @max(parent_level, children[child_count].level +| 1);
+        child_count += 1;
+        index_start += group_size;
+    }
+    return try buildBulkParentFromNodeRange(self, txn, children, parent_level);
+}
+
+fn assignBalancedHierarchicalKmeansGroups(
+    self: anytype,
+    points: []const kmeans.Point,
+    centroids: []const f32,
+    capacities: []const usize,
+    assignments: []usize,
+    margins: []f32,
+    counts: []usize,
+    order: []usize,
+) !void {
+    const dims: usize = @intCast(self.config.dims);
+    if (points.len != assignments.len or points.len != margins.len or points.len != order.len or
+        capacities.len != counts.len or centroids.len != capacities.len * dims)
+        return error.BufferTooSmall;
+
+    for (points, 0..) |point, point_index| {
+        var best = std.math.inf(f32);
+        var second = std.math.inf(f32);
+        for (0..capacities.len) |cluster| {
+            const centroid = centroids[cluster * dims ..][0..dims];
+            const distance = vec.distance(point.vector, centroid, self.config.metric);
+            if (distance < best) {
+                second = best;
+                best = distance;
+            } else if (distance < second) {
+                second = distance;
+            }
+        }
+        const margin = second - best;
+        margins[point_index] = if (std.math.isFinite(margin)) margin else 0;
+        order[point_index] = point_index;
+    }
+    const SortContext = struct { margins: []const f32, points: []const kmeans.Point };
+    std.mem.sort(usize, order, SortContext{ .margins = margins, .points = points }, struct {
+        fn lessThan(context: SortContext, a: usize, b: usize) bool {
+            if (context.margins[a] != context.margins[b]) return context.margins[a] > context.margins[b];
+            return context.points[a].stable_id < context.points[b].stable_id;
+        }
+    }.lessThan);
+
+    @memset(counts, 0);
+    for (order) |point_index| {
+        var selected: ?usize = null;
+        var selected_distance = std.math.inf(f32);
+        for (0..capacities.len) |cluster| {
+            if (counts[cluster] >= capacities[cluster]) continue;
+            const centroid = centroids[cluster * dims ..][0..dims];
+            const distance = vec.distance(points[point_index].vector, centroid, self.config.metric);
+            if (selected == null or distance < selected_distance) {
+                selected = cluster;
+                selected_distance = distance;
+            }
+        }
+        const cluster = selected orelse return error.UnbalancedBulkSplit;
+        assignments[point_index] = cluster;
+        counts[cluster] += 1;
+    }
+    for (counts, capacities) |count, capacity| {
+        if (count != capacity) return error.UnbalancedBulkSplit;
+    }
 }
 
 pub fn splitVectorSet(
@@ -8415,6 +10000,12 @@ pub fn putQuantizedCached(self: anytype, txn: anytype, node_id: u64, qs: *const 
 
 pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !hbc_runtime.QuantizedSet {
     _ = is_not_found;
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "loadNativeQuantizedView")) {
+        if (try self.loadNativeQuantizedView(txn, node_id, is_root, expected_count)) |native| {
+            return try native.clone(self.alloc);
+        }
+    }
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node_id));
     var decoded = if (is_root)
@@ -8566,6 +10157,7 @@ pub fn refreshQuantizedWithOptions(
 
     if (node.is_leaf) {
         try posting.PostingStore.refreshQuantizedPayload(self, txn, node, vectors, now_fn, elapsed_fn);
+        if (usesNonQuantizedPayload(node)) noteSplitWorkspaceLeafPayloadCoverage(self, node.members);
         return;
     }
 
@@ -9297,13 +10889,13 @@ fn buildBulkLeaf(
         .children = &.{},
         .members = members,
     };
-    if (self.config.metric == .l2_squared) {
+    if (self.config.metric != .inner_product) {
         const radius_matrix = try self.alloc.alloc(f32, inputs.len * self.config.dims);
         defer self.alloc.free(radius_matrix);
         for (inputs, 0..) |input, row| {
             @memcpy(radius_matrix[row * self.config.dims ..][0..self.config.dims], input.transformed);
         }
-        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, radius_matrix, inputs.len);
+        node.covering_radius = coveringRadiusForMatrix(self.config.metric, node.centroid, radius_matrix, inputs.len);
     }
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, &range);
@@ -9337,38 +10929,278 @@ fn partitionBulkInputIndexesInPlace(
     indexes: []usize,
     scratch: *BulkRecursiveScratch,
 ) !usize {
+    if (indexes.len < 2) return error.TooFewVectors;
+    if (self.config.metric == .cosine) {
+        for (indexes) |input_idx| {
+            if (@abs(vec.norm(inputs[input_idx].transformed) - 1.0) > 1e-3) return error.NonUnitVector;
+        }
+    }
+    return switch (self.config.split_algo) {
+        .kmeans => partitionBulkInputIndexesKmeans(self, inputs, indexes, scratch),
+        .hilbert => partitionBulkInputIndexesHilbert(self, inputs, indexes, scratch),
+    };
+}
+
+/// Partition views over the caller-owned vector plane. The previous recursive
+/// builder copied every vector in the current subtree into one contiguous
+/// matrix before each split. At the root that duplicated the complete corpus
+/// (3.07 GB for 1M x 768), and every lower level recopied it again. Keeping
+/// only indexes and O(N) scalar scratch makes the builder usable with mmap'd
+/// exact-vector generations while preserving the same two-means algorithm.
+fn partitionBulkInputIndexesKmeans(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    scratch: *BulkRecursiveScratch,
+) !usize {
+    const count = indexes.len;
     const dims: usize = @intCast(self.config.dims);
-    const vec_data = scratch.vec_data[0 .. indexes.len * dims];
-    const positions = scratch.positions[0..indexes.len];
-    const partitioned_indexes = scratch.partitioned_indexes[0..indexes.len];
+    const assignments = scratch.assignments[0..count];
+    const distances = scratch.distances[0..count];
+    const offsets = scratch.offsets[0..count];
+    const partitioned_indexes = scratch.partitioned_indexes[0..count];
+
+    const left_centroid = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(left_centroid);
+    const right_centroid = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(right_centroid);
+    const new_left = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(new_left);
+    const new_right = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(new_right);
+
+    const left_idx = self.rng.intN(count);
+    @memcpy(left_centroid, inputs[indexes[left_idx]].transformed);
+
+    var dist_sum: f32 = 0;
+    var min_dist: f32 = std.math.inf(f32);
+    for (indexes, 0..) |input_idx, i| {
+        const input_vector = inputs[input_idx].transformed;
+        var distance = vec.distance(input_vector, left_centroid, self.config.metric);
+        if (self.config.metric == .inner_product) {
+            const norm = vec.norm(input_vector);
+            if (norm != 0) distance /= norm;
+        }
+        distances[i] = distance;
+        dist_sum += distance;
+        min_dist = @min(min_dist, distance);
+    }
+    dist_sum += @as(f32, @floatFromInt(count)) * -min_dist;
+    if (min_dist != 0) {
+        for (distances) |*distance| distance.* -= min_dist;
+    }
+    if (dist_sum > 0) vec.scale(1.0 / dist_sum, distances);
+
+    var cumulative: f32 = 0;
+    const random = self.rng.float32();
+    var right_idx: usize = count - 1;
+    for (distances, 0..) |probability, i| {
+        cumulative += probability;
+        if (random < cumulative) {
+            right_idx = i;
+            break;
+        }
+    }
+    @memcpy(right_centroid, inputs[indexes[right_idx]].transformed);
+
+    const tolerance = calcIndexedTolerance(self, inputs, indexes);
+    for (0..self.config.kmeans_max_iter) |_| {
+        assignIndexedPartitions(self, inputs, indexes, left_centroid, right_centroid, assignments, distances, offsets);
+        calcIndexedPartitionCentroids(inputs, indexes, assignments, new_left, new_right);
+        const left_shift = vec.l2SquaredDistance(left_centroid, new_left);
+        const right_shift = vec.l2SquaredDistance(right_centroid, new_right);
+        @memcpy(left_centroid, new_left);
+        @memcpy(right_centroid, new_right);
+        if (left_shift + right_shift <= tolerance) break;
+    }
+    assignIndexedPartitions(self, inputs, indexes, left_centroid, right_centroid, assignments, distances, offsets);
+
+    var left_count: usize = 0;
+    for (assignments) |assignment| {
+        if (assignment == 0) left_count += 1;
+    }
+    if (left_count == 0 or left_count == count) return error.UnbalancedBulkSplit;
+
+    var left_position: usize = 0;
+    var right_position: usize = left_count;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            partitioned_indexes[left_position] = input_idx;
+            left_position += 1;
+        } else {
+            partitioned_indexes[right_position] = input_idx;
+            right_position += 1;
+        }
+    }
+    @memcpy(indexes, partitioned_indexes);
+    return left_count;
+}
+
+fn partitionBulkInputIndexesHilbert(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    scratch: *BulkRecursiveScratch,
+) !usize {
+    const Entry = struct {
+        position: usize,
+        embedding: []const u8,
+    };
+    const count = indexes.len;
+    const entries = try self.alloc.alloc(Entry, count);
+    defer self.alloc.free(entries);
+    const hilbert = try self.getHilbert();
+    const embedding_len = hilbert.byteLen();
+    const embeddings = try self.alloc.alloc(u8, count * embedding_len);
+    defer self.alloc.free(embeddings);
+    const coords = try self.alloc.alloc(u32, hilbert.dimension);
+    defer self.alloc.free(coords);
+    const assignments = scratch.assignments[0..count];
+    const partitioned_indexes = scratch.partitioned_indexes[0..count];
+
+    for (indexes, 0..) |input_idx, position| {
+        const embedding = embeddings[position * embedding_len ..][0..embedding_len];
+        try hilbert.encodeVecBytesInto(inputs[input_idx].transformed, coords, embedding);
+        entries[position] = .{ .position = position, .embedding = embedding };
+    }
+    std.mem.sort(Entry, entries, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            const order = std.mem.order(u8, a.embedding, b.embedding);
+            return order == .lt or (order == .eq and a.position < b.position);
+        }
+    }.lessThan);
+
+    const left_count = count / 2;
+    @memset(assignments, 1);
+    for (entries[0..left_count]) |entry| assignments[entry.position] = 0;
+    var left_position: usize = 0;
+    var right_position: usize = left_count;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            partitioned_indexes[left_position] = input_idx;
+            left_position += 1;
+        } else {
+            partitioned_indexes[right_position] = input_idx;
+            right_position += 1;
+        }
+    }
+    @memcpy(indexes, partitioned_indexes);
+    return left_count;
+}
+
+fn assignIndexedPartitions(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+    left_centroid: []const f32,
+    right_centroid: []const f32,
+    assignments: []u8,
+    distances: []f32,
+    offsets: []usize,
+) void {
+    const spherical = self.config.metric == .cosine;
+    var inv_left_norm: f32 = 1;
+    var inv_right_norm: f32 = 1;
+    if (spherical) {
+        const left_norm = vec.norm(left_centroid);
+        if (left_norm != 0) inv_left_norm = 1.0 / left_norm;
+        const right_norm = vec.norm(right_centroid);
+        if (right_norm != 0) inv_right_norm = 1.0 / right_norm;
+    }
+
+    var left_count: usize = 0;
+    for (indexes, 0..) |input_idx, i| {
+        const input_vector = inputs[input_idx].transformed;
+        const left_distance = if (spherical)
+            -vec.dot(input_vector, left_centroid) * inv_left_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(input_vector, left_centroid)
+        else
+            vec.l2SquaredDistance(input_vector, left_centroid);
+        const right_distance = if (spherical)
+            -vec.dot(input_vector, right_centroid) * inv_right_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(input_vector, right_centroid)
+        else
+            vec.l2SquaredDistance(input_vector, right_centroid);
+        distances[i] = left_distance - right_distance;
+        if (distances[i] < 0) left_count += 1;
+    }
+
+    const count = indexes.len;
+    const min_count = (count * self.config.kmeans_min_balance_pct + 99) / 100;
+    if (left_count >= min_count and count - left_count >= min_count) {
+        for (distances, 0..) |distance, i| assignments[i] = if (distance < 0) 0 else 1;
+        return;
+    }
+
+    for (offsets, 0..) |*offset, i| offset.* = i;
+    std.mem.sort(usize, offsets, distances, struct {
+        fn lessThan(ctx: []f32, a: usize, b: usize) bool {
+            return ctx[a] < ctx[b] or (ctx[a] == ctx[b] and a < b);
+        }
+    }.lessThan);
+    const adjusted_left = if (left_count < min_count)
+        min_count
+    else if (count - left_count < min_count)
+        count - min_count
+    else
+        left_count;
+    for (offsets, 0..) |offset, i| assignments[offset] = if (i < adjusted_left) 0 else 1;
+}
+
+fn calcIndexedPartitionCentroids(
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+    assignments: []const u8,
+    left_centroid: []f32,
+    right_centroid: []f32,
+) void {
+    @memset(left_centroid, 0);
+    @memset(right_centroid, 0);
+    var left_count: usize = 0;
+    var right_count: usize = 0;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            vec.add(left_centroid, inputs[input_idx].transformed);
+            left_count += 1;
+        } else {
+            vec.add(right_centroid, inputs[input_idx].transformed);
+            right_count += 1;
+        }
+    }
+    if (left_count > 0) vec.scale(1.0 / @as(f32, @floatFromInt(left_count)), left_centroid);
+    if (right_count > 0) vec.scale(1.0 / @as(f32, @floatFromInt(right_count)), right_centroid);
+}
+
+fn calcIndexedTolerance(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+) f32 {
+    if (indexes.len < 2) return 0;
+    const dims: usize = @intCast(self.config.dims);
+    const means = self.alloc.alloc(f32, dims) catch return 0;
+    defer self.alloc.free(means);
+    const m2 = self.alloc.alloc(f32, dims) catch return 0;
+    defer self.alloc.free(m2);
+    @memset(means, 0);
+    @memset(m2, 0);
 
     for (indexes, 0..) |input_idx, i| {
-        const input = inputs[input_idx];
-        positions[i] = @intCast(i);
-        @memcpy(vec_data[i * dims ..][0..dims], input.transformed);
+        const input_vector = inputs[input_idx].transformed;
+        const sample_index: f32 = @floatFromInt(i + 1);
+        for (0..dims) |dimension| {
+            const delta = input_vector[dimension] - means[dimension];
+            means[dimension] += delta / sample_index;
+            const delta2 = input_vector[dimension] - means[dimension];
+            m2[dimension] += delta * delta2;
+        }
     }
-    var vector_set = vec.Set{
-        .dims = self.config.dims,
-        .count = indexes.len,
-        .data = vec_data,
-    };
-    const split = try self.splitVectorSet(&vector_set, positions);
-    defer {
-        if (split.c1.len > 0) self.alloc.free(split.c1);
-        if (split.g1.len > 0) self.alloc.free(split.g1);
-        if (split.c2.len > 0) self.alloc.free(split.c2);
-        if (split.g2.len > 0) self.alloc.free(split.g2);
-    }
-
-    for (split.g1, 0..) |position, i| {
-        partitioned_indexes[i] = indexes[@intCast(position)];
-    }
-    for (split.g2, 0..) |position, i| {
-        partitioned_indexes[split.g1.len + i] = indexes[@intCast(position)];
-    }
-    if (split.g1.len == 0 or split.g2.len == 0) return error.UnbalancedBulkSplit;
-    @memcpy(indexes, partitioned_indexes);
-    return split.g1.len;
+    var variance_sum: f32 = 0;
+    const inverse_count_minus_one = 1.0 / @as(f32, @floatFromInt(indexes.len - 1));
+    for (m2) |value| variance_sum += value * inverse_count_minus_one;
+    return (variance_sum / @as(f32, @floatFromInt(dims))) * 1e-4;
 }
 
 fn splitVectorSetKmeans(

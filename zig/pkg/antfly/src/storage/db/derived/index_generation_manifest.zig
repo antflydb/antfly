@@ -14,14 +14,25 @@ const fs_paths = @import("../../../common/fs_paths.zig");
 const Allocator = std.mem.Allocator;
 const file_name = ".antfly-index-generation";
 const magic = "AFIDXGN1";
-const version: u32 = 1;
+const legacy_version: u32 = 1;
+const version: u32 = 2;
 const max_index_name_bytes: usize = 4 * 1024;
 const max_manifest_bytes: usize = 8 * 1024;
+
+pub const PhysicalFormat = enum(u16) {
+    /// Generic LSM-backed physical generation used by pre-native indexes and
+    /// by non-dense derived indexes.
+    legacy_lsm = 1,
+    /// Native HBC WAL + immutable segment generation. V2 active-root pointers
+    /// deliberately keep binaries that do not understand this format out.
+    dense_native_v2 = 2,
+};
 
 pub const Manifest = struct {
     generation_id: u128,
     config_hash: u64,
     ready_applied_sequence: u64,
+    physical_format: PhysicalFormat,
     index_name: []u8,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -49,12 +60,32 @@ pub fn writeReady(
     config_hash: u64,
     ready_applied_sequence: u64,
 ) !void {
+    return writeReadyForPhysicalFormat(
+        alloc,
+        index_path,
+        generation_id,
+        index_name,
+        config_hash,
+        ready_applied_sequence,
+        .legacy_lsm,
+    );
+}
+
+pub fn writeReadyForPhysicalFormat(
+    alloc: Allocator,
+    index_path: []const u8,
+    generation_id: u128,
+    index_name: []const u8,
+    config_hash: u64,
+    ready_applied_sequence: u64,
+    physical_format: PhysicalFormat,
+) !void {
     if (generation_id == 0 or index_name.len == 0 or index_name.len > max_index_name_bytes) {
         return error.InvalidIndexGenerationManifest;
     }
     const path = try manifestPathAlloc(alloc, index_path);
     defer alloc.free(path);
-    const raw = try encode(alloc, generation_id, index_name, config_hash, ready_applied_sequence);
+    const raw = try encode(alloc, generation_id, index_name, config_hash, ready_applied_sequence, physical_format);
     defer alloc.free(raw);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp_path);
@@ -140,14 +171,47 @@ fn manifestPathAlloc(alloc: Allocator, index_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ index_path, file_name });
 }
 
-fn encode(alloc: Allocator, generation_id: u128, index_name: []const u8, config_hash: u64, sequence: u64) ![]u8 {
+fn encode(
+    alloc: Allocator,
+    generation_id: u128,
+    index_name: []const u8,
+    config_hash: u64,
+    sequence: u64,
+    physical_format: PhysicalFormat,
+) ![]u8 {
+    return encodeForVersion(
+        alloc,
+        generation_id,
+        index_name,
+        config_hash,
+        sequence,
+        physical_format,
+        version,
+    );
+}
+
+fn encodeForVersion(
+    alloc: Allocator,
+    generation_id: u128,
+    index_name: []const u8,
+    config_hash: u64,
+    sequence: u64,
+    physical_format: PhysicalFormat,
+    record_version: u32,
+) ![]u8 {
+    if (record_version != legacy_version and record_version != version) {
+        return error.InvalidIndexGenerationManifest;
+    }
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, magic);
-    try appendInt(alloc, &out, u32, version);
+    try appendInt(alloc, &out, u32, record_version);
     try appendInt(alloc, &out, u128, generation_id);
     try appendInt(alloc, &out, u64, config_hash);
     try appendInt(alloc, &out, u64, sequence);
+    if (record_version >= version) {
+        try appendInt(alloc, &out, u16, @intFromEnum(physical_format));
+    }
     try appendInt(alloc, &out, u32, @intCast(index_name.len));
     try out.appendSlice(alloc, index_name);
     try appendInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
@@ -163,10 +227,20 @@ fn decode(alloc: Allocator, raw: []const u8) !Manifest {
         return error.InvalidIndexGenerationManifest;
     }
     var pos: usize = magic.len;
-    if (try readInt(raw[0..payload_end], &pos, u32) != version) return error.InvalidIndexGenerationManifest;
+    const record_version = try readInt(raw[0..payload_end], &pos, u32);
+    if (record_version != legacy_version and record_version != version) return error.InvalidIndexGenerationManifest;
     const generation_id = try readInt(raw[0..payload_end], &pos, u128);
     const config_hash = try readInt(raw[0..payload_end], &pos, u64);
     const sequence = try readInt(raw[0..payload_end], &pos, u64);
+    const physical_format: PhysicalFormat = if (record_version >= version) switch (try readInt(
+        raw[0..payload_end],
+        &pos,
+        u16,
+    )) {
+        @intFromEnum(PhysicalFormat.legacy_lsm) => .legacy_lsm,
+        @intFromEnum(PhysicalFormat.dense_native_v2) => .dense_native_v2,
+        else => return error.InvalidIndexGenerationManifest,
+    } else .legacy_lsm;
     const name_len = try readInt(raw[0..payload_end], &pos, u32);
     if (generation_id == 0 or name_len == 0 or name_len > max_index_name_bytes or pos + name_len != payload_end) {
         return error.InvalidIndexGenerationManifest;
@@ -175,6 +249,7 @@ fn decode(alloc: Allocator, raw: []const u8) !Manifest {
         .generation_id = generation_id,
         .config_hash = config_hash,
         .ready_applied_sequence = sequence,
+        .physical_format = physical_format,
         .index_name = try alloc.dupe(u8, raw[pos .. pos + name_len]),
     };
 }
@@ -216,4 +291,26 @@ test "index generation manifest is durable and fenced by identity" {
     try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
     const missing = try certifyReady(alloc, path, 91, "dense_idx", 44);
     try std.testing.expectEqual(ReadyCertification.missing, std.meta.activeTag(missing));
+}
+
+test "index generation manifest identifies native physical generations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try writeReadyForPhysicalFormat(alloc, path, 92, "dense_idx", 45, 124, .dense_native_v2);
+    var manifest = try load(alloc, path);
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(PhysicalFormat.dense_native_v2, manifest.physical_format);
+}
+
+test "index generation manifest decodes legacy v1 as LSM physical format" {
+    const alloc = std.testing.allocator;
+    const raw = try encodeForVersion(alloc, 93, "old_dense_idx", 46, 125, .legacy_lsm, legacy_version);
+    defer alloc.free(raw);
+    var manifest = try decode(alloc, raw);
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(PhysicalFormat.legacy_lsm, manifest.physical_format);
+    try std.testing.expectEqual(@as(u64, 125), manifest.ready_applied_sequence);
 }

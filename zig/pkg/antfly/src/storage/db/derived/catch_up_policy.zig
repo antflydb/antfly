@@ -159,7 +159,10 @@ pub fn replayWindowMaxWaitNs(policy: Policy, pending_records: u64) u64 {
     if (pending_records == 0) return 0;
     if (policy.coalesce_min_records == 0 or policy.coalesce_delay_ns == 0 or policy.coalesce_max_wait_ns == 0) return 0;
     if (pending_records >= policy.coalesce_min_records) return 0;
-    return scaleCeilNs(policy.coalesce_max_wait_ns, pending_records, policy.coalesce_min_records);
+    // This is the total bound for a busy ingest burst, not the delay imposed
+    // on an isolated write. The worker returns after one quiet coalesce period;
+    // it only spends this whole budget while the replay target keeps moving.
+    return policy.coalesce_max_wait_ns;
 }
 
 pub fn sessionIdleMaxWaitNs(policy: Policy, recent_tail_records: u64) u64 {

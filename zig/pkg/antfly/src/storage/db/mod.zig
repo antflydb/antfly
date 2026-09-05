@@ -93,6 +93,7 @@ pub const DocumentArtifactChildRangeApplyBatch = @import("db.zig").DocumentArtif
 pub const DocumentArtifactChildRangeDispatch = @import("db.zig").DocumentArtifactChildRangeDispatch;
 pub const DocumentArtifactChildRangeDispatcher = @import("db.zig").DocumentArtifactChildRangeDispatcher;
 pub const OpenOptions = @import("db.zig").OpenOptions;
+pub const DenseNativeMigrationPolicySource = @import("db.zig").DenseNativeMigrationPolicySource;
 pub const NativeRestoreOpenPlan = @import("db.zig").NativeRestoreOpenPlan;
 pub const OpenMode = @import("db.zig").OpenMode;
 pub const HAAsyncEffectMirror = @import("db.zig").HAAsyncEffectMirror;

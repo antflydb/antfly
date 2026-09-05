@@ -40,6 +40,88 @@ pub const CancellationToken = struct {
 };
 
 const estimate_cancellation_stride = 64;
+const query_quantization_simd_width = 8;
+const QueryQuantizationSimdF32 = @Vector(query_quantization_simd_width, f32);
+const QueryQuantizationSimdU32 = @Vector(query_quantization_simd_width, u32);
+
+fn quantizeQueryPlanes(
+    query_diff: []const f32,
+    unbias: []const f32,
+    min_val: f32,
+    delta: f32,
+    q1: []u64,
+    q2: []u64,
+    q3: []u64,
+    q4: []u64,
+    cancellation: ?CancellationToken,
+) !u64 {
+    std.debug.assert(query_diff.len == unbias.len);
+    const width = rabitq.codeWidth(query_diff.len);
+    std.debug.assert(q1.len == width);
+    std.debug.assert(q2.len == width);
+    std.debug.assert(q3.len == width);
+    std.debug.assert(q4.len == width);
+
+    const min_vec: QueryQuantizationSimdF32 = @splat(min_val);
+    const delta_vec: QueryQuantizationSimdF32 = @splat(delta);
+    const max_vec: QueryQuantizationSimdF32 = @splat(15.0);
+    var quantized_sum: u64 = 0;
+
+    for (0..width) |word_index| {
+        if (cancellation) |token| try token.check();
+
+        const start = word_index * 64;
+        const end = @min(start + 64, query_diff.len);
+        var quantized1: u64 = 0;
+        var quantized2: u64 = 0;
+        var quantized3: u64 = 0;
+        var quantized4: u64 = 0;
+        var d = start;
+
+        if (delta != 0) {
+            while (d + query_quantization_simd_width <= end) : (d += query_quantization_simd_width) {
+                const diff_vec: QueryQuantizationSimdF32 = query_diff[d..][0..query_quantization_simd_width].*;
+                const unbias_vec: QueryQuantizationSimdF32 = unbias[d..][0..query_quantization_simd_width].*;
+                const quantized_float = @min(@floor((diff_vec - min_vec) / delta_vec + unbias_vec), max_vec);
+                const quantized: QueryQuantizationSimdU32 = @intFromFloat(quantized_float);
+
+                inline for (0..query_quantization_simd_width) |lane| {
+                    const q_val: u64 = quantized[lane];
+                    quantized_sum += q_val;
+                    quantized1 = (quantized1 << 1) | (q_val & 1);
+                    quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+                    quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+                    quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+                }
+            }
+
+            while (d < end) : (d += 1) {
+                var q_val: u64 = @intFromFloat(@floor((query_diff[d] - min_val) / delta + unbias[d]));
+                q_val = @min(q_val, 15);
+                quantized_sum += q_val;
+                quantized1 = (quantized1 << 1) | (q_val & 1);
+                quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+                quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+                quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+            }
+        }
+
+        const word_dims = end - start;
+        if (word_dims < 64) {
+            const shift: u6 = @intCast(64 - word_dims);
+            quantized1 <<= shift;
+            quantized2 <<= shift;
+            quantized3 <<= shift;
+            quantized4 <<= shift;
+        }
+        q1[word_index] = quantized1;
+        q2[word_index] = quantized2;
+        q3[word_index] = quantized3;
+        q4[word_index] = quantized4;
+    }
+
+    return quantized_sum;
+}
 
 /// RaBitQuantizer quantizes vectors into 1 bit per dimension.
 ///
@@ -396,53 +478,20 @@ pub const RaBitQuantizer = struct {
         const quantized_range: f32 = 15.0;
         const delta = (max_val - min_val) / quantized_range;
 
-        // Quantize query to 4-bit sub-codes.
-        @memset(temp_q1, 0);
-        @memset(temp_q2, 0);
-        @memset(temp_q3, 0);
-        @memset(temp_q4, 0);
-
-        var quantized_sum: u64 = 0;
-        var quantized1: u64 = 0;
-        var quantized2: u64 = 0;
-        var quantized3: u64 = 0;
-        var quantized4: u64 = 0;
-
-        for (0..self.dims) |d| {
-            if (d % estimate_cancellation_stride == 0) if (cancellation) |token| try token.check();
-            if (delta != 0) {
-                var q_val: u64 = @intFromFloat(@floor((temp_query_diff[d] - min_val) / delta + self.unbias[d]));
-                q_val = @min(q_val, @as(u64, @intFromFloat(quantized_range)));
-                quantized_sum += q_val;
-                quantized1 = (quantized1 << 1) | (q_val & 1);
-                quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
-                quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
-                quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
-            } else {
-                quantized1 <<= 1;
-                quantized2 <<= 1;
-                quantized3 <<= 1;
-                quantized4 <<= 1;
-            }
-
-            if ((d + 1) % 64 == 0) {
-                const offset = d / 64;
-                temp_q1[offset] = quantized1;
-                temp_q2[offset] = quantized2;
-                temp_q3[offset] = quantized3;
-                temp_q4[offset] = quantized4;
-            }
-        }
-
-        // Set leftover bits.
-        if (self.dims % 64 != 0) {
-            const offset = self.dims / 64;
-            const shift: u6 = @intCast(64 - (self.dims % 64));
-            temp_q1[offset] = quantized1 << shift;
-            temp_q2[offset] = quantized2 << shift;
-            temp_q3[offset] = quantized3 << shift;
-            temp_q4[offset] = quantized4 << shift;
-        }
+        // Quantize query to 4-bit sub-codes. Query quantization runs once per
+        // visited leaf, so keep the floating-point work SIMD even though the
+        // four bit planes retain the existing MSB-first wire representation.
+        const quantized_sum = try quantizeQueryPlanes(
+            temp_query_diff,
+            self.unbias,
+            min_val,
+            delta,
+            temp_q1,
+            temp_q2,
+            temp_q3,
+            temp_q4,
+            cancellation,
+        );
 
         const delta_scale = delta * self.sqrt_dims_inv;
         const term1_scale = 2.0 * delta_scale;
@@ -573,6 +622,131 @@ fn resizeSlice(comptime T: type, alloc: Allocator, slice: []T, new_len: usize) !
 }
 
 // --- Tests ---
+
+fn quantizeQueryPlanesScalarForTest(
+    query_diff: []const f32,
+    unbias: []const f32,
+    min_val: f32,
+    delta: f32,
+    q1: []u64,
+    q2: []u64,
+    q3: []u64,
+    q4: []u64,
+) u64 {
+    @memset(q1, 0);
+    @memset(q2, 0);
+    @memset(q3, 0);
+    @memset(q4, 0);
+    var quantized_sum: u64 = 0;
+    var quantized1: u64 = 0;
+    var quantized2: u64 = 0;
+    var quantized3: u64 = 0;
+    var quantized4: u64 = 0;
+
+    for (query_diff, 0..) |value, d| {
+        if (delta != 0) {
+            var q_val: u64 = @intFromFloat(@floor((value - min_val) / delta + unbias[d]));
+            q_val = @min(q_val, 15);
+            quantized_sum += q_val;
+            quantized1 = (quantized1 << 1) | (q_val & 1);
+            quantized2 = (quantized2 << 1) | ((q_val & 2) >> 1);
+            quantized3 = (quantized3 << 1) | ((q_val & 4) >> 2);
+            quantized4 = (quantized4 << 1) | ((q_val & 8) >> 3);
+        } else {
+            quantized1 <<= 1;
+            quantized2 <<= 1;
+            quantized3 <<= 1;
+            quantized4 <<= 1;
+        }
+
+        if ((d + 1) % 64 == 0) {
+            const offset = d / 64;
+            q1[offset] = quantized1;
+            q2[offset] = quantized2;
+            q3[offset] = quantized3;
+            q4[offset] = quantized4;
+        }
+    }
+
+    if (query_diff.len % 64 != 0) {
+        const offset = query_diff.len / 64;
+        const shift: u6 = @intCast(64 - (query_diff.len % 64));
+        q1[offset] = quantized1 << shift;
+        q2[offset] = quantized2 << shift;
+        q3[offset] = quantized3 << shift;
+        q4[offset] = quantized4 << shift;
+    }
+    return quantized_sum;
+}
+
+test "RaBitQuantizer SIMD query packing is bit-identical to scalar packing" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5241_4249_5451);
+    const random = prng.random();
+    const dimensions = [_]usize{ 1, 7, 8, 9, 63, 64, 65, 127, 768 };
+
+    for (dimensions) |dims| {
+        const query_diff = try alloc.alloc(f32, dims);
+        defer alloc.free(query_diff);
+        const unbias = try alloc.alloc(f32, dims);
+        defer alloc.free(unbias);
+        for (query_diff) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        for (unbias) |*value| value.* = random.float(f32);
+
+        const mm = vec.minMax(query_diff);
+        const delta = (mm.max - mm.min) / 15.0;
+        const width = rabitq.codeWidth(dims);
+        const expected = try alloc.alloc(u64, width * 4);
+        defer alloc.free(expected);
+        const actual = try alloc.alloc(u64, width * 4);
+        defer alloc.free(actual);
+
+        const expected_sum = quantizeQueryPlanesScalarForTest(
+            query_diff,
+            unbias,
+            mm.min,
+            delta,
+            expected[0 * width .. 1 * width],
+            expected[1 * width .. 2 * width],
+            expected[2 * width .. 3 * width],
+            expected[3 * width .. 4 * width],
+        );
+        const actual_sum = try quantizeQueryPlanes(
+            query_diff,
+            unbias,
+            mm.min,
+            delta,
+            actual[0 * width .. 1 * width],
+            actual[1 * width .. 2 * width],
+            actual[2 * width .. 3 * width],
+            actual[3 * width .. 4 * width],
+            null,
+        );
+        try std.testing.expectEqual(expected_sum, actual_sum);
+        try std.testing.expectEqualSlices(u64, expected, actual);
+    }
+
+    var zero_q1: [1]u64 = undefined;
+    var zero_q2: [1]u64 = undefined;
+    var zero_q3: [1]u64 = undefined;
+    var zero_q4: [1]u64 = undefined;
+    const zero_sum = try quantizeQueryPlanes(
+        &.{ 0.25, 0.25, 0.25 },
+        &.{ 0.1, 0.2, 0.3 },
+        0.25,
+        0,
+        &zero_q1,
+        &zero_q2,
+        &zero_q3,
+        &zero_q4,
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 0), zero_sum);
+    try std.testing.expectEqual(@as(u64, 0), zero_q1[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q2[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q3[0]);
+    try std.testing.expectEqual(@as(u64, 0), zero_q4[0]);
+}
 
 test "RaBitQuantizer checks cancellation inside distance scans" {
     var quantizer = try RaBitQuantizer.init(std.testing.allocator, 2, 42, .l2_squared);

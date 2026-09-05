@@ -13,6 +13,48 @@
 // limitations under the License.
 
 const std = @import("std");
+
+/// Compact physical hint for the lossless residual owned by a shared native
+/// exact-vector generation. Consumers must validate every field against the
+/// generation lease and fall back to authoritative key lookup on mismatch.
+pub const NativeResidualLocation = struct {
+    reader_generation: u64,
+    reader_shard_id: u32,
+    revision: u64,
+    residual_offset: u64,
+    residual_len: u32,
+    residual_checksum: u32,
+};
+
+pub const NativeResidualLocationPlane = struct {
+    reader_generations: []const u64,
+    reader_shard_ids: []const u32,
+    revisions: []const u64,
+    residual_offsets: []const u64,
+    residual_lengths: []const u32,
+    residual_checksums: []const u32,
+
+    pub fn validFor(self: @This(), count: usize) bool {
+        return self.reader_generations.len == count and
+            self.reader_shard_ids.len == count and
+            self.revisions.len == count and
+            self.residual_offsets.len == count and
+            self.residual_lengths.len == count and
+            self.residual_checksums.len == count;
+    }
+
+    pub fn at(self: @This(), index: usize) ?NativeResidualLocation {
+        if (!self.validFor(self.reader_generations.len) or index >= self.reader_generations.len) return null;
+        return .{
+            .reader_generation = self.reader_generations[index],
+            .reader_shard_id = self.reader_shard_ids[index],
+            .revision = self.revisions[index],
+            .residual_offset = self.residual_offsets[index],
+            .residual_len = self.residual_lengths[index],
+            .residual_checksum = self.residual_checksums[index],
+        };
+    }
+};
 const Allocator = std.mem.Allocator;
 const vec = @import("antfly_vector").vector;
 
@@ -37,8 +79,10 @@ pub const HBCConfig = struct {
     };
 
     pub const CentroidDirectoryMode = enum {
+        auto,
         hbc,
         flat_rabitq,
+        flat_exact,
     };
 
     storage_backend: StorageBackend = .lmdb,
@@ -71,7 +115,8 @@ pub const HBCConfig = struct {
     defer_page_mutation: bool = false,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
-    centroid_directory_mode: CentroidDirectoryMode = .hbc,
+    centroid_directory_mode: CentroidDirectoryMode = .auto,
+    flat_exact_min_postings: usize = 1024,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
 };

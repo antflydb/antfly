@@ -48,6 +48,11 @@ pub const ObsoletePath = struct {
 
 pub const Run = struct {
     id: u64,
+    /// Logical newest-write precedence for L0. Physical rewrites allocate a
+    /// fresh id but retain the newest input sequence so tiered merges cannot
+    /// make older values shadow newer unmerged runs. Zero means `id` for
+    /// in-memory/legacy callers.
+    l0_sequence: u64 = 0,
     level: u32,
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats = .{},
@@ -159,6 +164,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .l0_sequence = source.l0_sequence,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -196,6 +202,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .l0_sequence = source.l0_sequence,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -281,6 +288,7 @@ pub fn loadManifestIfPresentWithStorage(
         errdefer if (path_owned) allocator.free(owned_path);
         try runs.append(allocator, .{
             .id = meta.id,
+            .l0_sequence = meta.l0_sequence,
             .level = meta.level,
             .size_bytes = meta.size_bytes,
             .compression_stats = meta.compression_stats,
@@ -352,6 +360,12 @@ pub fn persistRunFileWithStorageAccounted(
         compression_policy,
         prefix_extractor,
         resource_manager,
+        // Flush and direct-ingest runs are immutable one-pass outputs just
+        // like compaction runs. Keeping every new L0 run resident makes the
+        // later L0->L1 compaction temporarily own both the full input corpus
+        // and its output in RSS. Foreground point/range reads reopen through
+        // the normal descriptor cache when they actually need a page.
+        .cold_sequential,
         max_run_file_read_bytes,
     );
 }
@@ -365,6 +379,7 @@ pub fn persistRunFileWithStorageAccountedOptions(
     compression_policy: lsm_table_file.CompressionPolicy,
     prefix_extractor: lsm_table_file.PrefixExtractor,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    cache_intent: storage_io.AtomicWriteCacheIntent,
     max_file_bytes: usize,
 ) ![]u8 {
     const state = run.state orelse return error.RunStateUnavailable;
@@ -380,6 +395,7 @@ pub fn persistRunFileWithStorageAccountedOptions(
         compression_policy,
         prefix_extractor,
         resource_manager,
+        cache_intent,
     );
     var writer_active = true;
     errdefer if (writer_active) writer.deinit();
@@ -493,6 +509,7 @@ pub fn persistManifestWithStorageCount(
     for (runs, 0..) |run, i| {
         metas[i] = .{
             .id = run.id,
+            .l0_sequence = if (run.l0_sequence != 0) run.l0_sequence else run.id,
             .level = run.level,
             .size_bytes = run.size_bytes,
             .compression_stats = run.compression_stats,
@@ -770,6 +787,7 @@ fn writeTableFileAtomically(
     compression_policy: lsm_table_file.CompressionPolicy,
 ) !WrittenTableFile {
     var writer = try storage.beginAtomicWrite(allocator, path);
+    writer.setCacheIntent(.cold_sequential);
     var active = true;
     defer if (active) writer.abort();
 
@@ -968,6 +986,7 @@ pub const StreamingRunFileWriter = struct {
         compression_policy: lsm_table_file.CompressionPolicy,
         prefix_extractor: lsm_table_file.PrefixExtractor,
         resource_manager: ?*resource_manager_mod.ResourceManager,
+        cache_intent: storage_io.AtomicWriteCacheIntent,
     ) !void {
         self.* = .{
             .allocator = allocator,
@@ -982,6 +1001,7 @@ pub const StreamingRunFileWriter = struct {
         }
 
         self.writer = try storage.beginAtomicWrite(allocator, self.path);
+        self.writer.setCacheIntent(cache_intent);
         self.writer_active = true;
         errdefer {
             self.writer.abort();
@@ -1163,6 +1183,7 @@ test "repository refuses to publish a streaming run above the reader cap" {
         .none,
         .none,
         null,
+        .cold_sequential,
     );
     var writer_active = true;
     defer if (writer_active) writer.deinit();
@@ -1201,6 +1222,7 @@ test "repository streaming size admission bounds metadata-heavy runs" {
         .none,
         .first_separator,
         null,
+        .normal,
     );
     var writer_active = true;
     defer if (writer_active) writer.deinit();
@@ -1248,6 +1270,7 @@ test "repository streaming size admission remains exact across completed blocks"
         .none,
         .none,
         null,
+        .normal,
     );
     var writer_active = true;
     defer if (writer_active) writer.deinit();

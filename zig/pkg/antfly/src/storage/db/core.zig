@@ -835,6 +835,16 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
+        // A WAL-authoritative dense index carries replay durability in its
+        // posting generation even when an upgraded legacy projection has not
+        // yet acquired config-hash readiness metadata. Do not conflate that
+        // acceleration certificate with the source sequence: doing so reports
+        // zero after a successful native commit and replays published work.
+        if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+            const dense_checkpoint = self.index_manager.denseProjectionCheckpointMetadata(index_name) orelse
+                return error.InvalidDerivedApplyState;
+            return dense_checkpoint.applied_sequence;
+        }
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
         }
@@ -904,6 +914,17 @@ pub const DBCore = struct {
         else
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+                // Source mutation paths publish with their exact capture
+                // lease before reaching this generic watermark callback. A
+                // mutation-free target advance may publish coverage here, but
+                // must never consume a newer transaction it does not own.
+                try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
+                // The posting checkpoint/WAL commit boundary is the durable
+                // dense applied sequence. Lifecycle metadata is persisted only
+                // when status/generation/config identity changes.
+                return;
+            }
             const published_count = if (self.index_manager.denseIndex(index_name)) |entry|
                 entry.index.stats().active_count
             else
@@ -919,6 +940,7 @@ pub const DBCore = struct {
                 .name = index_name,
                 .kind = .dense_vector,
             });
+            try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
         } else if (cfg) |value| {
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,

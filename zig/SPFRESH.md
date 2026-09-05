@@ -68,6 +68,25 @@ Current status:
 - An opt-in lazy-versus-eager posting maintenance benchmark exists. Current
   local samples show lazy centroid deferral is working, but centroid deferral
   alone is not the dominant write-latency cost in those runs.
+- A first immutable posting segment container now stores opaque packed posting,
+  quantized-checkpoint, centroid-directory, mutation, and tombstone values in a
+  posting-local sorted index. The v2 format checks the footer and index at
+  admission, validates strict key ordering and value bounds, and lazily checks
+  each payload on access so opening a large segment is not O(file size).
+  A concurrent-safe verified reader memoizes both successful and failed
+  per-entry verification, avoiding a full payload CRC on every query.
+- A framed posting WAL codec now makes whole batches query-visible with an
+  explicit commit record. Its CRC covers routing metadata and payload, replay
+  ignores incomplete or uncommitted tails, and a checksummed checkpoint records
+  the exact segment generation and committed WAL prefix. Runtime wiring remains
+  experimental; keeping payloads opaque lets the current packed HBC read path
+  coexist with a small WAL tail instead of forcing base/delta replay on every
+  query.
+- The HBC read benchmark now treats query behavior as an ingest acceptance
+  gate. It reports QPS, p50/p95/p99/max latency, sampled exact recall@k, and
+  storage reads both immediately after ingest and after close/reopen. Its
+  `public_ingest` build arm uses the same external-vector/coalesced/bulk-session
+  options as derived replay so storage experiments share one matched workload.
 
 ## Current HBC Shape
 

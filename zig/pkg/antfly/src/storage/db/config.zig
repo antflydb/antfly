@@ -37,6 +37,10 @@ const primary_wal_soft_limit_segments: u64 = 8;
 const primary_wal_hard_limit_segments: u64 = 32;
 const primary_wal_soft_limit_bytes: u64 = 512 * mib;
 const primary_wal_hard_limit_bytes: u64 = 2 * gib;
+// The mutable generation is bounded independently below. This configured
+// checkpoint floor is normalized by the LSM to cover a segment-straddling WAL
+// tail whenever windowed publication is enabled, while remaining explicit for
+// profiles that do not use an immutable merge window.
 const primary_wal_checkpoint_dirty_bytes_floor: u64 = 32 * mib;
 const index_wal_soft_limit_segments: u64 = 4;
 const index_wal_hard_limit_segments: u64 = 16;
@@ -45,6 +49,7 @@ const index_wal_hard_limit_bytes: u64 = gib;
 const index_idle_flush_after_ns: u64 = 5 * std.time.ns_per_s;
 const index_idle_flush_min_bytes: u64 = mib;
 const dense_idle_flush_after_ns: u64 = 30 * std.time.ns_per_s;
+const primary_idle_flush_after_ns: u64 = 30 * std.time.ns_per_s;
 const dense_idle_flush_min_bytes: u64 = 8 * mib;
 const durable_lsm_idle_flush_max_age_ns: u64 = 5 * 60 * std.time.ns_per_s;
 
@@ -65,14 +70,37 @@ pub const PrimaryBackend = union(enum) {
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
+    // Public bulk transactions are already coalesced and sorted. Publish them
+    // directly at an eighth of the ordinary mutable flush size so concurrent
+    // status/catch-up scans do not rotate normal replay windows into thousands
+    // of split immutable runs. Four MiB remains a meaningful publication unit
+    // for general bulk loads while fitting below the adaptive replay window.
+    .direct_bulk_ingest_min_bytes = 4 * 1024 * 1024,
+    // Four-way size-tiered merging turns sorted publication windows into an
+    // external merge tree. This bounds L0 read amplification during sustained
+    // imports without repeatedly merging each window through the full base.
+    .bulk_ingest_tiered_l0_fan_in = 4,
+    // Once fragmented L0 is at least half of all lower-level data, seal its
+    // newer delta above the largest anchor. The seal must also grow by at
+    // least 2x, bounding rewrite amplification while leaving the base intact.
+    .bulk_ingest_l0_delta_seal_ratio_denominator = 2,
     // Preserve throughput batching while bounding retained WAL for every
     // workload shape. Meaningful bursts checkpoint promptly; low-rate tables
     // accumulate instead of producing one run per write and checkpoint at the
     // maximum dirty age if they remain small.
-    .mutable_idle_flush_after_ns = 5 * std.time.ns_per_s,
+    // Short producer pauses are not a storage-generation boundary. A quiet
+    // table remains WAL durable and query-visible; publish its partial window
+    // after a sustained pause, with the maximum-age and resource limits below
+    // retaining their existing safety bounds.
+    .mutable_idle_flush_after_ns = primary_idle_flush_after_ns,
     .mutable_idle_flush_min_bytes = 1024 * 1024,
     .mutable_idle_flush_max_age_ns = durable_lsm_idle_flush_max_age_ns,
     .bulk_ingest_flush_threshold_bytes_multiplier = 2,
+    // A bulk current scan transfers the mutable epoch into the immutable set
+    // instead of cloning it. The pinned epoch remains query-stable while the
+    // existing background flusher publishes it, so foreground writes retain
+    // the normal 32 MiB direct-ingest amortization.
+    .bulk_ingest_current_scan_clone_max_bytes = 0,
     .local_block_cache_enabled = false,
     .l0_soft_limit_runs = 32,
     .l0_hard_limit_runs = 128,
@@ -91,12 +119,23 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
     .wal_hard_limit_bytes = primary_wal_hard_limit_bytes,
     .wal_checkpoint_dirty_bytes_multiplier = 2,
-    // This floor prevents replay payloads from turning sustained batch
-    // ingestion into tiny foreground flushes. It is safe only because point
-    // and recovery reads no longer clone the growing mutable memtable.
+    // The LSM raises this to two physical WAL segments for the windowed profile
+    // below. Mutable/snapshot memory remains bounded by the independent 32 MiB
+    // thresholds above.
     .wal_checkpoint_dirty_bytes_floor = primary_wal_checkpoint_dirty_bytes_floor,
     .foreground_soft_wal_checkpoint = true,
+    .max_deferred_immutable_memtables = 64,
+    // Resident memory is the safety invariant. Shared process governance may
+    // publish a partial logical window when this cap is reached; keeping the
+    // cap at the process-friendly bound is preferable to retaining enough
+    // allocator state to force a nominal 256 MiB publication.
     .max_deferred_immutable_bytes = 256 * mib,
+    // WAL-backed direct batches and scan-rotated tails remain individually
+    // query-visible, but publish through one bounded external-merge window.
+    // This matches the public API's 25K-operation bulk window without tying
+    // file/manifest cadence to its concurrent request boundaries.
+    .immutable_flush_window_bytes = 256 * mib,
+    .immutable_flush_window_max_memtables = 64,
     .table_prefix_extractor = .first_separator,
 };
 
@@ -153,6 +192,11 @@ pub const text_wal_lsm_options_default = lsm_backend_mod.Options{
 pub const dense_hbc_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 128 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 128 * 1024 * 1024,
+    // HBC replay repeatedly scans its structural namespaces while bulk writes
+    // are active. Transfer those mutable epochs into the pinned immutable set
+    // instead of cloning large node/value maps for every scan; the normal
+    // background flush path preserves ordering and bounded memory.
+    .bulk_ingest_current_scan_clone_max_bytes = 0,
     // HBC updates are substantially larger and burstier than document/index
     // metadata. Retain useful batching without allowing a quiet index to pin
     // its WAL indefinitely.
@@ -218,6 +262,19 @@ pub const graph_reverse_lsm_options_default = lsm_backend_mod.Options{
 
 pub const sparse_lsm_options_default = graph_reverse_lsm_options_default;
 
+/// Catalog-owned rollout gate for the irreversible native HBC authority
+/// transition. A missing source means the DB is a standalone owner and may
+/// cut over locally; provisioned/distributed DBs always install a source that
+/// remains closed until every possible shard owner advertises support.
+pub const DenseNativeMigrationPolicySource = struct {
+    ptr: *const anyopaque,
+    authority_permitted: *const fn (ptr: *const anyopaque) bool,
+
+    pub fn authorityPermitted(self: @This()) bool {
+        return self.authority_permitted(self.ptr);
+    }
+};
+
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
@@ -225,6 +282,10 @@ pub const IndexBackendOptions = struct {
     graph_reverse_backend: graph_mod.ReverseBackend = .lsm,
     text_lsm_storage: ?lsm_backend_mod.Storage = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage = null,
+    /// Raw durable file service for table-level native vector generations.
+    /// This is deliberately separate from dense_lsm_storage: native HBC may
+    /// retire its compatibility LSM while vector blocks still need files.
+    vector_block_storage: ?lsm_backend_mod.Storage = null,
     sparse_lsm_storage: ?lsm_backend_mod.Storage = null,
     graph_lsm_storage: ?lsm_backend_mod.Storage = null,
     lsm_cache: ?*lsm_backend_mod.Cache = null,
@@ -234,6 +295,11 @@ pub const IndexBackendOptions = struct {
     /// null uses ResourceManager-derived capacity and dynamic admission;
     /// false is a hard operator opt-out and true permits governed retention.
     retained_vector_cache_enabled: ?bool = null,
+    dense_native_migration_policy_source: ?DenseNativeMigrationPolicySource = null,
+    /// Private capability delegated only to a shadow builder after its parent
+    /// catalog has observed the migration floor. It may never be set on an
+    /// ordinary active managed DB open.
+    dense_native_candidate_build_authorized: bool = false,
     // Binding a caller-owned shared cache requires a manager whose lifetime
     // covers that cache. Per-DB fallback managers govern local work but must
     // not be installed into external caches.
@@ -426,6 +492,7 @@ pub fn indexBackendOptionsForPrimary(
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
+        .vector_block_storage = overrides.vector_block_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .sparse_lsm_storage = overrides.sparse_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .graph_lsm_storage = overrides.graph_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .lsm_cache = overrides.lsm_cache orelse lsm_cache,
@@ -433,6 +500,8 @@ pub fn indexBackendOptionsForPrimary(
         .lsm_root_generation = if (overrides.lsm_root_generation != 0) overrides.lsm_root_generation else lsm_root_generation,
         .resource_manager = overrides.resource_manager orelse resource_manager,
         .retained_vector_cache_enabled = overrides.retained_vector_cache_enabled,
+        .dense_native_migration_policy_source = overrides.dense_native_migration_policy_source,
+        .dense_native_candidate_build_authorized = overrides.dense_native_candidate_build_authorized,
         .bind_cache_resource_manager = overrides.bind_cache_resource_manager and bind_cache_resource_manager,
         .text_main_lsm_options = mergedIndexLsmOptions(
             overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
@@ -512,6 +581,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(usize, 8), opts.dense_lsm_options.flush_threshold);
     try std.testing.expectEqual(@as(u64, 128 * 1024 * 1024), opts.dense_lsm_options.flush_threshold_bytes);
     try std.testing.expectEqual(opts.dense_lsm_options.flush_threshold_bytes, opts.dense_lsm_options.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 0), opts.dense_lsm_options.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(dense_idle_flush_after_ns, opts.dense_lsm_options.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(dense_idle_flush_min_bytes, opts.dense_lsm_options.mutable_idle_flush_min_bytes);
     try std.testing.expectEqual(durable_lsm_idle_flush_max_age_ns, opts.dense_lsm_options.mutable_idle_flush_max_age_ns);
@@ -568,7 +638,11 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
-    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
+    try std.testing.expectEqual(@as(usize, 4), primary_opts.bulk_ingest_tiered_l0_fan_in);
+    try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_l0_delta_seal_ratio_denominator);
+    try std.testing.expectEqual(@as(u64, 0), primary_opts.bulk_ingest_current_scan_clone_max_bytes);
+    try std.testing.expectEqual(primary_idle_flush_after_ns, primary_opts.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);
     try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), primary_opts.mutable_idle_flush_max_age_ns);
     try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_flush_threshold_bytes_multiplier);
@@ -582,7 +656,10 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(primary_wal_hard_limit_bytes, primary_opts.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(u32, 2), primary_opts.wal_checkpoint_dirty_bytes_multiplier);
     try std.testing.expectEqual(primary_wal_checkpoint_dirty_bytes_floor, primary_opts.wal_checkpoint_dirty_bytes_floor);
+    try std.testing.expectEqual(@as(usize, 64), primary_opts.max_deferred_immutable_memtables);
     try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.max_deferred_immutable_bytes);
+    try std.testing.expectEqual(@as(u64, 256 * mib), primary_opts.immutable_flush_window_bytes);
+    try std.testing.expectEqual(@as(usize, 64), primary_opts.immutable_flush_window_max_memtables);
     try std.testing.expect(primary_opts.write_pressure_during_bulk_ingest);
     try std.testing.expect(primary_opts.foreground_soft_wal_checkpoint);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);

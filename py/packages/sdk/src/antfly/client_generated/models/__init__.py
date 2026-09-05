@@ -159,6 +159,7 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .dense_vector_publication_status import DenseVectorPublicationStatus
@@ -1161,6 +1162,7 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
     "DenseVectorPublicationStatus",

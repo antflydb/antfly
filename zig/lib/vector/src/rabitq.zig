@@ -24,12 +24,47 @@
 //! URL: https://arxiv.org/pdf/2405.12497
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = std.math;
 
 // SIMD vector width: 4 u64s = 256 bits (matches AVX2 / 2x NEON).
 const simd_width = 4;
 const SimdU64 = @Vector(simd_width, u64);
+const ArmU64x2 = @Vector(2, u64);
+const ArmU8x16 = @Vector(16, u8);
 const SimdF32x8 = @Vector(8, f32);
+
+inline fn armMaskedPopCount128(code: ArmU64x2, query: ArmU64x2) u32 {
+    const bytes: ArmU8x16 = @bitCast(code & query);
+    const counts: ArmU8x16 = @popCount(bytes);
+    const wide_counts: @Vector(16, u16) = @intCast(counts);
+    // Widen before reduction because vector integer reduction uses wrapping
+    // lane arithmetic. LLVM still lowers this to AArch64 CNT plus a widening
+    // horizontal sum; reducing u64 lanes produces a much longer sequence.
+    return @reduce(.Add, wide_counts);
+}
+
+fn bitProductAarch64(code: []const u64, q1: []const u64, q2: []const u64, q3: []const u64, q4: []const u64) u32 {
+    var sum1: u32 = 0;
+    var sum2: u32 = 0;
+    var sum4: u32 = 0;
+    var sum8: u32 = 0;
+    var i: usize = 0;
+    while (i + 2 <= code.len) : (i += 2) {
+        const code_vec: ArmU64x2 = code[i..][0..2].*;
+        sum1 += armMaskedPopCount128(code_vec, q1[i..][0..2].*);
+        sum2 += armMaskedPopCount128(code_vec, q2[i..][0..2].*);
+        sum4 += armMaskedPopCount128(code_vec, q3[i..][0..2].*);
+        sum8 += armMaskedPopCount128(code_vec, q4[i..][0..2].*);
+    }
+    if (i < code.len) {
+        sum1 += @popCount(code[i] & q1[i]);
+        sum2 += @popCount(code[i] & q2[i]);
+        sum4 += @popCount(code[i] & q3[i]);
+        sum8 += @popCount(code[i] & q4[i]);
+    }
+    return sum1 + (sum2 << 1) + (sum4 << 2) + (sum8 << 3);
+}
 
 /// Computes the weighted bit product used in RaBitQ distance estimation.
 ///
@@ -40,6 +75,7 @@ const SimdF32x8 = @Vector(8, f32);
 pub fn bitProduct(code: []const u64, q1: []const u64, q2: []const u64, q3: []const u64, q4: []const u64) u32 {
     const n = code.len;
     if (n == 0) return 0;
+    if (comptime builtin.cpu.arch == .aarch64) return bitProductAarch64(code, q1, q2, q3, q4);
 
     var sum1: u64 = 0;
     var sum2: u64 = 0;
@@ -326,6 +362,34 @@ test "bitProduct selective bits" {
     const q4 = [_]u64{0};
     // popcount(1 & 1) = 1, weight 1 => 1
     try expect(bitProduct(&code, &q1, &q2, &q3, &q4) == 1);
+}
+
+test "bitProduct matches scalar across code widths" {
+    var prng = std.Random.DefaultPrng.init(0x5241_4249_5451);
+    const random = prng.random();
+    var code: [33]u64 = undefined;
+    var q1: [33]u64 = undefined;
+    var q2: [33]u64 = undefined;
+    var q3: [33]u64 = undefined;
+    var q4: [33]u64 = undefined;
+    for (0..33) |width| {
+        var expected: u32 = 0;
+        for (0..width) |i| {
+            code[i] = random.int(u64);
+            q1[i] = random.int(u64);
+            q2[i] = random.int(u64);
+            q3[i] = random.int(u64);
+            q4[i] = random.int(u64);
+            expected += @popCount(code[i] & q1[i]);
+            expected += @as(u32, @popCount(code[i] & q2[i])) << 1;
+            expected += @as(u32, @popCount(code[i] & q3[i])) << 2;
+            expected += @as(u32, @popCount(code[i] & q4[i])) << 3;
+        }
+        try std.testing.expectEqual(
+            expected,
+            bitProduct(code[0..width], q1[0..width], q2[0..width], q3[0..width], q4[0..width]),
+        );
+    }
 }
 
 test "quantizeVectors single positive vector" {

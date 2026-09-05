@@ -42,6 +42,7 @@ pub fn applyObservation(
     {
         updated.status_generation = observation.status_generation;
         updated.artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
+        updated.dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
     }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
@@ -98,6 +99,7 @@ pub fn applyObservationsOwnedWithRepairStatus(
         {
             records[index].status_generation = observation.status_generation;
             records[index].artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
+            records[index].dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
         }
         records[index].live = observation.live;
         records[index].capacity_bytes = observation.capacity_bytes;
@@ -230,6 +232,7 @@ pub fn observationChangesRecordWithRepairStatus(
         (existing.reporter_incarnation != 0 and
             existing.status_generation != observation.status_generation) or
         existing.artifact_sources_protocol_version != observation.artifact_sources_protocol_version or
+        existing.dense_native_storage_protocol_version != observation.dense_native_storage_protocol_version or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or
@@ -500,6 +503,8 @@ fn runtimeStatusEqual(
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
+            left.dense_vector_projection_pending != right.dense_vector_projection_pending or
+            left.dense_native_storage_phase != right.dense_native_storage_phase or
             !runtimeIndexSourceReplayEqual(left.source_replay, right.source_replay) or
             (include_repair_status and (left.lifecycle_work_class != right.lifecycle_work_class or
                 left.repair_status != right.repair_status or
@@ -826,6 +831,35 @@ test "store observer can ignore unactivated repair fields without hiding other c
     try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
     observed_indexes[0].doc_count += 1;
     try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+}
+
+test "store observer publishes projection-only readiness transitions" {
+    var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+    }};
+    var observed_indexes = existing_indexes;
+    observed_indexes[0].dense_vector_projection_pending = true;
+    var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .indexes = existing_indexes[0..],
+    }};
+    var observed_runtime = existing_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const existing = table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .runtime_statuses = existing_runtime[0..],
+    };
+    const observation = StoreObservation{
+        .store_id = 3,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expect(observationChangesRecord(existing, observation));
 }
 
 test "store observer durable report equality excludes only volatile activity" {

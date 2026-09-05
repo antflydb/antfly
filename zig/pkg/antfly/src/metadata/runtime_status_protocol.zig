@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations.
 
-/// Runtime-status records are embedded in unframed StoreRecord transitions.
-/// Only released wire profiles are compatibility surfaces. V12 is the
-/// v0.2.0 profile; V15 is the current profile. Every other number belongs to
-/// an unreleased development format and must not be advertised, negotiated,
-/// read, or written.
+/// Runtime-status records are embedded in StoreRecord transitions. Only named
+/// wire profiles are compatibility surfaces: V12 is the v0.2.0 profile, V15
+/// is the positional profile from main, and V16 introduces framed index
+/// records plus native dense-storage capability. Intermediate development
+/// formats must never be advertised, negotiated, read, or written.
 pub const v0_2_0_record_version: u16 = 12;
-pub const current_record_version: u16 = 15;
+pub const positional_record_version: u16 = 15;
+pub const current_record_version: u16 = 16;
+pub const legacy_record_version: u16 = v0_2_0_record_version;
 
 pub const Profile = enum(u16) {
     released_v0_2_0 = v0_2_0_record_version,
+    positional = positional_record_version,
     current = current_record_version,
 
     pub fn wireVersion(self: @This()) u16 {
@@ -41,18 +44,41 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
     const required = profileForVersion(required_version) orelse return false;
     return switch (required) {
         .released_v0_2_0 => true,
+        .positional => available == .positional or available == .current,
         .current => available == .current,
     };
 }
 
-/// These facts form one current admission-safety profile. Keeping semantic
-/// aliases makes call sites state why V15 is required without inventing
-/// intermediate compatibility levels when new facts join that profile.
-pub const repair_status_record_version: u16 = current_record_version;
-pub const native_restore_identity_record_version: u16 = current_record_version;
-pub const artifact_source_status_record_version: u16 = current_record_version;
-pub const artifact_source_failure_status_record_version: u16 = current_record_version;
-pub const publication_target_record_version: u16 = current_record_version;
+/// Returns the strongest named wire profile understood by both endpoints.
+/// Version integers identify formats; compatibility is never inferred from
+/// numeric ordering.
+pub fn greatestCommonProfile(left_version: u16, right_version: u16) ?Profile {
+    const candidates = [_]Profile{ .current, .positional, .released_v0_2_0 };
+    for (candidates) |candidate| {
+        const version = candidate.wireVersion();
+        if (profileSatisfies(left_version, version) and
+            profileSatisfies(right_version, version))
+        {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+/// Facts already encoded by the positional V15 profile.
+pub const repair_status_record_version: u16 = positional_record_version;
+pub const native_restore_identity_record_version: u16 = positional_record_version;
+pub const artifact_source_status_record_version: u16 = positional_record_version;
+pub const artifact_source_failure_status_record_version: u16 = positional_record_version;
+pub const publication_target_record_version: u16 = positional_record_version;
+
+/// Native projection state is introduced atomically with the framed V16
+/// profile. Semantic aliases keep call sites descriptive without creating
+/// wire formats for every field.
+pub const vector_projection_record_version: u16 = current_record_version;
+pub const dense_native_storage_record_version: u16 = current_record_version;
+pub const framed_index_status_record_version: u16 = current_record_version;
+pub const dense_native_capability_record_version: u16 = current_record_version;
 
 pub fn isSupported(version: u16) bool {
     return isNegotiable(version);
@@ -65,28 +91,48 @@ pub fn isNegotiable(version: u16) bool {
 test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isSupported(1));
     try std.testing.expect(isSupported(v0_2_0_record_version));
+    try std.testing.expect(isSupported(positional_record_version));
     try std.testing.expect(isSupported(current_record_version));
     try std.testing.expect(!isSupported(0));
     try std.testing.expect(!isSupported(13));
     try std.testing.expect(!isSupported(14));
-    try std.testing.expect(!isSupported(16));
+    try std.testing.expect(!isSupported(17));
 
     try std.testing.expect(isNegotiable(v0_2_0_record_version));
+    try std.testing.expect(isNegotiable(positional_record_version));
     try std.testing.expect(isNegotiable(current_record_version));
     try std.testing.expect(!isNegotiable(11));
     try std.testing.expect(!isNegotiable(13));
     try std.testing.expect(!isNegotiable(14));
     try std.testing.expectEqual(Profile.released_v0_2_0, profileForVersion(12).?);
-    try std.testing.expectEqual(Profile.current, profileForVersion(15).?);
+    try std.testing.expectEqual(Profile.positional, profileForVersion(15).?);
+    try std.testing.expectEqual(Profile.current, profileForVersion(16).?);
 
     try std.testing.expect(profileSatisfies(12, 12));
     try std.testing.expect(profileSatisfies(15, 12));
     try std.testing.expect(profileSatisfies(15, 15));
+    try std.testing.expect(profileSatisfies(16, 12));
+    try std.testing.expect(profileSatisfies(16, 15));
+    try std.testing.expect(profileSatisfies(16, 16));
     try std.testing.expect(!profileSatisfies(12, 15));
     try std.testing.expect(!profileSatisfies(13, 12));
     try std.testing.expect(!profileSatisfies(14, 15));
-    try std.testing.expect(!profileSatisfies(16, 15));
+    try std.testing.expect(!profileSatisfies(17, 15));
     try std.testing.expect(!profileSatisfies(15, 16));
+
+    try std.testing.expectEqual(Profile.current, greatestCommonProfile(16, 16).?);
+    try std.testing.expectEqual(Profile.positional, greatestCommonProfile(16, 15).?);
+    try std.testing.expectEqual(Profile.positional, greatestCommonProfile(15, 16).?);
+    try std.testing.expectEqual(Profile.released_v0_2_0, greatestCommonProfile(16, 12).?);
+    try std.testing.expectEqual(Profile.released_v0_2_0, greatestCommonProfile(15, 12).?);
+    try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(16, 14));
+    try std.testing.expectEqual(@as(?Profile, null), greatestCommonProfile(17, 16));
+
+    var rolling_common = Profile.current;
+    for ([_]u16{ 16, 15, 16 }) |peer_version| {
+        rolling_common = greatestCommonProfile(rolling_common.wireVersion(), peer_version).?;
+    }
+    try std.testing.expectEqual(Profile.positional, rolling_common);
 }
 
 const std = @import("std");

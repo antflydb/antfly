@@ -20,12 +20,15 @@ const hbc = antfly.hbc;
 const lsm_backend = antfly.lsm_backend;
 const platform_time = antfly.platform_time;
 const vec = antfly.vector;
+const recall_common = @import("recall_common.zig");
+const posting_segment = antfly.vectorindex.posting_segment;
 
 const Config = struct {
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
     queries: usize = 200,
+    recall_queries: usize = 20,
     k: usize = 10,
     batch_size: usize = 1_000,
     seed: u64 = 42,
@@ -38,11 +41,20 @@ const Config = struct {
     kmeans_backend: hbc.HBCConfig.KmeansBackend = .auto,
     kmeans_update_strategy: hbc.HBCConfig.KmeansUpdateStrategy = .auto,
     use_quantization: bool = true,
+    rerank_policy: hbc.HBCConfig.RerankPolicy = .boundary,
+    rerank_factor: usize = 0,
     use_random_ortho_trans: bool = false,
     centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
     reopen_before_query: bool = true,
+    shadow_segment_checkpoint: bool = false,
+    segment_store_reads: bool = false,
+    segment_wal_shadow_batches: usize = 0,
+    segment_wal_mutation_batches: usize = 0,
+    prebuild_mutation_batches: usize = 0,
+    mutation_rebuild_quantized: bool = false,
+    segment_wal_sync_each_batch: bool = false,
 };
 
 const StorageSelection = enum {
@@ -55,7 +67,18 @@ const StorageSelection = enum {
 const BuildSelection = enum {
     bulk_build,
     online_coalesced,
+    public_ingest,
     both,
+};
+
+const ExternalVectorLoaderContext = struct {
+    items: []const hbc.BatchInsertItem,
+
+    fn load(ctx_ptr: *anyopaque, allocator: Allocator, vector_id: u64, _: []const u8) ![]f32 {
+        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        if (vector_id == 0 or vector_id > ctx.items.len) return error.NotFound;
+        return try allocator.dupe(f32, ctx.items[@intCast(vector_id - 1)].vector);
+    }
 };
 
 const StorageCounters = struct {
@@ -92,6 +115,7 @@ const StorageCounters = struct {
 
 const StorageHarness = struct {
     const CountingStorage = struct {
+        allocator: Allocator,
         backing: lsm_backend.Storage,
         counters: StorageCounters = .{},
 
@@ -141,6 +165,23 @@ const StorageHarness = struct {
             return self.backing.writeFileAbsolute(path, contents);
         }
 
+        fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.counters.write_file += 1;
+            self.counters.write_bytes += contents.len;
+            return self.backing.appendFileAbsolute(self.allocator, path, contents, sync);
+        }
+
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.counters.rename += 1;
@@ -172,10 +213,14 @@ const StorageHarness = struct {
         .file_size = CountingStorage.fileSize,
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
+        .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncFileContentsAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
         .now_ns = CountingStorage.nowNs,
+        .rename_is_atomic = true,
     };
 
     allocator: Allocator,
@@ -196,7 +241,7 @@ const StorageHarness = struct {
                 if (mode == .host) {
                     const ctx = try allocator.create(CountingStorage);
                     errdefer allocator.destroy(ctx);
-                    ctx.* = .{ .backing = backing.storage() };
+                    ctx.* = .{ .allocator = allocator, .backing = backing.storage() };
                     harness.counting_ctx = ctx;
                 }
             },
@@ -209,7 +254,7 @@ const StorageHarness = struct {
 
                 const ctx = try allocator.create(CountingStorage);
                 errdefer allocator.destroy(ctx);
-                ctx.* = .{ .backing = backing.storage() };
+                ctx.* = .{ .allocator = allocator, .backing = backing.storage() };
                 harness.counting_ctx = ctx;
             },
             .both => unreachable,
@@ -369,15 +414,13 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(dataset);
     const queries = try makeQueries(allocator, cfg, dataset);
     defer allocator.free(queries);
-    const items = try makeItems(allocator, cfg, dataset);
-    defer freeItems(allocator, items);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
     try out.print(
-        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any}\n",
+        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} rerank_policy={s} rerank_factor={d} centroid_directory={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} reopen_before_query={any} segment_store_reads={any} segment_wal_shadow_batches={d} segment_wal_mutation_batches={d} prebuild_mutation_batches={d} mutation_rebuild_quantized={any} segment_wal_sync_each_batch={any}\n",
         .{
             cfg.samples,
             cfg.vectors,
@@ -391,10 +434,18 @@ pub fn main(init: std.process.Init) !void {
             @tagName(cfg.build_mode),
             @tagName(cfg.kmeans_backend),
             @tagName(cfg.kmeans_update_strategy),
+            @tagName(cfg.rerank_policy),
+            cfg.rerank_factor,
             @tagName(cfg.centroid_directory_mode),
             cfg.flat_centroid_block_size,
             cfg.flat_centroid_probe_count,
             cfg.reopen_before_query,
+            cfg.segment_store_reads,
+            cfg.segment_wal_shadow_batches,
+            cfg.segment_wal_mutation_batches,
+            cfg.prebuild_mutation_batches,
+            cfg.mutation_rebuild_quantized,
+            cfg.segment_wal_sync_each_batch,
         },
     );
     try stdout_writer.flush();
@@ -408,42 +459,384 @@ pub fn main(init: std.process.Init) !void {
     const build_modes: []const BuildSelection = switch (cfg.build_mode) {
         .bulk_build => &[_]BuildSelection{.bulk_build},
         .online_coalesced => &[_]BuildSelection{.online_coalesced},
+        .public_ingest => &[_]BuildSelection{.public_ingest},
         .both => &[_]BuildSelection{ .bulk_build, .online_coalesced },
     };
 
     for (storage_modes) |storage_mode| {
         for (build_modes) |build_mode| {
             for (0..cfg.samples) |sample_index| {
+                const sample_dataset = try allocator.dupe(f32, dataset);
+                defer allocator.free(sample_dataset);
+                applyDatasetMutations(sample_dataset, cfg, cfg.prebuild_mutation_batches);
+                const sample_items = try makeItems(allocator, cfg, sample_dataset);
+                defer freeItems(allocator, sample_items);
                 var scenario = try Scenario.init(allocator, cfg, sample_index, storage_mode, build_mode);
                 defer scenario.deinit();
-                try buildIndex(&scenario, items);
-                if (cfg.reopen_before_query) try scenario.reopen();
+                var external_loader_ctx: ExternalVectorLoaderContext = .{ .items = sample_items };
+                if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                const before_build_storage = scenario.storage_harness.snapshotCounters();
+                scenario.index.resetWriteProfile();
+                const build_start = nanotime();
+                try buildIndex(&scenario, sample_items);
+                const build_elapsed = nanotime() - build_start;
+                const after_build_storage = scenario.storage_harness.snapshotCounters();
+                try printBuildResult(out, &scenario, build_elapsed, before_build_storage, after_build_storage);
+                try stdout_writer.flush();
+                if (cfg.shadow_segment_checkpoint) {
+                    try benchShadowSegmentCheckpoint(out, &stdout_writer, &scenario);
+                }
+                var posting_source_sequence: u64 = @intCast(cfg.vectors);
+                if (cfg.segment_store_reads) {
+                    const checkpoint_start = nanotime();
+                    const checkpoint = try scenario.index.publishExperimentalPostingCheckpoint(@intCast(cfg.vectors));
+                    const checkpoint_ns = nanotime() - checkpoint_start;
+                    try out.print(
+                        "{{\"scenario\":\"{s}_{s}_posting_store_publish\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_store_publish\",\"generation\":{d},\"covered_source_sequence\":{d},\"live_postings\":{d},\"segment_bytes\":{d},\"checkpoint_ns\":{d}}}\n",
+                        .{
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            scenario.sample_index,
+                            checkpoint.generation,
+                            checkpoint.covered_source_sequence,
+                            checkpoint.posting_count,
+                            checkpoint.segment_bytes,
+                            checkpoint_ns,
+                        },
+                    );
+                    try stdout_writer.flush();
+                    if (cfg.segment_wal_shadow_batches > 0) {
+                        const wal_start = nanotime();
+                        var wal_bytes: u64 = 0;
+                        var wal_records: u64 = 0;
+                        for (0..cfg.segment_wal_shadow_batches) |batch_index| {
+                            posting_source_sequence += 1;
+                            const posting_id = @as(u64, @intCast(batch_index % @as(usize, @intCast(checkpoint.posting_count)))) + 1;
+                            const wal_stats = try scenario.index.appendExperimentalPostingWalSnapshotBatchWithOptions(
+                                @intCast(batch_index + 1),
+                                posting_source_sequence,
+                                &.{posting_id},
+                                .{ .sync = cfg.segment_wal_sync_each_batch },
+                            );
+                            wal_bytes = wal_stats.wal_committed_bytes;
+                            wal_records += wal_stats.record_count;
+                        }
+                        const wal_ns = nanotime() - wal_start;
+                        try out.print(
+                            "{{\"scenario\":\"{s}_{s}_posting_wal_shadow\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_wal_shadow\",\"batches\":{d},\"records\":{d},\"wal_bytes\":{d},\"sync_each_batch\":{any},\"ns\":{d}}}\n",
+                            .{
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                scenario.sample_index,
+                                cfg.segment_wal_shadow_batches,
+                                wal_records,
+                                wal_bytes,
+                                cfg.segment_wal_sync_each_batch,
+                                wal_ns,
+                            },
+                        );
+                        try stdout_writer.flush();
+                    }
+                    if (cfg.segment_wal_mutation_batches > 0) {
+                        const mutation_storage_before = scenario.storage_harness.snapshotCounters();
+                        const mutation_start = nanotime();
+                        var apply_ns: u64 = 0;
+                        var wal_capture_ns: u64 = 0;
+                        var quantized_rebuild_ns: u64 = 0;
+                        var wal_bytes: u64 = 0;
+                        var wal_records: u64 = 0;
+                        const item_batch_slots = (sample_items.len - 1) / cfg.batch_size + 1;
+                        for (0..cfg.segment_wal_mutation_batches) |batch_index| {
+                            const offset = (batch_index % item_batch_slots) * cfg.batch_size;
+                            const end = @min(offset + cfg.batch_size, sample_items.len);
+                            const mutation_count = end - offset;
+                            const mutation_vectors = try allocator.alloc(f32, mutation_count * cfg.dims);
+                            defer allocator.free(mutation_vectors);
+                            const mutation_items = try allocator.alloc(hbc.BatchInsertItem, mutation_count);
+                            defer allocator.free(mutation_items);
+                            const mutation_deletes = try allocator.alloc(u64, mutation_count);
+                            defer allocator.free(mutation_deletes);
+                            for (mutation_items, 0..) |*item, item_index| {
+                                const source = sample_items[offset + item_index];
+                                const vector = mutation_vectors[item_index * cfg.dims ..][0..cfg.dims];
+                                @memcpy(vector, source.vector);
+                                applyVectorMutation(vector, batch_index);
+                                item.* = .{
+                                    .vector_id = source.vector_id,
+                                    .vector = vector,
+                                    .metadata = source.metadata,
+                                };
+                                mutation_deletes[item_index] = source.vector_id;
+                            }
+                            const apply_start = nanotime();
+                            try scenario.index.beginExperimentalPostingMutationCapture();
+                            scenario.index.batchApplyOptions(mutation_items, mutation_deletes, .{
+                                .assume_absent_ids = false,
+                                .coalesce_leaf_writes = true,
+                                .skip_vector_store = true,
+                            }) catch |err| {
+                                scenario.index.cancelExperimentalPostingMutationCapture();
+                                return err;
+                            };
+                            apply_ns += nanotime() - apply_start;
+                            for (mutation_items, 0..) |item, item_index| {
+                                @memcpy(sample_dataset[(offset + item_index) * cfg.dims ..][0..cfg.dims], item.vector);
+                                scenario.index.invalidateVectorCache(item.vector_id);
+                            }
+                            posting_source_sequence += 1;
+                            const wal_capture_start = nanotime();
+                            const wal_stats = try scenario.index.finishExperimentalPostingMutationCapture(
+                                @intCast(batch_index + 1),
+                                posting_source_sequence,
+                                .{ .sync = cfg.segment_wal_sync_each_batch },
+                            );
+                            wal_capture_ns += nanotime() - wal_capture_start;
+                            wal_bytes = wal_stats.wal_committed_bytes;
+                            wal_records += wal_stats.record_count;
+                        }
+                        if (cfg.mutation_rebuild_quantized) {
+                            const rebuild_start = nanotime();
+                            try scenario.index.beginExperimentalPostingMutationCapture();
+                            scenario.index.rebuildAllQuantizedForExperiment() catch |err| {
+                                scenario.index.cancelExperimentalPostingMutationCapture();
+                                return err;
+                            };
+                            quantized_rebuild_ns = nanotime() - rebuild_start;
+                            posting_source_sequence += 1;
+                            const wal_capture_start = nanotime();
+                            const wal_stats = try scenario.index.finishExperimentalPostingMutationCapture(
+                                @intCast(cfg.segment_wal_mutation_batches + 1),
+                                posting_source_sequence,
+                                .{ .sync = cfg.segment_wal_sync_each_batch },
+                            );
+                            wal_capture_ns += nanotime() - wal_capture_start;
+                            wal_bytes = wal_stats.wal_committed_bytes;
+                            wal_records += wal_stats.record_count;
+                        }
+                        const mutation_ns = nanotime() - mutation_start;
+                        const mutation_storage_after = scenario.storage_harness.snapshotCounters();
+                        const mutation_storage = StorageCounters.delta(mutation_storage_after, mutation_storage_before);
+                        try out.print(
+                            "{{\"scenario\":\"{s}_{s}_posting_wal_mutation\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_wal_mutation\",\"batches\":{d},\"batch_size\":{d},\"records\":{d},\"wal_bytes\":{d},\"sync_each_batch\":{any},\"ns\":{d},\"apply_ns\":{d},\"quantized_rebuild_ns\":{d},\"wal_capture_ns\":{d},\"storage_write_file\":{d},\"storage_write_bytes\":{d}}}\n",
+                            .{
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                @tagName(scenario.storage_kind),
+                                @tagName(scenario.build_kind),
+                                scenario.sample_index,
+                                cfg.segment_wal_mutation_batches,
+                                cfg.batch_size,
+                                wal_records,
+                                wal_bytes,
+                                cfg.segment_wal_sync_each_batch,
+                                mutation_ns,
+                                apply_ns,
+                                quantized_rebuild_ns,
+                                wal_capture_ns,
+                                mutation_storage.write_file,
+                                mutation_storage.write_bytes,
+                            },
+                        );
+                        try stdout_writer.flush();
+                    }
+                }
+                try benchQueries(out, &stdout_writer, &scenario, "post_ingest_query_no_metadata", queries, cfg.queries, .{
+                    .query = queries[0..cfg.dims],
+                    .k = cfg.k,
+                    .load_metadata = false,
+                }, sample_dataset, true);
+                if (cfg.segment_wal_mutation_batches > 0) {
+                    try scenario.reopen();
+                    if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                    try benchQueries(out, &stdout_writer, &scenario, "reopened_lsm_cold_query_no_metadata", queries, 1, .{
+                        .query = queries[0..cfg.dims],
+                        .k = cfg.k,
+                        .load_metadata = false,
+                    }, sample_dataset, false);
+                    try benchQueries(out, &stdout_writer, &scenario, "reopened_lsm_warm_query_no_metadata", queries, cfg.queries, .{
+                        .query = queries[0..cfg.dims],
+                        .k = cfg.k,
+                        .load_metadata = false,
+                    }, sample_dataset, true);
+                }
+                var reopened = false;
+                if (cfg.segment_store_reads) {
+                    const reopen_start = nanotime();
+                    try scenario.reopen();
+                    const reopen_ns = nanotime() - reopen_start;
+                    if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                    const activate_start = nanotime();
+                    try scenario.index.activateExperimentalPostingReads(posting_source_sequence);
+                    const activate_ns = nanotime() - activate_start;
+                    try out.print(
+                        "{{\"scenario\":\"{s}_{s}_posting_store_activate\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"posting_store_activate\",\"reopen_ns\":{d},\"activate_ns\":{d}}}\n",
+                        .{
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            @tagName(scenario.storage_kind),
+                            @tagName(scenario.build_kind),
+                            scenario.sample_index,
+                            reopen_ns,
+                            activate_ns,
+                        },
+                    );
+                    try stdout_writer.flush();
+                    reopened = true;
+                }
+                if (cfg.reopen_before_query and !reopened) {
+                    try scenario.reopen();
+                    if (build_mode == .public_ingest) scenario.index.setExternalVectorLoader(&external_loader_ctx, ExternalVectorLoaderContext.load);
+                }
 
                 try benchQueries(out, &stdout_writer, &scenario, "cold_first_query_no_metadata", queries, 1, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
-                });
+                }, sample_dataset, false);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_no_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
-                });
+                }, sample_dataset, true);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_metadata", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = true,
-                });
+                }, sample_dataset, false);
                 try benchQueries(out, &stdout_writer, &scenario, "warm_query_filter_prefix", queries, cfg.queries, .{
                     .query = queries[0..cfg.dims],
                     .k = cfg.k,
                     .load_metadata = false,
                     .filter_prefix = "doc:0000",
-                });
+                }, sample_dataset, false);
             }
         }
     }
     try stdout_writer.flush();
+}
+
+fn benchShadowSegmentCheckpoint(writer: anytype, stdout_writer: anytype, scenario: *Scenario) !void {
+    var segment_writer = posting_segment.Writer.init(scenario.allocator);
+    defer segment_writer.deinit();
+    var live_ids = std.ArrayListUnmanaged(u64).empty;
+    defer live_ids.deinit(scenario.allocator);
+
+    var txn = try scenario.index.beginRuntimeReadTxn();
+    defer txn.abort();
+    const checkpoint_start = nanotime();
+    var node_id: u64 = 1;
+    while (node_id <= scenario.index.metadata.node_count) : (node_id += 1) {
+        var key_buf: [12]u8 = undefined;
+        const packed_value = scenario.index.getNamespaced(&txn, .nodes, antfly.vectorindex.encodeNodeKey(&key_buf, node_id, .packed_node)) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        try segment_writer.appendBase(node_id, packed_value);
+        try live_ids.append(scenario.allocator, node_id);
+
+        var quant_key_buf: [10]u8 = undefined;
+        if (scenario.index.getNamespaced(&txn, .quant, antfly.vectorindex.encodeQuantKey(&quant_key_buf, node_id))) |quantized| {
+            try segment_writer.appendQuantizedCheckpoint(node_id, quantized);
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+    }
+    const segment_bytes = try segment_writer.build();
+    defer scenario.allocator.free(segment_bytes);
+    const checkpoint_ns = nanotime() - checkpoint_start;
+
+    const open_start = nanotime();
+    var reader = try posting_segment.VerifiedReader.init(scenario.allocator, segment_bytes);
+    defer reader.deinit();
+    const open_ns = nanotime() - open_start;
+    const verification_latencies = try scenario.allocator.alloc(u64, live_ids.items.len);
+    defer scenario.allocator.free(verification_latencies);
+    for (live_ids.items, 0..) |lookup_id, index| {
+        const lookup_start = nanotime();
+        _ = (try reader.getBase(lookup_id)).?;
+        _ = try reader.getQuantizedCheckpoint(lookup_id);
+        verification_latencies[index] = nanotime() - lookup_start;
+    }
+    std.mem.sort(u64, verification_latencies, {}, std.sort.asc(u64));
+    const lookup_count = @max(scenario.cfg.queries, 1000);
+    const latencies = try scenario.allocator.alloc(u64, lookup_count);
+    defer scenario.allocator.free(latencies);
+    var bytes_touched: usize = 0;
+    for (0..lookup_count) |index| {
+        const lookup_id = live_ids.items[(index * 9973) % live_ids.items.len];
+        const lookup_start = nanotime();
+        const base = (try reader.getBase(lookup_id)).?;
+        const quantized = try reader.getQuantizedCheckpoint(lookup_id);
+        latencies[index] = nanotime() - lookup_start;
+        bytes_touched +%= base.len;
+        if (quantized) |value| bytes_touched +%= value.len;
+    }
+    std.mem.doNotOptimizeAway(bytes_touched);
+    std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+    try writer.print(
+        "{{\"scenario\":\"{s}_{s}_shadow_segment_checkpoint\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"shadow_segment_checkpoint\",\"live_postings\":{d},\"segment_bytes\":{d},\"checkpoint_ns\":{d},\"open_ns\":{d},\"verification_p50_ns\":{d},\"verification_p95_ns\":{d},\"verification_max_ns\":{d},\"lookups\":{d},\"lookup_p50_ns\":{d},\"lookup_p95_ns\":{d},\"lookup_p99_ns\":{d},\"lookup_max_ns\":{d}}}\n",
+        .{
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            scenario.sample_index,
+            live_ids.items.len,
+            segment_bytes.len,
+            checkpoint_ns,
+            open_ns,
+            percentile(verification_latencies, 50),
+            percentile(verification_latencies, 95),
+            verification_latencies[verification_latencies.len - 1],
+            lookup_count,
+            percentile(latencies, 50),
+            percentile(latencies, 95),
+            percentile(latencies, 99),
+            latencies[latencies.len - 1],
+        },
+    );
+    try stdout_writer.flush();
+}
+
+fn printBuildResult(
+    writer: anytype,
+    scenario: *const Scenario,
+    elapsed_ns: u64,
+    before_storage: StorageCounters,
+    after_storage: StorageCounters,
+) !void {
+    const storage_delta = StorageCounters.delta(after_storage, before_storage);
+    const profile = scenario.index.getWriteProfile();
+    try writer.print(
+        "{{\"scenario\":\"{s}_{s}_build\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"build\",\"vectors\":{d},\"dims\":{d},\"ns\":{d},\"ns_per_vector\":{d:.2},\"vectors_per_second\":{d:.2},\"storage_write_file\":{d},\"storage_write_bytes\":{d},\"storage_manifest_write_file\":{d},\"storage_manifest_write_bytes\":{d},\"insert_calls\":{d},\"save_node_calls\":{d},\"split_leaf_calls\":{d},\"refresh_quantized_ns\":{d},\"quantized_store_ns\":{d},\"quantized_put_ns\":{d}}}\n",
+        .{
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            @tagName(scenario.storage_kind),
+            @tagName(scenario.build_kind),
+            scenario.sample_index,
+            scenario.cfg.vectors,
+            scenario.cfg.dims,
+            elapsed_ns,
+            @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(scenario.cfg.vectors)),
+            @as(f64, @floatFromInt(scenario.cfg.vectors)) * 1_000_000_000.0 / @as(f64, @floatFromInt(@max(elapsed_ns, 1))),
+            storage_delta.write_file,
+            storage_delta.write_bytes,
+            storage_delta.manifest_write_file,
+            storage_delta.manifest_write_bytes,
+            profile.insert_calls,
+            profile.save_node_calls,
+            profile.split_leaf_calls,
+            profile.refresh_quantized_ns,
+            profile.quantized_store_ns,
+            profile.quantized_put_ns,
+        },
+    );
 }
 
 fn buildIndex(scenario: *Scenario, items: []const hbc.BatchInsertItem) !void {
@@ -460,6 +853,23 @@ fn buildIndex(scenario: *Scenario, items: []const hbc.BatchInsertItem) !void {
                 offset = end;
             }
         },
+        .public_ingest => {
+            try scenario.index.beginBulkIngestSession();
+            errdefer scenario.index.abortBulkIngestSession();
+            var offset: usize = 0;
+            while (offset < items.len) {
+                const end = @min(offset + scenario.cfg.batch_size, items.len);
+                try scenario.index.batchInsertWithMetadataOptions(items[offset..end], .{
+                    .assume_absent_ids = true,
+                    .coalesce_leaf_writes = true,
+                    .defer_quantized_rebuild = true,
+                    .skip_vector_store = true,
+                    .bulk_ingest = true,
+                });
+                offset = end;
+            }
+            try scenario.index.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        },
         .both => unreachable,
     }
 }
@@ -472,20 +882,66 @@ fn benchQueries(
     queries: []const f32,
     query_count: usize,
     request_template: hbc.SearchRequest,
+    dataset: []const f32,
+    measure_recall: bool,
 ) !void {
     const before_storage = scenario.storage_harness.snapshotCounters();
     var totals: ProfileTotals = .{};
+    const latencies = try scenario.allocator.alloc(u64, query_count);
+    defer scenario.allocator.free(latencies);
+    const predictions = try scenario.allocator.alloc(u64, query_count * scenario.cfg.k);
+    defer scenario.allocator.free(predictions);
+    @memset(predictions, 0);
+    const prediction_counts = try scenario.allocator.alloc(usize, query_count);
+    defer scenario.allocator.free(prediction_counts);
     const start = nanotime();
     for (0..query_count) |i| {
         var req = request_template;
         req.query = queries[(i % scenario.cfg.queries) * scenario.cfg.dims ..][0..scenario.cfg.dims];
+        if (scenario.cfg.rerank_factor != 0) req.rerank_factor = scenario.cfg.rerank_factor;
+        const query_start = nanotime();
         var profiled = try scenario.index.searchProfiledRequest(req);
+        latencies[i] = nanotime() - query_start;
         totals.add(&profiled);
+        const hits = profiled.results.getHits();
+        prediction_counts[i] = @min(hits.len, scenario.cfg.k);
+        for (hits[0..prediction_counts[i]], 0..) |hit, hit_index| {
+            predictions[i * scenario.cfg.k + hit_index] = hit.vector_id;
+        }
         profiled.results.deinit();
     }
     const elapsed = nanotime() - start;
     const after_storage = scenario.storage_harness.snapshotCounters();
-    try printResult(writer, scenario, workload, query_count, elapsed, before_storage, after_storage, totals);
+    std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+
+    var recall_sum: f64 = 0;
+    const recall_queries = if (measure_recall) @min(query_count, scenario.cfg.recall_queries) else 0;
+    for (0..recall_queries) |i| {
+        const query = queries[(i % scenario.cfg.queries) * scenario.cfg.dims ..][0..scenario.cfg.dims];
+        const truth = try recall_common.calculateTruth(
+            scenario.allocator,
+            @min(scenario.cfg.k, scenario.cfg.vectors),
+            .cosine,
+            query,
+            .{ .dims = scenario.cfg.dims, .count = scenario.cfg.vectors, .data = @constCast(dataset) },
+        );
+        defer scenario.allocator.free(truth);
+        var hits: usize = 0;
+        for (truth) |truth_offset| {
+            for (predictions[i * scenario.cfg.k ..][0..prediction_counts[i]]) |prediction| {
+                if (prediction == truth_offset + 1) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        recall_sum += @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(truth.len));
+    }
+    const recall = if (recall_queries > 0) recall_sum / @as(f64, @floatFromInt(recall_queries)) else 0;
+    var result_hasher = std.hash.Wyhash.init(0);
+    result_hasher.update(std.mem.sliceAsBytes(predictions));
+    result_hasher.update(std.mem.sliceAsBytes(prediction_counts));
+    try printResult(writer, scenario, workload, query_count, elapsed, before_storage, after_storage, totals, latencies, recall_queries, recall, result_hasher.final());
     try stdout_writer.flush();
 }
 
@@ -498,11 +954,15 @@ fn printResult(
     before_storage: StorageCounters,
     after_storage: StorageCounters,
     totals: ProfileTotals,
+    sorted_latencies: []const u64,
+    recall_queries: usize,
+    recall: f64,
+    result_digest: u64,
 ) !void {
     const storage_delta = StorageCounters.delta(after_storage, before_storage);
     const ns_per_query = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(queries, 1)));
     try writer.print(
-        "{{\"scenario\":\"{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2}",
+        "{{\"scenario\":\"{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2},\"qps\":{d:.2},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d},\"latency_max_ns\":{d},\"recall_queries\":{d},\"recall_at_k\":{d:.6},\"result_digest\":{d}",
         .{
             @tagName(scenario.storage_kind),
             @tagName(scenario.build_kind),
@@ -517,6 +977,14 @@ fn printResult(
             scenario.cfg.k,
             ns,
             ns_per_query,
+            @as(f64, @floatFromInt(queries)) * 1_000_000_000.0 / @as(f64, @floatFromInt(@max(ns, 1))),
+            percentile(sorted_latencies, 50),
+            percentile(sorted_latencies, 95),
+            percentile(sorted_latencies, 99),
+            sorted_latencies[sorted_latencies.len - 1],
+            recall_queries,
+            recall,
+            result_digest,
         },
     );
     try writer.print(
@@ -566,6 +1034,12 @@ fn printResult(
     );
 }
 
+fn percentile(sorted: []const u64, percent: usize) u64 {
+    std.debug.assert(sorted.len > 0);
+    const rank = @max(@as(usize, 1), (sorted.len * percent + 99) / 100);
+    return sorted[@min(rank - 1, sorted.len - 1)];
+}
+
 fn hbcConfig(cfg: Config) hbc.HBCConfig {
     return .{
         .storage_backend = .lsm,
@@ -577,7 +1051,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .search_width = cfg.branching_factor,
         .epsilon = 7,
         .use_quantization = cfg.use_quantization,
-        .rerank_policy = .boundary,
+        .rerank_policy = cfg.rerank_policy,
         .quantizer_seed = cfg.seed,
         .use_random_ortho_trans = cfg.use_random_ortho_trans,
         .bulk_build_algo = cfg.bulk_build_algo,
@@ -620,6 +1094,23 @@ fn makeQueries(allocator: Allocator, cfg: Config, dataset: []const f32) ![]f32 {
     return queries;
 }
 
+fn applyVectorMutation(vector: []f32, batch_index: usize) void {
+    vector[batch_index % vector.len] += 0.05;
+    _ = vec.normalize(vector);
+}
+
+fn applyDatasetMutations(dataset: []f32, cfg: Config, batches: usize) void {
+    if (batches == 0) return;
+    const batch_slots = (cfg.vectors - 1) / cfg.batch_size + 1;
+    for (0..batches) |batch_index| {
+        const offset = (batch_index % batch_slots) * cfg.batch_size;
+        const end = @min(offset + cfg.batch_size, cfg.vectors);
+        for (offset..end) |vector_index| {
+            applyVectorMutation(dataset[vector_index * cfg.dims ..][0..cfg.dims], batch_index);
+        }
+    }
+}
+
 fn makeItems(allocator: Allocator, cfg: Config, dataset: []const f32) ![]hbc.BatchInsertItem {
     const items = try allocator.alloc(hbc.BatchInsertItem, cfg.vectors);
     errdefer allocator.free(items);
@@ -656,6 +1147,8 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.dims = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--queries")) {
             cfg.queries = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--recall-queries")) {
+            cfg.recall_queries = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--k")) {
             cfg.k = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
@@ -695,15 +1188,45 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             cfg.flat_centroid_probe_count = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--no-quantization")) {
             cfg.use_quantization = false;
+        } else if (std.mem.eql(u8, arg, "--rerank-policy")) {
+            const value = args.next() orelse return error.MissingArgument;
+            cfg.rerank_policy = if (std.mem.eql(u8, value, "always"))
+                .always
+            else if (std.mem.eql(u8, value, "boundary"))
+                .boundary
+            else if (std.mem.eql(u8, value, "never"))
+                .never
+            else
+                return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--rerank-factor")) {
+            cfg.rerank_factor = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--no-reopen")) {
             cfg.reopen_before_query = false;
+        } else if (std.mem.eql(u8, arg, "--shadow-segment-checkpoint")) {
+            cfg.shadow_segment_checkpoint = true;
+        } else if (std.mem.eql(u8, arg, "--segment-store-reads")) {
+            cfg.segment_store_reads = true;
+        } else if (std.mem.eql(u8, arg, "--segment-wal-shadow-batches")) {
+            cfg.segment_wal_shadow_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--segment-wal-mutation-batches")) {
+            cfg.segment_wal_mutation_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--prebuild-mutation-batches")) {
+            cfg.prebuild_mutation_batches = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--mutation-rebuild-quantized")) {
+            cfg.mutation_rebuild_quantized = true;
+        } else if (std.mem.eql(u8, arg, "--segment-wal-sync-each-batch")) {
+            cfg.segment_wal_sync_each_batch = true;
         } else if (std.mem.eql(u8, arg, "--random-ortho")) {
             cfg.use_random_ortho_trans = true;
         } else {
             return error.InvalidArgument;
         }
     }
-    if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
+    if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.recall_queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
+    if ((cfg.segment_wal_shadow_batches > 0 or cfg.segment_wal_mutation_batches > 0) and !cfg.segment_store_reads) return error.InvalidArgument;
+    if (cfg.segment_wal_shadow_batches > 0 and cfg.segment_wal_mutation_batches > 0) return error.InvalidArgument;
+    if (cfg.prebuild_mutation_batches > 0 and cfg.segment_wal_mutation_batches > 0) return error.InvalidArgument;
+    if (cfg.mutation_rebuild_quantized and cfg.segment_wal_mutation_batches == 0) return error.InvalidArgument;
     return cfg;
 }
 
