@@ -151,6 +151,9 @@ pub fn main(init: std.process.Init) !void {
     var node = try server_mod.Node.init(allocator, .{
         .kernel_jit = opts.kernel_jit,
         .allow_unknown_models = true,
+        // Benchmarks are disposable dedicated processes, so fail-stop driver
+        // cancellation is safe even without a resident service supervisor.
+        .process_termination_available = true,
     });
     defer node.deinit();
     try node.attachIo(init.io);

@@ -453,7 +453,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
-        .supervised_process_worker = platform.env.getenvBool(supervised_worker_env),
+        .process_termination_available = platform.env.getenvBool(supervised_worker_env),
     });
     defer node.deinit();
 

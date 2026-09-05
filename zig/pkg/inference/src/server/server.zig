@@ -1236,10 +1236,11 @@ pub const NodeConfig = struct {
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
     allow_unknown_models: bool = false,
-    /// Set only by the child side of the inference process supervisor.
-    /// Embedded nodes intentionally remain fail-closed for uninterruptible
-    /// backends because killing them would also kill the database owner.
-    supervised_process_worker: bool = false,
+    /// True only when this Node owns its whole process and may terminate it to
+    /// interrupt a wedged driver. Production sets this in a supervised worker;
+    /// disposable CLI tools may opt in directly. Embedded database nodes must
+    /// remain false because termination would also kill their owner.
+    process_termination_available: bool = false,
 };
 
 fn isLoopbackBindHost(host: []const u8) bool {
@@ -3613,7 +3614,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
-        session_manager.process_isolation_available = config.supervised_process_worker;
+        session_manager.process_isolation_available = config.process_termination_available;
         try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
@@ -3634,7 +3635,7 @@ pub const Node = struct {
                 );
             }
         }
-        const hard_cancellation_watchdog = if (config.supervised_process_worker)
+        const hard_cancellation_watchdog = if (config.process_termination_available)
             try HardCancellationWatchdog.create(allocator)
         else
             null;
@@ -16805,7 +16806,7 @@ test "node attachIo wires model session manager" {
 
 test "supervised node owns and joins the hard cancellation watchdog" {
     var node = try Node.init(std.testing.allocator, .{
-        .supervised_process_worker = true,
+        .process_termination_available = true,
     });
     defer node.deinit();
     try std.testing.expectError(

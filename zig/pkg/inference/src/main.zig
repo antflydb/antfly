@@ -591,6 +591,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        // This binary is itself a dedicated inference process. A cancelled
+        // uninterruptible request may terminate it for its service manager to
+        // restart; it never takes a database runtime down with it.
+        .process_termination_available = true,
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
