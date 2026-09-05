@@ -3043,10 +3043,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
-        if (cfg.backend_runtime) |runtime| {
-            if (runtime.apiIoImpl()) |io_impl| return io_impl.io();
-        }
-        return std.Io.Threaded.global_single_threaded.io();
+        const fallback = std.Io.Threaded.global_single_threaded.io();
+        const runtime = cfg.backend_runtime orelse return fallback;
+        return runtime.apiIo() orelse fallback;
     }
 
     fn protocolStoreNowNs() u64 {
@@ -3536,10 +3535,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .io = if (self.cfg.backend_runtime) |runtime|
-                if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
-            else
-                null,
+            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiIo() else null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3608,8 +3604,7 @@ pub const ApiHttpServer = struct {
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
         const runtime = self.cfg.backend_runtime orelse return null;
-        const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return null;
-        return io_impl.io();
+        return runtime.apiIo();
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -15246,10 +15241,10 @@ pub const ApiHttpServer = struct {
         fn run(ptr: *anyopaque) !void {
             const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
             const runtime = self.server.cfg.backend_runtime orelse return;
-            const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return;
+            const api_io = runtime.apiIo() orelse return;
             var elapsed_ns: u64 = 0;
             while (!self.stop.load(.acquire)) {
-                io_impl.io().sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
+                api_io.sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
                 if (self.stop.load(.acquire)) break;
                 elapsed_ns +|= poll_ns;
                 if (elapsed_ns < interval_ns) continue;
@@ -15307,7 +15302,7 @@ pub const ApiHttpServer = struct {
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
-        if (runtime.apiIoImpl() == null and runtime.io_impl == null) return null;
+        if (runtime.apiIo() == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
         const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);

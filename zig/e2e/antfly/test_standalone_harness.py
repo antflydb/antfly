@@ -15,7 +15,9 @@
 """Fast regression tests for the standalone inference test harness."""
 
 import pytest
+import requests
 
+import conftest as e2e_conftest
 import test_standalone as standalone
 
 
@@ -133,3 +135,29 @@ def test_cleanup_failure_is_primary_after_successful_test():
         standalone._finish_standalone_server(server, None)
 
     assert server.stop_calls == 1
+
+
+def test_request_failure_attaches_one_bounded_server_log_tail():
+    logs = "old-log-entry\n" + ("x" * 25_000) + "\nactionable-tail"
+
+    class Server:
+        def debug_logs(self) -> str:
+            return logs
+
+    original = requests.HTTPError(
+        "503 Service Unavailable body=index_rebuilding\n"
+        "server logs:\nprevious-unbounded-copy"
+    )
+
+    with pytest.raises(requests.HTTPError) as raised:
+        e2e_conftest.raise_request_error_with_logs(original, Server())
+
+    message = str(raised.value)
+    assert raised.value is original
+    assert message.count("server logs:") == 1
+    assert "previous-unbounded-copy" not in message
+    assert "old-log-entry" not in message
+    omitted = len(logs) - e2e_conftest.FAILURE_LOG_TAIL_LIMIT
+    assert f"omitted {omitted} earlier server-log characters" in message
+    assert message.endswith("actionable-tail")
+    assert raised.value.__cause__ is None
