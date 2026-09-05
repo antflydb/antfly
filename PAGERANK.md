@@ -543,6 +543,24 @@ floating-point reduction and caches the phase summary. This keeps publication
 bit-deterministic without recomputing floating aggregates after every
 completion.
 
+Planned score workers likewise write only their disjoint node-keyed score
+pages. They do not maintain the generation-wide score-ranked keyspace at every
+checkpoint. After verification, the coordinator selects the exact supported
+top-10k once from the immutable generation and installs that bounded secondary
+index in the same transaction that flips the publication pointer (and both
+indexes/pointers for paired HITS). Readers therefore retain O(K) top-K access
+without turning every 4k-score checkpoint into another generation scan and
+sort.
+
+Public serverless query shaping treats the selector's returned parent indexes
+as the row-lineage authority. Resident metric columns are transactionally
+rebased with direct indexing after each filter/order transition, filter-only
+and order-only columns are released before the next transition, and a failed
+allocation leaves the entire cache on its prior lineage. Cross-column I/O also
+preallocates every caller-owned result buffer before scheduling the first
+worker, so no error path can release stack state or score storage still used by
+an asynchronous child.
+
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible
 limit. A future physical-format migration may share an ordinal dictionary only

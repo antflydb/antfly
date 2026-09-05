@@ -11176,7 +11176,7 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricBuildPageExecutionLease(expected_page, page);
         if (page.total_units != 0 and completed_units > page.total_units) return error.InvalidGraphMetricBuildProgress;
 
-        try self.putGraphMetricScoresInBatch(&batch, metric_name, job.score_generation, scores);
+        try self.putGraphMetricScorePageInBatch(&batch, metric_name, job.score_generation, scores);
 
         page.state = if (complete_page) .complete else .leased;
         page.worker_id = worker_id;
@@ -11282,8 +11282,8 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .publish_generation, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, page);
-        try self.putGraphMetricScoresInBatch(&batch, metric_name, job.score_generation, primary_scores.items);
-        if (pair_cfg) |pair| try self.putGraphMetricScoresInBatch(&batch, pair.name, job.score_generation, pair_scores.items);
+        try self.putGraphMetricScorePageInBatch(&batch, metric_name, job.score_generation, primary_scores.items);
+        if (pair_cfg) |pair| try self.putGraphMetricScorePageInBatch(&batch, pair.name, job.score_generation, pair_scores.items);
 
         page.completed_units = completed_units;
         page.total_units = total_units;
@@ -12795,6 +12795,18 @@ pub const GraphIndex = struct {
         const verification = try self.verifyGraphMetricBuildPublishReady(metric_name, job_id);
         if (verification.config_fingerprint != meta.config_fingerprint) return error.InvalidGraphMetricBuildManifest;
 
+        const rank_count = @min(score_count, graph_metric_rank_entry_limit);
+        const ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
+            metric_name,
+            verification.score_generation,
+            rank_count,
+        );
+        defer {
+            for (ranked_scores) |*score| score.deinit(self.alloc);
+            self.alloc.free(ranked_scores);
+        }
+        if (ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
+
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
@@ -12802,6 +12814,12 @@ pub const GraphIndex = struct {
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
         var published_meta = meta;
         published_meta.target_edge_generation = verification.target_generation;
+        try self.putExactGraphMetricRankPrefixInBatch(
+            &batch,
+            metric_name,
+            verification.score_generation,
+            ranked_scores,
+        );
         try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, published_meta);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .publish,
@@ -12903,6 +12921,21 @@ pub const GraphIndex = struct {
         target_generation: u64,
         scores: []const GraphMetricScore,
     ) !void {
+        try self.putGraphMetricScorePageInBatch(batch, metric_name, target_generation, scores);
+        try self.mergeGraphMetricRankPrefixInBatch(batch, metric_name, target_generation, scores);
+    }
+
+    /// Writes one unpublished score page without repeatedly rebuilding the
+    /// generation-wide top-K index. Planned builds finalize that secondary
+    /// index once, atomically with publication, after every score page is
+    /// immutable and verified.
+    fn putGraphMetricScorePageInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        target_generation: u64,
+        scores: []const GraphMetricScore,
+    ) !void {
         // The check shares the writer transaction with the score writes. A
         // build that started before an operator delete can therefore neither
         // recreate deleted scores nor race the tombstone at commit time.
@@ -12916,7 +12949,6 @@ pub const GraphIndex = struct {
             try self.writeGraphMetricKey(&score_key, &.{ metric_name, "score", generation_text, score.node });
             try putF64(batch, score_key.items, score.score);
         }
-        try self.mergeGraphMetricRankPrefixInBatch(batch, metric_name, target_generation, scores);
     }
 
     const RankIndexCandidate = struct {
@@ -13032,6 +13064,31 @@ pub const GraphIndex = struct {
                     else => return err,
                 };
             }
+        }
+    }
+
+    /// Replaces the bounded secondary rank index with a top-K set selected from
+    /// the complete immutable score generation. Deleting and installing the
+    /// prefix in the publication transaction means readers can observe neither
+    /// a partial rank tier nor a generation pointer without its exact tier.
+    fn putExactGraphMetricRankPrefixInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        generation: u64,
+        scores: []const GraphMetricScore,
+    ) !void {
+        if (scores.len > graph_metric_rank_entry_limit) return error.InvalidGraphMetricTopK;
+        const rank_prefix = try self.graphMetricRankPrefixAlloc(metric_name, generation);
+        defer self.alloc.free(rank_prefix);
+        _ = try self.deleteKeysWithPrefixInBatch(batch, rank_prefix);
+        for (scores, 0..) |score, index| {
+            if (!std.math.isFinite(score.score)) return error.InvalidGraphMetricScore;
+            if (index > 0 and !graphMetricScoreComesBefore(scores[index - 1], score))
+                return error.InvalidGraphMetricRankEntry;
+            const key = try self.graphMetricRankKeyAlloc(metric_name, generation, score.score, score.node);
+            defer self.alloc.free(key);
+            try putF64(batch, key, score.score);
         }
     }
 
@@ -13766,12 +13823,36 @@ pub const GraphIndex = struct {
         var pair_meta = meta;
         pair_meta.config_fingerprint = graphMetricConfigFingerprint(pair);
 
+        const rank_count = @min(score_count, graph_metric_rank_entry_limit);
+        const ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
+            metric_name,
+            verification.score_generation,
+            rank_count,
+        );
+        defer {
+            for (ranked_scores) |*score| score.deinit(self.alloc);
+            self.alloc.free(ranked_scores);
+        }
+        if (ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
+        const pair_ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
+            pair.name,
+            verification.score_generation,
+            rank_count,
+        );
+        defer {
+            for (pair_ranked_scores) |*score| score.deinit(self.alloc);
+            self.alloc.free(pair_ranked_scores);
+        }
+        if (pair_ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
+
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const persisted_job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
         if (persisted_job.job_id != job.job_id) return error.GraphMetricBuildJobMismatch;
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
         const pair_prior_published = try self.metricPublishedGeneration(&batch, pair.name);
+        try self.putExactGraphMetricRankPrefixInBatch(&batch, metric_name, verification.score_generation, ranked_scores);
+        try self.putExactGraphMetricRankPrefixInBatch(&batch, pair.name, verification.score_generation, pair_ranked_scores);
         try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, meta);
         try self.publishGraphMetricPointerInBatch(&batch, pair.name, verification.score_generation, pair_meta);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
@@ -14212,6 +14293,17 @@ pub const GraphIndex = struct {
             return out;
         }
 
+        return try self.selectGraphMetricTopKFromScoresInTxnAlloc(txn, metric_name, generation, limit);
+    }
+
+    fn selectGraphMetricTopKFromScoresInTxnAlloc(
+        self: *GraphIndex,
+        txn: anytype,
+        metric_name: []const u8,
+        generation: u64,
+        limit: usize,
+    ) ![]GraphMetricScore {
+        if (limit == 0) return try self.alloc.alloc(GraphMetricScore, 0);
         const prefix = try self.graphMetricScorePrefixAlloc(metric_name, generation);
         defer self.alloc.free(prefix);
         var scores = std.PriorityQueue(GraphMetricScore, void, graphMetricScoreWorstFirst).initContext({});
@@ -14223,13 +14315,15 @@ pub const GraphIndex = struct {
         var entry_opt = try cur.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cur.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            const score_value = decodeF64(entry.value) orelse continue;
+            const score_value = decodeF64(entry.value) orelse return error.InvalidGraphMetricScore;
+            if (!std.math.isFinite(score_value)) return error.InvalidGraphMetricScore;
             // Once the heap is full, a strictly lower score cannot enter it;
             // avoid decoding and allocating that node key on the common path.
             if (scores.peek()) |worst| {
                 if (scores.items.len == limit and score_value < worst.score) continue;
             }
-            const node = (try self.graphMetricNodeFromScoreKeyAlloc(entry.key, prefix)) orelse continue;
+            const node = (try self.graphMetricNodeFromScoreKeyAlloc(entry.key, prefix)) orelse
+                return error.InvalidGraphMetricRankEntry;
             errdefer self.alloc.free(node);
             const candidate = GraphMetricScore{ .node = node, .score = score_value };
             if (scores.items.len < limit) {
@@ -14249,6 +14343,17 @@ pub const GraphIndex = struct {
         const out = try self.alloc.dupe(GraphMetricScore, scores.items);
         scores.items.len = 0;
         return out;
+    }
+
+    fn selectGraphMetricTopKFromScoresAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        generation: u64,
+        limit: usize,
+    ) ![]GraphMetricScore {
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        return try self.selectGraphMetricTopKFromScoresInTxnAlloc(&txn, metric_name, generation, limit);
     }
 
     fn graphMetricScoreComesBefore(a: GraphMetricScore, b: GraphMetricScore) bool {
@@ -20635,6 +20740,17 @@ test "graph degree planned worker and coordinator steps survive reopened handles
         try std.testing.expect(step.completed_page);
         try std.testing.expect(!step.advanced_phase);
         try std.testing.expect(!step.published);
+
+        // Planned workers write only their disjoint score pages. The bounded
+        // global rank tier is derived once by the coordinator immediately
+        // before the generation pointer becomes visible.
+        var txn = try worker_b.beginReadReverseTxn();
+        defer txn.abort();
+        const active_job = try worker_b.metricBuildJob(&txn, "degree") orelse
+            return error.TestExpectedGraphMetricBuildJob;
+        const rank_prefix = try worker_b.graphMetricRankPrefixAlloc("degree", active_job.score_generation);
+        defer alloc.free(rank_prefix);
+        try std.testing.expectEqual(@as(usize, 0), try GraphIndex.countKeysWithPrefix(&txn, rank_prefix));
     }
 
     {

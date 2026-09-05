@@ -1162,12 +1162,11 @@ pub const GraphQueryEngine = struct {
                 return error.InvalidQueryRequest;
         }
 
-        const selected_mask = try alloc.alloc(bool, nodes.*.len);
-        defer alloc.free(selected_mask);
-        @memset(selected_mask, false);
+        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(alloc, nodes.*.len);
+        defer selected_mask.deinit(alloc);
         for (selected) |source_index| {
-            if (source_index >= nodes.*.len or selected_mask[source_index]) return error.InvalidQueryRequest;
-            selected_mask[source_index] = true;
+            if (source_index >= nodes.*.len or selected_mask.isSet(source_index)) return error.InvalidQueryRequest;
+            selected_mask.set(source_index);
         }
 
         const slab_len = std.math.mul(usize, selected.len, query.metrics.len) catch return error.QueryCandidateBudgetExceeded;
@@ -1196,7 +1195,7 @@ pub const GraphQueryEngine = struct {
             node.metrics_owned = false;
             final_nodes[out_index] = node;
         }
-        for (nodes.*, selected_mask) |*node, keep| if (!keep) node.deinit(alloc);
+        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(alloc);
         alloc.free(nodes.*);
         nodes.* = final_nodes;
         return metric_values_slab;
@@ -1223,13 +1222,12 @@ pub const GraphQueryEngine = struct {
             }
         }
 
-        const selected_mask = try alloc.alloc(bool, nodes.*.len);
-        defer alloc.free(selected_mask);
-        @memset(selected_mask, false);
+        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(alloc, nodes.*.len);
+        defer selected_mask.deinit(alloc);
         for (selected_source_indexes) |source_index| {
-            if (source_index >= nodes.*.len or selected_mask[source_index])
+            if (source_index >= nodes.*.len or selected_mask.isSet(source_index))
                 return error.InvalidQueryRequest;
-            selected_mask[source_index] = true;
+            selected_mask.set(source_index);
         }
 
         const slab_len = std.math.mul(usize, selected_source_indexes.len, metric_value_names.len) catch
@@ -1255,7 +1253,7 @@ pub const GraphQueryEngine = struct {
             node.metrics_owned = false;
             final_nodes[out_index] = node;
         }
-        for (nodes.*, selected_mask) |*node, keep| if (!keep) node.deinit(alloc);
+        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(alloc);
         alloc.free(nodes.*);
         nodes.* = final_nodes;
         return metric_values_slab;

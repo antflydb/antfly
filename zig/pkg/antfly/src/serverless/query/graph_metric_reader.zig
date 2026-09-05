@@ -300,10 +300,17 @@ pub fn scoreColumnsAlloc(
         var combined_cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
         defer for (score_buffers[0..count]) |maybe_scores| if (maybe_scores) |scores| alloc.free(scores);
 
+        // Complete every fallible preparation step before the first worker is
+        // scheduled. Once group.async has observed the stack-backed child
+        // state, returning before group.await would let error cleanup release
+        // result buffers while a worker can still write through them.
+        for (0..count) |relative_index| {
+            score_buffers[relative_index] = try alloc.alloc(?f64, node_ids.len);
+        }
+
         const io = session.io.?;
         var group: std.Io.Group = .init;
         for (metric_names[start..end], 0..) |metric_name, relative_index| {
-            score_buffers[relative_index] = try alloc.alloc(?f64, node_ids.len);
             children[relative_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
             combined_cancellations[relative_index] = .{
                 .parent = session.cancellation,
@@ -1464,6 +1471,19 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
     defer columns.deinit(alloc);
     try std.testing.expectEqual(@as(usize, column_names.len), columns.columns.len);
     for (columns.columns) |column| try std.testing.expectEqual(@as(?f64, 1024), column.scores[0]);
+
+    const AllocationRunner = struct {
+        fn run(failing_alloc: Allocator, active_session: *runtime_mod.QuerySession) !void {
+            // Each injected run is one logical request. Workers share this
+            // budget, but never the intentionally non-thread-safe allocator.
+            active_session.graph_metric_read_budget = .{};
+            const names = [_][]const u8{ "rank", "rank", "rank" };
+            const ids = [_][]const u8{"node:1024"};
+            var loaded = try scoreColumnsAlloc(failing_alloc, active_session, "graph_idx", &names, &ids);
+            defer loaded.deinit(failing_alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&session});
 
     state.range_calls.store(0, .monotonic);
     var top = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", metric_segment.score_block_entries + 1, .{ .max_scores_scanned = 0 });
