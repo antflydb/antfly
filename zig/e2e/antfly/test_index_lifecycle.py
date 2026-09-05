@@ -1916,14 +1916,34 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     )
     assert recovered is not None
 
-    recovered_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "alpha concept",
-            "indexes": [index_name],
-            "limit": 2,
-        },
+    def query_recovered_index():
+        try:
+            return stateful_api.query_table(
+                table_name,
+                {
+                    "semantic_search": "alpha concept",
+                    "indexes": [index_name],
+                    "limit": 2,
+                },
+            )
+        except requests.HTTPError as exc:
+            response = exc.response
+            if response is None or response.status_code != 503:
+                raise
+            try:
+                unavailable = response.json()
+            except ValueError:
+                unavailable = {}
+            if unavailable.get("code") != "index_rebuilding":
+                raise
+            return None
+
+    recovered_query = wait_until(
+        query_recovered_index,
+        timeout_s=30.0,
+        interval_s=0.5,
     )
+    assert recovered_query is not None
     assert _response_hit_ids(recovered_query)[0] == "doc:a"
 
 

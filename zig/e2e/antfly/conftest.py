@@ -2333,11 +2333,15 @@ def serverless_api(serverless_runtime):
                         antfly_internal_api_path(f"/tables/{table_name}/build"), {}
                     )
                 except requests.HTTPError as exc:
-                    if (
-                        exc.response is None
-                        or exc.response.status_code != 409
-                        or time.monotonic() >= deadline
-                    ):
+                    response = exc.response
+                    retryable_build_race = response is not None and (
+                        response.status_code == 409
+                        or (
+                            response.status_code == 500
+                            and response.text.strip() == "build failed"
+                        )
+                    )
+                    if not retryable_build_race or time.monotonic() >= deadline:
                         raise
                     time.sleep(interval_s)
 
