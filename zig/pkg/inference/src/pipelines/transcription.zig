@@ -213,8 +213,11 @@ pub const TranscriptionPipeline = struct {
             const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
 
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
-            const dec_outputs = try self.decoder.run(&.{ dec_tensor, enc_hidden }, allocator);
-            if (self.execution_control) |control| try control.check();
+            const dec_outputs = try self.decoder.runWithControl(
+                &.{ dec_tensor, enc_hidden },
+                allocator,
+                self.execution_control,
+            );
             defer {
                 for (dec_outputs) |*t| {
                     var mt = t.*;

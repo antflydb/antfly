@@ -6105,6 +6105,7 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 
 const arch_vtable = Session.VTable{
     .run = &archRun,
+    .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
     .runResidentWithControl = &archRunResidentWithControl,
@@ -6871,6 +6872,25 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, null);
+}
+
+fn archRunWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, control);
+}
+
+fn archRunImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) ![]Tensor {
+    if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
@@ -6886,7 +6906,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const bert_inputs = try parseBertRunInputs(inputs);
             const batch = bert_inputs.batch;
             const seq_len = bert_inputs.seq_len;
-            const hidden = try bert_arch.forward(
+            const hidden = try bert_arch.forwardWithControl(
                 &cb,
                 allocator,
                 cfg,
@@ -6895,6 +6915,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 bert_inputs.token_type_ids,
                 batch,
                 seq_len,
+                control,
             );
             defer allocator.free(hidden);
 

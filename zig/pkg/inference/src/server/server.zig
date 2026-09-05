@@ -87,6 +87,25 @@ pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
+fn httpInferenceExecutionControl(ctx: *httpx.Context) InferenceExecutionControl {
+    const Check = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+            if (request.cancellation) |cancelled| {
+                if (cancelled.load(.acquire)) return error.Cancelled;
+            }
+            if (request.cancellation_probe) |probe| {
+                if (probe.requested()) return error.Cancelled;
+            }
+        }
+    };
+    return .{
+        .deadline_ns = ctx.application_deadline_ns,
+        .ptr = ctx,
+        .check_fn = Check.check,
+    };
+}
+
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
@@ -1589,6 +1608,12 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
                     recovery_attempted = true;
                     continue;
                 }
+            } else if (err == error.Timeout) {
+                // A deadline failure is not retried inline: quarantine the
+                // exact runtime and let the durable caller retry after its
+                // backoff, at which point acquisition selects another healthy
+                // backend when one is available.
+                adapter.quarantine(&handle);
             }
             return err;
         };
@@ -1615,11 +1640,19 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
             if (self.options.failure_stage) |stage| stage.* = .acquire;
             if (self.options.execution_control) |control| try control.check();
             return if (self.options.preferred_backends) |preferred_backends|
-                try self.node.model_manager.acquireFromDirWithPreferredBackends(
-                    self.model_path,
-                    preferred_backends,
-                    self.options.cache_default_alias,
-                )
+                if (self.options.execution_control) |control|
+                    try self.node.model_manager.acquireFromDirWithPreferredBackendsAndControl(
+                        self.model_path,
+                        preferred_backends,
+                        self.options.cache_default_alias,
+                        control,
+                    )
+                else
+                    try self.node.model_manager.acquireFromDirWithPreferredBackends(
+                        self.model_path,
+                        preferred_backends,
+                        self.options.cache_default_alias,
+                    )
             else if (self.options.execution_control) |control|
                 try self.node.model_manager.acquireFromDirWithControl(self.model_path, control)
             else
@@ -1638,6 +1671,10 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
             // corrupt, preventing later requests from reusing a known-bad
             // cache entry.
             handle.retire();
+        }
+
+        fn quarantine(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            handle.quarantine();
         }
 
         fn release(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
@@ -1660,13 +1697,14 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
 
 test "embedding runtime recovery retries once and retires every corrupt runtime" {
     const Probe = struct {
-        const FailureMode = enum { first_missing, persistent_missing, capacity };
+        const FailureMode = enum { first_missing, persistent_missing, capacity, timeout };
         const Handle = struct { active: bool = true };
 
         mode: FailureMode,
         acquire_count: usize = 0,
         execute_count: usize = 0,
         retire_count: usize = 0,
+        quarantine_count: usize = 0,
         release_count: usize = 0,
         succeed_count: usize = 0,
 
@@ -1681,6 +1719,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
                 .first_missing => if (self.execute_count == 1) return error.MissingWeight,
                 .persistent_missing => return error.MissingWeight,
                 .capacity => return error.ResourceTemporarilyUnavailable,
+                .timeout => return error.Timeout,
             }
         }
 
@@ -1694,6 +1733,12 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
             if (!handle.active) return;
             handle.active = false;
             self.release_count += 1;
+        }
+
+        fn quarantine(self: *@This(), handle: *Handle) void {
+            std.debug.assert(handle.active);
+            handle.active = false;
+            self.quarantine_count += 1;
         }
 
         fn succeed(self: *@This(), _: *Handle) void {
@@ -1720,6 +1765,12 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), capacity.acquire_count);
     try std.testing.expectEqual(@as(usize, 0), capacity.retire_count);
     try std.testing.expectEqual(@as(usize, 1), capacity.release_count);
+
+    var timeout = Probe{ .mode = .timeout };
+    try std.testing.expectError(error.Timeout, runEmbeddingRuntimeRecoveryLoop(&timeout));
+    try std.testing.expectEqual(@as(usize, 1), timeout.acquire_count);
+    try std.testing.expectEqual(@as(usize, 1), timeout.quarantine_count);
+    try std.testing.expectEqual(@as(usize, 0), timeout.release_count);
 }
 
 test "embedding runtime recovery is limited to weight integrity failures" {
@@ -3773,6 +3824,42 @@ pub const Node = struct {
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        try control.check();
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
+        return self.embedDenseTextsFromPathWithExecutionControlAndTask(
+            allocator,
+            control,
+            model_path,
+            texts,
+            task_type_name,
+            instruction,
+        );
+    }
+
+    /// Production managed-operation boundary for callers that have already
+    /// resolved and authorized an immutable model directory. Benchmarks use
+    /// this entry point so they include request admission, coordinated cold
+    /// load, tokenization, forward execution, and output ownership.
+    pub fn embedDenseTextsFromPathWithExecutionControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        control: InferenceExecutionControl,
+        model_path: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        return self.embedDenseTextsFromPathWithExecutionControlAndTask(allocator, control, model_path, texts, null, null);
+    }
+
+    pub fn embedDenseTextsFromPathWithExecutionControlAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        control: InferenceExecutionControl,
+        model_path: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         const task_type = if (task_type_name) |name|
             parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
@@ -3785,8 +3872,6 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
-        defer self.allocator.free(model_path);
         try control.update(.loading_model, 0, 1);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
@@ -3838,9 +3923,12 @@ pub const Node = struct {
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) ![][]f32 {
-        try model.ensureEmbeddingAssets(true, false, false);
-        try control.check();
-        var pipeline = model.embeddingPipeline(allocator);
+        var pipeline = blk: {
+            try model.lockEmbeddingAssetsWithControl(control);
+            defer model.unlockEmbeddingAssets();
+            try model.ensurePrimaryEmbeddingAssetsLockedWithControl(true, false, control);
+            break :blk model.embeddingPipelineLocked(allocator);
+        };
         const owned_prefix = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{
             .model = "",
             .input = .null,
@@ -3943,10 +4031,6 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        var pipeline = model.rerankingPipeline(allocator);
         const DeadlineControl = struct {
             deadline_ns: ?u64,
             upstream: ?reranking_pipeline.ExecutionControl,
@@ -3958,10 +4042,15 @@ pub const Node = struct {
             }
         };
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
-        pipeline.execution_control = .{
+        const execution_control = InferenceExecutionControl{
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
         };
+        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
+        defer model_handle.release();
+        const model = model_handle.get();
+        var pipeline = model.rerankingPipeline(allocator);
+        pipeline.execution_control = execution_control;
         const scores = try pipeline.rerank(query, documents);
         errdefer allocator.free(scores);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -4240,16 +4329,30 @@ pub const Node = struct {
         const resolved_at_ns = embedTimingNowNs();
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
-                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
-                    model_path,
-                    backends,
-                    cache_default_alias,
-                    request,
-                )
+                if (execution_control) |control|
+                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+                        model_path,
+                        backends,
+                        cache_default_alias,
+                        request,
+                        control,
+                    )
+                else
+                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                        model_path,
+                        backends,
+                        cache_default_alias,
+                        request,
+                    )
+            else if (execution_control) |control|
+                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, control)
             else
                 try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
         else if (preferred_backends) |backends|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
+            if (execution_control) |control|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, control)
+            else
+                try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else if (execution_control) |control|
             try self.model_manager.acquireFromDirWithControl(model_path, control)
         else
@@ -4260,7 +4363,10 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        model.lockNativeGeneration(io);
+        if (execution_control) |control|
+            try control.lock(model.nativeGenerationMutex())
+        else
+            model.lockNativeGeneration(io);
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -4997,7 +5103,7 @@ pub const Node = struct {
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
                 defer asset_lease.release();
                 try attempt.control.check();
-                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed, attempt.control);
                 pipeline.execution_control = attempt.control;
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
                 const owned_prefix = try applyDenseEmbeddingRequestOptions(attempt.allocator, &pipeline, &model.manifest, .{
@@ -5462,6 +5568,7 @@ pub const Node = struct {
                 texts,
                 want_relations,
                 &failure_stage,
+                execution_control,
             );
         }
 
@@ -6300,6 +6407,8 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(std.json.Value)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6371,6 +6480,7 @@ pub const Node = struct {
                 allocator: std.mem.Allocator,
                 io: ?std.Io,
                 texts: []const []const u8,
+                execution_control: InferenceExecutionControl,
                 vectors: ?[]DirectSparseEmbedding = null,
                 prompt_tokens: usize = 0,
 
@@ -6383,6 +6493,7 @@ pub const Node = struct {
                         .tok = model.getTokenizer(),
                         .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
                         .execution_lock = model.embeddingExecutionLock(),
+                        .execution_control = attempt.execution_control,
                     };
                     const vectors = try pipeline.embed(attempt.texts);
                     errdefer {
@@ -6397,8 +6508,9 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .execution_control = execution_control,
             };
-            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err|
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = execution_control }, &attempt, Attempt.run) catch |err|
                 return inferenceFailureResponse(ctx, err);
             const sparse_vecs = attempt.vectors.?;
             defer {
@@ -6461,6 +6573,7 @@ pub const Node = struct {
             inputs: *ParsedDenseEmbedInputs,
             request: ParsedEmbedRequest,
             audio_decode_working_bytes: usize,
+            execution_control: InferenceExecutionControl,
             result: ?ExecutionResult = null,
             prompt_tokens: usize = 0,
 
@@ -6469,7 +6582,8 @@ pub const Node = struct {
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
                 defer asset_lease.release();
-                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs);
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs, attempt.execution_control);
+                pipeline.execution_control = attempt.execution_control;
                 var audio_asset_guard = AudioEmbeddingAssetGuard.init(
                     model,
                     attempt.inputs.audio.items.len > 0,
@@ -6521,11 +6635,13 @@ pub const Node = struct {
             .inputs = &inputs,
             .request = request,
             .audio_decode_working_bytes = audio_decode_working_bytes,
+            .execution_control = execution_control,
         };
         var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .failure_stage = &failure_stage,
+            .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
             if (isEmbedRequestOptionError(err)) {
                 return ctx.status(400).json(.{
@@ -6673,6 +6789,7 @@ pub const Node = struct {
     }
 
     pub fn rerankPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6687,12 +6804,13 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
@@ -6704,6 +6822,7 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var parsed_body = (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
@@ -6775,7 +6894,7 @@ pub const Node = struct {
             reserved_units = required_units;
         }
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -6786,6 +6905,7 @@ pub const Node = struct {
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
+            pipeline.execution_control = execution_control;
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
@@ -6927,7 +7047,7 @@ pub const Node = struct {
             });
         }
 
-        model.ensureVisionSession() catch |err|
+        model.ensureVisionSessionWithControl(execution_control) catch |err|
             return inferenceFailureResponse(ctx, err);
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
@@ -6943,7 +7063,8 @@ pub const Node = struct {
         // complete lifetime; request parsing and image preparation remain
         // outside it.
         const execution_mutex = model.targetInferenceExecutionMutex();
-        if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+        if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+            return inferenceFailureResponse(ctx, err);
         defer if (execution_mutex) |mutex| mutex.unlock();
 
         var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
@@ -6961,6 +7082,7 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             .{ .distributed = runtime.distributed.configFromEnv() },
         );
+        mm_pipeline.execution_control = execution_control;
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -6974,6 +7096,7 @@ pub const Node = struct {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 // This request already owns the non-reentrant model lane.
                 text_pipeline.execution_lock = null;
+                text_pipeline.execution_control = execution_control;
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
@@ -7002,6 +7125,8 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         // Single JSON parse per request: only bodies that can carry
@@ -7446,6 +7571,7 @@ pub const Node = struct {
                 return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
+            pipeline.execution_control = execution_control;
 
             if (requiresNativeChannelProjection(pipeline.gpt_config)) {
                 return ctx.status(400).json(.{
@@ -7518,6 +7644,7 @@ pub const Node = struct {
                 result.tokens_used,
                 0,
                 parsed_tool_calls,
+                null,
             );
         }
 
@@ -7586,12 +7713,14 @@ pub const Node = struct {
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
+                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
 
                 var pipeline = generation.GenerationPipeline{
                     .allocator = ctx.allocator,
                     .model = &gen_model,
                     .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
                     .prompt_override = if (prompt_override) |prompt| prompt else null,
+                    .execution_control = execution_control,
                 };
 
                 if (config.grammar != null) {
@@ -7658,6 +7787,7 @@ pub const Node = struct {
                     result.tokens_used,
                     0,
                     parsed_tool_calls,
+                    null,
                 );
             }
         }
@@ -7666,9 +7796,9 @@ pub const Node = struct {
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+            break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-        } else self.model_manager.acquireFromDir(model_path) catch |err|
+        } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -7880,14 +8010,14 @@ pub const Node = struct {
                 draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
                     var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                     configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                    break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err| {
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(draft_model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
                         if (draft_was_discovered) {
                             draft_degraded = true;
                             break :draft_setup;
                         }
                         return modelLoadFailureResponse(ctx, err);
                     };
-                } else self.model_manager.acquireFromDir(draft_model_path) catch |err| {
+                } else self.model_manager.acquireFromDirWithControl(draft_model_path, execution_control) catch |err| {
                     if (draft_was_discovered) {
                         draft_degraded = true;
                         break :draft_setup;
@@ -8200,8 +8330,12 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        first_locked_model.lockNativeGeneration(ctx.io);
-        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
+            first_locked_model.unlockNativeGeneration();
+            return inferenceFailureResponse(ctx, err);
+        };
         defer {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
@@ -8388,6 +8522,7 @@ pub const Node = struct {
             .compiled_partition_backend = effective_compiled_partition_backend,
             .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
+            .execution_control = execution_control,
         };
 
         if (want_stream) {
@@ -9055,6 +9190,8 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, true)) {
@@ -9094,6 +9231,8 @@ pub const Node = struct {
         defer ctx.allocator.free(pending);
 
         for (body.requests, 0..) |item, idx| {
+            if (idx % 16 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             results[idx] = .{
                 .custom_id = item.custom_id,
                 .index = @intCast(idx),
@@ -9188,14 +9327,14 @@ pub const Node = struct {
             var model_handle = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
+                break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
-            } else self.model_manager.acquireFromDir(model_path) catch |err| {
+            } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
@@ -9687,6 +9826,7 @@ pub const Node = struct {
                             .scheduler = model.native_generate_coordinator,
                             .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,
                             .execution_lock = batch_model_lock.pipelineExecutionLock(),
+                            .execution_control = execution_control,
                         },
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
@@ -10676,6 +10816,8 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
             return requestModelResolutionError(ctx, err);
@@ -10687,7 +10829,7 @@ pub const Node = struct {
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
         }
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -10712,6 +10854,7 @@ pub const Node = struct {
         }
 
         var pipeline = model.nerPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -10738,6 +10881,7 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var failure_stage: RebelExtractionFailureStage = .model_layout;
         const json = self.extractRebelJsonAlloc(
             ctx.allocator,
@@ -10746,6 +10890,7 @@ pub const Node = struct {
             texts,
             want_relations,
             &failure_stage,
+            execution_control,
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
             return switch (failure_stage) {
@@ -10790,7 +10935,9 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
         failure_stage: *RebelExtractionFailureStage,
+        execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
+        if (execution_control) |control| try control.check();
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 
         failure_stage.* = .model_layout;
@@ -10818,10 +10965,16 @@ pub const Node = struct {
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
         );
-        var encoder_managed = try component_loader.load(paths.encoder);
+        var encoder_managed = if (execution_control) |control|
+            try component_loader.loadWithControl(paths.encoder, control)
+        else
+            try component_loader.load(paths.encoder);
         defer encoder_managed.deinit();
         var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
-        var decoder_managed = try strict_loader.load(paths.decoder);
+        var decoder_managed = if (execution_control) |control|
+            try strict_loader.loadWithControl(paths.decoder, control)
+        else
+            try strict_loader.load(paths.decoder);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.disownSession();
         const decoder_session = decoder_managed.disownSession();
@@ -10833,6 +10986,7 @@ pub const Node = struct {
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = decoder_config,
+                .execution_control = execution_control,
             },
             .tokenizer = tokenizer.tokenizer(),
             .config = config,
@@ -10885,7 +11039,9 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var pipeline = model.glinerPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         pipeline.config.flat_ner = body.flat_ner orelse pipeline.config.flat_ner;
 
@@ -10994,6 +11150,7 @@ pub const Node = struct {
     }
 
     pub fn classifyText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var parsed = (try ctx.parseJson(api.ClassifyRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11008,7 +11165,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
             defer ctx.allocator.free(model_path);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
@@ -11030,6 +11187,7 @@ pub const Node = struct {
                 .entailment_index = entailment_idx,
             };
             var pipeline = model.classificationPipeline(ctx.allocator, config);
+            pipeline.execution_control = execution_control;
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -11050,7 +11208,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
             defer ctx.allocator.free(model_path);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
@@ -11059,6 +11217,7 @@ pub const Node = struct {
             }
 
             var pipeline = model.glinerPipeline(ctx.allocator);
+            pipeline.execution_control = execution_control;
             const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
@@ -11084,6 +11243,8 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11124,6 +11285,7 @@ pub const Node = struct {
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
             else => return inferenceFailureResponse(ctx, err),
         };
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
 
         const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
             error.LabelCountMismatch => return ctx.status(400).json(.{
@@ -11186,6 +11348,8 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11217,6 +11381,8 @@ pub const Node = struct {
         const tokens = try ctx.allocator.alloc(document_token_classification.TokenBox, body.tokens.len);
         defer ctx.allocator.free(tokens);
         for (body.tokens, 0..) |tok, idx| {
+            if (idx % 32 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             if (tok.bbox.len != 4) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "each token bbox must contain 4 integers" });
             }
@@ -11271,6 +11437,8 @@ pub const Node = struct {
         }
 
         for (predictions, 0..) |pred, pred_idx| {
+            if (pred_idx % 32 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             const bbox_slice = try ctx.allocator.alloc(i64, pred.bbox.len);
             for (pred.bbox, 0..) |coord, ci| bbox_slice[ci] = coord;
             try bbox_bufs.append(ctx.allocator, bbox_slice);
@@ -11329,6 +11497,8 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11359,12 +11529,12 @@ pub const Node = struct {
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
         ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.load(paths.encoder) catch |err|
+        var encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer encoder_managed.deinit();
         var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+        var decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.session;
@@ -11395,6 +11565,7 @@ pub const Node = struct {
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = dec_config,
+                .execution_control = execution_control,
             },
             .tokenizer = hf_tok.tokenizer(),
             .config = .{
@@ -11440,6 +11611,7 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var parsed = (try ctx.parseJson(api.ReadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11558,6 +11730,7 @@ pub const Node = struct {
         const results = reader.readBatch(image_datas, .{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
+            .execution_control = execution_control,
         }) catch |err| switch (err) {
             error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
             error.InvalidMaxTokens => return ctx.status(400).json(.{
@@ -11633,6 +11806,7 @@ pub const Node = struct {
     }
 
     pub fn transcribeAudio(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         var parsed = (try ctx.parseJson(api.TranscribeRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11717,12 +11891,12 @@ pub const Node = struct {
                 self.session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             ) catch |err| return modelLoadFailureResponse(ctx, err);
-            encoder_managed = component_loader.load(paths.encoder) catch |err|
+            encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             encoder_session = encoder_managed.?.session;
             var strict_loader = component_loader.restrictToBackend(encoder_session.backend()) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-            decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             decoder_session = decoder_managed.?.session;
             self.model_manager.validateWhisperAssetsCurrent(
@@ -11735,7 +11909,7 @@ pub const Node = struct {
             decoder_config = assets.decoder_config;
             prompt_cache = &assets.prompt_cache;
         } else |_| {
-            loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            loaded_model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             const model = loaded_model_handle.?.get();
             const whisper_config = session_factory.getWhisperConfig(model.session) orelse {
@@ -11781,6 +11955,7 @@ pub const Node = struct {
                 .language_tokens = effective_prompt_cache.language_tokens,
             },
         );
+        pipeline.execution_control = execution_control;
 
         var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
@@ -11805,6 +11980,8 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11840,7 +12017,7 @@ pub const Node = struct {
                 .inputs = inputs,
                 .schema_json = schema_json,
                 .options_json = options_json,
-            }, .http_route, null) catch |err| return extractionDirectFailureResponse(ctx, err);
+            }, .http_route, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
             _ = ctx.response.body(response.json);
@@ -11908,6 +12085,7 @@ pub const Node = struct {
         body: extraction_api.ExtractionRequest,
         texts: []const []const u8,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
         if (try self.acquireSlot(ctx)) |resp| return resp;
         defer self.releaseSlot();
         self.metrics.incRequest("extract");
@@ -11917,7 +12095,7 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -11946,6 +12124,7 @@ pub const Node = struct {
 
             if (model.isGlinerModel()) {
                 var pipeline = model.glinerPipeline(ctx.allocator);
+                pipeline.execution_control = execution_control;
                 const multi_label = schema.multi_label orelse false;
                 const results = pipeline.classifyBatch(texts, schema.labels, .{
                     .threshold = options.threshold orelse 0.0,
@@ -11974,6 +12153,7 @@ pub const Node = struct {
                 .multi_label = schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
+            pipeline.execution_control = execution_control;
             var schema_prompt_tokens: usize = 0;
             const results = pipeline.classifyBatchWithPromptTokens(texts, schema.labels, &schema_prompt_tokens) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -12388,6 +12568,8 @@ pub const Node = struct {
     }
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -12402,11 +12584,12 @@ pub const Node = struct {
         const result = tabular_mod.http.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
             .model = body.model,
             .input = body.input,
-        }) catch |err| switch (err) {
+        }, execution_control) catch |err| switch (err) {
             error.ModelNotFound => return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "predictor not found" }),
             error.BatchTooLarge => return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "batch too large" }),
             error.FeatureMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature vector length mismatch" }),
             error.LoadFailed => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = "failed to load predictor" }),
+            error.Timeout, error.Cancelled => return inferenceFailureResponse(ctx, err),
             else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = internalErrorMessage("INTERNAL_ERROR", err) }),
         };
 
@@ -19063,17 +19246,19 @@ fn prepareInitialDenseEmbeddingPipeline(
     model: *model_manager_mod.LoadedModel,
     allocator: std.mem.Allocator,
     inputs: *const ParsedDenseEmbedInputs,
+    control: InferenceExecutionControl,
 ) !embedding_mod.EmbeddingPipeline {
-    model.lockEmbeddingAssets();
+    try model.lockEmbeddingAssetsWithControl(control);
     defer model.unlockEmbeddingAssets();
     if (inputs.audio.items.len > 0) {
         // Audio is deliberately the only optional phase admitted up front.
         // Text/image assets are admitted after the audio outputs are copied.
-        try model.ensureAudioEmbeddingAssetsLocked();
+        try model.ensureAudioEmbeddingAssetsLockedWithControl(control);
     } else {
-        try model.ensurePrimaryEmbeddingAssetsLocked(
+        try model.ensurePrimaryEmbeddingAssetsLockedWithControl(
             inputs.texts.items.len > 0,
             inputs.images.items.len > 0,
+            control,
         );
     }
     return model.embeddingPipelineLocked(allocator);
@@ -19085,11 +19270,13 @@ fn admitPrimaryDenseEmbeddingAssetsAfterAudio(
     inputs: *const ParsedDenseEmbedInputs,
 ) !void {
     if (inputs.texts.items.len == 0 and inputs.images.items.len == 0) return;
-    model.lockEmbeddingAssets();
+    const control = pipeline.execution_control orelse return error.MissingInferenceExecutionControl;
+    try model.lockEmbeddingAssetsWithControl(control);
     defer model.unlockEmbeddingAssets();
-    try model.ensurePrimaryEmbeddingAssetsLocked(
+    try model.ensurePrimaryEmbeddingAssetsLockedWithControl(
         inputs.texts.items.len > 0,
         inputs.images.items.len > 0,
+        control,
     );
     model.bindEmbeddingPipelineAssetsLocked(pipeline);
 }
@@ -19105,16 +19292,25 @@ fn admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(
     inputs: *const ParsedDenseEmbedInputs,
 ) PartialPrimaryDenseEmbeddingAdmission {
     var admission = PartialPrimaryDenseEmbeddingAdmission{};
-    model.lockEmbeddingAssets();
+    const control = pipeline.execution_control orelse {
+        admission.text_error = error.MissingInferenceExecutionControl;
+        admission.image_error = error.MissingInferenceExecutionControl;
+        return admission;
+    };
+    model.lockEmbeddingAssetsWithControl(control) catch |err| {
+        admission.text_error = err;
+        admission.image_error = err;
+        return admission;
+    };
     defer model.unlockEmbeddingAssets();
 
     if (inputs.texts.items.len > 0) {
-        model.ensurePrimaryEmbeddingAssetsLocked(true, false) catch |err| {
+        model.ensurePrimaryEmbeddingAssetsLockedWithControl(true, false, control) catch |err| {
             admission.text_error = err;
         };
     }
     if (inputs.images.items.len > 0) {
-        model.ensurePrimaryEmbeddingAssetsLocked(false, true) catch |err| {
+        model.ensurePrimaryEmbeddingAssetsLockedWithControl(false, true, control) catch |err| {
             admission.image_error = err;
         };
     }

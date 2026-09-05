@@ -18,11 +18,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const inference = @import("inference_internal");
+const benchmark_runtime = @import("bge_m3_runtime");
+const inference = benchmark_runtime.internal;
 const backends = inference.backends;
 const session_factory = inference.architectures.session_factory;
 const kernel_jit = inference.graph.kernel_jit;
-const model_manager_mod = inference.server.model_manager;
+const server_mod = benchmark_runtime.server;
 const native_backend_guard = inference.native_backend_guard;
 const metal_runtime = inference.metal_runtime;
 const metal_generated_quant_stats = inference.metal_generated_quant_stats;
@@ -142,29 +143,73 @@ pub fn main(init: std.process.Init) !void {
     const fixture = fixture_doc.value;
     try validateFixture(fixture);
 
-    var session_manager = backends.SessionManager.initWithIo(allocator, init.io);
-    session_manager.preferred_backends = switch (opts.backend) {
+    const preferred_backends: []const backends.BackendType = switch (opts.backend) {
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
         .cuda => &.{backends.BackendType.cuda},
     };
-    session_manager.kernel_jit = opts.kernel_jit;
-    if (opts.tune_generated_kernels) session_manager.kernel_jit_load_context = .startup_preload;
-
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
+    var node = try server_mod.Node.init(allocator, .{
+        .kernel_jit = opts.kernel_jit,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    node.attachIo(init.io);
+    node.session_manager.preferred_backends = preferred_backends;
+    node.model_manager.session_manager.preferred_backends = preferred_backends;
+    if (opts.tune_generated_kernels) {
+        node.session_manager.kernel_jit_load_context = .startup_preload;
+        node.model_manager.session_manager.kernel_jit_load_context = .startup_preload;
+    }
     var cold_capture = PhaseCapture{};
     const cold_control = inference.InferenceExecutionControl{
         .progress = .{ .ptr = &cold_capture, .update_fn = PhaseCapture.update },
     };
     const load_started_ns = nowNs();
-    var model_handle = model_manager.acquireFromDirWithControl(opts.model_dir, cold_control) catch |err| {
-        std.debug.print("bge_m3_e2e: model_load_error={s}\n", .{@errorName(err)});
+    const managed_text = try managedBenchmarkText(allocator, fixture.source_text);
+    defer allocator.free(managed_text);
+    const managed_texts = try allocator.alloc([]const u8, opts.batch);
+    defer allocator.free(managed_texts);
+    @memset(managed_texts, managed_text);
+    const cold_embeddings = node.embedDenseTextsFromPathWithExecutionControl(
+        allocator,
+        cold_control,
+        opts.model_dir,
+        managed_texts,
+    ) catch |err| {
+        std.debug.print("bge_m3_e2e: managed_cold_request_error={s}\n", .{@errorName(err)});
         return err;
     };
+    const cold_forward_done_ns = nowNs();
+    const cold_json = try std.json.Stringify.valueAlloc(allocator, cold_embeddings, .{});
+    const cold_done_ns = nowNs();
+    allocator.free(cold_json);
+    freeEmbeddings(allocator, cold_embeddings);
+    const cold_managed = managedTiming(cold_capture, load_started_ns, cold_forward_done_ns, cold_done_ns);
+
+    var warm_capture = PhaseCapture{};
+    const warm_control = inference.InferenceExecutionControl{ .progress = .{ .ptr = &warm_capture, .update_fn = PhaseCapture.update } };
+    const warm_started_ns = nowNs();
+    const warm_embeddings = try node.embedDenseTextsFromPathWithExecutionControl(
+        allocator,
+        warm_control,
+        opts.model_dir,
+        managed_texts,
+    );
+    const warm_forward_done_ns = nowNs();
+    const warm_json = try std.json.Stringify.valueAlloc(allocator, warm_embeddings, .{});
+    const warm_done_ns = nowNs();
+    allocator.free(warm_json);
+    freeEmbeddings(allocator, warm_embeddings);
+    const warm_managed = managedTiming(warm_capture, warm_started_ns, warm_forward_done_ns, warm_done_ns);
+
+    var model_handle = try node.model_manager.acquireFromDirWithControl(opts.model_dir, cold_control);
     defer model_handle.release();
     const model = model_handle.get();
-    const loaded_ns = nowNs();
+    const managed_token_ids = try model.getTokenizer().encode(allocator, managed_text);
+    defer allocator.free(managed_token_ids);
+    const managed_sequence_length = managed_token_ids.len;
+    if (managed_sequence_length < 180 or managed_sequence_length > 220)
+        return error.ManagedFixtureNotApproximatelyTwoHundredTokens;
     try model.ensureEmbeddingAssets(true, false, false);
     const expected_backend: backends.BackendType = switch (opts.backend) {
         .native => .native,
@@ -180,31 +225,7 @@ pub fn main(init: std.process.Init) !void {
         return error.ResidentTextEncoderUnavailable;
     }
 
-    const managed_text = try managedBenchmarkText(allocator, fixture.source_text);
-    defer allocator.free(managed_text);
-    const managed_texts = try allocator.alloc([]const u8, 8);
-    defer allocator.free(managed_texts);
-    @memset(managed_texts, managed_text);
     pipeline.config.max_length = 200;
-    const cold_request_started_ns = load_started_ns;
-    const cold_embeddings = try pipeline.embed(managed_texts);
-    const cold_forward_done_ns = nowNs();
-    const cold_json = try std.json.Stringify.valueAlloc(allocator, cold_embeddings, .{});
-    const cold_done_ns = nowNs();
-    allocator.free(cold_json);
-    freeEmbeddings(allocator, cold_embeddings);
-    const cold_managed = managedTiming(cold_capture, cold_request_started_ns, loaded_ns, cold_forward_done_ns, cold_done_ns);
-
-    var warm_capture = PhaseCapture{};
-    pipeline.execution_control = .{ .progress = .{ .ptr = &warm_capture, .update_fn = PhaseCapture.update } };
-    const warm_started_ns = nowNs();
-    const warm_embeddings = try pipeline.embed(managed_texts);
-    const warm_forward_done_ns = nowNs();
-    const warm_json = try std.json.Stringify.valueAlloc(allocator, warm_embeddings, .{});
-    const warm_done_ns = nowNs();
-    allocator.free(warm_json);
-    freeEmbeddings(allocator, warm_embeddings);
-    const warm_managed = managedTiming(warm_capture, warm_started_ns, warm_started_ns, warm_forward_done_ns, warm_done_ns);
     pipeline.execution_control = null;
 
     const token_count = std.math.mul(usize, opts.batch, opts.seq_len) catch return error.InvalidInputShape;
@@ -293,10 +314,22 @@ pub fn main(init: std.process.Init) !void {
     const measured_embeddings = std.math.mul(usize, opts.batch, opts.measure_iters) catch return error.InvalidArguments;
     const embeddings_per_second = if (total_ns == 0) 0.0 else @as(f64, @floatFromInt(measured_embeddings)) /
         (@as(f64, @floatFromInt(total_ns)) / 1.0e9);
+    const managed_warm_embeddings_per_second = if (warm_managed.total_ns == 0) 0.0 else @as(f64, @floatFromInt(opts.batch)) /
+        (@as(f64, @floatFromInt(warm_managed.total_ns)) / 1.0e9);
+    const expected_projection_slots: u64 = 24 * 6;
+    const all_projection_slots_prepared = provider_stats.metal_runtime_dense_linear_f16_slots >= expected_projection_slots;
+    const fused_routes_selected = provider_stats.metal_runtime_dense_qkv_packed_calls > 0 and
+        provider_stats.metal_runtime_dense_qkv_packed_fallbacks == 0 and
+        provider_stats.metal_runtime_dense_pair_packed_calls > 0 and
+        provider_stats.metal_runtime_dense_pair_packed_fallbacks == 0;
+    const no_unexpected_host_materialization = provider_stats.prepared_view_owned_materializations == 0;
+    const metal_qualification_pass = opts.backend == .metal and
+        managed_warm_embeddings_per_second >= backends.bge_m3_metal_min_managed_embeddings_per_second and
+        all_projection_slots_prepared and fused_routes_selected and no_unexpected_host_materialization;
 
     std.debug.print(
-        "{{\"kind\":\"bge_m3_managed\",\"model\":\"{s}\",\"backend\":\"{s}\",\"batch\":8,\"sequence_length\":200,\"cold\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6}}},\"warm\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6}}}}}\n",
-        .{ fixture.model, @tagName(opts.backend), nsToMs(cold_managed.total_ns), nsToMs(cold_managed.model_load_ns), nsToMs(cold_managed.tokenization_ns), nsToMs(cold_managed.weight_prep_ns), nsToMs(cold_managed.forward_ns), nsToMs(cold_managed.serialization_ns), nsToMs(warm_managed.total_ns), nsToMs(warm_managed.model_load_ns), nsToMs(warm_managed.tokenization_ns), nsToMs(warm_managed.weight_prep_ns), nsToMs(warm_managed.forward_ns), nsToMs(warm_managed.serialization_ns) },
+        "{{\"kind\":\"bge_m3_managed\",\"model\":\"{s}\",\"backend\":\"{s}\",\"batch\":{d},\"sequence_length\":{d},\"cold\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6}}},\"warm\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6},\"embeddings_per_second\":{d:.6}}},\"metal_qualification\":{{\"minimum_managed_embeddings_per_second\":{d:.6},\"pass\":{}}}}}\n",
+        .{ fixture.model, @tagName(opts.backend), opts.batch, managed_sequence_length, nsToMs(cold_managed.total_ns), nsToMs(cold_managed.model_load_ns), nsToMs(cold_managed.tokenization_ns), nsToMs(cold_managed.weight_prep_ns), nsToMs(cold_managed.forward_ns), nsToMs(cold_managed.serialization_ns), nsToMs(warm_managed.total_ns), nsToMs(warm_managed.model_load_ns), nsToMs(warm_managed.tokenization_ns), nsToMs(warm_managed.weight_prep_ns), nsToMs(warm_managed.forward_ns), nsToMs(warm_managed.serialization_ns), managed_warm_embeddings_per_second, backends.bge_m3_metal_min_managed_embeddings_per_second, metal_qualification_pass },
     );
 
     std.debug.print(
@@ -330,7 +363,7 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     std.debug.print(
-        "\"command_counts\":{{\"compute_encoders\":{d},\"blit_encoders\":{d},\"planned_ops\":{d},\"mps_dense_linear\":{d},\"quant_qkv\":{d}}},\"optimized\":{{\"resident_text_successes\":{d},\"resident_text_fallbacks\":{d},\"qkv_packed_calls\":{d},\"qkv_packed_fallbacks\":{d},\"ffn_fused_calls\":{d},\"ffn_fused_mps_matmuls\":{d},\"ffn_fused_fallbacks\":{d},\"generated_total\":{d},\"generated_q4_k\":{d},\"generated_q6_k\":{d},\"jit_exact_q4_k\":{d},\"jit_tuned\":{d}}},",
+        "\"command_counts\":{{\"compute_encoders\":{d},\"blit_encoders\":{d},\"planned_ops\":{d},\"mps_dense_linear\":{d},\"quant_qkv\":{d}}},\"optimized\":{{\"resident_text_successes\":{d},\"resident_text_fallbacks\":{d},\"qkv_packed_calls\":{d},\"qkv_packed_fallbacks\":{d},\"ffn_pair_packed_calls\":{d},\"ffn_pair_packed_fallbacks\":{d},\"prepared_view_host_materializations\":{d},\"all_projection_slots_prepared\":{},\"fused_routes_selected\":{},\"no_unexpected_host_materialization\":{},\"generated_total\":{d},\"generated_q4_k\":{d},\"generated_q6_k\":{d},\"jit_exact_q4_k\":{d},\"jit_tuned\":{d}}},",
         .{
             provider_stats.metal_runtime_last_frame_compute_encoder_count,
             provider_stats.metal_runtime_last_frame_blit_encoder_count,
@@ -341,9 +374,12 @@ pub fn main(init: std.process.Init) !void {
             resident.text_fallback - before_resident.text_fallback,
             provider_stats.metal_runtime_dense_qkv_packed_calls,
             provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
-            provider_stats.metal_runtime_deberta_ffn_fused_calls,
-            provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
-            provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
+            provider_stats.metal_runtime_dense_pair_packed_calls,
+            provider_stats.metal_runtime_dense_pair_packed_fallbacks,
+            provider_stats.prepared_view_owned_materializations,
+            all_projection_slots_prepared,
+            fused_routes_selected,
+            no_unexpected_host_materialization,
             generated.generatedTotal(),
             generated.q4_k + generated.q4_k_bias + generated.q4_k_bias_gelu,
             generated.q6_k + generated.q6_k_bias + generated.q6_k_bias_gelu,
@@ -395,25 +431,41 @@ pub fn main(init: std.process.Init) !void {
 fn managedBenchmarkText(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var text = std.ArrayListUnmanaged(u8).empty;
     errdefer text.deinit(allocator);
-    for (0..64) |_| {
+    for (0..4) |_| {
         try text.appendSlice(allocator, source);
         try text.append(allocator, ' ');
     }
+    try text.appendSlice(allocator, "Represent this sentence for searching relevant passages: Production-quality multilingual retrieval should remain stable.");
     return text.toOwnedSlice(allocator);
 }
 
-fn managedTiming(capture: PhaseCapture, started: u64, loaded: u64, forward_done: u64, done: u64) ManagedTiming {
-    const tokenizing = if (capture.tokenizing_ns != 0) capture.tokenizing_ns else loaded;
+fn managedTiming(capture: PhaseCapture, started: u64, forward_done: u64, done: u64) ManagedTiming {
+    const tokenizing = if (capture.tokenizing_ns != 0) capture.tokenizing_ns else forward_done;
     const preparing = if (capture.preparing_ns != 0) capture.preparing_ns else tokenizing;
     const executing = if (capture.executing_ns != 0) capture.executing_ns else preparing;
     return .{
         .total_ns = done -| started,
-        .model_load_ns = loaded -| started,
+        .model_load_ns = tokenizing -| started,
         .tokenization_ns = preparing -| tokenizing,
         .weight_prep_ns = executing -| preparing,
         .forward_ns = forward_done -| executing,
         .serialization_ns = done -| forward_done,
     };
+}
+
+test "managed BGE timing partitions ordered request phases" {
+    const timing = managedTiming(.{
+        .loading_ns = 10,
+        .tokenizing_ns = 30,
+        .preparing_ns = 50,
+        .executing_ns = 80,
+    }, 10, 130, 150);
+    try std.testing.expectEqual(@as(u64, 20), timing.model_load_ns);
+    try std.testing.expectEqual(@as(u64, 20), timing.tokenization_ns);
+    try std.testing.expectEqual(@as(u64, 30), timing.weight_prep_ns);
+    try std.testing.expectEqual(@as(u64, 50), timing.forward_ns);
+    try std.testing.expectEqual(@as(u64, 20), timing.serialization_ns);
+    try std.testing.expectEqual(@as(u64, 140), timing.total_ns);
 }
 
 fn ensureBackendAvailable(backend: BackendChoice) !void {

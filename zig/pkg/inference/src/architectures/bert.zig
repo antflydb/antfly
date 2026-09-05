@@ -256,8 +256,23 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len);
+    return forwardWithControl(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len, null);
+}
+
+pub fn forwardWithControl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+    control: ?InferenceExecutionControl,
+) ![]f32 {
+    const hidden = try forwardCtWithControl(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len, control);
     defer cb.free(hidden);
+    if (control) |active| try active.check();
     return cb.toFloat32(hidden, allocator);
 }
 

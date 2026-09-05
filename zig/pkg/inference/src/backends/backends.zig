@@ -844,11 +844,25 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
         man.audio_projection_path == null;
 }
 
+pub const bge_m3_metal_min_managed_embeddings_per_second: f64 = 1.0;
+
+fn bgeM3MetalThroughputQualifies(raw: []const u8) bool {
+    const measured = std.fmt.parseFloat(f64, raw) catch return false;
+    return std.math.isFinite(measured) and
+        measured >= bge_m3_metal_min_managed_embeddings_per_second;
+}
+
 fn bgeM3MetalQualified() bool {
     if (build_options.enable_wasm or !build_options.link_libc) return false;
-    const value = std.c.getenv("ANTFLY_BGE_M3_METAL_QUALIFIED") orelse return false;
-    return std.mem.eql(u8, std.mem.span(value), "1") or
-        std.ascii.eqlIgnoreCase(std.mem.span(value), "true");
+    const value = std.c.getenv("ANTFLY_BGE_M3_METAL_MANAGED_EMBEDDINGS_PER_SECOND") orelse return false;
+    return bgeM3MetalThroughputQualifies(std.mem.span(value));
+}
+
+test "BGE-M3 Metal qualification enforces measured managed throughput" {
+    try std.testing.expect(!bgeM3MetalThroughputQualifies("true"));
+    try std.testing.expect(!bgeM3MetalThroughputQualifies("0.999"));
+    try std.testing.expect(bgeM3MetalThroughputQualifies("1.0"));
+    try std.testing.expect(bgeM3MetalThroughputQualifies("4.25"));
 }
 
 fn shouldPreferNativeBgeM3(man: manifest_mod.ModelManifest) bool {

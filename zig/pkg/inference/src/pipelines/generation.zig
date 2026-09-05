@@ -3036,10 +3036,12 @@ pub const GenerationPipeline = struct {
     model: if (build_options.enable_onnx) *ortgenai.GenAiModel else void,
     chat_template: ?*const ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn generate(self: *GenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
         if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
 
         // Format messages into a prompt
         const prompt = if (self.prompt_override) |override|
@@ -3049,6 +3051,7 @@ pub const GenerationPipeline = struct {
         else
             try formatMessages(self.allocator, messages);
         defer self.allocator.free(prompt);
+        if (self.execution_control) |control| try control.update(.executing, 0, @intCast(@max(config.max_tokens, 1)));
 
         const gen_opts = ortgenai.GenerateOptions{
             .max_tokens = config.max_tokens,
@@ -3069,6 +3072,7 @@ pub const GenerationPipeline = struct {
             }
 
             const result = try ortgenai.generateWithImages(self.allocator, self.model, prompt, all_images.items, gen_opts);
+            if (self.execution_control) |control| try control.check();
             return .{
                 .text = result.text,
                 .token_ids = null,
@@ -3080,6 +3084,7 @@ pub const GenerationPipeline = struct {
         }
 
         const result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts);
+        if (self.execution_control) |control| try control.check();
         return .{
             .text = result.text,
             .token_ids = null,
@@ -3102,6 +3107,7 @@ pub const GenerationPipeline = struct {
     ) !GenerationResult {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
         if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
+        if (self.execution_control) |control| try control.check();
 
         // Multimodal streaming not supported yet — fall back
         if (messagesHaveImages(messages)) {
@@ -3125,7 +3131,50 @@ pub const GenerationPipeline = struct {
             .top_k = config.top_k,
         };
 
-        const result = try ortgenai.generateStreaming(self.allocator, self.model, prompt, gen_opts, on_token_ctx, on_token);
+        const ControlledCallback = struct {
+            control: ?InferenceExecutionControl,
+            downstream_ctx: *anyopaque,
+            downstream: TokenCallback,
+            completed: u64 = 0,
+            total: u64,
+            control_error: ?anyerror = null,
+
+            fn call(raw: *anyopaque, text: []const u8) bool {
+                const callback: *@This() = @ptrCast(@alignCast(raw));
+                callback.completed +|= 1;
+                if (callback.control) |control| control.update(
+                    .executing,
+                    callback.completed,
+                    callback.total,
+                ) catch |err| {
+                    callback.control_error = err;
+                    return false;
+                };
+                return callback.downstream(callback.downstream_ctx, text);
+            }
+        };
+        var callback = ControlledCallback{
+            .control = self.execution_control,
+            .downstream_ctx = on_token_ctx,
+            .downstream = on_token,
+            .total = @intCast(@max(config.max_tokens, 1)),
+        };
+        var result = try ortgenai.generateStreaming(
+            self.allocator,
+            self.model,
+            prompt,
+            gen_opts,
+            @ptrCast(&callback),
+            ControlledCallback.call,
+        );
+        if (callback.control_error) |err| {
+            result.deinit();
+            return err;
+        }
+        if (self.execution_control) |control| control.check() catch |err| {
+            result.deinit();
+            return err;
+        };
         return .{
             .text = result.text,
             .token_ids = null,

@@ -20867,6 +20867,8 @@ components:
         - active_backend
         - active_deadline_ms
         - last_progress_ms
+        - active_progress_completed
+        - active_progress_total
         - inference_timeout_count
         - inference_cancel_count
         - skip_by_hash_count
@@ -20973,6 +20975,12 @@ components:
           format: uint64
           description: Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
         last_progress_ms:
+          type: integer
+          format: uint64
+        active_progress_completed:
+          type: integer
+          format: uint64
+        active_progress_total:
           type: integer
           format: uint64
         inference_timeout_count:

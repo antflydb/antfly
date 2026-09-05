@@ -31,6 +31,11 @@ pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const EmbedSetCancellationFn = *const fn (ptr: *anyopaque, cancellation: CancellationToken) void;
 pub const EmbedSetProgressFn = *const fn (ptr: *anyopaque, progress: inference_request_context.ProgressSink) void;
+pub const RecoveryIdentity = struct {
+    model: []const u8,
+    backend: []const u8 = "",
+};
+pub const EmbedRecoveryIdentityFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?RecoveryIdentity;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
 pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
@@ -55,6 +60,7 @@ pub const DenseEmbedder = struct {
     deinit_fn: ?DenseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
     /// implementations that cannot make this guarantee; background replay
@@ -117,6 +123,11 @@ pub const DenseEmbedder = struct {
         const set_progress_fn = self.set_progress_fn orelse return;
         set_progress_fn(self.ptr, progress);
     }
+
+    pub fn recoveryIdentity(self: DenseEmbedder, embedding_name: []const u8) RecoveryIdentity {
+        const get_identity = self.recovery_identity_fn orelse return .{ .model = embedding_name };
+        return get_identity(self.ptr, embedding_name) orelse .{ .model = embedding_name };
+    }
 };
 
 pub const SparseEmbedder = struct {
@@ -126,6 +137,7 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
@@ -160,6 +172,11 @@ pub const SparseEmbedder = struct {
     pub fn setProgress(self: SparseEmbedder, progress: inference_request_context.ProgressSink) void {
         const set_progress_fn = self.set_progress_fn orelse return;
         set_progress_fn(self.ptr, progress);
+    }
+
+    pub fn recoveryIdentity(self: SparseEmbedder, embedding_name: []const u8) RecoveryIdentity {
+        const get_identity = self.recovery_identity_fn orelse return .{ .model = embedding_name };
+        return get_identity(self.ptr, embedding_name) orelse .{ .model = embedding_name };
     }
 };
 

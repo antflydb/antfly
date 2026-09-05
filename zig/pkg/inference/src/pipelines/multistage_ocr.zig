@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const image = @import("image.zig");
@@ -206,7 +207,7 @@ pub const CTCRecognizer = struct {
         self.session.close();
     }
 
-    pub fn recognize(self: *CTCRecognizer, img: image.Image) !RecognitionResult {
+    pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
         var input_width = self.preprocess.width;
         const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
             if (self.preprocess.dynamic_width) {
@@ -256,7 +257,7 @@ pub const CTCRecognizer = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try self.session.run(&.{input_tensor}, self.allocator);
+        const outputs = try self.session.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return error.NoRecognitionOutput;
 
@@ -316,8 +317,8 @@ pub const Vision2SeqRecognizer = struct {
         self.reader.deinit();
     }
 
-    pub fn recognize(self: *Vision2SeqRecognizer, img: image.Image) !RecognitionResult {
-        var result = try self.reader.readDecodedRaw(img, .{});
+    pub fn recognize(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
+        var result = try self.reader.readDecodedRaw(img, .{ .execution_control = control });
         defer result.deinit();
 
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
@@ -339,10 +340,10 @@ pub const Recognizer = union(enum) {
         }
     }
 
-    pub fn recognize(self: *Recognizer, img: image.Image) !RecognitionResult {
+    pub fn recognize(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
         return switch (self.*) {
-            .ctc => |*recognizer| recognizer.recognize(img),
-            .vision2seq => |*recognizer| recognizer.recognize(img),
+            .ctc => |*recognizer| recognizer.recognize(img, control),
+            .vision2seq => |*recognizer| recognizer.recognize(img, control),
         };
     }
 };
@@ -373,13 +374,22 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     pub fn run(self: *MultiStageOCRPipeline, image_bytes: []const u8) !MultiStageOCRResult {
+        return self.runWithControl(image_bytes, null);
+    }
+
+    pub fn runWithControl(self: *MultiStageOCRPipeline, image_bytes: []const u8, control: ?InferenceExecutionControl) !MultiStageOCRResult {
+        if (control) |active| try active.update(.tokenizing, 0, 1);
         const img = try image.decode(self.allocator, image_bytes);
         defer img.deinit(self.allocator);
-        return self.runDecoded(img);
+        return self.runDecodedWithControl(img, control);
     }
 
     pub fn runDecoded(self: *MultiStageOCRPipeline, img: image.Image) !MultiStageOCRResult {
-        const regions = try self.detect(img);
+        return self.runDecodedWithControl(img, null);
+    }
+
+    pub fn runDecodedWithControl(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) !MultiStageOCRResult {
+        const regions = try self.detect(img, control);
         defer if (regions.len > 0) self.allocator.free(regions);
 
         var layout_regions: []LayoutRegion = &.{};
@@ -389,11 +399,11 @@ pub const MultiStageOCRPipeline = struct {
         }
 
         if (self.layout != null) {
-            layout_regions = try self.analyzeLayout(img);
+            layout_regions = try self.analyzeLayout(img, control);
         }
 
         if (self.order != null) {
-            try self.determineOrder(regions);
+            try self.determineOrder(regions, control);
         } else {
             sortRegionsByReadingOrder(TextRegion, regions);
         }
@@ -405,11 +415,16 @@ pub const MultiStageOCRPipeline = struct {
         }
 
         if (self.recognizer) |*recognizer| {
-            for (regions) |region| {
+            for (regions, 0..) |region, index| {
+                if (control) |active|
+                    try active.update(.executing, @intCast(index), @intCast(regions.len));
                 const cropped = try crop.cropBBox(self.allocator, img, region.bbox);
                 defer cropped.deinit(self.allocator);
 
-                const rec = recognizer.recognize(cropped) catch continue;
+                const rec = recognizer.recognize(cropped, control) catch |err| switch (err) {
+                    error.Cancelled, error.Timeout => return err,
+                    else => continue,
+                };
                 if (rec.text.len == 0) {
                     self.allocator.free(rec.text);
                     continue;
@@ -454,7 +469,7 @@ pub const MultiStageOCRPipeline = struct {
         };
     }
 
-    fn detect(self: *MultiStageOCRPipeline, img: image.Image) ![]TextRegion {
+    fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
         const pixel_values = try image.preprocessDecodedRectScaledWithResample(
             self.allocator,
             img,
@@ -477,7 +492,7 @@ pub const MultiStageOCRPipeline = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try self.detector.run(&.{input_tensor}, self.allocator);
+        const outputs = try self.detector.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
 
@@ -487,7 +502,7 @@ pub const MultiStageOCRPipeline = struct {
         return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
     }
 
-    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image) ![]LayoutRegion {
+    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]LayoutRegion {
         const layout = self.layout orelse return self.allocator.dupe(LayoutRegion, &.{});
 
         const pixel_values = try image.preprocessDecodedRectScaledWithResample(
@@ -512,14 +527,14 @@ pub const MultiStageOCRPipeline = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try layout.run(&.{input_tensor}, self.allocator);
+        const outputs = try layout.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(LayoutRegion, &.{});
 
         return parseLayoutOutput(self.allocator, &outputs[0], img.width, img.height);
     }
 
-    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion) !void {
+    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion, control: ?InferenceExecutionControl) !void {
         if (regions.len <= 1) return;
         const order = self.order orelse {
             sortRegionsByReadingOrder(TextRegion, regions);
@@ -540,9 +555,12 @@ pub const MultiStageOCRPipeline = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, bbox_data);
         defer input_tensor.deinit();
 
-        const outputs = order.run(&.{input_tensor}, self.allocator) catch {
-            sortRegionsByReadingOrder(TextRegion, regions);
-            return;
+        const outputs = order.runWithControl(&.{input_tensor}, self.allocator, control) catch |err| switch (err) {
+            error.Cancelled, error.Timeout => return err,
+            else => {
+                sortRegionsByReadingOrder(TextRegion, regions);
+                return;
+            },
         };
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) {

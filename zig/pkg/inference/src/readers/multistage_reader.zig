@@ -332,8 +332,8 @@ pub const LoadedMultiStageReader = struct {
         self.managed_sessions.deinit(self.allocator);
     }
 
-    pub fn read(self: *LoadedMultiStageReader, image_data: []const u8, _: reader_types.ReadOptions) !reader_types.Result {
-        var ocr_result = try self.pipeline.run(image_data);
+    pub fn read(self: *LoadedMultiStageReader, image_data: []const u8, options: reader_types.ReadOptions) !reader_types.Result {
+        var ocr_result = try self.pipeline.runWithControl(image_data, options.execution_control);
         defer ocr_result.deinit();
 
         const text = try self.allocator.dupe(u8, ocr_result.full_text);

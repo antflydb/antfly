@@ -870,7 +870,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = run_permit.run(&.{pv_tensor}, alloc) catch |err| {
+        const outputs = run_permit.runWithControl(&.{pv_tensor}, alloc, self.execution_control) catch |err| {
             return err;
         };
         logEmbedTiming("image.encoder", batch, encoder_start);
@@ -1192,7 +1192,7 @@ pub const EmbeddingPipeline = struct {
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try run_permit.run(run_inputs, alloc);
+        var outputs = try run_permit.runWithControl(run_inputs, alloc, self.execution_control);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -1300,7 +1300,7 @@ pub const EmbeddingPipeline = struct {
         defer proj_input.deinit();
 
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = try run_permit.run(&.{proj_input}, alloc);
+        var proj_outputs = try run_permit.runWithControl(&.{proj_input}, alloc, self.execution_control);
         logEmbedTiming("projection", batch, projection_start);
         defer {
             for (proj_outputs) |*o| o.deinit();
@@ -1638,7 +1638,9 @@ pub const EmbeddingPipeline = struct {
             .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {
+        var projection_permit = try proj.admitResidentInputs(&resident_input);
+        defer projection_permit.deinit();
+        var proj_outputs = (projection_permit.runResidentInputsWithControl(&resident_input, self.allocator, self.execution_control) catch |err| switch (err) {
             error.UnsupportedResidentInputBackend => return self.residentProjectionFallback(.text, "text.projection.resident", batch, @errorName(err)),
             else => return err,
         }) orelse return self.residentProjectionFallback(.text, "text.projection.resident", batch, "unsupported");
@@ -1747,7 +1749,9 @@ pub const EmbeddingPipeline = struct {
             .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {
+        var projection_permit = try proj.admitResidentInputs(&resident_input);
+        defer projection_permit.deinit();
+        var proj_outputs = (projection_permit.runResidentInputsWithControl(&resident_input, self.allocator, self.execution_control) catch |err| switch (err) {
             error.UnsupportedResidentInputBackend => return self.residentProjectionFallback(modality, projection_phase, batch, @errorName(err)),
             else => return err,
         }) orelse return self.residentProjectionFallback(modality, projection_phase, batch, "unsupported");

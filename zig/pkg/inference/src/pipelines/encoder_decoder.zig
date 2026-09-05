@@ -28,6 +28,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const c_file = @import("../util/c_file.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const manifest_mod = @import("../models/manifest.zig");
 
 /// Configuration parsed from config.json for the decoder architecture.
@@ -61,6 +62,7 @@ pub const EncoderDecoderPipeline = struct {
     encoder: backends.Session,
     decoder: backends.Session,
     config: DecoderConfig,
+    execution_control: ?InferenceExecutionControl = null,
 
     /// Run the encoder on input_ids, returning hidden state tensors.
     pub fn encode(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize) ![]backends.Tensor {
@@ -79,7 +81,8 @@ pub const EncoderDecoderPipeline = struct {
         var mask_tensor = try backends.Tensor.initInt64(allocator, "attention_mask", shape, mask);
         defer mask_tensor.deinit();
 
-        return try self.encoder.run(&.{ input_ids_tensor, mask_tensor }, allocator);
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        return try self.encoder.runWithControl(&.{ input_ids_tensor, mask_tensor }, allocator, self.execution_control);
     }
 
     /// Run one decoder step, returning logits for the last token position.
@@ -107,11 +110,11 @@ pub const EncoderDecoderPipeline = struct {
         // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
         const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
 
-        var decoder_outputs = try self.decoder.run(&.{
+        var decoder_outputs = try self.decoder.runWithControl(&.{
             dec_input_ids,
             enc_mask_tensor,
             enc_hidden_renamed,
-        }, allocator);
+        }, allocator, self.execution_control);
         defer {
             for (decoder_outputs) |*o| o.deinit();
             allocator.free(decoder_outputs);
@@ -150,7 +153,9 @@ pub const EncoderDecoderPipeline = struct {
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
         const encoder_hidden = &encoder_outputs[0];
 
-        for (0..max_len) |_| {
+        for (0..max_len) |step| {
+            if (self.execution_control) |control|
+                try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
             // Convert output_ids (i32) to i64 for the decoder

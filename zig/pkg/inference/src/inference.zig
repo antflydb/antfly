@@ -114,6 +114,7 @@ test {
     _ = cache;
     _ = singleflight;
     _ = registry;
+    _ = tabular;
     _ = models;
     _ = gguf;
     _ = runtime;

@@ -5006,12 +5006,19 @@ fn invokeInferenceProvider(
         }
     };
     const RequestProgress = struct {
-        fn update(raw: ?*anyopaque, phase: u8, completed: u64, total: u64) callconv(.c) void {
+        fn update(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: inference_bridge.String, backend: inference_bridge.String) callconv(.c) void {
             const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return));
             const active = context.* orelse return;
             const progress = active.progress orelse return;
             const typed_phase = std.enums.fromInt(antfly.inference.request_context.Phase, phase) orelse return;
-            progress.update(.{ .phase = typed_phase, .completed = completed, .total = total });
+            progress.update(.{
+                .phase = typed_phase,
+                .completed = completed,
+                .total = total,
+                .model = model.slice(),
+                .backend = backend.slice(),
+                .deadline_ns = active.deadline_ns,
+            });
         }
     };
     const context = inference_bridge.ProviderInvokeContext{

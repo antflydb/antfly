@@ -657,15 +657,11 @@ pub const ReadingPipeline = struct {
                 allocator,
                 pv_tensor,
                 prompt_i32,
+                self.execution_control,
             );
         } else blk: {
             if (self.execution_control) |control| try control.update(.executing, 0, 1);
-            const outputs = try self.vision_encoder.run(&.{pv_tensor}, allocator);
-            if (self.execution_control) |control| control.check() catch |err| {
-                for (outputs) |*output| output.deinit();
-                allocator.free(outputs);
-                return err;
-            };
+            const outputs = try self.vision_encoder.runWithControl(&.{pv_tensor}, allocator, self.execution_control);
             break :blk outputs;
         };
         if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
@@ -691,6 +687,7 @@ pub const ReadingPipeline = struct {
         allocator: std.mem.Allocator,
         pixel_tensor: backends.Tensor,
         prompt_ids: []const i32,
+        execution_control: ?@import("../execution_control.zig").InferenceExecutionControl,
     ) ![]backends.Tensor {
         const prompt_i64 = try allocator.alloc(i64, prompt_ids.len);
         defer allocator.free(prompt_i64);
@@ -705,7 +702,7 @@ pub const ReadingPipeline = struct {
         );
         defer prompt_tensor.deinit();
 
-        return vision_encoder.run(&.{ pixel_tensor, prompt_tensor }, allocator);
+        return vision_encoder.runWithControl(&.{ pixel_tensor, prompt_tensor }, allocator, execution_control);
     }
 
     fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
@@ -1219,7 +1216,7 @@ pub const ReadingPipeline = struct {
         else
             &[_]backends.Tensor{patch_tensor};
 
-        const encoder_outputs = try self.vision_encoder.run(inputs, allocator);
+        const encoder_outputs = try self.vision_encoder.runWithControl(inputs, allocator, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -1305,8 +1302,11 @@ pub const ReadingPipeline = struct {
 
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            const dec_outputs = try self.decoder.run(decoder_inputs.items, allocator);
-            if (self.execution_control) |control| try control.check();
+            const dec_outputs = try self.decoder.runWithControl(
+                decoder_inputs.items,
+                allocator,
+                self.execution_control,
+            );
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;
@@ -1772,6 +1772,7 @@ test "Florence prompt tensor cleanup survives encoder admission denial" {
             allocator,
             pixel_tensor,
             &.{ 11, 22, 33 },
+            null,
         ),
     );
     try std.testing.expect(fake.run_called);

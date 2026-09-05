@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
@@ -144,7 +145,7 @@ pub fn debugImageFeaturesFromDir(
 
     const images = try collectImagesInPromptOrder(allocator, messages);
     defer allocator.free(images);
-    const image_features = try encodeImages(allocator, model_dir, vision, shared.gpt_config, images);
+    const image_features = try encodeImages(allocator, model_dir, vision, shared.gpt_config, images, null);
     return image_features.data;
 }
 
@@ -227,7 +228,7 @@ pub fn debugPromptEmbeddingsFromDir(
     if (image_bytes.len > 0) {
         std.debug.print("onnx-debug: encode images count={d}\n", .{image_bytes.len});
         const vision = vision_encoder orelse return error.MissingVisionEncoder;
-        const image_features = try encodeImages(allocator, model_dir, vision, shared.gpt_config, image_bytes);
+        const image_features = try encodeImages(allocator, model_dir, vision, shared.gpt_config, image_bytes, null);
         defer allocator.free(image_features.data);
         const hidden_size = if (embed_outputs[0].shape.len >= 3) @as(usize, @intCast(embed_outputs[0].shape[2])) else return error.InvalidEmbeddingShape;
         std.debug.print("onnx-debug: concat image features hidden={d}\n", .{hidden_size});
@@ -258,6 +259,7 @@ pub const Pipeline = struct {
     eos_token_ids: []i64,
     chat_tmpl: ?*generation.ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !Pipeline {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
@@ -430,7 +432,9 @@ pub const Pipeline = struct {
         var finish_reason: []const u8 = "length";
 
         const max_tokens: usize = @intCast(@max(config.max_tokens, 1));
-        for (0..max_tokens) |_| {
+        for (0..max_tokens) |step| {
+            if (self.execution_control) |control|
+                try control.update(.executing, @intCast(step), @intCast(max_tokens));
             const logits = if (first_step)
                 try self.firstStep(working_token_ids, images, &kv_cache)
             else
@@ -513,7 +517,7 @@ pub const Pipeline = struct {
         const images = try collectImagesInPromptOrder(self.allocator, messages);
         defer self.allocator.free(images);
         const vision = self.vision_encoder orelse return error.MissingVisionEncoder;
-        const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images);
+        const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images, self.execution_control);
         return image_features.data;
     }
 
@@ -562,14 +566,14 @@ pub const Pipeline = struct {
         var input_tensor = try Tensor.initInt64(self.allocator, "input_ids", &input_shape, token_ids);
         defer input_tensor.deinit();
 
-        var embed_outputs = try self.embed_tokens.run(&.{input_tensor}, self.allocator);
+        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, self.execution_control);
         defer freeTensorSlice(self.allocator, embed_outputs);
         if (embed_outputs.len == 0) return error.NoEmbedOutput;
 
         const embeds = try tensorToOwnedF32(self.allocator, &embed_outputs[0]);
         if (image_bytes.len > 0) {
             const vision = self.vision_encoder orelse return error.MissingVisionEncoder;
-            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, image_bytes);
+            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, image_bytes, self.execution_control);
             defer self.allocator.free(image_features.data);
             const hidden_size = if (embed_outputs[0].shape.len >= 3) @as(usize, @intCast(embed_outputs[0].shape[2])) else return error.InvalidEmbeddingShape;
             const combined = try concatImageAndTextEmbeddings(self.allocator, image_features.data, embeds, hidden_size);
@@ -598,7 +602,7 @@ pub const Pipeline = struct {
         var input_tensor = try Tensor.initInt64(self.allocator, "input_ids", &input_shape, input_ids);
         defer input_tensor.deinit();
 
-        var embed_outputs = try self.embed_tokens.run(&.{input_tensor}, self.allocator);
+        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, self.execution_control);
         defer freeTensorSlice(self.allocator, embed_outputs);
         if (embed_outputs.len == 0) return error.NoEmbedOutput;
 
@@ -609,7 +613,7 @@ pub const Pipeline = struct {
 
         if (images.len > 0) {
             const vision = self.vision_encoder orelse return error.MissingVisionEncoder;
-            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images);
+            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images, self.execution_control);
             defer self.allocator.free(image_features.data);
             const combined = try concatImageAndTextEmbeddings(self.allocator, image_features.data, embeds, hidden_size);
             self.allocator.free(embeds);
@@ -641,7 +645,7 @@ pub const Pipeline = struct {
 
         try appendZeroPastKvInputs(self.allocator, self.decoder, &decoder_inputs, self.gpt_config);
 
-        const outputs = try self.decoder.run(decoder_inputs.items, self.allocator);
+        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, self.execution_control);
         return extractLogitsAndMoveKv(self.allocator, outputs, kv_cache);
     }
 
@@ -657,7 +661,7 @@ pub const Pipeline = struct {
         var input_tensor = try Tensor.initInt64(self.allocator, "input_ids", &input_shape, input_ids);
         defer input_tensor.deinit();
 
-        var embed_outputs = try self.embed_tokens.run(&.{input_tensor}, self.allocator);
+        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, self.execution_control);
         defer freeTensorSlice(self.allocator, embed_outputs);
         if (embed_outputs.len == 0) return error.NoEmbedOutput;
 
@@ -691,7 +695,7 @@ pub const Pipeline = struct {
 
         try onnx_kv_cache.appendPastInputs(self.allocator, self.decoder.inputInfo(), kv_cache, &decoder_inputs);
 
-        const outputs = try self.decoder.run(decoder_inputs.items, self.allocator);
+        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, self.execution_control);
         return extractLogitsAndMoveKv(self.allocator, outputs, kv_cache);
     }
 };
@@ -862,6 +866,7 @@ fn encodeImages(
     vision_session: Session,
     gpt_config: gpt_mod.Config,
     images: []const []const u8,
+    execution_control: ?InferenceExecutionControl,
 ) !ImageFeatures {
     const pre_cfg = try gemma3_mm.loadPreprocessorConfig(allocator, model_dir);
     _ = gpt_config;
@@ -871,6 +876,8 @@ fn encodeImages(
     defer allocator.free(pixel_values);
 
     for (images, 0..) |image_bytes, idx| {
+        if (execution_control) |control|
+            try control.update(.tokenizing, @intCast(idx), @intCast(images.len));
         const processed = try gemma3_mm.preprocessImage(allocator, image_bytes, pre_cfg);
         defer allocator.free(processed);
         @memcpy(pixel_values[idx * pixels_per_image ..][0..pixels_per_image], processed);
@@ -880,7 +887,7 @@ fn encodeImages(
     var pv = try initSessionFloatInput(allocator, vision_session, "pixel_values", &shape, pixel_values);
     defer pv.deinit();
 
-    var outputs = try vision_session.run(&.{pv}, allocator);
+    var outputs = try vision_session.runWithControl(&.{pv}, allocator, execution_control);
     defer freeTensorSlice(allocator, outputs);
     if (outputs.len == 0) return error.NoVisionOutput;
     return .{ .data = try tensorToOwnedF32(allocator, &outputs[0]) };

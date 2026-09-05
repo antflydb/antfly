@@ -1017,6 +1017,7 @@ pub const ManagedEmbedder = struct {
             .deinit_fn = deinitDenseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
+            .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.denseForegroundBounded(),
         };
     }
@@ -1029,6 +1030,7 @@ pub const ManagedEmbedder = struct {
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
+            .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
     }
@@ -1256,6 +1258,12 @@ pub const ManagedEmbedder = struct {
 
     fn findEntry(self: *const ManagedEmbedder, name: []const u8) ?*const ManagedEmbeddingEntry {
         return self.findQueryEntry(name) orelse self.findArtifactEntry(name);
+    }
+
+    fn recoveryIdentity(ptr: *anyopaque, embedding_name: []const u8) ?db_embedder.RecoveryIdentity {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(embedding_name) orelse return null;
+        return .{ .model = entry.model, .backend = @tagName(entry.provider) };
     }
 
     fn embedDense(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {

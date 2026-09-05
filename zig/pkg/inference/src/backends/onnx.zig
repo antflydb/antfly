@@ -25,6 +25,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 pub const ExecutionProvider = @import("backend_runtime.zig").OnnxExecutionProvider;
 
 const c = @cImport({
@@ -462,13 +463,84 @@ test "CUDA provider options preserve ORT C++ defaults and admitted limit" {
 
 const onnx_vtable = Session.VTable{
     .run = &onnxRun,
+    .runWithControl = &onnxRunWithControl,
     .inputInfo = &onnxInputInfo,
     .outputInfo = &onnxOutputInfo,
     .backend = &onnxBackend,
     .close = &onnxClose,
 };
 
+fn onnxRunWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    try control.check();
+    const api = getApi();
+    var run_options: ?*c.OrtRunOptions = null;
+    try checkStatus(api, api.CreateRunOptions.?(&run_options));
+    defer api.ReleaseRunOptions.?(run_options.?);
+
+    var watcher = RunCancellationWatcher{
+        .api = api,
+        .run_options = run_options.?,
+        .control = control,
+    };
+    const watcher_thread = try std.Thread.spawn(.{}, RunCancellationWatcher.run, .{&watcher});
+    defer {
+        watcher.finished.store(true, .release);
+        watcher_thread.join();
+    }
+
+    const outputs = onnxRunImpl(ptr, inputs, allocator, run_options) catch |err| {
+        if (watcher.termination_requested.load(.acquire)) {
+            control.check() catch |control_err| return control_err;
+        }
+        return err;
+    };
+    errdefer deinitTensorSlice(outputs, allocator);
+    try control.check();
+    return outputs;
+}
+
+const RunCancellationWatcher = struct {
+    api: *const c.OrtApi,
+    run_options: *c.OrtRunOptions,
+    control: InferenceExecutionControl,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    termination_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *@This()) void {
+        while (!self.finished.load(.acquire)) {
+            self.control.check() catch {
+                self.termination_requested.store(true, .release);
+                if (self.api.RunOptionsSetTerminate.?(self.run_options)) |status| {
+                    self.api.ReleaseStatus.?(status);
+                }
+                return;
+            };
+            var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            while (std.posix.errno(std.posix.system.nanosleep(&delay, &delay)) == .INTR) {}
+        }
+    }
+};
+
+fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
+    for (tensors) |*tensor| tensor.deinit();
+    allocator.free(tensors);
+}
+
 fn onnxRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+    return onnxRunImpl(ptr, inputs, allocator, null);
+}
+
+fn onnxRunImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    run_options: ?*c.OrtRunOptions,
+) ![]Tensor {
     const self: *OnnxSession = @ptrCast(@alignCast(ptr));
     const api = getApi();
 
@@ -537,7 +609,7 @@ fn onnxRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
     // Run inference
     try checkStatus(api, api.Run.?(
         self.session,
-        null, // run options
+        run_options,
         input_name_ptrs.ptr,
         @ptrCast(input_values.ptr),
         num_inputs,

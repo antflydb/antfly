@@ -20,6 +20,8 @@ pub const Progress = struct {
     phase: Phase,
     completed: u64 = 0,
     total: u64 = 0,
+    model: []const u8 = "",
+    backend: []const u8 = "",
 };
 
 pub const Cancellation = struct {
@@ -61,11 +63,24 @@ pub const InferenceExecutionControl = struct {
     }
 
     pub fn update(self: InferenceExecutionControl, phase: Phase, completed: u64, total: u64) !void {
+        return self.updateDetail(phase, completed, total, "", "");
+    }
+
+    pub fn updateDetail(
+        self: InferenceExecutionControl,
+        phase: Phase,
+        completed: u64,
+        total: u64,
+        model: []const u8,
+        backend: []const u8,
+    ) !void {
         try self.check();
         if (self.progress) |sink| sink.update(.{
             .phase = phase,
             .completed = completed,
             .total = total,
+            .model = model,
+            .backend = backend,
         });
     }
 

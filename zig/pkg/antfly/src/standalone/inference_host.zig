@@ -460,7 +460,13 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
 
         fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.view.update(@intFromEnum(progress.phase), progress.completed, progress.total);
+            self.view.update(
+                @intFromEnum(progress.phase),
+                progress.completed,
+                progress.total,
+                progress.model,
+                progress.backend,
+            );
         }
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
@@ -492,7 +498,13 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.instruction,
                 )
             else
-                try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
+                try state.node.embedDenseTextsDirectWithExecutionControl(
+                    state.alloc,
+                    state.io,
+                    execution_control,
+                    parsed.value.model,
+                    parsed.value.texts,
+                );
             defer {
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
@@ -518,7 +530,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parsed.value.parts,
                 state.io,
-                if (operation == .embed_dense_parts_with_context) execution_control else .{},
+                execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
@@ -1066,6 +1078,44 @@ fn localAntflyEmbedDenseTexts(
     return try node.embedDenseTextsDirect(alloc, model, texts);
 }
 
+const LocalInferenceControlAdapter = struct {
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.context.check();
+    }
+
+    fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const sink = self.context.request.progress orelse return;
+        const phase = std.enums.fromInt(
+            antfly.inference.request_context.Phase,
+            @intFromEnum(progress.phase),
+        ) orelse return;
+        sink.update(.{
+            .phase = phase,
+            .completed = progress.completed,
+            .total = progress.total,
+            .model = progress.model,
+            .backend = progress.backend,
+            .deadline_ns = self.context.request.deadline_ns,
+        });
+    }
+
+    fn control(self: *@This()) inference.InferenceExecutionControl {
+        return .{
+            .deadline_ns = self.context.request.deadline_ns,
+            .ptr = self,
+            .check_fn = check,
+            .progress = if (self.context.request.progress != null)
+                .{ .ptr = self, .update_fn = update }
+            else
+                null,
+        };
+    }
+};
+
 fn localAntflyEmbedDenseTextsWithContext(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -1074,55 +1124,17 @@ fn localAntflyEmbedDenseTextsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var adapters = LocalEmbeddingControlAdapters.init(context);
+    var adapter = LocalInferenceControlAdapter{ .context = context };
     return try node.embedDenseTextsDirectWithExecutionControlAndTask(
         alloc,
         context.request.io,
-        adapters.control(),
+        adapter.control(),
         model,
         texts,
         context.task_type.canonical(),
         context.instruction,
     );
 }
-
-const LocalEmbeddingControlAdapters = struct {
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-
-    fn init(context: antfly.inference.managed_embedder.EmbeddingRequestContext) @This() {
-        return .{ .context = context };
-    }
-
-    fn cancelled(raw: ?*anyopaque) bool {
-        const self: *@This() = @ptrCast(@alignCast(raw.?));
-        const token = self.context.request.cancellation orelse return false;
-        return token.isCancelled();
-    }
-
-    fn progress(raw: ?*anyopaque, value: inference.execution_control.Progress) void {
-        const self: *@This() = @ptrCast(@alignCast(raw.?));
-        const sink = self.context.request.progress orelse return;
-        sink.update(.{
-            .phase = @enumFromInt(@intFromEnum(value.phase)),
-            .completed = value.completed,
-            .total = value.total,
-        });
-    }
-
-    fn control(self: *@This()) inference.InferenceExecutionControl {
-        return .{
-            .deadline_ns = self.context.request.deadline_ns,
-            .cancellation = if (self.context.request.cancellation != null)
-                .{ .ptr = self, .is_cancelled_fn = cancelled }
-            else
-                null,
-            .progress = if (self.context.request.progress != null)
-                .{ .ptr = self, .update_fn = progress }
-            else
-                null,
-        };
-    }
-};
 
 fn localAntflyEmbedDensePartsWithExecutionContext(
     ptr: *anyopaque,
@@ -1171,14 +1183,14 @@ fn localAntflyEmbedDensePartsWithContext(
     parts: []const antfly.template.ContentPart,
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
-    var adapters = LocalEmbeddingControlAdapters.init(context);
+    var adapter = LocalInferenceControlAdapter{ .context = context };
     return try localAntflyEmbedDensePartsWithExecutionContext(
         ptr,
         alloc,
         model,
         parts,
         context.request.io,
-        adapters.control(),
+        adapter.control(),
         context.task_type.canonical(),
         context.instruction,
     );

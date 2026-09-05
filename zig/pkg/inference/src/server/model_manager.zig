@@ -2488,13 +2488,15 @@ pub const LoadedModel = struct {
         );
     }
 
-    fn ensureOptionalSession(
+    fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
+        control: ?InferenceExecutionControl,
     ) !bool {
+        if (control) |active| try active.check();
         if (slot.* != null) return false;
         const session_path = path orelse return false;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
@@ -2517,12 +2519,24 @@ pub const LoadedModel = struct {
             strict_backend[0..],
             shared_ctx,
             &session_manager,
+            control,
         );
+        if (control) |active| try active.check();
         slot.* = loaded.session;
         lease_slot.* = loaded.resource_lease;
         loaded.owns_session = false;
         loaded.resource_lease = null;
         return true;
+    }
+
+    fn ensureOptionalSession(
+        self: *LoadedModel,
+        kind: DeclaredOptionalSessionKind,
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+        path: ?[]const u8,
+    ) !bool {
+        return self.ensureOptionalSessionWithControl(kind, slot, lease_slot, path, null);
     }
 
     fn releaseOptionalSession(
@@ -2540,6 +2554,10 @@ pub const LoadedModel = struct {
     /// retain shared concurrency.
     pub fn lockEmbeddingAssets(self: *LoadedModel) void {
         spinLock(&self.embedding_session_lock);
+    }
+
+    pub fn lockEmbeddingAssetsWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try control.lock(&self.embedding_session_lock);
     }
 
     pub fn unlockEmbeddingAssets(self: *LoadedModel) void {
@@ -2602,6 +2620,18 @@ pub const LoadedModel = struct {
         );
     }
 
+    pub fn ensureVisionSessionWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try self.lockEmbeddingAssetsWithControl(control);
+        defer self.unlockEmbeddingAssets();
+        _ = try self.ensureOptionalSessionWithControl(
+            .vision,
+            &self.vision_session,
+            &self.vision_resource_lease,
+            self.manifest.visual_model_path,
+            control,
+        );
+    }
+
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         self.lockEmbeddingAssets();
         defer self.unlockEmbeddingAssets();
@@ -2611,6 +2641,17 @@ pub const LoadedModel = struct {
     pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         try self.ensurePrimaryEmbeddingAssetsLocked(include_text, include_image);
         if (include_audio) try self.ensureAudioEmbeddingAssetsLocked();
+    }
+
+    pub fn ensureEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        include_audio: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        try self.ensurePrimaryEmbeddingAssetsLockedWithControl(include_text, include_image, control);
+        if (include_audio) try self.ensureAudioEmbeddingAssetsLockedWithControl(control);
     }
 
     const PrimaryEmbeddingAssetAcquisitions = struct {
@@ -2666,6 +2707,42 @@ pub const LoadedModel = struct {
         }
     }
 
+    pub fn ensurePrimaryEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        var acquired = PrimaryEmbeddingAssetAcquisitions{};
+        errdefer self.rollbackPrimaryEmbeddingAssetsLocked(acquired);
+
+        if (include_text) {
+            acquired.text_projection = try self.ensureOptionalSessionWithControl(
+                .text_projection,
+                &self.text_projection,
+                &self.text_projection_resource_lease,
+                self.manifest.text_projection_path,
+                control,
+            );
+        }
+        if (include_image) {
+            acquired.vision = try self.ensureOptionalSessionWithControl(
+                .vision,
+                &self.vision_session,
+                &self.vision_resource_lease,
+                self.manifest.visual_model_path,
+                control,
+            );
+            acquired.visual_projection = try self.ensureOptionalSessionWithControl(
+                .visual_projection,
+                &self.visual_projection,
+                &self.visual_projection_resource_lease,
+                self.manifest.visual_projection_path,
+                control,
+            );
+        }
+    }
+
     /// Admit the ephemeral audio sidecars as one phase. Any partial admission
     /// is rolled back immediately so a failed request cannot strand a lease
     /// and prevent subsequent text/image work from making progress.
@@ -2682,6 +2759,24 @@ pub const LoadedModel = struct {
             &self.audio_projection,
             &self.audio_projection_resource_lease,
             self.manifest.audio_projection_path,
+        );
+    }
+
+    pub fn ensureAudioEmbeddingAssetsLockedWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        errdefer self.releaseAudioEmbeddingAssetsLocked();
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio,
+            &self.audio_session,
+            &self.audio_resource_lease,
+            self.manifest.audio_model_path,
+            control,
+        );
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio_projection,
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+            self.manifest.audio_projection_path,
+            control,
         );
     }
 
@@ -3074,6 +3169,10 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -3093,6 +3192,7 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3132,6 +3232,10 @@ test "audio asset rollback closes every ephemeral session" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -3151,6 +3255,7 @@ test "audio asset rollback closes every ephemeral session" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3333,6 +3438,16 @@ pub const ModelHandle = struct {
     /// restart; concurrent users retain the retired object until they unwind.
     pub fn retire(self: *ModelHandle) void {
         const model = self.model orelse return;
+        self.manager.retireLoadedModel(model);
+        self.release();
+    }
+
+    /// Quarantine the exact model/backend pair before retiring its in-process
+    /// runtime. A later durable retry can select the next healthy backend
+    /// without penalizing unrelated models that use the same backend.
+    pub fn quarantine(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        markModelBackendUnhealthy(self.manager, model.model_dir, model.session.backend());
         self.manager.retireLoadedModel(model);
         self.release();
     }
@@ -3638,6 +3753,8 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
@@ -4768,6 +4885,21 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 null,
+                null,
+            );
+        }
+
+        pub fn loadWithControl(
+            self: *const ComponentLoader,
+            model_path: []const u8,
+            control: InferenceExecutionControl,
+        ) !ManagedSession {
+            try self.ensureComponentPath(model_path);
+            return self.manager.loadManagedSessionWithAdmission(
+                model_path,
+                self.preferredBackends(),
+                null,
+                control,
             );
         }
 
@@ -4781,6 +4913,7 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 shared_backend_ctx,
+                null,
             );
         }
 
@@ -5089,12 +5222,14 @@ pub const ModelManager = struct {
         model_path: []const u8,
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
         return self.loadManagedSessionWithAdmissionUsingManager(
             model_path,
             preferred_backends,
             shared_backend_ctx,
             &self.session_manager,
+            control,
         );
     }
 
@@ -5104,7 +5239,9 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try source_session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -5118,6 +5255,7 @@ pub const ModelManager = struct {
         defer artifact_estimate.deinit();
 
         for (effective_backends) |backend| {
+            if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
@@ -5183,6 +5321,11 @@ pub const ModelManager = struct {
                 model_path,
                 shared_backend_ctx,
             )) |loaded_session| {
+                if (control) |active| active.check() catch |err| {
+                    loaded_session.close();
+                    if (resource_lease) |*lease| lease.release();
+                    return err;
+                };
                 var session = loaded_session;
                 if (resource_lease) |*lease| {
                     lease.retain(resident_amounts) catch |err| {
@@ -5373,6 +5516,7 @@ pub const ModelManager = struct {
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
+        self.unhealthy_model_backends.deinit(self.allocator);
         var whisper_assets_it = self.whisper_assets.iterator();
         while (whisper_assets_it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -5861,6 +6005,22 @@ pub const ModelManager = struct {
         );
     }
 
+    pub fn acquireFromDirWithPreferredBackendsAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            control,
+        );
+    }
+
     /// Acquire a model using an immutable A4B policy for this load. Explicit
     /// policies do not accept an existing unqualified alias: the qualified
     /// cache key must match before a model can be reused. A newly qualified
@@ -5881,6 +6041,21 @@ pub const ModelManager = struct {
         );
     }
 
+    pub fn acquireFromDirWithA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
+        );
+    }
+
     pub fn acquireFromDirWithPreferredBackendsAndA4bRequest(
         self: *ModelManager,
         model_dir: []const u8,
@@ -5894,6 +6069,23 @@ pub const ModelManager = struct {
             cache_default_alias,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
             null,
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
         );
     }
 
@@ -5934,6 +6126,7 @@ pub const ModelManager = struct {
     ) !?*LoadedModel {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
+            if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
             const variant_key = try backendVariantCacheKey(
                 self.allocator,
                 model_dir,
@@ -5946,11 +6139,13 @@ pub const ModelManager = struct {
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
         }
         return null;
     }
@@ -6288,6 +6483,7 @@ pub const ModelManager = struct {
             self.allocator.destroy(sp);
         };
 
+        if (control) |active| try active.check();
         switch (tokenizer_type) {
             .huggingface => {
                 hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
@@ -6315,7 +6511,15 @@ pub const ModelManager = struct {
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
-        var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
+        if (control) |active| try active.update(.preparing_weights, 0, 1);
+        var loaded_session = try loadSessionForPreferredBackends(
+            self,
+            sm.preferred_backends,
+            model_dir,
+            man,
+            sm,
+            control,
+        );
         if (control) |active| try active.update(.loading_model, 3, 4);
         errdefer if (loaded_session.resource_lease) |*lease| lease.release();
         const session = loaded_session.session;
@@ -6615,6 +6819,56 @@ fn loadedModelUsesPreferredBackend(
     return false;
 }
 
+const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
+const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(model_dir);
+    hasher.update(&[_]u8{@intFromEnum(backend)});
+    var digest: ModelBackendHealthKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn markModelBackendUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) void {
+    const retry_after_ns = platform.time.monotonicNs() +| model_backend_quarantine_ns;
+    spinLock(&self.unhealthy_backend_lock);
+    self.unhealthy_model_backends.put(
+        self.allocator,
+        modelBackendHealthKey(model_dir, backend),
+        retry_after_ns,
+    ) catch {
+        self.unhealthy_backend_lock.unlock();
+        return;
+    };
+    self.unhealthy_backend_lock.unlock();
+    std.log.warn("quarantined inference model path={s} backend={s} for {d}ms", .{
+        model_dir,
+        @tagName(backend),
+        model_backend_quarantine_ns / std.time.ns_per_ms,
+    });
+}
+
+fn modelBackendIsUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) bool {
+    const key = modelBackendHealthKey(model_dir, backend);
+    const now_ns = platform.time.monotonicNs();
+    spinLock(&self.unhealthy_backend_lock);
+    defer self.unhealthy_backend_lock.unlock();
+    const retry_after_ns = self.unhealthy_model_backends.get(key) orelse return false;
+    if (now_ns < retry_after_ns) return true;
+    _ = self.unhealthy_model_backends.remove(key);
+    return false;
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -6685,6 +6939,10 @@ test "explicit backend lookup reuses only a matching default alias" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6702,6 +6960,7 @@ test "explicit backend lookup reuses only a matching default alias" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -6910,6 +7169,10 @@ test "failed loaded model retires from lookup while active handles unwind" {
         fn run(_: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
             return alloc.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6924,6 +7187,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         var state: u8 = 0;
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -7683,7 +7947,9 @@ fn loadSessionForPreferredBackends(
     model_dir: []const u8,
     man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
+    if (control) |active| try active.check();
     var required_backend_scratch: [1]backends.BackendType = undefined;
     const policy_backends = try source_session_manager.requiredBackendCandidates(
         preferred_backends,
@@ -7704,6 +7970,11 @@ fn loadSessionForPreferredBackends(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
+        if (control) |active| try active.check();
+        if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
+            rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
+            continue;
+        }
         if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
             std.log.err(
                 "loadModel({s}) qualified CUDA A4B artifact rejected CPU fallback after GPU admission failure",
@@ -7721,6 +7992,13 @@ fn loadSessionForPreferredBackends(
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (control) |active| try active.updateDetail(
+            .preparing_weights,
+            0,
+            1,
+            model_dir,
+            @tagName(backend),
+        );
         if (source_session_manager.kernel_jit.mode.failClosed() and
             std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
@@ -7760,6 +8038,7 @@ fn loadSessionForPreferredBackends(
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
             }
+            if (control) |active| try active.check();
             resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
                 admission_limits,
@@ -7781,8 +8060,18 @@ fn loadSessionForPreferredBackends(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
+            if (control) |active| active.check() catch |err| {
+                if (resource_lease) |*lease| lease.release();
+                return err;
+            };
         }
+        if (control) |active| try active.check();
         if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+            if (control) |active| active.check() catch |err| {
+                loaded_session.close();
+                if (resource_lease) |*lease| lease.release();
+                return err;
+            };
             var session = loaded_session;
             if (resource_lease) |*lease| {
                 lease.retain(resident_amounts) catch |err| {

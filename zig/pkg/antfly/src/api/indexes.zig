@@ -3024,10 +3024,14 @@ fn aggregateEnrichmentStats(
     dst.worker_started = dst.worker_started or src.worker_started;
     dst.stalled = dst.stalled or src.stalled;
     if (dst.stall_reason.len == 0 and src.stall_reason.len > 0) dst.stall_reason = src.stall_reason;
-    if (std.mem.eql(u8, dst.active_phase, "idle") and !std.mem.eql(u8, src.active_phase, "idle")) dst.active_phase = src.active_phase;
-    if (dst.active_model.len == 0) dst.active_model = src.active_model;
-    if (dst.active_backend.len == 0) dst.active_backend = src.active_backend;
-    dst.active_deadline_ms = @max(dst.active_deadline_ms, src.active_deadline_ms);
+    if (std.mem.eql(u8, dst.active_phase, "idle") and !std.mem.eql(u8, src.active_phase, "idle")) {
+        dst.active_phase = src.active_phase;
+        dst.active_model = src.active_model;
+        dst.active_backend = src.active_backend;
+        dst.active_deadline_ms = src.active_deadline_ms;
+        dst.active_progress_completed = src.active_progress_completed;
+        dst.active_progress_total = src.active_progress_total;
+    }
     dst.last_progress_ms = @max(dst.last_progress_ms, src.last_progress_ms);
     dst.inference_timeout_count +|= src.inference_timeout_count;
     dst.inference_cancel_count +|= src.inference_cancel_count;
@@ -5462,13 +5466,17 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, ",\"active_phase\":");
     try appendJsonString(alloc, out, stats.active_phase);
     try out.appendSlice(alloc, ",\"active_model\":");
-    try appendJsonString(alloc, out, stats.active_model);
+    try appendJsonString(alloc, out, stats.active_model.slice());
     try out.appendSlice(alloc, ",\"active_backend\":");
-    try appendJsonString(alloc, out, stats.active_backend);
+    try appendJsonString(alloc, out, stats.active_backend.slice());
     try out.appendSlice(alloc, ",\"active_deadline_ms\":");
     try appendIntValue(alloc, out, stats.active_deadline_ms);
     try out.appendSlice(alloc, ",\"last_progress_ms\":");
     try appendIntValue(alloc, out, stats.last_progress_ms);
+    try out.appendSlice(alloc, ",\"active_progress_completed\":");
+    try appendIntValue(alloc, out, stats.active_progress_completed);
+    try out.appendSlice(alloc, ",\"active_progress_total\":");
+    try appendIntValue(alloc, out, stats.active_progress_total);
     try out.appendSlice(alloc, ",\"inference_timeout_count\":");
     try appendIntValue(alloc, out, stats.inference_timeout_count);
     try out.appendSlice(alloc, ",\"inference_cancel_count\":");

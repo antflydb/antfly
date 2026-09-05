@@ -3709,9 +3709,11 @@ fn cloneParsedRuntimeGroupStatus(
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, parsed.freshness orelse "unknown");
     errdefer alloc.free(freshness);
-    var enrichment = parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{};
-    enrichment.projection_checkpoint_status = try alloc.dupe(u8, enrichment.projection_checkpoint_status);
-    errdefer alloc.free(enrichment.projection_checkpoint_status);
+    const enrichment = try metadata_table_manager.cloneRuntimeEnrichmentStatusReport(
+        alloc,
+        parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{},
+    );
+    errdefer metadata_table_manager.freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     return .{
         .table_id = parsed.table_id orelse 0,
         .table_name = table_name,

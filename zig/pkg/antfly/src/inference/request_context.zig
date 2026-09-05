@@ -32,6 +32,7 @@ pub const Progress = struct {
     total: u64 = 0,
     model: []const u8 = "",
     backend: []const u8 = "",
+    deadline_ns: ?u64 = null,
 };
 
 pub const ProgressSink = struct {
@@ -67,7 +68,7 @@ pub const RequestContext = struct {
 
     pub fn update(self: RequestContext, phase: Phase, completed: u64, total: u64) !void {
         try self.check();
-        if (self.progress) |sink| sink.update(.{ .phase = phase, .completed = completed, .total = total });
+        if (self.progress) |sink| sink.update(.{ .phase = phase, .completed = completed, .total = total, .deadline_ns = self.deadline_ns });
     }
 
     pub fn updateDetail(self: RequestContext, phase: Phase, completed: u64, total: u64, model: []const u8, backend: []const u8) !void {
@@ -78,6 +79,7 @@ pub const RequestContext = struct {
             .total = total,
             .model = model,
             .backend = backend,
+            .deadline_ns = self.deadline_ns,
         });
     }
 };

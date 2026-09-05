@@ -34,6 +34,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const ops_mod = @import("../ops/ops.zig");
 const graph_runtime_mod = if (build_options.enable_wasm) WasmGraphRuntime else @import("../graph/runtime.zig");
 
@@ -1061,13 +1062,32 @@ pub fn createSessionWithOptions(
 
 const imported_session_vtable = Session.VTable{
     .run = run,
+    .runWithControl = runWithControl,
     .inputInfo = inputInfo,
     .outputInfo = outputInfo,
     .backend = backend,
     .close = close,
     .runResident = runResident,
     .runResidentInputs = runResidentInputs,
+    .runResidentWithControl = runResidentWithControl,
+    .runResidentInputsWithControl = runResidentInputsWithControl,
 };
+
+fn runWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    try control.check();
+    const outputs = try run(ptr, inputs, allocator);
+    errdefer {
+        for (outputs) |*tensor| tensor.deinit();
+        allocator.free(outputs);
+    }
+    try control.check();
+    return outputs;
+}
 
 pub fn sharedBackendContext(session: Session) ?*SharedBackendContext {
     if (session.vtable != &imported_session_vtable) return null;
@@ -1153,6 +1173,32 @@ fn runResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Alloc
 fn runResidentInputs(ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
     return try runResidentImpl(self, null, inputs, allocator);
+}
+
+fn runResidentWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) anyerror!?ResidentOutputs {
+    try control.check();
+    var outputs = (try runResident(ptr, inputs, allocator)) orelse return null;
+    errdefer outputs.deinit();
+    try control.check();
+    return outputs;
+}
+
+fn runResidentInputsWithControl(
+    ptr: *anyopaque,
+    inputs: []const ResidentInput,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) anyerror!?ResidentOutputs {
+    try control.check();
+    var outputs = (try runResidentInputs(ptr, inputs, allocator)) orelse return null;
+    errdefer outputs.deinit();
+    try control.check();
+    return outputs;
 }
 
 fn runResidentImpl(

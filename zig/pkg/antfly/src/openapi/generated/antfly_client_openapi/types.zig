@@ -9613,6 +9613,8 @@ pub const EnrichmentRuntimeStatus = struct {
     /// Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
     active_deadline_ms: i64,
     last_progress_ms: i64,
+    active_progress_completed: i64,
+    active_progress_total: i64,
     inference_timeout_count: i64,
     inference_cancel_count: i64,
     skip_by_hash_count: i64,

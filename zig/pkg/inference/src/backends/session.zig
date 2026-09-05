@@ -20,6 +20,15 @@ const BackendType = @import("backends.zig").BackendType;
 const memory = @import("../runtime/tier/memory.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
+fn unsupportedControlledRun(
+    _: *anyopaque,
+    _: []const Tensor,
+    _: std.mem.Allocator,
+    _: InferenceExecutionControl,
+) anyerror![]Tensor {
+    return error.UncontrolledSession;
+}
+
 pub const ResidentInput = struct {
     value: ops.CT,
     backend: *const ops.ComputeBackend,
@@ -315,8 +324,13 @@ pub const Session = struct {
         runResident: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentInputs: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentTextEmbedding: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
-        runWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror![]Tensor = null,
+        /// Every backend must provide the controlled entry point. Backends that
+        /// cannot cooperatively interrupt their native call still check before
+        /// and after it; the owner can then route those backends through the
+        /// supervised process boundary without a silent uncontrolled fallback.
+        runWithControl: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror![]Tensor = &unsupportedControlledRun,
         runResidentWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
+        runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
     };
 
@@ -328,9 +342,41 @@ pub const Session = struct {
             null;
         errdefer if (resource_lease) |*lease| lease.release();
         const outputs = try self.vtable.run(self.ptr, inputs, allocator);
-        if (resource_lease == null) return outputs;
+        return attachOutputAdmission(outputs, allocator, &resource_lease);
+    }
+
+    pub fn runWithControl(
+        self: Session,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) ![]Tensor {
+        const active = control orelse return self.run(inputs, allocator);
+        try active.check();
+        var resource_lease = if (self.run_admission) |admission|
+            try admission.acquire(inputs, self.outputInfo())
+        else
+            null;
+        errdefer if (resource_lease) |*lease| lease.release();
+        active.check() catch |err| {
+            if (resource_lease) |*lease| lease.release();
+            resource_lease = null;
+            return err;
+        };
+        const outputs = try self.vtable.runWithControl(self.ptr, inputs, allocator, active);
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return attachOutputAdmission(outputs, allocator, &resource_lease);
+    }
+
+    fn attachOutputAdmission(
+        outputs: []Tensor,
+        allocator: std.mem.Allocator,
+        resource_lease: *?memory.AdmissionLease,
+    ) ![]Tensor {
+        if (resource_lease.* == null) return outputs;
         if (outputs.len == 0) {
-            resource_lease.?.release();
+            resource_lease.*.?.release();
             return outputs;
         }
         var retained_output_bytes: usize = 0;
@@ -345,7 +391,7 @@ pub const Session = struct {
                     std.math.maxInt(usize),
             ) catch std.math.maxInt(usize);
         }
-        resource_lease.?.retain(.{
+        resource_lease.*.?.retain(.{
             .host_scratch_bytes = retained_output_bytes,
         }) catch {};
 
@@ -355,10 +401,10 @@ pub const Session = struct {
         };
         output_admission.* = .{
             .allocator = allocator,
-            .lease = resource_lease.?,
+            .lease = resource_lease.*.?,
             .remaining = std.atomic.Value(usize).init(outputs.len),
         };
-        resource_lease = null;
+        resource_lease.* = null;
         for (outputs) |*output| {
             std.debug.assert(output.lifetime == null);
             output.lifetime = .{
@@ -390,6 +436,16 @@ pub const Session = struct {
             .session = self,
             .lease = if (self.run_admission) |admission|
                 try admission.acquireAmounts(.{ .host_scratch_bytes = host_scratch_bytes })
+            else
+                null,
+        };
+    }
+
+    pub fn admitResidentInputs(self: Session, inputs: []const ResidentInput) !RunPermit {
+        return .{
+            .session = self,
+            .lease = if (self.run_admission) |admission|
+                try admission.acquireResidentInputs(inputs, self.outputInfo())
             else
                 null,
         };
@@ -473,10 +529,12 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
-        const outputs = if (self.session.vtable.runWithControl) |run_controlled|
-            try run_controlled(self.session.ptr, inputs, allocator, active)
-        else
-            try self.run(inputs, allocator);
+        const outputs = try self.session.vtable.runWithControl(
+            self.session.ptr,
+            inputs,
+            allocator,
+            active,
+        );
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return outputs;
@@ -502,7 +560,7 @@ pub const RunPermit = struct {
         var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
         else
-            (try self.runResident(inputs, allocator)) orelse return null;
+            return null;
         errdefer outputs.deinit();
         try active.check();
         return outputs;
@@ -516,6 +574,21 @@ pub const RunPermit = struct {
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
         return run_resident_inputs(self.session.ptr, inputs, allocator);
+    }
+
+    pub fn runResidentInputsWithControl(
+        self: *RunPermit,
+        inputs: []const ResidentInput,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?ResidentOutputs {
+        const active = control orelse return self.runResidentInputs(inputs, allocator);
+        try active.check();
+        const run_controlled = self.session.vtable.runResidentInputsWithControl orelse return null;
+        var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
+        errdefer outputs.deinit();
+        try active.check();
+        return outputs;
     }
 
     pub fn runResidentTextEmbedding(
@@ -540,7 +613,7 @@ pub const RunPermit = struct {
         var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
         else
-            (try self.runResidentTextEmbedding(inputs, request, allocator)) orelse return null;
+            return null;
         errdefer outputs.deinit();
         try active.check();
         return outputs;
@@ -560,7 +633,7 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 11), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 12), info.@"struct".fields.len);
 }
 
 const AdmissionProbeSession = struct {
@@ -586,6 +659,19 @@ const AdmissionProbeSession = struct {
         return outputs;
     }
 
+    fn runWithControl(
+        ptr: *anyopaque,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: InferenceExecutionControl,
+    ) ![]Tensor {
+        try control.check();
+        const outputs = try run(ptr, inputs, allocator);
+        errdefer deinitTensorSlice(outputs, allocator);
+        try control.check();
+        return outputs;
+    }
+
     fn inputInfo(_: *anyopaque) []const TensorInfo {
         return &.{};
     }
@@ -602,6 +688,7 @@ const AdmissionProbeSession = struct {
 
     const vtable = Session.VTable{
         .run = run,
+        .runWithControl = runWithControl,
         .inputInfo = inputInfo,
         .outputInfo = outputInfo,
         .backend = backend,
