@@ -18,7 +18,8 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
-const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -3304,6 +3305,7 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 const LoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
+    hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
     /// Protected by ModelManager.load_lock. The manager-owned task holds one
@@ -3364,8 +3366,10 @@ const LoadFlightControl = struct {
 
     fn control(self: *@This()) InferenceExecutionControl {
         return .{
+            .io = self.flight.io,
             .ptr = self,
             .check_fn = check,
+            .hard_cancellation = self.flight.hard_cancellation,
         };
     }
 };
@@ -6495,6 +6499,7 @@ pub const ModelManager = struct {
             std.Io.Threaded.global_single_threaded.io();
         flight.* = .{
             .io = coordination_io,
+            .hard_cancellation = if (control) |active| active.hard_cancellation else null,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
@@ -8251,6 +8256,11 @@ fn loadSessionForPreferredBackends(
             };
         }
         if (control) |active| try active.check();
+        var hard_cancellation = if (control) |active|
+            try active.enterUninterruptible(backend_runtime.interruption())
+        else
+            execution_control_mod.UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
             if (control) |active| active.check() catch |err| {
                 loaded_session.close();

@@ -19,6 +19,7 @@ const TensorInfo = @import("tensor.zig").TensorInfo;
 const BackendType = @import("backends.zig").BackendType;
 const memory = @import("../runtime/tier/memory.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const Interruption = @import("../execution_control.zig").Interruption;
 
 fn unsupportedControlledRun(
     _: *anyopaque,
@@ -320,6 +321,7 @@ pub const Session = struct {
         inputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         outputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         backend: *const fn (ptr: *anyopaque) BackendType,
+        interruption: ?*const fn (ptr: *anyopaque) Interruption = null,
         close: *const fn (ptr: *anyopaque) void,
         runResident: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentInputs: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
@@ -353,6 +355,8 @@ pub const Session = struct {
     ) ![]Tensor {
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
+        var hard_cancellation = try active.enterUninterruptible(self.interruption());
+        defer hard_cancellation.deinit();
         var resource_lease = if (self.run_admission) |admission|
             try admission.acquire(inputs, self.outputInfo())
         else
@@ -463,6 +467,11 @@ pub const Session = struct {
         return self.vtable.backend(self.ptr);
     }
 
+    pub fn interruption(self: Session) Interruption {
+        if (self.vtable.interruption) |classify| return classify(self.ptr);
+        return self.backend().interruption();
+    }
+
     pub fn close(self: Session) void {
         self.vtable.close(self.ptr);
     }
@@ -529,6 +538,8 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
+        var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
+        defer hard_cancellation.deinit();
         const outputs = try self.session.vtable.runWithControl(
             self.session.ptr,
             inputs,
@@ -557,6 +568,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         const active = control orelse return self.runResident(inputs, allocator);
         try active.check();
+        var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
+        defer hard_cancellation.deinit();
         var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
         else
@@ -584,6 +597,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         const active = control orelse return self.runResidentInputs(inputs, allocator);
         try active.check();
+        var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
+        defer hard_cancellation.deinit();
         const run_controlled = self.session.vtable.runResidentInputsWithControl orelse return null;
         var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
         errdefer outputs.deinit();
@@ -610,6 +625,8 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         const active = control orelse return self.runResidentTextEmbedding(inputs, request, allocator);
         try active.check();
+        var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
+        defer hard_cancellation.deinit();
         var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
             (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
         else

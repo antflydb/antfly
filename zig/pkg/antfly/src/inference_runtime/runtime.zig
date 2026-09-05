@@ -22,6 +22,16 @@ const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
 const httpx = @import("httpx");
 
+const supervised_worker_env = "ANTFLY_INFERENCE_SUPERVISED_WORKER";
+const supervisor_pid_env = "ANTFLY_INFERENCE_SUPERVISOR_PID";
+
+fn supervisedWorkerParentAlive() bool {
+    if (!platform.env.getenvBool(supervised_worker_env)) return true;
+    const raw = platform.env.getenv(supervisor_pid_env) orelse return false;
+    const expected = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch return false;
+    return std.posix.system.getppid() == expected;
+}
+
 pub const ServerBudgetOverrides = inference.server.BudgetOverrides;
 
 /// Returns ~/.antfly/inference/models if $HOME is set, otherwise falls back to ./models.
@@ -443,12 +453,13 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        .supervised_process_worker = platform.env.getenvBool(supervised_worker_env),
     });
     defer node.deinit();
 
     // Bind the caller-owned runtime before warmup so model loading, tokenizer
     // work, and backend sessions all compose with the same executor.
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     node.startReadinessInventory(io);
@@ -484,6 +495,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         return error.MissingInferenceListener;
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+        if (!supervisedWorkerParentAlive())
+            return error.InferenceSupervisorExited;
         if (listener_task.runtimeFailure()) |err|
             return supervisor.fail("inference", "public-http", err);
         io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {
@@ -523,7 +536,7 @@ pub fn spawnServerProcess(
     errdefer alloc.free(host_dup);
 
     try node.validateHttpBind(host_dup);
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.startReadinessInventory(io);
 

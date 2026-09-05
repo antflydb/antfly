@@ -20,6 +20,12 @@
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
+
+fn enterGenerationBoundary(control: ?InferenceExecutionControl) !UninterruptibleGuard {
+    const active = control orelse return .{};
+    return active.enterUninterruptible(.process_required);
+}
 
 const c = @cImport({
     @cInclude("ort_genai_c.h");
@@ -795,6 +801,8 @@ pub fn generate(
     execution_control: ?InferenceExecutionControl,
 ) !GenerateResult {
     if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     // Encode prompt to token sequences
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
@@ -896,6 +904,8 @@ pub fn generateFirstTokenDebug(
     execution_control: ?InferenceExecutionControl,
 ) !FirstTokenDebug {
     if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
 
@@ -954,6 +964,8 @@ pub fn generateWithImages(
 ) !GenerateResult {
     if (image_data.len == 0) return generate(allocator, model, prompt, opts, execution_control);
     if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
 
     // Load images from byte buffers
     const ptrs = try allocator.alloc(*const anyopaque, image_data.len);
@@ -1087,6 +1099,8 @@ pub fn generateStreaming(
     execution_control: ?InferenceExecutionControl,
 ) !GenerateResult {
     if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
 

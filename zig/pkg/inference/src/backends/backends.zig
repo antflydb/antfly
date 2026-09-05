@@ -20,6 +20,7 @@ const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
+const Interruption = @import("../execution_control.zig").Interruption;
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -87,6 +88,17 @@ pub const BackendType = enum {
         return self == .metal or self == .cuda;
     }
 
+    /// Strongest cancellation mechanism available once execution has crossed
+    /// into the backend. GPU driver and PJRT calls have no portable per-call
+    /// abort primitive, so they may execute only in a supervised worker.
+    pub fn interruption(self: BackendType) Interruption {
+        return switch (self) {
+            .native, .wasm => .cooperative,
+            .onnx => .native_terminable,
+            .metal, .cuda, .pjrt => .process_required,
+        };
+    }
+
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
@@ -110,6 +122,12 @@ pub const BackendRuntime = struct {
             else => false,
         };
     }
+
+    pub fn interruption(self: BackendRuntime) Interruption {
+        if (self.backend == .onnx and self.onnx_execution_provider == .cuda)
+            return .process_required;
+        return self.backend.interruption();
+    }
 };
 
 test "backend runtime classifies external ONNX CUDA as GPU hosted" {
@@ -117,10 +135,38 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
         .backend = .onnx,
         .onnx_execution_provider = .cpu,
     }).usesGpuHostedSession());
+    try std.testing.expectEqual(
+        Interruption.native_terminable,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).interruption(),
+    );
+    try std.testing.expectEqual(
+        Interruption.process_required,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cuda }).interruption(),
+    );
     try std.testing.expect((BackendRuntime{
         .backend = .onnx,
         .onnx_execution_provider = .cuda,
     }).usesGpuHostedSession());
+}
+
+test "backend interruption policy isolates unabortable driver calls" {
+    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.interruption());
+    try std.testing.expectEqual(Interruption.native_terminable, BackendType.onnx.interruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.interruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.interruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.interruption());
+}
+
+test "embedded session policy fails before selecting an uninterruptible backend" {
+    if (!BackendType.metal.available()) return error.SkipZigTest;
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .metal;
+    manager.required_backend_invalid = false;
+    manager.process_isolation_available = false;
+    try std.testing.expectError(
+        error.ProcessIsolationRequired,
+        manager.validateRequiredBackendPolicy(),
+    );
 }
 
 const backend_order_capacity = std.meta.fields(BackendType).len;
@@ -153,6 +199,10 @@ pub const SessionManager = struct {
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
     io: ?std.Io = null,
+    /// True for CLI tools and supervised inference workers. Server nodes set
+    /// this explicitly so embedded database runtimes cannot even load a
+    /// backend whose driver requires process-level recovery.
+    process_isolation_available: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         const required = requiredBackendFromEnv();
@@ -196,6 +246,9 @@ pub const SessionManager = struct {
         const backend = self.required_backend orelse return;
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
+        const backend_runtime = try self.resolveBackendRuntime(backend);
+        if (!self.process_isolation_available and backend_runtime.interruption() == .process_required)
+            return error.ProcessIsolationRequired;
     }
 
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
@@ -283,6 +336,10 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
+            if (!self.process_isolation_available and backend_runtime.interruption() == .process_required) {
+                first_err = first_err orelse error.ProcessIsolationRequired;
+                continue;
+            }
             const effective_model_path = switch (backend) {
                 .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,

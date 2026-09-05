@@ -123,6 +123,7 @@ pub const OnnxSession = struct {
     output_names: std.ArrayListUnmanaged([:0]const u8),
     input_info: std.ArrayListUnmanaged(TensorInfo),
     output_info: std.ArrayListUnmanaged(TensorInfo),
+    execution_provider: ExecutionProvider,
 
     pub fn deinit(self: *OnnxSession) void {
         const api = getApi();
@@ -380,6 +381,7 @@ pub fn createSessionWithOptions(
         .output_names = std.ArrayListUnmanaged([:0]const u8).empty,
         .input_info = std.ArrayListUnmanaged(TensorInfo).empty,
         .output_info = std.ArrayListUnmanaged(TensorInfo).empty,
+        .execution_provider = execution_provider,
     };
 
     // Introspect model inputs and outputs
@@ -467,8 +469,14 @@ const onnx_vtable = Session.VTable{
     .inputInfo = &onnxInputInfo,
     .outputInfo = &onnxOutputInfo,
     .backend = &onnxBackend,
+    .interruption = &onnxInterruption,
     .close = &onnxClose,
 };
+
+fn onnxInterruption(ptr: *anyopaque) @import("../execution_control.zig").Interruption {
+    const self: *const OnnxSession = @ptrCast(@alignCast(ptr));
+    return if (self.execution_provider == .cuda) .process_required else .native_terminable;
+}
 
 fn onnxRunWithControl(
     ptr: *anyopaque,
@@ -487,10 +495,18 @@ fn onnxRunWithControl(
         .run_options = run_options.?,
         .control = control,
     };
-    const watcher_thread = try std.Thread.spawn(.{}, RunCancellationWatcher.run, .{&watcher});
+    var owned_io: ?std.Io.Threaded = if (control.io == null)
+        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    else
+        null;
+    defer if (owned_io) |*runtime| runtime.deinit();
+    const io = control.io orelse owned_io.?.io();
+    var watcher_group: std.Io.Group = .init;
+    try watcher_group.concurrent(io, RunCancellationWatcher.run, .{ &watcher, io });
     defer {
         watcher.finished.store(true, .release);
-        watcher_thread.join();
+        watcher_group.cancel(io);
+        watcher_group.await(io) catch {};
     }
 
     const outputs = onnxRunImpl(ptr, inputs, allocator, run_options) catch |err| {
@@ -511,7 +527,7 @@ const RunCancellationWatcher = struct {
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     termination_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn run(self: *@This()) void {
+    fn run(self: *@This(), io: std.Io) std.Io.Cancelable!void {
         while (!self.finished.load(.acquire)) {
             self.control.check() catch {
                 self.termination_requested.store(true, .release);
@@ -520,8 +536,7 @@ const RunCancellationWatcher = struct {
                 }
                 return;
             };
-            var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            while (std.posix.errno(std.posix.system.nanosleep(&delay, &delay)) == .INTR) {}
+            try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
         }
     }
 };
@@ -696,10 +711,18 @@ pub fn runWithBoundValuesControl(
         .run_options = run_options.?,
         .control = active,
     };
-    const watcher_thread = try std.Thread.spawn(.{}, RunCancellationWatcher.run, .{&watcher});
+    var owned_io: ?std.Io.Threaded = if (active.io == null)
+        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    else
+        null;
+    defer if (owned_io) |*runtime| runtime.deinit();
+    const io = active.io orelse owned_io.?.io();
+    var watcher_group: std.Io.Group = .init;
+    try watcher_group.concurrent(io, RunCancellationWatcher.run, .{ &watcher, io });
     defer {
         watcher.finished.store(true, .release);
-        watcher_thread.join();
+        watcher_group.cancel(io);
+        watcher_group.await(io) catch {};
     }
 
     var result = runWithBoundValuesImpl(

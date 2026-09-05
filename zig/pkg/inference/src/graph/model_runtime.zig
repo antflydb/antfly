@@ -16,6 +16,8 @@ const std = @import("std");
 const cache_mod = @import("cache.zig");
 const activations = @import("../backends/activations.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const Interruption = @import("../execution_control.zig").Interruption;
+const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
 const ops = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 
@@ -88,6 +90,11 @@ pub const ModelRuntime = struct {
     ) !bool {
         try request.check();
         const prepare_fn = self.vtable.prepare orelse return false;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         const prepared = try prepare_fn(self.ptr, allocator, request);
         try request.check();
         return prepared;
@@ -118,6 +125,11 @@ pub const ModelRuntime = struct {
         request: PrefillRequest,
     ) !ModelOutput {
         try request.check();
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         var output = try self.vtable.prefill(self.ptr, allocator, request);
         errdefer output.deinit(allocator);
         try request.check();
@@ -131,6 +143,11 @@ pub const ModelRuntime = struct {
     ) !ModelOutput {
         try request.check();
         const decode_fn = self.vtable.decode orelse return error.UnsupportedDecode;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         var output = try decode_fn(self.ptr, allocator, request);
         errdefer output.deinit(allocator);
         try request.check();
@@ -144,6 +161,11 @@ pub const ModelRuntime = struct {
     ) !GreedyDecodeOutput {
         try request.check();
         const decode_greedy_fn = self.vtable.decode_greedy orelse return error.UnsupportedGreedyDecode;
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         var output = try decode_greedy_fn(self.ptr, allocator, request);
         errdefer output.deinit();
         try request.check();
@@ -157,6 +179,11 @@ pub const ModelRuntime = struct {
     ) !SampledDecodeOutput {
         try request.decode.check();
         const decode_sample_fn = self.vtable.decode_sample orelse return error.UnsupportedSampleDecode;
+        var hard_cancellation = if (request.decode.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
         const output = try decode_sample_fn(self.ptr, allocator, request);
         try request.decode.check();
         return output;
@@ -185,6 +212,7 @@ pub const RuntimeCapabilities = struct {
     supports_sample_decode: bool = false,
     supports_greedy_decode: bool = false,
     state_ownership: RuntimeStateOwnership = .host_assisted_inputs,
+    interruption: Interruption = .cooperative,
 };
 
 pub const RuntimeDebugTimingStats = struct {

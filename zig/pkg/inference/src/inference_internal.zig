@@ -18,7 +18,6 @@ pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
-pub const supervised_worker = @import("supervised_worker.zig");
 pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;

@@ -248,12 +248,12 @@ fn executorDeinit(ctx: *anyopaque) void {
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
-    _ = runtime_ctx;
     return .{
         .supports_decode = true,
         .supports_sample_decode = true,
         .supports_greedy_decode = true,
         .state_ownership = .runtime_owned_host_cache,
+        .interruption = if (runtime_ctx.cb.kind() == .metal) .process_required else .cooperative,
     };
 }
 

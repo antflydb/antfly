@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         .allow_unknown_models = true,
     });
     defer node.deinit();
-    node.attachIo(init.io);
+    try node.attachIo(init.io);
     node.session_manager.preferred_backends = preferred_backends;
     node.model_manager.session_manager.preferred_backends = preferred_backends;
     if (opts.tune_generated_kernels) {

@@ -405,7 +405,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     };
     errdefer state.route_validator.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
-    state.node.attachIo(state.io);
+    try state.node.attachIo(state.io);
     return state;
 }
 

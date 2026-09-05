@@ -85,9 +85,10 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
-const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 
-fn httpInferenceExecutionControl(ctx: *httpx.Context) InferenceExecutionControl {
+fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
             const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
@@ -100,9 +101,14 @@ fn httpInferenceExecutionControl(ctx: *httpx.Context) InferenceExecutionControl 
         }
     };
     return .{
+        .io = ctx.io,
         .deadline_ns = ctx.application_deadline_ns,
         .ptr = ctx,
         .check_fn = Check.check,
+        .hard_cancellation = if (node.hard_cancellation_watchdog) |watchdog|
+            watchdog.boundary()
+        else
+            null,
     };
 }
 
@@ -1085,6 +1091,112 @@ fn rawGenerateChatTemplateKwargsAreValid(
     return true;
 }
 
+/// Watches only calls which declared that cooperative or native termination is
+/// insufficient. Expiry is process-fatal by design: the supervisor owns the
+/// replacement generation, while continuing in this address space could reuse
+/// buffers still retained by a wedged driver.
+const HardCancellationWatchdog = struct {
+    const Entry = struct {
+        token: u64,
+        control: execution_control_mod.MonitorControl,
+    };
+
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    next_token: u64 = 1,
+    stopping: std.atomic.Value(bool) = .init(false),
+    io: ?std.Io = null,
+    group: std.Io.Group = .init,
+
+    fn create(allocator: std.mem.Allocator) !*HardCancellationWatchdog {
+        const self = try allocator.create(HardCancellationWatchdog);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+
+    fn start(self: *HardCancellationWatchdog, io: std.Io) !void {
+        if (self.io != null) return;
+        self.io = io;
+        errdefer self.io = null;
+        try self.group.concurrent(io, run, .{ self, io });
+    }
+
+    fn destroy(self: *HardCancellationWatchdog) void {
+        self.stopping.store(true, .release);
+        if (self.io) |io| {
+            self.group.cancel(io);
+            self.group.await(io) catch {};
+        }
+        spinLock(&self.mutex);
+        std.debug.assert(self.entries.items.len == 0);
+        self.entries.deinit(self.allocator);
+        self.mutex.unlock();
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    fn boundary(self: *HardCancellationWatchdog) execution_control_mod.HardCancellationBoundary {
+        return .{
+            .ptr = self,
+            .arm_fn = armOpaque,
+            .disarm_fn = disarmOpaque,
+        };
+    }
+
+    fn armOpaque(raw: *anyopaque, control: execution_control_mod.MonitorControl) !u64 {
+        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
+        try control.check();
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.stopping.load(.acquire)) return error.InferenceWorkerShuttingDown;
+        if (self.io == null) return error.HardCancellationWatchdogNotStarted;
+        const token = self.next_token;
+        self.next_token +%= 1;
+        if (self.next_token == 0) self.next_token = 1;
+        try self.entries.append(self.allocator, .{ .token = token, .control = control });
+        return token;
+    }
+
+    fn disarmOpaque(raw: *anyopaque, token: u64) void {
+        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items, 0..) |entry, index| {
+            if (entry.token != token) continue;
+            _ = self.entries.swapRemove(index);
+            return;
+        }
+        // A missing token is an ownership violation. Do not silently leave a
+        // borrowed request pointer in the monitor.
+        @panic("hard cancellation watchdog token was not armed");
+    }
+
+    fn run(self: *HardCancellationWatchdog, io: std.Io) std.Io.Cancelable!void {
+        while (!self.stopping.load(.acquire)) {
+            var fatal: ?anyerror = null;
+            spinLock(&self.mutex);
+            for (self.entries.items) |entry| {
+                entry.control.check() catch |err| {
+                    fatal = err;
+                    break;
+                };
+            }
+            self.mutex.unlock();
+            if (fatal) |err| {
+                std.log.err(
+                    "uninterruptible inference request expired; terminating supervised worker err={s}",
+                    .{@errorName(err)},
+                );
+                std.process.abort();
+            }
+            try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+        }
+    }
+};
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -1124,6 +1236,10 @@ pub const NodeConfig = struct {
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
     allow_unknown_models: bool = false,
+    /// Set only by the child side of the inference process supervisor.
+    /// Embedded nodes intentionally remain fail-closed for uninterruptible
+    /// backends because killing them would also kill the database owner.
+    supervised_process_worker: bool = false,
 };
 
 fn isLoopbackBindHost(host: []const u8) bool {
@@ -2791,6 +2907,11 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
         => modelArtifactsChangingResponse(ctx),
+        error.ProcessIsolationRequired => ctx.status(503).json(.{
+            .@"error" = "PROCESS_ISOLATION_REQUIRED",
+            .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
+            .retryable = false,
+        }),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -2814,6 +2935,11 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
+        }),
+        error.ProcessIsolationRequired => ctx.status(503).json(.{
+            .@"error" = "PROCESS_ISOLATION_REQUIRED",
+            .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
+            .retryable = false,
         }),
         else => ctx.status(500).json(.{
             .@"error" = "INFERENCE_FAILED",
@@ -3385,6 +3511,7 @@ pub const Node = struct {
     readiness_refresh_group: std.Io.Group = .init,
     readiness_refresh_io: ?std.Io = null,
     readiness_refresh_started: bool = false,
+    hard_cancellation_watchdog: ?*HardCancellationWatchdog = null,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
     /// Set after configured preloads, including declared optional sessions,
@@ -3486,6 +3613,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        session_manager.process_isolation_available = config.supervised_process_worker;
         try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
@@ -3506,6 +3634,11 @@ pub const Node = struct {
                 );
             }
         }
+        const hard_cancellation_watchdog = if (config.supervised_process_worker)
+            try HardCancellationWatchdog.create(allocator)
+        else
+            null;
+        errdefer if (hard_cancellation_watchdog) |watchdog| watchdog.destroy();
         var node: Node = .{
             .config = config,
             .allocator = allocator,
@@ -3518,6 +3651,7 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
+            .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(
@@ -3625,6 +3759,10 @@ pub const Node = struct {
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
+        if (self.hard_cancellation_watchdog) |watchdog| {
+            watchdog.destroy();
+            self.hard_cancellation_watchdog = null;
+        }
         self.model_manager.deinit();
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
@@ -3771,7 +3909,8 @@ pub const Node = struct {
         return error.ModelArtifactsChanging;
     }
 
-    pub fn attachIo(self: *Node, io: std.Io) void {
+    pub fn attachIo(self: *Node, io: std.Io) !void {
+        if (self.hard_cancellation_watchdog) |watchdog| try watchdog.start(io);
         self.session_manager.io = io;
         self.model_manager.attachIo(io);
     }
@@ -4116,8 +4255,10 @@ pub const Node = struct {
         };
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
         const execution_control = InferenceExecutionControl{
+            .io = if (upstream_control) |control| control.io else null,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
+            .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
         };
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
@@ -6497,7 +6638,7 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(std.json.Value)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -6882,7 +7023,7 @@ pub const Node = struct {
     }
 
     pub fn rerankPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6915,7 +7056,7 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed_body = (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
@@ -7225,7 +7366,7 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -7815,6 +7956,9 @@ pub const Node = struct {
                     );
                 }
 
+                var ort_hard_cancellation = execution_control.enterUninterruptible(.process_required) catch |err|
+                    return inferenceFailureResponse(ctx, err);
+                defer ort_hard_cancellation.deinit();
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
@@ -9162,6 +9306,11 @@ pub const Node = struct {
                 .message = "model resource plan exceeds the configured inference budget",
                 .retryable = false,
             },
+            error.ProcessIsolationRequired => .{
+                .code = "PROCESS_ISOLATION_REQUIRED",
+                .message = "this backend requires the supervised inference process",
+                .retryable = false,
+            },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
                 .message = @errorName(err),
@@ -9320,7 +9469,7 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -10975,7 +11124,7 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
@@ -11040,7 +11189,7 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var failure_stage: RebelExtractionFailureStage = .model_layout;
         const json = self.extractRebelJsonAlloc(
             ctx.allocator,
@@ -11198,7 +11347,7 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var pipeline = model.glinerPipeline(ctx.allocator);
         pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
@@ -11309,7 +11458,7 @@ pub const Node = struct {
     }
 
     pub fn classifyText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.ClassifyRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11402,7 +11551,7 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -11507,7 +11656,7 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -11656,7 +11805,7 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -11770,7 +11919,7 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.ReadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11972,7 +12121,7 @@ pub const Node = struct {
     }
 
     pub fn transcribeAudio(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.TranscribeRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -12146,7 +12295,7 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -12251,7 +12400,7 @@ pub const Node = struct {
         body: extraction_api.ExtractionRequest,
         texts: []const []const u8,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         if (try self.acquireSlot(ctx)) |resp| return resp;
         defer self.releaseSlot();
         self.metrics.incRequest("extract");
@@ -12374,7 +12523,7 @@ pub const Node = struct {
                 img_url.url,
                 batch_byte_cap,
                 batch_bytes,
-                .{ .io = ctx.io, .control = httpInferenceExecutionControl(ctx) },
+                .{ .io = ctx.io, .control = httpInferenceExecutionControl(self, ctx) },
             );
             defer ctx.allocator.free(downloaded.content_type);
             errdefer ctx.allocator.free(downloaded.data);
@@ -12741,7 +12890,7 @@ pub const Node = struct {
     }
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -12885,7 +13034,7 @@ pub const Node = struct {
             );
             return err;
         };
-        self.attachIo(io);
+        try self.attachIo(io);
         self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
@@ -16648,10 +16797,30 @@ test "node attachIo wires model session manager" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
 
-    node.attachIo(std.testing.io);
+    try node.attachIo(std.testing.io);
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+}
+
+test "supervised node owns and joins the hard cancellation watchdog" {
+    var node = try Node.init(std.testing.allocator, .{
+        .supervised_process_worker = true,
+    });
+    defer node.deinit();
+    try std.testing.expectError(
+        error.HardCancellationWatchdogNotStarted,
+        (InferenceExecutionControl{
+            .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(),
+        }).enterUninterruptible(.process_required),
+    );
+    try node.attachIo(std.testing.io);
+
+    const boundary = node.hard_cancellation_watchdog.?.boundary();
+    var guard = try (InferenceExecutionControl{
+        .hard_cancellation = boundary,
+    }).enterUninterruptible(.process_required);
+    guard.deinit();
 }
 
 test "canonical relation schemas preserve endpoint label constraints" {
