@@ -28,6 +28,8 @@ pub const managed_embedder = @import("managed_embedder.zig");
 pub const request_context = @import("request_context.zig");
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -65,6 +67,7 @@ test "bedrock provider request helpers" {
     try bedrock.testSharedCredentialsProfileParser();
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();
+    try bedrock.testCredentialSourceKeysAreStructured();
     try bedrock.testRequestShapeBatchesByProviderRequest();
     try bedrock.testBedrockRequestFormatResolution();
     try bedrock.testBedrockInvokePathEscapesModelId();
@@ -80,6 +83,9 @@ test "embedding provider request helpers" {
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
     try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
     try managed_embedder.testManagedEmbeddingRequestContextProgress();
+    try google_auth.testCredentialSourceCacheKeys();
+    try credential_source_identity.testCredentialSourceIdentities();
+    try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();
     try managed_embedder.testCohereBatchLimit();
     try managed_embedder.testVertexEmbeddingRequestPlanning();
     try managed_embedder.testManagedVertexCredentialManagerLifetime();
