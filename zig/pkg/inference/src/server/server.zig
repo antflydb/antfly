@@ -83,6 +83,7 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
+const executor_microbatch = @import("executor_microbatch.zig");
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1093,6 +1094,9 @@ pub const NodeConfig = struct {
     resource_ownership: model_manager_mod.ResourceOwnership = .local,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
+    /// Maximum queueing delay used only by resolved native executor batches.
+    /// Serial compatibility paths bypass the broker and never pay this delay.
+    executor_microbatch_max_wait_us: u64 = 200,
     kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
@@ -3106,6 +3110,8 @@ const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
     model_load_attempts: usize = 0,
     media_fetch_attempts: usize = 0,
+    batch_materialized_items: usize = 0,
+    batch_peak_materialized_items: usize = 0,
 };
 // Ordering tests assert real side-effect boundaries. Both this storage and all
 // mutations become void/dead code in production builds.
@@ -3177,6 +3183,11 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
+    /// Lazily allocates only while compatible native executor work is queued.
+    /// Ownership is here, rather than the storage BackendRuntime, because Node
+    /// owns resolved model generations and concrete fused executor callbacks.
+    executor_microbatch_broker: ?executor_microbatch.Broker = null,
+    executor_microbatch_init_mutex: std.atomic.Mutex = .unlocked,
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
@@ -3422,6 +3433,7 @@ pub const Node = struct {
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
+        if (self.executor_microbatch_broker) |*broker| broker.deinit();
         self.model_manager.deinit();
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
@@ -3433,6 +3445,14 @@ pub const Node = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.compatibility_cache.deinit(self.allocator);
+    }
+
+    fn executorMicrobatchBroker(self: *Node) *executor_microbatch.Broker {
+        spinLock(&self.executor_microbatch_init_mutex);
+        defer self.executor_microbatch_init_mutex.unlock();
+        if (self.executor_microbatch_broker == null)
+            self.executor_microbatch_broker = executor_microbatch.Broker.init(self.allocator);
+        return &self.executor_microbatch_broker.?;
     }
 
     /// Derive artifact compatibility once per immutable artifact signature. Discovery
@@ -5247,6 +5267,132 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
+        // Cross-request coalescing is enabled only when the resolved reader
+        // advertises a real native batch primitive. Existing multi-image calls
+        // already arrive as a complete fused batch and use the direct path.
+        if (request.images.len == 1) broker_attempt: {
+            // The path manifest is provisional and used only to reject invalid
+            // encoded input and decide whether acquiring a broker generation
+            // is worthwhile. It never supplies execution limits after model
+            // acquisition, so a concurrent republish cannot mix generations.
+            var provisional_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+            defer provisional_manifest.deinit();
+            const provisional_contract = try resolvedInferenceExecutorContract(self, "read", &provisional_manifest);
+            if (provisional_contract.batch.mode == .native and provisional_contract.batch.max_items > 1) {
+                try validateEncodedImageMime(request.images[0].mime_type, request.images[0].bytes);
+                _ = try measureExecutorDecodedImages(
+                    &provisional_manifest,
+                    &.{request.images[0].bytes},
+                );
+
+                // Fence the immutable generation, then authoritatively derive
+                // all grouping limits and image shape from that generation.
+                // Component readers without one aggregate generation bypass
+                // cross-request coalescing.
+                if (try readers_mod.LoadedReader.acquireExecutionFence(
+                    allocator,
+                    model_path,
+                    &self.model_manager,
+                )) |acquired_fence| {
+                    var broker_fence = acquired_fence;
+                    defer broker_fence.deinit();
+                    const broker_manifest = broker_fence.manifest();
+                    const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_manifest);
+                    if (broker_contract.batch.mode != .native or broker_contract.batch.max_items <= 1)
+                        break :broker_attempt;
+                    const broker_pixels = try measureExecutorDecodedImages(
+                        broker_manifest,
+                        &.{request.images[0].bytes},
+                    );
+                    const resolved_backend = broker_fence.backend();
+                    const resolved_generation = broker_fence.generationIdentity();
+                    const broker_payload = ReadMicrobatchPayload{
+                        .model_path = model_path,
+                        .fence = &broker_fence,
+                        .image = request.images[0],
+                        .prompt = normalizeReadPrompt(request.prompt),
+                        .max_tokens = max_tokens,
+                        .profile_source_fingerprint = request.source_fingerprint,
+                    };
+                    const max_batch_tokens = if (broker_contract.batch.max_output_tokens_per_item) |limit|
+                        std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
+                    else
+                        std.math.maxInt(usize);
+                    const broker_result = try self.executorMicrobatchBroker().submit(
+                        ReadMicrobatchPayload,
+                        readers_api.Result,
+                        io,
+                        allocator,
+                        .{
+                            .model = model_path,
+                            .generation = resolved_generation,
+                            .task = .read,
+                            .prompt = broker_payload.prompt orelse "",
+                            // Provenance is carried per item and must not fragment
+                            // otherwise-compatible work from different documents.
+                            // Reader transforms are fixed by this resolved model.
+                            .transform = "",
+                            .option_key = max_tokens orelse 0,
+                            .resource_class = executorMicrobatchResourceClass(resolved_backend),
+                        },
+                        .{
+                            .mode = .native,
+                            .preferred_items = broker_contract.batch.preferred_items,
+                            .max_items = broker_contract.batch.max_items,
+                            .max_bytes = broker_contract.batch.max_encoded_media_bytes,
+                            .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
+                            .max_tokens = max_batch_tokens,
+                            .max_wait_us = self.config.executor_microbatch_max_wait_us,
+                        },
+                        .{
+                            .bytes = request.images[0].bytes.len,
+                            .pixels = broker_pixels,
+                            .tokens = max_tokens orelse 0,
+                        },
+                        .{
+                            .item_id = request.images[0].item_id,
+                            .source_fingerprint = request.images[0].source_fingerprint,
+                            .page_number = request.images[0].page_number,
+                        },
+                        null,
+                        null,
+                        &broker_payload,
+                        self,
+                        executeReadMicrobatch,
+                    );
+                    switch (broker_result.result) {
+                        .item_error => |failure| return failure.cause,
+                        .value => |value| {
+                            var owned_value = value;
+                            errdefer readers_api.deinitResult(allocator, &owned_value);
+                            const items = try allocator.alloc(readers_api.Result, 1);
+                            items[0] = owned_value;
+                            return .{
+                                .items = items,
+                                .execution = switch (broker_result.execution) {
+                                    .native_batch => .{
+                                        .requested_items = 1,
+                                        .native_batches = 1,
+                                        .native_items = 1,
+                                    },
+                                    .serial => .{
+                                        .requested_items = 1,
+                                        .serial_items = 1,
+                                    },
+                                    .fallback => .{
+                                        .requested_items = 1,
+                                        .serial_items = 1,
+                                        .fallback_items = 1,
+                                        .fallback_reason = "native reader microbatch fallback",
+                                    },
+                                },
+                            };
+                        },
+                    }
+                }
+            }
+        }
+
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
         for (request.images, 0..) |image, i| image_datas[i] = image.bytes;
@@ -5258,7 +5404,164 @@ pub const Node = struct {
             request.prompt,
             max_tokens,
             request.source_fingerprint,
+            null,
         );
+    }
+
+    pub fn readRasterImagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.RasterRequest,
+    ) ![]readers_api.Result {
+        return (try self.readRasterImagesReportedDirect(allocator, model_name, request)).items;
+    }
+
+    /// Linked-process raw-raster executor. Every raster and identity slice is
+    /// borrowed only until this synchronous call returns. Remote and
+    /// unsupported model adapters must use the encoded reader entrypoint.
+    pub fn readRasterImagesReportedDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.RasterRequest,
+    ) !readers_api.BatchResult {
+        if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
+        try readers_api.validateRasterRequest(request);
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        const security = effectiveRequestContentSecurity(self);
+        var raster_bytes: usize = 0;
+        var decoded_pixels: u64 = 0;
+        for (request.images) |raster| {
+            try image_pipeline.DecodeLimits.inference_default.validate(raster.width, raster.height);
+            if (security.max_image_dimension) |limit| {
+                if (raster.width > limit or raster.height > limit) return error.ImageTooLarge;
+            }
+            raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
+                return error.ReadBatchTooLarge;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try raster.pixels()) catch
+                return error.ReadBatchTooLarge;
+        }
+
+        var admission = readResidentEncodedAdmissionForLimits(
+            request.images.len,
+            raster_bytes,
+            self.inference_admission.capacity,
+            security.max_image_dimension,
+        );
+        admission.units = @max(admission.units, estimateReadAdmissionUnits(request.images.len, max_tokens));
+        try self.acquireAdmissionUnits(admission.units);
+        var reserved_units = admission.units;
+        defer self.releaseAdmissionUnits(reserved_units);
+        self.metrics.incRequest("read.local.raster");
+        defer self.metrics.decActive();
+
+        var decoded_budget = ReadDecodedImageBudget.init(admission, security.max_image_dimension);
+        decoded_budget.addPixels(std.math.cast(usize, decoded_pixels) orelse return error.ReadBatchTooLarge) catch
+            return error.ReadBatchTooLarge;
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        try self.growAdmissionUnits(reserved_units, required_units);
+        reserved_units = required_units;
+
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
+        defer self.allocator.free(model_path);
+        return self.runReadRasterBatchReportedDirect(
+            allocator,
+            model_path,
+            request.images,
+            request.prompt,
+            max_tokens,
+            request.source_fingerprint,
+        );
+    }
+
+    const ReadMicrobatchPayload = struct {
+        model_path: []const u8,
+        fence: *const readers_mod.ExecutionFence,
+        image: readers_api.EncodedImage,
+        prompt: ?[]const u8,
+        max_tokens: ?usize,
+        profile_source_fingerprint: ?[]const u8,
+    };
+
+    fn executorMicrobatchResourceClass(backend: backends_mod.BackendType) executor_microbatch.ResourceClass {
+        return switch (backend) {
+            .native, .onnx, .wasm => .cpu,
+            .metal, .cuda, .pjrt => .gpu,
+        };
+    }
+
+    fn cloneReadResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
+        var result = readers_api.Result{ .text = try allocator.dupe(u8, source.text) };
+        errdefer readers_api.deinitResult(allocator, &result);
+        result.fields_json = if (source.fields_json) |value| try allocator.dupe(u8, value) else null;
+        result.regions_json = if (source.regions_json) |value| try allocator.dupe(u8, value) else null;
+        result.item_id = if (source.item_id.len > 0) try allocator.dupe(u8, source.item_id) else "";
+        result.source_fingerprint = if (source.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+        result.page_number = source.page_number;
+        return result;
+    }
+
+    fn executeReadMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        if (items.len == 0) return;
+        const allocator = self.allocator;
+        const images = allocator.alloc(readers_api.EncodedImage, items.len) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(images);
+        const image_datas = allocator.alloc([]const u8, items.len) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(image_datas);
+        const first = items[0].payloadAs(ReadMicrobatchPayload);
+        var common_profile_source = first.profile_source_fingerprint;
+        for (items, 0..) |item, index| {
+            const payload = item.payloadAs(ReadMicrobatchPayload);
+            images[index] = payload.image;
+            image_datas[index] = payload.image.bytes;
+            if (!optionalBytesEql(common_profile_source, payload.profile_source_fingerprint))
+                common_profile_source = null;
+        }
+
+        var batch = self.runReadImageBatchReportedDirect(
+            allocator,
+            first.model_path,
+            image_datas,
+            images,
+            first.prompt,
+            first.max_tokens,
+            // The legacy profiling hook accepts one batch-wide source. Do not
+            // attribute a cross-document fused batch to its first item.
+            common_profile_source,
+            first.fence,
+        ) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer batch.deinit(allocator);
+        if (batch.items.len != items.len) {
+            for (items) |item| item.slot.fail(error.InvalidReadResultCount);
+            return;
+        }
+        const execution: executor_microbatch.Execution = if (batch.execution.fallback_items > 0)
+            .fallback
+        else if (batch.execution.native_items > 0)
+            .native_batch
+        else
+            .serial;
+        for (items, batch.items) |item, source| {
+            const result = cloneReadResult(item.allocator, source) catch |err| {
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue(readers_api.Result, result, execution);
+        }
     }
 
     fn runReadImageBatchDirect(
@@ -5278,7 +5581,117 @@ pub const Node = struct {
             prompt,
             max_tokens,
             source_fingerprint,
+            null,
         )).items;
+    }
+
+    fn runReadRasterBatchReportedDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        rasters: []const readers_api.RasterImage,
+        prompt: ?[]const u8,
+        max_tokens: ?usize,
+        source_fingerprint: ?[]const u8,
+    ) !readers_api.BatchResult {
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        const executor_contract = try resolvedInferenceExecutorContract(self, "read", &admission_manifest);
+        if (!executor_contract.accepts_borrowed_rasters)
+            return error.BorrowedRasterUnsupported;
+        const normalized_prompt = normalizeReadPrompt(prompt);
+        var decoded_pixels: u64 = 0;
+        for (rasters) |raster| {
+            try raster.validate();
+            decoded_pixels = std.math.add(u64, decoded_pixels, try raster.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = rasters.len,
+            .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
+            .output_tokens_per_item = max_tokens orelse 0,
+            // Raw raster bytes are resident-memory admission, not encoded
+            // media and therefore do not consume the model codec byte limit.
+            .encoded_media_bytes = 0,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+
+        var reader = try readers_mod.LoadedReader.loadFromDir(
+            allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+        );
+        defer reader.deinit();
+        const exact_prompt_tokens = try reader.inputTokenCount(.{
+            .prompt = normalized_prompt,
+            .max_tokens = max_tokens,
+            .source_fingerprint = source_fingerprint,
+        });
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = rasters.len,
+            .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
+            .input_tokens_per_item = exact_prompt_tokens,
+            .output_tokens_per_item = max_tokens orelse 0,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+
+        const raw_batch = try reader.readBorrowedRasterBatchReported(rasters, .{
+            .prompt = normalized_prompt,
+            .max_tokens = max_tokens,
+            .source_fingerprint = source_fingerprint,
+        });
+        const results = raw_batch.results;
+        defer {
+            for (results) |result| {
+                var tmp = result;
+                tmp.deinit();
+            }
+            allocator.free(results);
+        }
+        if (results.len != rasters.len) return error.InvalidReadResultCount;
+
+        const out = try allocator.alloc(readers_api.Result, rasters.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+            allocator.free(out);
+        }
+        for (results, rasters, out) |result, raster, *item| {
+            item.* = .{ .text = try allocator.dupe(u8, result.text) };
+            errdefer readers_api.deinitResult(allocator, item);
+            item.fields_json = try readerFieldsJsonAlloc(allocator, result.fields);
+            item.regions_json = try readerRegionsJsonAlloc(allocator, result.regions);
+            item.item_id = if (raster.item_id.len > 0) try allocator.dupe(u8, raster.item_id) else "";
+            item.source_fingerprint = if (raster.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            item.page_number = raster.page_number;
+            initialized += 1;
+        }
+        return .{
+            .items = out,
+            .execution = switch (raw_batch.mode) {
+                .native => .{
+                    .requested_items = rasters.len,
+                    .native_batches = raw_batch.native_batches,
+                    .native_items = rasters.len,
+                },
+                .serial => .{
+                    .requested_items = rasters.len,
+                    .serial_items = rasters.len,
+                },
+                .fallback => .{
+                    .requested_items = rasters.len,
+                    .native_batches = raw_batch.native_batches,
+                    .serial_items = rasters.len,
+                    .fallback_items = rasters.len,
+                    .fallback_reason = raw_batch.fallback_reason,
+                },
+            },
+        };
     }
 
     fn runReadImageBatchReportedDirect(
@@ -5290,10 +5703,17 @@ pub const Node = struct {
         prompt: ?[]const u8,
         max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
+        execution_fence: ?*const readers_mod.ExecutionFence,
     ) !readers_api.BatchResult {
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
-        defer admission_manifest.deinit();
-        const executor_contract = try resolvedInferenceExecutorContract(self, "read", &admission_manifest);
+        var owned_admission_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (owned_admission_manifest) |*manifest| manifest.deinit();
+        const admission_manifest: *const manifest_mod.ModelManifest = if (execution_fence) |fence|
+            fence.manifest()
+        else blk: {
+            owned_admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+            break :blk &owned_admission_manifest.?;
+        };
+        const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
         const normalized_prompt = normalizeReadPrompt(prompt);
         var encoded_media_bytes: usize = 0;
         for (image_datas, 0..) |image_data, index| {
@@ -5301,7 +5721,7 @@ pub const Node = struct {
                 return error.InferenceEncodedBytesExceeded;
             if (encoded_images) |images| try validateEncodedImageMime(images[index].mime_type, image_data);
         }
-        const decoded_pixels = try measureExecutorDecodedImages(&admission_manifest, image_datas);
+        const decoded_pixels = try measureExecutorDecodedImages(admission_manifest, image_datas);
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = image_datas.len,
             .text_bytes_per_item = if (normalized_prompt) |value| value.len else 0,
@@ -5312,7 +5732,15 @@ pub const Node = struct {
             .has_image = true,
         });
 
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        var reader = if (execution_fence) |fence|
+            try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
+        else
+            try readers_mod.LoadedReader.loadFromDir(
+                allocator,
+                model_path,
+                &self.session_manager,
+                &self.model_manager,
+            );
         defer reader.deinit();
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
@@ -7284,6 +7712,12 @@ pub const Node = struct {
         // Admission precedes model resolution and media decoding so rejected
         // requests cannot consume model or download work first.
         const media_shape = generateRequestMediaShape(body);
+        if (media_shape.invalid_inline_media) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "invalid base64 media data",
+            });
+        }
         const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(estimateGenerateRequestAdmissionUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -7310,7 +7744,7 @@ pub const Node = struct {
             .text_bytes_per_item = estimateGenerateRequestTextBytes(body),
             .has_text = true,
             .output_tokens_per_item = @intCast(numeric.max_tokens),
-            .encoded_media_bytes = media_shape.inline_bytes +| media_shape.borrowed_bytes,
+            .encoded_media_bytes = media_shape.knownEncodedMediaBytes(),
             .media_parts_per_item = media_shape.media_count,
             .has_image = media_shape.image_count > 0,
             .has_audio = media_shape.has_audio,
@@ -9499,6 +9933,8 @@ pub const Node = struct {
         }
         var pending = try ctx.allocator.alloc(bool, body.requests.len);
         defer ctx.allocator.free(pending);
+        const media_shapes = try ctx.allocator.alloc(RequestMediaAdmissionShape, body.requests.len);
+        defer ctx.allocator.free(media_shapes);
         var execution_attempted = try ctx.allocator.alloc(bool, body.requests.len);
         defer ctx.allocator.free(execution_attempted);
         @memset(execution_attempted, false);
@@ -9527,8 +9963,12 @@ pub const Node = struct {
             };
             owned_messages[idx] = .{ .allocator = ctx.allocator };
             pending[idx] = true;
+            media_shapes[idx] = generateRequestMediaShape(item.body);
             if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
                 results[idx].@"error" = batch_err;
+                pending[idx] = false;
+            } else if (media_shapes[idx].invalid_inline_media) {
+                results[idx].@"error" = generateBatchMessageParseError(error.InvalidGenerateMediaBase64).?;
                 pending[idx] = false;
             }
         }
@@ -9591,13 +10031,13 @@ pub const Node = struct {
             // raw envelopes that are already known to exceed model limits
             // before base64/download allocation, then revalidate against the
             // exact loaded model generation before execution.
-            const media_shape = generateRequestMediaShape(item.body);
+            const media_shape = media_shapes[idx];
             const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
             validateGenerateExecutorInvocation(prepared_model.?.executor_contract, .{
                 .text_bytes_per_item = estimateGenerateRequestTextBytes(item.body),
                 .has_text = true,
                 .output_tokens_per_item = max_tokens,
-                .encoded_media_bytes = media_shape.inline_bytes +| media_shape.borrowed_bytes,
+                .encoded_media_bytes = media_shape.knownEncodedMediaBytes(),
                 .media_parts_per_item = media_shape.media_count,
                 .has_image = media_shape.image_count > 0,
                 .has_audio = media_shape.has_audio,
@@ -9607,100 +10047,8 @@ pub const Node = struct {
             };
         }
 
-        var batch_media_shape: RequestMediaAdmissionShape = .{};
-        for (body.requests, pending) |item, is_pending| {
-            if (is_pending) batch_media_shape.merge(generateRequestMediaShape(item.body));
-        }
-        const media_admission = requestMediaAdmission(self, batch_media_shape);
-        const admission_units = self.estimateGenerateBatchAdmissionUnitsPreflight(body.requests, pending);
-        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
-        var reserved_units = admission_units;
-        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("generate_batch");
         defer self.metrics.decActive();
-
-        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        for (body.requests, 0..) |item, idx| {
-            if (!pending[idx]) continue;
-            const prior_media_bytes = media_budget.used_bytes;
-            owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
-                if (err == error.OutOfMemory) return err;
-                results[idx].@"error" = generateBatchMessageParseError(err).?;
-                break :blk .{ .allocator = ctx.allocator };
-            };
-            if (results[idx].@"error" == null)
-                item_encoded_media_bytes[idx] = media_budget.used_bytes - prior_media_bytes;
-            if (results[idx].@"error" == null and owned_messages[idx].messages.len == 0) {
-                results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "'messages' must not be empty", .retryable = false };
-            }
-            if (results[idx].@"error" == null) {
-                if (generateBatchUnsupportedReason(item.body, owned_messages[idx].messages)) |batch_err| results[idx].@"error" = batch_err;
-            }
-            pending[idx] = results[idx].@"error" == null;
-        }
-
-        // Inspect every decoded image before model loading. This enforces both the
-        // configured dimension ceiling and an aggregate decoded-pixel budget for
-        // the whole request; rejected items do not consume the remaining budget.
-        var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
-        for (owned_messages, 0..) |owned, idx| {
-            if (!pending[idx]) continue;
-            const prior_pixels = decoded_budget.used_pixels;
-            var image_error: ?anyerror = null;
-            for (owned.decoded_images) |image| {
-                decoded_budget.addImage(image) catch |err| {
-                    image_error = err;
-                    break;
-                };
-            }
-            if (image_error) |err| {
-                decoded_budget.used_pixels = prior_pixels;
-                results[idx].@"error" = generateBatchImageError(err);
-                pending[idx] = false;
-            }
-        }
-        const decoded_required_units = decoded_budget.requiredUnits();
-        if (try self.growSlotUnits(ctx, reserved_units, decoded_required_units)) |resp| return resp;
-        reserved_units = @max(reserved_units, decoded_required_units);
-
-        // The directory manifest is a provisional optimization boundary, not
-        // the final authority: reject work it already proves invalid before a
-        // costly model load, then repeat the same validation against the exact
-        // loaded model generation below to close publication races.
-        for (body.requests, 0..) |item, idx| {
-            if (!pending[idx]) continue;
-            const prepared_model = blk: {
-                for (prepared_models.items) |*prepared| {
-                    if (std.mem.eql(u8, prepared.requested_model, item.body.model)) break :blk prepared;
-                }
-                return error.InvalidInferenceCapabilities;
-            };
-            const pixels = measureGenerateDecodedImages(
-                &prepared_model.manifest,
-                owned_messages[idx].decoded_images,
-            ) catch |err| {
-                results[idx].@"error" = generateExecutorContractError(err).batch;
-                pending[idx] = false;
-                continue;
-            };
-            const item_media_shape = generateRequestMediaShape(item.body);
-            const max_tokens: usize = if (item.body.max_tokens) |value| @intCast(value) else 256;
-            validateGenerateExecutorInvocation(prepared_model.executor_contract, .{
-                .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
-                .has_text = true,
-                .output_tokens_per_item = max_tokens,
-                .encoded_media_bytes = item_encoded_media_bytes[idx],
-                .decoded_pixels = pixels,
-                .media_parts_per_item = item_media_shape.media_count,
-                .has_image = owned_messages[idx].decoded_images.len > 0,
-                .has_audio = owned_messages[idx].decoded_audio.len > 0,
-            }) catch |err| {
-                results[idx].@"error" = generateExecutorContractError(err).batch;
-                pending[idx] = false;
-                continue;
-            };
-            item_decoded_pixels[idx] = pixels;
-        }
 
         while (true) {
             const first_idx = blk: {
@@ -9731,37 +10079,158 @@ pub const Node = struct {
             for (pending, 0..) |is_pending, idx| {
                 if (!is_pending) continue;
                 const candidate = body.requests[idx].body;
-                if (!std.mem.eql(u8, candidate.model, first_body.model)) continue;
-                if (candidate.backend != first_body.backend) continue;
-                if (!std.mem.eql(u8, candidate.mode orelse "", first_body.mode orelse "")) continue;
-                if (!std.mem.eql(u8, candidate.compiled_target orelse "", first_body.compiled_target orelse "")) continue;
-                if (!std.mem.eql(u8, candidate.cache_dtype orelse "", first_body.cache_dtype orelse "")) continue;
+                if (!generateBatchWindowCompatible(first_body, candidate)) continue;
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            // Build the largest valid model-contract window. Invalid singleton
-            // items receive an exact per-item failure; otherwise the remaining
-            // compatible items stay pending for the next bounded window.
-            var admitted_group_len: usize = 0;
+            // Form a bounded window from envelope metadata before allocating or
+            // fetching any media. Remote sizes are unknowable until download,
+            // so charge one remote-bearing item the complete window byte cap;
+            // this preserves boundedness without downloading a speculative item
+            // that may belong to the next window.
+            var admitted_group_len = generateBatchWindowPrefixLen(
+                media_shapes,
+                group_indices.items,
+                provisional_contract.batch.max_items,
+                provisional_contract.batch.max_encoded_media_bytes,
+            );
             var group_encoded_bytes: usize = 0;
             var group_decoded_pixels: u64 = 0;
-            for (group_indices.items) |idx| {
-                if (admitted_group_len == provisional_contract.batch.max_items) break;
-                const next_encoded = std.math.add(usize, group_encoded_bytes, item_encoded_media_bytes[idx]) catch
-                    std.math.maxInt(usize);
-                const next_pixels = std.math.add(u64, group_decoded_pixels, item_decoded_pixels[idx]) catch
-                    std.math.maxInt(u64);
-                if (admitted_group_len > 0 and
-                    (next_encoded > provisional_contract.batch.max_encoded_media_bytes or
-                        (provisional_contract.batch.max_decoded_pixels != null and
-                            next_pixels > provisional_contract.batch.max_decoded_pixels.?)))
-                {
-                    break;
+            group_indices.items.len = admitted_group_len;
+            if (admitted_group_len == 0) continue;
+
+            // Retain only this execution window's materialized media. The
+            // independent index copy is intentional: authoritative validation
+            // below compacts group_indices, while every item fetched for this
+            // provisional window must still be released before the next one.
+            const materialized_indices = try ctx.allocator.dupe(usize, group_indices.items);
+            defer ctx.allocator.free(materialized_indices);
+            defer for (materialized_indices) |idx| {
+                owned_messages[idx].deinit();
+                item_encoded_media_bytes[idx] = 0;
+                item_decoded_pixels[idx] = 0;
+            };
+
+            var window_media_shape: RequestMediaAdmissionShape = .{};
+            var window_admission_units: usize = 1;
+            for (materialized_indices) |idx| {
+                const item = body.requests[idx];
+                window_media_shape.merge(media_shapes[idx]);
+                const max_tokens: i32 = if (item.body.max_tokens) |value| @intCast(value) else 256;
+                window_admission_units = std.math.add(
+                    usize,
+                    window_admission_units,
+                    estimateGenerateRequestAdmissionUnits(item.body, max_tokens),
+                ) catch std.math.maxInt(usize);
+            }
+            const media_admission = requestMediaAdmission(self, window_media_shape);
+            window_admission_units = @max(window_admission_units, media_admission.units);
+            if (try self.acquireSlotUnits(ctx, window_admission_units)) |resp| return resp;
+            var reserved_units = window_admission_units;
+            defer self.releaseSlotUnits(reserved_units);
+
+            var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+            for (materialized_indices) |idx| {
+                const item = body.requests[idx];
+                const prior_media_bytes = media_budget.used_bytes;
+                owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
+                    if (err == error.OutOfMemory) return err;
+                    results[idx].@"error" = generateBatchMessageParseError(err).?;
+                    break :blk .{ .allocator = ctx.allocator };
+                };
+                if (results[idx].@"error" == null)
+                    item_encoded_media_bytes[idx] = media_budget.used_bytes - prior_media_bytes;
+                if (results[idx].@"error" == null and owned_messages[idx].messages.len == 0) {
+                    results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "'messages' must not be empty", .retryable = false };
                 }
+                if (results[idx].@"error" == null) {
+                    if (generateBatchUnsupportedReason(item.body, owned_messages[idx].messages)) |batch_err| results[idx].@"error" = batch_err;
+                }
+                pending[idx] = results[idx].@"error" == null;
+            }
+            var test_live_items: usize = 0;
+            if (comptime builtin.is_test) {
+                for (materialized_indices) |idx| {
+                    if (owned_messages[idx].messages.len > 0) test_live_items += 1;
+                }
+                request_work_test_counters.batch_materialized_items += test_live_items;
+                request_work_test_counters.batch_peak_materialized_items = @max(
+                    request_work_test_counters.batch_peak_materialized_items,
+                    request_work_test_counters.batch_materialized_items,
+                );
+            }
+            defer {
+                if (comptime builtin.is_test)
+                    request_work_test_counters.batch_materialized_items -= test_live_items;
+            }
+
+            // Decoded-pixel and weighted request admission are scoped to the
+            // same window as the retained encoded media.
+            var decoded_budget = ReadDecodedImageBudget.init(
+                media_admission,
+                effectiveRequestContentSecurity(self).max_image_dimension,
+            );
+            var actual_admission_units: usize = 1;
+            for (materialized_indices) |idx| {
+                if (!pending[idx]) continue;
+                const prior_pixels = decoded_budget.used_pixels;
+                var image_error: ?anyerror = null;
+                for (owned_messages[idx].decoded_images) |image| {
+                    decoded_budget.addImage(image) catch |err| {
+                        image_error = err;
+                        break;
+                    };
+                }
+                if (image_error) |err| {
+                    decoded_budget.used_pixels = prior_pixels;
+                    results[idx].@"error" = generateBatchImageError(err);
+                    pending[idx] = false;
+                    continue;
+                }
+                const max_tokens: i32 = if (body.requests[idx].body.max_tokens) |value| @intCast(value) else 256;
+                actual_admission_units = std.math.add(
+                    usize,
+                    actual_admission_units,
+                    self.estimateGenerateAdmissionUnits(owned_messages[idx].messages, max_tokens),
+                ) catch std.math.maxInt(usize);
+            }
+            const required_units = @max(decoded_budget.requiredUnits(), actual_admission_units);
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = @max(reserved_units, required_units);
+
+            // The directory manifest is a provisional optimization boundary,
+            // not the final authority. Validate concrete media before loading
+            // the model, then compact parse failures out of this window.
+            admitted_group_len = 0;
+            for (group_indices.items) |idx| {
+                if (!pending[idx]) continue;
+                const pixels = measureGenerateDecodedImages(
+                    &prepared_model.manifest,
+                    owned_messages[idx].decoded_images,
+                ) catch |err| {
+                    results[idx].@"error" = generateExecutorContractError(err).batch;
+                    pending[idx] = false;
+                    continue;
+                };
+                const item_media_shape = media_shapes[idx];
+                const max_tokens: usize = if (body.requests[idx].body.max_tokens) |value| @intCast(value) else 256;
+                validateGenerateExecutorInvocation(provisional_contract, .{
+                    .text_bytes_per_item = self.estimateGeneratePromptBytes(owned_messages[idx].messages),
+                    .has_text = true,
+                    .output_tokens_per_item = max_tokens,
+                    .encoded_media_bytes = item_encoded_media_bytes[idx],
+                    .decoded_pixels = pixels,
+                    .media_parts_per_item = item_media_shape.media_count,
+                    .has_image = owned_messages[idx].decoded_images.len > 0,
+                    .has_audio = owned_messages[idx].decoded_audio.len > 0,
+                }) catch |err| {
+                    results[idx].@"error" = generateExecutorContractError(err).batch;
+                    pending[idx] = false;
+                    continue;
+                };
+                item_decoded_pixels[idx] = pixels;
                 group_indices.items[admitted_group_len] = idx;
                 admitted_group_len += 1;
-                group_encoded_bytes = next_encoded;
-                group_decoded_pixels = next_pixels;
             }
             group_indices.items.len = admitted_group_len;
             if (admitted_group_len == 0) continue;
@@ -9828,7 +10297,7 @@ pub const Node = struct {
                 group_decoded_pixels = 0;
                 for (group_indices.items) |idx| {
                     if (admitted_group_len == executor_contract.batch.max_items) break;
-                    const item_media_shape = generateRequestMediaShape(body.requests[idx].body);
+                    const item_media_shape = media_shapes[idx];
                     const item_pixels = measureGenerateDecodedImages(
                         &model.manifest,
                         owned_messages[idx].decoded_images,
@@ -15544,6 +16013,7 @@ const ResolvedInferenceExecutorContract = struct {
     accepts_image: bool,
     accepts_audio: bool,
     accepts_document: bool,
+    accepts_borrowed_rasters: bool = false,
 };
 
 const InferenceExecutorInvocationShape = struct {
@@ -15610,6 +16080,8 @@ fn resolvedInferenceExecutorContract(
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
         .accepts_document = modalities.document,
+        .accepts_borrowed_rasters = std.mem.eql(u8, resolved_task, "read") and
+            manifest.native_arch_hint == .florence,
     };
 }
 
@@ -17005,6 +17477,119 @@ test "generate batch preflight accepts bounded multimodal content for per-item p
     try std.testing.expect(Node.generateBatchUnsupportedReasonPreflight(parsed.value) == null);
 }
 
+test "reader microbatch resource class follows the resolved physical backend" {
+    try std.testing.expectEqual(
+        executor_microbatch.ResourceClass.cpu,
+        Node.executorMicrobatchResourceClass(.native),
+    );
+    try std.testing.expectEqual(
+        executor_microbatch.ResourceClass.cpu,
+        Node.executorMicrobatchResourceClass(.onnx),
+    );
+    try std.testing.expectEqual(
+        executor_microbatch.ResourceClass.gpu,
+        Node.executorMicrobatchResourceClass(.metal),
+    );
+    try std.testing.expectEqual(
+        executor_microbatch.ResourceClass.gpu,
+        Node.executorMicrobatchResourceClass(.cuda),
+    );
+}
+
+test "generate batch media planner bounds inline and unknown remote windows" {
+    const allocator = std.testing.allocator;
+    const request_json =
+        \\{"requests":[
+        \\{"custom_id":"inline-a","body":{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AA=="}]}]}},
+        \\{"custom_id":"inline-b","body":{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AQ=="}]}]}},
+        \\{"custom_id":"remote-a","body":{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}]}]}},
+        \\{"custom_id":"remote-b","body":{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/b.png"}}]}]}}
+        \\]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateBatchRequest, allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var media_shapes: [4]RequestMediaAdmissionShape = undefined;
+    for (parsed.value.requests, &media_shapes) |item, *shape|
+        shape.* = generateRequestMediaShape(item.body);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        generateBatchWindowPrefixLen(&media_shapes, &.{ 0, 1 }, 8, 2),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        generateBatchWindowPrefixLen(&media_shapes, &.{ 0, 1 }, 8, 1),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        generateBatchWindowPrefixLen(&media_shapes, &.{ 2, 3 }, 8, 1024),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        generateBatchWindowPrefixLen(&media_shapes, &.{ 0, 1 }, 1, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 4), media_shapes[0].inline_transport_bytes);
+    try std.testing.expectEqual(@as(usize, 1), media_shapes[0].decoded_inline_media_bytes);
+    const invalid_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"YR=="}]}]}
+    ;
+    var invalid = try std.json.parseFromSlice(api.GenerateRequest, allocator, invalid_json, .{ .ignore_unknown_fields = true });
+    defer invalid.deinit();
+    const invalid_shape = generateRequestMediaShape(invalid.value);
+    try std.testing.expect(invalid_shape.invalid_inline_media);
+    try std.testing.expectEqual(@as(usize, "YR==".len), invalid_shape.inline_transport_bytes);
+    try std.testing.expectEqual(@as(usize, 0), invalid_shape.decoded_inline_media_bytes);
+    try std.testing.expect(generateBatchWindowCompatible(
+        parsed.value.requests[0].body,
+        parsed.value.requests[1].body,
+    ));
+}
+
+test "generate batch releases materialized media between executor windows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/model/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/model/model_manifest.json",
+        .data =
+        \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_items=1"]}
+        ,
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    const batch_body =
+        \\{"requests":[
+        \\{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}},
+        \\{"custom_id":"page-2","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}}
+        \\]}
+    ;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
+    defer request.deinit();
+    try request.setJson(batch_body);
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.generateBatchContent(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 2), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.batch_peak_materialized_items);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.batch_materialized_items);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
 test "generate parser consumes generic image and audio media parts strictly" {
     const alloc = std.testing.allocator;
     const png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
@@ -17022,7 +17607,9 @@ test "generate parser consumes generic image and audio media parts strictly" {
 
     try std.testing.expectEqual(@as(usize, 1), messages.messages.len);
     try std.testing.expectEqual(@as(usize, 1), shape.image_count);
-    try std.testing.expectEqual(png_data_uri.len + "AwQ=".len, shape.inline_bytes);
+    try std.testing.expectEqual(png_data_uri.len + "AwQ=".len, shape.inline_transport_bytes);
+    try std.testing.expectEqual(@as(usize, 26), shape.decoded_inline_media_bytes);
+    try std.testing.expect(!shape.invalid_inline_media);
     try std.testing.expectEqual(@as(usize, 1), messages.decoded_images.len);
     try std.testing.expectEqual(@as(usize, 1), messages.decoded_audio.len);
     try std.testing.expectEqual(@as(usize, 24), messages.messages[0].image_bytes.?[0].len);
@@ -17476,7 +18063,7 @@ test "direct dense embed admission counts borrowed media once" {
     };
     const preflight = try directDenseEmbedPreflight(&parts);
     try std.testing.expectEqual(@as(usize, 5), preflight.shape.borrowed_bytes);
-    try std.testing.expectEqual(@as(usize, inline_url.len), preflight.shape.inline_bytes);
+    try std.testing.expectEqual(@as(usize, inline_url.len), preflight.shape.inline_transport_bytes);
     try std.testing.expectEqual(@as(usize, 2), preflight.shape.image_count);
     try std.testing.expect(preflight.has_audio);
     try std.testing.expectEqual(@as(usize, 5 + inline_url.len), preflight.known_media_bytes);
@@ -17506,7 +18093,7 @@ test "direct dense embed admission counts borrowed media once" {
     saturated.addInline(1, false);
     try std.testing.expectEqual(
         default_max_request_media_bytes,
-        saturated.potentialBytes(default_max_request_media_bytes),
+        saturated.potentialTransportBytes(default_max_request_media_bytes),
     );
 }
 
@@ -18223,10 +18810,10 @@ test "direct extraction media shape reserves remote and cumulative inline source
     );
     try std.testing.expect(!inline_shape.has_remote);
     try std.testing.expectEqual(@as(usize, 2), inline_shape.image_count);
-    try std.testing.expectEqual(data_uri.len + "Yg==".len, inline_shape.inline_bytes);
+    try std.testing.expectEqual(data_uri.len + "Yg==".len, inline_shape.inline_transport_bytes);
     const inline_admission = requestMediaAdmissionForLimits(inline_shape, default_max_request_media_bytes, 32, null);
-    try std.testing.expectEqual(inline_shape.inline_bytes, inline_admission.byte_cap);
-    try std.testing.expectEqual(2 * inline_shape.inline_bytes, inline_admission.resident_byte_cap);
+    try std.testing.expectEqual(inline_shape.inline_transport_bytes, inline_admission.byte_cap);
+    try std.testing.expectEqual(2 * inline_shape.inline_transport_bytes, inline_admission.resident_byte_cap);
     try std.testing.expectEqual(@as(usize, 1), inline_admission.units);
 
     var text_shape: RequestMediaAdmissionShape = .{};
@@ -22649,17 +23236,37 @@ const RequestMediaAdmissionShape = struct {
     image_count: usize = 0,
     media_count: usize = 0,
     has_audio: bool = false,
-    // Inline encoded sources coexist with a separately allocated decoded copy.
-    inline_bytes: usize = 0,
+    // Bytes retained by the request transport. Inline encoded sources coexist
+    // with a separately allocated decoded copy, so admission accounts for the
+    // source representation independently from the model-facing payload.
+    inline_transport_bytes: usize = 0,
+    // Allocation-free decoded size of inline encoded media. Executor byte
+    // contracts and batch windows are expressed in these model-facing bytes,
+    // not in base64/data-URI transport bytes.
+    decoded_inline_media_bytes: usize = 0,
+    invalid_inline_media: bool = false,
     // Direct callers already own decoded media. It is part of the logical
     // media budget but is borrowed and therefore resident only once.
     borrowed_bytes: usize = 0,
     has_remote: bool = false,
 
-    fn addInline(self: *RequestMediaAdmissionShape, encoded_bytes: usize, is_image: bool) void {
+    fn addInline(self: *RequestMediaAdmissionShape, transport_bytes: usize, is_image: bool) void {
         self.media_count = std.math.add(usize, self.media_count, 1) catch std.math.maxInt(usize);
         if (is_image) self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
-        self.inline_bytes = std.math.add(usize, self.inline_bytes, encoded_bytes) catch std.math.maxInt(usize);
+        self.inline_transport_bytes = std.math.add(usize, self.inline_transport_bytes, transport_bytes) catch std.math.maxInt(usize);
+    }
+
+    fn addEncodedInline(self: *RequestMediaAdmissionShape, source: []const u8, is_image: bool) void {
+        self.addInline(source.len, is_image);
+        const decoded_bytes = decodedMediaDataSize(source) catch {
+            self.invalid_inline_media = true;
+            return;
+        };
+        self.decoded_inline_media_bytes = std.math.add(
+            usize,
+            self.decoded_inline_media_bytes,
+            decoded_bytes,
+        ) catch std.math.maxInt(usize);
     }
 
     fn addBorrowed(self: *RequestMediaAdmissionShape, bytes: usize, is_image: bool) void {
@@ -22671,15 +23278,21 @@ const RequestMediaAdmissionShape = struct {
     fn merge(self: *RequestMediaAdmissionShape, other: RequestMediaAdmissionShape) void {
         self.media_count = std.math.add(usize, self.media_count, other.media_count) catch std.math.maxInt(usize);
         self.image_count = std.math.add(usize, self.image_count, other.image_count) catch std.math.maxInt(usize);
-        self.inline_bytes = std.math.add(usize, self.inline_bytes, other.inline_bytes) catch std.math.maxInt(usize);
+        self.inline_transport_bytes = std.math.add(usize, self.inline_transport_bytes, other.inline_transport_bytes) catch std.math.maxInt(usize);
+        self.decoded_inline_media_bytes = std.math.add(
+            usize,
+            self.decoded_inline_media_bytes,
+            other.decoded_inline_media_bytes,
+        ) catch std.math.maxInt(usize);
         self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, other.borrowed_bytes) catch std.math.maxInt(usize);
+        self.invalid_inline_media = self.invalid_inline_media or other.invalid_inline_media;
         self.has_remote = self.has_remote or other.has_remote;
         self.has_audio = self.has_audio or other.has_audio;
     }
 
     fn addImageUrlSlice(self: *RequestMediaAdmissionShape, source: []const u8) void {
         if (data_uri_mod.hasScheme(source)) {
-            self.addInline(source.len, true);
+            self.addEncodedInline(source, true);
             return;
         }
         self.media_count = std.math.add(usize, self.media_count, 1) catch std.math.maxInt(usize);
@@ -22699,10 +23312,23 @@ const RequestMediaAdmissionShape = struct {
         self.addImageUrlSlice(url orelse return);
     }
 
-    fn potentialBytes(self: RequestMediaAdmissionShape, request_cap: usize) usize {
+    fn potentialTransportBytes(self: RequestMediaAdmissionShape, request_cap: usize) usize {
         if (self.has_remote) return request_cap;
-        const known_bytes = std.math.add(usize, self.inline_bytes, self.borrowed_bytes) catch std.math.maxInt(usize);
+        const known_bytes = std.math.add(usize, self.inline_transport_bytes, self.borrowed_bytes) catch std.math.maxInt(usize);
         return @min(known_bytes, request_cap);
+    }
+
+    fn knownEncodedMediaBytes(self: RequestMediaAdmissionShape) usize {
+        return std.math.add(
+            usize,
+            self.decoded_inline_media_bytes,
+            self.borrowed_bytes,
+        ) catch std.math.maxInt(usize);
+    }
+
+    fn plannedEncodedMediaBytes(self: RequestMediaAdmissionShape, request_cap: usize) usize {
+        if (self.has_remote or self.invalid_inline_media) return request_cap;
+        return @min(self.knownEncodedMediaBytes(), request_cap);
     }
 };
 
@@ -22729,7 +23355,7 @@ fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDe
     };
     return .{
         .shape = shape,
-        .known_media_bytes = std.math.add(usize, shape.inline_bytes, shape.borrowed_bytes) catch
+        .known_media_bytes = std.math.add(usize, shape.inline_transport_bytes, shape.borrowed_bytes) catch
             std.math.maxInt(usize),
         .has_audio = has_audio,
     };
@@ -22754,11 +23380,48 @@ fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionSha
             const mime = part.object.get("mime_type") orelse continue;
             if (data != .string or mime != .string) continue;
             const is_image = std.ascii.startsWithIgnoreCase(mime.string, "image/");
-            shape.addInline(data.string.len, is_image);
+            shape.addEncodedInline(data.string, is_image);
             shape.has_audio = shape.has_audio or std.ascii.startsWithIgnoreCase(mime.string, "audio/");
         }
     }
     return shape;
+}
+
+fn generateBatchWindowCompatible(first: api.GenerateRequest, candidate: api.GenerateRequest) bool {
+    return std.mem.eql(u8, candidate.model, first.model) and
+        candidate.backend == first.backend and
+        std.mem.eql(u8, candidate.mode orelse "", first.mode orelse "") and
+        std.mem.eql(u8, candidate.compiled_target orelse "", first.compiled_target orelse "") and
+        std.mem.eql(u8, candidate.cache_dtype orelse "", first.cache_dtype orelse "");
+}
+
+/// Media bytes used by the allocation-free batch-window planner. Inline and
+/// borrowed payload sizes are known from the parsed envelope. A remote payload
+/// is deliberately charged the entire byte cap because its size cannot be
+/// trusted until it has been downloaded; that makes it a bounded singleton
+/// instead of materializing speculative media from a later window.
+fn generateBatchWindowPlannedMediaBytes(shape: RequestMediaAdmissionShape, window_byte_cap: usize) usize {
+    return shape.plannedEncodedMediaBytes(window_byte_cap);
+}
+
+fn generateBatchWindowPrefixLen(
+    media_shapes: []const RequestMediaAdmissionShape,
+    compatible_indices: []const usize,
+    max_items: usize,
+    max_media_bytes: usize,
+) usize {
+    var count: usize = 0;
+    var media_bytes: usize = 0;
+    for (compatible_indices) |idx| {
+        if (count == max_items) break;
+        const item_bytes = generateBatchWindowPlannedMediaBytes(media_shapes[idx], max_media_bytes);
+        const next_bytes = std.math.add(usize, media_bytes, item_bytes) catch
+            std.math.maxInt(usize);
+        if (count > 0 and next_bytes > max_media_bytes) break;
+        count += 1;
+        media_bytes = next_bytes;
+    }
+    return count;
 }
 
 fn estimateGenerateRequestTextBytes(body: api.GenerateRequest) usize {
@@ -23428,20 +24091,20 @@ fn requestMediaAdmissionForLimits(
     max_concurrent_units: usize,
     max_image_dimension: ?u32,
 ) ReadRequestAdmission {
-    const potential_bytes = shape.potentialBytes(request_byte_cap);
+    const potential_bytes = shape.potentialTransportBytes(request_byte_cap);
     const byte_cap = if (max_concurrent_units == 0)
         potential_bytes
     else blk: {
         const capacity_bytes = std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch
             std.math.maxInt(usize);
-        const inline_potential = @min(shape.inline_bytes, potential_bytes);
+        const inline_potential = @min(shape.inline_transport_bytes, potential_bytes);
         const max_logical_bytes = if (inline_potential >= capacity_bytes / 2)
             capacity_bytes / 2
         else
             capacity_bytes - inline_potential;
         break :blk @min(potential_bytes, max_logical_bytes);
     };
-    const resident_byte_cap = std.math.add(usize, byte_cap, @min(shape.inline_bytes, byte_cap)) catch
+    const resident_byte_cap = std.math.add(usize, byte_cap, @min(shape.inline_transport_bytes, byte_cap)) catch
         std.math.maxInt(usize);
     return .{
         .units = @max(
@@ -23526,6 +24189,12 @@ fn readMaxTokensJsonField(obj: std.json.ObjectMap, name: []const u8) !?usize {
 fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
     const value = prompt orelse return null;
     return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
+}
+
+fn optionalBytesEql(a: ?[]const u8, b: ?[]const u8) bool {
+    const lhs = a orelse return b == null;
+    const rhs = b orelse return false;
+    return std.mem.eql(u8, lhs, rhs);
 }
 
 fn estimateReadAdmissionUnits(image_count: usize, max_tokens: ?usize) usize {

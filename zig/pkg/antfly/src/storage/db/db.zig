@@ -34528,68 +34528,14 @@ fn computeDocumentExtractionAssetRequestDerived(
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(extraction_alloc);
 
-    // Downloaded bytes and the decoded extraction result are admitted before
-    // allocation by extraction_alloc. Native render forks and transient OCR
-    // buffers use the inspection, render, and output credits below, so no
-    // owner relies on unclaimed "headroom" or duplicates a ResourceManager
-    // charge.
-    var pdf_operation_reservation: ?resource_manager_mod.OwnedSplitReservation = null;
-    defer if (pdf_operation_reservation) |*reservation| reservation.release();
+    // Downloaded bytes, inspection state, and decoded extraction results are
+    // charged at their actual live allocator size. OCR render scratch plus
+    // provider/output memory are admitted atomically for each page window in
+    // enrichment_runtime and released before the next window.
     const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
-    var pdf_output_budgeted: ?resource_manager_mod.BudgetedAllocator = if (source_is_pdf and extraction_resource_manager != null)
-        resource_manager_mod.BudgetedAllocator.init(extraction_resource_manager.?, .document_extraction_working_set, alloc, 1)
-    else
-        null;
-    defer if (pdf_output_budgeted) |*budgeted| budgeted.deinit();
-    const pdf_output_alloc = if (pdf_output_budgeted) |*budgeted| budgeted.allocator() else alloc;
-    var pdf_output_bytes: ?usize = null;
-    var pdf_inspection_bytes: usize = if (source_is_pdf) config.pdf_decode_limits.max_working_set_bytes else 0;
-    if (source_is_pdf) {
-        if (extraction_resource_manager) |manager| {
-            const requested_inspection_bytes = config.pdf_decode_limits.max_working_set_bytes;
-            const requested_render_bytes = config.pdf_render_max_inflight_bytes;
-            const requested_native_bytes = std.math.add(usize, requested_inspection_bytes, requested_render_bytes) catch
-                return error.DocumentExtractionWorkingSetTooLarge;
-            const requested_native_bytes_u64: u64 = @intCast(requested_native_bytes);
-            const output_reservation_bytes = if (db.enrichment_runtime) |runtime|
-                try enrichment_runtime_mod.documentExtractionPdfOutputReservationBytes(
-                    runtime,
-                    alloc,
-                    request,
-                    config,
-                    if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
-                )
-            else if (document_extraction_mod.ocrEnabledForRoute(config, "pdf"))
-                return error.MissingAssetProducer
-            else
-                0;
-            const tracked_headroom: u64 = @intCast(output_reservation_bytes);
-            pdf_operation_reservation = manager.reserveOwnedSplitAtMost(
-                .document_extraction_working_set,
-                requested_native_bytes_u64,
-                tracked_headroom,
-            ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
-                else => return err,
-            };
-            const native_budget = std.math.cast(usize, pdf_operation_reservation.?.primary_bytes) orelse
-                return error.DocumentExtractionWorkingSetTooLarge;
-            const partition = try enrichment_runtime_mod.partitionPdfNativeBudget(
-                native_budget,
-                requested_inspection_bytes,
-                requested_render_bytes,
-            );
-            pdf_inspection_bytes = partition.inspection_bytes;
-            pdf_output_bytes = std.math.cast(usize, pdf_operation_reservation.?.secondary_bytes) orelse
-                return error.DocumentExtractionWorkingSetTooLarge;
-            try pdf_operation_reservation.?.transferSecondaryToPinned(&pdf_output_budgeted.?);
-            config.pdf_render_max_inflight_bytes = partition.render_bytes;
-            config.pdf_decode_limits.max_working_set_bytes = @min(config.pdf_decode_limits.max_working_set_bytes, config.pdf_render_max_inflight_bytes);
-            config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, config.pdf_decode_limits.max_working_set_bytes);
-        }
-    }
+    const pdf_inspection_bytes: usize = if (source_is_pdf) config.pdf_decode_limits.max_working_set_bytes else 0;
 
-    var pdf_inspection_reservation = enrichment_runtime_mod.ReservedWorkingSetAllocator.init(alloc, pdf_inspection_bytes);
+    var pdf_inspection_reservation = enrichment_runtime_mod.ReservedWorkingSetAllocator.init(extraction_alloc, pdf_inspection_bytes);
     const document_extraction_alloc = if (source_is_pdf)
         pdf_inspection_reservation.allocator()
     else
@@ -34619,16 +34565,10 @@ fn computeDocumentExtractionAssetRequestDerived(
             &extraction,
             .{
                 .native_backing_alloc = alloc,
-                .working_alloc = if (pdf_output_bytes != null and pdf_output_bytes.? > 0) pdf_output_alloc else null,
-                .output_bytes = pdf_output_bytes,
             },
         );
     } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
         return error.MissingAssetProducer;
-    }
-    if (pdf_output_budgeted) |*budgeted| {
-        budgeted.deinit();
-        pdf_output_budgeted = null;
     }
     document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 

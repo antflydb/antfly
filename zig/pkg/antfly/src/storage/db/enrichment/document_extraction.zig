@@ -34,7 +34,25 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
             };
 
+            pub const RenderForkTemplate = struct {
+                pub fn instantiate(_: *const RenderForkTemplate, _: Allocator, _: CancellationProbe) anyerror!Reader {
+                    return error.PdfExtractionUnavailable;
+                }
+
+                pub fn deinit(_: *RenderForkTemplate) void {}
+
+                pub fn refreshFrom(_: *RenderForkTemplate, _: *Reader, _: CancellationProbe) anyerror!void {}
+            };
+
             pub const Reader = struct {
+                pub fn allocator(_: *const Reader) Allocator {
+                    return std.heap.page_allocator;
+                }
+
+                pub fn cancellationProbe(_: *const Reader) CancellationProbe {
+                    return .{};
+                }
+
                 pub fn init(_: Allocator, _: []const u8) anyerror!Reader {
                     return error.PdfExtractionUnavailable;
                 }
@@ -47,8 +65,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                     return error.PdfExtractionUnavailable;
                 }
 
-                pub fn forkForRendering(_: *Reader, _: Allocator, _: CancellationProbe) anyerror!Reader {
-                    return error.PdfExtractionUnavailable;
+                pub fn prepareRenderForkTemplate(_: *Reader, _: Allocator, _: CancellationProbe) anyerror!RenderForkTemplate {
+                    return .{};
                 }
 
                 pub fn deinit(_: *Reader) void {}
@@ -144,9 +162,14 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             quality: RenderQuality = .native,
             diagnostics: ?PageRenderDiagnostics = null,
         };
+        pub const RenderedPageRaster = @import("antfly_pdf").RenderedPageRaster;
+        pub const RenderedPageRasterBatch = @import("antfly_pdf").RenderedPageRasterBatch;
 
         pub const RenderQuality = enum { native, degraded, compatibility_backend };
         pub const RenderProfile = enum { exact, ocr };
+        // Keep the erased executor ABI identical in unit/minimal builds even
+        // though the rendering functions themselves are stubbed.
+        pub const PageRenderExecutor = @import("antfly_pdf").PageRenderExecutor;
         pub const PageRenderRequest = struct {
             page_number: usize,
             requested_dpi: u16 = 150,
@@ -162,15 +185,37 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             height: u32,
             pixels: u64,
         };
+        pub const PreparedPageRenderPlan = struct {
+            request_value: PageRenderRequest,
+            geometry_value: PageRenderGeometry,
+
+            pub fn request(self: @This()) PageRenderRequest {
+                return self.request_value;
+            }
+
+            pub fn geometry(self: @This()) PageRenderGeometry {
+                return self.geometry_value;
+            }
+
+            pub fn withMaxOutputBytes(self: @This(), max_output_bytes: ?usize) @This() {
+                var updated = self;
+                updated.request_value.max_output_bytes = max_output_bytes;
+                return updated;
+            }
+        };
         pub const PageRenderBatchOptions = struct {
             max_batch_pages: usize = 8,
             max_parallel_pages: usize = 1,
             max_inflight_pixels: u64 = 50_000_000,
             max_inflight_bytes: usize = 512 * 1024 * 1024,
             max_retained_png_bytes: usize = 64 * 1024 * 1024,
+            max_retained_raster_bytes: usize = 256 * 1024 * 1024,
             bytes_per_pixel_reserve: usize = 12,
             profile: RenderProfile = .ocr,
             cancellation: reader.CancellationProbe = .{},
+            executor: ?PageRenderExecutor = null,
+            fork_template: ?*reader.RenderForkTemplate = null,
+            concurrent_output_allocator: ?Allocator = null,
             executor_io: ?std.Io = null,
         };
         pub const PageRenderResult = struct {
@@ -226,7 +271,19 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             return error.PdfRenderingUnavailable;
         }
 
+        pub fn renderPreparedPagesBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PreparedPageRenderPlan, _: PageRenderBatchOptions) anyerror!RenderedPageBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn renderPreparedPagesRasterBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PreparedPageRenderPlan, _: PageRenderBatchOptions) anyerror!RenderedPageRasterBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
         pub fn planParsedPageRenderGeometry(_: *reader.Reader, _: PageRenderRequest) anyerror!PageRenderGeometry {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn prepareParsedPageRenderPlan(_: *reader.Reader, _: PageRenderRequest) anyerror!PreparedPageRenderPlan {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -401,10 +458,14 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
 }
 
 pub const RenderedPdfPage = pdf.RenderedPagePng;
+pub const RenderedPdfPageRaster = pdf.RenderedPageRaster;
 pub const PdfPageRenderRequest = pdf.PageRenderRequest;
 pub const PdfPageRenderGeometry = pdf.PageRenderGeometry;
+pub const PreparedPdfPageRenderPlan = pdf.PreparedPageRenderPlan;
+pub const PdfPageRenderExecutor = pdf.PageRenderExecutor;
 pub const PdfPageRenderBatchOptions = pdf.PageRenderBatchOptions;
 pub const RenderedPdfPageBatch = pdf.RenderedPageBatch;
+pub const RenderedPdfPageRasterBatch = pdf.RenderedPageRasterBatch;
 pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
 pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 
@@ -429,7 +490,7 @@ pub const PdfRenderDeadline = struct {
     }
 };
 
-pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: RenderedPdfPage) !void {
+pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: anytype) !void {
     if (rendered.quality == .native) return;
     const fallback_groups = if (rendered.diagnostics) |diagnostics| diagnostics.fallback_text_groups else 0;
     const fallback_reason = if (rendered.diagnostics) |diagnostics|
@@ -447,6 +508,7 @@ pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendere
 
 pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
+    render_fork_template: ?pdf.reader.RenderForkTemplate = null,
 
     pub fn init(alloc: Allocator, pdf_bytes: []const u8) !PdfRenderSession {
         return try initWithDecodeLimits(alloc, pdf_bytes, .{});
@@ -466,10 +528,12 @@ pub const PdfRenderSession = struct {
     /// owned by `alloc`. The caller must finish `prepareForBatchRendering`
     /// before publishing the source to other task executors.
     pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
-        return .{ .parsed = try source.parsed.forkForRendering(alloc, cancellation) };
+        try source.ensureRenderForkTemplate(cancellation);
+        return .{ .parsed = try source.render_fork_template.?.instantiate(alloc, cancellation) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {
+        if (self.render_fork_template) |*template| template.deinit();
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -479,11 +543,13 @@ pub const PdfRenderSession = struct {
     }
 
     pub fn setDecodeLimits(self: *PdfRenderSession, decode_limits: pdf.reader.DecodeLimits) !void {
+        if (self.render_fork_template) |*template| template.deinit();
+        self.render_fork_template = null;
         try self.parsed.setDecodeLimits(decode_limits);
     }
 
     pub fn prepareForBatchRendering(self: *PdfRenderSession) !void {
-        _ = try self.parsed.pageCount();
+        try self.ensureRenderForkTemplate(self.parsed.cancellationProbe());
     }
 
     pub fn pageCount(self: *PdfRenderSession) !usize {
@@ -492,6 +558,10 @@ pub const PdfRenderSession = struct {
 
     pub fn planPageRenderGeometry(self: *PdfRenderSession, request: PdfPageRenderRequest) !PdfPageRenderGeometry {
         return try pdf.planParsedPageRenderGeometry(&self.parsed, request);
+    }
+
+    pub fn preparePageRenderPlan(self: *PdfRenderSession, request: PdfPageRenderRequest) !PreparedPdfPageRenderPlan {
+        return try pdf.prepareParsedPageRenderPlan(&self.parsed, request);
     }
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
@@ -503,7 +573,31 @@ pub const PdfRenderSession = struct {
     }
 
     pub fn renderPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, requests: []const PdfPageRenderRequest, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
-        return try pdf.renderParsedPagesBatchAlloc(alloc, &self.parsed, requests, options);
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderParsedPagesBatchAlloc(alloc, &self.parsed, requests, cached_options);
+    }
+
+    pub fn renderPreparedPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderPreparedPagesBatchAlloc(alloc, &self.parsed, plans, cached_options);
+    }
+
+    pub fn renderPreparedPagesRasterBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageRasterBatch {
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderPreparedPagesRasterBatchAlloc(alloc, &self.parsed, plans, cached_options);
+    }
+
+    fn ensureRenderForkTemplate(self: *PdfRenderSession, cancellation: PdfCancellationProbe) !void {
+        if (self.render_fork_template) |*template|
+            try template.refreshFrom(&self.parsed, cancellation)
+        else
+            self.render_fork_template = try self.parsed.prepareRenderForkTemplate(self.parsed.allocator(), cancellation);
     }
 };
 
@@ -4343,7 +4437,10 @@ test "PDF render quality warning preserves prior diagnostics and fallback reason
         .width = 1,
         .height = 1,
         .quality = .degraded,
-        .diagnostics = .{ .fallback_text_groups = 2, .first_fallback_reason = .outline_too_complex },
+        .diagnostics = @as(?pdf.PageRenderDiagnostics, .{
+            .fallback_text_groups = 2,
+            .first_fallback_reason = .outline_too_complex,
+        }),
     });
     try std.testing.expectEqualStrings("existing;pdf_render_quality:degraded:fallback_groups=2:reason=outline_too_complex", unit.extraction_warning.?);
 }

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const image = @import("antfly_image");
 const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 const CompatibilityRenderSession = if (builtin.os.tag == .macos) darwin_render.SharedSession else struct {};
 
@@ -38,6 +39,39 @@ pub const RenderedPagePng = struct {
 
     pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
         alloc.free(self.png);
+        self.* = undefined;
+    }
+};
+
+/// Physical layout of an unencoded page raster. Formats are deliberately
+/// closed here rather than inferred from byte length so local inference ABIs
+/// can validate the producer/consumer contract before borrowing the bytes.
+pub const PixelFormat = enum {
+    rgba8,
+
+    pub fn bytesPerPixel(self: @This()) usize {
+        return switch (self) {
+            .rgba8 => 4,
+        };
+    }
+};
+
+/// Allocator-owned, tightly packed page pixels. Scratch allocations used to
+/// parse and paint the page are never retained by this value; only `bytes`
+/// survives the render call and must be released with `deinit`.
+pub const RenderedPageRaster = struct {
+    bytes: []u8,
+    pixel_format: PixelFormat,
+    width: u32,
+    height: u32,
+    stride: usize,
+    requested_dpi: u16,
+    effective_dpi: u16,
+    quality: RenderQuality = .native,
+    diagnostics: ?reader.PageRenderDiagnostics = null,
+
+    pub fn deinit(self: *RenderedPageRaster, alloc: Allocator) void {
+        alloc.free(self.bytes);
         self.* = undefined;
     }
 };
@@ -69,11 +103,41 @@ pub const PageRenderRequest = struct {
     requested_dpi: u16 = 150,
     max_pixels: u64 = 40_000_000,
     max_dimension: u32 = 4096,
-    /// When set, retry this page at smaller raster dimensions before exposing
-    /// it to the batch's retained-output allocator.
+    /// Bound retained output for this page. PNG rendering resizes and
+    /// re-encodes when necessary; raw raster rendering constrains geometry
+    /// before painting because its byte size is known exactly.
     max_output_bytes: ?usize = null,
     min_output_dimension: u32 = 1,
     max_output_attempts: u8 = 8,
+};
+
+/// Erased fixed-worker executor supplied by a process-lifetime runtime. Each
+/// callback runs completely on one physical worker and receives that worker's
+/// private resettable scratch allocator. The executor call is synchronous: no
+/// callback may retain either the allocator or scratch-backed memory.
+pub const PageRenderExecutor = struct {
+    ptr: *anyopaque,
+    concurrent_capacity: usize,
+    run_batch_fn: *const fn (
+        ptr: *anyopaque,
+        contexts: []const *anyopaque,
+        run: *const fn (context: *anyopaque, scratch: Allocator) void,
+        max_scratch_bytes: usize,
+    ) anyerror!BatchStats,
+
+    pub const BatchStats = struct {
+        peak_parallelism: usize,
+    };
+
+    pub fn runBatch(
+        self: @This(),
+        contexts: []const *anyopaque,
+        run: *const fn (context: *anyopaque, scratch: Allocator) void,
+        max_scratch_bytes: usize,
+    ) !BatchStats {
+        if (self.concurrent_capacity == 0) return error.InvalidPageRenderExecutor;
+        return try self.run_batch_fn(self.ptr, contexts, run, max_scratch_bytes);
+    }
 };
 
 /// Admission policy for one render microbatch. The caller deliberately owns
@@ -85,12 +149,32 @@ pub const PageRenderBatchOptions = struct {
     max_inflight_pixels: u64 = 50_000_000,
     max_inflight_bytes: usize = 512 * 1024 * 1024,
     max_retained_png_bytes: usize = 64 * 1024 * 1024,
+    /// Hard bound for raw raster bytes retained after completed workers leave
+    /// the batch scratch budget. This is intentionally separate from encoded
+    /// PNG retention because their sizes have very different distributions.
+    max_retained_raster_bytes: usize = 256 * 1024 * 1024,
     bytes_per_pixel_reserve: usize = 12,
     profile: RenderProfile = .ocr,
     cancellation: reader.CancellationProbe = .{},
     /// Production callers borrow this from BackendRuntime. When present,
     /// render jobs use that runtime's bounded executor instead of creating a
     /// batch-local thread team.
+    executor: ?PageRenderExecutor = null,
+    /// Optional caller-owned immutable fork template. The batch refreshes it
+    /// after serial preflight and before worker dispatch, but only walks the
+    /// encrypted-stream registry when that registry grew. The owning Reader
+    /// and this template must remain exclusively borrowed for the synchronous
+    /// batch call.
+    fork_template: ?*reader.RenderForkTemplate = null,
+    /// Thread-safe allocator that workers may use for retained output bytes.
+    /// This must be the result allocator passed to the batch and is accepted
+    /// only with a fixed PageRenderExecutor. Successful output allocations are
+    /// then detached directly into results instead of copied on the caller
+    /// thread. Compatibility executors retain page_allocator-plus-copy.
+    concurrent_output_allocator: ?Allocator = null,
+    /// Compatibility executor for callers not yet migrated to a fixed PDF CPU
+    /// lane. `std.Io` does not guarantee physical thread affinity, so it cannot
+    /// provide reusable worker scratch.
     executor_io: ?std.Io = null,
 };
 
@@ -123,6 +207,34 @@ pub const RenderedPageBatch = struct {
     thread_spawn_fallbacks: usize,
 
     pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
+        for (self.results) |*result| result.deinit(alloc);
+        alloc.free(self.results);
+        self.* = undefined;
+    }
+};
+
+pub const PageRasterResult = struct {
+    page_number: usize,
+    rendered: ?RenderedPageRaster = null,
+    failure: ?anyerror = null,
+    render_elapsed_ns: u64 = 0,
+
+    pub fn deinit(self: *PageRasterResult, alloc: Allocator) void {
+        if (self.rendered) |*page| page.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RenderedPageRasterBatch = struct {
+    results: []PageRasterResult,
+    requested_parallelism: usize,
+    peak_launched_workers: usize,
+    peak_parallelism: usize,
+    peak_admitted_pixels: u64,
+    peak_admitted_bytes: usize,
+    thread_spawn_fallbacks: usize,
+
+    pub fn deinit(self: *RenderedPageRasterBatch, alloc: Allocator) void {
         for (self.results) |*result| result.deinit(alloc);
         alloc.free(self.results);
         self.* = undefined;
@@ -200,8 +312,34 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
     used_compatibility_backend: ?*bool,
     compatibility_session: ?*CompatibilityRenderSession,
 ) ![]u8 {
+    return try renderParsedPagePngEffectiveWithRotationAllocators(
+        alloc,
+        alloc,
+        parsed,
+        page_number,
+        dpi,
+        max_pixels,
+        rotation,
+        profile,
+        used_compatibility_backend,
+        compatibility_session,
+    );
+}
+
+fn renderParsedPagePngEffectiveWithRotationAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
+    compatibility_session: ?*CompatibilityRenderSession,
+) ![]u8 {
     if (used_compatibility_backend) |value| value.* = false;
-    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
+    return renderParsedPagePngNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
         error.UnsupportedPdfRendering,
@@ -212,7 +350,7 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
             if (used_compatibility_backend) |value| value.* = true;
             break :blk if (compatibility_session) |session|
                 try session.renderPagePngAlloc(
-                    alloc,
+                    output_alloc,
                     page_number,
                     dpi,
                     max_pixels,
@@ -220,7 +358,7 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
                     parsed.cancellationProbe(),
                 )
             else
-                try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+                try darwin_render.renderPagePngAlloc(output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
         } else return err,
         else => return err,
     };
@@ -235,6 +373,56 @@ fn renderParsedPagePngNativeAlloc(
     rotation: render.PageRotation,
     profile: RenderProfile,
 ) ![]u8 {
+    return try renderParsedPagePngNativeWithAllocators(alloc, alloc, parsed, page_number, dpi, max_pixels, rotation, profile);
+}
+
+fn renderParsedPagePngNativeWithAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+) ![]u8 {
+    const raw = try renderParsedPageRgbaNativeWithAllocators(scratch_alloc, scratch_alloc, parsed, page_number, dpi, max_pixels, rotation, profile);
+    defer scratch_alloc.free(raw.rgba);
+    try parsed.checkCancellation();
+    return try image.png.encodeRgbaWithCancellation(
+        output_alloc,
+        @intCast(raw.width),
+        @intCast(raw.height),
+        raw.rgba,
+        .{
+            .context = parsed.cancellationProbe().context,
+            .is_cancelled_fn = parsed.cancellationProbe().is_cancelled_fn,
+        },
+    );
+}
+
+fn renderParsedPageRgbaNativeAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+) !render.RgbaCanvas {
+    return try renderParsedPageRgbaNativeWithAllocators(alloc, alloc, parsed, page_number, dpi, max_pixels, rotation, profile);
+}
+
+fn renderParsedPageRgbaNativeWithAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+) !render.RgbaCanvas {
     const reader_alloc = parsed.allocator();
     try parsed.checkCancellation();
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
@@ -263,32 +451,92 @@ fn renderParsedPagePngNativeAlloc(
     const pattern_runs = render_runs.pattern_runs;
     const shape_runs = render_runs.shape_runs;
     var plain_runs = std.ArrayList(reader.TextRun).empty;
-    defer plain_runs.deinit(alloc);
+    defer plain_runs.deinit(scratch_alloc);
     for (runs) |run| {
         const has_pattern = run.fill_pattern_name != null or run.stroke_pattern_name != null;
         if (has_pattern or run.vectorizable) continue;
-        try plain_runs.append(alloc, run);
+        try plain_runs.append(scratch_alloc, run);
     }
-    std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
-        fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
-            return a.paint_order < b.paint_order;
-        }
-    }.lessThan);
-    std.mem.sort(reader.ShapeRun, shape_runs, {}, struct {
-        fn lessThan(_: void, a: reader.ShapeRun, b: reader.ShapeRun) bool {
-            return a.paint_order < b.paint_order;
-        }
-    }.lessThan);
-    std.mem.sort(reader.PatternRun, pattern_runs, {}, struct {
-        fn lessThan(_: void, a: reader.PatternRun, b: reader.PatternRun) bool {
-            return a.paint_order < b.paint_order;
-        }
-    }.lessThan);
+    // RenderPlan merges every paint kind into group-local schedules and orders
+    // them by (paint_order, paint_phase, kind, source index). Pre-sorting three
+    // individual arrays here is both redundant and subtly less complete: it
+    // ignores paint phase and cannot establish cross-kind ordering.
     try parsed.checkCancellation();
-    const png = try render.renderPageContentPngInBoxRotatedCancelable(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
-    errdefer alloc.free(png);
+    const raw = try render.renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(scratch_alloc, output_alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
+    errdefer output_alloc.free(raw.rgba);
     try parsed.checkCancellation();
-    return png;
+    return raw;
+}
+
+fn renderParsedPageRgbaEffectiveWithRotationAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !render.RgbaCanvas {
+    return try renderParsedPageRgbaEffectiveWithRotationAllocators(
+        alloc,
+        alloc,
+        parsed,
+        page_number,
+        dpi,
+        max_pixels,
+        rotation,
+        profile,
+        used_compatibility_backend,
+        compatibility_session,
+    );
+}
+
+fn renderParsedPageRgbaEffectiveWithRotationAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !render.RgbaCanvas {
+    if (used_compatibility_backend) |value| value.* = false;
+    return renderParsedPageRgbaNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
+        error.UnsupportedStreamFilter,
+        error.UnsupportedNativeDecode,
+        error.UnsupportedPdfRendering,
+        error.InvalidFlateStream,
+        error.MissingEndStream,
+        error.UnexpectedEof,
+        => if (builtin.os.tag == .macos) blk: {
+            if (used_compatibility_backend) |value| value.* = true;
+            try parsed.checkCancellation();
+            const png = if (compatibility_session) |session|
+                try session.renderPagePngAlloc(
+                    scratch_alloc,
+                    page_number,
+                    dpi,
+                    max_pixels,
+                    rotation,
+                    parsed.cancellationProbe(),
+                )
+            else
+                try darwin_render.renderPagePngAlloc(scratch_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+            defer scratch_alloc.free(png);
+            const decoded = try image.png.decodeRgba(output_alloc, png);
+            errdefer output_alloc.free(decoded.rgba);
+            try parsed.checkCancellation();
+            const pixels = std.math.mul(u64, decoded.width, decoded.height) catch return error.RenderedPageTooLarge;
+            if (pixels > max_pixels) return error.RenderedPageTooLarge;
+            break :blk .{ .rgba = decoded.rgba, .width = decoded.width, .height = decoded.height };
+        } else return err,
+        else => return err,
+    };
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
@@ -378,9 +626,33 @@ fn renderParsedPagePngWithGeometryAlloc(
     profile: RenderProfile,
     compatibility_session: ?*CompatibilityRenderSession,
 ) !RenderedPagePng {
+    return try renderParsedPagePngWithGeometryAllocators(
+        alloc,
+        alloc,
+        parsed,
+        page_number,
+        requested_dpi,
+        max_pixels,
+        geometry,
+        profile,
+        compatibility_session,
+    );
+}
+
+fn renderParsedPagePngWithGeometryAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    geometry: AdaptiveRenderGeometry,
+    profile: RenderProfile,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !RenderedPagePng {
     parsed.clearRenderDiagnostics();
     var used_compatibility_backend = false;
-    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, geometry.effective_dpi, max_pixels, geometry.rotation, profile, &used_compatibility_backend, compatibility_session);
+    const png = try renderParsedPagePngEffectiveWithRotationAllocators(scratch_alloc, output_alloc, parsed, page_number, geometry.effective_dpi, max_pixels, geometry.rotation, profile, &used_compatibility_backend, compatibility_session);
     const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
     const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
     return .{
@@ -389,6 +661,152 @@ fn renderParsedPagePngWithGeometryAlloc(
         .effective_dpi = geometry.effective_dpi,
         .width = geometry.width,
         .height = geometry.height,
+        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
+        .diagnostics = diagnostics,
+    };
+}
+
+/// Parse and render one page directly into owned RGBA8 pixels. This is the
+/// unencoded counterpart to the adaptive PNG API and is intended for local
+/// inference paths that can borrow a raster for the duration of an invocation.
+pub fn renderPageRasterAdaptiveAlloc(
+    alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+) !RenderedPageRaster {
+    var parsed = try reader.Reader.init(alloc, pdf_bytes);
+    defer parsed.deinit();
+    return try renderParsedPageRasterAdaptiveAlloc(alloc, &parsed, page_number, requested_dpi, max_pixels, max_dimension);
+}
+
+pub fn renderParsedPageRasterAdaptiveAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+) !RenderedPageRaster {
+    return try renderParsedPageRasterAdaptiveWithProfileAlloc(alloc, parsed, page_number, requested_dpi, max_pixels, max_dimension, .exact);
+}
+
+pub fn renderParsedPageRasterAdaptiveWithProfileAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    profile: RenderProfile,
+) !RenderedPageRaster {
+    return try renderParsedPageRasterAdaptiveWithProfileAndCompatibilityAlloc(
+        alloc,
+        parsed,
+        page_number,
+        requested_dpi,
+        max_pixels,
+        max_dimension,
+        profile,
+        null,
+    );
+}
+
+fn renderParsedPageRasterAdaptiveWithProfileAndCompatibilityAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    profile: RenderProfile,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !RenderedPageRaster {
+    const geometry = try adaptiveRenderGeometry(parsed, .{
+        .page_number = page_number,
+        .requested_dpi = requested_dpi,
+        .max_pixels = max_pixels,
+        .max_dimension = max_dimension,
+    });
+    return try renderParsedPageRasterWithGeometryAlloc(
+        alloc,
+        parsed,
+        page_number,
+        requested_dpi,
+        max_pixels,
+        geometry,
+        profile,
+        compatibility_session,
+    );
+}
+
+fn renderParsedPageRasterWithGeometryAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    geometry: AdaptiveRenderGeometry,
+    profile: RenderProfile,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !RenderedPageRaster {
+    return try renderParsedPageRasterWithGeometryAllocators(
+        alloc,
+        alloc,
+        parsed,
+        page_number,
+        requested_dpi,
+        max_pixels,
+        geometry,
+        profile,
+        compatibility_session,
+    );
+}
+
+fn renderParsedPageRasterWithGeometryAllocators(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    geometry: AdaptiveRenderGeometry,
+    profile: RenderProfile,
+    compatibility_session: ?*CompatibilityRenderSession,
+) !RenderedPageRaster {
+    parsed.clearRenderDiagnostics();
+    var used_compatibility_backend = false;
+    const raw = try renderParsedPageRgbaEffectiveWithRotationAllocators(
+        scratch_alloc,
+        output_alloc,
+        parsed,
+        page_number,
+        geometry.effective_dpi,
+        max_pixels,
+        geometry.rotation,
+        profile,
+        &used_compatibility_backend,
+        compatibility_session,
+    );
+    errdefer output_alloc.free(raw.rgba);
+    const width = std.math.cast(u32, raw.width) orelse return error.RenderedPageTooLarge;
+    const height = std.math.cast(u32, raw.height) orelse return error.RenderedPageTooLarge;
+    const stride = try raw.stride();
+    const expected_bytes = std.math.mul(usize, stride, raw.height) catch return error.RenderedPageTooLarge;
+    if (raw.rgba.len != expected_bytes or width != geometry.width or height != geometry.height)
+        return error.RenderedPageGeometryMismatch;
+    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
+    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
+    return .{
+        .bytes = raw.rgba,
+        .pixel_format = .rgba8,
+        .width = width,
+        .height = height,
+        .stride = stride,
+        .requested_dpi = requested_dpi,
+        .effective_dpi = geometry.effective_dpi,
         .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
         .diagnostics = diagnostics,
     };
@@ -408,6 +826,59 @@ pub const PageRenderGeometry = struct {
     height: u32,
     pixels: u64,
 };
+
+/// Immutable geometry resolved against one prepared Reader. Keeping this value
+/// beside a planner's page item lets batch admission reuse the exact result
+/// instead of resolving the page dictionary for a second time. The source
+/// identity is checked again at execution, so plans cannot be mixed across
+/// prepared documents accidentally.
+pub const PreparedPageRenderPlan = struct {
+    _request: PageRenderRequest,
+    _geometry: AdaptiveRenderGeometry,
+    _source_ptr: [*]const u8,
+    _source_len: usize,
+
+    pub fn request(self: @This()) PageRenderRequest {
+        return self._request;
+    }
+
+    pub fn geometry(self: @This()) PageRenderGeometry {
+        return .{
+            .effective_dpi = self._geometry.effective_dpi,
+            .width = self._geometry.width,
+            .height = self._geometry.height,
+            .pixels = self._geometry.pixels,
+        };
+    }
+
+    /// Return the same source-bound geometry with a caller-owned encoded
+    /// output ceiling. Output admission does not affect raster geometry, so a
+    /// document planner may narrow this limit after it sizes the complete
+    /// inference window without repeating page-tree and box discovery.
+    pub fn withMaxOutputBytes(self: @This(), max_output_bytes: ?usize) @This() {
+        var updated = self;
+        updated._request.max_output_bytes = max_output_bytes;
+        return updated;
+    }
+
+    fn matchesSource(self: @This(), parsed: *const reader.Reader) bool {
+        const source = parsed.sourceBytes();
+        return self._source_ptr == source.ptr and self._source_len == source.len;
+    }
+};
+
+pub fn prepareParsedPageRenderPlan(
+    parsed: *reader.Reader,
+    request: PageRenderRequest,
+) !PreparedPageRenderPlan {
+    const source = parsed.sourceBytes();
+    return .{
+        ._request = request,
+        ._geometry = try adaptiveRenderGeometry(parsed, request),
+        ._source_ptr = source.ptr,
+        ._source_len = source.len,
+    };
+}
 
 /// Resolve the raster geometry for a page using the exact same adaptive rules
 /// as rendering, without allocating the raster. Document planners use this to
@@ -432,32 +903,81 @@ fn adaptiveRenderGeometry(parsed: *reader.Reader, request: PageRenderRequest) !A
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(request.page_number));
     const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
 
-    var effective_dpi = request.requested_dpi;
-    while (true) {
-        const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
-        const unrotated_width = rasterAxisExtent(box.min_x, box.max_x, scale);
-        const unrotated_height = rasterAxisExtent(box.min_y, box.max_y, scale);
-        const width_f = if (swaps_dimensions) unrotated_height else unrotated_width;
-        const height_f = if (swaps_dimensions) unrotated_width else unrotated_height;
-        const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
-            height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
-        if (fits_integer) {
-            const width: u32 = @intFromFloat(width_f);
-            const height: u32 = @intFromFloat(height_f);
-            const pixels = @as(u64, width) * @as(u64, height);
-            if (width <= request.max_dimension and height <= request.max_dimension and pixels <= request.max_pixels) {
-                return .{
-                    .effective_dpi = effective_dpi,
-                    .width = width,
-                    .height = height,
-                    .pixels = pixels,
-                    .rotation = rotation,
-                };
-            }
+    return try adaptiveRenderGeometryForBox(box, rotation, swaps_dimensions, request);
+}
+
+fn adaptiveRenderGeometryForBox(
+    box: reader.PageBox,
+    rotation: render.PageRotation,
+    swaps_dimensions: bool,
+    request: PageRenderRequest,
+) !AdaptiveRenderGeometry {
+    const point_width = box.max_x - box.min_x;
+    const point_height = box.max_y - box.min_y;
+    if (!(point_width > 0) or !(point_height > 0) or
+        !std.math.isFinite(point_width) or !std.math.isFinite(point_height))
+        return error.InvalidPageBox;
+
+    // ceil(points * dpi / 72) <= max_dimension exactly when the unrounded
+    // extent is <= max_dimension. Use that direct bound to avoid probing as
+    // many as 600 DPIs. `ceil` deliberately leaves a one-DPI rounding margin;
+    // the monotonic search below resolves both that margin and the pixel cap.
+    const dimension_bound = @min(
+        @as(f64, @floatFromInt(request.requested_dpi)),
+        @min(
+            @ceil(@as(f64, @floatFromInt(request.max_dimension)) * 72.0 / point_width),
+            @ceil(@as(f64, @floatFromInt(request.max_dimension)) * 72.0 / point_height),
+        ),
+    );
+    if (!(dimension_bound >= 1.0)) return error.RenderedPageTooLarge;
+    var lower: u16 = minimum_direct_render_dpi;
+    var upper: u16 = @intFromFloat(dimension_bound);
+    var best: ?AdaptiveRenderGeometry = null;
+    while (lower <= upper) {
+        const dpi: u16 = lower + (upper - lower) / 2;
+        const geometry = renderGeometryAtDpi(box, rotation, swaps_dimensions, dpi) catch {
+            if (dpi == minimum_direct_render_dpi) break;
+            upper = dpi - 1;
+            continue;
+        };
+        if (geometry.width <= request.max_dimension and
+            geometry.height <= request.max_dimension and
+            geometry.pixels <= request.max_pixels)
+        {
+            best = geometry;
+            if (dpi == upper) break;
+            lower = dpi + 1;
+        } else {
+            if (dpi == minimum_direct_render_dpi) break;
+            upper = dpi - 1;
         }
-        if (effective_dpi == minimum_direct_render_dpi) return error.RenderedPageTooLarge;
-        effective_dpi -= 1;
     }
+    return best orelse error.RenderedPageTooLarge;
+}
+
+fn renderGeometryAtDpi(
+    box: reader.PageBox,
+    rotation: render.PageRotation,
+    swaps_dimensions: bool,
+    dpi: u16,
+) !AdaptiveRenderGeometry {
+    const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
+    const unrotated_width = rasterAxisExtent(box.min_x, box.max_x, scale);
+    const unrotated_height = rasterAxisExtent(box.min_y, box.max_y, scale);
+    const width_f = if (swaps_dimensions) unrotated_height else unrotated_width;
+    const height_f = if (swaps_dimensions) unrotated_width else unrotated_height;
+    if (width_f > @as(f64, @floatFromInt(std.math.maxInt(u32))) or
+        height_f > @as(f64, @floatFromInt(std.math.maxInt(u32))))
+        return error.RenderedPageTooLarge;
+    const width: u32 = @intFromFloat(width_f);
+    const height: u32 = @intFromFloat(height_f);
+    return .{
+        .effective_dpi = dpi,
+        .width = width,
+        .height = height,
+        .pixels = @as(u64, width) * @as(u64, height),
+        .rotation = rotation,
+    };
 }
 
 const RenderBatchBudget = struct {
@@ -490,6 +1010,10 @@ const RenderWorkerBudgetAllocator = struct {
     live_bytes: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
+    /// Arena-backed lane scratch does not return physical memory on individual
+    /// frees. Charge it cumulatively until the job finishes; the lane resets
+    /// the arena before releasing its corresponding window charge.
+    account_frees: bool = true,
 
     fn allocator(self: *RenderWorkerBudgetAllocator) Allocator {
         return .{
@@ -536,8 +1060,12 @@ const RenderWorkerBudgetAllocator = struct {
             if (growth > 0) if (self.shared) |shared| shared.release(growth);
             return false;
         }
-        if (memory.len > new_len) if (self.shared) |shared| shared.release(memory.len - new_len);
-        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        if (self.account_frees and memory.len > new_len) {
+            if (self.shared) |shared| shared.release(memory.len - new_len);
+            self.live_bytes -= memory.len - new_len;
+        } else {
+            self.live_bytes += growth;
+        }
         return true;
     }
 
@@ -556,18 +1084,43 @@ const RenderWorkerBudgetAllocator = struct {
             if (growth > 0) if (self.shared) |shared| shared.release(growth);
             return null;
         };
-        if (memory.len > new_len) if (self.shared) |shared| shared.release(memory.len - new_len);
-        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        if (self.account_frees and memory.len > new_len) {
+            if (self.shared) |shared| shared.release(memory.len - new_len);
+            self.live_bytes -= memory.len - new_len;
+        } else {
+            self.live_bytes += growth;
+        }
         return ptr;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *RenderWorkerBudgetAllocator = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(memory, alignment, ret_addr);
-        self.live_bytes -|= memory.len;
+        if (self.account_frees) {
+            self.live_bytes -|= memory.len;
+            if (self.shared) |shared| shared.release(memory.len);
+        }
+    }
+
+    /// Relinquish accounting for an allocation without freeing it. This is
+    /// valid only when ownership moves to a result that uses `backing`
+    /// directly; the budget wrapper itself must never be used to free it
+    /// afterward.
+    fn detachOwned(self: *@This(), memory: []u8) void {
+        std.debug.assert(self.account_frees);
+        std.debug.assert(self.live_bytes >= memory.len);
+        self.live_bytes -= memory.len;
         if (self.shared) |shared| shared.release(memory.len);
     }
+
+    fn releaseAllCharges(self: *@This()) void {
+        std.debug.assert(!self.account_frees);
+        if (self.shared) |shared| shared.release(self.live_bytes);
+        self.live_bytes = 0;
+    }
 };
+
+const RenderBatchOutputKind = enum { png, raster };
 
 const PreparedRenderPage = struct {
     request_index: usize,
@@ -695,9 +1248,14 @@ const CombinedCancellation = struct {
 const PageRenderWorker = struct {
     request: PageRenderRequest,
     profile: RenderProfile,
-    budget: RenderWorkerBudgetAllocator,
+    scratch_budget: RenderWorkerBudgetAllocator,
+    output_budget: RenderWorkerBudgetAllocator,
+    fork_template: *const reader.RenderForkTemplate,
+    shared_budget: *RenderBatchBudget,
     parsed: ?reader.Reader = null,
-    rendered: ?RenderedPagePng = null,
+    output_kind: RenderBatchOutputKind,
+    rendered_png: ?RenderedPagePng = null,
+    rendered_raster: ?RenderedPageRaster = null,
     failure: ?anyerror = null,
     render_elapsed_ns: u64 = 0,
     thread: ?std.Thread = null,
@@ -705,52 +1263,65 @@ const PageRenderWorker = struct {
     planned_geometry: AdaptiveRenderGeometry = undefined,
     thread_control: *RenderBatchThreadControl,
     worker_index: usize,
-    task_initialized: bool = false,
+    task_configured: bool = false,
+    scratch_initialized: bool = false,
     compatibility_session: ?*CompatibilityRenderSession = null,
 
     fn initBase(self: *PageRenderWorker, thread_control: *RenderBatchThreadControl, worker_index: usize) void {
         self.* = .{
             .request = undefined,
             .profile = undefined,
-            .budget = undefined,
+            .scratch_budget = undefined,
+            .output_budget = undefined,
+            .fork_template = undefined,
+            .shared_budget = undefined,
+            .output_kind = undefined,
             .thread_control = thread_control,
             .worker_index = worker_index,
         };
     }
 
-    fn prepare(self: *PageRenderWorker, source: *reader.Reader, prepared: PreparedRenderPage, profile: RenderProfile, wave_control: *RenderWaveControl, shared_budget: *RenderBatchBudget, compatibility_session: ?*CompatibilityRenderSession) !void {
-        std.debug.assert(!self.task_initialized);
+    fn configure(self: *PageRenderWorker, fork_template: *const reader.RenderForkTemplate, prepared: PreparedRenderPage, profile: RenderProfile, output_kind: RenderBatchOutputKind, wave_control: *RenderWaveControl, shared_budget: *RenderBatchBudget, output_allocator: ?Allocator, max_retained_output_bytes: usize, compatibility_session: ?*CompatibilityRenderSession) void {
+        std.debug.assert(!self.task_configured);
         std.debug.assert(self.parsed == null);
         self.request = prepared.request;
         self.profile = profile;
-        self.budget = .{
-            .backing = std.heap.page_allocator,
-            .shared = shared_budget,
-            // The batch-wide allocator is the hard aggregate boundary. Wave
-            // admission reserves each task's full decode working set, so a
-            // complex page may use the aggregate ceiling without retaining
-            // mutable caches after the task completes.
-            .max_live_bytes = shared_budget.max_live_bytes,
+        self.output_kind = output_kind;
+        self.fork_template = fork_template;
+        self.shared_budget = shared_budget;
+        self.output_budget = .{
+            .backing = output_allocator orelse std.heap.page_allocator,
+            // Direct retained output is charged by the caller's concurrent
+            // allocator. Compatibility output remains part of the renderer's
+            // physical batch budget until it is copied on the caller thread.
+            .shared = if (output_allocator == null) shared_budget else null,
+            // Both choices retain a hard aggregate boundary: the shared render
+            // budget for compatibility output, or the caller's thread-safe
+            // window allocator for direct retained output.
+            .max_live_bytes = if (output_allocator == null)
+                shared_budget.max_live_bytes
+            else
+                max_retained_output_bytes,
         };
-        self.parsed = try source.forkForRendering(self.budget.allocator(), wave_control.probe());
         self.wave_control = wave_control;
         self.compatibility_session = compatibility_session;
         self.planned_geometry = prepared.geometry;
-        self.rendered = null;
+        self.rendered_png = null;
+        self.rendered_raster = null;
         self.failure = null;
         self.render_elapsed_ns = 0;
-        self.task_initialized = true;
-        errdefer self.deinitTask();
+        self.task_configured = true;
     }
 
     fn deinitTask(self: *PageRenderWorker) void {
-        if (self.task_initialized) {
-            if (self.rendered) |*rendered| rendered.deinit(self.budget.allocator());
+        self.deinitScratch();
+        if (self.task_configured) {
+            if (self.rendered_png) |*rendered| rendered.deinit(self.output_budget.allocator());
+            if (self.rendered_raster) |*rendered| rendered.deinit(self.output_budget.allocator());
         }
-        self.rendered = null;
-        if (self.parsed) |*parsed| parsed.deinit();
-        self.parsed = null;
-        self.task_initialized = false;
+        self.rendered_png = null;
+        self.rendered_raster = null;
+        self.task_configured = false;
     }
 
     fn deinitLane(self: *PageRenderWorker) void {
@@ -770,6 +1341,30 @@ const PageRenderWorker = struct {
     }
 
     fn runPrepared(self: *PageRenderWorker) void {
+        self.runWithScratch(std.heap.page_allocator, false);
+    }
+
+    fn runOnExecutor(context: *anyopaque, scratch: Allocator) void {
+        const self: *PageRenderWorker = @ptrCast(@alignCast(context));
+        self.runWithScratch(scratch, true);
+    }
+
+    fn runWithScratch(self: *PageRenderWorker, scratch: Allocator, cumulative_accounting: bool) void {
+        std.debug.assert(self.task_configured);
+        std.debug.assert(!self.scratch_initialized);
+        self.scratch_budget = .{
+            .backing = scratch,
+            .shared = self.shared_budget,
+            .max_live_bytes = self.shared_budget.max_live_bytes,
+            .account_frees = !cumulative_accounting,
+        };
+        self.parsed = self.fork_template.instantiate(self.scratch_budget.allocator(), self.wave_control.probe()) catch |err| {
+            self.recordRenderFailure(err);
+            if (cumulative_accounting) self.scratch_budget.releaseAllCharges();
+            return;
+        };
+        self.scratch_initialized = true;
+        defer self.deinitScratch();
         self.wave_control.probe().check() catch {
             self.failure = error.Canceled;
             return;
@@ -781,9 +1376,35 @@ const PageRenderWorker = struct {
             const finished_ns = monotonicNowNs();
             self.render_elapsed_ns = finished_ns -| render_started_ns;
         }
+        switch (self.output_kind) {
+            .png => self.runPreparedPng(),
+            .raster => self.runPreparedRaster(),
+        }
+    }
+
+    fn deinitScratch(self: *PageRenderWorker) void {
+        if (!self.scratch_initialized) return;
+        if (self.parsed) |*parsed| parsed.deinit();
+        self.parsed = null;
+        if (!self.scratch_budget.account_frees) self.scratch_budget.releaseAllCharges();
+        self.scratch_initialized = false;
+    }
+
+    fn recordRenderFailure(self: *PageRenderWorker, err: anyerror) void {
+        self.failure = if (err == error.OutOfMemory and
+            (self.scratch_budget.limit_exceeded or self.output_budget.limit_exceeded))
+            error.RenderWorkerMemoryLimitExceeded
+        else
+            err;
+        if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
+            self.wave_control.stop();
+    }
+
+    fn runPreparedRaster(self: *PageRenderWorker) void {
         const request = self.request;
-        var rendered = renderParsedPagePngWithGeometryAlloc(
-            self.budget.allocator(),
+        const rendered = renderParsedPageRasterWithGeometryAllocators(
+            self.scratch_budget.allocator(),
+            self.output_budget.allocator(),
             &self.parsed.?,
             request.page_number,
             request.requested_dpi,
@@ -792,26 +1413,46 @@ const PageRenderWorker = struct {
             self.profile,
             self.compatibility_session,
         ) catch |err| {
-            self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
-                error.RenderWorkerMemoryLimitExceeded
-            else
-                err;
-            if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
-                self.wave_control.stop();
+            self.recordRenderFailure(err);
+            return;
+        };
+        if (request.max_output_bytes) |limit| if (rendered.bytes.len > limit) {
+            var oversized = rendered;
+            oversized.deinit(self.output_budget.allocator());
+            self.failure = error.RenderedPageOutputTooLarge;
+            return;
+        };
+        self.rendered_raster = rendered;
+    }
+
+    fn runPreparedPng(self: *PageRenderWorker) void {
+        const request = self.request;
+        var rendered = renderParsedPagePngWithGeometryAllocators(
+            self.scratch_budget.allocator(),
+            self.output_budget.allocator(),
+            &self.parsed.?,
+            request.page_number,
+            request.requested_dpi,
+            request.max_pixels,
+            self.planned_geometry,
+            self.profile,
+            self.compatibility_session,
+        ) catch |err| {
+            self.recordRenderFailure(err);
             return;
         };
         const output_limit = request.max_output_bytes orelse {
-            self.rendered = rendered;
+            self.rendered_png = rendered;
             return;
         };
         if (rendered.png.len <= output_limit) {
-            self.rendered = rendered;
+            self.rendered_png = rendered;
             return;
         }
         const minimum = @max(@as(u32, 1), request.min_output_dimension);
         const rendered_dimension = @max(rendered.width, rendered.height);
         if (request.max_output_attempts <= 1 or rendered_dimension <= minimum) {
-            rendered.deinit(self.budget.allocator());
+            rendered.deinit(self.output_budget.allocator());
             self.failure = error.RenderedPageOutputTooLarge;
             return;
         }
@@ -820,19 +1461,14 @@ const PageRenderWorker = struct {
         const previous_png = rendered.png;
         rendered.png = &.{};
         const resized = render.resizeOwnedPngToOutputLimitAlloc(
-            self.budget.allocator(),
+            self.output_budget.allocator(),
             previous_png,
             output_limit,
             minimum,
             request.max_output_attempts - 1,
             self.wave_control.probe(),
         ) catch |err| {
-            self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
-                error.RenderWorkerMemoryLimitExceeded
-            else
-                err;
-            if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
-                self.wave_control.stop();
+            self.recordRenderFailure(err);
             return;
         };
         rendered.png = resized.png;
@@ -842,7 +1478,7 @@ const PageRenderWorker = struct {
             1,
             @as(u16, @intCast((@as(u64, previous_effective_dpi) * @max(resized.width, resized.height)) / rendered_dimension)),
         );
-        self.rendered = rendered;
+        self.rendered_png = rendered;
     }
 };
 
@@ -865,7 +1501,9 @@ fn renderPageReservedBytes(parsed: *const reader.Reader, pixels: u64, options: P
 fn prepareRenderPageForAdmission(
     parsed: *reader.Reader,
     request: PageRenderRequest,
+    planned_geometry: ?AdaptiveRenderGeometry,
     options: PageRenderBatchOptions,
+    output_kind: RenderBatchOutputKind,
     request_index: usize,
 ) !PreparedRenderPage {
     const fixed_bytes = std.math.add(
@@ -879,6 +1517,14 @@ fn prepareRenderPageForAdmission(
     if (memory_pixels == 0) return error.RenderBatchAdmissionExceeded;
 
     var adjusted = request;
+    if (output_kind == .raster) if (request.max_output_bytes) |output_limit| {
+        const retained_pixels = output_limit / PixelFormat.rgba8.bytesPerPixel();
+        if (retained_pixels == 0) return error.RenderedPageOutputTooLarge;
+        adjusted.max_pixels = @min(
+            adjusted.max_pixels,
+            std.math.cast(u64, retained_pixels) orelse std.math.maxInt(u64),
+        );
+    };
     adjusted.max_pixels = @min(
         adjusted.max_pixels,
         @min(
@@ -886,12 +1532,23 @@ fn prepareRenderPageForAdmission(
             std.math.cast(u64, memory_pixels) orelse std.math.maxInt(u64),
         ),
     );
-    const geometry = try adaptiveRenderGeometry(parsed, adjusted);
+    const geometry = if (planned_geometry) |planned|
+        if (planned.pixels <= adjusted.max_pixels and
+            planned.width <= adjusted.max_dimension and
+            planned.height <= adjusted.max_dimension)
+            planned
+        else
+            try adaptiveRenderGeometry(parsed, adjusted)
+    else
+        try adaptiveRenderGeometry(parsed, adjusted);
     const admitted_bytes = try renderPageReservedBytes(parsed, geometry.pixels, options);
     const worker_limit_bytes = std.math.add(usize, admitted_bytes, parsed.decode_limits.max_working_set_bytes) catch
         return error.RenderBatchAdmissionExceeded;
     if (geometry.pixels > options.max_inflight_pixels or worker_limit_bytes > options.max_inflight_bytes)
         return error.RenderBatchAdmissionExceeded;
+    if (output_kind == .raster and request.max_output_bytes != null and
+        @max(geometry.width, geometry.height) < @max(@as(u32, 1), request.min_output_dimension))
+        return error.RenderedPageOutputTooLarge;
     return .{
         .request_index = request_index,
         .request = adjusted,
@@ -914,13 +1571,70 @@ pub fn renderParsedPagesBatchAlloc(
     requests: []const PageRenderRequest,
     options: PageRenderBatchOptions,
 ) !RenderedPageBatch {
+    return renderParsedPageWorkBatchAlloc(.png, alloc, parsed, requests, null, options);
+}
+
+/// Execute page plans previously resolved against `parsed`. This is the
+/// planner-facing batch entry point: admission still narrows geometry if its
+/// aggregate byte/pixel ceilings require it, but the ordinary path does not
+/// repeat page-box and rotation discovery.
+pub fn renderPreparedPagesBatchAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    plans: []const PreparedPageRenderPlan,
+    options: PageRenderBatchOptions,
+) !RenderedPageBatch {
+    for (plans) |plan| if (!plan.matchesSource(parsed))
+        return error.PreparedPageRenderSourceMismatch;
+    return renderParsedPageWorkBatchAlloc(.png, alloc, parsed, &.{}, plans, options);
+}
+
+/// Raw-raster variant of `renderParsedPagesBatchAlloc`. Results retain only
+/// owned RGBA bytes and metadata; worker readers, renderer plans, and decode
+/// scratch are released at the end of each admitted wave.
+pub fn renderParsedPagesRasterBatchAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    requests: []const PageRenderRequest,
+    options: PageRenderBatchOptions,
+) !RenderedPageRasterBatch {
+    return renderParsedPageWorkBatchAlloc(.raster, alloc, parsed, requests, null, options);
+}
+
+pub fn renderPreparedPagesRasterBatchAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    plans: []const PreparedPageRenderPlan,
+    options: PageRenderBatchOptions,
+) !RenderedPageRasterBatch {
+    for (plans) |plan| if (!plan.matchesSource(parsed))
+        return error.PreparedPageRenderSourceMismatch;
+    return renderParsedPageWorkBatchAlloc(.raster, alloc, parsed, &.{}, plans, options);
+}
+
+fn renderParsedPageWorkBatchAlloc(
+    comptime output_kind: RenderBatchOutputKind,
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    requests: []const PageRenderRequest,
+    prepared_plans: ?[]const PreparedPageRenderPlan,
+    options: PageRenderBatchOptions,
+) !(if (output_kind == .png) RenderedPageBatch else RenderedPageRasterBatch) {
     if (options.max_batch_pages == 0 or options.max_parallel_pages == 0 or
         options.max_inflight_pixels == 0 or options.max_inflight_bytes == 0 or
-        options.max_retained_png_bytes == 0 or options.bytes_per_pixel_reserve < 4)
+        (output_kind == .png and options.max_retained_png_bytes == 0) or
+        (output_kind == .raster and options.max_retained_raster_bytes == 0) or
+        options.bytes_per_pixel_reserve < 4 or
+        (options.executor != null and options.executor.?.concurrent_capacity == 0) or
+        (options.executor != null and options.executor_io != null) or
+        (options.concurrent_output_allocator != null and
+            (options.executor == null or
+                !allocatorsEqual(alloc, options.concurrent_output_allocator.?))))
     {
         return error.InvalidRenderBatchOptions;
     }
-    if (requests.len > options.max_batch_pages) return error.RenderBatchTooLarge;
+    const request_count = if (prepared_plans) |plans| plans.len else requests.len;
+    if (request_count > options.max_batch_pages) return error.RenderBatchTooLarge;
     const source_cancellation = parsed.cancellationProbe();
     const combined_cancellation = CombinedCancellation{
         .source = source_cancellation,
@@ -934,33 +1648,63 @@ pub fn renderParsedPagesBatchAlloc(
     parsed.setCancellationProbe(cancellation);
     defer parsed.setCancellationProbe(source_cancellation);
 
-    const results = try alloc.alloc(PageRenderResult, requests.len);
+    const Result = if (output_kind == .png) PageRenderResult else PageRasterResult;
+    const results = try alloc.alloc(Result, request_count);
     var initialized_results: usize = 0;
     errdefer {
         for (results[0..initialized_results]) |*result| result.deinit(alloc);
         alloc.free(results);
     }
-    for (requests, 0..) |request, i| {
+    for (0..request_count) |i| {
+        const request = if (prepared_plans) |plans| plans[i]._request else requests[i];
         results[i] = .{ .page_number = request.page_number };
         initialized_results += 1;
     }
 
-    const prepared = try alloc.alloc(?PreparedRenderPage, requests.len);
+    const prepared = try alloc.alloc(?PreparedRenderPage, request_count);
     defer alloc.free(prepared);
     @memset(prepared, null);
-    for (requests, 0..) |request, i| {
-        prepared[i] = prepareRenderPageForAdmission(parsed, request, options, i) catch |err| {
+    for (0..request_count) |i| {
+        const request = if (prepared_plans) |plans| plans[i]._request else requests[i];
+        const geometry = if (prepared_plans) |plans| plans[i]._geometry else null;
+        prepared[i] = prepareRenderPageForAdmission(parsed, request, geometry, options, output_kind, i) catch |err| {
             results[i].failure = err;
             continue;
         };
     }
 
-    const worker_capacity = @min(options.max_parallel_pages, requests.len);
+    // Freeze the source Reader after every serial preflight lookup and before
+    // any worker is dispatched. Worker-local Readers are instantiated only
+    // from this immutable snapshot, so renderer threads never race lazy page
+    // discovery or encrypted-stream bookkeeping on `parsed`. Document-scoped
+    // callers may retain the snapshot across windows; ordinary callers keep a
+    // compatibility-local snapshot for this invocation.
+    var local_render_fork_template: ?reader.RenderForkTemplate = null;
+    defer if (local_render_fork_template) |*template| template.deinit();
+    const render_fork_template: *const reader.RenderForkTemplate = if (options.fork_template) |template| blk: {
+        try template.refreshFrom(parsed, cancellation);
+        break :blk template;
+    } else blk: {
+        local_render_fork_template = try parsed.prepareRenderForkTemplate(alloc, cancellation);
+        break :blk &local_render_fork_template.?;
+    };
+
+    const requested_worker_capacity = @min(options.max_parallel_pages, request_count);
+    const worker_capacity = if (options.executor) |executor|
+        @min(requested_worker_capacity, executor.concurrent_capacity)
+    else
+        requested_worker_capacity;
     const workers = try alloc.alloc(PageRenderWorker, worker_capacity);
     defer alloc.free(workers);
     const wave = try alloc.alloc(PreparedRenderPage, worker_capacity);
     defer alloc.free(wave);
+    const executor_contexts = try alloc.alloc(*anyopaque, worker_capacity);
+    defer alloc.free(executor_contexts);
     var shared_budget = RenderBatchBudget{ .max_live_bytes = options.max_inflight_bytes };
+    const max_retained_output_bytes = if (output_kind == .png)
+        options.max_retained_png_bytes
+    else
+        options.max_retained_raster_bytes;
     var compatibility_session: CompatibilityRenderSession = if (builtin.os.tag == .macos)
         darwin_render.SharedSession.init(parsed.sourceBytes())
     else
@@ -971,7 +1715,7 @@ pub fn renderParsedPagesBatchAlloc(
     for (workers, 0..) |*worker, i| worker.initBase(&thread_control, i);
     var thread_spawn_fallbacks: usize = 0;
     var spawned_workers: usize = 0;
-    if (worker_capacity > 1 and options.executor_io == null) {
+    if (worker_capacity > 1 and options.executor == null and options.executor_io == null) {
         for (workers) |*worker| {
             worker.thread = std.Thread.spawn(.{}, PageRenderWorker.threadMain, .{worker}) catch blk: {
                 thread_spawn_fallbacks += 1;
@@ -989,17 +1733,17 @@ pub fn renderParsedPagesBatchAlloc(
     }
 
     var next_request: usize = 0;
-    var retained_png_bytes: usize = 0;
+    var retained_output_bytes: usize = 0;
     var peak_launched_workers: usize = 0;
     var peak_parallelism: usize = 0;
     var peak_admitted_pixels: u64 = 0;
     var peak_admitted_bytes: usize = 0;
-    while (next_request < requests.len) {
+    while (next_request < request_count) {
         try cancellation.check();
         var wave_len: usize = 0;
         var wave_pixels: u64 = 0;
         var wave_bytes: usize = 0;
-        while (next_request < requests.len and wave_len < worker_capacity) : (next_request += 1) {
+        while (next_request < request_count and wave_len < worker_capacity) : (next_request += 1) {
             const candidate = prepared[next_request] orelse continue;
             const next_pixels = std.math.add(u64, wave_pixels, candidate.pixels) catch break;
             // Account for the raster/fork reservation and the page's bounded
@@ -1023,18 +1767,30 @@ pub fn renderParsedPagesBatchAlloc(
             for (workers[0..initialized_workers]) |*worker| worker.deinitTask();
         }
         for (wave[0..wave_len], 0..) |candidate, i| {
-            try workers[i].prepare(
-                parsed,
+            workers[i].configure(
+                render_fork_template,
                 candidate,
                 options.profile,
+                output_kind,
                 &wave_control,
                 &shared_budget,
+                options.concurrent_output_allocator,
+                max_retained_output_bytes,
                 &compatibility_session,
             );
             initialized_workers += 1;
         }
 
-        if (options.executor_io) |io| {
+        if (options.executor) |executor| {
+            for (workers[0..wave_len], executor_contexts[0..wave_len]) |*worker, *context|
+                context.* = @ptrCast(worker);
+            _ = try executor.runBatch(
+                executor_contexts[0..wave_len],
+                PageRenderWorker.runOnExecutor,
+                options.max_inflight_bytes,
+            );
+            peak_launched_workers = @max(peak_launched_workers, wave_len);
+        } else if (options.executor_io) |io| {
             var group: std.Io.Group = .init;
             errdefer group.cancel(io);
             for (workers[0 .. wave_len - 1]) |*worker|
@@ -1067,20 +1823,47 @@ pub fn renderParsedPagesBatchAlloc(
                 results[candidate.request_index].failure = err;
                 continue;
             }
-            const rendered = worker.rendered.?;
-            const next_retained = std.math.add(usize, retained_png_bytes, rendered.png.len) catch return error.RenderBatchRetainedBytesExceeded;
-            if (next_retained > options.max_retained_png_bytes) return error.RenderBatchRetainedBytesExceeded;
-            const owned_png = try alloc.dupe(u8, rendered.png);
-            results[candidate.request_index].rendered = .{
-                .png = owned_png,
-                .requested_dpi = rendered.requested_dpi,
-                .effective_dpi = rendered.effective_dpi,
-                .width = rendered.width,
-                .height = rendered.height,
-                .quality = rendered.quality,
-                .diagnostics = rendered.diagnostics,
-            };
-            retained_png_bytes = next_retained;
+            if (output_kind == .png) {
+                const rendered = worker.rendered_png.?;
+                const next_retained = std.math.add(usize, retained_output_bytes, rendered.png.len) catch return error.RenderBatchRetainedBytesExceeded;
+                if (next_retained > options.max_retained_png_bytes) return error.RenderBatchRetainedBytesExceeded;
+                const owned_png = if (allocatorsEqual(alloc, worker.output_budget.backing)) blk: {
+                    worker.output_budget.detachOwned(rendered.png);
+                    worker.rendered_png = null;
+                    break :blk rendered.png;
+                } else try alloc.dupe(u8, rendered.png);
+                results[candidate.request_index].rendered = .{
+                    .png = owned_png,
+                    .requested_dpi = rendered.requested_dpi,
+                    .effective_dpi = rendered.effective_dpi,
+                    .width = rendered.width,
+                    .height = rendered.height,
+                    .quality = rendered.quality,
+                    .diagnostics = rendered.diagnostics,
+                };
+                retained_output_bytes = next_retained;
+            } else {
+                const rendered = worker.rendered_raster.?;
+                const next_retained = std.math.add(usize, retained_output_bytes, rendered.bytes.len) catch return error.RenderBatchRetainedBytesExceeded;
+                if (next_retained > options.max_retained_raster_bytes) return error.RenderBatchRetainedBytesExceeded;
+                const owned_bytes = if (allocatorsEqual(alloc, worker.output_budget.backing)) blk: {
+                    worker.output_budget.detachOwned(rendered.bytes);
+                    worker.rendered_raster = null;
+                    break :blk rendered.bytes;
+                } else try alloc.dupe(u8, rendered.bytes);
+                results[candidate.request_index].rendered = .{
+                    .bytes = owned_bytes,
+                    .pixel_format = rendered.pixel_format,
+                    .width = rendered.width,
+                    .height = rendered.height,
+                    .stride = rendered.stride,
+                    .requested_dpi = rendered.requested_dpi,
+                    .effective_dpi = rendered.effective_dpi,
+                    .quality = rendered.quality,
+                    .diagnostics = rendered.diagnostics,
+                };
+                retained_output_bytes = next_retained;
+            }
         }
     }
 
@@ -1093,6 +1876,10 @@ pub fn renderParsedPagesBatchAlloc(
         .peak_admitted_bytes = peak_admitted_bytes,
         .thread_spawn_fallbacks = thread_spawn_fallbacks,
     };
+}
+
+fn allocatorsEqual(a: Allocator, b: Allocator) bool {
+    return a.ptr == b.ptr and a.vtable == b.vtable;
 }
 
 fn scaleBox(box: *reader.PageBox, scale: f64) void {
@@ -1238,6 +2025,71 @@ test "raster extents include fractional crop-box edges" {
     try std.testing.expectApproxEqAbs(0.999991667, scaled.min_y, 0.000001);
     try std.testing.expectApproxEqAbs(1241.500002083, scaled.max_x, 0.000001);
     try std.testing.expectApproxEqAbs(1754.999991667, scaled.max_y, 0.000001);
+}
+
+test "direct adaptive geometry matches exhaustive DPI selection" {
+    const Case = struct {
+        box: reader.PageBox,
+        rotation: render.PageRotation,
+        request: PageRenderRequest,
+    };
+    const cases = [_]Case{
+        .{
+            .box = .{ .min_x = 0.720001, .min_y = 0.479996, .max_x = 595.92, .max_y = 842.16 },
+            .rotation = .none,
+            .request = .{ .page_number = 1, .requested_dpi = 150, .max_pixels = 40_000_000, .max_dimension = 1000 },
+        },
+        .{
+            .box = .{ .min_x = -12.25, .min_y = 3.75, .max_x = 599.9, .max_y = 795.125 },
+            .rotation = .clockwise_90,
+            .request = .{ .page_number = 1, .requested_dpi = 600, .max_pixels = 1_000_000, .max_dimension = 4096 },
+        },
+        .{
+            // A very thin page exercises ceil-to-one-pixel behavior, where a
+            // square-root area estimate would be unnecessarily conservative.
+            .box = .{ .min_x = 0, .min_y = 0, .max_x = 720, .max_y = 0.01 },
+            .rotation = .clockwise_270,
+            .request = .{ .page_number = 1, .requested_dpi = 600, .max_pixels = 7000, .max_dimension = 7000 },
+        },
+        .{
+            .box = .{ .min_x = 0, .min_y = 0, .max_x = 595, .max_y = 842 },
+            .rotation = .none,
+            .request = .{ .page_number = 1, .requested_dpi = 72, .max_pixels = 64, .max_dimension = 8 },
+        },
+    };
+
+    for (cases) |case| {
+        const swaps_dimensions = case.rotation == .clockwise_90 or case.rotation == .clockwise_270;
+        var expected: ?AdaptiveRenderGeometry = null;
+        var dpi = case.request.requested_dpi;
+        while (true) {
+            if (renderGeometryAtDpi(case.box, case.rotation, swaps_dimensions, dpi)) |geometry| {
+                if (geometry.width <= case.request.max_dimension and
+                    geometry.height <= case.request.max_dimension and
+                    geometry.pixels <= case.request.max_pixels)
+                {
+                    expected = geometry;
+                    break;
+                }
+            } else |_| {}
+            if (dpi == minimum_direct_render_dpi) break;
+            dpi -= 1;
+        }
+
+        if (expected) |want| {
+            const got = try adaptiveRenderGeometryForBox(case.box, case.rotation, swaps_dimensions, case.request);
+            try std.testing.expectEqual(want.effective_dpi, got.effective_dpi);
+            try std.testing.expectEqual(want.width, got.width);
+            try std.testing.expectEqual(want.height, got.height);
+            try std.testing.expectEqual(want.pixels, got.pixels);
+            try std.testing.expectEqual(want.rotation, got.rotation);
+        } else {
+            try std.testing.expectError(
+                error.RenderedPageTooLarge,
+                adaptiveRenderGeometryForBox(case.box, case.rotation, swaps_dimensions, case.request),
+            );
+        }
+    }
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
@@ -3490,6 +4342,69 @@ test {
     _ = render;
 }
 
+/// Test allocator that records page-sized allocations while serializing an
+/// otherwise task-local backing allocator. A zero-copy result must be the one
+/// large allocation made by the render worker, not a caller-thread duplicate.
+const LargeAllocationTrackingAllocator = struct {
+    backing: Allocator,
+    threshold: usize,
+    mutex: std.atomic.Mutex = .unlocked,
+    large_allocations: usize = 0,
+    first_large_ptr: usize = 0,
+
+    fn allocator(self: *@This()) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        if (len >= self.threshold) {
+            self.large_allocations += 1;
+            if (self.first_large_ptr == 0) self.first_large_ptr = @intFromPtr(ptr);
+        }
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (memory.len >= self.threshold and self.first_large_ptr == @intFromPtr(memory.ptr))
+            self.first_large_ptr = @intFromPtr(ptr);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 test "native page renderer honors OCR DPI and pixel guard" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
@@ -3542,6 +4457,46 @@ test "adaptive OCR rendering records effective DPI and enforces safety caps" {
     try std.testing.expect(compact.height <= 400);
     try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
     try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
+}
+
+test "adaptive raster rendering exposes the native RGBA layout without PNG loss" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    var raster_reader = try reader.Reader.init(alloc, fixture);
+    defer raster_reader.deinit();
+    var raster = try renderParsedPageRasterAdaptiveWithProfileAlloc(
+        alloc,
+        &raster_reader,
+        1,
+        150,
+        40_000_000,
+        1000,
+        .ocr,
+    );
+    defer raster.deinit(alloc);
+
+    try std.testing.expectEqual(PixelFormat.rgba8, raster.pixel_format);
+    try std.testing.expectEqual(@as(usize, raster.width) * 4, raster.stride);
+    try std.testing.expectEqual(raster.stride * raster.height, raster.bytes.len);
+
+    var png_reader = try reader.Reader.init(alloc, fixture);
+    defer png_reader.deinit();
+    var png = try renderParsedPagePngAdaptiveWithProfileAlloc(
+        alloc,
+        &png_reader,
+        1,
+        150,
+        40_000_000,
+        1000,
+        .ocr,
+    );
+    defer png.deinit(alloc);
+    const decoded = try image.png.decodeRgba(alloc, png.png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(png.width, raster.width);
+    try std.testing.expectEqual(png.height, raster.height);
+    try std.testing.expectEqual(png.effective_dpi, raster.effective_dpi);
+    try std.testing.expectEqualSlices(u8, decoded.rgba, raster.bytes);
 }
 
 test "OCR DPI scaling maps tiling patterns exactly once" {
@@ -3621,15 +4576,18 @@ test "render forks isolate mutable state across concurrent pages" {
     var parsed = try reader.Reader.init(std.testing.allocator, fixture);
     defer parsed.deinit();
 
-    // Fork construction is intentionally serial. Each worker receives an
-    // allocator that no other render thread touches.
+    // Source preparation is intentionally serial. Each worker then
+    // instantiates from the immutable template with an allocator that no
+    // other render thread touches.
+    var fork_template = try parsed.prepareRenderForkTemplate(std.testing.allocator, .{});
+    defer fork_template.deinit();
     var first_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer first_arena.deinit();
     var second_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer second_arena.deinit();
-    var first_fork = try parsed.forkForRendering(first_arena.allocator(), .{});
+    var first_fork = try fork_template.instantiate(first_arena.allocator(), .{});
     defer first_fork.deinit();
-    var second_fork = try parsed.forkForRendering(second_arena.allocator(), .{});
+    var second_fork = try fork_template.instantiate(second_arena.allocator(), .{});
     defer second_fork.deinit();
     try std.testing.expect(!first_fork.owns_document_metadata);
     try std.testing.expect(!second_fork.owns_document_metadata);
@@ -3691,6 +4649,61 @@ test "render forks isolate mutable state across concurrent pages" {
     try std.testing.expect(std.mem.indexOf(u8, source_text, "FIRST PAGE") != null);
 }
 
+test "immutable render fork template supports concurrent encrypted readers" {
+    if (comptime builtin.single_threaded) return;
+    const fixture = @embedFile("../testdata/rc4_40_empty_password_fixture.pdf");
+    var parsed = try reader.Reader.init(std.testing.allocator, fixture);
+    defer parsed.deinit();
+
+    // Force lazy encrypted-stream discovery on the source before freezing it.
+    // Workers must copy that state from the immutable snapshot without ever
+    // iterating or mutating the source Reader's map.
+    const source_text = try parsed.extractPageTextAlloc(1);
+    defer std.testing.allocator.free(source_text);
+    try std.testing.expectEqualStrings("Hello RC4-40", std.mem.trim(u8, source_text, &std.ascii.whitespace));
+    var fork_template = try parsed.prepareRenderForkTemplate(std.testing.allocator, .{});
+    defer fork_template.deinit();
+
+    const Worker = struct {
+        template: *const reader.RenderForkTemplate,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            for (0..8) |_| {
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                var fork = self.template.instantiate(arena.allocator(), .{}) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer fork.deinit();
+                const text = fork.extractPageTextAlloc(1) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                defer arena.allocator().free(text);
+                if (!std.mem.eql(u8, "Hello RC4-40", std.mem.trim(u8, text, &std.ascii.whitespace))) {
+                    self.failure = error.UnexpectedEncryptedPageText;
+                    return;
+                }
+            }
+        }
+    };
+
+    const worker_count = 4;
+    var workers = [_]Worker{.{ .template = &fork_template }} ** worker_count;
+    var threads: [worker_count]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker|
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    for (threads) |thread| thread.join();
+    for (workers) |worker| if (worker.failure) |err| return err;
+
+    // The original Reader remains usable after concurrent template work.
+    const repeated_source_text = try parsed.extractPageTextAlloc(1);
+    defer std.testing.allocator.free(repeated_source_text);
+    try std.testing.expectEqualStrings("Hello RC4-40", std.mem.trim(u8, repeated_source_text, &std.ascii.whitespace));
+}
+
 test "bounded render batch preserves order and isolates page failures" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
@@ -3723,6 +4736,108 @@ test "bounded render batch preserves order and isolates page failures" {
     try std.testing.expect(batch.peak_admitted_pixels > 0);
     try std.testing.expect(batch.peak_admitted_bytes > 0);
     try std.testing.expect(!std.mem.eql(u8, batch.results[0].rendered.?.png, batch.results[2].rendered.?.png));
+}
+
+test "bounded raw raster batch preserves order, plans, and output byte limits" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{
+        .{ .page_number = 2, .requested_dpi = 150, .max_dimension = 1200, .max_output_bytes = 100_000 },
+        .{ .page_number = 99 },
+        .{ .page_number = 1, .requested_dpi = 150, .max_dimension = 1200, .max_output_bytes = 100_000 },
+    };
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var batch = try renderParsedPagesRasterBatchAlloc(alloc, &parsed, &requests, .{
+        .max_batch_pages = requests.len,
+        .max_parallel_pages = 2,
+        .max_retained_raster_bytes = 200_000,
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), batch.results.len);
+    try std.testing.expect(batch.results[1].rendered == null);
+    try std.testing.expect(batch.results[1].failure.? == error.InvalidPageNumber);
+    for ([_]usize{ 0, 2 }) |index| {
+        const rendered = batch.results[index].rendered.?;
+        try std.testing.expect(batch.results[index].failure == null);
+        try std.testing.expectEqual(PixelFormat.rgba8, rendered.pixel_format);
+        try std.testing.expectEqual(@as(usize, rendered.width) * 4, rendered.stride);
+        try std.testing.expectEqual(rendered.stride * rendered.height, rendered.bytes.len);
+        try std.testing.expect(rendered.bytes.len <= requests[index].max_output_bytes.?);
+        try std.testing.expect(rendered.effective_dpi < rendered.requested_dpi);
+    }
+    try std.testing.expect(!std.mem.eql(u8, batch.results[0].rendered.?.bytes, batch.results[2].rendered.?.bytes));
+
+    const plan_requests = [_]PageRenderRequest{
+        .{ .page_number = 2, .requested_dpi = 72, .max_dimension = 96 },
+        .{ .page_number = 1, .requested_dpi = 72, .max_dimension = 96 },
+    };
+    var plans: [plan_requests.len]PreparedPageRenderPlan = undefined;
+    for (plan_requests, 0..) |request, i| plans[i] = try prepareParsedPageRenderPlan(&parsed, request);
+    var prepared = try renderPreparedPagesRasterBatchAlloc(alloc, &parsed, &plans, .{
+        .max_batch_pages = plans.len,
+        .max_parallel_pages = 1,
+        .max_retained_raster_bytes = 96 * 96 * 4 * plans.len,
+    });
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), prepared.results.len);
+    try std.testing.expectEqual(@as(usize, 2), prepared.results[0].page_number);
+    try std.testing.expectEqual(@as(usize, 1), prepared.results[1].page_number);
+    for (prepared.results) |result| {
+        try std.testing.expect(result.failure == null);
+        try std.testing.expect(result.rendered != null);
+    }
+}
+
+test "prepared page plans preserve batch output and reject another source" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{
+        .{ .page_number = 2, .requested_dpi = 150, .max_dimension = 1200 },
+        .{ .page_number = 1, .requested_dpi = 150, .max_dimension = 1200 },
+    };
+
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var plans: [requests.len]PreparedPageRenderPlan = undefined;
+    for (requests, 0..) |request, i| plans[i] = try prepareParsedPageRenderPlan(&parsed, request);
+    for (plans, requests) |plan, request| {
+        try std.testing.expectEqual(request.page_number, plan.request().page_number);
+        try std.testing.expect(plan.geometry().pixels > 0);
+    }
+    const capped_plan = plans[0].withMaxOutputBytes(1234);
+    try std.testing.expectEqual(@as(?usize, 1234), capped_plan.request().max_output_bytes);
+    try std.testing.expectEqual(plans[0].geometry(), capped_plan.geometry());
+    try std.testing.expectEqual(requests[0].max_output_bytes, plans[0].request().max_output_bytes);
+
+    var prepared_batch = try renderPreparedPagesBatchAlloc(alloc, &parsed, &plans, .{
+        .max_batch_pages = plans.len,
+        .max_parallel_pages = 2,
+    });
+    defer prepared_batch.deinit(alloc);
+
+    var ordinary_reader = try reader.Reader.init(alloc, fixture);
+    defer ordinary_reader.deinit();
+    var ordinary_batch = try renderParsedPagesBatchAlloc(alloc, &ordinary_reader, &requests, .{
+        .max_batch_pages = requests.len,
+        .max_parallel_pages = 2,
+    });
+    defer ordinary_batch.deinit(alloc);
+    for (prepared_batch.results, ordinary_batch.results) |prepared, ordinary| {
+        try std.testing.expect(prepared.failure == null);
+        try std.testing.expect(ordinary.failure == null);
+        try std.testing.expectEqualSlices(u8, prepared.rendered.?.png, ordinary.rendered.?.png);
+    }
+
+    const copied_fixture = try alloc.dupe(u8, fixture);
+    defer alloc.free(copied_fixture);
+    var another_source = try reader.Reader.init(alloc, copied_fixture);
+    defer another_source.deinit();
+    try std.testing.expectError(
+        error.PreparedPageRenderSourceMismatch,
+        renderPreparedPagesBatchAlloc(alloc, &another_source, &plans, .{ .max_batch_pages = plans.len }),
+    );
 }
 
 test "bounded render batch is byte stable across concurrency levels" {
@@ -3781,6 +4896,138 @@ test "bounded render batch uses a caller-owned executor without local threads" {
         try std.testing.expect(result.failure == null);
         try std.testing.expect(result.rendered != null);
     }
+}
+
+test "bounded render batch keeps results alive across fixed-executor scratch resets" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{
+        .{ .page_number = 1 },
+        .{ .page_number = 2 },
+    };
+    const InlineExecutor = struct {
+        invocations: usize = 0,
+        resets: usize = 0,
+        observed_scratch_limit: usize = 0,
+
+        fn runBatch(
+            context: *anyopaque,
+            contexts: []const *anyopaque,
+            run: *const fn (context: *anyopaque, scratch: Allocator) void,
+            max_scratch_bytes: usize,
+        ) anyerror!PageRenderExecutor.BatchStats {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.invocations += 1;
+            self.observed_scratch_limit = max_scratch_bytes;
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            for (contexts) |item| {
+                run(item, scratch.allocator());
+                _ = scratch.reset(.free_all);
+                self.resets += 1;
+            }
+            return .{ .peak_parallelism = @min(@as(usize, 1), contexts.len) };
+        }
+    };
+
+    var executor = InlineExecutor{};
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &requests, .{
+        .max_parallel_pages = 2,
+        .executor = .{
+            .ptr = &executor,
+            .concurrent_capacity = 2,
+            .run_batch_fn = InlineExecutor.runBatch,
+        },
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), executor.invocations);
+    try std.testing.expectEqual(requests.len, executor.resets);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), executor.observed_scratch_limit);
+    try std.testing.expectEqual(requests.len, batch.peak_launched_workers);
+    try std.testing.expectEqual(@as(usize, 0), batch.thread_spawn_fallbacks);
+    for (batch.results) |result| {
+        try std.testing.expect(result.failure == null);
+        try std.testing.expect(result.rendered.?.png.len > 0);
+    }
+
+    try std.testing.expectError(error.InvalidRenderBatchOptions, renderParsedPagesBatchAlloc(
+        alloc,
+        &parsed,
+        &requests,
+        .{
+            .max_parallel_pages = 2,
+            .executor = .{
+                .ptr = &executor,
+                .concurrent_capacity = 2,
+                .run_batch_fn = InlineExecutor.runBatch,
+            },
+            .executor_io = std.testing.io,
+        },
+    ));
+}
+
+test "fixed executor detaches retained raster output without a page-sized copy" {
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{.{
+        .page_number = 1,
+        .requested_dpi = 150,
+        .max_dimension = 256,
+    }};
+    const InlineExecutor = struct {
+        fn runBatch(
+            _: *anyopaque,
+            contexts: []const *anyopaque,
+            run: *const fn (context: *anyopaque, scratch: Allocator) void,
+            _: usize,
+        ) anyerror!PageRenderExecutor.BatchStats {
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            for (contexts) |item| {
+                run(item, scratch.allocator());
+                _ = scratch.reset(.free_all);
+            }
+            return .{ .peak_parallelism = @min(@as(usize, 1), contexts.len) };
+        }
+    };
+
+    var tracking = LargeAllocationTrackingAllocator{
+        .backing = std.testing.allocator,
+        .threshold = 64 * 1024,
+    };
+    const result_alloc = tracking.allocator();
+    var parsed = try reader.Reader.init(std.testing.allocator, fixture);
+    defer parsed.deinit();
+    var executor_state: u8 = 0;
+    const executor = PageRenderExecutor{
+        .ptr = &executor_state,
+        .concurrent_capacity = 1,
+        .run_batch_fn = InlineExecutor.runBatch,
+    };
+
+    try std.testing.expectError(
+        error.InvalidRenderBatchOptions,
+        renderParsedPagesRasterBatchAlloc(result_alloc, &parsed, &requests, .{
+            .concurrent_output_allocator = result_alloc,
+        }),
+    );
+
+    var batch = try renderParsedPagesRasterBatchAlloc(result_alloc, &parsed, &requests, .{
+        .max_batch_pages = 1,
+        .max_parallel_pages = 1,
+        .max_retained_raster_bytes = 1024 * 1024,
+        .executor = executor,
+        .concurrent_output_allocator = result_alloc,
+    });
+    defer batch.deinit(result_alloc);
+
+    const rendered = batch.results[0].rendered.?;
+    try std.testing.expect(batch.results[0].failure == null);
+    try std.testing.expect(rendered.bytes.len >= tracking.threshold);
+    try std.testing.expectEqual(@as(usize, 1), tracking.large_allocations);
+    try std.testing.expectEqual(tracking.first_large_ptr, @intFromPtr(rendered.bytes.ptr));
 }
 
 test "bounded render batch downsizes pages before retaining outputs" {

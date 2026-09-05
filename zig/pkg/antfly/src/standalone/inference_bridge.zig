@@ -19,6 +19,7 @@
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
+const antfly_image = @import("antfly_image");
 
 pub const abi_version: u32 = 24;
 pub const ai_api_prefix = "/ai/v1";
@@ -164,6 +165,7 @@ pub const ProviderOperation = enum(c_int) {
     chunk_input = 17,
     rewrite_texts = 18,
     classify_texts = 19,
+    read_raster_images_reported = 20,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -191,6 +193,25 @@ pub const ProviderAttachmentRef = extern struct {
 pub const ReadEncodedImagesRequest = struct {
     model: []const u8,
     image_count: usize,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+};
+
+pub const RasterImageMetadata = struct {
+    width: u32,
+    height: u32,
+    stride_bytes: usize,
+    format: antfly_image.RasterFormat,
+};
+
+/// Metadata paired one-for-one with borrowed binary raster payloads. Identity
+/// stays in ProviderAttachmentRef so every attachment ABI uses the same
+/// provenance channel.
+pub const ReadRasterImagesRequest = struct {
+    model: []const u8,
+    raster_count: usize,
+    rasters: []const RasterImageMetadata,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     source_fingerprint: ?[]const u8 = null,

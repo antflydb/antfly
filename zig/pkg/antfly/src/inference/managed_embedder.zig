@@ -288,6 +288,22 @@ pub const AntflyProvider = struct {
         request: extracting.Request,
         context: execution_context.RequestContext,
     ) anyerror!extracting.Response = null,
+    /// Linked-process raw rasters stay borrowed for this synchronous call.
+    /// Capability `borrowed_rasters` must be true before invoking it. Keep
+    /// these fields append-only for provider boundary layout compatibility.
+    read_raster_images_reported: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.RasterRequest,
+    ) anyerror!readers.BatchResult = null,
+    read_raster_images_reported_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.RasterRequest,
+        context: execution_context.RequestContext,
+    ) anyerror!readers.BatchResult = null,
 };
 
 pub const ClassificationRequest = struct {

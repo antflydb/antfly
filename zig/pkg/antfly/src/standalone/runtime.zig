@@ -4992,6 +4992,8 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .read_encoded_images_with_context = inferenceProviderReadEncodedImagesWithContext,
         .read_encoded_images_reported = inferenceProviderReadEncodedImagesReported,
         .read_encoded_images_reported_with_context = inferenceProviderReadEncodedImagesReportedWithContext,
+        .read_raster_images_reported = inferenceProviderReadRasterImagesReported,
+        .read_raster_images_reported_with_context = inferenceProviderReadRasterImagesReportedWithContext,
         .transcribe_audio = inferenceProviderTranscribeAudio,
         .transcribe_audio_with_context = inferenceProviderTranscribeAudioWithContext,
         .extract = inferenceProviderExtract,
@@ -5927,6 +5929,120 @@ fn encodedImageProviderPayloadsAlloc(
     return .{ .payloads = payloads, .refs = refs };
 }
 
+fn inferenceProviderReadRasterImagesReported(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.RasterRequest,
+) anyerror!antfly.readers.BatchResult {
+    return inferenceProviderReadRasterImagesReportedControlled(
+        handle,
+        alloc,
+        model,
+        request,
+        null,
+        .none,
+    );
+}
+
+fn inferenceProviderReadRasterImagesReportedWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.RasterRequest,
+    context: antfly.inference.execution_context.RequestContext,
+) anyerror!antfly.readers.BatchResult {
+    try context.check();
+    var result = try inferenceProviderReadRasterImagesReportedControlled(
+        handle,
+        alloc,
+        model,
+        request,
+        context.deadline_ns,
+        context.cancellation,
+    );
+    errdefer result.deinit(alloc);
+    try context.check();
+    return result;
+}
+
+fn inferenceProviderReadRasterImagesReportedControlled(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.RasterRequest,
+    deadline_ns: ?u64,
+    cancellation: CancellationToken,
+) !antfly.readers.BatchResult {
+    try antfly.readers.validateRasterRequest(request);
+    var borrowed = try rasterProviderPayloadsAlloc(alloc, request.images);
+    defer borrowed.deinit(alloc);
+    return invokeInferenceProviderWithBinaryControlled(
+        antfly.readers.BatchResult,
+        alloc,
+        handle,
+        .read_raster_images_reported,
+        inference_bridge.ReadRasterImagesRequest{
+            .model = model,
+            .raster_count = request.images.len,
+            .rasters = borrowed.metadata,
+            .prompt = request.prompt,
+            .max_tokens = request.max_tokens,
+            .source_fingerprint = request.source_fingerprint,
+        },
+        deadline_ns,
+        borrowed.payloads,
+        borrowed.refs,
+        cancellation,
+    );
+}
+
+const RasterProviderPayloads = struct {
+    metadata: []inference_bridge.RasterImageMetadata,
+    payloads: []inference_bridge.ProviderBinaryPayload,
+    refs: []inference_bridge.ProviderAttachmentRef,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.metadata);
+        alloc.free(self.payloads);
+        alloc.free(self.refs);
+        self.* = undefined;
+    }
+};
+
+fn rasterProviderPayloadsAlloc(
+    alloc: std.mem.Allocator,
+    images: []const antfly.readers.RasterImage,
+) !RasterProviderPayloads {
+    const metadata = try alloc.alloc(inference_bridge.RasterImageMetadata, images.len);
+    errdefer alloc.free(metadata);
+    const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, images.len);
+    errdefer alloc.free(payloads);
+    const refs = try alloc.alloc(inference_bridge.ProviderAttachmentRef, images.len);
+    for (images, 0..) |image, i| {
+        try image.validate();
+        metadata[i] = .{
+            .width = image.width,
+            .height = image.height,
+            .stride_bytes = image.stride_bytes,
+            .format = image.format,
+        };
+        payloads[i] = .{
+            .bytes = inference_bridge.String.init(image.bytes),
+            .content_type = inference_bridge.String.init(image.mime_type),
+        };
+        refs[i] = .{
+            .attachment_index = i,
+            .item_index = i,
+            .item_id = inference_bridge.OptionalString.init(if (image.item_id.len > 0) image.item_id else null),
+            .source_fingerprint = inference_bridge.OptionalString.init(image.source_fingerprint),
+            .page_number = image.page_number orelse 0,
+            .has_page_number = @intFromBool(image.page_number != null),
+        };
+    }
+    return .{ .metadata = metadata, .payloads = payloads, .refs = refs };
+}
+
 fn inferenceProviderTranscribeAudio(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -6813,6 +6929,112 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     try std.testing.expectError(
         error.ReadBatchTooLarge,
         inferenceProviderReadEncodedImagesReported(unused_handle, alloc, "florence2", empty_request),
+    );
+}
+
+test "standalone raster reader ABI preserves borrowed strided pages and identity" {
+    const alloc = std.testing.allocator;
+    var first = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    var second = [_]u8{ 7, 8, 9, 255, 10, 11, 12, 255 };
+    const images = [_]antfly.readers.RasterImage{
+        .{ .bytes = &first, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:1", .source_fingerprint = "doc", .page_number = 1 },
+        .{ .bytes = &second, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:2", .source_fingerprint = "doc", .page_number = 2 },
+    };
+    const request = antfly.readers.RasterRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "doc",
+    };
+
+    const FakeReader = struct {
+        expected: [2][*]const u8,
+        observed_addresses: [2]usize = .{ 0, 0 },
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            raster_request: antfly.readers.RasterRequest,
+        ) !antfly.readers.BatchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", raster_request.prompt.?);
+            try std.testing.expectEqual(@as(usize, 2), raster_request.images.len);
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*result| antfly.readers.deinitResult(result_alloc, result);
+                result_alloc.free(out);
+            }
+            for (raster_request.images, 0..) |raster, i| {
+                try std.testing.expectEqual(@intFromPtr(self.expected[i]), @intFromPtr(raster.bytes.ptr));
+                try std.testing.expectEqual(@as(usize, 8), raster.stride_bytes);
+                self.observed_addresses[i] = @intFromPtr(raster.bytes.ptr);
+                out[i] = .{
+                    .text = try result_alloc.dupe(u8, if (i == 0) "first" else "second"),
+                    .item_id = try result_alloc.dupe(u8, raster.item_id),
+                    .source_fingerprint = if (raster.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null,
+                    .page_number = raster.page_number,
+                };
+                filled += 1;
+            }
+            return .{
+                .items = out,
+                .execution = .{ .requested_items = 2, .native_batches = 1, .native_items = 2 },
+            };
+        }
+    };
+    var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
+    var state: inference_host.LinkedInferenceState = undefined;
+    state.alloc = alloc;
+    state.read_raster_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
+
+    var batch = try inferenceProviderReadRasterImagesReported(&lifetime, alloc, "florence2", request);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@intFromPtr(first[0..].ptr), fake.observed_addresses[0]);
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+    first[0] = 99;
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+
+    var payloads = try rasterProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = inference_bridge.ReadRasterImagesRequest{
+        .model = "florence2",
+        .raster_count = request.images.len,
+        .rasters = payloads.metadata,
+        .prompt = request.prompt,
+        .max_tokens = request.max_tokens,
+        .source_fingerprint = request.source_fingerprint,
+    };
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            null,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
+    );
+    payloads.refs[1].item_index = payloads.refs[0].item_index;
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            payloads.payloads.ptr,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
     );
 }
 

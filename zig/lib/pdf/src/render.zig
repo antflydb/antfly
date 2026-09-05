@@ -109,11 +109,8 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     rotation: PageRotation,
     cancellation: reader.CancellationProbe,
 ) ![]u8 {
-    try cancellation.check();
-    var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation);
+    const raw = try renderPageContentRgbaInBoxRotatedCancelable(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, rotation, cancellation);
     defer alloc.free(raw.rgba);
-    try cancellation.check();
-    try rotateRawPageCanvasAlloc(alloc, &raw, rotation, cancellation);
     try cancellation.check();
     return try image.png.encodeRgbaWithCancellation(
         alloc,
@@ -124,11 +121,68 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     );
 }
 
-const RawPageCanvas = struct {
+/// Tightly packed, allocator-owned RGBA8 output from the native renderer.
+/// The caller owns `rgba` and must release it with the allocator passed to the
+/// render operation. `stride` is explicit so transport code does not need to
+/// infer layout from the pixel format.
+pub const RgbaCanvas = struct {
     rgba: []u8,
     width: usize,
     height: usize,
+
+    pub fn stride(self: @This()) !usize {
+        return std.math.mul(usize, self.width, 4) catch error.RenderedPageTooLarge;
+    }
 };
+
+pub fn renderPageContentRgbaInBoxRotatedCancelable(
+    alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+) !RgbaCanvas {
+    return try renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
+        alloc,
+        alloc,
+        page_box,
+        text_runs,
+        image_runs,
+        shading_runs,
+        pattern_runs,
+        shape_runs,
+        rotation,
+        cancellation,
+    );
+}
+
+/// Render with independent scratch and retained-output allocators. Render
+/// plans, group canvases, glyph/image decode state, and other temporaries use
+/// `scratch_alloc`; only the returned root canvas uses `output_alloc`.
+pub fn renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+) !RgbaCanvas {
+    try cancellation.check();
+    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, output_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+    errdefer output_alloc.free(raw.rgba);
+    try cancellation.check();
+    try rotateRawPageCanvasAlloc(output_alloc, &raw, rotation, cancellation);
+    try cancellation.check();
+    return raw;
+}
 
 pub const ResizedPng = struct {
     png: []u8,
@@ -363,7 +417,7 @@ const BilevelCancellationPoller = struct {
     }
 };
 
-fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
+fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RgbaCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
         .clockwise_180 => {
@@ -926,14 +980,15 @@ fn renderPageContentRgbaInBoxAlloc(
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
-) !RawPageCanvas {
-    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+) !RgbaCanvas {
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
 }
 
 const CanvasBackground = enum { opaque_white, transparent };
 
 fn renderPageContentRgbaInBoxAllocWithBudget(
-    alloc: Allocator,
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
     page_box: reader.PageBox,
     text_runs: []const reader.TextRun,
     image_runs: []const reader.ImageRun,
@@ -943,7 +998,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     cancellation: reader.CancellationProbe,
     shared_bilevel_sample_budget: ?*BilevelSampleBudget,
     background: CanvasBackground,
-) !RawPageCanvas {
+) !RgbaCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
     const page_h = @max(1.0, page_box.max_y - page_box.min_y);
@@ -953,17 +1008,17 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
     const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
 
-    var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
-    defer plan.deinit(alloc);
+    var plan = try buildRenderPlanAlloc(scratch_alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
+    defer plan.deinit(scratch_alloc);
     const planned_pixels = std.math.mul(usize, pixel_count, plan.peak_canvas_count) catch return error.RenderedPageTooLarge;
     if (planned_pixels > 200_000_000) return error.RenderedPageTooLarge;
 
-    const rgba = try alloc.alloc(u8, rgba_len);
-    errdefer alloc.free(rgba);
+    const rgba = try output_alloc.alloc(u8, rgba_len);
+    errdefer output_alloc.free(rgba);
     @memset(rgba, if (background == .opaque_white) 0xff else 0x00);
     var local_bilevel_sample_budget = BilevelSampleBudget.init(pixel_count);
     const bilevel_sample_budget = shared_bilevel_sample_budget orelse &local_bilevel_sample_budget;
-    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
+    try renderGroupChildrenAlloc(scratch_alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
 
     return .{ .rgba = rgba, .width = width, .height = height };
 }
@@ -2020,6 +2075,7 @@ fn renderPatternTileCanvasAlloc(
 ) anyerror!RawTile {
     const raw = try renderPageContentRgbaInBoxAllocWithBudget(
         alloc,
+        alloc,
         run.pattern_bbox,
         run.tile_text_runs,
         run.tile_image_runs,
@@ -3012,6 +3068,33 @@ test "render plan schedules a large page exactly once per choice" {
     for (seen) |was_seen| try std.testing.expect(was_seen);
 }
 
+test "render plan orders unsorted inputs across paint kinds" {
+    const alloc = std.testing.allocator;
+    const text_runs = [_]reader.TextRun{
+        .{ .text = "late", .x = 0, .y = 0, .font_size = 12, .paint_order = 9 },
+        .{ .text = "early", .x = 0, .y = 0, .font_size = 12, .paint_order = 1 },
+    };
+    const shape_runs = [_]reader.ShapeRun{
+        .{ .kind = .fill, .paint_order = 8, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 2, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+    };
+    const pattern_runs = [_]reader.PatternRun{
+        .{ .kind = .fill, .paint_order = 7, .points = @constCast(&[_][2]f64{}), .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .pattern_x_step = 1, .pattern_y_step = 1 },
+        .{ .kind = .fill, .paint_order = 3, .points = @constCast(&[_][2]f64{}), .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .pattern_x_step = 1, .pattern_y_step = 1 },
+    };
+
+    var plan = try buildRenderPlanAlloc(alloc, &text_runs, &.{}, &.{}, &pattern_runs, &shape_runs);
+    defer plan.deinit(alloc);
+    const schedule = plan.schedules[0].items;
+    try std.testing.expectEqual(@as(usize, 6), schedule.len);
+    try std.testing.expect(schedule[0] == .text and schedule[0].text == 1);
+    try std.testing.expect(schedule[1] == .shape and schedule[1].shape == 1);
+    try std.testing.expect(schedule[2] == .pattern and schedule[2].pattern == 1);
+    try std.testing.expect(schedule[3] == .pattern and schedule[3].pattern == 0);
+    try std.testing.expect(schedule[4] == .shape and schedule[4].shape == 0);
+    try std.testing.expect(schedule[5] == .text and schedule[5].text == 0);
+}
+
 test "blend pixel mode multiply darkens with backdrop" {
     var canvas = [_]u8{ 0xff, 0x00, 0x00, 0xff };
     blendPixelMode(&canvas, 0, .{ 0x00, 0x00, 0xff, 0xff }, .multiply);
@@ -3116,6 +3199,7 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
     }};
     var budget = BilevelSampleBudget{ .remaining_samples = 8 };
     const raw = try renderPageContentRgbaInBoxAllocWithBudget(
+        alloc,
         alloc,
         .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
         &.{},
@@ -3464,7 +3548,7 @@ test "raw page rotation normalizes dimensions and pixel orientation" {
     };
 
     for (cases) |case| {
-        var raw = RawPageCanvas{
+        var raw = RgbaCanvas{
             .rgba = try alloc.alloc(u8, 2 * 3 * 4),
             .width = 2,
             .height = 3,

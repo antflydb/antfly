@@ -2342,10 +2342,12 @@ The hardening above follows these long-term rules:
     subtracted from the other.
 69. **Implemented after allocator-lifetime review:** retained document state
     and transient PDF invocation memory have distinct BudgetedAllocators. The
-    atomically reserved secondary credit transfers only to the transient
-    allocator, is reusable after every window, and is released as soon as OCR
-    finishes; completed text is admitted independently and cannot consume the
-    next window's guarantee.
+    atomically reserved secondary credit transfers only to a window-scoped
+    transient allocator. Each render/inference window owns one composite lease
+    covering native scratch and its complete transport/provider peak, and
+    releases both sides before another window competes for capacity. Completed
+    text is admitted independently and cannot consume the next window's
+    guarantee.
 70. **Implemented after transport and staging review:** the legacy unconditional
     base64 gate is removed. Exact logical request limits and the resolved
     transport planner govern admission, while PDF-only staging arrays are
@@ -2369,27 +2371,32 @@ The hardening above follows these long-term rules:
     prepared document's immutable page index, xref entries, and trailer rather
     than cloning structures proportional to the PDF for every page. Each fork
     still owns mutable font, image, encryption, decode, and diagnostic caches,
-    so sharing does not weaken thread isolation. Admission charges a bounded
-    fork-control allowance instead of charging the source document once per
-    worker.
+    so sharing does not weaken thread isolation. Serial preparation publishes
+    an explicit immutable fork template, including the encrypted-stream
+    identities; executor threads instantiate private readers only from that
+    template and never call methods on the shared source Reader. Admission
+    charges a bounded fork-control allowance instead of charging the source
+    document once per worker.
 73. **Implemented after render scheduling review:** production render calls
-    submit each admitted wave to the backend runtime's bounded inference
-    executor. `std.Io.Threaded` creates workers only when asynchronous work is
-    submitted and retains them under the runtime's lifecycle, so windows do not
-    create independent thread teams and concurrent documents cannot multiply
-    pools. The final task runs inline for progress on a one-worker runtime.
-    Standalone library callers without a runtime retain the prior call-scoped
-    bounded worker team as a compatibility fallback. The immutable prepared
-    document survives across waves, while each wave creates and destroys
-    private render forks and mutable caches. Planned adaptive geometry is
-    passed into the first render attempt, avoiding duplicate page-box/rotation
-    work; geometry is recomputed only for a quality/size retry.
+    submit each admitted wave to a lazily activated, backend-runtime-owned PDF
+    lane. It has a fixed physical worker set, a bounded queue, thread-confined
+    reusable arenas, a lane-wide physical scratch ceiling, and a per-window
+    scratch ceiling. Windows therefore do not construct thread teams and
+    concurrent documents cannot multiply pools. Standalone library callers
+    without a runtime retain the call-scoped bounded worker fallback. The
+    immutable prepared document survives across waves, while each page still
+    receives private mutable render state. Planned adaptive geometry is passed
+    into the first render attempt, avoiding duplicate page-box/rotation work;
+    geometry is recomputed only for a quality/size retry.
 74. **Implemented after output-credit and storage review:** page-image
-    embedding pins its complete pre-admitted output credit for the whole
-    operation instead of releasing and reacquiring capacity between windows.
-    Attempt-private page embeddings are committed once per bounded render
-    window rather than once per page. These changes remove allocator races and
-    writer-transaction amplification without retaining more than one window.
+    embedding and OCR use fair window-scoped composite leases instead of
+    pinning their maximum output credit for a whole document. Rendered media,
+    provider request/response storage, and result parsing retain the same lease
+    identity until the consumer finishes, after which scratch and output credit
+    are released together. Attempt-private page embeddings are committed once
+    per bounded render window rather than once per page. These changes remove
+    allocator races and writer-transaction amplification without retaining
+    more than one window.
 75. **Implemented after hot-path allocation review:** OCR and visual embedding
     choose the largest admissible prefix with monotonic binary search rather
     than decrementing one page at a time. Generic image, CLIP, and Florence
@@ -2523,8 +2530,11 @@ The hardening above follows these long-term rules:
 85. **Implemented after runtime-pool review:** specialized backend lanes activate
     on demand, and all direct inference families prefer the node's attached
     runtime executor. This removes idle executor allocation and
-    request-scoped executor construction in production; the existing executor
-    implementation continues to staff its worker team only when work arrives.
+    request-scoped executor construction in production. API, durable work,
+    inbound and outbound Raft, inference, control, and PDF rendering have
+    independently configurable nonzero shares beneath one 256-thread aggregate
+    ceiling; capacity can be redistributed without allowing every lazy lane to
+    assume the old service-wide maximum.
 86. **Implemented after adaptive-output review:** output-byte retries downsample
     one decoded renderer result and never re-enter PDF parsing, font/image
     decoding, or page painting.
@@ -2534,6 +2544,62 @@ The hardening above follows these long-term rules:
 88. **Implemented after CI contract review:** fake reader and local embedder
     fixtures satisfy the public catalog/model contract instead of weakening
     production discovery to accommodate tests.
+89. **Implemented after document hot-path review:** prepared-document caching
+    fingerprints source bytes once, keys stable preparations by every decode
+    limit that affects validity, and reuses prepared page geometry across
+    planning and rendering. Page selection and materialization use monotonic
+    cursors or hash membership rather than repeated suffix scans. PDF visual
+    embedding renews operation tenure for its full execution, and spilled-unit
+    replay copies one bounded segment per read transaction before invoking a
+    sink that may write.
+90. **Implemented after bounded-materialization review:** generation batches
+    resolve provisional model contracts from envelope metadata before decoding
+    inline media, form capability-sized windows, and retain materialized media
+    only for the active window. Exact decoded sizes and pixels are revalidated
+    against the loaded model generation before execution, preserving stable
+    outer result order without holding the complete batch's decoded payloads.
+91. **Implemented after cross-request batching review:** the inference node owns
+    a lazy, task-neutral microbatch broker keyed by exact model generation,
+    task, prompt/schema, transform options, resource class, and limits. It
+    coalesces only executors that advertise native batching; compatibility
+    executors bypass the queue. Per-item deadlines, cancellation, provenance,
+    resource shapes, typed failures, and actual execution mode survive the
+    merge. Native encoded-image reads are the first adapter; generation,
+    embedding, reranking, chunking, extraction, rewriting, and transcription
+    use the same broker contract as their fused executors become available.
+92. **Implemented after local image-transport review:** the generic borrowed
+    attachment ABI now also describes validated RGBA8 rasters with width,
+    height, stride, item identity, source fingerprint, and page number. Native
+    Florence reads can consume PDF renderer output without PNG encode/copy/
+    decode; capability negotiation preserves encoded PNG fallback for remote
+    nodes, other model families, and incompatible providers. Stride is resolved
+    once before preprocessing rather than recomputed in the pixel loop.
+93. **Implemented after storage lock-order review:** unit and publication spool
+    replay pre-admit one fixed-size segment with the resource manager's
+    no-reclaim path before opening a backend read transaction. Keys, records,
+    and staged payloads are copied through that fixed allocator; the read
+    transaction closes before JSON sinks, generated writers, or publication
+    can allocate or reclaim. This preserves bounded replay without allowing a
+    memory-reclaim callback to enter storage behind an already-held LMDB
+    transaction.
+94. **Implemented after retained-raster performance review:** fixed PDF workers
+    no longer render into page-local memory and duplicate the completed frame
+    into the invocation window. They write directly through an explicitly
+    thread-safe window allocator, detach the same allocation into the result,
+    and leave provider request/result allocation under that allocator's one
+    aggregate ceiling. Compatibility executors keep the isolated allocator and
+    copy path. Concurrent-cap and pointer-identity tests prove both the shared
+    bound and the absence of a second page-sized allocation.
+95. **Implemented after microbatch generation and admission review:** inline
+    transport bytes and decoded encoded-media bytes are measured separately;
+    request residency uses the former while model contracts and batch windows
+    use the latter. Cross-request groups include the immutable loaded-model
+    generation and actual backend resource class, not merely a reusable path.
+    Queued requests retain cheap generation fences and the leader constructs
+    one reader for the executed batch. Provisional MIME/header checks still run
+    before model acquisition, but only the fenced manifest supplies
+    authoritative limits. The leader waits until the earlier of its bounded
+    coalescing delay and caller deadline.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2567,11 +2633,13 @@ chunk configurations do not change behavior:
 capabilities can only reduce the configured item, byte, and pixel windows;
 document data and index configuration cannot raise them.
 
-Renderer scratch and retained PNGs are two ceilings over the same
-operation-owned allocator grant. The planner splits that grant before each
-window and requires `scratch_bytes + retained_bytes <= available_bytes`; it
-also refreshes the cancellation deadline at each window boundary. This avoids
-depending on allocator failure to enforce the combined peak.
+Renderer scratch and retained media/provider memory are separate subcredits of
+one atomic, window-scoped composite lease. The output subcredit backs a bounded
+allocator that stays alive through the consumer invocation; the scratch
+subcredit bounds the render wave. The lease is released at the end of each
+window, creating a fair admission opportunity between documents. This avoids
+both depending on allocator failure and pinning a maximum-document reservation
+while inference or persistence is idle.
 
 The central idea is a document-scoped streaming microbatcher:
 
@@ -2635,49 +2703,37 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   bytes.
 - One stable, heap-owned PDF OCR coordinator is retained for the entire
   document operation, including across streaming OCR microbatch flushes. Its
-  `PdfRenderSession` discovers the page tree once, and each admitted render
-  worker receives a private
-  `Reader.forkForRendering` snapshot with its own allocator, caches,
-  cancellation probe, render targets, and diagnostics.
+  `PdfRenderSession` discovers the page tree once and serially refreshes an
+  immutable `RenderForkTemplate`. Each admitted render worker instantiates a
+  private reader from that template with its own allocator, caches,
+  cancellation probe, render targets, and diagnostics; workers never mutate
+  or lazily discover state through the source reader.
 - `renderParsedPagesBatchAlloc` accepts an explicit page window, preserves
   request order and page identity, isolates deterministic page failures, and
   enforces batch-page, parallelism, pixel, in-flight byte, retained PNG, and
   per-worker allocator limits.
-- One atomic operation reservation owns three disjoint subcredits: PDF text
-  inspection, PDF render coordination/workers, and retained/transient OCR
-  output. Inspection and rendering use separate hard bounded allocators because
-  the inspection reader remains alive while a streaming callback renders a
-  window; they can never spend the same logical native bytes. The synchronous
-  path uses the inspection subcredit for its initial extraction rather than
-  transferring only output credit and leaving native capacity idle.
-  The combined native side is partially grantable and the output side is
-  required.
-  Concurrent documents cannot steal the output credit after admission, and a
-  full request gets normal cache reclamation before partial native fallback.
-  The output credit is atomically transferred into a dedicated, pinned
-  `BudgetedAllocator` that owns only rendered media and transient provider
-  buffers. Retained streaming state and the synchronous download remain in
-  independently admitted allocators. Native credit is partitioned after
-  admission into non-overlapping inspection and render ceilings. After the
-  render session is prepared, its remaining credit must
-  still fit a minimum raster; otherwise the operation fails before launching a
-  worker. Decode limits and render geometry shrink to a smaller partial grant
-  instead of admitting a mathematically impossible worker. The available worker
-  allowance is recomputed from live coordinator allocations before every
-  window. Both the byte-derived pixel allowance and the explicit in-flight
-  pixel cap participate in adaptive geometry, so a tighter operator pixel
-  limit reduces DPI instead of rejecting an otherwise renderable page.
-- Render workers use freeing, task-local bounded allocators rather than arenas,
-  so their limits measure peak live memory instead of cumulative allocations.
-  Multi-worker waves rendezvous after thread creation and are released from a
-  start gate together. Telemetry reports `peak_launched_workers` for the
-  deterministic wave width and `peak_parallelism` separately for workers
-  actually inside rendering; waiting workers are never counted as renderers.
-  Cancellation
-  releases the gate immediately, so a late worker cannot extend the operation
-  past its render deadline.
-  Each worker downsizes an oversized PNG to its request byte ceiling before
-  the result is copied into retained batch storage.
+- PDF inspection is charged by actual allocation through its own bounded
+  allocator. Each render/inference window then acquires one atomic composite
+  lease: scratch may receive a partial grant, while the calculated transport
+  and provider output peak is required in full. Its output side is transferred
+  to a window-local `BudgetedAllocator`, so rendered media and provider buffers
+  cannot outlive their reservation. The available worker allowance is
+  recomputed from the lease before every window. Both the byte-derived pixel
+  allowance and the explicit in-flight pixel cap participate in adaptive
+  geometry, so a tighter operator pixel limit reduces DPI instead of rejecting
+  an otherwise renderable page.
+- Production render workers belong to one lazy BackendRuntime PDF lane. Its
+  fixed physical workers receive private reusable arenas whose retained backing
+  is capped per worker; a lane-wide physical ceiling and the current window's
+  logical scratch ceiling bound new backing. The bounded queue applies
+  backpressure across concurrent documents, shutdown drains admitted jobs, and
+  no page callback can escape the synchronous batch lifetime. Standalone PDF
+  callers retain the call-scoped compatibility executor. The fixed lane writes
+  retained output directly through a thread-safe window allocator with one
+  atomic byte ceiling shared by renderer workers and the provider invocation;
+  provider request/result allocation therefore sees the exact remaining
+  credit. Each page downsizes output to its request ceiling before ownership is
+  detached into the batch result, avoiding a page-sized copy.
 - The enrichment runtime renders only the next OCR microbatch. It holds no
   prefetched window, transfers each rendered PNG into the matching producer
   request, flushes OCR, and releases the bytes before preparing another
@@ -2688,12 +2744,15 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   pages from different documents may now share a native batch. Legacy URL-only
   reader inputs remain source-bounded until that transport carries the same
   per-item identity.
-- Rendered PNGs cross the asset producer and standalone inference ABI as
-  generic borrowed attachments. Reader, generator, and embedding operations
-  share payload validation and provenance. Providers without a binary callback
-  adapt to data URIs only at their final transport boundary. JSON metadata
-  repeats payload count, and the inference host rejects cardinality mismatches,
-  invalid item indexes, and missing pointers before borrowing bytes.
+- Encoded pages cross the asset producer and standalone inference ABI as
+  generic borrowed attachments. For a linked native reader that advertises the
+  raster capability, validated RGBA8 pages use the same borrowed payload array
+  plus dimensions, stride, pixel format, and per-item provenance, avoiding the
+  local PNG round trip. Reader, generator, and embedding operations retain the
+  encoded path, and remote nodes or providers without the raw-raster callback
+  adapt at the final transport boundary. The inference host rejects redundant
+  count, cardinality, index, pointer, geometry, stride, and lifetime violations
+  before borrowing bytes.
 - The read endpoint and direct read interface accept up to 64 images and apply
   aggregate encoded-byte and decoded-pixel admission. Direct encoded-image
   calls charge their already-resident bytes once; only URL/data-URI paths
@@ -2719,9 +2778,11 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   remain padded while active rows retain independent lengths.
 
 The implementation intentionally does not prefetch a second render window.
-That keeps memory and backpressure simple: render, infer, merge, release, then
-advance. Decoded-pixel handoff and sharing the extraction parse with the render
-session remain measurement-driven follow-ups.
+That keeps memory and backpressure simple: acquire, render, infer, merge,
+release, then advance. The composite lease accepts an explicit window count so
+future one-window overlap must admit both live windows atomically; enabling it
+remains a benchmark-driven policy choice rather than an accidental queueing
+effect.
 
 ## Required invariants
 
@@ -2847,16 +2908,18 @@ pub const PageRenderBatchOptions = struct {
     max_inflight_pixels: u64 = 50_000_000,
     max_inflight_bytes: usize = 512 * 1024 * 1024,
     max_retained_png_bytes: usize = 64 * 1024 * 1024,
+    max_retained_raster_bytes: usize = 256 * 1024 * 1024,
     bytes_per_pixel_reserve: usize = 12,
     cancellation: reader.CancellationProbe = .{},
+    executor: ?PageRenderExecutor = null,
+    concurrent_output_allocator: ?Allocator = null,
 };
 ```
 
-The returned `RenderedPageBatch.results` array is in request order. Each result
-contains the explicit page number and exactly one of a rendered PNG or a page
-failure. `RenderedPageBatch.deinit` releases every unclaimed result. The
-enrichment coordinator may take a result by clearing its optional rendered
-value, after which it owns and eventually releases that PNG.
+The encoded and raster batch variants both return results in request order.
+Each result contains the explicit page number and exactly one payload or page
+failure. Batch deinitialization releases every result with the same allocator
+that owns that invocation window.
 
 The provider performs these steps inside one call:
 
@@ -2864,7 +2927,10 @@ The provider performs these steps inside one call:
 2. Reuse the document-scoped parsed reader.
 3. Create a bounded render group.
 4. Render admitted pages using private contexts.
-5. Copy completed PNGs to the caller allocator in coordinator order.
+5. With a fixed executor and an explicitly thread-safe caller allocator,
+   allocate retained encoded or raster payloads directly in caller-owned
+   storage and detach them in coordinator order. Compatibility executors copy
+   completed payloads on the caller thread.
 6. Cancel and join workers on a systemic failure.
 7. Destroy the parsed document after the final worker joins.
 
@@ -2878,27 +2944,23 @@ Parallel rendering uses two levels of admission in the current runtime:
 
 - Global resource-manager byte admission and bounded enrichment execution lanes
   prevent concurrent PDFs from multiplying memory without limit.
-- Backend-runtime-owned inference execution supplies one aggregate thread
-  ceiling across documents; a per-document worker cap prevents one large PDF
-  from monopolizing it. The underlying workers are created lazily on submitted
-  asynchronous work and are destroyed with the runtime.
+- A backend-runtime-owned PDF lane supplies a small fixed physical worker set
+  across documents; a per-document worker cap prevents one large PDF from
+  monopolizing it. The lane is created lazily on first use and its configured
+  share participates in the aggregate BackendRuntime thread ceiling.
 
-The resource-manager admission is one owned split reservation. With the
-defaults, an OCR operation must own the physical peak implied by its 64 MiB
-logical media window, resolved attachment transport, and bounded invocation
-allocator; it may also own the requested inspection-plus-render native
-capacity. Page-image embedding uses the same mechanism with a render-only
-native side and a model-batch output side. A partial OCR native grant is divided
-proportionally into non-overlapping inspection and render ceilings; both must
-remain nonzero when both phases are requested. Another operation cannot consume
-either operation's already-owned scratch or output side. An unusable native
-partition or unavailable required output credit fails before coordinator
-parsing or worker creation.
+Resource-manager admission uses one owned split reservation per execution
+window. With the defaults, a window must own the physical peak implied by its
+logical media cap, resolved attachment transport, bounded invocation allocator,
+and requested native scratch. Page-image embedding uses the same mechanism.
+The native side may be partially granted but must still render one valid page;
+the output side is required. An unusable scratch grant or unavailable output
+credit fails before worker submission, and successful windows release both
+sides before the next admission opportunity.
 
-PDF and model modules must not own process-global worker pools. If operational
-measurements require separate render and model-compute concurrency classes,
-they should become lazily activated lanes behind `BackendRuntime`, with the
-same lease, shutdown, and metrics contract as its current inference lane.
+PDF and model modules do not own process-global worker pools. The specialized
+PDF lane and model-compute lanes are lazily activated behind `BackendRuntime`
+with a common aggregate configuration, lease, shutdown, and metrics contract.
 
 Page count is not a sufficient weight. Before scheduling a page, derive its
 target dimensions after DPI and dimension clamping, then estimate:
@@ -3423,13 +3485,14 @@ byte admission. Parallelism defaults to one and is operator-capped at eight.
   rather than planned concurrency.
 - Reserve native and transient output memory as one owned split, reclaim before
   partial fallback, atomically transfer output credit to a dedicated
-  operation-pinned invocation allocator, partition partial native grants into
-  persistent/decode/raster budgets, and recompute available render bytes before
-  each window.
+  window-scoped invocation allocator, partition partial native grants into
+  decode/raster budgets, and recompute available render bytes before each
+  window. Release the complete composite lease before planning the next window.
 - Downsize encoded output within each worker before retaining a completed page.
 - Borrow immutable document metadata into wave-local worker forks and reuse one
-  worker thread team across all waves in a render call; mutable reader/cache
-  state is destroyed at the end of each wave.
+  fixed backend-runtime worker lane across documents and waves; mutable page
+  state remains thread-confined and reusable scratch is reset with a strict
+  retention cap after every job.
 - Treat the native Zig allocator ceiling and the CoreGraphics framework
   allowance as separate guarantees. Compatibility pages are serialized and
   RSS-qualified because framework-private allocations cannot be intercepted by
@@ -3453,10 +3516,11 @@ fallback at unsupported provider boundaries.
 ### Phase 5: Render/OCR pipeline overlap
 
 Status: optional follow-up. The implemented pipeline intentionally keeps
-prefetch at zero and retains one operation-scoped output credit. Before overlap
-is enabled, admission must become a fair window lease: the active inference
-window and optional prefetched render window are admitted atomically, and each
-lease releases its scratch/output capacity as soon as its consumers finish.
+prefetch at zero. Fair window-scoped composite admission is complete: the active
+window releases its scratch and output credit as soon as its consumer finishes,
+and the lease API can reserve two windows atomically. Overlap should be enabled
+only after benchmarks justify it and only by acquiring the two-window lease
+before either window begins.
 
 - Add optional one-window prefetch.
 - Admit active OCR and prefetched render memory together.
@@ -3467,17 +3531,18 @@ lease releases its scratch/output capacity as soon as its consumers finish.
 
 ### Phase 6: Optional decoded-image handoff
 
-Status: bounded direct-to-batch-tensor preprocessing is complete. It uses the
-backend runtime's lazily staffed inference executor, deterministic output
-slices, direct RGBA consumption for Florence, and direct baseline-JPEG
-component-plane-to-CHW writes for CLIP. Passing decoded PDF rasters across the
-local model boundary remains a measurement-driven future optimization.
+Status: complete for linked native Florence reads. Bounded direct-to-batch-
+tensor preprocessing uses the backend runtime's lazy inference lane,
+deterministic output slices, direct RGBA consumption for Florence, and direct
+baseline-JPEG component-plane-to-CHW writes for CLIP. The borrowed raster ABI
+carries validated RGBA8 dimensions and stride through the standalone bridge;
+capability negotiation retains encoded-image fallback everywhere else.
 
-- Measure whether PNG encode/decode remains material after Phase 4.
-- If justified, define a stable decoded pixel format and ownership/admission
-  contract at the local boundary.
-- Pass decoded PDF image batches directly into the already in-place Florence
-  tensor preprocessing path.
+- Measure the realized encode/decode reduction and copy cost on the production
+  corpus.
+- Keep the decoded pixel format and ownership/admission contract narrow and
+  append-only until another executor demonstrates a need for additional pixel
+  formats.
 - Preserve encoded-image fallback for other reader families.
 
 ### Phase 7: Fuse PDF inspection and render preparation if needed
@@ -3503,6 +3568,8 @@ The implemented baseline satisfies these criteria:
 - A changed PDF is parsed and transformed once for its complete extraction
   operation, independent of the number of OCR pages and publication passes.
 - Render concurrency is explicitly capped and never derived from CPU count.
+- Lazy backend lanes have independently configurable shares whose sum cannot
+  exceed the process-wide aggregate thread ceiling.
 - Aggregate pixels and working bytes are admitted before concurrent work, and
   every worker also has a hard live-allocation ceiling.
 - Page order and artifact identity are stable across concurrency levels.
@@ -3538,11 +3605,19 @@ The following remain qualification work rather than architectural blockers:
 - Whether the conservative source-size, decode-working-set, and
   bytes-per-pixel reservation can be tightened with measured high-water data.
 - Whether profiling justifies splitting the lazily activated inference lane
-  into distinct render and model CPU lanes. The default deliberately shares
-  one bounded runtime-owned executor so separate subsystems cannot multiply
-  process threads; a split must preserve aggregate admission and shutdown.
-- Whether the long-term pipeline should retain PNG as the local interchange
-  format or move directly to RGB pixels after measuring Phase 4.
+  further by model resource class. PDF rendering already owns a small fixed
+  physical lane because renderer scratch benefits from worker affinity; any
+  additional split must remain beneath the same aggregate ceiling and preserve
+  shutdown ordering.
+- Whether distributed inference should gain a framed binary side channel for
+  attachments. Linked execution uses borrowed encoded or raster bytes today;
+  remote nodes intentionally retain encoded JSON/base64 compatibility until a
+  versioned transport supplies framing, authentication, checksums, flow
+  control, cancellation, and per-item provenance.
+- Whether cross-request broker adapters should be enabled for a model family is
+  executor-specific. The task-neutral broker exists, but a family must expose a
+  genuinely fused native batch implementation before it may opt in; accepting
+  a batch envelope or looping serially is not sufficient.
 - Whether the attempt spool should eventually use a compact versioned binary
   unit codec instead of JSON after corpus measurements quantify serialization
   CPU and temporary storage size.

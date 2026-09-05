@@ -30,6 +30,7 @@ pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
 pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
+pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");
 pub const singleflight = @import("cache/singleflight.zig");
 pub const registry = @import("registry/registry.zig");
@@ -103,6 +104,7 @@ test {
     _ = @import("pipelines/gliner.zig");
     _ = extractors;
     _ = server;
+    _ = executor_microbatch;
     _ = cache;
     _ = singleflight;
     _ = registry;

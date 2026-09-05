@@ -18,6 +18,7 @@ const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
 const config = @import("antfly_reader_config");
 const data_uri = @import("antfly_scraping").data_uri;
+const antfly_image = @import("antfly_image");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
@@ -86,6 +87,24 @@ pub const EncodedRequest = struct {
     source_fingerprint: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
 };
+
+/// Task-neutral physical raster attachment specialized into a reader request.
+/// The underlying bytes and identity remain borrowed for this synchronous
+/// invocation and may not be retained by a provider.
+pub const RasterImage = antfly_image.BorrowedRasterAttachment;
+
+pub const RasterRequest = struct {
+    images: []const RasterImage,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
+};
+
+pub fn validateRasterRequest(request: RasterRequest) !void {
+    if (request.images.len == 0) return error.ReadBatchTooLarge;
+    for (request.images) |image| try image.validate();
+}
 
 /// Validate the shared in-process encoded-image contract before execution
 /// mode selection. Keeping this here prevents embedded and standalone readers

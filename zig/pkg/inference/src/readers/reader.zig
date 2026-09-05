@@ -26,9 +26,11 @@ const multistage_reader_mod = @import("multistage_reader.zig");
 const pix2struct_mod = @import("pix2struct.zig");
 const vision_reader_mod = @import("vision_reader.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+const session_factory = @import("../architectures/session_factory.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const antfly_image = @import("antfly_image");
 
 pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
@@ -72,6 +74,26 @@ const VisionLoadedReader = struct {
         };
     }
 
+    /// Construct the Florence wrapper for an already generation-fenced native
+    /// model. The core loader validates that the borrowed session is Florence;
+    /// avoiding another path-based parser probe also prevents a concurrent
+    /// model publication from changing this wrapper's parser semantics.
+    pub fn loadFromBorrowedModel(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model: *model_manager_mod.LoadedModel,
+    ) !VisionLoadedReader {
+        return .{
+            .allocator = allocator,
+            .parser_kind = .florence,
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromBorrowedModel(
+                allocator,
+                model_path,
+                model,
+            ),
+        };
+    }
+
     pub fn deinit(self: *VisionLoadedReader) void {
         self.core.deinit();
     }
@@ -101,6 +123,30 @@ const VisionLoadedReader = struct {
             .max_tokens = options.max_tokens,
             .source_fingerprint = options.source_fingerprint,
         });
+        return self.parseRawBatch(raw_batch, normalized_prompt);
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *VisionLoadedReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: ReadOptions,
+    ) !BatchResult {
+        try validateVisionReadOptions(self.parser_kind, options);
+        if (self.parser_kind != .florence) return error.BorrowedRasterUnsupported;
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        const raw_batch = try self.core.readBorrowedRasterBatchReported(rasters, .{
+            .prompt = normalized_prompt,
+            .max_tokens = options.max_tokens,
+            .source_fingerprint = options.source_fingerprint,
+        });
+        return self.parseRawBatch(raw_batch, normalized_prompt);
+    }
+
+    fn parseRawBatch(
+        self: *VisionLoadedReader,
+        raw_batch: @import("../pipelines/reading.zig").ReadBatchResult,
+        normalized_prompt: ?[]const u8,
+    ) !BatchResult {
         const raw_results = raw_batch.results;
         defer {
             for (raw_results) |raw| {
@@ -275,6 +321,30 @@ const GenAiLoadedReader = struct {
     }
 };
 
+/// Cheap immutable model-generation lease used while a request waits in the
+/// cross-request broker. The broker leader builds one reader wrapper for the
+/// executed batch; followers retain only this model-manager handle.
+pub const ExecutionFence = struct {
+    handle: model_manager_mod.ModelHandle,
+
+    pub fn deinit(self: *ExecutionFence) void {
+        self.handle.release();
+        self.* = undefined;
+    }
+
+    pub fn backend(self: *const ExecutionFence) backends.BackendType {
+        return self.handle.get().session.backend();
+    }
+
+    pub fn generationIdentity(self: *const ExecutionFence) usize {
+        return @intFromPtr(self.handle.get());
+    }
+
+    pub fn manifest(self: *const ExecutionFence) *const manifest_mod.ModelManifest {
+        return &self.handle.get().manifest;
+    }
+};
+
 pub const LoadedReader = union(enum) {
     vision: VisionLoadedReader,
     genai: GenAiLoadedReader,
@@ -316,6 +386,44 @@ pub const LoadedReader = union(enum) {
         }
 
         return .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager) };
+    }
+
+    /// Acquire the minimum lifetime fence needed for safe read microbatching.
+    /// Split-component and multistage readers do not yet expose one immutable
+    /// aggregate generation, so they bypass cross-request coalescing.
+    pub fn acquireExecutionFence(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model_manager: *model_manager_mod.ModelManager,
+    ) !?ExecutionFence {
+        if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return null;
+        if (try detectParserKind(allocator, model_path) != .florence) return null;
+        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+            allocator.free(paths.encoder);
+            allocator.free(paths.decoder);
+            return null;
+        } else |_| {}
+
+        var handle = try model_manager.acquireFromDir(model_path);
+        errdefer handle.release();
+        if (session_factory.getFlorenceConfig(handle.get().session) == null)
+            return error.InvalidModelForReading;
+        return .{ .handle = handle };
+    }
+
+    /// Build the single per-executed-batch wrapper while `fence` keeps its
+    /// exact model generation alive. The returned reader does not own the
+    /// fence and must be destroyed before it.
+    pub fn loadFromExecutionFence(
+        allocator: std.mem.Allocator,
+        fence: *const ExecutionFence,
+    ) !LoadedReader {
+        const model = fence.handle.get();
+        return .{ .vision = try VisionLoadedReader.loadFromBorrowedModel(
+            allocator,
+            model.model_dir,
+            model,
+        ) };
     }
 
     pub fn deinit(self: *LoadedReader) void {
@@ -364,6 +472,26 @@ pub const LoadedReader = union(enum) {
             for (batch.results) |*result| result.deinit();
             allocator.free(batch.results);
         }
+        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        return batch;
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *LoadedReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: ReadOptions,
+    ) !BatchResult {
+        try validateReadOptions(options);
+        const allocator = self.resultAllocator();
+        const batch = try switch (self.*) {
+            .vision => |*reader| reader.readBorrowedRasterBatchReported(rasters, options),
+            .genai, .vlm, .multistage => return error.BorrowedRasterUnsupported,
+        };
+        errdefer {
+            for (batch.results) |*result| result.deinit();
+            allocator.free(batch.results);
+        }
+        if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         return batch;
     }

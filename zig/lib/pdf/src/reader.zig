@@ -3635,6 +3635,117 @@ fn objectEncryptionKey(
     };
 }
 
+const FrozenEncryptedStream = struct {
+    data_offset: usize,
+    ptr: syntax.ObjRef,
+};
+
+/// Immutable metadata snapshot used to construct task-local render Readers.
+///
+/// Preparing this value is the only render-fork operation that may touch the
+/// source Reader: it serializes lazy page-index discovery and snapshots the
+/// source's lazily discovered encrypted-stream identities. Once prepared,
+/// worker threads instantiate Readers exclusively from this value and never
+/// access mutable source state. The source Reader and its borrowed document
+/// bytes must outlive this template and every Reader instantiated from it.
+pub const RenderForkTemplate = struct {
+    alloc: Allocator,
+    bytes: []const u8,
+    decode_limits: DecodeLimits,
+    version_minor: u8,
+    startxref_offset: usize,
+    xref_entries: []XrefEntry,
+    trailer: syntax.Object,
+    page_index: []syntax.Object,
+    encryption: ?EncryptionContext,
+    encrypted_stream_registry: *const std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
+    encrypted_stream_generation: u64,
+    encrypted_streams: []FrozenEncryptedStream,
+
+    pub fn deinit(self: *RenderForkTemplate) void {
+        self.alloc.free(self.encrypted_streams);
+        self.* = undefined;
+    }
+
+    /// Instantiate independently mutable render state. This method only reads
+    /// immutable template memory and is safe to call concurrently. `alloc`
+    /// must remain confined to the calling worker.
+    pub fn instantiate(self: *const RenderForkTemplate, alloc: Allocator, cancellation: CancellationProbe) !Reader {
+        try cancellation.check();
+
+        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
+        errdefer alloc.destroy(font_cache);
+        font_cache.* = .empty;
+
+        const image_cache = try alloc.create(DecodedImageCache);
+        errdefer alloc.destroy(image_cache);
+        image_cache.* = .{};
+
+        const encrypted_streams = try alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef));
+        errdefer alloc.destroy(encrypted_streams);
+        encrypted_streams.* = .empty;
+        errdefer encrypted_streams.deinit(alloc);
+        try encrypted_streams.ensureTotalCapacity(alloc, @intCast(self.encrypted_streams.len));
+        for (self.encrypted_streams) |entry|
+            encrypted_streams.putAssumeCapacity(entry.data_offset, entry.ptr);
+
+        return .{
+            .alloc = alloc,
+            .bytes = self.bytes,
+            .decode_limits = self.decode_limits,
+            .version_minor = self.version_minor,
+            .startxref_offset = self.startxref_offset,
+            .xref_entries = self.xref_entries,
+            .trailer = self.trailer,
+            .page_index = self.page_index,
+            .font_cache = font_cache,
+            .image_cache = image_cache,
+            .encryption = self.encryption,
+            .encrypted_streams = encrypted_streams,
+            .encrypted_stream_generation = self.encrypted_stream_generation,
+            .cancellation = cancellation,
+            .owns_document_metadata = false,
+        };
+    }
+
+    /// Refresh metadata that may have changed during the caller's serial
+    /// preflight phase. No allocation or map walk occurs when the source's
+    /// encrypted-stream registry and decode limits are unchanged.
+    pub fn refreshFrom(self: *RenderForkTemplate, source: *Reader, cancellation: CancellationProbe) !void {
+        try cancellation.check();
+        try source.ensurePageIndex();
+        if (self.bytes.ptr != source.bytes.ptr or
+            self.bytes.len != source.bytes.len or
+            self.xref_entries.ptr != source.xref_entries.ptr or
+            self.xref_entries.len != source.xref_entries.len or
+            self.page_index.ptr != source.page_index.?.ptr or
+            self.page_index.len != source.page_index.?.len or
+            self.encrypted_stream_registry != source.encrypted_streams)
+        {
+            return error.RenderForkTemplateSourceMismatch;
+        }
+        self.decode_limits = source.decode_limits;
+        self.version_minor = source.version_minor;
+        self.startxref_offset = source.startxref_offset;
+        self.trailer = source.trailer;
+        self.encryption = source.encryption;
+
+        if (self.encrypted_stream_generation == source.encrypted_stream_generation) return;
+        self.encrypted_streams = try self.alloc.realloc(self.encrypted_streams, source.encrypted_streams.count());
+        var encrypted_stream_index: usize = 0;
+        var encrypted_stream_iter = source.encrypted_streams.iterator();
+        while (encrypted_stream_iter.next()) |entry| {
+            self.encrypted_streams[encrypted_stream_index] = .{
+                .data_offset = entry.key_ptr.*,
+                .ptr = entry.value_ptr.*,
+            };
+            encrypted_stream_index += 1;
+        }
+        std.debug.assert(encrypted_stream_index == self.encrypted_streams.len);
+        self.encrypted_stream_generation = source.encrypted_stream_generation;
+    }
+};
+
 pub const Reader = struct {
     alloc: Allocator,
     bytes: []const u8,
@@ -3651,6 +3762,10 @@ pub const Reader = struct {
     /// before allocating. The object reference is all that is retained: it is
     /// needed to derive the per-object encryption key at raw-read time.
     encrypted_streams: *std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
+    /// Monotonic generation for the logically mutable encrypted-stream cache.
+    /// All production inserts go through `rememberEncryptedStream`, making
+    /// RenderForkTemplate refresh independent of hash-map count semantics.
+    encrypted_stream_generation: u64 = 0,
     image_decode_target: ?ImageDecodeTarget = null,
     /// Resource dictionary that gives names and Default* substitutions their
     /// dynamic meaning while an image XObject is decoded. Scoped Reader
@@ -3853,37 +3968,26 @@ pub const Reader = struct {
         self.* = undefined;
     }
 
-    /// Create an independently mutable render view of this parsed document.
-    ///
-    /// The source byte slice remains borrowed from the original document and
-    /// must outlive the returned Reader. The frozen xref, trailer, and page
-    /// index are borrowed; every mutable cache and render diagnostic remains
-    /// task-local. A fork may therefore be moved to another thread as long as
-    /// its allocator is also safe to use exclusively from that thread.
-    ///
-    /// Callers must create all forks before starting render threads. This
-    /// serializes lazy page-tree discovery and makes the shared source Reader
-    /// immutable for the lifetime of the render group.
-    pub fn forkForRendering(self: *Reader, alloc: Allocator, cancellation: CancellationProbe) !Reader {
+    /// Freeze all source-owned state needed to instantiate render Readers.
+    /// Call this serially before dispatching worker threads. The returned
+    /// template owns only the encrypted-stream snapshot; document metadata and
+    /// bytes remain borrowed from `self`.
+    pub fn prepareRenderForkTemplate(self: *Reader, alloc: Allocator, cancellation: CancellationProbe) !RenderForkTemplate {
         try cancellation.check();
         try self.ensurePageIndex();
 
-        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
-        errdefer alloc.destroy(font_cache);
-        font_cache.* = .empty;
-
-        const image_cache = try alloc.create(DecodedImageCache);
-        errdefer alloc.destroy(image_cache);
-        image_cache.* = .{};
-
-        const encrypted_streams = try alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef));
-        errdefer alloc.destroy(encrypted_streams);
-        encrypted_streams.* = .empty;
-        errdefer encrypted_streams.deinit(alloc);
+        const encrypted_streams = try alloc.alloc(FrozenEncryptedStream, self.encrypted_streams.count());
+        errdefer alloc.free(encrypted_streams);
+        var encrypted_stream_index: usize = 0;
         var encrypted_stream_iter = self.encrypted_streams.iterator();
         while (encrypted_stream_iter.next()) |entry| {
-            try encrypted_streams.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+            encrypted_streams[encrypted_stream_index] = .{
+                .data_offset = entry.key_ptr.*,
+                .ptr = entry.value_ptr.*,
+            };
+            encrypted_stream_index += 1;
         }
+        std.debug.assert(encrypted_stream_index == encrypted_streams.len);
 
         return .{
             .alloc = alloc,
@@ -3893,13 +3997,11 @@ pub const Reader = struct {
             .startxref_offset = self.startxref_offset,
             .xref_entries = self.xref_entries,
             .trailer = self.trailer,
-            .page_index = self.page_index,
-            .font_cache = font_cache,
-            .image_cache = image_cache,
+            .page_index = self.page_index.?,
             .encryption = self.encryption,
+            .encrypted_stream_registry = self.encrypted_streams,
             .encrypted_streams = encrypted_streams,
-            .cancellation = cancellation,
-            .owns_document_metadata = false,
+            .encrypted_stream_generation = self.encrypted_stream_generation,
         };
     }
 
@@ -4040,10 +4142,26 @@ pub const Reader = struct {
                 // Do not decrypt or retain stream payloads during object
                 // resolution. The downstream raw read knows both its terminal
                 // output allowance and its complete working-set allowance.
-                try self.encrypted_streams.put(self.alloc, stream.data_offset, ptr);
+                try self.rememberEncryptedStream(stream.data_offset, ptr);
             },
             else => {},
         }
+    }
+
+    fn rememberEncryptedStream(self: *const Reader, data_offset: usize, ptr: syntax.ObjRef) !void {
+        if (self.encrypted_streams.get(data_offset)) |existing| {
+            if (existing.id != ptr.id or existing.gen != ptr.gen)
+                return error.InvalidEncryptedPdf;
+            return;
+        }
+        const mutable_self = @constCast(self);
+        const next_generation = std.math.add(
+            u64,
+            mutable_self.encrypted_stream_generation,
+            1,
+        ) catch return error.InvalidEncryptedPdf;
+        try self.encrypted_streams.put(self.alloc, data_offset, ptr);
+        mutable_self.encrypted_stream_generation = next_generation;
     }
 
     pub fn readIndirectObject(self: *const Reader, ptr: syntax.ObjRef) anyerror!syntax.Object {
@@ -20569,6 +20687,38 @@ test "reader extracts empty-password Standard R2 RC4 PDF" {
     };
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Hello RC4-40", std.mem.trim(u8, text, &std.ascii.whitespace));
+}
+
+test "render fork template refresh tracks explicit encrypted stream generation" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/rc4_40_empty_password_fixture.pdf");
+    var parsed = try Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var template = try parsed.prepareRenderForkTemplate(alloc, .{});
+    defer template.deinit();
+
+    const synthetic_offset = fixture.len + 1;
+    const synthetic_ptr: syntax.ObjRef = .{ .id = 42, .gen = 0 };
+    const generation_before = parsed.encrypted_stream_generation;
+    try parsed.rememberEncryptedStream(synthetic_offset, synthetic_ptr);
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
+    try template.refreshFrom(&parsed, .{});
+    try std.testing.expectEqual(parsed.encrypted_stream_generation, template.encrypted_stream_generation);
+    try std.testing.expectEqual(parsed.encrypted_streams.count(), template.encrypted_streams.len);
+
+    const snapshot_ptr = template.encrypted_streams.ptr;
+    try template.refreshFrom(&parsed, .{});
+    try std.testing.expectEqual(snapshot_ptr, template.encrypted_streams.ptr);
+
+    // Re-observing an identical stream is idempotent, while a conflicting
+    // replacement is rejected without changing the cache generation.
+    try parsed.rememberEncryptedStream(synthetic_offset, synthetic_ptr);
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
+    try std.testing.expectError(
+        error.InvalidEncryptedPdf,
+        parsed.rememberEncryptedStream(synthetic_offset, .{ .id = 43, .gen = 0 }),
+    );
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
 }
 
 test "stream filter prefix decoding stops before DCT data" {

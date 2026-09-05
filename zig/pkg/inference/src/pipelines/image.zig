@@ -584,6 +584,39 @@ test "bounded batch preprocessing preserves input-indexed tensor order" {
     try std.testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(serial[0..12]), std.mem.sliceAsBytes(serial[12..24])));
 }
 
+test "borrowed raster batch preprocesses strided RGBA without decode copy or retention" {
+    var padded = [_]u8{
+        255, 0, 0,   255, 0, 255, 0, 255, 91, 92, 93, 94,
+        0,   0, 255, 255, 7, 8,   9, 255, 81, 82, 83, 84,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &padded,
+        .width = 2,
+        .height = 2,
+        .stride_bytes = 12,
+        .item_id = "page-7",
+        .page_number = 7,
+    };
+    const view = try raster.imageView();
+    try std.testing.expectEqual(@intFromPtr(padded[0..].ptr), @intFromPtr(view.data.ptr));
+
+    var actual: [12]f32 = undefined;
+    try preprocessBorrowedRasterBatchInto(
+        &actual,
+        &.{raster},
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+    );
+    const snapshot = actual;
+    @memset(&padded, 0);
+    try std.testing.expectEqualSlices(f32, &snapshot, &actual);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[5], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[10], 1e-6);
+}
+
 test "bounded batch preprocessing uses a caller-owned executor without changing output" {
     const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
     var serial: [24]f32 = undefined;
@@ -1340,6 +1373,37 @@ pub fn preprocessBatchIntoBounded(
         .std_dev = std_dev,
         .resample = resample,
     } }, options);
+}
+
+/// Preprocess renderer-owned rasters directly into caller-owned model storage.
+/// This synchronous path has no allocator and therefore cannot decode, copy,
+/// or retain the borrowed source buffers. Arbitrary validated row stride is
+/// preserved all the way into the sampler.
+pub fn preprocessBorrowedRasterBatchInto(
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    for (rasters, 0..) |raster, index| {
+        const view = try raster.imageView();
+        try shared.preprocessDecodedWithResampleInto(
+            view,
+            result[index * per_image ..][0..per_image],
+            target_size,
+            mean,
+            std_dev,
+            resample,
+        );
+    }
 }
 
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,

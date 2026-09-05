@@ -775,6 +775,9 @@ pub const InferenceCapabilities = struct {
     // use this to select byte accounting: transport is an executor property
     // and is supplied explicitly through AttachmentTransport.
     borrowed_attachments: bool = false,
+    /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
+    /// This is never inferred from image modality or encoded attachment support.
+    borrowed_rasters: bool = false,
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
@@ -805,6 +808,9 @@ pub const InferenceCapabilities = struct {
         };
         if (self.result_cardinality != expected_cardinality) return error.InvalidInferenceCapabilities;
         if (self.input_granularity == .document and !self.input_modalities.document)
+            return error.InvalidInferenceCapabilities;
+        if (self.borrowed_rasters and
+            (!self.borrowed_attachments or !self.input_modalities.image))
             return error.InvalidInferenceCapabilities;
     }
 

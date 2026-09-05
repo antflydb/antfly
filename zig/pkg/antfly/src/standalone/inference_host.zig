@@ -48,6 +48,7 @@ pub const LinkedInferenceState = struct {
     /// Model-free invocation seam used by ABI conformance tests. Production
     /// states leave this null and dispatch directly to `node`.
     read_encoded_images_override: ?ReadEncodedImagesHandler = null,
+    read_raster_images_override: ?ReadRasterImagesHandler = null,
 };
 
 /// Stable, ref-counted copy of the standalone resource-owner capability. The
@@ -132,6 +133,25 @@ pub const ReadEncodedImagesHandler = struct {
         model: []const u8,
         request: antfly.readers.EncodedRequest,
     ) ![]antfly.readers.Result {
+        return try self.read_fn(self.ptr, alloc, model, request);
+    }
+};
+
+pub const ReadRasterImagesHandler = struct {
+    ptr: *anyopaque,
+    read_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.RasterRequest,
+    ) anyerror!antfly.readers.BatchResult,
+
+    fn read(
+        self: @This(),
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.RasterRequest,
+    ) !antfly.readers.BatchResult {
         return try self.read_fn(self.ptr, alloc, model, request);
     }
 };
@@ -345,10 +365,22 @@ const ReadImagesRequest = struct {
 };
 
 const ReadEncodedImagesRequest = inference_bridge.ReadEncodedImagesRequest;
+const ReadRasterImagesRequest = inference_bridge.ReadRasterImagesRequest;
 
 pub const DecodedReadEncodedImagesRequest = struct {
     metadata: std.json.Parsed(ReadEncodedImagesRequest),
     images: []antfly.readers.EncodedImage,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.images);
+        self.metadata.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const DecodedReadRasterImagesRequest = struct {
+    metadata: std.json.Parsed(ReadRasterImagesRequest),
+    images: []antfly.readers.RasterImage,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.images);
@@ -392,6 +424,55 @@ pub fn decodeReadEncodedImagesProviderRequest(
         }
     }
     try antfly.readers.validateEncodedRequest(.{ .images = images });
+    return .{ .metadata = metadata, .images = images };
+}
+
+pub fn decodeReadRasterImagesProviderRequest(
+    alloc: std.mem.Allocator,
+    request_json: []const u8,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) !DecodedReadRasterImagesRequest {
+    var metadata = try std.json.parseFromSlice(ReadRasterImagesRequest, alloc, request_json, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer metadata.deinit();
+    if (metadata.value.raster_count != payload_len or
+        metadata.value.rasters.len != payload_len or ref_len != payload_len)
+        return error.InvalidArguments;
+    if (payload_len > 0 and payload_ptr == null) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const refs = if (ref_ptr) |ptr| ptr[0..ref_len] else &.{};
+    for (refs, 0..) |ref, index| {
+        if (ref.item_index >= payload_len) return error.InvalidArguments;
+        for (refs[0..index]) |prior| {
+            if (prior.item_index == ref.item_index) return error.InvalidArguments;
+        }
+    }
+
+    const images = try alloc.alloc(antfly.readers.RasterImage, payload_len);
+    errdefer alloc.free(images);
+    if (payload_ptr) |payloads| {
+        for (images, metadata.value.rasters, 0..) |*image, raster, i| {
+            const ref = providerAttachmentRefForItem(ref_ptr.?, ref_len, i) orelse
+                return error.InvalidArguments;
+            const payload = payloads[ref.attachment_index];
+            image.* = .{
+                .bytes = payload.bytes.slice(),
+                .width = raster.width,
+                .height = raster.height,
+                .stride_bytes = raster.stride_bytes,
+                .format = raster.format,
+                .mime_type = payload.content_type.slice(),
+                .item_id = ref.item_id.slice() orelse "",
+                .source_fingerprint = ref.source_fingerprint.slice(),
+                .page_number = if (ref.has_page_number != 0) ref.page_number else null,
+            };
+        }
+    }
+    try antfly.readers.validateRasterRequest(.{ .images = images });
     return .{ .metadata = metadata, .images = images };
 }
 
@@ -938,6 +1019,62 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc.free(result);
             }
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .read_raster_images_reported => blk: {
+            var decoded = try decodeReadRasterImagesProviderRequest(
+                alloc,
+                request_json,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer decoded.deinit(alloc);
+            const raster_request = antfly.readers.RasterRequest{
+                .images = decoded.images,
+                .prompt = decoded.metadata.value.prompt,
+                .max_tokens = decoded.metadata.value.max_tokens,
+                .source_fingerprint = decoded.metadata.value.source_fingerprint,
+            };
+            if (state.read_raster_images_override == null) {
+                const capabilities = try localModelCapabilities(
+                    &state.node,
+                    state.io,
+                    decoded.metadata.value.model,
+                    .read,
+                );
+                if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
+                var pixels: u64 = 0;
+                for (decoded.images) |raster| {
+                    pixels = std.math.add(u64, pixels, try raster.pixels()) catch
+                        return error.InferenceDecodedPixelsExceeded;
+                }
+                try capabilities.validateInvocation(.read, .{
+                    .item_count = decoded.images.len,
+                    .modalities = .{ .image = true },
+                    .text_bytes = if (raster_request.prompt) |prompt| prompt.len else 0,
+                    .max_text_bytes_per_item = if (raster_request.prompt) |prompt| prompt.len else 0,
+                    .requested_output_tokens_per_item = if (raster_request.max_tokens) |tokens|
+                        if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+                    else
+                        0,
+                    .decoded_pixels = pixels,
+                    .max_media_parts_per_item = 1,
+                });
+            }
+            var batch = if (state.read_raster_images_override) |handler|
+                try handler.read(alloc, decoded.metadata.value.model, raster_request)
+            else
+                try state.node.readRasterImagesReportedDirect(
+                    alloc,
+                    decoded.metadata.value.model,
+                    raster_request,
+                );
+            defer batch.deinit(alloc);
+            if (batch.items.len != raster_request.images.len)
+                return error.InvalidReaderResponse;
+            try batch.execution.validate(batch.items.len);
+            break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
         },
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
@@ -2146,6 +2283,9 @@ fn localModelCapabilitiesInScope(
             inference.server.resolvedTaskPromptPolicy(@tagName(task)),
         ).?,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
+        // Only the native vision-reader path below consumes decoded raster
+        // views today. Other image-capable task families remain encoded-only.
+        .borrowed_rasters = task == .read and manifest.native_arch_hint == .florence,
     };
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";

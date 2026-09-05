@@ -330,7 +330,9 @@ pub const Runtime = struct {
         return provider.read_images != null or provider.read_encoded_images != null or
             provider.read_encoded_images_reported != null or provider.read_images_with_context != null or
             provider.read_encoded_images_with_context != null or
-            provider.read_encoded_images_reported_with_context != null;
+            provider.read_encoded_images_reported_with_context != null or
+            provider.read_raster_images_reported != null or
+            provider.read_raster_images_reported_with_context != null;
     }
 
     fn linkedGeneratorAvailable(self: *const Runtime) bool {
@@ -400,6 +402,10 @@ pub const Runtime = struct {
                 .capabilities_for_requests_with_context = capabilitiesForRequestsWithContext,
                 .invocation_memory_for_requests = invocationMemoryForRequests,
                 .invocation_memory_for_requests_with_context = invocationMemoryForRequestsWithContext,
+                .produce_borrowed_raster_batch_reported = produceBorrowedRasterBatchReported,
+                .produce_borrowed_raster_batch_reported_with_context = produceBorrowedRasterBatchReportedWithContext,
+                .borrowed_raster_batch_available = borrowedRasterBatchAvailable,
+                .borrowed_raster_batch_available_with_context = borrowedRasterBatchAvailableWithContext,
             },
         };
     }
@@ -421,6 +427,10 @@ pub const Runtime = struct {
                 .capabilities_for_requests_with_context = capabilitiesForRequestsWithContext,
                 .invocation_memory_for_requests = invocationMemoryForRequests,
                 .invocation_memory_for_requests_with_context = invocationMemoryForRequestsWithContext,
+                .produce_borrowed_raster_batch_reported = produceBorrowedRasterBatchReported,
+                .produce_borrowed_raster_batch_reported_with_context = produceBorrowedRasterBatchReportedWithContext,
+                .borrowed_raster_batch_available = borrowedRasterBatchAvailable,
+                .borrowed_raster_batch_available_with_context = borrowedRasterBatchAvailableWithContext,
                 .deinit = deinitProducer,
                 .foreground_bounded = true,
                 .foreground_bounded_for_requests = foregroundBoundedForRequests,
@@ -480,7 +490,9 @@ pub const Runtime = struct {
                     allocator_owner = try localInvocationAllocatorOwner(local);
                     const binary = local.read_encoded_images != null or local.read_encoded_images_reported != null or
                         local.read_encoded_images_with_context != null or
-                        local.read_encoded_images_reported_with_context != null;
+                        local.read_encoded_images_reported_with_context != null or
+                        local.read_raster_images_reported != null or
+                        local.read_raster_images_reported_with_context != null;
                     if (!binary and local.read_images == null and local.read_images_with_context == null)
                         return error.InferenceInvocationMemoryUnavailable;
                     break :blk if (binary) .borrowed_binary else .data_uri;
@@ -773,6 +785,36 @@ pub const Runtime = struct {
         return batch;
     }
 
+    fn produceBorrowedRasterBatchReportedWithContext(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+        rasters: []const readers.RasterImage,
+        context: asset_producer.InvocationContext,
+    ) !asset_producer.ProducedBatch {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        var batch = try produceBorrowedRasterBatchReported(&scoped, alloc, requests, rasters);
+        errdefer batch.deinit(alloc);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return batch;
+    }
+
+    fn borrowedRasterBatchAvailableWithContext(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+        context: asset_producer.InvocationContext,
+    ) !bool {
+        var cancellation: RuntimeInvocationCancellation = undefined;
+        var scoped = invocationRuntime(ptr, context, &cancellation);
+        try scoped.execution.check(platform.time.monotonicNs());
+        const available = try borrowedRasterBatchAvailable(&scoped, alloc, requests);
+        try scoped.execution.check(platform.time.monotonicNs());
+        return available;
+    }
+
     fn batchModeWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.BatchMode {
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
@@ -923,6 +965,38 @@ pub const Runtime = struct {
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return false;
         }
         return true;
+    }
+
+    fn borrowedRasterBatchAvailable(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+    ) !bool {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0 or !requestsShareRoute(requests)) return false;
+        for (requests) |request| {
+            if (request.producer_type != .reader or request.media.len != 0 or
+                !request.inline_media_trusted) return false;
+        }
+        var parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        const cfg = self.routedReaderConfig(parsed.value);
+        try cfg.validate();
+        // Physical locality is checked before the descriptor. A distributed
+        // node cannot opt a storage node into an in-process borrowed ABI by
+        // publishing a logically valid but physically unusable capability.
+        if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) return false;
+        const local = self.antfly_provider orelse return false;
+        if (local.read_raster_images_reported == null and
+            local.read_raster_images_reported_with_context == null) return false;
+        const capabilities = (try self.readerCapabilities(alloc, cfg)) orelse return false;
+        return capabilities.borrowed_rasters and
+            capabilities.result_cardinality == .one_per_item and
+            capabilities.supports(.{ .image = true }) and
+            capabilities.batch.acceptsItems(requests.len);
     }
 
     fn canReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
@@ -1239,6 +1313,95 @@ pub const Runtime = struct {
                 .serial_compatibility, .none => inference_work.ExecutionReport.serial(requests.len),
             },
         );
+    }
+
+    fn produceBorrowedRasterBatchReported(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        requests: []const asset_producer.Request,
+        rasters: []const readers.RasterImage,
+    ) !asset_producer.ProducedBatch {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0 or requests.len != rasters.len)
+            return error.InvalidBorrowedRasterCardinality;
+        if (!requestsShareRoute(requests)) return error.BatchIncompatible;
+        for (requests) |request| {
+            if (request.producer_type != .reader or request.media.len != 0)
+                return error.BatchIncompatible;
+            if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
+        }
+
+        var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer cfg_parsed.deinit();
+        const execution_cfg = self.routedReaderConfig(cfg_parsed.value);
+        if (!isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl()))
+            return error.BorrowedRasterUnsupported;
+        const capabilities = (try self.readerCapabilities(alloc, cfg_parsed.value)) orelse
+            return error.BorrowedRasterUnsupported;
+        if (!capabilities.borrowed_rasters or capabilities.result_cardinality != .one_per_item or
+            !capabilities.supports(.{ .image = true })) return error.BorrowedRasterUnsupported;
+
+        var owned_shared_prompt: ?[]u8 = null;
+        defer if (owned_shared_prompt) |prompt| alloc.free(prompt);
+        var shared_prompt: ?[]const u8 = cfg_parsed.value.prompt;
+        for (requests, 0..) |request, i| {
+            var source = try parseReaderSourceWithMetadataOnly(
+                alloc,
+                request.source_text,
+                request.source_parts_json,
+                true,
+            );
+            defer source.deinit(alloc);
+            const effective_prompt = source.prompt orelse cfg_parsed.value.prompt;
+            if (i == 0) {
+                if (source.prompt) |prompt| {
+                    owned_shared_prompt = try alloc.dupe(u8, prompt);
+                    shared_prompt = owned_shared_prompt;
+                }
+            } else if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                return error.BatchIncompatible;
+            }
+        }
+
+        var batch = try self.readRasterImagesWithConfigReported(alloc, execution_cfg, .{
+            .images = rasters,
+            .prompt = shared_prompt,
+            .max_tokens = execution_cfg.max_tokens,
+            .source_fingerprint = requests[0].source_fingerprint,
+            .max_response_bytes = self.responseLimitForTask(.reader, requests.len),
+        });
+        defer batch.deinit(alloc);
+        if (batch.items.len != requests.len) return error.InvalidReaderResponse;
+        try batch.execution.validate(batch.items.len);
+
+        const outputs = try alloc.alloc([]u8, requests.len);
+        var filled: usize = 0;
+        var outputs_owned = true;
+        errdefer if (outputs_owned) {
+            for (outputs[0..filled]) |output| alloc.free(output);
+            alloc.free(outputs);
+        };
+        for (batch.items, requests, rasters, 0..) |result, request, raster, i| {
+            if (!readerResultMatchesRasterIdentity(result, raster))
+                return error.InvalidReaderResponseIdentity;
+            outputs[i] = try encodeReaderResults(alloc, request.content_type, batch.items[i .. i + 1]);
+            filled += 1;
+        }
+        const execution = inference_work.ExecutionReport{
+            .requested_items = batch.execution.requested_items,
+            .native_items = batch.execution.native_items,
+            .serial_items = batch.execution.serial_items,
+            .fallback_items = batch.execution.fallback_items,
+            .native_batches = batch.execution.native_batches,
+            .fallback_reason = batch.execution.fallback_reason,
+        };
+        // producedBatchFromOutputs owns the output array on both success and
+        // error, so disarm our construction cleanup before transferring it.
+        outputs_owned = false;
+        return try asset_producer.producedBatchFromOutputs(alloc, requests, outputs, execution);
     }
 
     fn produceCopyBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -2286,6 +2449,72 @@ pub const Runtime = struct {
         };
     }
 
+    fn readRasterImagesWithConfigReported(
+        self: *Runtime,
+        alloc: Allocator,
+        cfg: readers.Config,
+        request: readers.RasterRequest,
+    ) !readers.BatchResult {
+        try readers.validateRasterRequest(request);
+        const execution_cfg = self.routedReaderConfig(cfg);
+        try execution_cfg.validate();
+        if (!isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl()))
+            return error.BorrowedRasterUnsupported;
+        const capabilities = (try self.readerCapabilities(alloc, execution_cfg)) orelse
+            return error.InvalidInferenceCapabilities;
+        if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
+        const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+        if (local.read_raster_images_reported == null and
+            local.read_raster_images_reported_with_context == null)
+            return error.BorrowedRasterUnsupported;
+
+        var decoded_pixels: u64 = 0;
+        for (request.images) |raster| {
+            try raster.validate();
+            decoded_pixels = std.math.add(u64, decoded_pixels, try raster.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+        try capabilities.validateInvocation(.read, .{
+            .item_count = request.images.len,
+            .modalities = .{ .image = true },
+            .text_bytes = if (request.prompt) |prompt| prompt.len else 0,
+            .max_text_bytes_per_item = if (request.prompt) |prompt| prompt.len else 0,
+            .requested_output_tokens_per_item = if (request.max_tokens) |tokens|
+                if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+            else
+                0,
+            // The model receives decoded pixels. Raw resident bytes are
+            // covered by the caller's composite window and local admission;
+            // they are not encoded codec input and must not consume that cap.
+            .encoded_media_bytes = 0,
+            .decoded_pixels = decoded_pixels,
+            .max_media_parts_per_item = 1,
+        });
+
+        var batch = if (local.read_raster_images_reported_with_context) |read_reported|
+            try managed_embedder.AntflyProviderBoundary.call(
+                "read_raster_images_reported_with_context",
+                local.boundary_dispatch,
+                read_reported,
+                .{ local.ptr, alloc, execution_cfg.model orelse "", request, self.requestContext() },
+            )
+        else
+            try managed_embedder.AntflyProviderBoundary.call(
+                "read_raster_images_reported",
+                local.boundary_dispatch,
+                local.read_raster_images_reported.?,
+                .{ local.ptr, alloc, execution_cfg.model orelse "", request },
+            );
+        errdefer batch.deinit(alloc);
+        if (batch.items.len != request.images.len) return error.InvalidReaderResponse;
+        try batch.execution.validate(batch.items.len);
+        for (batch.items, request.images) |result, raster| {
+            if (!readerResultMatchesRasterIdentity(result, raster))
+                return error.InvalidReaderResponseIdentity;
+        }
+        return batch;
+    }
+
     fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var cfg_parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
             .allocate = .alloc_always,
@@ -2732,6 +2961,12 @@ fn readerResultMatchesImageIdentity(result: readers.Result, image: readers.Encod
     return std.mem.eql(u8, result.item_id, image.item_id) and
         optionalStringsEqual(result.source_fingerprint, image.source_fingerprint) and
         result.page_number == image.page_number;
+}
+
+fn readerResultMatchesRasterIdentity(result: readers.Result, raster: readers.RasterImage) bool {
+    return std.mem.eql(u8, result.item_id, raster.item_id) and
+        optionalStringsEqual(result.source_fingerprint, raster.source_fingerprint) and
+        result.page_number == raster.page_number;
 }
 
 /// Mirrors the native Florence chunk policy at the caller boundary. Keeping
@@ -5362,6 +5597,122 @@ test "asset producer runtime batches compatible antfly reader requests" {
         .inline_media_trusted = true,
     }};
     try std.testing.expect(!(try producer.canProduceBatch(alloc, &multi_image_prompt)));
+}
+
+test "asset producer raw raster selection requires local physical capability and borrows pixels" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        expected: [2][*]const u8,
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .owns_invocation_admission = true,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .model_capabilities = capabilities,
+                .read_raster_images_reported = readRasters,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn capabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            var result = try testNativeReaderCapabilities(undefined, undefined, "", task);
+            result.borrowed_rasters = true;
+            return result;
+        }
+
+        fn readRasters(
+            ptr: *anyopaque,
+            result_alloc: Allocator,
+            model: []const u8,
+            request: readers.RasterRequest,
+        ) !readers.BatchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", request.prompt.?);
+            try std.testing.expectEqual(@as(usize, 2), request.images.len);
+            for (request.images, 0..) |raster, i| {
+                try std.testing.expectEqual(@intFromPtr(self.expected[i]), @intFromPtr(raster.bytes.ptr));
+                try std.testing.expectEqual(@as(u32, 2), raster.width);
+                try std.testing.expectEqual(@as(u32, 1), raster.height);
+                try std.testing.expectEqual(@as(usize, 8), raster.stride_bytes);
+            }
+            const out = try result_alloc.alloc(readers.Result, 2);
+            for (out, request.images, 0..) |*result, raster, i| result.* = .{
+                .text = try result_alloc.dupe(u8, if (i == 0) "first" else "second"),
+                .item_id = try result_alloc.dupe(u8, raster.item_id),
+                .source_fingerprint = if (raster.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null,
+                .page_number = raster.page_number,
+            };
+            return .{
+                .items = out,
+                .execution = .{ .requested_items = 2, .native_batches = 1, .native_items = 2 },
+            };
+        }
+    };
+
+    var first_pixels = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    var second_pixels = [_]u8{ 7, 8, 9, 255, 10, 11, 12, 255 };
+    var local = Local{ .expected = .{ first_pixels[0..].ptr, second_pixels[0..].ptr } };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    defer runtime.deinit();
+    const producer = runtime.producer();
+    const requests = [_]asset_producer.Request{
+        .{
+            .producer_type = .reader,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"florence2\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "doc",
+            .item_id = "page:1",
+            .page_number = 1,
+        },
+        .{
+            .producer_type = .reader,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"florence2\"}",
+            .source_text = "",
+            .source_parts_json = "[{\"type\":\"text\",\"text\":\"<OCR>\"}]",
+            .content_type = "text/plain",
+            .inline_media_trusted = true,
+            .source_fingerprint = "doc",
+            .item_id = "page:2",
+            .page_number = 2,
+        },
+    };
+    const rasters = [_]readers.RasterImage{
+        .{ .bytes = &first_pixels, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:1", .source_fingerprint = "doc", .page_number = 1 },
+        .{ .bytes = &second_pixels, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:2", .source_fingerprint = "doc", .page_number = 2 },
+    };
+    try std.testing.expect(try producer.borrowedRasterBatchAvailable(alloc, &requests));
+    var batch = try producer.produceBorrowedRasterBatchReported(alloc, &requests, &rasters);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
+    try std.testing.expectEqualStrings("first", batch.items[0].result.value);
+    try std.testing.expectEqualStrings("second", batch.items[1].result.value);
+    first_pixels[0] = 99;
+    try std.testing.expectEqualStrings("first", batch.items[0].result.value);
+
+    var remote_requests = requests;
+    remote_requests[0].config_json = "{\"provider\":\"antfly\",\"model\":\"florence2\",\"url\":\"https://inference.example/ai/v1\"}";
+    remote_requests[1].config_json = remote_requests[0].config_json;
+    try std.testing.expect(!try producer.borrowedRasterBatchAvailable(alloc, &remote_requests));
 }
 
 test "asset producer runtime batches local encoded media without base64 adaptation" {

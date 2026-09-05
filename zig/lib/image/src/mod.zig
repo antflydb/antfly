@@ -29,6 +29,85 @@ pub const conformance = conformance_impl;
 pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
 pub const DecodeLimits = limits.DecodeLimits;
 
+/// Canonical MIME for the linked-process raw raster ABI. This is deliberately
+/// not an encoded-image MIME and must never be sent over HTTP or advertised as
+/// a model input codec. `RasterFormat` remains separately explicit so a future
+/// ABI extension cannot reinterpret existing bytes based on a MIME string.
+pub const rgba8_raster_mime_type = "image/x-antfly-rgba8";
+
+pub const RasterFormat = enum {
+    rgba8,
+
+    pub fn channels(self: RasterFormat) usize {
+        return switch (self) {
+            .rgba8 => 4,
+        };
+    }
+
+    pub fn mimeType(self: RasterFormat) []const u8 {
+        return switch (self) {
+            .rgba8 => rgba8_raster_mime_type,
+        };
+    }
+};
+
+/// A synchronous borrowed view of a decoded raster plus stable work identity.
+/// The producer owns `bytes` and every identity slice for the complete
+/// invocation; consumers must not retain any pointer after returning. Rows may
+/// contain padding, but the buffer itself is exact: no trailing unaccounted
+/// storage is accepted.
+///
+/// This physical ABI is task-neutral. Reader, generator, embedder, reranker,
+/// and extractor adapters may use it only after their resolved local executor
+/// advertises a concrete raw-raster path.
+pub const BorrowedRasterAttachment = struct {
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+    stride_bytes: usize,
+    format: RasterFormat = .rgba8,
+    mime_type: []const u8 = rgba8_raster_mime_type,
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
+
+    pub fn validate(self: BorrowedRasterAttachment) !void {
+        if (self.width == 0 or self.height == 0) return error.InvalidRasterDimensions;
+        if (!std.mem.eql(u8, self.mime_type, self.format.mimeType()))
+            return error.InvalidRasterMimeType;
+        const row_bytes = std.math.mul(
+            usize,
+            @as(usize, self.width),
+            self.format.channels(),
+        ) catch return error.InvalidRasterDimensions;
+        if (self.stride_bytes < row_bytes) return error.InvalidRasterStride;
+        const required = std.math.mul(
+            usize,
+            self.stride_bytes,
+            @as(usize, self.height),
+        ) catch return error.InvalidRasterDimensions;
+        if (self.bytes.len != required) return error.InvalidRasterBuffer;
+    }
+
+    pub fn pixels(self: BorrowedRasterAttachment) !u64 {
+        return std.math.mul(u64, self.width, self.height) catch
+            error.InvalidRasterDimensions;
+    }
+
+    pub fn imageView(self: BorrowedRasterAttachment) !processing.ImageU8 {
+        try self.validate();
+        return .{
+            .data = self.bytes,
+            .width = self.width,
+            .height = self.height,
+            .format = switch (self.format) {
+                .rgba8 => .rgba8,
+            },
+            .row_stride_bytes = self.stride_bytes,
+        };
+    }
+};
+
 /// Resolve a canonical MIME essence to a format supported by the shared
 /// inference image decoder. Keeping this registry beside `detectFormat` makes
 /// capability advertisement, header inspection, and decoding use one codec

@@ -2027,6 +2027,7 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("antfly_google", google_mod);
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
     readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
@@ -3494,6 +3495,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "generating backend factory executes fallback chain across providers",
             "asset producer runtime",
+            "asset producer raw raster selection requires local physical capability and borrows pixels",
             "asset producer destroys returned values",
             "asset producer media invocation memory fails closed",
             "asset producer enforces media allocator and result contracts",
@@ -4998,15 +5000,17 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
-            "document extraction reserves PDF decoder peak memory atomically",
             "PDF output allowance makes window size quality neutral",
+            "PDF raw raster output credit exactly bounds pixels and provider peak",
+            "PDF window output allocator enforces one ceiling across concurrent workers",
             "PDF image embedding has a media-sized batch byte default",
-            "PDF native grant partitions concurrent inspection and render ownership",
-            "PDF operation reservation owns native scratch and output headroom",
-            "PDF pinned output credit remains reusable across invocation windows",
-            "PDF decoder reservation composes with every live slice owner",
-            "PDF decoder credit and OCR transient allocations compose without double charging",
-            "reserved PDF working set is bounded without duplicate resource charges",
+            "PDF composite lease releases admission between invocation windows",
+            "PDF composite lease admits two future overlap windows atomically",
+            "prepared document source cache isolates credentials and reuses bytes",
+            "prepared document cache single-flights concurrent PDF variants and drains leases",
+            "document unit spool admits replay memory before opening a read transaction",
+            "document publication spool reads ordered segments with one transaction",
+            "document publication spool admits replay memory before opening a read transaction",
             "budgeted document download composes with materialization accounting",
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
@@ -7717,6 +7721,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime local generator accepts media url data uris",
             "standalone runtime local dense embed preserves borrowed binary media",
             "standalone encoded reader ABI round trips borrowed payloads",
+            "standalone raster reader ABI preserves borrowed strided pages and identity",
             "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const antfly_image = @import("antfly_image");
 const inference_work = @import("../../../inference/work.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
 
@@ -237,6 +238,34 @@ pub const Producer = struct {
             alloc: Allocator,
             requests: []const Request,
         ) anyerror!bool = null,
+        /// Task-neutral physical raster transport. The logical task remains
+        /// encoded by each Request and only resolved executors which advertise
+        /// borrowed-raster support may install this callback. Every raster and
+        /// identity slice is borrowed strictly for the synchronous call.
+        produce_borrowed_raster_batch_reported: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+            rasters: []const antfly_image.BorrowedRasterAttachment,
+        ) anyerror!ProducedBatch = null,
+        produce_borrowed_raster_batch_reported_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+            rasters: []const antfly_image.BorrowedRasterAttachment,
+            context: InvocationContext,
+        ) anyerror!ProducedBatch = null,
+        borrowed_raster_batch_available: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+        ) anyerror!bool = null,
+        borrowed_raster_batch_available_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            requests: []const Request,
+            context: InvocationContext,
+        ) anyerror!bool = null,
     };
 
     pub fn withInvocationContext(self: Producer, context: InvocationContext) Producer {
@@ -352,6 +381,98 @@ pub const Producer = struct {
             return batch;
         }
         return try self.produceBatchReportedUnchecked(alloc, requests);
+    }
+
+    /// Execute a batch directly from caller-owned decoded rasters. This is a
+    /// distinct transport entry point rather than a raw pseudo-MIME in
+    /// Request.media: encoded and decoded byte limits have different meanings,
+    /// and remote executors must continue through the encoded compatibility
+    /// path. The callback must complete before this function returns.
+    pub fn produceBorrowedRasterBatchReported(
+        self: Producer,
+        alloc: Allocator,
+        requests: []const Request,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) !ProducedBatch {
+        if (requests.len == 0 or requests.len != rasters.len)
+            return error.InvalidBorrowedRasterCardinality;
+        for (rasters, requests) |raster, request| {
+            try raster.validate();
+            const expected = inference_work.WorkIdentity{
+                .item_id = request.item_id,
+                .source_fingerprint = request.source_fingerprint,
+                .page_number = request.page_number,
+            };
+            const actual = inference_work.WorkIdentity{
+                .item_id = raster.item_id,
+                .source_fingerprint = raster.source_fingerprint,
+                .page_number = raster.page_number,
+            };
+            if (!actual.eql(expected)) return error.InvalidBorrowedRasterIdentity;
+        }
+        const capabilities = (try self.capabilitiesForRequests(alloc, requests)) orelse
+            return error.BorrowedRasterUnsupported;
+        if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
+
+        const plan = try self.resolvedInvocationPlan(alloc, requests);
+        if (plan) |resolved| {
+            var bounded = inference_work.BoundedInvocationAllocator.init(
+                alloc,
+                try invocationAllocatorLimit(resolved, requests),
+            );
+            var batch = self.produceBorrowedRasterBatchReportedUnchecked(
+                bounded.allocator(),
+                requests,
+                rasters,
+            ) catch |err| {
+                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+                return err;
+            };
+            validateProducedResultBytes(
+                batch.items,
+                resolved.max_result_bytes_per_item,
+                resolved.max_result_bytes,
+            ) catch |err| {
+                batch.deinit(alloc);
+                return err;
+            };
+            return batch;
+        }
+        return try self.produceBorrowedRasterBatchReportedUnchecked(alloc, requests, rasters);
+    }
+
+    /// Resolve both the logical model capability and the physical transport.
+    /// Callers use this before choosing a render representation so a remote or
+    /// older executor is rendered directly as encoded media, never rendered
+    /// raw and then rerendered after a transport failure.
+    pub fn borrowedRasterBatchAvailable(
+        self: Producer,
+        alloc: Allocator,
+        requests: []const Request,
+    ) !bool {
+        if (requests.len == 0) return false;
+        if (self.vtable.borrowed_raster_batch_available_with_context) |available|
+            return try available(self.ptr, alloc, requests, self.invocation_context);
+        if (self.vtable.borrowed_raster_batch_available) |available|
+            return try available(self.ptr, alloc, requests);
+        return false;
+    }
+
+    fn produceBorrowedRasterBatchReportedUnchecked(
+        self: Producer,
+        alloc: Allocator,
+        requests: []const Request,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) !ProducedBatch {
+        var batch = if (self.vtable.produce_borrowed_raster_batch_reported_with_context) |reported|
+            try reported(self.ptr, alloc, requests, rasters, self.invocation_context)
+        else if (self.vtable.produce_borrowed_raster_batch_reported) |reported|
+            try reported(self.ptr, alloc, requests, rasters)
+        else
+            return error.BorrowedRasterUnsupported;
+        errdefer batch.deinit(alloc);
+        try batch.validateForRequests(requests);
+        return batch;
     }
 
     fn produceBatchReportedUnchecked(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {

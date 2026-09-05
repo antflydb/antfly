@@ -35,6 +35,7 @@ const backends = @import("../backends/backends.zig");
 const ops = @import("../ops/ops.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
+const antfly_image = @import("antfly_image");
 
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
@@ -240,6 +241,166 @@ pub const ReadingPipeline = struct {
         return .{ .results = try self.readBatchSerial(image_datas), .mode = .serial };
     }
 
+    /// Execute directly from renderer-owned RGBA views. Only the qualified
+    /// native Florence reader exposes this contract; callers must retain an
+    /// encoded fallback for every other model family or remote executor.
+    pub fn readBorrowedRasterBatchReported(
+        self: *ReadingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) !ReadBatchResult {
+        const previous_source_fingerprint = active_read_profile_source_fingerprint;
+        active_read_profile_source_fingerprint = self.config.source_fingerprint;
+        defer active_read_profile_source_fingerprint = previous_source_fingerprint;
+        const allocator = self.allocator;
+        if (session_factory.getFlorenceConfig(self.vision_encoder) == null or
+            expectsFlattenedPatches(self.vision_encoder))
+            return error.BorrowedRasterUnsupported;
+        if (rasters.len == 0)
+            return .{ .results = try allocator.alloc(ReadResult, 0), .mode = .serial };
+        for (rasters) |raster| try raster.validate();
+        if (rasters.len == 1) {
+            logBorrowedRasterBatchMode("single", rasters, null);
+            return .{
+                .results = try self.readBorrowedRasterSerial(rasters),
+                .mode = .serial,
+            };
+        }
+
+        const max_batch = nativeFlorenceReadBatchSize();
+        if (max_batch <= 1) {
+            logBorrowedRasterBatchMode("serial", rasters, "configured_batch_size_one");
+            return .{
+                .results = try self.readBorrowedRasterSerial(rasters),
+                .mode = .serial,
+            };
+        }
+        const results = self.readBorrowedRasterBatchNativeChunked(rasters) catch |err| switch (err) {
+            error.UnsupportedShape,
+            error.UnsupportedOperation,
+            error.UnsupportedFlorence2ResidentMetal,
+            => {
+                logBorrowedRasterBatchMode("serial_fallback", rasters, @errorName(err));
+                return .{
+                    .results = try self.readBorrowedRasterSerial(rasters),
+                    .mode = .fallback,
+                    .fallback_reason = @errorName(err),
+                };
+            },
+            else => return err,
+        };
+        return .{
+            .results = results,
+            .mode = .native,
+            .native_batches = std.math.divCeil(usize, rasters.len, max_batch) catch unreachable,
+        };
+    }
+
+    fn readBorrowedRasterSerial(
+        self: *ReadingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) ![]ReadResult {
+        const out = try self.allocator.alloc(ReadResult, rasters.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            self.allocator.free(out);
+        }
+        for (rasters, out) |raster, *result| {
+            result.* = try self.readBorrowedRaster(raster);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn readBorrowedRaster(
+        self: *ReadingPipeline,
+        raster: antfly_image.BorrowedRasterAttachment,
+    ) !ReadResult {
+        resetLastReadTelemetry();
+        const img_size: u32 = @intCast(self.config.image_size);
+        const per_image_side = std.math.mul(usize, img_size, img_size) catch
+            return error.InvalidInputShape;
+        const pixel_values = try self.allocator.alloc(f32, 3 * per_image_side);
+        defer self.allocator.free(pixel_values);
+        try image.preprocessBorrowedRasterBatchInto(
+            pixel_values,
+            &.{raster},
+            img_size,
+            self.config.image_mean,
+            self.config.image_std,
+            self.config.resample,
+        );
+        return self.readPixelValues(pixel_values);
+    }
+
+    fn readBorrowedRasterBatchNativeChunked(
+        self: *ReadingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) ![]ReadResult {
+        const max_batch = nativeFlorenceReadBatchSize();
+        logBorrowedRasterBatchMode(
+            if (rasters.len > max_batch) "native_florence_chunked" else "native_florence",
+            rasters,
+            null,
+        );
+        const out = try self.allocator.alloc(ReadResult, rasters.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            self.allocator.free(out);
+        }
+        var offset: usize = 0;
+        while (offset < rasters.len) {
+            const chunk_len = @min(max_batch, rasters.len - offset);
+            const chunk_results = try self.readBorrowedRasterBatchNative(
+                rasters[offset..][0..chunk_len],
+            );
+            if (chunk_results.len != chunk_len) {
+                for (chunk_results) |*result| result.deinit();
+                self.allocator.free(chunk_results);
+                return error.InvalidReadResultCount;
+            }
+            {
+                defer self.allocator.free(chunk_results);
+                for (chunk_results, 0..) |result, i| out[offset + i] = result;
+            }
+            filled += chunk_results.len;
+            offset += chunk_len;
+        }
+        return out;
+    }
+
+    fn readBorrowedRasterBatchNative(
+        self: *ReadingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) ![]ReadResult {
+        const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse
+            return error.BorrowedRasterUnsupported;
+        const batch = rasters.len;
+        const img_size: u32 = @intCast(self.config.image_size);
+        const ts: usize = img_size;
+        const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+        const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+        const pixel_count = std.math.mul(usize, batch, per_image) catch return error.InvalidInputShape;
+        const pixel_values = try self.allocator.alloc(f32, pixel_count);
+        defer self.allocator.free(pixel_values);
+        resetLastReadTelemetry();
+        try image.preprocessBorrowedRasterBatchInto(
+            pixel_values,
+            rasters,
+            img_size,
+            self.config.image_mean,
+            self.config.image_std,
+            self.config.resample,
+        );
+        return self.readBatchNativeFlorencePixels(
+            pixel_values,
+            batch,
+            florence_cfg,
+            platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION"),
+        );
+    }
+
     fn readBatchSerial(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
         const allocator = self.allocator;
         const out = try allocator.alloc(ReadResult, image_datas.len);
@@ -320,6 +481,23 @@ pub const ReadingPipeline = struct {
             self.config.resample,
             .{ .io = self.config.preprocess_io },
         );
+
+        return self.readBatchNativeFlorencePixels(
+            pixel_values,
+            batch,
+            florence_cfg,
+            debug_cuda_session,
+        );
+    }
+
+    fn readBatchNativeFlorencePixels(
+        self: *ReadingPipeline,
+        pixel_values: []const f32,
+        batch: usize,
+        florence_cfg: florence_arch.Config,
+        debug_cuda_session: bool,
+    ) ![]ReadResult {
+        const allocator = self.allocator;
 
         const prompt_text = self.config.prompt orelse "<OCR>";
         const prompt_i32 = try buildFlorencePromptIds(
@@ -1548,19 +1726,38 @@ fn logMetalStageTimingProfile(cb: *const ComputeBackend) void {
 }
 
 fn logReadBatchMode(mode: []const u8, image_datas: []const []const u8, fallback_reason: ?[]const u8) void {
-    if (!readProfileEnabled()) return;
     var encoded_bytes: usize = 0;
     for (image_datas) |data| encoded_bytes +|= data.len;
+    logReadBatchModeSize(mode, image_datas.len, encoded_bytes, fallback_reason);
+}
+
+fn logBorrowedRasterBatchMode(
+    mode: []const u8,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    fallback_reason: ?[]const u8,
+) void {
+    var raster_bytes: usize = 0;
+    for (rasters) |raster| raster_bytes +|= raster.bytes.len;
+    logReadBatchModeSize(mode, rasters.len, raster_bytes, fallback_reason);
+}
+
+fn logReadBatchModeSize(
+    mode: []const u8,
+    count: usize,
+    input_bytes: usize,
+    fallback_reason: ?[]const u8,
+) void {
+    if (!readProfileEnabled()) return;
     if (active_read_profile_source_fingerprint) |source_fingerprint| {
         if (fallback_reason) |reason| {
-            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ source_fingerprint, mode, image_datas.len, encoded_bytes, reason });
+            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ source_fingerprint, mode, count, input_bytes, reason });
         } else {
-            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d}", .{ source_fingerprint, mode, image_datas.len, encoded_bytes });
+            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d}", .{ source_fingerprint, mode, count, input_bytes });
         }
     } else if (fallback_reason) |reason| {
-        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ mode, image_datas.len, encoded_bytes, reason });
+        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ mode, count, input_bytes, reason });
     } else {
-        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d}", .{ mode, image_datas.len, encoded_bytes });
+        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d}", .{ mode, count, input_bytes });
     }
 }
 

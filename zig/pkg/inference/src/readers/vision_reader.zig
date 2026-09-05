@@ -24,6 +24,7 @@ const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
 const c_file = @import("../util/c_file.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const antfly_image = @import("antfly_image");
 
 pub const PreprocessorConfig = struct {
     image_size: usize = 384,
@@ -57,12 +58,11 @@ pub const LoadedVisionReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedVisionReader {
-        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
+            const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
             var loader = try model_manager.componentLoaderForPaths(
                 model_path,
                 session_manager.preferred_backends,
@@ -77,6 +77,20 @@ pub const LoadedVisionReader = struct {
         };
         errdefer model_handle.release();
         const model = model_handle.get();
+        var reader = try loadFromBorrowedModel(allocator, model_path, model);
+        reader.loaded_model_handle = model_handle;
+        return reader;
+    }
+
+    /// Construct the lightweight reader wrapper around an already fenced
+    /// immutable model generation. The caller must retain its ModelHandle until
+    /// this reader is deinitialized.
+    pub fn loadFromBorrowedModel(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model: *model_manager_mod.LoadedModel,
+    ) !LoadedVisionReader {
+        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
             std.log.err(
                 "reader model resolved without a Florence session requested_path={s} loaded_path={s} backend={s}",
@@ -98,7 +112,6 @@ pub const LoadedVisionReader = struct {
             .dec_config = dec_config,
             .preproc = preproc,
             .loaded_model = model,
-            .loaded_model_handle = model_handle,
             .owns_sessions = false,
         };
     }
@@ -200,6 +213,15 @@ pub const LoadedVisionReader = struct {
     pub fn readRawBatchReported(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadBatchResult {
         var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readBatchReported(image_datas);
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *LoadedVisionReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: reader_types.ReadOptions,
+    ) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBorrowedRasterBatchReported(rasters);
     }
 
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
