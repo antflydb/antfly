@@ -895,10 +895,12 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         try ignoreNonResourceMetadataError(parseSentenceTransformersPoolingConfig(&manifest, allocator, pooling_bytes));
     }
 
-    // Try to parse model_manifest.json
+    // model_manifest.json is Antfly-owned executable metadata, not an
+    // opportunistic upstream hint. A present file must be valid so task-aware
+    // embedders cannot silently fall back to symmetric raw-text behavior.
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
@@ -2189,6 +2191,14 @@ fn parseEmbeddingTaskContractJson(value: std.json.Value) !EmbeddingTaskContract 
     return error.InvalidEmbeddingTaskProfile;
 }
 
+fn parseEmbeddingStyleJson(value: std.json.Value) !EmbeddingStyle {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    inline for (.{ "none", "jina_v5", "qwen3_embedding" }) |name| {
+        if (std.mem.eql(u8, value.string, name)) return @field(EmbeddingStyle, name);
+    }
+    return error.InvalidEmbeddingTaskProfile;
+}
+
 fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !void {
     // An explicit profile replaces inferred config.json defaults. Mark it
     // unresolved first so malformed or partial role mappings fail closed in
@@ -2257,7 +2267,10 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidModelManifest,
+    };
 
     if (obj.get("type")) |v| {
         if (v == .string) {
@@ -2321,23 +2334,15 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     // Legacy flat fields remain read-compatible. New manifests should use
     // embedding_profile.query/document.prefix.
     if (obj.get("query_prefix")) |v| {
-        if (v == .string) {
-            try setEmbeddingProfilePrefix(manifest, .query, v.string);
-        }
+        if (v != .string) return error.InvalidEmbeddingTaskProfile;
+        try setEmbeddingProfilePrefix(manifest, .query, v.string);
     }
     if (obj.get("document_prefix")) |v| {
-        if (v == .string) {
-            try setEmbeddingProfilePrefix(manifest, .document, v.string);
-        }
+        if (v != .string) return error.InvalidEmbeddingTaskProfile;
+        try setEmbeddingProfilePrefix(manifest, .document, v.string);
     }
     if (obj.get("embedding_style")) |v| {
-        if (v == .string) {
-            inline for (.{ "none", "jina_v5", "qwen3_embedding" }) |name| {
-                if (std.mem.eql(u8, v.string, name)) {
-                    manifest.embedding_style = @field(EmbeddingStyle, name);
-                }
-            }
-        }
+        manifest.embedding_style = try parseEmbeddingStyleJson(v);
     }
 }
 
@@ -3524,6 +3529,62 @@ test "embedding task contract declarations reject unknown values and types" {
             error.InvalidEmbeddingTaskProfile,
             parseModelManifestJson(&manifest, allocator, manifest_json),
         );
+    }
+}
+
+test "embedding execution-style declarations reject unknown values and types" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","embedding_style":true}
+        ,
+        \\{"type":"embedder","query_prefix":42,"document_prefix":""}
+        ,
+        \\{"type":"embedder","query_prefix":"query: ","document_prefix":42}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+}
+
+test "loadFromDir fails closed on invalid explicit embedding metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+        ,
+    }, .{
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
+        error.MissingEmbeddingTaskProfile,
+    }) |manifest_json, expected_error| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(expected_error, loadFromDir(allocator, model_dir));
     }
 }
 
