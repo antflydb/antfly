@@ -1017,6 +1017,14 @@ fn preparedProjectionAlloc(
     prepared: *PreparedGraphArtifact,
     options: BuildOptions,
 ) !PreparedProjection {
+    // Prepared artifacts may outlive a single publication request. Re-admit
+    // the immutable source topology against every caller's limits before a
+    // cache hit can bypass projection construction.
+    if (prepared.topology.source_node_count > options.limits.max_nodes or
+        prepared.topology.source_edge_count > options.limits.max_edges)
+    {
+        return error.GraphMetricBuildBudgetExceeded;
+    }
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (prepared.cached_projection != null and
         prepared.cached_projection_filter.?.equivalent(options.config.edge_filter) and
@@ -1945,4 +1953,31 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     try std.testing.expect(!std.mem.eql(u8, alias_a[0].name, alias_b[0].name));
     try std.testing.expectEqualStrings(alias_a[0].artifact_id, alias_b[0].artifact_id);
     try std.testing.expectEqualStrings(alias_a[0].checksum, alias_b[0].checksum);
+
+    // Cache reuse must not inherit admission from the request that populated
+    // the cache. A later caller's stricter source-topology limit still wins.
+    const strict_limits = Limits{ .max_nodes = 1 };
+    var strict_budget = graph_metric_policy.Budget{ .limits = strict_limits };
+    const strict = try publishManyFromPreparedGraphWithBudgetAlloc(
+        alloc,
+        &artifacts,
+        "strict_alias",
+        source,
+        &one_config,
+        .none,
+        strict_limits,
+        &strict_budget,
+        &alias_prepared,
+        .{ .published_generation = 2, .edge_generation = 1, .computed_at_ms = 2 },
+        .{},
+    );
+    defer {
+        for (strict) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(strict);
+    }
+    const strict_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, strict[0].artifact_id, strict[0].byte_len, strict[0].checksum, .none);
+    defer alloc.free(strict_payload);
+    var strict_decoded = try metric_segment.decodeAlloc(alloc, strict_payload);
+    defer strict_decoded.deinit(alloc);
+    try std.testing.expectEqual(metric_segment.MaterializationState.rejected, strict_decoded.materialization_state);
 }
