@@ -51,7 +51,12 @@ DIMENSIONS_MIN_COSINE = 0.99999
 NORM_ABS_TOLERANCE = 1e-3
 CHECK_DIMENSIONS = 256
 ORACLE_DIMS = ("1024", "256", "32")
-RETRIEVAL_QUERY_CASES = ("query_custom", "query_default", "query_shared_text", "query_short")
+RETRIEVAL_QUERY_CASES = (
+    "query_custom",
+    "query_default",
+    "query_shared_text",
+    "query_short",
+)
 RETRIEVAL_DOCUMENT_CASES = ("doc_cjk", "doc_emoji", "doc_english", "doc_shared_text")
 
 
@@ -81,7 +86,9 @@ def _finite_floats(value: Any) -> bool:
     return (
         isinstance(value, list)
         and bool(value)
-        and all(isinstance(item, (int, float)) and math.isfinite(item) for item in value)
+        and all(
+            isinstance(item, (int, float)) and math.isfinite(item) for item in value
+        )
     )
 
 
@@ -89,7 +96,9 @@ def validate_oracle(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if payload.get("schema") != ORACLE_SCHEMA:
         raise QualificationError(f"unexpected oracle schema: {payload.get('schema')!r}")
     contract = payload.get("contract")
-    if not isinstance(contract, dict) or not isinstance(contract.get("default_instruction"), str):
+    if not isinstance(contract, dict) or not isinstance(
+        contract.get("default_instruction"), str
+    ):
         raise QualificationError("oracle contract lacks a default_instruction")
     raw_cases = payload.get("cases")
     if not isinstance(raw_cases, list) or not raw_cases:
@@ -105,7 +114,9 @@ def validate_oracle(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if case_id in cases:
             raise QualificationError(f"duplicate oracle case id: {case_id}")
         if case.get("role") not in ("query", "document"):
-            raise QualificationError(f"case {case_id}: invalid role {case.get('role')!r}")
+            raise QualificationError(
+                f"case {case_id}: invalid role {case.get('role')!r}"
+            )
         if not isinstance(case.get("text"), str):
             raise QualificationError(f"case {case_id}: text is not a string")
         served_text = case.get("served_text")
@@ -113,10 +124,14 @@ def validate_oracle(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise QualificationError(f"case {case_id}: served_text is not a string")
         instruction = case.get("instruction")
         if instruction is not None and not isinstance(instruction, str):
-            raise QualificationError(f"case {case_id}: invalid instruction {instruction!r}")
+            raise QualificationError(
+                f"case {case_id}: invalid instruction {instruction!r}"
+            )
         token_ids = case.get("token_ids")
-        if not isinstance(token_ids, list) or not token_ids or not all(
-            isinstance(token, int) for token in token_ids
+        if (
+            not isinstance(token_ids, list)
+            or not token_ids
+            or not all(isinstance(token, int) for token in token_ids)
         ):
             raise QualificationError(f"case {case_id}: invalid token_ids")
         embeddings = case.get("embeddings")
@@ -164,7 +179,9 @@ def embedding_request_body(
     return body
 
 
-def post_embeddings(base_url: str, body: dict[str, Any], timeout: float) -> list[list[float]]:
+def post_embeddings(
+    base_url: str, body: dict[str, Any], timeout: float
+) -> list[list[float]]:
     request = urllib.request.Request(
         base_url.rstrip("/") + EMBEDDINGS_PATH,
         data=json.dumps(body).encode(),
@@ -182,13 +199,17 @@ def post_embeddings(base_url: str, body: dict[str, Any], timeout: float) -> list
         )
     rows = sorted(
         enumerate(data),
-        key=lambda item: item[1].get("index", item[0]) if isinstance(item[1], dict) else item[0],
+        key=lambda item: (
+            item[1].get("index", item[0]) if isinstance(item[1], dict) else item[0]
+        ),
     )
     vectors: list[list[float]] = []
     for position, item in rows:
         embedding = item.get("embedding") if isinstance(item, dict) else None
         if not _finite_floats(embedding):
-            raise QualificationError(f"response row {position} has no finite embedding vector")
+            raise QualificationError(
+                f"response row {position} has no finite embedding vector"
+            )
         vectors.append([float(value) for value in embedding])
     return vectors
 
@@ -219,7 +240,9 @@ def case_gates(
         )
     )
     if norm <= 0.0:
-        rows.append(gate("oracle_cosine", case_id, False, "server vector has zero norm"))
+        rows.append(
+            gate("oracle_cosine", case_id, False, "server vector has zero norm")
+        )
         return rows
     value = cosine(server_vector, oracle_vector)
     rows.append(
@@ -259,7 +282,14 @@ def mrl_gates(
         )
     )
     if norm <= 0.0:
-        rows.append(gate("mrl_truncate_renormalize", case_id, False, "reduced vector has zero norm"))
+        rows.append(
+            gate(
+                "mrl_truncate_renormalize",
+                case_id,
+                False,
+                "reduced vector has zero norm",
+            )
+        )
         return rows
     expected = truncate_and_renormalize(server_full, dimensions)
     value = cosine(server_reduced, expected)
@@ -313,8 +343,12 @@ def retrieval_gates(
     oracle_vectors: dict[str, list[float]],
     server_vectors: dict[str, list[float]],
 ) -> list[dict[str, Any]]:
-    oracle_documents = {case_id: oracle_vectors[case_id] for case_id in RETRIEVAL_DOCUMENT_CASES}
-    server_documents = {case_id: server_vectors[case_id] for case_id in RETRIEVAL_DOCUMENT_CASES}
+    oracle_documents = {
+        case_id: oracle_vectors[case_id] for case_id in RETRIEVAL_DOCUMENT_CASES
+    }
+    server_documents = {
+        case_id: server_vectors[case_id] for case_id in RETRIEVAL_DOCUMENT_CASES
+    }
     rows = []
     for query_id in RETRIEVAL_QUERY_CASES:
         oracle_top = retrieval_top1(oracle_vectors[query_id], oracle_documents)
@@ -348,9 +382,13 @@ def render_table(rows: list[dict[str, Any]]) -> str:
         (row["gate"], row["case"], "PASS" if row["pass"] else "FAIL", row["detail"])
         for row in rows
     ]
-    widths = [max(len(entry[column]) for entry in table) for column in range(len(header))]
+    widths = [
+        max(len(entry[column]) for entry in table) for column in range(len(header))
+    ]
     return "\n".join(
-        "  ".join(entry[column].ljust(widths[column]) for column in range(len(header))).rstrip()
+        "  ".join(
+            entry[column].ljust(widths[column]) for column in range(len(header))
+        ).rstrip()
         for entry in table
     )
 
@@ -389,7 +427,9 @@ def needs_reduced_dimension_replay(case: dict[str, Any]) -> bool:
     return not case.get("truncated", False)
 
 
-def run_qualification(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def run_qualification(
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     payload = load_oracle(args.oracle)
     cases = validate_oracle(payload)
     default_instruction = payload["contract"]["default_instruction"]
@@ -435,16 +475,24 @@ def run_qualification(args: argparse.Namespace) -> tuple[list[dict[str, Any]], d
     for case_id, batch_vector in zip(document_ids, batch_vectors):
         rows.extend(batch_gates(case_id, server_full[case_id], batch_vector))
 
-    oracle_vectors = {case_id: cases[case_id]["embeddings"]["1024"] for case_id in cases}
+    oracle_vectors = {
+        case_id: cases[case_id]["embeddings"]["1024"] for case_id in cases
+    }
     rows.extend(retrieval_gates(oracle_vectors, server_full))
     if "query_shared_text" in server_full and "doc_shared_text" in server_full:
         rows.append(
-            shared_text_gate(server_full["query_shared_text"], server_full["doc_shared_text"])
+            shared_text_gate(
+                server_full["query_shared_text"], server_full["doc_shared_text"]
+            )
         )
 
     evidence = {
         "schema": SCHEMA,
-        "oracle": {"path": str(args.oracle), "schema": ORACLE_SCHEMA, "cases": len(cases)},
+        "oracle": {
+            "path": str(args.oracle),
+            "schema": ORACLE_SCHEMA,
+            "cases": len(cases),
+        },
         "base_url": args.base_url,
         "model": args.model,
         "tier": args.tier,
@@ -473,7 +521,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         rows, evidence = run_qualification(args)
-    except (QualificationError, OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
+    except (
+        QualificationError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        urllib.error.URLError,
+    ) as exc:
         print(f"qwen3-embedding qualification failed: {exc}", file=sys.stderr)
         return 2
     if args.report:

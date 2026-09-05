@@ -55,7 +55,9 @@ class ManagedBundleTests(unittest.TestCase):
             root = Path(raw)
             self.make_bundle(root)
             evidence = qualify.validate_managed_bundle(root)
-            self.assertEqual(str(root.resolve() / "decoder.gguf"), evidence["decoder_path"])
+            self.assertEqual(
+                str(root.resolve() / "decoder.gguf"), evidence["decoder_path"]
+            )
             self.assertEqual(3, len(evidence["artifacts"]))
 
     def test_tamper_fails_closed(self) -> None:
@@ -71,7 +73,9 @@ class ManagedBundleTests(unittest.TestCase):
             root = Path(raw)
             self.make_bundle(root)
             (root / "stale.json").write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(qualify.QualificationError, "file set mismatch"):
+            with self.assertRaisesRegex(
+                qualify.QualificationError, "file set mismatch"
+            ):
                 qualify.validate_managed_bundle(root)
 
     def test_reranker_requires_exact_nested_contract_artifacts(self) -> None:
@@ -121,7 +125,9 @@ class ManagedBundleTests(unittest.TestCase):
             }
             try:
                 evidence = qualify.validate_managed_reranker_bundle(root)
-                self.assertEqual(str(root.resolve() / "model.safetensors"), evidence["model_path"])
+                self.assertEqual(
+                    str(root.resolve() / "model.safetensors"), evidence["model_path"]
+                )
                 (root / "1_LogitScore/config.json").write_bytes(b"wrong")
                 with self.assertRaises(qualify.QualificationError):
                     qualify.validate_managed_reranker_bundle(root)
@@ -237,7 +243,9 @@ class ParserAndMetricTests(unittest.TestCase):
                         label="test process",
                     )
             self.assertIn("timeout", str(raised.exception))
-            self.assertGreaterEqual(raised.exception.execution["resources"]["sample_count"], 1)
+            self.assertGreaterEqual(
+                raised.exception.execution["resources"]["sample_count"], 1
+            )
 
     def test_final_swap_snapshot_is_a_hard_gate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

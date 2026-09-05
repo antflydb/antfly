@@ -67,7 +67,9 @@ class OracleValidationTests(unittest.TestCase):
     def test_wrong_schema_fails_closed(self) -> None:
         payload = make_oracle_payload()
         payload["schema"] = "antfly.qwen3_embedding.transformers_oracle.v0"
-        with self.assertRaisesRegex(qualify.QualificationError, "unexpected oracle schema"):
+        with self.assertRaisesRegex(
+            qualify.QualificationError, "unexpected oracle schema"
+        ):
             qualify.validate_oracle(payload)
 
     def test_missing_default_instruction_fails_closed(self) -> None:
@@ -79,19 +81,25 @@ class OracleValidationTests(unittest.TestCase):
     def test_duplicate_case_id_fails_closed(self) -> None:
         payload = make_oracle_payload()
         payload["cases"].append(make_case("doc_cjk", "document", None, 4))
-        with self.assertRaisesRegex(qualify.QualificationError, "duplicate oracle case id"):
+        with self.assertRaisesRegex(
+            qualify.QualificationError, "duplicate oracle case id"
+        ):
             qualify.validate_oracle(payload)
 
     def test_wrong_embedding_width_fails_closed(self) -> None:
         payload = make_oracle_payload()
         payload["cases"][0]["embeddings"]["256"] = [1.0] * 255
-        with self.assertRaisesRegex(qualify.QualificationError, "invalid 256-dim embedding"):
+        with self.assertRaisesRegex(
+            qualify.QualificationError, "invalid 256-dim embedding"
+        ):
             qualify.validate_oracle(payload)
 
     def test_non_finite_embedding_fails_closed(self) -> None:
         payload = make_oracle_payload()
         payload["cases"][0]["embeddings"]["32"][0] = float("nan")
-        with self.assertRaisesRegex(qualify.QualificationError, "invalid 32-dim embedding"):
+        with self.assertRaisesRegex(
+            qualify.QualificationError, "invalid 32-dim embedding"
+        ):
             qualify.validate_oracle(payload)
 
     def test_missing_retrieval_matrix_case_fails_closed(self) -> None:
@@ -106,15 +114,25 @@ class OracleValidationTests(unittest.TestCase):
 class RequestBodyTests(unittest.TestCase):
     def test_document_sends_raw_text_without_task_type(self) -> None:
         body = qualify.embedding_request_body(
-            "qwen3-embedding-0.6b", "hello", "document", None, oracle.DEFAULT_INSTRUCTION
+            "qwen3-embedding-0.6b",
+            "hello",
+            "document",
+            None,
+            oracle.DEFAULT_INSTRUCTION,
         )
         self.assertEqual({"model": "qwen3-embedding-0.6b", "input": "hello"}, body)
 
     def test_default_query_sends_task_type_only(self) -> None:
         body = qualify.embedding_request_body(
-            "m", "hello", "query", oracle.DEFAULT_INSTRUCTION, oracle.DEFAULT_INSTRUCTION
+            "m",
+            "hello",
+            "query",
+            oracle.DEFAULT_INSTRUCTION,
+            oracle.DEFAULT_INSTRUCTION,
         )
-        self.assertEqual({"model": "m", "input": "hello", "task_type": "RETRIEVAL_QUERY"}, body)
+        self.assertEqual(
+            {"model": "m", "input": "hello", "task_type": "RETRIEVAL_QUERY"}, body
+        )
 
     def test_custom_query_sends_instruction(self) -> None:
         body = qualify.embedding_request_body(
@@ -132,13 +150,20 @@ class RequestBodyTests(unittest.TestCase):
 
     def test_dimensions_and_batch_inputs_are_forwarded(self) -> None:
         body = qualify.embedding_request_body(
-            "m", ["a", "b"], "document", None, oracle.DEFAULT_INSTRUCTION, dimensions=256
+            "m",
+            ["a", "b"],
+            "document",
+            None,
+            oracle.DEFAULT_INSTRUCTION,
+            dimensions=256,
         )
         self.assertEqual({"model": "m", "input": ["a", "b"], "dimensions": 256}, body)
 
     def test_unknown_role_fails_closed(self) -> None:
         with self.assertRaisesRegex(qualify.QualificationError, "unknown oracle role"):
-            qualify.embedding_request_body("m", "x", "passage", None, oracle.DEFAULT_INSTRUCTION)
+            qualify.embedding_request_body(
+                "m", "x", "passage", None, oracle.DEFAULT_INSTRUCTION
+            )
 
 
 class TierGateTests(unittest.TestCase):
@@ -152,7 +177,9 @@ class TierGateTests(unittest.TestCase):
 
     def test_identical_vectors_pass_every_gate(self) -> None:
         vector = basis_vector(1024, 5)
-        rows = qualify.case_gates("case", vector, list(vector), qualify.TIER_MIN_COSINE["bf16"])
+        rows = qualify.case_gates(
+            "case", vector, list(vector), qualify.TIER_MIN_COSINE["bf16"]
+        )
         self.assertTrue(all(row["pass"] for row in rows))
 
     def test_tier_selects_the_cosine_threshold(self) -> None:
@@ -161,20 +188,33 @@ class TierGateTests(unittest.TestCase):
         server_vector = basis_vector(1024, 0)
         server_vector[0] = math.cos(angle)
         server_vector[1] = math.sin(angle)
-        strict = qualify.case_gates("case", oracle_vector, server_vector, qualify.TIER_MIN_COSINE["f16"])
-        relaxed = qualify.case_gates("case", oracle_vector, server_vector, qualify.TIER_MIN_COSINE["q8_0"])
-        self.assertFalse([row for row in strict if row["gate"] == "oracle_cosine"][0]["pass"])
-        self.assertTrue([row for row in relaxed if row["gate"] == "oracle_cosine"][0]["pass"])
+        strict = qualify.case_gates(
+            "case", oracle_vector, server_vector, qualify.TIER_MIN_COSINE["f16"]
+        )
+        relaxed = qualify.case_gates(
+            "case", oracle_vector, server_vector, qualify.TIER_MIN_COSINE["q8_0"]
+        )
+        self.assertFalse(
+            [row for row in strict if row["gate"] == "oracle_cosine"][0]["pass"]
+        )
+        self.assertTrue(
+            [row for row in relaxed if row["gate"] == "oracle_cosine"][0]["pass"]
+        )
 
     def test_scaled_vector_fails_only_the_norm_gate(self) -> None:
         oracle_vector = basis_vector(1024, 0)
         server_vector = basis_vector(1024, 0, scale=2.0)
-        rows = {row["gate"]: row for row in qualify.case_gates("case", oracle_vector, server_vector, 0.99)}
+        rows = {
+            row["gate"]: row
+            for row in qualify.case_gates("case", oracle_vector, server_vector, 0.99)
+        }
         self.assertFalse(rows["unit_norm"]["pass"])
         self.assertTrue(rows["oracle_cosine"]["pass"])
 
     def test_width_mismatch_short_circuits(self) -> None:
-        rows = qualify.case_gates("case", basis_vector(1024, 0), basis_vector(256, 0), 0.99)
+        rows = qualify.case_gates(
+            "case", basis_vector(1024, 0), basis_vector(256, 0), 0.99
+        )
         self.assertEqual(1, len(rows))
         self.assertFalse(rows[0]["pass"])
 
@@ -194,7 +234,9 @@ class MrlGateTests(unittest.TestCase):
         full = [float(index + 1) for index in range(64)]
         reduced = oracle.truncate_and_renormalize(full, 32)
         reduced[0] += 0.05
-        rows = {row["gate"]: row for row in qualify.mrl_gates("case", full, reduced, 32)}
+        rows = {
+            row["gate"]: row for row in qualify.mrl_gates("case", full, reduced, 32)
+        }
         self.assertFalse(rows["mrl_truncate_renormalize"]["pass"])
 
     def test_wrong_reduced_width_short_circuits(self) -> None:
@@ -228,7 +270,9 @@ class BatchGateTests(unittest.TestCase):
         self.assertTrue(rows[0]["pass"])
 
     def test_divergent_batch_vector_fails(self) -> None:
-        rows = qualify.batch_gates("case", basis_vector(1024, 9), basis_vector(1024, 10))
+        rows = qualify.batch_gates(
+            "case", basis_vector(1024, 9), basis_vector(1024, 10)
+        )
         self.assertFalse(rows[0]["pass"])
 
 
@@ -245,14 +289,18 @@ class RetrievalGateTests(unittest.TestCase):
 
     def test_agreeing_server_passes_all_queries(self) -> None:
         vectors = self.vectors()
-        rows = qualify.retrieval_gates(vectors, {key: list(value) for key, value in vectors.items()})
+        rows = qualify.retrieval_gates(
+            vectors, {key: list(value) for key, value in vectors.items()}
+        )
         self.assertEqual(len(qualify.RETRIEVAL_QUERY_CASES), len(rows))
         self.assertTrue(all(row["pass"] for row in rows))
 
     def test_flipped_server_query_fails_its_gate(self) -> None:
         vectors = self.vectors()
         server = {key: list(value) for key, value in vectors.items()}
-        server["query_default"] = basis_vector(1024, 1)  # now retrieves doc_cjk, not doc_english
+        server["query_default"] = basis_vector(
+            1024, 1
+        )  # now retrieves doc_cjk, not doc_english
         rows = {row["case"]: row for row in qualify.retrieval_gates(vectors, server)}
         self.assertFalse(rows["query_default"]["pass"])
         self.assertTrue(rows["query_short"]["pass"])
@@ -269,7 +317,9 @@ class SharedTextGateTests(unittest.TestCase):
 class TableTests(unittest.TestCase):
     def test_render_table_includes_status_columns(self) -> None:
         rows = [
-            qualify.gate("oracle_cosine", "doc_english", True, "cosine=1.000000 min=0.999"),
+            qualify.gate(
+                "oracle_cosine", "doc_english", True, "cosine=1.000000 min=0.999"
+            ),
             qualify.gate("unit_norm", "doc_cjk", False, "|v|=2.000000 tol=0.001"),
         ]
         table = qualify.render_table(rows)

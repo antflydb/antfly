@@ -46,22 +46,64 @@ RERANKER_EXPECTED_SOURCE = {
     "variant": "bf16-safetensors-bundle-v1",
 }
 RERANKER_EXPECTED_ARTIFACTS = {
-    "model.safetensors": (4_255_140_312, "466ec01961061e9d7f804b4fb1625fb6f406106cd1567e026096d4736fa9d5b9"),
-    "config.json": (1_652, "82d38a8f803e38e13986fdd622114a6fec12a834adbd3cee9253d757a257d23d"),
-    "tokenizer.json": (11_422_654, "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
-    "tokenizer_config.json": (5_445, "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5"),
-    "preprocessor_config.json": (628, "fd32af55c2d3846adb0bc46df8eb07c92c332b31b34c338ae85259f3f3951f24"),
-    "video_preprocessor_config.json": (817, "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1"),
-    "chat_template.jinja": (5_292, "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4"),
-    "additional_chat_templates/reranker.jinja": (2_443, "47c758cb74d7f1e20e22483949a5ba4c8c1f4515126ad173da1c63211f472aa7"),
-    "1_LogitScore/config.json": (57, "73e3156450564d8a98b7e47bcf5aace0f29600828b51937da545571e84db3ff3"),
-    "modules.json": (280, "6f13b6b4a89e577b591b2077bca40c67c26541a6740a8809267cb474f90806a9"),
-    "sentence_bert_config.json": (756, "729676c811dadb5cf2cefdfcfca1bd04de40d0f0caed8a6482016d8a2937341d"),
-    "scripts/qwen3_vl_reranker.py": (10_873, "bd5d2f5d97fc4a738864d93f6b15d8850243e60da4484f3ea78867a46efdebd6"),
+    "model.safetensors": (
+        4_255_140_312,
+        "466ec01961061e9d7f804b4fb1625fb6f406106cd1567e026096d4736fa9d5b9",
+    ),
+    "config.json": (
+        1_652,
+        "82d38a8f803e38e13986fdd622114a6fec12a834adbd3cee9253d757a257d23d",
+    ),
+    "tokenizer.json": (
+        11_422_654,
+        "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    ),
+    "tokenizer_config.json": (
+        5_445,
+        "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5",
+    ),
+    "preprocessor_config.json": (
+        628,
+        "fd32af55c2d3846adb0bc46df8eb07c92c332b31b34c338ae85259f3f3951f24",
+    ),
+    "video_preprocessor_config.json": (
+        817,
+        "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1",
+    ),
+    "chat_template.jinja": (
+        5_292,
+        "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
+    ),
+    "additional_chat_templates/reranker.jinja": (
+        2_443,
+        "47c758cb74d7f1e20e22483949a5ba4c8c1f4515126ad173da1c63211f472aa7",
+    ),
+    "1_LogitScore/config.json": (
+        57,
+        "73e3156450564d8a98b7e47bcf5aace0f29600828b51937da545571e84db3ff3",
+    ),
+    "modules.json": (
+        280,
+        "6f13b6b4a89e577b591b2077bca40c67c26541a6740a8809267cb474f90806a9",
+    ),
+    "sentence_bert_config.json": (
+        756,
+        "729676c811dadb5cf2cefdfcfca1bd04de40d0f0caed8a6482016d8a2937341d",
+    ),
+    "scripts/qwen3_vl_reranker.py": (
+        10_873,
+        "bd5d2f5d97fc4a738864d93f6b15d8850243e60da4484f3ea78867a46efdebd6",
+    ),
 }
 RERANKER_GENERATED_ARTIFACTS = {
-    "antfly_inference_bundle.json": (81, "1e2df99d4e60b29e4d95faf2d18f5097a1af02bd74d2a40d037d204358913e46"),
-    "model_manifest.json": (64, "696935ae5821d0e7babf351925e900d7dd6aaa96e1780608283359554694af16"),
+    "antfly_inference_bundle.json": (
+        81,
+        "1e2df99d4e60b29e4d95faf2d18f5097a1af02bd74d2a40d037d204358913e46",
+    ),
+    "model_manifest.json": (
+        64,
+        "696935ae5821d0e7babf351925e900d7dd6aaa96e1780608283359554694af16",
+    ),
 }
 PATCH_LIMITS = {
     # Versioned cross-implementation tolerances for normalized spatial patch
@@ -126,7 +168,13 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def safe_artifact_path(raw: object) -> str:
-    if not isinstance(raw, str) or not raw or "\\" in raw or ":" in raw or "\x00" in raw:
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\\" in raw
+        or ":" in raw
+        or "\x00" in raw
+    ):
         raise QualificationError(f"unsafe managed artifact path: {raw!r}")
     path = PurePosixPath(raw)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
@@ -170,14 +218,22 @@ def _validate_managed_install(
         try:
             metadata = path.lstat()
         except OSError as exc:
-            raise QualificationError(f"missing managed artifact {relative}: {exc}") from exc
+            raise QualificationError(
+                f"missing managed artifact {relative}: {exc}"
+            ) from exc
         if not stat.S_ISREG(metadata.st_mode):
-            raise QualificationError(f"managed artifact is not a regular file: {relative}")
+            raise QualificationError(
+                f"managed artifact is not a regular file: {relative}"
+            )
         canonical = path.resolve(strict=True)
         if not canonical.is_relative_to(root):
             raise QualificationError(f"managed artifact escapes model root: {relative}")
         expected_size = item.get("size")
-        if not isinstance(expected_size, int) or expected_size < 0 or metadata.st_size != expected_size:
+        if (
+            not isinstance(expected_size, int)
+            or expected_size < 0
+            or metadata.st_size != expected_size
+        ):
             raise QualificationError(
                 f"managed artifact size mismatch for {relative}: "
                 f"expected {expected_size}, got {metadata.st_size}"
@@ -185,7 +241,9 @@ def _validate_managed_install(
         actual_sha = sha256_file(path)
         expected_sha = item.get("sha256")
         if expected_sha is not None:
-            if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            if not isinstance(expected_sha, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_sha
+            ):
                 raise QualificationError(f"invalid receipt SHA-256 for {relative}")
             if actual_sha != expected_sha:
                 raise QualificationError(
@@ -235,9 +293,13 @@ def validate_managed_bundle(
     decoder = safe_artifact_path(bundle.get("decoder"))
     projector = safe_artifact_path(bundle.get("projector"))
     if decoder not in seen or projector not in seen:
-        raise QualificationError("bundle decoder/projector is absent from the managed receipt")
+        raise QualificationError(
+            "bundle decoder/projector is absent from the managed receipt"
+        )
     if not decoder.endswith(".gguf") or not projector.endswith(".gguf"):
-        raise QualificationError("Qwen3-VL generation bundle must contain GGUF decoder/projector")
+        raise QualificationError(
+            "Qwen3-VL generation bundle must contain GGUF decoder/projector"
+        )
     evidence.update(
         {
             "bundle": bundle,
@@ -252,7 +314,9 @@ def validate_managed_reranker_bundle(model_dir: Path) -> dict[str, Any]:
     evidence = _validate_managed_install(model_dir, RERANKER_EXPECTED_SOURCE)
     root = Path(evidence["model_dir"])
     received = {artifact["path"]: artifact for artifact in evidence["artifacts"]}
-    expected_paths = set(RERANKER_EXPECTED_ARTIFACTS) | set(RERANKER_GENERATED_ARTIFACTS)
+    expected_paths = set(RERANKER_EXPECTED_ARTIFACTS) | set(
+        RERANKER_GENERATED_ARTIFACTS
+    )
     if set(received) != expected_paths:
         raise QualificationError(
             "reranker artifact set mismatch: "
@@ -268,7 +332,9 @@ def validate_managed_reranker_bundle(model_dir: Path) -> dict[str, Any]:
                 f"got size={artifact['size']} sha256={artifact['sha256']}"
             )
         if artifact["receipt_sha256"] != expected_sha:
-            raise QualificationError(f"reranker receipt does not pin the catalog SHA-256 for {path}")
+            raise QualificationError(
+                f"reranker receipt does not pin the catalog SHA-256 for {path}"
+            )
     for path, (expected_size, expected_sha) in RERANKER_GENERATED_ARTIFACTS.items():
         artifact = received[path]
         if artifact["size"] != expected_size or artifact["sha256"] != expected_sha:
@@ -278,20 +344,29 @@ def validate_managed_reranker_bundle(model_dir: Path) -> dict[str, Any]:
                 f"got size={artifact['size']} sha256={artifact['sha256']}"
             )
         if artifact["receipt_sha256"] is not None:
-            raise QualificationError(f"generated reranker artifact unexpectedly has a catalog digest: {path}")
+            raise QualificationError(
+                f"generated reranker artifact unexpectedly has a catalog digest: {path}"
+            )
 
     bundle = load_json(root / "antfly_inference_bundle.json")
     if bundle.get("family") != "qwen3_vl_reranker_safetensors_bundle/v1":
-        raise QualificationError(f"unexpected reranker bundle family: {bundle.get('family')!r}")
+        raise QualificationError(
+            f"unexpected reranker bundle family: {bundle.get('family')!r}"
+        )
     model = safe_artifact_path(bundle.get("model"))
     if model != "model.safetensors" or model not in received:
-        raise QualificationError("reranker bundle does not select the pinned safetensors model")
+        raise QualificationError(
+            "reranker bundle does not select the pinned safetensors model"
+        )
     evidence.update({"bundle": bundle, "model_path": str(root / model)})
     return evidence
 
 
 def git_provenance(binary: Path) -> dict[str, Any]:
-    result: dict[str, Any] = {"binary": str(binary), "binary_sha256": sha256_file(binary)}
+    result: dict[str, Any] = {
+        "binary": str(binary),
+        "binary_sha256": sha256_file(binary),
+    }
     try:
         repo = subprocess.run(
             ["git", "-C", str(binary.parent), "rev-parse", "--show-toplevel"],
@@ -335,7 +410,9 @@ def git_provenance(binary: Path) -> dict[str, Any]:
     return result
 
 
-def run_oracle(args: argparse.Namespace, work_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def run_oracle(
+    args: argparse.Namespace, work_dir: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
     output = work_dir / "transformers_oracle.json"
     patches = work_dir / "transformers_spatial_patches.f32le"
     command = [
@@ -373,16 +450,24 @@ def run_oracle(args: argparse.Namespace, work_dir: Path) -> tuple[dict[str, Any]
             start_new_session=True,
         )
     except subprocess.TimeoutExpired as exc:
-        raise QualificationError(f"Transformers oracle timed out after {exc.timeout}s") from exc
-    (work_dir / "transformers_oracle.stdout.log").write_text(completed.stdout, encoding="utf-8")
-    (work_dir / "transformers_oracle.stderr.log").write_text(completed.stderr, encoding="utf-8")
+        raise QualificationError(
+            f"Transformers oracle timed out after {exc.timeout}s"
+        ) from exc
+    (work_dir / "transformers_oracle.stdout.log").write_text(
+        completed.stdout, encoding="utf-8"
+    )
+    (work_dir / "transformers_oracle.stderr.log").write_text(
+        completed.stderr, encoding="utf-8"
+    )
     if completed.returncode != 0:
         raise QualificationError(
             f"Transformers oracle exited {completed.returncode}: {completed.stderr.strip()}"
         )
     payload = load_json(output)
     if payload.get("schema") != "antfly.qwen3vl.transformers_oracle.v1":
-        raise QualificationError(f"unexpected Transformers oracle schema: {payload.get('schema')}")
+        raise QualificationError(
+            f"unexpected Transformers oracle schema: {payload.get('schema')}"
+        )
     return payload, {"command": command, "output": str(output), "patches": str(patches)}
 
 
@@ -516,44 +601,46 @@ def cuda_command(args: argparse.Namespace, work_dir: Path) -> list[str]:
     ]
     for image_path in image_paths:
         command.extend(("--image", str(image_path)))
-    command.extend((
-        "--backend",
-        "cuda",
-        "--max-tokens",
-        str(args.max_tokens),
-        "--temperature",
-        "0",
-        "--top-k",
-        "1",
-        "--top-p",
-        "1",
-        "--repetition-penalty",
-        "1",
-        "--host-budget-mb",
-        str(args.host_budget_mb),
-        "--backend-budget-mb",
-        str(args.backend_budget_mb),
-        "--combined-budget-mb",
-        str(args.combined_budget_mb),
-        "--kv-budget-mb",
-        str(args.kv_budget_mb),
-        "--scratch-budget-mb",
-        str(args.scratch_budget_mb),
-        "--disable-thinking",
-        "--print-token-ids",
-        "--print-prompt-token-ids",
-        "--print-prompt",
-        "--print-finish-reason",
-        "--print-token-count",
-        "--json-timing",
-        str(work_dir / "antfly_cuda_timing.json"),
-        "--qwen3vl-parity-json",
-        str(work_dir / "antfly_parity.json"),
-        "--qwen3vl-parity-patch-f32le",
-        str(work_dir / "antfly_spatial_patches.f32le"),
-        "--qwen3vl-parity-logits-f32le",
-        str(work_dir / "antfly_prefill_logits.f32le"),
-    ))
+    command.extend(
+        (
+            "--backend",
+            "cuda",
+            "--max-tokens",
+            str(args.max_tokens),
+            "--temperature",
+            "0",
+            "--top-k",
+            "1",
+            "--top-p",
+            "1",
+            "--repetition-penalty",
+            "1",
+            "--host-budget-mb",
+            str(args.host_budget_mb),
+            "--backend-budget-mb",
+            str(args.backend_budget_mb),
+            "--combined-budget-mb",
+            str(args.combined_budget_mb),
+            "--kv-budget-mb",
+            str(args.kv_budget_mb),
+            "--scratch-budget-mb",
+            str(args.scratch_budget_mb),
+            "--disable-thinking",
+            "--print-token-ids",
+            "--print-prompt-token-ids",
+            "--print-prompt",
+            "--print-finish-reason",
+            "--print-token-count",
+            "--json-timing",
+            str(work_dir / "antfly_cuda_timing.json"),
+            "--qwen3vl-parity-json",
+            str(work_dir / "antfly_parity.json"),
+            "--qwen3vl-parity-patch-f32le",
+            str(work_dir / "antfly_spatial_patches.f32le"),
+            "--qwen3vl-parity-logits-f32le",
+            str(work_dir / "antfly_prefill_logits.f32le"),
+        )
+    )
     return command
 
 
@@ -580,7 +667,10 @@ def run_resource_monitored(
     started = time.monotonic()
     next_system_probe = started
     violation: str | None = None
-    with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
+    with (
+        stdout_path.open("wb") as stdout_stream,
+        stderr_path.open("wb") as stderr_stream,
+    ):
         process = subprocess.Popen(
             command,
             stdout=stdout_stream,
@@ -599,7 +689,9 @@ def run_resource_monitored(
                     max_rss = max(max_rss, rss)
                     sample_count += 1
                     if rss > max_rss_mib:
-                        violation = f"{label} RSS {rss:.1f} MiB exceeded {max_rss_mib:.1f} MiB"
+                        violation = (
+                            f"{label} RSS {rss:.1f} MiB exceeded {max_rss_mib:.1f} MiB"
+                        )
                         break
                     if now >= next_system_probe:
                         if max_gpu_memory_mib is not None:
@@ -615,9 +707,7 @@ def run_resource_monitored(
                         min_free = min(min_free, free)
                         swap_growth = max(swapout_bytes() - baseline_swap, 0)
                         if free < min_free_percent:
-                            violation = (
-                                f"system memory free {free}% fell below {min_free_percent}%"
-                            )
+                            violation = f"system memory free {free}% fell below {min_free_percent}%"
                             break
                         if swap_growth > max_swap_growth_mib * 1024 * 1024:
                             violation = (
@@ -672,7 +762,9 @@ def run_resource_monitored(
     return execution
 
 
-def run_cuda(args: argparse.Namespace, work_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def run_cuda(
+    args: argparse.Namespace, work_dir: Path
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     command = cuda_command(args, work_dir)
     env_overrides = {"ANTFLY_INFERENCE_JSON_TOKEN_IDS": "1"}
     if args.vision_trace_layer is not None:
@@ -701,16 +793,22 @@ def run_cuda(args: argparse.Namespace, work_dir: Path) -> tuple[dict[str, Any], 
         )
     parity = load_json(work_dir / "antfly_parity.json")
     timing = load_json(work_dir / "antfly_cuda_timing.json")
-    return parity, timing, {
-        "command": command,
-        "environment": env_overrides,
-        **execution,
-        "patches": str(work_dir / "antfly_spatial_patches.f32le"),
-        "logits": str(work_dir / "antfly_prefill_logits.f32le"),
-    }
+    return (
+        parity,
+        timing,
+        {
+            "command": command,
+            "environment": env_overrides,
+            **execution,
+            "patches": str(work_dir / "antfly_spatial_patches.f32le"),
+            "logits": str(work_dir / "antfly_prefill_logits.f32le"),
+        },
+    )
 
 
-def run_weights_oracle(args: argparse.Namespace, work_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def run_weights_oracle(
+    args: argparse.Namespace, work_dir: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
     output = work_dir / "transformers_weights_oracle.json"
     logits = work_dir / "transformers_bf16_prefill_logits.f32le"
     command = [
@@ -775,7 +873,9 @@ def run_weights_oracle(args: argparse.Namespace, work_dir: Path) -> tuple[dict[s
         )
     payload = load_json(output)
     if payload.get("schema") != "antfly.qwen3vl.transformers_weights_oracle.v1":
-        raise QualificationError(f"unexpected weights oracle schema: {payload.get('schema')}")
+        raise QualificationError(
+            f"unexpected weights oracle schema: {payload.get('schema')}"
+        )
     return payload, {
         "command": command,
         **execution,
@@ -787,11 +887,15 @@ def run_weights_oracle(args: argparse.Namespace, work_dir: Path) -> tuple[dict[s
 def read_f32le(path: Path) -> list[float]:
     payload = path.read_bytes()
     if len(payload) % 4 != 0:
-        raise QualificationError(f"invalid f32le payload length for {path}: {len(payload)}")
+        raise QualificationError(
+            f"invalid f32le payload length for {path}: {len(payload)}"
+        )
     return [value[0] for value in struct.iter_unpack("<f", payload)]
 
 
-def patch_metrics(reference_path: Path, actual_path: Path) -> dict[str, float | int | bool]:
+def patch_metrics(
+    reference_path: Path, actual_path: Path
+) -> dict[str, float | int | bool]:
     reference = read_f32le(reference_path)
     actual = read_f32le(actual_path)
     if not reference or len(actual) != len(reference):
@@ -800,20 +904,26 @@ def patch_metrics(reference_path: Path, actual_path: Path) -> dict[str, float | 
             "reference_value_count": len(reference),
             "actual_value_count": len(actual),
         }
-    difference = [abs(candidate - expected) for expected, candidate in zip(reference, actual)]
+    difference = [
+        abs(candidate - expected) for expected, candidate in zip(reference, actual)
+    ]
     sorted_difference = sorted(difference)
     p99_index = math.ceil(0.99 * (len(sorted_difference) - 1))
     return {
         "size_match": True,
         "value_count": len(reference),
         "mean_abs": math.fsum(difference) / len(difference),
-        "rmse": math.sqrt(math.fsum(value * value for value in difference) / len(difference)),
+        "rmse": math.sqrt(
+            math.fsum(value * value for value in difference) / len(difference)
+        ),
         "p99_abs": sorted_difference[p99_index],
         "max_abs": max(difference),
     }
 
 
-def logit_metrics(reference_path: Path, actual_path: Path, top_k: int = 10) -> dict[str, Any]:
+def logit_metrics(
+    reference_path: Path, actual_path: Path, top_k: int = 10
+) -> dict[str, Any]:
     if top_k <= 0:
         raise QualificationError("top_k must be positive")
     reference = read_f32le(reference_path)
@@ -829,16 +939,22 @@ def logit_metrics(reference_path: Path, actual_path: Path, top_k: int = 10) -> d
     )
     if not finite:
         return {"size_match": True, "finite": False, "value_count": len(reference)}
-    difference = [candidate - expected for expected, candidate in zip(reference, actual)]
-    reference_order = sorted(range(len(reference)), key=lambda index: (-reference[index], index))
+    difference = [
+        candidate - expected for expected, candidate in zip(reference, actual)
+    ]
+    reference_order = sorted(
+        range(len(reference)), key=lambda index: (-reference[index], index)
+    )
     actual_order = sorted(range(len(actual)), key=lambda index: (-actual[index], index))
     selected_top_k = min(top_k, len(reference))
     reference_top = reference_order[:selected_top_k]
     actual_top = actual_order[:selected_top_k]
-    dot_product = math.fsum(expected * candidate for expected, candidate in zip(reference, actual))
-    denominator = math.sqrt(math.fsum(value * value for value in reference)) * math.sqrt(
-        math.fsum(value * value for value in actual)
+    dot_product = math.fsum(
+        expected * candidate for expected, candidate in zip(reference, actual)
     )
+    denominator = math.sqrt(
+        math.fsum(value * value for value in reference)
+    ) * math.sqrt(math.fsum(value * value for value in actual))
     reference_mean = math.fsum(reference) / len(reference)
     actual_mean = math.fsum(actual) / len(actual)
     covariance = math.fsum(
@@ -859,10 +975,14 @@ def logit_metrics(reference_path: Path, actual_path: Path, top_k: int = 10) -> d
         "reference_top_k": reference_top,
         "actual_top_k": actual_top,
         "top_k_overlap": len(set(reference_top) & set(actual_top)),
-        "reference_top1_margin": float(reference[reference_order[0]] - reference[reference_order[1]]),
+        "reference_top1_margin": float(
+            reference[reference_order[0]] - reference[reference_order[1]]
+        ),
         "actual_top1_margin": float(actual[actual_order[0]] - actual[actual_order[1]]),
         "mean_abs": math.fsum(absolute_difference) / len(absolute_difference),
-        "rmse": math.sqrt(math.fsum(value * value for value in difference) / len(difference)),
+        "rmse": math.sqrt(
+            math.fsum(value * value for value in difference) / len(difference)
+        ),
         "max_abs": max(absolute_difference),
         "cosine_similarity": dot_product / denominator if denominator else 0.0,
         "pearson_correlation": covariance / correlation_denominator
@@ -906,7 +1026,8 @@ def cuda_determinism_metrics(
         images = parity.get("images")
         positioned_hashes = (
             [image.get("positioned_embedding_f32le_sha256") for image in images]
-            if isinstance(images, list) and all(isinstance(image, dict) for image in images)
+            if isinstance(images, list)
+            and all(isinstance(image, dict) for image in images)
             else None
         )
         vision_traces = (
@@ -917,7 +1038,8 @@ def cuda_determinism_metrics(
                 }
                 for image in images
             ]
-            if isinstance(images, list) and all(isinstance(image, dict) for image in images)
+            if isinstance(images, list)
+            and all(isinstance(image, dict) for image in images)
             else None
         )
         structural_images = (
@@ -937,7 +1059,8 @@ def cuda_determinism_metrics(
                 }
                 for image in images
             ]
-            if isinstance(images, list) and all(isinstance(image, dict) for image in images)
+            if isinstance(images, list)
+            and all(isinstance(image, dict) for image in images)
             else None
         )
         evidence.append(
@@ -977,8 +1100,10 @@ def cuda_determinism_metrics(
 
     def exact(field: str) -> bool:
         values = [item.get(field) for item in evidence]
-        return len(values) >= 2 and values[0] is not None and all(
-            value == values[0] for value in values[1:]
+        return (
+            len(values) >= 2
+            and values[0] is not None
+            and all(value == values[0] for value in values[1:])
         )
 
     digest_pattern = re.compile(r"[0-9a-f]{64}")
@@ -1017,7 +1142,9 @@ def cuda_determinism_metrics(
 
 
 def parse_prompt_output(stdout: str) -> tuple[str, list[int], list[int]]:
-    match = re.search(r"(?:^|\n)prompt:\n(.*?)\nprompt_token_ids:([^\n]*)", stdout, re.DOTALL)
+    match = re.search(
+        r"(?:^|\n)prompt:\n(.*?)\nprompt_token_ids:([^\n]*)", stdout, re.DOTALL
+    )
     generated = re.search(r"(?:^|\n)token_ids:([^\n]*)", stdout)
     if match is None or generated is None:
         raise QualificationError("Antfly output lacks prompt or token ID diagnostics")
@@ -1051,7 +1178,9 @@ def fallback_counters_are_zero(timing: dict[str, Any]) -> tuple[bool, dict[str, 
     positive_values = {key: cuda.get(key) for key in positive_keys}
     return (
         all(value == 0 for value in zero_values.values())
-        and all(isinstance(value, int) and value > 0 for value in positive_values.values())
+        and all(
+            isinstance(value, int) and value > 0 for value in positive_values.values()
+        )
     ), {
         "required_zero": zero_values,
         "required_positive": positive_values,
@@ -1069,7 +1198,9 @@ def parity_gates(
     gates: dict[str, Any] = {}
     diagnostic_output = run["stdout"] + "\n" + run["stderr"]
     rendered, prompt_ids, generated_ids = parse_prompt_output(diagnostic_output)
-    add_gate(gates, "rendered_prompt_exact", rendered == oracle.get("rendered_prompt"), {})
+    add_gate(
+        gates, "rendered_prompt_exact", rendered == oracle.get("rendered_prompt"), {}
+    )
     expected_placeholder = oracle.get("placeholder_token_ids")
     add_gate(
         gates,
@@ -1104,7 +1235,8 @@ def parity_gates(
     antfly_images = parity.get("images")
     antfly_grid = (
         [image.get("grid_thw") for image in antfly_images]
-        if isinstance(antfly_images, list) and all(isinstance(image, dict) for image in antfly_images)
+        if isinstance(antfly_images, list)
+        and all(isinstance(image, dict) for image in antfly_images)
         else None
     )
     add_gate(
@@ -1115,8 +1247,12 @@ def parity_gates(
     )
     oracle_resized = oracle.get("image", {}).get("resized_sizes")
     antfly_resized = (
-        [[image.get("resized_width"), image.get("resized_height")] for image in antfly_images]
-        if isinstance(antfly_images, list) and all(isinstance(image, dict) for image in antfly_images)
+        [
+            [image.get("resized_width"), image.get("resized_height")]
+            for image in antfly_images
+        ]
+        if isinstance(antfly_images, list)
+        and all(isinstance(image, dict) for image in antfly_images)
         else None
     )
     add_gate(
@@ -1140,7 +1276,10 @@ def parity_gates(
         gates,
         "deepstack_layer_count_exact",
         parity.get("deepstack_layer_count") == expected_deepstack,
-        {"transformers": expected_deepstack, "antfly": parity.get("deepstack_layer_count")},
+        {
+            "transformers": expected_deepstack,
+            "antfly": parity.get("deepstack_layer_count"),
+        },
     )
     text_hidden_size = architecture.get("text_hidden_size")
     expected_projected_values = (
@@ -1170,13 +1309,23 @@ def parity_gates(
     )
     size_match = metrics.get("size_match") is True
     add_gate(gates, "preprocess_patch_shape_exact", size_match, metrics)
-    patch_pass = size_match and all(metrics[name] <= limit for name, limit in PATCH_LIMITS.items())
-    add_gate(gates, "preprocess_numeric_tolerance", patch_pass, {"metrics": metrics, "limits": PATCH_LIMITS})
+    patch_pass = size_match and all(
+        metrics[name] <= limit for name, limit in PATCH_LIMITS.items()
+    )
+    add_gate(
+        gates,
+        "preprocess_numeric_tolerance",
+        patch_pass,
+        {"metrics": metrics, "limits": PATCH_LIMITS},
+    )
     add_gate(
         gates,
         "cuda_backend_exact",
         timing.get("backend") == "cuda" and isinstance(timing.get("cuda"), dict),
-        {"backend": timing.get("backend"), "device": timing.get("cuda", {}).get("device")},
+        {
+            "backend": timing.get("backend"),
+            "device": timing.get("cuda", {}).get("device"),
+        },
     )
     fallback_pass, fallback_details = fallback_counters_are_zero(timing)
     add_gate(gates, "cuda_fallback_counters_zero", fallback_pass, fallback_details)
@@ -1202,13 +1351,19 @@ def parity_gates(
         gates,
         "swapout_growth_within_limit",
         resources["swapout_growth_mib"] <= args.max_swap_growth_mib,
-        {"actual_mib": resources["swapout_growth_mib"], "limit_mib": args.max_swap_growth_mib},
+        {
+            "actual_mib": resources["swapout_growth_mib"],
+            "limit_mib": args.max_swap_growth_mib,
+        },
     )
     add_gate(
         gates,
         "memory_pressure_within_limit",
         resources["min_free_percent"] >= args.min_free_percent,
-        {"actual_percent": resources["min_free_percent"], "minimum_percent": args.min_free_percent},
+        {
+            "actual_percent": resources["min_free_percent"],
+            "minimum_percent": args.min_free_percent,
+        },
     )
     token_count_ok = len(generated_ids) == args.max_tokens == timing.get("tokens")
     add_gate(
@@ -1245,13 +1400,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise QualificationError("expected token count must equal --max-tokens")
     if not 0 < args.sample_interval_seconds <= 1:
         raise QualificationError("sample interval must be in (0, 1] seconds")
-    if min(
-        args.host_budget_mb,
-        args.backend_budget_mb,
-        args.combined_budget_mb,
-        args.kv_budget_mb,
-        args.scratch_budget_mb,
-    ) <= 0:
+    if (
+        min(
+            args.host_budget_mb,
+            args.backend_budget_mb,
+            args.combined_budget_mb,
+            args.kv_budget_mb,
+            args.scratch_budget_mb,
+        )
+        <= 0
+    ):
         raise QualificationError("all runtime memory budgets must be positive")
     if args.max_gpu_memory_mib <= 0 or args.weights_max_gpu_memory_mib <= 0:
         raise QualificationError("GPU memory limits must be positive")
@@ -1271,7 +1429,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--antfly-bin", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--oracle-script", type=Path, default=here / "transformers_oracle.py")
+    parser.add_argument(
+        "--oracle-script", type=Path, default=here / "transformers_oracle.py"
+    )
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument(
         "--weights-oracle-script",
@@ -1365,7 +1525,9 @@ def main(argv: list[str] | None = None) -> int:
         weights_payload: dict[str, Any] | None = None
         weights_run: dict[str, Any] | None = None
         if args.weights_dir is not None:
-            report["scope"] = "bf16_logits_preprocess_and_bounded_single_request_cuda_acceptance"
+            report["scope"] = (
+                "bf16_logits_preprocess_and_bounded_single_request_cuda_acceptance"
+            )
             weights_payload, weights_run = run_weights_oracle(args, work_dir)
             report["transformers_weights_oracle"] = {
                 "command": weights_run["command"],
@@ -1397,9 +1559,13 @@ def main(argv: list[str] | None = None) -> int:
                 repeat_run,
                 repeat_metrics,
             )
-            failed = sorted(name for name, gate in repeat_gates.items() if not gate["pass"])
+            failed = sorted(
+                name for name, gate in repeat_gates.items() if not gate["pass"]
+            )
             if failed:
-                repeat_gate_failures.append({"run": repeat_index, "failed_gates": failed})
+                repeat_gate_failures.append(
+                    {"run": repeat_index, "failed_gates": failed}
+                )
             repeat_summaries.append(
                 {
                     "run": repeat_index,
@@ -1474,9 +1640,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         logits: dict[str, Any] | None = None
         if weights_run is not None and weights_payload is not None:
-            logits = logit_metrics(Path(weights_run["logits"]), Path(cuda_run["logits"]))
-            add_gate(gates, "bf16_logit_vector_shape_exact", logits.get("size_match") is True, logits)
-            add_gate(gates, "bf16_and_q4_logits_finite", logits.get("finite") is True, logits)
+            logits = logit_metrics(
+                Path(weights_run["logits"]), Path(cuda_run["logits"])
+            )
+            add_gate(
+                gates,
+                "bf16_logit_vector_shape_exact",
+                logits.get("size_match") is True,
+                logits,
+            )
+            add_gate(
+                gates, "bf16_and_q4_logits_finite", logits.get("finite") is True, logits
+            )
             add_gate(
                 gates,
                 "bf16_q4_logit_quality_within_limits",
