@@ -137,6 +137,14 @@ pub fn appendSchemaMetadataMutation(
     const payload = try encodeSchemaMetadataMutationAlloc(alloc, schema, public_schema_json);
     defer alloc.free(payload);
 
+    return try appendEncodedSchemaMetadataMutation(primary, payload, options);
+}
+
+pub fn appendEncodedSchemaMetadataMutation(
+    primary: *primary_mod.Primary,
+    payload: []const u8,
+    options: AppendMetadataMutationOptions,
+) !u64 {
     return try primary.append(.{
         .kind = .metadata_mutation,
         .payload_codec = .json,

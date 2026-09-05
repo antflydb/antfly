@@ -20,6 +20,18 @@ pub const OwnedKVPair = struct {
     value: []u8,
 };
 
+pub const RangePage = struct {
+    items: []OwnedKVPair,
+    /// False when an item/byte budget stopped the cursor. A following page may
+    /// be empty when the bound landed exactly on the range end.
+    reached_end: bool,
+
+    pub fn deinit(self: *RangePage, alloc: std.mem.Allocator) void {
+        freeResults(alloc, self.items);
+        self.* = undefined;
+    }
+};
+
 pub const ScanOptions = struct {
     skip_fn: ?*const fn (key: []const u8) bool = null,
     reverse: bool = false,
@@ -39,6 +51,19 @@ pub fn freeResults(alloc: std.mem.Allocator, results: []OwnedKVPair) void {
         alloc.free(item.value);
     }
     alloc.free(results);
+}
+
+fn appendOwnedPair(
+    alloc: std.mem.Allocator,
+    results: *std.ArrayListUnmanaged(OwnedKVPair),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try results.append(alloc, .{ .key = owned_key, .value = owned_value });
 }
 
 pub fn scan(
@@ -255,6 +280,55 @@ pub fn scanRange(
     defer cur.close();
 
     return try scanRangeCursor(alloc, &cur, lower, upper);
+}
+
+/// Copy one bounded range page from a fresh snapshot. `lower_exclusive` makes
+/// the last key of the previous page a stable resume cursor without inventing
+/// a byte successor. At least one entry is admitted even when it exceeds the
+/// byte target, ensuring forward progress for unusually large rows.
+pub fn scanRangePage(
+    alloc: std.mem.Allocator,
+    store: *backend_erased.Store,
+    lower: []const u8,
+    lower_exclusive: bool,
+    upper: []const u8,
+    max_items: usize,
+    max_bytes: usize,
+) !RangePage {
+    if (max_items == 0 or max_bytes == 0) return error.InvalidArgument;
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var cur = try txn.openCursor();
+    defer cur.close();
+    cur.setUpperBound(if (upper.len > 0) upper else null);
+
+    var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
+    errdefer {
+        for (results.items) |item| {
+            alloc.free(item.key);
+            alloc.free(item.value);
+        }
+        results.deinit(alloc);
+    }
+    var copied_bytes: usize = 0;
+    var entry = if (lower.len == 0) try cur.first() else try cur.seekAtOrAfter(lower);
+    if (lower_exclusive) if (entry) |kv| {
+        if (std.mem.eql(u8, kv.key, lower)) entry = try cur.next();
+    };
+    while (entry) |kv| {
+        if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt)
+            return .{ .items = try results.toOwnedSlice(alloc), .reached_end = true };
+        const item_bytes = std.math.add(usize, kv.key.len, kv.value.len) catch return error.OutOfMemory;
+        if (results.items.len > 0 and
+            (results.items.len >= max_items or copied_bytes > max_bytes -| item_bytes))
+            return .{ .items = try results.toOwnedSlice(alloc), .reached_end = false };
+        try appendOwnedPair(alloc, &results, kv.key, kv.value);
+        copied_bytes = std.math.add(usize, copied_bytes, item_bytes) catch std.math.maxInt(usize);
+        if (results.items.len >= max_items or copied_bytes >= max_bytes)
+            return .{ .items = try results.toOwnedSlice(alloc), .reached_end = false };
+        entry = try cur.next();
+    }
+    return .{ .items = try results.toOwnedSlice(alloc), .reached_end = true };
 }
 
 fn scanRangeCursor(

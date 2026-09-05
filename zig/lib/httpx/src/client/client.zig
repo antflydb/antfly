@@ -1499,6 +1499,7 @@ pub const Client = struct {
         if (shouldUseHttp2(self.config)) {
             var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
+            if (!res.isRedirect()) try notifyStreamingWriterResponse(writer, res);
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
         }
@@ -2845,6 +2846,8 @@ pub const Client = struct {
         const no_body_status = (code >= 100 and code < 200) or code == 204 or code == 304;
         const has_body = !no_body_status and req_method != .HEAD and
             (parser.chunked or (parser.content_length orelse 1) > 0);
+        const is_redirect = code >= 300 and code < 400;
+        if (!is_redirect) try notifyStreamingWriterResponse(writer, res);
         if (!has_body) return res;
 
         const content_coding = responseContentCoding(&res.headers);
@@ -2879,7 +2882,6 @@ pub const Client = struct {
         };
 
         const close_delimited_body = !parser.chunked and parser.content_length == null;
-        const is_redirect = code >= 300 and code < 400;
         const progress_total = if (content_coding == null and !parser.chunked) parser.content_length else null;
         var written_total: usize = 0;
 
@@ -3019,6 +3021,15 @@ pub const Client = struct {
             }
             res.body = null;
         }
+    }
+
+    fn notifyStreamingWriterResponse(writer: anytype, response: Response) !void {
+        const WriterType = @TypeOf(writer);
+        const WriterBase = switch (@typeInfo(WriterType)) {
+            .pointer => |pointer| pointer.child,
+            else => WriterType,
+        };
+        if (@hasDecl(WriterBase, "startResponse")) try writer.startResponse(response);
     }
 
     fn readChunkedTlsBody(

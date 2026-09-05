@@ -14443,7 +14443,7 @@ fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     const raw = try storeGetAlloc(runtime, key);
     if (!runtimeUsesRelationalBaseRows(runtime)) return raw;
     defer runtime.alloc.free(raw);
-    return try relational_store.decodeValueAlloc(runtime.alloc, raw);
+    return try runtime.index_manager.materializeStoredValueAlloc(runtime.alloc, key, raw);
 }
 
 fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8) ![]u8 {

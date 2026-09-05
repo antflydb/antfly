@@ -15,6 +15,7 @@ const openapi_contract = @import("api/openapi_contract.zig");
 const runtime_http_abi = @import("runtime_http_abi.zig");
 const runtime_http_bridge = @import("runtime_http_bridge.zig");
 const table_contract = @import("api/table_contract.zig");
+const table_read_source = @import("api/table_read_source.zig");
 
 // Some API storage adapters deliberately resolve these declarations through
 // the discovery root to avoid production import cycles.
@@ -32,4 +33,5 @@ test {
     _ = runtime_http_abi;
     _ = runtime_http_bridge;
     _ = table_contract;
+    _ = table_read_source;
 }

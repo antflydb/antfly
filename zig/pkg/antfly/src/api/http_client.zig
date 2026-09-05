@@ -297,6 +297,20 @@ pub const ApiHttpClient = struct {
         );
     }
 
+    pub fn executeRequestStream(
+        self: *ApiHttpClient,
+        request: http_common.HttpRequest,
+        writer: http_common.StreamWriter,
+    ) !?bool {
+        return try internal_service_auth.executeRequestStream(
+            self.alloc,
+            self.executor,
+            request,
+            writer,
+            self.internal_service,
+        );
+    }
+
     /// Public generated operations live below `/db/v1`. Internal forwarding
     /// deliberately remains rooted on the listener, so callers continue to
     /// pass a node base URI rather than having to know which routing namespace
@@ -868,6 +882,85 @@ pub const ApiHttpClient = struct {
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupScanStream(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: ?[]const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        downstream: http_common.StreamWriter,
+    ) !?bool {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        const StatusWriter = struct {
+            alloc: std.mem.Allocator,
+            downstream: http_common.StreamWriter,
+            status: u16 = 0,
+            error_body: std.ArrayListUnmanaged(u8) = .empty,
+
+            fn deinit(adapter: *@This()) void {
+                adapter.error_body.deinit(adapter.alloc);
+            }
+
+            fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                adapter.status = response.status;
+                if (response.status == 200) try adapter.downstream.start(response_alloc, response);
+            }
+
+            fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.status == 200) return try adapter.downstream.writeAll(bytes);
+                if (adapter.error_body.items.len +| bytes.len > 64 * 1024)
+                    return error.InvalidRemoteResponse;
+                try adapter.error_body.appendSlice(adapter.alloc, bytes);
+            }
+
+            fn flush(raw: *anyopaque) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.status == 200) try adapter.downstream.flush();
+            }
+
+            fn writer(adapter: *@This()) http_common.StreamWriter {
+                return .{ .ptr = adapter, .vtable = &.{
+                    .start = start,
+                    .write_all = writeAll,
+                    .flush = flush,
+                } };
+            }
+        };
+        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream };
+        defer status_writer.deinit();
+        const handled = (try self.executeRequestStream(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = if (body != null) "application/json" else null,
+            .body = body orelse "",
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        }, status_writer.writer())) orelse return null;
+        if (!handled) return false;
+        switch (status_writer.status) {
+            200 => return true,
+            408 => return error.Canceled,
+            409 => return remoteGroupConflictError(status_writer.error_body.items),
+            503 => return remoteStorageReadUnavailableError(status_writer.error_body.items),
+            504 => return error.DeadlineExceeded,
+            else => return error.UnexpectedHttpStatus,
+        }
     }
 
     pub fn fetchQuery(

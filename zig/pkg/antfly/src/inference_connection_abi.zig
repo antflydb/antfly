@@ -11,7 +11,7 @@ const error_abi = @import("runtime_error_abi.zig");
 const http_abi = @import("runtime_http_abi.zig");
 const memory_abi = @import("runtime_memory_abi.zig");
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;

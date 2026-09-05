@@ -93,6 +93,38 @@ pub fn executeRequest(
     return executor.execute(alloc, authenticated);
 }
 
+pub fn executeRequestStream(
+    alloc: std.mem.Allocator,
+    executor: http_common.RequestExecutor,
+    request: http_common.HttpRequest,
+    writer: http_common.StreamWriter,
+    config: ?Config,
+) !?bool {
+    const signing = config orelse return try executor.executeStream(alloc, request, writer);
+    if (!requestTargetsInternalApi(request.uri))
+        return try executor.executeStream(alloc, request, writer);
+
+    const token = try tokenAlloc(
+        alloc,
+        signing,
+        @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+    );
+    defer alloc.free(token);
+    const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 1);
+    defer alloc.free(headers);
+    var header_count: usize = 0;
+    for (request.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, header_name)) continue;
+        headers[header_count] = header;
+        header_count += 1;
+    }
+    headers[header_count] = .{ .name = header_name, .value = token };
+    header_count += 1;
+    var authenticated = request;
+    authenticated.headers = headers[0..header_count];
+    return try executor.executeStream(alloc, authenticated, writer);
+}
+
 pub fn parseRolloutMode(raw: ?[]const u8) !RolloutMode {
     const value = raw orelse return .enforce;
     if (std.mem.eql(u8, value, "enforce")) return .enforce;

@@ -25,6 +25,7 @@ const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const document_content_hash = @import("document_content_hash.zig");
 const types = @import("types.zig");
 
 pub const schema_less_exact_field_suffix = ".keyword";
@@ -47,15 +48,153 @@ pub const SparseVectorData = struct {
     }
 };
 
+/// One row's preparation allocations. Keeping the region intact through the
+/// store transaction lets commit structures borrow prepared slices without a
+/// deep-copy promotion step.
+const PreparedRowRegion = struct {
+    backing: Allocator,
+    arena: std.heap.ArenaAllocator,
+    ref_count: std.atomic.Value(usize) = .init(1),
+
+    fn create(backing: Allocator) !*PreparedRowRegion {
+        const region = try backing.create(PreparedRowRegion);
+        region.* = .{ .backing = backing, .arena = std.heap.ArenaAllocator.init(backing) };
+        return region;
+    }
+
+    fn retain(self: *PreparedRowRegion) void {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    pub fn release(self: *PreparedRowRegion) void {
+        const previous = self.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        const backing = self.backing;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
 pub const ExtractedWrite = struct {
     cleaned_value: ?[]u8,
+    /// Prepared relational writes may borrow the request body when no reserved
+    /// fields were stripped. The request owns that memory through commit.
+    cleaned_value_owned: bool = true,
     graph_writes: []types.GraphEdgeWrite,
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
+    /// When set, all ordinary fields above borrow this region. Artifact keys
+    /// attached after preparation remain caller-allocator owned and are the
+    /// only values released individually.
+    prepared_region: ?*PreparedRowRegion = null,
+
+    pub fn clone(self: ExtractedWrite, alloc: Allocator) !ExtractedWrite {
+        var out: ExtractedWrite = .{
+            .cleaned_value = null,
+            .cleaned_value_owned = self.cleaned_value_owned,
+            .graph_writes = &.{},
+            .mentioned_graph_indexes = &.{},
+            .dense_embeddings = &.{},
+            .sparse_embeddings = &.{},
+        };
+        errdefer out.deinit(alloc);
+        if (self.cleaned_value) |value| {
+            out.cleaned_value = if (self.cleaned_value_owned) try alloc.dupe(u8, value) else @constCast(value);
+        }
+        out.graph_writes = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
+        var graph_initialized: usize = 0;
+        errdefer out.graph_writes = out.graph_writes[0..graph_initialized];
+        for (self.graph_writes, 0..) |write, i| {
+            out.graph_writes[i] = blk: {
+                const index_name = try alloc.dupe(u8, write.index_name);
+                errdefer alloc.free(index_name);
+                const source = try alloc.dupe(u8, write.source);
+                errdefer alloc.free(source);
+                const target = try alloc.dupe(u8, write.target);
+                errdefer alloc.free(target);
+                const edge_type = try alloc.dupe(u8, write.edge_type);
+                errdefer alloc.free(edge_type);
+                const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
+                break :blk .{
+                    .index_name = index_name,
+                    .source = source,
+                    .target = target,
+                    .edge_type = edge_type,
+                    .metadata_json = metadata_json,
+                };
+            };
+            graph_initialized += 1;
+        }
+        out.mentioned_graph_indexes = try alloc.alloc([]u8, self.mentioned_graph_indexes.len);
+        var mentioned_initialized: usize = 0;
+        errdefer out.mentioned_graph_indexes = out.mentioned_graph_indexes[0..mentioned_initialized];
+        for (self.mentioned_graph_indexes, 0..) |name, i| {
+            out.mentioned_graph_indexes[i] = try alloc.dupe(u8, name);
+            mentioned_initialized += 1;
+        }
+        out.dense_embeddings = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
+        var dense_initialized: usize = 0;
+        errdefer out.dense_embeddings = out.dense_embeddings[0..dense_initialized];
+        for (self.dense_embeddings, 0..) |embedding, i| {
+            out.dense_embeddings[i] = blk: {
+                const index_name = try alloc.dupe(u8, embedding.index_name);
+                errdefer alloc.free(index_name);
+                const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                errdefer alloc.free(doc_key);
+                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                errdefer if (artifact_key) |key| alloc.free(key);
+                const vector = try alloc.dupe(f32, embedding.vector);
+                break :blk .{
+                    .index_name = index_name,
+                    .doc_key = doc_key,
+                    .parent_doc_key = embedding.parent_doc_key,
+                    .artifact_key = artifact_key,
+                    .vector = vector,
+                };
+            };
+            dense_initialized += 1;
+        }
+        out.sparse_embeddings = try alloc.alloc(SparseEmbeddingWrite, self.sparse_embeddings.len);
+        var sparse_initialized: usize = 0;
+        errdefer out.sparse_embeddings = out.sparse_embeddings[0..sparse_initialized];
+        for (self.sparse_embeddings, 0..) |embedding, i| {
+            out.sparse_embeddings[i] = blk: {
+                const index_name = try alloc.dupe(u8, embedding.index_name);
+                errdefer alloc.free(index_name);
+                const doc_key = try alloc.dupe(u8, embedding.doc_key);
+                errdefer alloc.free(doc_key);
+                const artifact_key = if (embedding.artifact_key) |key| try alloc.dupe(u8, key) else null;
+                errdefer if (artifact_key) |key| alloc.free(key);
+                const indices = try alloc.dupe(u32, embedding.indices);
+                errdefer alloc.free(indices);
+                const values = try alloc.dupe(f32, embedding.values);
+                break :blk .{
+                    .index_name = index_name,
+                    .doc_key = doc_key,
+                    .artifact_key = artifact_key,
+                    .indices = indices,
+                    .values = values,
+                };
+            };
+            sparse_initialized += 1;
+        }
+        return out;
+    }
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
-        if (self.cleaned_value) |value| alloc.free(value);
+        if (self.prepared_region) |region| {
+            for (self.dense_embeddings) |embedding|
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            for (self.sparse_embeddings) |embedding|
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            region.release();
+            self.* = undefined;
+            return;
+        }
+        if (self.cleaned_value_owned) if (self.cleaned_value) |value| alloc.free(value);
         for (self.graph_writes) |graph_write| {
             alloc.free(@constCast(graph_write.index_name));
             alloc.free(@constCast(graph_write.source));
@@ -82,6 +221,222 @@ pub const ExtractedWrite = struct {
         }
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
         self.* = undefined;
+    }
+};
+
+/// Fully owned output of the relational write preparation boundary. One JSON
+/// parse supplies validation, special-field extraction, the semantic digest,
+/// and the physical base row.
+pub const PreparedRelationalWrite = struct {
+    parsed: ?std.json.Parsed(std.json.Value),
+    extracted: ExtractedWrite,
+    packed_row: []u8,
+    semantic_hash: document_content_hash.Digest,
+    schema_version: u32,
+    owned_region: ?*PreparedRowRegion = null,
+    packed_row_owned_individually: bool = true,
+
+    pub fn createSharedRegion(backing: Allocator) !*PreparedRowRegion {
+        return try PreparedRowRegion.create(backing);
+    }
+
+    pub fn init(
+        alloc: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        return try initWithScratch(alloc, alloc, key, document_json, validator, table_schema, physical_layout);
+    }
+
+    /// `scratch` owns only preparation-temporary validation/hash/clone data;
+    /// every field retained by the returned row is allocated from `alloc`.
+    pub fn initWithScratch(
+        alloc: Allocator,
+        scratch: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        return try initWithAllocators(
+            alloc,
+            alloc,
+            scratch,
+            key,
+            document_json,
+            validator,
+            table_schema,
+            physical_layout,
+        );
+    }
+
+    /// Split transient parse ownership from retained row ownership. Batch
+    /// workers parse into their resettable scratch arena while the packed row
+    /// and extracted effects land in the worker's retained output region. The
+    /// caller must consume `parsedValue` and call `releaseParsed` before
+    /// resetting `parse_alloc`.
+    fn initWithAllocators(
+        alloc: Allocator,
+        parse_alloc: Allocator,
+        scratch: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        var parsed = try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
+        errdefer parsed.deinit();
+        if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
+
+        var logical_owned: ?std.json.Value = null;
+        defer if (logical_owned) |*value| freeJsonValue(scratch, value);
+        const logical_value = if (parsed.value == .object and
+            (parsed.value.object.contains("_edges") or parsed.value.object.contains("_embeddings")))
+        blk: {
+            logical_owned = try cloneWithoutSpecialFields(scratch, parsed.value);
+            break :blk logical_owned.?;
+        } else parsed.value;
+
+        var extracted = try extractWriteFromParsedPrepared(
+            alloc,
+            key,
+            document_json,
+            parsed.value,
+            logical_value,
+            logical_owned == null,
+        );
+        errdefer extracted.deinit(alloc);
+
+        const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
+            alloc,
+            scratch,
+            logical_value,
+            table_schema,
+            physical_layout,
+        );
+        errdefer alloc.free(prepared_row.bytes);
+        return .{
+            .parsed = parsed,
+            .extracted = extracted,
+            .packed_row = prepared_row.bytes,
+            .semantic_hash = prepared_row.semantic_hash,
+            .schema_version = table_schema.version,
+        };
+    }
+
+    pub fn initInOwnedRegion(
+        backing: Allocator,
+        scratch: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        const region = try PreparedRowRegion.create(backing);
+        errdefer region.release();
+        var prepared = try initWithScratch(
+            region.arena.allocator(),
+            scratch,
+            key,
+            document_json,
+            validator,
+            table_schema,
+            physical_layout,
+        );
+        prepared.owned_region = region;
+        return prepared;
+    }
+
+    /// Prepare into a worker-owned region shared by multiple rows. A batch
+    /// retains one reference per completed row, allowing commit structures to
+    /// release rows independently without creating an arena (and allocator
+    /// page chain) for every document.
+    pub fn initInSharedRegion(
+        region: *PreparedRowRegion,
+        scratch: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        var prepared = try initWithAllocators(
+            region.arena.allocator(),
+            scratch,
+            scratch,
+            key,
+            document_json,
+            validator,
+            table_schema,
+            physical_layout,
+        );
+        region.retain();
+        prepared.owned_region = region;
+        return prepared;
+    }
+
+    pub fn preparationAllocator(self: *PreparedRelationalWrite, fallback: Allocator) Allocator {
+        return if (self.owned_region) |region| region.arena.allocator() else fallback;
+    }
+
+    pub fn deinit(self: *PreparedRelationalWrite, alloc: Allocator) void {
+        if (self.owned_region) |region| {
+            if (self.parsed) |*parsed| parsed.deinit();
+            // Artifact keys are attached after preparation with the DB
+            // allocator; the remaining extracted state belongs to the arena.
+            for (self.extracted.dense_embeddings) |embedding|
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            for (self.extracted.sparse_embeddings) |embedding|
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            region.release();
+            self.* = undefined;
+            return;
+        }
+        if (self.parsed) |*parsed| parsed.deinit();
+        self.extracted.deinit(alloc);
+        if (self.packed_row_owned_individually and self.packed_row.len != 0) alloc.free(self.packed_row);
+        self.* = undefined;
+    }
+
+    pub fn parsedValue(self: *const PreparedRelationalWrite) std.json.Value {
+        return self.parsed.?.value;
+    }
+
+    pub fn releaseParsed(self: *PreparedRelationalWrite) void {
+        if (self.parsed) |*parsed| parsed.deinit();
+        self.parsed = null;
+    }
+
+    pub fn takeExtracted(self: *PreparedRelationalWrite) ExtractedWrite {
+        if (self.owned_region) |region| {
+            if (self.parsed) |*parsed| parsed.deinit();
+            self.parsed = null;
+            self.extracted.prepared_region = region;
+            self.owned_region = null;
+            self.packed_row_owned_individually = false;
+        }
+        const extracted = self.extracted;
+        self.extracted = .{
+            .cleaned_value = null,
+            .cleaned_value_owned = false,
+            .graph_writes = &.{},
+            .mentioned_graph_indexes = &.{},
+            .dense_embeddings = &.{},
+            .sparse_embeddings = &.{},
+        };
+        return extracted;
+    }
+
+    pub fn takePackedRow(self: *PreparedRelationalWrite) []u8 {
+        const row_bytes = self.packed_row;
+        self.packed_row = &.{};
+        return row_bytes;
     }
 };
 
@@ -750,6 +1105,43 @@ pub fn extractDenseVectorField(
     }
 }
 
+pub fn extractDenseVectorFieldFromParsed(
+    alloc: Allocator,
+    root: std.json.Value,
+    field_name: []const u8,
+    dims: u32,
+) !?[]f32 {
+    if (root != .object) return null;
+    const field = root.object.get(field_name) orelse return null;
+    if (field != .array) return null;
+    if (field.array.items.len != dims) return error.InvalidVectorDimensions;
+    const values = try alloc.alloc(f32, dims);
+    errdefer alloc.free(values);
+    for (field.array.items, 0..) |item, i| values[i] = switch (item) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| @floatCast(number),
+        .number_string => |number| try std.fmt.parseFloat(f32, number),
+        else => return error.InvalidVectorValue,
+    };
+    return values;
+}
+
+/// Decode a direct-field vector from an ordinal cell payload. Unlike the
+/// document extractor this parses only the selected column, so rebuild memory
+/// and CPU are independent of unrelated document size.
+pub fn extractDenseVectorValue(
+    alloc: Allocator,
+    data: []const u8,
+    dims: u32,
+) ![]f32 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    const values = try parseDenseEmbeddingValue(alloc, parsed.value);
+    errdefer alloc.free(values);
+    if (values.len != dims) return error.InvalidVectorDimensions;
+    return values;
+}
+
 /// Extract a dense vector into caller-owned scratch without retaining a
 /// decoded allocation. Used by bounded exact-score fallback batches for
 /// pre-artifact direct-field indexes.
@@ -820,6 +1212,44 @@ pub fn extractSparseVectorField(
         },
         else => return raw_err,
     };
+}
+
+pub fn extractSparseVectorFieldFromParsed(
+    alloc: Allocator,
+    root: std.json.Value,
+    field_name: []const u8,
+) !?SparseVectorData {
+    if (root != .object) return null;
+    const field = root.object.get(field_name) orelse return null;
+    if (field != .object) return null;
+    const indices_value = field.object.get("indices") orelse return error.InvalidSparseVector;
+    const values_value = field.object.get("values") orelse return error.InvalidSparseVector;
+    if (indices_value != .array or values_value != .array or
+        indices_value.array.items.len != values_value.array.items.len)
+        return error.InvalidSparseVector;
+    const indices = try alloc.alloc(u32, indices_value.array.items.len);
+    errdefer alloc.free(indices);
+    const values = try alloc.alloc(f32, values_value.array.items.len);
+    errdefer alloc.free(values);
+    for (indices_value.array.items, 0..) |item, i| indices[i] = switch (item) {
+        .integer => |number| std.math.cast(u32, number) orelse return error.InvalidSparseVector,
+        .number_string => |number| std.fmt.parseInt(u32, number, 10) catch return error.InvalidSparseVector,
+        else => return error.InvalidSparseVector,
+    };
+    for (values_value.array.items, 0..) |item, i| values[i] = switch (item) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| @floatCast(number),
+        .number_string => |number| std.fmt.parseFloat(f32, number) catch return error.InvalidSparseVector,
+        else => return error.InvalidSparseVector,
+    };
+    return .{ .indices = indices, .values = values };
+}
+
+/// Decode a sparse direct-field vector from one ordinal JSON cell.
+pub fn extractSparseVectorValue(alloc: Allocator, data: []const u8) !SparseVectorData {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    return try parseSparseValue(alloc, parsed.value);
 }
 
 fn extractSparseVectorFieldRawFast(
@@ -1128,10 +1558,9 @@ fn extractSparseVectorFieldSlow(
     data: []const u8,
     field_name: []const u8,
 ) !?SparseVectorData {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
-
     if (root != .object) return null;
     const field = root.object.get(field_name) orelse return null;
     if (field != .object) return null;
@@ -1313,13 +1742,35 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         return extracted;
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const root = parsed.value;
+    return try extractWriteFromParsed(alloc, key, data, parsed.value);
+}
 
+/// Extract special fields from a shared parse tree. `original_json` is copied
+/// only when no special fields need removal; all extracted values are owned by
+/// the returned result.
+pub fn extractWriteFromParsed(
+    alloc: Allocator,
+    key: []const u8,
+    original_json: []const u8,
+    root: std.json.Value,
+) !ExtractedWrite {
+    return try extractWriteFromParsedPrepared(alloc, key, original_json, root, null, false);
+}
+
+fn extractWriteFromParsedPrepared(
+    alloc: Allocator,
+    key: []const u8,
+    original_json: []const u8,
+    root: std.json.Value,
+    logical_without_special_fields: ?std.json.Value,
+    borrow_original_json: bool,
+) !ExtractedWrite {
     if (root != .object) {
         return .{
-            .cleaned_value = try alloc.dupe(u8, data),
+            .cleaned_value = if (borrow_original_json) @constCast(original_json) else try alloc.dupe(u8, original_json),
+            .cleaned_value_owned = !borrow_original_json,
             .graph_writes = &.{},
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
@@ -1450,13 +1901,16 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
     const has_non_special_fields = hasNonSpecialFields(root);
     const cleaned_value = if (has_special_fields) blk: {
         if (!has_non_special_fields) break :blk null;
+        if (logical_without_special_fields) |logical|
+            break :blk try std.json.Stringify.valueAlloc(alloc, logical, .{});
         var cleaned = try cloneWithoutSpecialFields(alloc, root);
         defer freeJsonValue(alloc, &cleaned);
         break :blk try std.json.Stringify.valueAlloc(alloc, cleaned, .{});
-    } else try alloc.dupe(u8, data);
+    } else if (borrow_original_json) @constCast(original_json) else try alloc.dupe(u8, original_json);
 
     return .{
         .cleaned_value = cleaned_value,
+        .cleaned_value_owned = has_special_fields or !borrow_original_json,
         .graph_writes = try graph_writes.toOwnedSlice(alloc),
         .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
@@ -3213,85 +3667,199 @@ fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), val
     try list.append(alloc, try alloc.dupe(u8, value));
 }
 
-/// Project a validated relational document into the authoritative packed-row
-/// representation. Numeric parsing keeps the original JSON token so signed
-/// integers and JSON subdocuments retain their exact domains.
-pub fn buildRelationalRowValueAlloc(
+pub fn buildRelationalRowValueForSchemaFromParsedAlloc(
     alloc: Allocator,
-    doc_json: []const u8,
-    columns: []const runtime_schema.RelationalColumn,
+    root: std.json.Value,
+    table_schema: runtime_schema.TableSchema,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .parse_numbers = false });
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidBatchRequest;
+    var physical_layout = try relational_row_codec.PhysicalLayout.init(alloc, table_schema);
+    defer physical_layout.deinit();
+    return (try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(alloc, alloc, root, table_schema, &physical_layout)).bytes;
+}
+
+const PreparedEncodedRow = struct {
+    bytes: []u8,
+    semantic_hash: document_content_hash.Digest,
+};
+
+fn buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
+    alloc: Allocator,
+    scratch: Allocator,
+    root: std.json.Value,
+    table_schema: runtime_schema.TableSchema,
+    physical_layout: *const relational_row_codec.PhysicalLayout,
+) !PreparedEncodedRow {
+    if (root != .object) return error.InvalidBatchRequest;
+    const logical_values = try scratch.alloc(?std.json.Value, table_schema.relational_columns.len);
+    defer scratch.free(logical_values);
+    @memset(logical_values, null);
+    const canonical_json_values = try scratch.alloc(?[]const u8, table_schema.relational_columns.len);
+    defer scratch.free(canonical_json_values);
+    @memset(canonical_json_values, null);
+    var semantic_hash: document_content_hash.Digest = undefined;
+    const bytes = try buildRelationalRowValueFromParsedInternal(
+        alloc,
+        scratch,
+        root,
+        table_schema.relational_columns,
+        table_schema.version,
+        physical_layout,
+        logical_values,
+        canonical_json_values,
+    );
+    errdefer alloc.free(bytes);
+    semantic_hash = try document_content_hash.hashRelationalPreparedValuesCanonicalWithOrdinals(
+        scratch,
+        logical_values,
+        canonical_json_values,
+        table_schema,
+        physical_layout.hash_ordinals,
+    );
+
+    // The physical encoder needs the digest in its header, so re-encoding here
+    // would defeat the single prepared-row traversal. Patch the reserved digest
+    // and checksum after the row body is complete.
+    relational_row_codec.setOrdinalSemanticHash(bytes, semantic_hash) catch |err| {
+        alloc.free(bytes);
+        return err;
+    };
+    return .{ .bytes = bytes, .semantic_hash = semantic_hash };
+}
+
+fn buildRelationalRowValueFromParsedInternal(
+    alloc: Allocator,
+    scratch: Allocator,
+    root: std.json.Value,
+    columns: []const runtime_schema.RelationalColumn,
+    schema_version: u32,
+    physical_layout: *const relational_row_codec.PhysicalLayout,
+    logical_values: ?[]?std.json.Value,
+    canonical_json_values: ?[]?[]const u8,
+) ![]u8 {
+    if (root != .object) return error.InvalidBatchRequest;
 
     var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
-    defer cells.deinit(alloc);
+    defer cells.deinit(scratch);
     var owned = std.ArrayListUnmanaged([]u8).empty;
     defer {
-        for (owned.items) |buffer| alloc.free(buffer);
-        owned.deinit(alloc);
+        for (owned.items) |buffer| scratch.free(buffer);
+        owned.deinit(scratch);
     }
+    // Preparation normally uses an arena, where ArrayList growth cannot return
+    // superseded buffers. Reserve the schema upper bound once to avoid both
+    // allocator traffic and retained geometric-growth waste.
+    try cells.ensureTotalCapacity(scratch, columns.len);
+    try owned.ensureTotalCapacity(scratch, columns.len);
 
-    var found_columns: usize = 0;
-    for (columns) |column| {
-        const found = parsed.value.object.get(column.name) orelse {
-            if (column.required) return error.InvalidBatchRequest;
-            continue;
-        };
-        found_columns += 1;
-        const value_type = relationalValueType(column.column_type);
-        if (found == .null) {
-            if (!column.allows_null) return error.InvalidBatchRequest;
-            try cells.append(alloc, .{
+    const makeCell = struct {
+        fn call(
+            output_alloc: Allocator,
+            column: runtime_schema.RelationalColumn,
+            found: std.json.Value,
+            owned_buffers: *std.ArrayListUnmanaged([]u8),
+            canonical_json_slot: ?*?[]const u8,
+        ) !relational_row_codec.Cell {
+            const value_type = relationalValueType(column.column_type);
+            if (found == .null) {
+                if (!column.allows_null) return error.InvalidBatchRequest;
+                return .{
+                    .path = column.path,
+                    .value_type = value_type,
+                    .is_json = column.is_json,
+                    .is_null = true,
+                    .value = relationalZeroValue(value_type),
+                };
+            }
+
+            if (column.is_json) switch (column.json_kind) {
+                .object => if (found != .object) return error.InvalidBatchRequest,
+                .array => if (found != .array) return error.InvalidBatchRequest,
+                .any => {},
+                .none => return error.InvalidBatchRequest,
+            };
+
+            const value = if (column.is_json) blk: {
+                const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                if (canonical_json_slot) |slot| slot.* = encoded;
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else try relationalTypedValueAlloc(output_alloc, column.column_type, found, owned_buffers) orelse
+                return error.InvalidBatchRequest;
+
+            return .{
                 .path = column.path,
                 .value_type = value_type,
                 .is_json = column.is_json,
-                .is_null = true,
-                .value = relationalZeroValue(value_type),
-            });
-            continue;
+                .value = value,
+            };
+        }
+    }.call;
+
+    {
+        const layout = physical_layout;
+        if (layout.schema_version != schema_version or layout.column_count != columns.len)
+            return error.RelationalRowSchemaMismatch;
+        const cells_by_ordinal = try scratch.alloc(?relational_row_codec.Cell, columns.len);
+        defer scratch.free(cells_by_ordinal);
+        @memset(cells_by_ordinal, null);
+
+        // Resolve each input member once through the immutable epoch's
+        // name-to-ordinal index. This avoids a hash-table probe for every
+        // schema column and immediately rejects unknown members.
+        var fields = root.object.iterator();
+        while (fields.next()) |entry| {
+            const ordinal = layout.ordinalForName(columns, entry.key_ptr.*) orelse
+                return error.InvalidBatchRequest;
+            if (cells_by_ordinal[ordinal] != null) return error.InvalidBatchRequest;
+            const found = entry.value_ptr.*;
+            if (logical_values) |values| values[ordinal] = found;
+            cells_by_ordinal[ordinal] = try makeCell(
+                scratch,
+                columns[ordinal],
+                found,
+                &owned,
+                if (canonical_json_values) |values| &values[ordinal] else null,
+            );
         }
 
-        if (column.is_json) switch (column.json_kind) {
-            .object => if (found != .object) return error.InvalidBatchRequest,
-            .array => if (found != .array) return error.InvalidBatchRequest,
-            .any => {},
-            .none => return error.InvalidBatchRequest,
-        };
-
-        const value = if (column.is_json) blk: {
-            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(found, .{})});
-            errdefer alloc.free(encoded);
-            try owned.append(alloc, encoded);
-            break :blk typed_dv.TypedValue{ .bytes_val = encoded };
-        } else try relationalTypedValueAlloc(alloc, column.column_type, found, &owned) orelse
-            return error.InvalidBatchRequest;
-
-        try cells.append(alloc, .{
-            .path = column.path,
-            .value_type = value_type,
-            .is_json = column.is_json,
-            .value = value,
-        });
+        for (columns, 0..) |column, ordinal| {
+            if (cells_by_ordinal[ordinal]) |cell| {
+                try cells.append(scratch, cell);
+            } else if (column.required) {
+                return error.InvalidBatchRequest;
+            }
+        }
     }
-    // A relational row is closed. Checking the count after the column walk is
-    // allocation-free and rejects every unknown field without building a
-    // second name index for each write.
-    if (found_columns != parsed.value.object.count()) return error.InvalidBatchRequest;
-    return try relational_row_codec.serialize(alloc, cells.items);
+    return try relational_row_codec.serializePreparedOrdinalDeferredHash(
+        alloc,
+        schema_version,
+        columns,
+        cells.items,
+        physical_layout,
+    );
 }
 
-pub fn materializeRelationalRowValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    return try relational_row_codec.reconstructValueAlloc(alloc, value);
+pub fn materializeRelationalRowValueForSchemaAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+) ![]u8 {
+    _ = try relational_row_codec.rowSchemaVersion(value);
+    return try relational_row_codec.reconstructOrdinalValueAlloc(alloc, value, table_schema);
+}
+
+pub fn relationalRowSchemaVersion(value: []const u8) !u32 {
+    return try relational_row_codec.rowSchemaVersion(value);
 }
 
 pub fn isRelationalRowValue(value: []const u8) bool {
     return relational_row_codec.looksLikeRow(value);
 }
 
-pub fn validateRelationalRowValue(value: []const u8) !void {
-    try relational_row_codec.validate(value);
+pub fn validateRelationalRowValueForSchema(value: []const u8, table_schema: runtime_schema.TableSchema) !void {
+    _ = try relational_row_codec.rowSchemaVersion(value);
+    try relational_row_codec.validateOrdinal(value, table_schema);
 }
 
 fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
@@ -3358,27 +3926,6 @@ fn relationalTypedValueAlloc(
             break :blk .{ .bytes_val = encoded };
         },
     };
-}
-
-test "document mapper builds relational packed rows without numeric loss" {
-    const alloc = std.testing.allocator;
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .column_type = .string, .required = true },
-        .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
-        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
-    };
-    const encoded = try buildRelationalRowValueAlloc(
-        alloc,
-        "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":{\"n\":0.10000000000000001}}",
-        &columns,
-    );
-    defer alloc.free(encoded);
-    const rebuilt = try materializeRelationalRowValueAlloc(alloc, encoded);
-    defer alloc.free(rebuilt);
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"a\",\"count\":9007199254740993,\"payload\":{\"n\":0.10000000000000001}}",
-        rebuilt,
-    );
 }
 
 test "document mapper builds text segment from top-level string fields" {
@@ -5009,4 +5556,32 @@ test "document mapper extracts packed sparse embeddings from _embeddings" {
     try std.testing.expectEqual(@as(u32, 5), extracted.sparse_embeddings[0].indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), extracted.sparse_embeddings[0].values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), extracted.sparse_embeddings[0].values[1], 0.0001);
+}
+
+test "relational JSON cells have canonical physical bytes" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{
+            .name = "payload",
+            .path = "payload",
+            .column_type = .json,
+            .required = true,
+            .is_json = true,
+            .json_kind = .object,
+        },
+    };
+    const table_schema: runtime_schema.TableSchema = .{
+        .version = 11,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    var left = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":{\"z\":1,\"a\":{\"y\":2,\"b\":3}}}", .{ .parse_numbers = false });
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":{\"a\":{\"b\":3,\"y\":2},\"z\":1}}", .{ .parse_numbers = false });
+    defer right.deinit();
+    const left_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, left.value, table_schema);
+    defer alloc.free(left_row);
+    const right_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, right.value, table_schema);
+    defer alloc.free(right_row);
+    try std.testing.expectEqualSlices(u8, left_row, right_row);
 }

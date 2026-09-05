@@ -764,6 +764,26 @@ pub const Operations = struct {
             return mapCommonReadError(err) orelse error.Internal) orelse error.NotFound;
     }
 
+    /// Stream group-local NDJSON with transport backpressure. The source starts
+    /// the sink only after route/table admission succeeds, so callers can still
+    /// return a normal error response for a missing table.
+    pub fn scanStream(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        from: []const u8,
+        to: []const u8,
+        options: db_mod.types.ScanOptions,
+        sink: table_reads.ScanStreamSink,
+    ) Error!bool {
+        try request.ensureActive();
+        const reads = try self.routedReads(alloc, request, group_id);
+        return reads.scanGroupLocalStream(alloc, group_id, table_name, from, to, options, .read_index, sink) catch |err|
+            return mapCommonReadError(err) orelse error.Internal;
+    }
+
     /// Execute a schema-routed group-local query. The returned response owns
     /// its JSON buffer and must be deinitialized with `alloc`.
     pub fn query(

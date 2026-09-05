@@ -31,6 +31,8 @@ const wildcard_mod = @import("../../../search/wildcard.zig");
 const rfc3339 = @import("../../../common/rfc3339.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
+const runtime_schema = @import("../../schema.zig");
 
 const graph_document_hydration_batch_size: usize = 4096;
 
@@ -2561,7 +2563,100 @@ pub const PreparedPatternFilter = struct {
     ) !bool {
         return try self.compiled.matches(scratch_alloc, key, doc);
     }
+
+    pub fn matchesOrdinal(
+        self: *const PreparedPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        return try self.compiled.matchesOrdinal(scratch_alloc, key, row);
+    }
 };
+
+/// A schema-epoch-specific companion to `PreparedPatternFilter`. Field names
+/// are resolved to stable column ordinals once per request and schema version,
+/// instead of once per predicate for every row in a scan.
+pub const PreparedOrdinalPatternFilter = struct {
+    arena: std.heap.ArenaAllocator,
+    source: *const PreparedPatternFilter,
+    ordinals: std.StringHashMapUnmanaged(?u32) = .empty,
+
+    pub fn init(
+        backing_alloc: Allocator,
+        source: *const PreparedPatternFilter,
+        table_schema: runtime_schema.TableSchema,
+        layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedOrdinalPatternFilter {
+        var out = PreparedOrdinalPatternFilter{
+            .arena = std.heap.ArenaAllocator.init(backing_alloc),
+            .source = source,
+        };
+        errdefer out.arena.deinit();
+        try bindOrdinalFields(
+            out.arena.allocator(),
+            &out.ordinals,
+            source.compiled,
+            table_schema,
+            layout,
+        );
+        return out;
+    }
+
+    pub fn deinit(self: *PreparedOrdinalPatternFilter) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn matches(
+        self: *const PreparedOrdinalPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        var evaluation = OrdinalEvaluation{ .alloc = scratch_alloc, .row = row };
+        defer evaluation.deinit();
+        return try self.source.compiled.matchesOrdinalPrepared(
+            scratch_alloc,
+            key,
+            &evaluation,
+            &self.ordinals,
+        );
+    }
+};
+
+fn bindOrdinalFields(
+    alloc: Allocator,
+    ordinals: *std.StringHashMapUnmanaged(?u32),
+    filter: CompiledPatternFilter,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const relational_row_codec.PhysicalLayout,
+) !void {
+    switch (filter) {
+        .match_all, .match_none, .doc_id => {},
+        .conjuncts, .disjuncts => |items| for (items) |item|
+            try bindOrdinalFields(alloc, ordinals, item, table_schema, layout),
+        .bool_query => |query| {
+            for (query.must) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+            for (query.should) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+            for (query.must_not) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+        },
+        .field_matcher => |matcher| {
+            const top = switch (matcher.path) {
+                .single => |segment| segment,
+                .dotted => |segments| segments[0],
+                .json_pointer => |segments| if (segments.len == 0) return else segments[0],
+            };
+            const gop = try ordinals.getOrPut(alloc, top);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = if (layout.ordinalForName(table_schema.relational_columns, top)) |ordinal|
+                    @intCast(ordinal)
+                else
+                    null;
+            }
+        },
+    }
+}
 
 test "prepared pattern filters own source JSON" {
     const alloc = std.testing.allocator;
@@ -2597,6 +2692,48 @@ test "prepared pattern filters own source JSON" {
         "doc-1",
         stored,
     ));
+}
+
+test "prepared pattern filters evaluate scalar and nested ordinal cells" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "tenant", .path = "tenant", .column_type = .string, .required = true },
+        .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .version = 3,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .path = "tenant", .value_type = .bytes_val, .value = .{ .bytes_val = "acme" } },
+        .{ .path = "count", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"tier\":\"gold\"}" } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(
+        alloc,
+        schema.version,
+        &columns,
+        &cells,
+        [_]u8{0x7a} ** relational_row_codec.semantic_hash_len,
+    );
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowView(encoded, schema, &layout);
+
+    var scalar = try PreparedPatternFilter.init(alloc, "{\"term\":{\"tenant\":\"acme\"}}");
+    defer scalar.deinit();
+    try std.testing.expect((try scalar.matchesOrdinal(alloc, "doc-1", row)).?);
+
+    var nested = try PreparedPatternFilter.init(alloc, "{\"term\":{\"payload.tier\":\"gold\"}}");
+    defer nested.deinit();
+    try std.testing.expect((try nested.matchesOrdinal(alloc, "doc-1", row)).?);
+
+    var missing = try PreparedPatternFilter.init(alloc, "{\"exists\":{\"field\":\"absent\"}}");
+    defer missing.deinit();
+    try std.testing.expect(!(try missing.matchesOrdinal(alloc, "doc-1", row)).?);
 }
 
 /// Lazily prepares each distinct graph-node filter at most once per traversal.
@@ -2850,7 +2987,189 @@ pub const CompiledPatternFilter = union(enum) {
             },
         };
     }
+
+    /// Evaluate directly against one parsed AROW. A null result means the
+    /// query addresses the JSON root in a way that cannot be represented by a
+    /// column ordinal; callers may then use the general JSON materializer.
+    pub fn matchesOrdinal(
+        self: CompiledPatternFilter,
+        alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        var evaluation = OrdinalEvaluation{ .alloc = alloc, .row = row };
+        defer evaluation.deinit();
+        return try self.matchesOrdinalPrepared(alloc, key, &evaluation, null);
+    }
+
+    fn matchesOrdinalPrepared(
+        self: CompiledPatternFilter,
+        alloc: Allocator,
+        key: []const u8,
+        evaluation: *OrdinalEvaluation,
+        ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
+    ) !?bool {
+        return switch (self) {
+            .match_all => true,
+            .match_none => false,
+            .doc_id => |ids| blk: {
+                for (ids) |id| if (std.mem.eql(u8, key, id)) break :blk true;
+                break :blk false;
+            },
+            .conjuncts => |items| blk: {
+                for (items) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (!matched) break :blk false;
+                }
+                break :blk true;
+            },
+            .disjuncts => |items| blk: {
+                for (items) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (matched) break :blk true;
+                }
+                break :blk false;
+            },
+            .bool_query => |bool_query| blk: {
+                for (bool_query.must) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (!matched) break :blk false;
+                }
+                if (bool_query.min_should > 0) {
+                    var matched_count: usize = 0;
+                    for (bool_query.should) |item| {
+                        const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                        if (matched) matched_count += 1;
+                    }
+                    if (matched_count < bool_query.min_should) break :blk false;
+                }
+                for (bool_query.must_not) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (matched) break :blk false;
+                }
+                break :blk true;
+            },
+            .field_matcher => |matcher| try matcherMatchesOrdinal(alloc, matcher, evaluation, ordinal_bindings),
+        };
+    }
 };
+
+const OrdinalEvaluation = struct {
+    alloc: Allocator,
+    row: relational_row_codec.OrdinalRowView,
+    parsed_json_cells: std.AutoHashMapUnmanaged(usize, std.json.Parsed(std.json.Value)) = .empty,
+
+    fn deinit(self: *@This()) void {
+        var values = self.parsed_json_cells.valueIterator();
+        while (values.next()) |parsed| parsed.deinit();
+        self.parsed_json_cells.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn parsedJsonCell(self: *@This(), ordinal: usize, bytes: []const u8) !std.json.Value {
+        if (self.parsed_json_cells.getPtr(ordinal)) |parsed| return parsed.value;
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{});
+        errdefer parsed.deinit();
+        const gop = try self.parsed_json_cells.getOrPut(self.alloc, ordinal);
+        if (gop.found_existing) {
+            parsed.deinit();
+            return gop.value_ptr.value;
+        }
+        gop.value_ptr.* = parsed;
+        return parsed.value;
+    }
+};
+
+fn matcherMatchesOrdinal(
+    alloc: Allocator,
+    matcher: CompiledPatternFilter.FieldMatcher,
+    evaluation: *OrdinalEvaluation,
+    ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
+) !?bool {
+    const row = evaluation.row;
+    const Path = struct {
+        top: []const u8,
+        remaining: []const []const u8,
+        pointer: bool,
+    };
+    const path: Path = switch (matcher.path) {
+        .single => |top| .{ .top = top, .remaining = &.{}, .pointer = false },
+        .dotted => |segments| .{
+            .top = segments[0],
+            .remaining = segments[1..],
+            .pointer = false,
+        },
+        .json_pointer => |segments| if (segments.len == 0)
+            return null
+        else
+            .{
+                .top = segments[0],
+                .remaining = segments[1..],
+                .pointer = true,
+            },
+    };
+
+    const ordinal = if (ordinal_bindings) |bindings| blk: {
+        const bound = bindings.getPtr(path.top) orelse return error.InvalidArgument;
+        break :blk bound.* orelse return try matcher.predicate.matches(alloc, &.{});
+    } else row.ordinalForName(path.top) orelse
+        return try matcher.predicate.matches(alloc, &.{});
+    const maybe_cell = try row.findCell(ordinal);
+    const cell = maybe_cell orelse return try matcher.predicate.matches(alloc, &.{});
+
+    if (cell.is_null) {
+        if (path.remaining.len == 0) {
+            const values = [_]std.json.Value{.null};
+            return try matcher.predicate.matches(alloc, &values);
+        }
+        return try matcher.predicate.matches(alloc, &.{});
+    }
+
+    // Existence of a top-level non-null cell is already conclusive and avoids
+    // parsing JSON-valued columns for the overwhelmingly common predicate.
+    if (path.remaining.len == 0) switch (matcher.predicate) {
+        .exists => return true,
+        else => {},
+    };
+
+    var number_buf: [64]u8 = undefined;
+    const root: std.json.Value = switch (cell.value) {
+        .u64_val => |value| if (value <= std.math.maxInt(i64))
+            .{ .integer = @intCast(value) }
+        else
+            .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{value}) },
+        .i64_val => |value| .{ .integer = value },
+        .f64_val => |value| .{ .float = value },
+        .bool_val => |value| .{ .bool = value },
+        .numeric_val => |value| switch (value) {
+            .u64_val => |number| if (number <= std.math.maxInt(i64))
+                .{ .integer = @intCast(number) }
+            else
+                .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{number}) },
+            .i64_val => |number| .{ .integer = number },
+            .f64_val => |number| .{ .float = number },
+        },
+        .bytes_val => |bytes| if (cell.is_json)
+            try evaluation.parsedJsonCell(ordinal, bytes)
+        else
+            .{ .string = bytes },
+        // Geo predicates use shape-specific semantics. Keep their existing
+        // general evaluator until it has a native typed-cell implementation.
+        .geo_point => return null,
+    };
+    if (path.remaining.len == 0) {
+        const values = [_]std.json.Value{root};
+        return try matcher.predicate.matches(alloc, &values);
+    }
+    var values = std.ArrayListUnmanaged(std.json.Value).empty;
+    defer values.deinit(alloc);
+    if (path.pointer) {
+        try collectJsonValueAtPointer(alloc, root, path.remaining, &values);
+    } else {
+        try collectJsonValuesAtPath(alloc, root, path.remaining, 0, &values);
+    }
+    return try matcher.predicate.matches(alloc, values.items);
+}
 
 const pattern_filter_max_tree_depth: u8 = 64;
 const pattern_filter_max_tree_nodes: usize = 16_384;

@@ -366,7 +366,7 @@ pub const Context = struct {
 
     pub const StreamDelegate = struct {
         ptr: ?*anyopaque,
-        start: *const fn (?*anyopaque, u16) anyerror!void,
+        start: *const fn (?*anyopaque, u16, []const u8) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
     };
@@ -960,14 +960,22 @@ pub const Context = struct {
     /// return ctx.response.build(); // return value is ignored for streams
     /// ```
     pub fn streamResponse(self: *Self, status_code: u16) !StreamWriter {
+        return try self.streamResponseWithContentType(status_code, "text/event-stream; charset=utf-8");
+    }
+
+    /// Starts a transport-native streaming response with an explicit media
+    /// type. This is the general body-streaming primitive; `streamResponse`
+    /// remains the SSE convenience wrapper.
+    pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
         if (self.stream_delegate) |delegate| {
-            try delegate.start(delegate.ptr, status_code);
+            _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
+            try delegate.start(delegate.ptr, status_code, content_type);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
         if (self.h2 != null) {
             // HTTP/2 path — delegate to existing streamH2
             const h2w = try self.streamH2(status_code, &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+                .{ .name = "content-type", .value = content_type },
                 .{ .name = "cache-control", .value = "no-cache" },
             });
             return .{ .h1_sock = null, .h2_writer = h2w };
@@ -979,7 +987,7 @@ pub const Context = struct {
         // Build and send headers-only response
         var resp = Response.init(self.allocator, status_code);
         defer resp.deinit();
-        try resp.headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        try resp.headers.set(HeaderName.CONTENT_TYPE, content_type);
         try resp.headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         try resp.headers.set(HeaderName.CONNECTION, "keep-alive");
         try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");

@@ -16,6 +16,15 @@ const std = @import("std");
 const storage_schema = @import("../storage/schema.zig");
 const impl = @import("table_schema_impl.zig");
 
+/// Durable public-schema generations. The singleton remains the active schema
+/// pointer for compatibility; versioned entries make historical relational
+/// rows independently decodable and validatable.
+pub const versioned_schema_key_prefix = "\x00\x00__metadata__:schema_json_v";
+
+pub fn versionedSchemaKeyAlloc(alloc: std.mem.Allocator, version: u32) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{d}", .{ versioned_schema_key_prefix, version });
+}
+
 pub const ParsedTableSchema = impl.TableSchema;
 pub const DocumentSchema = impl.DocumentSchema;
 pub const DocumentProperty = impl.DocumentProperty;
@@ -102,6 +111,10 @@ pub const CompiledTableValidator = struct {
 
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
         try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, self.schema, writes, self.physical_fields);
+    }
+
+    pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
+        try impl.validateDocumentValueWithPhysicalFields(alloc, self.schema, value, self.physical_fields);
     }
 };
 

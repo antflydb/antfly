@@ -1213,6 +1213,18 @@ pub fn saveSchemaWithMetadata(
     defer alloc.free(versioned_key);
     const previous_schema = if (schema_changed) try loadSchema(store, alloc) else null;
     defer if (previous_schema) |loaded| freeSchema(alloc, loaded);
+    if (schema_changed) {
+        if (previous_schema) |loaded| {
+            if (schema.version < loaded.version) return error.SchemaVersionRegression;
+        }
+        const existing_version = try loadSchemaVersion(store, alloc, schema.version);
+        defer if (existing_version) |existing| freeSchema(alloc, existing);
+        if (existing_version) |existing| {
+            const existing_data = try serializeSchema(alloc, existing);
+            defer alloc.free(existing_data);
+            if (!std.mem.eql(u8, existing_data, data)) return error.ImmutableSchemaVersionConflict;
+        }
+    }
 
     const previous_versioned_data = blk: {
         const loaded = previous_schema orelse break :blk null;
@@ -1291,6 +1303,42 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     return try deserializeSchema(alloc, data);
 }
 
+/// Load every immutable schema layout stored for row decoding. The returned
+/// schemas and slice are owned by the caller. This is intentionally performed
+/// once at open/publication time so row scans never perform metadata I/O.
+pub fn loadSchemaHistory(store: anytype, alloc: Allocator) ![]TableSchema {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    const entries = try backend_scan.scanPrefixCurrent(alloc, &runtime.store, schema_version_prefix);
+    defer backend_scan.freeResults(alloc, entries);
+    const schemas = try alloc.alloc(TableSchema, entries.len);
+    var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer seen.deinit(alloc);
+    var initialized: usize = 0;
+    errdefer {
+        for (schemas[0..initialized]) |schema| freeSchema(alloc, schema);
+        alloc.free(schemas);
+    }
+    for (entries) |entry| {
+        const schema = try deserializeSchema(alloc, entry.value);
+        var schema_owned = true;
+        errdefer if (schema_owned) freeSchema(alloc, schema);
+        const key_version = std.fmt.parseInt(u32, entry.key[schema_version_prefix.len..], 10) catch return error.InvalidSchema;
+        if (key_version != schema.version) return error.InvalidSchema;
+        const inserted = try seen.getOrPut(alloc, schema.version);
+        if (inserted.found_existing) return error.InvalidSchema;
+        schemas[initialized] = schema;
+        schema_owned = false;
+        initialized += 1;
+    }
+    return schemas;
+}
+
+pub fn freeSchemaHistory(alloc: Allocator, schemas: []TableSchema) void {
+    for (schemas) |schema| freeSchema(alloc, schema);
+    alloc.free(schemas);
+}
+
 pub fn copySchemas(source_store: anytype, dest_store: anytype, alloc: Allocator) !void {
     var source_runtime = try initRuntimeStore(alloc, source_store);
     defer source_runtime.deinit();
@@ -1354,7 +1402,7 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     };
 }
 
-fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {
+pub fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{d}", .{ schema_version_prefix, version });
 }
 
@@ -2772,6 +2820,27 @@ test "schema preserves versioned history in DocStore" {
     defer freeSchema(alloc, previous);
     try std.testing.expectEqual(@as(u32, 0), previous.version);
     try std.testing.expectEqualStrings("doc_v0", previous.default_type);
+}
+
+test "schema epochs reject version reuse and active regression" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-immutable-epochs");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    _ = try saveSchema(&store, alloc, .{ .version = 4, .default_type = "v4" });
+    try std.testing.expectError(
+        error.ImmutableSchemaVersionConflict,
+        saveSchema(&store, alloc, .{ .version = 4, .default_type = "different" }),
+    );
+    _ = try saveSchema(&store, alloc, .{ .version = 5, .default_type = "v5" });
+    try std.testing.expectError(
+        error.SchemaVersionRegression,
+        saveSchema(&store, alloc, .{ .version = 4, .default_type = "v4" }),
+    );
 }
 
 test "schema copy includes versioned history" {

@@ -1130,6 +1130,12 @@ pub const ScanOptions = struct {
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,
+    /// Internal request lifetime controls. These are deliberately omitted from
+    /// the scan wire body: each transport hop derives its own remaining budget
+    /// and borrows the caller's cancellation source only for the synchronous
+    /// scan lifetime.
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
 };
 
 pub const ScanDocument = struct {
@@ -1152,6 +1158,20 @@ pub const ScanHash = struct {
         alloc.free(self.id);
         self.* = undefined;
     }
+};
+
+/// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
+/// duration of the callback; consumers that retain them must copy them.
+pub const ScanVisitEntry = struct {
+    id: []const u8,
+    hash: u64,
+    content_hash: ?DocumentContentHash = null,
+    document_json: ?[]const u8 = null,
+};
+
+pub const ScanVisitor = struct {
+    context: ?*anyopaque,
+    visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
 };
 
 pub const ScanResult = struct {
@@ -2498,6 +2518,11 @@ pub const DBStats = struct {
     /// Canonical live primary-document cardinality from durable identity metadata.
     /// Unlike doc_count, this is independent of derived index fan-out.
     source_doc_count: u64 = 0,
+    /// Active immutable schema epoch and durable table-catalog state.
+    schema_epoch: u32 = 0,
+    row_format_version: u32 = 0,
+    table_catalog_generation: u64 = 0,
+    schema_index_state: []const u8 = "none",
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},

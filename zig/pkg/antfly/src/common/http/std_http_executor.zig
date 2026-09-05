@@ -174,6 +174,7 @@ pub const StdHttpExecutor = struct {
             .ptr = self,
             .vtable = &.{
                 .execute = execute,
+                .execute_stream = executeStream,
                 .supports_concurrent_requests = supportsConcurrentRequests,
             },
         };
@@ -203,6 +204,205 @@ pub const StdHttpExecutor = struct {
         if (effective_req.timeout_ms != null or effective_req.cancellation != null)
             return try self.executeWithControl(alloc, effective_req);
         return try self.executeTransport(alloc, effective_req);
+    }
+
+    fn executeStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: common.HttpRequest,
+        writer: common.StreamWriter,
+    ) !bool {
+        const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        if (req.delivery_tracker) |tracker| tracker.markNotSent();
+        try self.beginRequest();
+        defer self.endRequest();
+
+        var effective_req = req;
+        if (effective_req.timeout_ms == null and self.cfg.request_timeout_ms > 0)
+            effective_req.timeout_ms = self.cfg.request_timeout_ms;
+        if (effective_req.cancellation) |cancellation| if (cancellation.isCancelled())
+            return error.Cancelled;
+        if (self.cfg.resolve_before_connect or
+            effective_req.timeout_ms != null or effective_req.cancellation != null)
+        {
+            // The httpx transport owns an interruptible request task and can
+            // therefore stream while honoring a deadline/cancellation source.
+            // std.http's direct reader has no equivalent lifetime control.
+            try self.executeResolvedStream(alloc, effective_req, writer);
+        } else {
+            try self.executeDirectStream(alloc, effective_req, writer);
+        }
+        return true;
+    }
+
+    fn executeResolvedStream(
+        self: *StdHttpExecutor,
+        alloc: std.mem.Allocator,
+        req: common.HttpRequest,
+        downstream: common.StreamWriter,
+    ) !void {
+        const io = self.io_impl.io();
+        var config = resolvedClientConfig(self.cfg);
+        // Response bytes are handed directly to downstream backpressure; the
+        // buffered-response ceiling is neither useful nor correct here.
+        config.max_response_size = std.math.maxInt(usize);
+        var client = httpx.Client.initWithConfig(std.heap.page_allocator, io, config);
+        defer client.deinit();
+
+        const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
+            @as(usize, @intFromBool(req.authorization != null));
+        const header_pairs = try alloc.alloc([2][]const u8, req.headers.len + extra_count);
+        defer alloc.free(header_pairs);
+        var header_index: usize = 0;
+        if (req.content_type) |content_type| {
+            header_pairs[header_index] = .{ "content-type", content_type };
+            header_index += 1;
+        }
+        if (req.authorization) |authorization| {
+            header_pairs[header_index] = .{ "authorization", authorization };
+            header_index += 1;
+        }
+        for (req.headers) |header| {
+            header_pairs[header_index] = .{ header.name, header.value };
+            header_index += 1;
+        }
+
+        const Adapter = struct {
+            alloc: std.mem.Allocator,
+            downstream: common.StreamWriter,
+
+            pub fn startResponse(adapter: *@This(), response: httpx.Response) !void {
+                var count: usize = 0;
+                for (response.headers.iterator()) |_| count += 1;
+                const headers = try adapter.alloc.alloc(common.RequestHeader, count);
+                defer adapter.alloc.free(headers);
+                var index: usize = 0;
+                for (response.headers.iterator()) |header| {
+                    headers[index] = .{ .name = header.name, .value = header.value };
+                    index += 1;
+                }
+                try adapter.downstream.start(adapter.alloc, .{
+                    .status = response.status.code,
+                    .content_type = response.contentType(),
+                    .headers = headers,
+                });
+            }
+
+            pub fn writeAll(adapter: *@This(), bytes: []const u8) !void {
+                try adapter.downstream.writeAll(bytes);
+            }
+        };
+        var adapter = Adapter{ .alloc = alloc, .downstream = downstream };
+        const method: httpx.Method = switch (req.method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+        };
+        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        var response = try client.requestToWriter(method, req.uri, .{
+            .headers = header_pairs,
+            .body = if (req.body.len == 0) null else req.body,
+            .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
+            .cancellation = if (req.cancellation) |cancellation| blk: {
+                const token_value = cancellation.token();
+                break :blk httpx.CancellationToken.fromCallback(token_value.ptr, token_value.is_cancelled_fn);
+            } else null,
+            .follow_redirects = false,
+        }, &adapter, null, null);
+        defer response.deinit();
+        try downstream.flush();
+    }
+
+    fn executeDirectStream(
+        self: *StdHttpExecutor,
+        alloc: std.mem.Allocator,
+        req: common.HttpRequest,
+        downstream: common.StreamWriter,
+    ) !void {
+        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        if (self.cfg.keep_alive) try self.client_mutex.lock(io);
+        defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
+
+        var local_client: std.http.Client = .{
+            .allocator = std.heap.page_allocator,
+            .io = io,
+            .read_buffer_size = self.cfg.read_buffer_size,
+            .write_buffer_size = self.cfg.write_buffer_size,
+        };
+        defer if (!self.cfg.keep_alive) local_client.deinit();
+        const client = if (self.cfg.keep_alive) &self.client else &local_client;
+
+        const uri = try std.Uri.parse(req.uri);
+        const method = switch (req.method) {
+            .GET => std.http.Method.GET,
+            .POST => std.http.Method.POST,
+            .PUT => std.http.Method.PUT,
+            .DELETE => std.http.Method.DELETE,
+        };
+        var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;
+        defer extra_headers.deinit(alloc);
+        if (req.content_type) |content_type| try extra_headers.append(alloc, .{
+            .name = "content-type",
+            .value = content_type,
+        });
+        if (req.authorization) |authorization| try extra_headers.append(alloc, .{
+            .name = "authorization",
+            .value = authorization,
+        });
+        for (req.headers) |header| {
+            if (!shouldForwardRequestHeader(req.headers, header.name)) continue;
+            try extra_headers.append(alloc, .{ .name = header.name, .value = header.value });
+        }
+
+        const request_keep_alive = self.reserveRequestKeepAlive();
+        var request = try std.http.Client.request(client, method, uri, .{
+            .extra_headers = extra_headers.items,
+            .keep_alive = request_keep_alive,
+        });
+        defer request.deinit();
+        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        if (req.body.len > 0 or method.requestHasBody()) {
+            request.transfer_encoding = .{ .content_length = req.body.len };
+            var body_buffer: [16 * 1024]u8 = undefined;
+            var body_writer = try request.sendBodyUnflushed(&body_buffer);
+            if (req.body.len > 0) try body_writer.writer.writeAll(req.body);
+            try body_writer.end();
+            try request.connection.?.flush();
+        } else {
+            try request.sendBodiless();
+        }
+
+        var response = try request.receiveHead(&.{});
+        var header_count: usize = 0;
+        var header_it = response.head.iterateHeaders();
+        while (header_it.next()) |_| header_count += 1;
+        const headers = if (header_count > 0)
+            try alloc.alloc(common.RequestHeader, header_count)
+        else
+            @constCast((&[_]common.RequestHeader{})[0..]);
+        defer if (headers.len > 0) alloc.free(headers);
+        header_it = response.head.iterateHeaders();
+        var header_index: usize = 0;
+        while (header_it.next()) |header| : (header_index += 1)
+            headers[header_index] = .{ .name = header.name, .value = header.value };
+        try downstream.start(alloc, .{
+            .status = @intFromEnum(response.head.status),
+            .content_type = response.head.content_type,
+            .headers = headers,
+        });
+
+        var transfer_buffer: [16 * 1024]u8 = undefined;
+        var read_buffer: [16 * 1024]u8 = undefined;
+        const body_reader = response.reader(&transfer_buffer);
+        while (true) {
+            const read = try body_reader.readSliceShort(&read_buffer);
+            if (read == 0) break;
+            try downstream.writeAll(read_buffer[0..read]);
+        }
+        try downstream.flush();
+        const connection_closing = if (request.connection) |connection| connection.closing else true;
+        self.recordCompletedRequest(request_keep_alive, connection_closing);
     }
 
     fn executeTransport(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -941,6 +1141,93 @@ test "resolved std http executor preserves delivery provenance across opaque exc
     }));
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, response_delivery.load());
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+}
+
+test "std http executor streams response metadata and body past buffered limit" {
+    const App = struct {
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const body = try alloc.alloc(u8, 128 * 1024);
+            @memset(body, 'x');
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/x-ndjson"),
+                .body = body,
+            };
+        }
+    };
+    const Capture = struct {
+        alloc: std.mem.Allocator,
+        status: u16 = 0,
+        starts: usize = 0,
+        writes: usize = 0,
+        flushes: usize = 0,
+        wrote_before_start: bool = false,
+        body: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.body.deinit(self.alloc);
+        }
+
+        fn start(raw: *anyopaque, _: std.mem.Allocator, response: common.StreamingResponse) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            self.status = response.status;
+            try std.testing.expectEqualStrings("application/x-ndjson", response.content_type.?);
+        }
+
+        fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.starts == 0) self.wrote_before_start = true;
+            self.writes += 1;
+            try self.body.appendSlice(self.alloc, bytes);
+        }
+
+        fn flush(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.flushes += 1;
+        }
+
+        fn writer(self: *@This()) common.StreamWriter {
+            return .{ .ptr = self, .vtable = &.{
+                .start = start,
+                .write_all = writeAll,
+                .flush = flush,
+            } };
+        }
+    };
+
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+    const uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(uri);
+
+    for ([_]bool{ false, true }) |resolve_before_connect| {
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{
+            .max_response_bytes = 16,
+            .resolve_before_connect = resolve_before_connect,
+        });
+        defer executor.deinit();
+        var capture = Capture{ .alloc = std.testing.allocator };
+        defer capture.deinit();
+
+        try std.testing.expect((try executor.executor().executeStream(
+            std.testing.allocator,
+            .{ .method = .GET, .uri = uri },
+            capture.writer(),
+        )).?);
+        try std.testing.expectEqual(@as(u16, 200), capture.status);
+        try std.testing.expectEqual(@as(usize, 1), capture.starts);
+        try std.testing.expect(capture.writes > 1);
+        try std.testing.expect(capture.flushes > 0);
+        try std.testing.expect(!capture.wrote_before_start);
+        try std.testing.expectEqual(@as(usize, 128 * 1024), capture.body.items.len);
+    }
 }
 
 test "resolved std http executor bounds queued requests before delivery" {

@@ -29837,9 +29837,19 @@ fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docst
     var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
     var file_open = true;
     defer if (file_open) file.close(io);
+    const spool_path = try std.fmt.allocPrint(alloc, "{s}.spool", .{tmp_path});
+    defer alloc.free(spool_path);
+    defer if (std.fs.path.isAbsolute(spool_path))
+        std.Io.Dir.deleteFileAbsolute(io, spool_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var spool_file = try fs_paths.createFilePortable(io, spool_path, .{ .read = true, .truncate = true });
+    defer spool_file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try portable_backup.exportPortableToWriter(alloc, store, &writer.interface);
+    try portable_backup.exportPortableToWriterWithOptions(alloc, store, &writer.interface, .{
+        .spool = .{ .io = io, .file = spool_file },
+    });
     try writer.end();
     try file.sync(io);
     file.close(io);

@@ -208,6 +208,36 @@ pub const Primary = struct {
         return self.log.nextLsn();
     }
 
+    /// Locate an already-appended outbox payload after crash recovery. The
+    /// caller records `from_lsn` before its local commit; searching from that
+    /// fence makes retrying the local outbox exactly-once with respect to this
+    /// WAL even if the process died after append but before clearing it.
+    pub fn findMatchingRecordFrom(
+        self: *Primary,
+        from_lsn: u64,
+        kind: replication_record.RecordKind,
+        payload: []const u8,
+        shard_id: u64,
+        table_id: u64,
+    ) !?u64 {
+        if (from_lsn == 0) return null;
+        const last = self.lastLsn();
+        if (from_lsn > last) return null;
+        var lsn = from_lsn;
+        while (true) {
+            var entry = (try self.log.entryAt(self.alloc, lsn)) orelse return error.WalNoLongerRetained;
+            defer entry.deinit(self.alloc);
+            if (entry.record.kind == kind and
+                entry.record.shard_id == shard_id and
+                entry.record.table_id == table_id and
+                std.mem.eql(u8, entry.record.payload, payload))
+                return lsn;
+            if (lsn == last) break;
+            lsn += 1;
+        }
+        return null;
+    }
+
     pub fn append(self: *Primary, options: AppendOptions) !u64 {
         const lsn = self.nextLsn();
         return try self.log.append(self.alloc, .{

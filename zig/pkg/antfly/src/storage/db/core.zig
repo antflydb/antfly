@@ -34,6 +34,10 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const persistent_mod = @import("../persistent.zig");
 const range_state_mod = @import("range_state.zig");
 const schema_mod = @import("../schema.zig");
+const public_schema_mod = @import("../../schema/mod.zig");
+const schema_registry_mod = @import("schema_registry.zig");
+const table_catalog_mod = @import("table_catalog.zig");
+const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const shard_mod = @import("../shard.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -294,6 +298,7 @@ pub const OpenedCoreResources = struct {
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
+    table_catalog: table_catalog_mod.Catalog,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: bool,
 
@@ -385,10 +390,41 @@ pub const DBCore = struct {
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
+    schema_registry: *schema_registry_mod.Registry,
+    table_catalog: table_catalog_mod.Catalog,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
 
-    pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) DBCore {
+    pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) !DBCore {
+        const schema_registry = try alloc.create(schema_registry_mod.Registry);
+        errdefer alloc.destroy(schema_registry);
+        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, opened.schema);
+        errdefer schema_registry.deinit();
+        // Historical layouts remain durable and are installed lazily on the
+        // first row that references them. Large, long-lived tables should not
+        // deserialize every schema generation during startup.
+        if (opened.schema) |active_schema| {
+            const public_json = opened.store.get(alloc, public_schema_json_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (public_json) |json| alloc.free(json);
+            if (public_json) |json| {
+                var validator = try public_schema_mod.CompiledTableValidator.init(alloc, json);
+                var validator_owned = true;
+                errdefer if (validator_owned) validator.deinit(alloc);
+                const active_encoded = try schema_mod.serializeSchema(alloc, active_schema);
+                defer alloc.free(active_encoded);
+                const active_clone = try schema_mod.deserializeSchema(alloc, active_encoded);
+                var clone_owned = true;
+                errdefer if (clone_owned) schema_mod.freeSchema(alloc, active_clone);
+                const active_epoch = try schema_registry_mod.Epoch.createOwnedValidated(alloc, active_clone, validator);
+                clone_owned = false;
+                validator_owned = false;
+                schema_registry.publishPrepared(active_epoch);
+            }
+        }
+        opened.index_manager.setSchemaRegistry(schema_registry);
         return .{
             .alloc = alloc,
             .path = opened.path,
@@ -406,12 +442,17 @@ pub const DBCore = struct {
             .repair_replay_mutex = opened.repair_replay_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
+            .schema_registry = schema_registry,
+            .table_catalog = opened.table_catalog,
             .identity_namespace = opened.identity_namespace,
             .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
         };
     }
 
     pub fn deinit(self: *DBCore) void {
+        self.index_manager.deinit();
+        self.schema_registry.deinit();
+        self.alloc.destroy(self.schema_registry);
         if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
         self.log_mutex.* = undefined;
         self.alloc.destroy(self.log_mutex);
@@ -423,7 +464,6 @@ pub const DBCore = struct {
         self.alloc.destroy(self.snapshot_replay_admission);
         self.repair_replay_mutex.* = undefined;
         self.alloc.destroy(self.repair_replay_mutex);
-        self.index_manager.deinit();
         self.alloc.destroy(self.index_manager);
         self.shard_manager.deinit();
         self.alloc.destroy(self.shard_manager);
@@ -1020,6 +1060,7 @@ pub const DBCore = struct {
             self.store,
             self.identity_namespace,
             if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
+            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
         );
         defer identity_ctx.deinit();
         var effective_config = config;
@@ -1099,7 +1140,7 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        _ = try self.commitSchemaMetadata(table_schema, &.{}, &.{});
+        _ = try self.commitSchemaMetadata(table_schema, &.{}, &.{}, null);
         // Refresh even when the durable value is unchanged. An index may have
         // been provisioned between the original schema commit and this
         // idempotent retry, and empty generations still need the mapping.
@@ -1115,26 +1156,188 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
         metadata_deletes: []const []const u8,
+        reconciled_row_count: ?u64,
     ) !bool {
         const encoded = try schema_mod.serializeSchema(self.alloc, table_schema);
         defer self.alloc.free(encoded);
+        const same_active_epoch = if (self.schema) |current|
+            current.version == table_schema.version and
+                try schema_mod.schemasEqual(self.alloc, current, table_schema)
+        else
+            false;
+        if (self.schema) |current| {
+            if (table_schema.version < current.version) return error.SchemaVersionRegression;
+            if (current.version == table_schema.version and !same_active_epoch)
+                return error.InvalidSchemaUpdateRequest;
+        }
+        try self.validateImmutablePublicSchemaMetadata(
+            table_schema.version,
+            same_active_epoch,
+            metadata_writes,
+            metadata_deletes,
+        );
         const next_schema = try schema_mod.deserializeSchema(self.alloc, encoded);
         errdefer schema_mod.freeSchema(self.alloc, next_schema);
+        var epoch_validator: ?public_schema_mod.CompiledTableValidator = null;
+        for (metadata_writes) |write| {
+            if (std.mem.eql(u8, write.key, public_schema_json_key)) {
+                epoch_validator = try public_schema_mod.CompiledTableValidator.init(self.alloc, write.value);
+                break;
+            }
+        }
+        var epoch_validator_owned = epoch_validator != null;
+        errdefer if (epoch_validator_owned) epoch_validator.?.deinit(self.alloc);
+        const next_epoch = blk: {
+            const next_epoch_schema = try schema_mod.deserializeSchema(self.alloc, encoded);
+            errdefer schema_mod.freeSchema(self.alloc, next_epoch_schema);
+            const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, next_epoch_schema, epoch_validator);
+            epoch_validator_owned = false;
+            break :blk epoch;
+        };
+        errdefer next_epoch.release();
+        try self.schema_registry.preparePublish(table_schema.version);
 
+        var next_catalog = self.table_catalog;
+        next_catalog.mode_initialized = true;
+        next_catalog.storage_mode = table_schema.storage_mode;
+        next_catalog.active_schema_version = table_schema.version;
+        if (reconciled_row_count) |row_count| next_catalog.row_count = @intFromBool(row_count != 0);
+        next_catalog.reconciled = true;
+        next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
+        const previous_catalog_data = self.table_catalog.encode();
+        const candidate_catalog_data = next_catalog.encode();
+        if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
+            next_catalog.generation +|= 1;
+        const catalog_data = next_catalog.encode();
+        const combined = try self.alloc.alloc(docstore_mod.KVPair, metadata_writes.len + 1);
+        defer self.alloc.free(combined);
+        @memcpy(combined[0..metadata_writes.len], metadata_writes);
+        combined[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
         const changed = try schema_mod.saveSchemaWithMetadata(
             self.store,
             self.alloc,
             table_schema,
-            metadata_writes,
+            combined,
             metadata_deletes,
         );
-        if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
-        self.schema = next_schema;
+        if (!changed or self.schema == null) {
+            if (self.schema == null) {
+                self.schema = next_schema;
+            } else {
+                schema_mod.freeSchema(self.alloc, next_schema);
+            }
+        } else {
+            if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
+            self.schema = next_schema;
+        }
+        self.schema_registry.publishPrepared(next_epoch);
+        self.table_catalog = next_catalog;
         return changed;
+    }
+
+    fn validateImmutablePublicSchemaMetadata(
+        self: *DBCore,
+        version: u32,
+        same_active_epoch: bool,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+    ) !void {
+        const versioned_key = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, version);
+        defer self.alloc.free(versioned_key);
+
+        var incoming_active: ?[]const u8 = null;
+        var incoming_versioned: ?[]const u8 = null;
+        for (metadata_writes) |write| {
+            if (std.mem.eql(u8, write.key, public_schema_json_key)) incoming_active = write.value;
+            if (std.mem.eql(u8, write.key, versioned_key)) incoming_versioned = write.value;
+        }
+        var deletes_active = false;
+        var deletes_versioned = false;
+        for (metadata_deletes) |key| {
+            deletes_active = deletes_active or std.mem.eql(u8, key, public_schema_json_key);
+            deletes_versioned = deletes_versioned or std.mem.eql(u8, key, versioned_key);
+        }
+
+        const existing_versioned = self.store.get(self.alloc, versioned_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing_versioned) |value| self.alloc.free(value);
+        if (existing_versioned) |existing| {
+            if (deletes_versioned) return error.ImmutableSchemaVersionConflict;
+            if (incoming_versioned) |incoming| {
+                if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
+            }
+        }
+
+        if (!same_active_epoch) return;
+        const existing_active = self.store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing_active) |value| self.alloc.free(value);
+        if (incoming_active) |incoming| {
+            const existing = existing_active orelse return error.ImmutableSchemaVersionConflict;
+            if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
+        }
+        if (deletes_active and existing_active != null) return error.ImmutableSchemaVersionConflict;
+        // A legacy database may lack the versioned copy. Backfill it only from
+        // the identical active validator; otherwise adding one would mutate
+        // the meaning of an already-published epoch.
+        if (incoming_versioned) |incoming| if (existing_versioned == null) {
+            const existing = existing_active orelse return error.ImmutableSchemaVersionConflict;
+            if (!std.mem.eql(u8, existing, incoming)) return error.ImmutableSchemaVersionConflict;
+        };
+    }
+
+    pub fn acquireSchemaView(self: *DBCore) ?schema_registry_mod.SchemaView {
+        return self.schema_registry.acquire();
+    }
+
+    pub fn isSchemaViewCurrent(self: *const DBCore, view: schema_registry_mod.SchemaView) bool {
+        return self.schema_registry.isCurrent(view);
+    }
+
+    pub fn acquireSchemaVersionView(self: *DBCore, version: u32) !?schema_registry_mod.SchemaView {
+        if (self.schema_registry.acquireVersion(version)) |view| return view;
+        const historical = try schema_mod.loadSchemaVersion(self.store, self.alloc, version) orelse return null;
+        var historical_owned = true;
+        errdefer if (historical_owned) schema_mod.freeSchema(self.alloc, historical);
+        const public_key = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, version);
+        defer self.alloc.free(public_key);
+        const public_json = self.store.get(self.alloc, public_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (public_json) |json| self.alloc.free(json);
+        var validator = if (public_json) |json|
+            try public_schema_mod.CompiledTableValidator.init(self.alloc, json)
+        else
+            null;
+        var validator_owned = validator != null;
+        errdefer if (validator_owned) validator.?.deinit(self.alloc);
+        if (validator) |compiled| if (compiled.schema.version != version)
+            return error.InvalidSchema;
+        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, historical, validator);
+        historical_owned = false;
+        validator_owned = false;
+        errdefer epoch.release();
+        try self.schema_registry.preparePublish(version);
+        return self.schema_registry.installHistorical(epoch);
     }
 
     pub fn refreshSchemaIndexes(self: *DBCore) !void {
         try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
+    }
+
+    pub fn persistCatalogIndexState(self: *DBCore, state: table_catalog_mod.IndexState) !void {
+        if (self.table_catalog.index_state == state) return;
+        var next = self.table_catalog;
+        next.index_state = state;
+        next.generation +|= 1;
+        const encoded = next.encode();
+        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &encoded }}, &.{});
+        self.table_catalog = next;
     }
 
     /// Replace the in-memory schema from already-restored durable metadata.
@@ -1143,12 +1346,68 @@ pub const DBCore = struct {
     pub fn reloadSchemaFromStore(self: *DBCore) !void {
         const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
         errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
-        self.replaceSchemaOwned(next_schema);
+        const next_catalog = try loadTableCatalogForSchema(self.alloc, self.store, next_schema);
+        try self.replaceSchemaOwned(next_schema);
+        self.table_catalog = next_catalog;
     }
 
-    pub fn replaceSchemaOwned(self: *DBCore, next_schema: ?schema_mod.TableSchema) void {
+    pub fn replaceSchemaOwned(self: *DBCore, next_schema: ?schema_mod.TableSchema) !void {
+        var public_json: ?[]u8 = null;
+        defer if (public_json) |json| self.alloc.free(json);
+        if (next_schema != null) {
+            public_json = self.store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
+        const next_epoch = if (next_schema) |schema| try self.prepareSchemaEpoch(schema, public_json) else null;
+        try self.schema_registry.prepareReplaceAll();
+        self.replaceSchemaOwnedPrepared(next_schema, next_epoch);
+    }
+
+    pub fn prepareSchemaRegistryReplacement(self: *DBCore) !void {
+        try self.schema_registry.prepareReplaceAll();
+    }
+
+    /// Allocate and compile every immutable epoch resource before a durable
+    /// schema or generation publication. The returned epoch owns its schema
+    /// clone and validator; callers either publish it or release it.
+    pub fn prepareSchemaEpoch(
+        self: *DBCore,
+        schema: schema_mod.TableSchema,
+        public_json: ?[]const u8,
+    ) !*schema_registry_mod.Epoch {
+        var epoch_validator = if (public_json) |json|
+            try public_schema_mod.CompiledTableValidator.init(self.alloc, json)
+        else
+            null;
+        var validator_owned = epoch_validator != null;
+        errdefer if (validator_owned) epoch_validator.?.deinit(self.alloc);
+        const encoded = try schema_mod.serializeSchema(self.alloc, schema);
+        defer self.alloc.free(encoded);
+        const cloned = try schema_mod.deserializeSchema(self.alloc, encoded);
+        var cloned_owned = true;
+        errdefer if (cloned_owned) schema_mod.freeSchema(self.alloc, cloned);
+        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, cloned, epoch_validator);
+        cloned_owned = false;
+        validator_owned = false;
+        errdefer epoch.release();
+        try self.schema_registry.preparePublish(schema.version);
+        return epoch;
+    }
+
+    /// Apply a schema and preallocated epoch while an external publication
+    /// fence is active. This path cannot allocate, read the store, or fail.
+    pub fn replaceSchemaOwnedPrepared(
+        self: *DBCore,
+        next_schema: ?schema_mod.TableSchema,
+        next_epoch: ?*schema_registry_mod.Epoch,
+    ) void {
+        std.debug.assert((next_schema == null) == (next_epoch == null));
+        if (next_schema) |schema| std.debug.assert(next_epoch.?.schema.version == schema.version);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
+        self.schema_registry.replaceAllPrepared(next_epoch);
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -1701,6 +1960,7 @@ pub const DBCore = struct {
             self.store,
             self.identity_namespace,
             if (self.schema) |schema| if (schema.storage_mode == .relational) schema.relational_columns else null else null,
+            if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
         );
         defer identity_ctx.deinit();
         return try manager.recoverTransactionsWithExtraBatchHooks(
@@ -1717,6 +1977,7 @@ pub const TransactionRecoveryIdentityContext = struct {
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     relational_base_rows: bool = false,
+    relational_schema_version: u32 = 0,
     relational_columns: []const schema_mod.RelationalColumn = &.{},
 
     pub fn init(
@@ -1724,6 +1985,7 @@ pub const TransactionRecoveryIdentityContext = struct {
         store: *docstore_mod.DocStore,
         identity_namespace: doc_identity.Namespace,
         relational_columns: ?[]const schema_mod.RelationalColumn,
+        relational_schema_version: u32,
     ) !TransactionRecoveryIdentityContext {
         const owned_columns = if (relational_columns) |columns|
             try cloneRelationalColumns(alloc, columns)
@@ -1734,6 +1996,7 @@ pub const TransactionRecoveryIdentityContext = struct {
             .identity_namespace = identity_namespace,
             .alloc = alloc,
             .relational_base_rows = relational_columns != null,
+            .relational_schema_version = if (relational_columns != null) relational_schema_version else 0,
             .relational_columns = owned_columns,
         };
     }
@@ -1743,8 +2006,8 @@ pub const TransactionRecoveryIdentityContext = struct {
         self.* = undefined;
     }
 
-    pub fn updateRelationalColumns(self: *TransactionRecoveryIdentityContext, columns: ?[]const schema_mod.RelationalColumn) !void {
-        var prepared = try PreparedRecoveryRelationalState.init(self.alloc, columns);
+    pub fn updateRelationalColumns(self: *TransactionRecoveryIdentityContext, columns: ?[]const schema_mod.RelationalColumn, schema_version: u32) !void {
+        var prepared = try PreparedRecoveryRelationalState.init(self.alloc, columns, schema_version);
         defer prepared.deinit();
         self.installPreparedRelationalState(&prepared);
     }
@@ -1755,6 +2018,7 @@ pub const TransactionRecoveryIdentityContext = struct {
         const previous = self.relational_columns;
         self.relational_columns = prepared.columns;
         self.relational_base_rows = prepared.enabled;
+        self.relational_schema_version = prepared.schema_version;
         prepared.columns = &.{};
         self.mutex.unlock();
         freeRelationalColumns(self.alloc, previous);
@@ -1770,12 +2034,14 @@ pub const TransactionRecoveryIdentityContext = struct {
 pub const PreparedRecoveryRelationalState = struct {
     alloc: Allocator,
     enabled: bool,
+    schema_version: u32,
     columns: []const schema_mod.RelationalColumn,
 
-    pub fn init(alloc: Allocator, columns: ?[]const schema_mod.RelationalColumn) !PreparedRecoveryRelationalState {
+    pub fn init(alloc: Allocator, columns: ?[]const schema_mod.RelationalColumn, schema_version: u32) !PreparedRecoveryRelationalState {
         return .{
             .alloc = alloc,
             .enabled = columns != null,
+            .schema_version = if (columns != null) schema_version else 0,
             .columns = if (columns) |items| try cloneRelationalColumns(alloc, items) else &.{},
         };
     }
@@ -1950,7 +2216,11 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             var row_key_owned = true;
             errdefer if (row_key_owned) alloc.free(row_key);
             if (mutation.value) |value| {
-                const row_value = try relational_store.encodeValueAlloc(alloc, value, identity_ctx.relational_columns);
+                const row_value = try relational_store.encodeValueForSchemaAlloc(alloc, value, .{
+                    .version = identity_ctx.relational_schema_version,
+                    .storage_mode = .relational,
+                    .relational_columns = identity_ctx.relational_columns,
+                });
                 var row_value_owned = true;
                 errdefer if (row_value_owned) alloc.free(row_value);
                 try identity_writes.append(alloc, .{ .key = row_key, .value = row_value });
@@ -2240,6 +2510,8 @@ pub fn openCoreResourcesFromPrimaryStore(
     index_manager.updateRange(shard_manager.getByteRange());
 
     const schema = try schema_mod.loadSchema(store, alloc);
+    errdefer if (schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    const table_catalog = try loadTableCatalogForSchema(alloc, store, schema);
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
@@ -2271,8 +2543,26 @@ pub fn openCoreResourcesFromPrimaryStore(
         .repair_replay_mutex = repair_replay_mutex,
         .log_mutex = log_mutex,
         .schema = schema,
+        .table_catalog = table_catalog,
         .identity_namespace = identity_namespace,
         .artifact_cleanup_maybe = artifact_cleanup_maybe,
+    };
+}
+
+pub fn loadTableCatalogForSchema(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    schema: ?schema_mod.TableSchema,
+) !table_catalog_mod.Catalog {
+    if (try table_catalog_mod.load(alloc, store)) |catalog| return catalog;
+    const identity_summary = try doc_identity.visibilitySummaryFromStore(store);
+    const row_count: u64 = @intFromBool(if (identity_summary) |summary| summary.live_ordinals != 0 else false);
+    return .{
+        .mode_initialized = schema != null or row_count != 0,
+        .storage_mode = if (schema) |table_schema| table_schema.storage_mode else .document,
+        .active_schema_version = if (schema) |table_schema| table_schema.version else 0,
+        .row_count = row_count,
+        .reconciled = identity_summary != null,
     };
 }
 

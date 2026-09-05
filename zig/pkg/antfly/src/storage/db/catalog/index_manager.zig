@@ -51,6 +51,8 @@ const resource_manager_mod = @import("../../resource_manager.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const schema_api = @import("../../../schema/mod.zig");
+const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
@@ -63,6 +65,7 @@ const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import(
 };
 const mapper = @import("../document_mapper.zig");
 const relational_store = @import("../relational_store.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
@@ -248,6 +251,8 @@ pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 const sparse_backfill_batch_size: usize = 1024;
+const vector_backfill_page_items: usize = 1024;
+const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
@@ -1258,6 +1263,7 @@ pub const IndexManager = struct {
     hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
     relational_base_rows: bool = false,
+    schema_registry: ?*schema_registry_mod.Registry = null,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
@@ -1271,6 +1277,17 @@ pub const IndexManager = struct {
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
     next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    /// Process-local generation of the extraction plan consumed by writes.
+    /// Prepared batches compare this scalar instead of rereading and hashing
+    /// the serialized catalog under the DB apply lock.
+    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_cache_mutex: std.atomic.Mutex = .unlocked,
+    /// Non-zero while one request is constructing the immutable plan for a
+    /// cold generation. Publication is rare; acquisitions remain lock-free
+    /// apart from the short cache pointer fence and never duplicate the owned
+    /// catalog clone under a thundering herd.
+    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_cache: ?*WritePlanSnapshotEpoch = null,
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -2670,6 +2687,228 @@ pub const IndexManager = struct {
         self.relational_base_rows = enabled;
     }
 
+    pub fn setSchemaRegistry(self: *IndexManager, registry: *schema_registry_mod.Registry) void {
+        self.schema_registry = registry;
+    }
+
+    /// Decode one base row against the immutable layout version carried by the
+    /// row. Schema epochs are retained for the duration of decoding. Historical
+    /// epochs load once on first use and then remain registry-resident, avoiding
+    /// eager startup work and schema lifetime races in index/enrichment workers.
+    pub fn materializeStoredValueAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+        );
+    }
+
+    fn acquireSchemaVersionView(self: *IndexManager, version: u32) !schema_registry_mod.SchemaView {
+        const registry = self.schema_registry orelse return error.SchemaRegistryUnavailable;
+        if (registry.acquireVersion(version)) |view| return view;
+        const store = self.primary_store orelse return error.SchemaRegistryUnavailable;
+        const historical = try schema_mod.loadSchemaVersion(store, self.alloc, version) orelse
+            return error.UnknownSchemaVersion;
+        var historical_owned = true;
+        errdefer if (historical_owned) schema_mod.freeSchema(self.alloc, historical);
+        const public_key = try schema_api.versionedSchemaKeyAlloc(self.alloc, version);
+        defer self.alloc.free(public_key);
+        const public_json = store.get(self.alloc, public_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (public_json) |json| self.alloc.free(json);
+        var validator = if (public_json) |json| try schema_api.CompiledTableValidator.init(self.alloc, json) else null;
+        var validator_owned = validator != null;
+        errdefer if (validator_owned) validator.?.deinit(self.alloc);
+        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, historical, validator);
+        historical_owned = false;
+        validator_owned = false;
+        errdefer epoch.release();
+        try registry.preparePublish(version);
+        return registry.installHistorical(epoch);
+    }
+
+    /// Batch-read variant that reuses a request-pinned active epoch. Rows from
+    /// older epochs still fall through to the historical registry lookup.
+    pub fn materializeStoredValueWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            );
+        };
+        return try self.materializeStoredValueAlloc(alloc, store_key, stored_value);
+    }
+
+    fn extractDenseVectorFromStoredAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        field_name: []const u8,
+        dims: u32,
+    ) !?[]f32 {
+        if (internal_keys.isRelationalRowKey(store_key)) {
+            const version = try relational_store.rowSchemaVersion(stored_value);
+            var view = try self.acquireSchemaVersionView(version);
+            defer view.release();
+            const ordinal = view.physicalLayout().ordinalForName(
+                view.tableSchema().relational_columns,
+                field_name,
+            ) orelse return null;
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                ordinal,
+            )) orelse return null;
+            if (cell.is_null or cell.value != .bytes_val or !cell.is_json) return null;
+            return try mapper.extractDenseVectorValue(alloc, cell.value.bytes_val, dims);
+        }
+        return try mapper.extractDenseVectorField(alloc, stored_value, field_name, dims);
+    }
+
+    fn extractSparseVectorFromStoredAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        field_name: []const u8,
+    ) !?mapper.SparseVectorData {
+        if (internal_keys.isRelationalRowKey(store_key)) {
+            const version = try relational_store.rowSchemaVersion(stored_value);
+            var view = try self.acquireSchemaVersionView(version);
+            defer view.release();
+            const ordinal = view.physicalLayout().ordinalForName(
+                view.tableSchema().relational_columns,
+                field_name,
+            ) orelse return null;
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                ordinal,
+            )) orelse return null;
+            if (cell.is_null or cell.value != .bytes_val or !cell.is_json) return null;
+            return try mapper.extractSparseVectorValue(alloc, cell.value.bytes_val);
+        }
+        return try mapper.extractSparseVectorField(alloc, stored_value, field_name);
+    }
+
+    pub fn projectStoredOrdinalFieldsWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_row_codec.projectOrdinalFieldsWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                fields,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
+    pub fn projectStoredOrdinalFieldsTrustedWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                fields,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
+    /// Use a projection compiled once for the active epoch. Historical rows
+    /// resolve through their own immutable schema version.
+    pub fn projectStoredOrdinalPlanTrustedWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        plan: relational_row_codec.OrdinalProjectionPlan,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version and plan.schema_version == version) {
+            return try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                plan,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
         self.deinitTextIndexEntry(entry, false);
     }
@@ -2768,6 +3007,9 @@ pub const IndexManager = struct {
     /// or the capability fingerprint is unchanged.
     pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var changed = false;
         for (self.algebraic_indexes.items) |*entry| {
             const cur = entry.index.config();
             const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
@@ -2833,7 +3075,681 @@ pub const IndexManager = struct {
             try entry.index.reloadConfigJson(merged_json);
             self.alloc.free(entry.config.config_json);
             entry.config.config_json = owned;
+            changed = true;
         }
+        if (changed) _ = self.write_plan_generation.fetchAdd(1, .release);
+    }
+
+    pub fn writePlanGeneration(self: *const IndexManager) u64 {
+        return self.write_plan_generation.load(.acquire);
+    }
+
+    pub const AssetContentTypeSnapshot = struct {
+        const Entry = struct {
+            name: []u8,
+            content_type: []u8,
+        };
+
+        alloc: Allocator,
+        entries: []Entry,
+
+        pub fn deinit(self: *AssetContentTypeSnapshot) void {
+            for (self.entries) |entry| {
+                self.alloc.free(entry.name);
+                self.alloc.free(entry.content_type);
+            }
+            self.alloc.free(self.entries);
+            self.* = undefined;
+        }
+
+        pub fn contentTypeAlloc(self: AssetContentTypeSnapshot, alloc: Allocator, name: []const u8) ![]u8 {
+            var lower: usize = 0;
+            var upper = self.entries.len;
+            while (lower < upper) {
+                const middle = lower + (upper - lower) / 2;
+                switch (std.mem.order(u8, self.entries[middle].name, name)) {
+                    .lt => lower = middle + 1,
+                    .gt => upper = middle,
+                    .eq => return try alloc.dupe(u8, self.entries[middle].content_type),
+                }
+            }
+            return try alloc.dupe(u8, "application/octet-stream");
+        }
+    };
+
+    /// Capture the only catalog data required by artifact projection. The
+    /// returned snapshot is request-owned, so scans never retain the catalog
+    /// lock while reading rows or decoding artifact payloads.
+    pub fn assetContentTypeSnapshotAlloc(self: *IndexManager, alloc: Allocator) !AssetContentTypeSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        var asset_count: usize = 0;
+        for (self.enrichments.items) |entry| if (entry.kind == .asset) {
+            asset_count += 1;
+        };
+        const entries = try alloc.alloc(AssetContentTypeSnapshot.Entry, asset_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |entry| {
+                alloc.free(entry.name);
+                alloc.free(entry.content_type);
+            }
+            alloc.free(entries);
+        }
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            const name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(name);
+            const content_type = try alloc.dupe(
+                u8,
+                if (entry.content_type.len > 0) entry.content_type else "text/plain",
+            );
+            entries[initialized] = .{ .name = name, .content_type = content_type };
+            initialized += 1;
+        }
+        std.mem.sort(AssetContentTypeSnapshot.Entry, entries, {}, struct {
+            fn lessThan(_: void, lhs: AssetContentTypeSnapshot.Entry, rhs: AssetContentTypeSnapshot.Entry) bool {
+                return std.mem.lessThan(u8, lhs.name, rhs.name);
+            }
+        }.lessThan);
+        return .{ .alloc = alloc, .entries = entries };
+    }
+
+    pub const DenseFieldWritePlan = struct {
+        index_name: []u8,
+        field_name: []u8,
+        dims: u32,
+    };
+
+    pub const SparseFieldWritePlan = struct {
+        index_name: []u8,
+        field_name: []u8,
+    };
+
+    pub const GraphFieldEdgeWritePlan = struct {
+        edge_type: []u8,
+        field_name: []u8,
+    };
+
+    pub const GraphFieldWritePlan = struct {
+        index_name: []u8,
+        coverage_generation: u64,
+        edges: []GraphFieldEdgeWritePlan,
+    };
+
+    /// Fully-owned extraction inputs for one immutable catalog generation.
+    /// Foreground preparation never borrows live index entries after this is
+    /// built, so catalog publication is independent of batch size.
+    pub const WritePlanSnapshot = struct {
+        alloc: Allocator,
+        generation: u64,
+        dense_fields: []DenseFieldWritePlan,
+        sparse_fields: []SparseFieldWritePlan,
+        graph_fields: []GraphFieldWritePlan,
+        /// Catalog-derived provider work compiled once for this generation.
+        /// Per-row planning only substitutes the document identity and removes
+        /// consumers already satisfied by explicit/direct vectors.
+        generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// For each chunk template, indexes of embedding templates consuming
+        /// its artifact. Compiling this adjacency once avoids an all-template
+        /// scan for every chunk of every row.
+        chunk_dependents: [][]u32,
+
+        pub fn deinit(self: *WritePlanSnapshot) void {
+            for (self.dense_fields) |field| {
+                self.alloc.free(field.index_name);
+                self.alloc.free(field.field_name);
+            }
+            self.alloc.free(self.dense_fields);
+            for (self.sparse_fields) |field| {
+                self.alloc.free(field.index_name);
+                self.alloc.free(field.field_name);
+            }
+            self.alloc.free(self.sparse_fields);
+            for (self.graph_fields) |graph| {
+                self.alloc.free(graph.index_name);
+                for (graph.edges) |edge| {
+                    self.alloc.free(edge.edge_type);
+                    self.alloc.free(edge.field_name);
+                }
+                self.alloc.free(graph.edges);
+            }
+            self.alloc.free(self.graph_fields);
+            for (self.chunk_dependents) |dependents| if (dependents.len > 0) self.alloc.free(dependents);
+            self.alloc.free(self.chunk_dependents);
+            enrichment_types.deinitGeneratedRequests(self.alloc, self.generated_templates);
+            self.* = undefined;
+        }
+
+        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
+            for (self.graph_fields) |graph|
+                if (std.mem.eql(u8, graph.index_name, index_name)) return graph.coverage_generation;
+            return null;
+        }
+
+        fn cloneDense(alloc: Allocator, entry: DenseIndex) !DenseFieldWritePlan {
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            return .{
+                .index_name = index_name,
+                .field_name = try alloc.dupe(u8, entry.field_name),
+                .dims = entry.dims,
+            };
+        }
+
+        fn cloneSparse(alloc: Allocator, entry: SparseIndex) !SparseFieldWritePlan {
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            return .{
+                .index_name = index_name,
+                .field_name = try alloc.dupe(u8, entry.field_name),
+            };
+        }
+
+        fn cloneGraphEdge(
+            alloc: Allocator,
+            edge_type: []const u8,
+            field_name: []const u8,
+        ) !GraphFieldEdgeWritePlan {
+            const owned_edge_type = try alloc.dupe(u8, edge_type);
+            errdefer alloc.free(owned_edge_type);
+            return .{
+                .edge_type = owned_edge_type,
+                .field_name = try alloc.dupe(u8, field_name),
+            };
+        }
+
+        fn cloneGraph(alloc: Allocator, entry: GraphIndex) !GraphFieldWritePlan {
+            var edge_count: usize = 0;
+            for (entry.edge_type_configs) |edge| if (edge.field_name != null) {
+                edge_count += 1;
+            };
+            const edges = try alloc.alloc(GraphFieldEdgeWritePlan, edge_count);
+            var edge_initialized: usize = 0;
+            errdefer {
+                for (edges[0..edge_initialized]) |edge| {
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.field_name);
+                }
+                alloc.free(edges);
+            }
+            for (entry.edge_type_configs) |edge| if (edge.field_name) |field_name| {
+                edges[edge_initialized] = try cloneGraphEdge(alloc, edge.name, field_name);
+                edge_initialized += 1;
+            };
+            return .{
+                .index_name = try alloc.dupe(u8, entry.config.name),
+                .coverage_generation = entry.config.coverage_generation,
+                .edges = edges,
+            };
+        }
+
+        fn appendDenseField(
+            alloc: Allocator,
+            field: DenseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, field.field_name, field.dims)) orelse return;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        fn appendSparseField(
+            alloc: Allocator,
+            field: SparseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, field.field_name)) orelse return;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+
+        pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            for (self.dense_fields) |field| {
+                if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
+                try appendDenseField(alloc, field, doc_key, root, extracted);
+            }
+            for (self.sparse_fields) |field| {
+                if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
+                try appendSparseField(alloc, field, doc_key, root, extracted);
+            }
+        }
+
+        fn generatedConsumerSatisfied(
+            extracted: mapper.ExtractedWrite,
+            kind: enrichment_types.GeneratedEnrichmentKind,
+            index_name: []const u8,
+        ) bool {
+            return switch (kind) {
+                .dense_embedding => hasExplicitDenseEmbedding(extracted.dense_embeddings, index_name),
+                .sparse_embedding => hasExplicitSparseEmbedding(extracted.sparse_embeddings, index_name),
+                .chunk_text, .asset => false,
+            };
+        }
+
+        fn generatedEmbeddingRequired(
+            extracted: mapper.ExtractedWrite,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+        ) bool {
+            if (request.kind != .dense_embedding and request.kind != .sparse_embedding) return false;
+            if (request.consumer_indexes.len == 0)
+                return !generatedConsumerSatisfied(extracted, request.kind, request.index_name);
+            for (request.consumer_indexes) |consumer|
+                if (!generatedConsumerSatisfied(extracted, request.kind, consumer)) return true;
+            return false;
+        }
+
+        fn generatedChunkRequired(
+            self: WritePlanSnapshot,
+            extracted: mapper.ExtractedWrite,
+            template_index: usize,
+        ) bool {
+            const request = self.generated_templates[template_index];
+            if (request.kind != .chunk_text) return false;
+            if (request.persist_artifact or request.full_text_index or request.consumer_indexes.len > 0) return true;
+            for (self.chunk_dependents[template_index]) |dependent_index| {
+                const consumer = self.generated_templates[dependent_index];
+                if (!generatedEmbeddingRequired(extracted, consumer)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        fn generatedTemplateRequired(
+            self: WritePlanSnapshot,
+            extracted: mapper.ExtractedWrite,
+            template_index: usize,
+        ) bool {
+            const request = self.generated_templates[template_index];
+            return switch (request.kind) {
+                .dense_embedding, .sparse_embedding => generatedEmbeddingRequired(extracted, request),
+                .chunk_text => self.generatedChunkRequired(extracted, template_index),
+                // Asset enrichments are explicit producers in their own right,
+                // not merely implementation details of an index consumer.
+                .asset => true,
+            };
+        }
+
+        /// Instantiate an owned generated-work plan without consulting the live
+        /// catalog. The template's consumer set is narrowed so a user-supplied
+        /// vector is never overwritten while other consumers can still share
+        /// the same generated artifact.
+        pub fn planGeneratedEnrichmentsForRow(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+        ) ![]enrichment_types.GeneratedEnrichmentRequest {
+            var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+            errdefer {
+                for (requests.items) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+                requests.deinit(alloc);
+            }
+            for (self.generated_templates, 0..) |template, template_index| {
+                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+
+                var request = try enrichment_types.cloneGeneratedRequest(alloc, template);
+                errdefer enrichment_types.freeGeneratedRequest(alloc, request);
+                const owned_doc_key = try alloc.dupe(u8, doc_key);
+                alloc.free(request.doc_key);
+                request.doc_key = owned_doc_key;
+
+                if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
+                    var consumers = std.ArrayListUnmanaged([]u8).empty;
+                    errdefer {
+                        for (consumers.items) |consumer| alloc.free(consumer);
+                        consumers.deinit(alloc);
+                    }
+                    for (request.consumer_indexes) |consumer| {
+                        if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                        const owned_consumer = try alloc.dupe(u8, consumer);
+                        consumers.append(alloc, owned_consumer) catch |err| {
+                            alloc.free(owned_consumer);
+                            return err;
+                        };
+                    }
+                    const owned_consumers = try consumers.toOwnedSlice(alloc);
+                    for (request.consumer_indexes) |consumer| alloc.free(consumer);
+                    if (request.consumer_indexes.len > 0) alloc.free(request.consumer_indexes);
+                    request.consumer_indexes = owned_consumers;
+                }
+                try requests.append(alloc, request);
+            }
+            return try requests.toOwnedSlice(alloc);
+        }
+
+        /// Request-local view of immutable templates. Only the request array
+        /// and filtered consumer pointer arrays are allocated; configuration
+        /// strings and consumer names stay borrowed from the pinned epoch.
+        pub const BorrowedGeneratedRowPlan = struct {
+            alloc: Allocator,
+            requests: []enrichment_types.GeneratedEnrichmentRequest,
+
+            pub fn deinit(self: *@This()) void {
+                for (self.requests) |request| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        self.alloc.free(request.consumer_indexes);
+                }
+                if (self.requests.len > 0) self.alloc.free(self.requests);
+                self.* = undefined;
+            }
+        };
+
+        pub fn planGeneratedEnrichmentsForRowBorrowed(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+        ) !BorrowedGeneratedRowPlan {
+            var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+            errdefer {
+                for (requests.items) |request| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        alloc.free(request.consumer_indexes);
+                }
+                requests.deinit(alloc);
+            }
+            for (self.generated_templates, 0..) |template, template_index| {
+                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+                var request = template;
+                request.doc_key = doc_key;
+                if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
+                    request.consumer_indexes = &.{};
+                    if (template.consumer_indexes.len > 0) {
+                        var consumers = std.ArrayListUnmanaged([]u8).empty;
+                        errdefer consumers.deinit(alloc);
+                        for (template.consumer_indexes) |consumer| {
+                            if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                            try consumers.append(alloc, consumer);
+                        }
+                        request.consumer_indexes = try consumers.toOwnedSlice(alloc);
+                    }
+                }
+                requests.append(alloc, request) catch |err| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        alloc.free(request.consumer_indexes);
+                    return err;
+                };
+            }
+            return .{ .alloc = alloc, .requests = try requests.toOwnedSlice(alloc) };
+        }
+    };
+
+    pub fn writePlanSnapshotAlloc(self: *IndexManager, alloc: Allocator) !WritePlanSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        const dense_fields = try alloc.alloc(DenseFieldWritePlan, self.dense_indexes.items.len);
+        var dense_initialized: usize = 0;
+        errdefer {
+            for (dense_fields[0..dense_initialized]) |field| {
+                alloc.free(field.index_name);
+                alloc.free(field.field_name);
+            }
+            alloc.free(dense_fields);
+        }
+        for (self.dense_indexes.items, 0..) |entry, i| {
+            dense_fields[i] = try WritePlanSnapshot.cloneDense(alloc, entry);
+            dense_initialized += 1;
+        }
+
+        const sparse_fields = try alloc.alloc(SparseFieldWritePlan, self.sparse_indexes.items.len);
+        var sparse_initialized: usize = 0;
+        errdefer {
+            for (sparse_fields[0..sparse_initialized]) |field| {
+                alloc.free(field.index_name);
+                alloc.free(field.field_name);
+            }
+            alloc.free(sparse_fields);
+        }
+        for (self.sparse_indexes.items, 0..) |entry, i| {
+            sparse_fields[i] = try WritePlanSnapshot.cloneSparse(alloc, entry);
+            sparse_initialized += 1;
+        }
+
+        const graph_fields = try alloc.alloc(GraphFieldWritePlan, self.graph_indexes.items.len);
+        var graph_initialized: usize = 0;
+        errdefer {
+            for (graph_fields[0..graph_initialized]) |graph| {
+                alloc.free(graph.index_name);
+                for (graph.edges) |edge| {
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.field_name);
+                }
+                alloc.free(graph.edges);
+            }
+            alloc.free(graph_fields);
+        }
+        for (self.graph_indexes.items, 0..) |entry, i| {
+            graph_fields[i] = try WritePlanSnapshot.cloneGraph(alloc, entry);
+            graph_initialized += 1;
+        }
+        const generated_templates = try self.planGeneratedEnrichments(alloc, "", "{}", &.{}, &.{});
+        errdefer enrichment_types.deinitGeneratedRequests(alloc, generated_templates);
+        const chunk_dependents = try alloc.alloc([]u32, generated_templates.len);
+        @memset(chunk_dependents, &.{});
+        var chunk_dependents_initialized: usize = 0;
+        errdefer {
+            for (chunk_dependents[0..chunk_dependents_initialized]) |dependents|
+                if (dependents.len > 0) alloc.free(dependents);
+            alloc.free(chunk_dependents);
+        }
+        for (generated_templates, 0..) |template, template_index| {
+            if (template.kind != .chunk_text) {
+                chunk_dependents_initialized += 1;
+                continue;
+            }
+            var dependent_count: usize = 0;
+            for (generated_templates) |consumer| {
+                if (consumer.kind != .dense_embedding and consumer.kind != .sparse_embedding) continue;
+                if (std.mem.eql(u8, consumer.artifact_name, template.artifact_name)) dependent_count += 1;
+            }
+            if (dependent_count > 0) {
+                const dependents = try alloc.alloc(u32, dependent_count);
+                errdefer alloc.free(dependents);
+                var dependent_index: usize = 0;
+                for (generated_templates, 0..) |consumer, consumer_index| {
+                    if (consumer.kind != .dense_embedding and consumer.kind != .sparse_embedding) continue;
+                    if (!std.mem.eql(u8, consumer.artifact_name, template.artifact_name)) continue;
+                    dependents[dependent_index] = std.math.cast(u32, consumer_index) orelse
+                        return error.InvalidArgument;
+                    dependent_index += 1;
+                }
+                chunk_dependents[template_index] = dependents;
+            }
+            chunk_dependents_initialized += 1;
+        }
+        return .{
+            .alloc = alloc,
+            .generation = self.writePlanGeneration(),
+            .dense_fields = dense_fields,
+            .sparse_fields = sparse_fields,
+            .graph_fields = graph_fields,
+            .generated_templates = generated_templates,
+            .chunk_dependents = chunk_dependents,
+        };
+    }
+
+    const WritePlanSnapshotEpoch = struct {
+        ref_count: std.atomic.Value(usize) = .init(1),
+        value: WritePlanSnapshot,
+
+        fn retain(self: *@This()) void {
+            const previous = self.ref_count.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0);
+        }
+
+        fn release(self: *@This()) void {
+            const previous = self.ref_count.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous != 1) return;
+            const alloc = self.value.alloc;
+            self.value.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    pub const WritePlanSnapshotView = struct {
+        epoch: *WritePlanSnapshotEpoch,
+
+        pub fn plan(self: @This()) *const WritePlanSnapshot {
+            return &self.epoch.value;
+        }
+
+        pub fn generation(self: @This()) u64 {
+            return self.epoch.value.generation;
+        }
+
+        pub fn release(self: *@This()) void {
+            self.epoch.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Pin the immutable extraction generation. The expensive owned clone is
+    /// shared by all requests in a catalog epoch and rebuilt lazily only after
+    /// a durable index/enrichment publication advances the generation.
+    pub fn acquireWritePlanSnapshot(self: *IndexManager) !WritePlanSnapshotView {
+        while (true) {
+            const target_generation = self.writePlanGeneration();
+            lockAtomicMutex(&self.write_plan_cache_mutex);
+            if (self.write_plan_cache) |cached| if (cached.value.generation == target_generation) {
+                cached.retain();
+                self.write_plan_cache_mutex.unlock();
+                return .{ .epoch = cached };
+            };
+            self.write_plan_cache_mutex.unlock();
+
+            if (self.write_plan_build_generation.cmpxchgStrong(
+                0,
+                target_generation,
+                .acq_rel,
+                .acquire,
+            ) != null) {
+                std.Thread.yield() catch {};
+                continue;
+            }
+            defer self.write_plan_build_generation.store(0, .release);
+
+            // Clone under the catalog's shared publication fence, but outside
+            // the cache mutex. The single-flight generation token keeps cold
+            // callers from multiplying this allocation-heavy work.
+            var snapshot = try self.writePlanSnapshotAlloc(self.alloc);
+            errdefer snapshot.deinit();
+            const replacement = try self.alloc.create(WritePlanSnapshotEpoch);
+            errdefer self.alloc.destroy(replacement);
+            replacement.* = .{ .value = snapshot };
+
+            lockAtomicMutex(&self.write_plan_cache_mutex);
+            const current_generation = self.writePlanGeneration();
+            if (self.write_plan_cache) |cached| if (cached.value.generation == current_generation) {
+                cached.retain();
+                self.write_plan_cache_mutex.unlock();
+                replacement.release();
+                return .{ .epoch = cached };
+            };
+            if (snapshot.generation != current_generation) {
+                self.write_plan_cache_mutex.unlock();
+                replacement.release();
+                continue;
+            }
+
+            const displaced = self.write_plan_cache;
+            self.write_plan_cache = replacement;
+            replacement.retain();
+            self.write_plan_cache_mutex.unlock();
+            if (displaced) |old| old.release();
+            return .{ .epoch = replacement };
+        }
+    }
+
+    test "immutable write plan cache shares an epoch and retires safely" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        var first = try manager.acquireWritePlanSnapshot();
+        defer first.release();
+        var same = try manager.acquireWritePlanSnapshot();
+        defer same.release();
+        try std.testing.expect(first.plan() == same.plan());
+
+        _ = manager.write_plan_generation.fetchAdd(1, .release);
+        var next = try manager.acquireWritePlanSnapshot();
+        defer next.release();
+        try std.testing.expect(first.plan() != next.plan());
+        try std.testing.expectEqual(first.generation() + 1, next.generation());
+        try std.testing.expectEqual(@as(usize, 0), first.plan().dense_fields.len);
+    }
+
+    test "borrowed generated row plan preserves chunk consumer routing" {
+        var consumers = [_][]u8{ @constCast("text-index"), @constCast("graph-index") };
+        var templates = [_]enrichment_types.GeneratedEnrichmentRequest{.{
+            .kind = .chunk_text,
+            .index_name = "text-index",
+            .artifact_name = "chunks",
+            .doc_key = "",
+            .source_field = "body",
+            .consumer_indexes = &consumers,
+        }};
+        var dependents = [_][]u32{&.{}};
+        const snapshot = WritePlanSnapshot{
+            .alloc = std.testing.allocator,
+            .generation = 1,
+            .dense_fields = &.{},
+            .sparse_fields = &.{},
+            .graph_fields = &.{},
+            .generated_templates = &templates,
+            .chunk_dependents = &dependents,
+        };
+        var plan = try snapshot.planGeneratedEnrichmentsForRowBorrowed(
+            std.testing.allocator,
+            "doc:1",
+            .{
+                .cleaned_value = @constCast("{}"),
+                .graph_writes = &.{},
+                .mentioned_graph_indexes = &.{},
+                .dense_embeddings = &.{},
+                .sparse_embeddings = &.{},
+            },
+        );
+        defer plan.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), plan.requests.len);
+        try std.testing.expectEqualStrings("doc:1", plan.requests[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 2), plan.requests[0].consumer_indexes.len);
+        try std.testing.expect(plan.requests[0].consumer_indexes.ptr == consumers[0..].ptr);
     }
 
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
@@ -3157,6 +4073,10 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        if (self.write_plan_cache) |cached| {
+            self.write_plan_cache = null;
+            cached.release();
+        }
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
@@ -8313,6 +9233,42 @@ pub const IndexManager = struct {
             }
         }
 
+        // Resolve every mutable catalog lookup into the owned request. The
+        // caller may now release its structural/apply fence before chunking,
+        // remote rendering, model inference, or asset-provider calls.
+        for (requests.items) |*request| {
+            if (request.input_kind == .materialized_chunks and request.artifact_name.len > 0) {
+                const chunk_cfg = self.getEnrichment(.chunk, request.artifact_name) orelse
+                    return error.InvalidIndexConfig;
+                if (chunk_cfg.source_artifact_name.len == 0) return error.InvalidIndexConfig;
+                request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+            }
+            request.consumer_indexes = switch (request.kind) {
+                .asset => try self.textIndexesForChunk(
+                    alloc,
+                    if (request.artifact_name.len > 0) request.artifact_name else request.index_name,
+                    request.full_text_index,
+                ),
+                .chunk_text => blk: {
+                    const include_default = request.full_text_index or
+                        try chunking_types.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+                    break :blk try self.textIndexesForChunk(
+                        alloc,
+                        if (request.artifact_name.len > 0) request.artifact_name else request.index_name,
+                        include_default,
+                    );
+                },
+                .dense_embedding => try self.denseIndexesForEmbedding(
+                    alloc,
+                    if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
+                    request.expected_dims,
+                ),
+                .sparse_embedding => try self.sparseIndexesForEmbedding(
+                    alloc,
+                    if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
+                ),
+            };
+        }
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -8358,6 +9314,47 @@ pub const IndexManager = struct {
             });
             index_name = &.{};
             owned_doc_key = &.{};
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+    }
+
+    pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+        self: *const IndexManager,
+        alloc: Allocator,
+        doc_key: []const u8,
+        root: std.json.Value,
+        extracted: *mapper.ExtractedWrite,
+    ) !void {
+        for (self.dense_indexes.items) |entry| {
+            if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
+            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, entry.field_name, entry.dims)) orelse continue;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        for (self.sparse_indexes.items) |entry| {
+            if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, entry.config.name)) continue;
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, entry.field_name)) orelse continue;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
             sparse_vec.indices = &.{};
             sparse_vec.values = &.{};
         }
@@ -11983,7 +12980,7 @@ pub const IndexManager = struct {
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try relational_store.materializeStoredValueAlloc(state.manager.alloc, key, value);
+                    const doc_value = try state.manager.materializeStoredValueAlloc(state.manager.alloc, key, value);
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
@@ -12192,7 +13189,7 @@ pub const IndexManager = struct {
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try relational_store.materializeStoredValueAlloc(state.manager.alloc, key, value);
+                    const doc_value = try state.manager.materializeStoredValueAlloc(state.manager.alloc, key, value);
                     var doc_value_owned = true;
                     errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
@@ -13498,6 +14495,7 @@ pub const IndexManager = struct {
             },
         };
         try txn.commit();
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     fn persistCatalogExcludingWithAtomicMutation(
@@ -13528,6 +14526,7 @@ pub const IndexManager = struct {
             },
         };
         try txn.commit();
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     fn loadEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -13559,6 +14558,10 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, data);
         try txn.commit();
+        // Enrichment definitions are part of the immutable foreground write
+        // plan just as much as index definitions. Advance only after durable
+        // commit so cached generations never expose uncommitted configuration.
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     /// Seed a newly-created split destination with the source shard's durable
@@ -14900,55 +15903,83 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
-        defer backend_scan.freeResults(self.alloc, docs);
-
-        var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
-        defer {
-            for (items.items) |item| {
-                self.alloc.free(@constCast(item.vector));
-                if (item.metadata.len > 0) self.alloc.free(@constCast(item.metadata));
-            }
-            items.deinit(self.alloc);
-        }
-        var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
-        defer pending_mappings.deinit(self.alloc);
-        var metadata_presence_memo = DenseVectorMetadataPresenceMemo{};
-        defer metadata_presence_memo.deinit(self.alloc);
-        var mapping_batch = try runtime_store.store.beginBatch();
-        errdefer mapping_batch.abort();
-
-        for (docs) |doc| {
-            if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
-            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
-            defer self.alloc.free(raw_key);
-            if (!self.keyInRange(raw_key)) continue;
-            const logical_value = try relational_store.materializeStoredValueAlloc(self.alloc, doc.key, doc.value);
-            defer self.alloc.free(logical_value);
-            const vector_values = (try mapper.extractDenseVectorField(self.alloc, logical_value, entry.field_name, entry.dims)) orelse continue;
-            errdefer self.alloc.free(vector_values);
-
-            const assignment = try self.ensureDenseVectorIdTxnWithMemo(
-                &mapping_batch,
-                entry.config.name,
-                raw_key,
-                null,
-                &metadata_presence_memo,
+        var cursor = try self.alloc.dupe(u8, lower);
+        defer self.alloc.free(cursor);
+        var lower_exclusive = false;
+        while (true) {
+            var page = try backend_scan.scanRangePage(
+                self.alloc,
+                &runtime_store.store,
+                cursor,
+                lower_exclusive,
+                if (upper) |buf| buf else "",
+                vector_backfill_page_items,
+                vector_backfill_page_bytes,
             );
-            try items.append(self.alloc, .{
-                .vector_id = assignment.vector_id,
-                .vector = vector_values,
-                .metadata = try self.alloc.dupe(u8, raw_key),
-            });
-            try pending_mappings.append(self.alloc, .{
-                .doc_key = items.items[items.items.len - 1].metadata,
-                .parent_doc_key = null,
-                .vector_id = assignment.vector_id,
-            });
-        }
+            defer page.deinit(self.alloc);
+            if (page.items.len == 0) break;
+            const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
+            var next_cursor_owned = true;
+            defer if (next_cursor_owned) self.alloc.free(next_cursor);
 
-        try self.insertDenseItems(entry, items.items);
-        try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
+            var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
+            defer {
+                for (items.items) |item| {
+                    self.alloc.free(@constCast(item.vector));
+                    if (item.metadata.len > 0) self.alloc.free(@constCast(item.metadata));
+                }
+                items.deinit(self.alloc);
+            }
+            var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
+            defer pending_mappings.deinit(self.alloc);
+            var metadata_presence_memo = DenseVectorMetadataPresenceMemo{};
+            defer metadata_presence_memo.deinit(self.alloc);
+            var mapping_batch = try runtime_store.store.beginBatch();
+            errdefer mapping_batch.abort();
+
+            for (page.items) |doc| {
+                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                defer self.alloc.free(raw_key);
+                if (!self.keyInRange(raw_key)) continue;
+                try items.ensureUnusedCapacity(self.alloc, 1);
+                try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
+                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims)) orelse continue;
+                errdefer self.alloc.free(vector_values);
+
+                const assignment = try self.ensureDenseVectorIdTxnWithMemo(
+                    &mapping_batch,
+                    entry.config.name,
+                    raw_key,
+                    null,
+                    &metadata_presence_memo,
+                );
+                const metadata = try self.alloc.dupe(u8, raw_key);
+                errdefer self.alloc.free(metadata);
+                items.appendAssumeCapacity(.{
+                    .vector_id = assignment.vector_id,
+                    .vector = vector_values,
+                    .metadata = metadata,
+                });
+                pending_mappings.appendAssumeCapacity(.{
+                    .doc_key = metadata,
+                    .parent_doc_key = null,
+                    .vector_id = assignment.vector_id,
+                });
+            }
+
+            if (items.items.len > 0) {
+                try self.insertDenseItems(entry, items.items);
+                try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
+            } else {
+                mapping_batch.abort();
+            }
+            self.alloc.free(cursor);
+            cursor = next_cursor;
+            next_cursor_owned = false;
+            lower_exclusive = true;
+            if (page.reached_end) break;
+        }
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
@@ -14960,9 +15991,6 @@ pub const IndexManager = struct {
         defer self.alloc.free(lower);
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
-
-        const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
-        defer backend_scan.freeResults(self.alloc, docs);
 
         var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
@@ -14977,7 +16005,8 @@ pub const IndexManager = struct {
         var flushed_batches: usize = 0;
         var backfilled_doc_count: u64 = entry.index.doc_count;
         var saw_visible_doc = false;
-        var max_flushed_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]u8 = null;
+        defer if (max_flushed_key) |key| self.alloc.free(key);
 
         const flush_batch = struct {
             fn run(
@@ -15014,38 +16043,70 @@ pub const IndexManager = struct {
         }.run;
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
-        for (docs) |doc| {
-            if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
-            if (resume_from) |resume_key| {
-                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
+        var cursor = if (resume_from) |resume_key|
+            try self.alloc.dupe(u8, resume_key)
+        else
+            try self.alloc.dupe(u8, lower);
+        defer self.alloc.free(cursor);
+        var lower_exclusive = resume_from != null;
+        while (true) {
+            var page = try backend_scan.scanRangePage(
+                self.alloc,
+                &runtime_store.store,
+                cursor,
+                lower_exclusive,
+                if (upper) |buf| buf else "",
+                vector_backfill_page_items,
+                vector_backfill_page_bytes,
+            );
+            defer page.deinit(self.alloc);
+            if (page.items.len == 0) break;
+            const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
+            var next_cursor_owned = true;
+            defer if (next_cursor_owned) self.alloc.free(next_cursor);
+
+            for (page.items) |doc| {
+                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                defer self.alloc.free(raw_key);
+                if (!self.keyInRange(raw_key)) continue;
+                var sparse_vec = (try self.extractSparseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name)) orelse continue;
+                var sparse_vec_owned = true;
+                errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
+                saw_visible_doc = true;
+                if (max_flushed_key) |old| self.alloc.free(old);
+                max_flushed_key = try self.alloc.dupe(u8, doc.key);
+                try writes.ensureUnusedCapacity(self.alloc, 1);
+                const doc_id = try self.alloc.dupe(u8, raw_key);
+                var doc_id_owned = true;
+                errdefer if (doc_id_owned) self.alloc.free(doc_id);
+                writes.appendAssumeCapacity(.{
+                    .doc_id = doc_id,
+                    .vec = .{
+                        .indices = sparse_vec.indices,
+                        .values = sparse_vec.values,
+                    },
+                });
+                doc_id_owned = false;
+                sparse_vec_owned = false;
+                if (writes.items.len >= backfill_batch_size) {
+                    try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+                    self.alloc.free(max_flushed_key.?);
+                    max_flushed_key = null;
+                }
             }
-            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
-            defer self.alloc.free(raw_key);
-            if (!self.keyInRange(raw_key)) continue;
-            const logical_value = try relational_store.materializeStoredValueAlloc(self.alloc, doc.key, doc.value);
-            defer self.alloc.free(logical_value);
-            var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, logical_value, entry.field_name)) orelse continue;
-            var sparse_vec_owned = true;
-            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
-            saw_visible_doc = true;
-            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
-                max_flushed_key = doc.key;
-            }
-            try writes.append(self.alloc, .{
-                .doc_id = try self.alloc.dupe(u8, raw_key),
-                .vec = .{
-                    .indices = sparse_vec.indices,
-                    .values = sparse_vec.values,
-                },
-            });
-            sparse_vec_owned = false;
-            if (writes.items.len >= backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
-            }
+
+            self.alloc.free(cursor);
+            cursor = next_cursor;
+            next_cursor_owned = false;
+            lower_exclusive = true;
+            if (page.reached_end) break;
         }
 
         if (writes.items.len > 0) {
             try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+            self.alloc.free(max_flushed_key.?);
+            max_flushed_key = null;
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
@@ -18546,7 +19607,7 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            const logical = try relational_store.materializeStoredValueAlloc(alloc, doc_store_key, raw);
+            const logical = try manager.materializeStoredValueAlloc(alloc, doc_store_key, raw);
             defer alloc.free(logical);
             break :blk (try mapper.extractDenseVectorField(alloc, logical, entry.field_name, entry.dims)) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
@@ -24861,6 +25922,55 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+
+    var write_plan = try manager.acquireWritePlanSnapshot();
+    defer write_plan.release();
+    const extracted_empty = mapper.ExtractedWrite{
+        .cleaned_value = @constCast("{}"),
+        .graph_writes = &.{},
+        .mentioned_graph_indexes = &.{},
+        .dense_embeddings = &.{},
+        .sparse_embeddings = &.{},
+    };
+    const snapshot_generated = try write_plan.plan().planGeneratedEnrichmentsForRow(
+        alloc,
+        "doc:snapshot",
+        extracted_empty,
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, snapshot_generated);
+    try std.testing.expectEqual(generated.len, snapshot_generated.len);
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(snapshot_generated, "doc:snapshot", "title", "", "", "title_dense_v1"));
+    try std.testing.expect(hasGeneratedChunkRequest(snapshot_generated, "doc:snapshot", "body", "", "document_chunks_v1"));
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(snapshot_generated, "doc:snapshot", "text", "", "document_chunks_v1", "body_dense_v1"));
+
+    const explicit_vectors = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = @constCast("document_vectors"),
+        .doc_key = @constCast("doc:explicit"),
+        .vector = @constCast(&[_]f32{ 1, 0, 0 }),
+    }};
+    var extracted_explicit = extracted_empty;
+    extracted_explicit.dense_embeddings = @constCast(&explicit_vectors);
+    const explicit_plan = try write_plan.plan().planGeneratedEnrichmentsForRow(
+        alloc,
+        "doc:explicit",
+        extracted_explicit,
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, explicit_plan);
+    try std.testing.expectEqual(@as(usize, 0), explicit_plan.len);
+
+    try manager.addEnrichment(&store, .{
+        .name = "summary_asset_v1",
+        .kind = .asset,
+        .field = "title",
+    });
+    var refreshed_write_plan = try manager.acquireWritePlanSnapshot();
+    defer refreshed_write_plan.release();
+    try std.testing.expect(refreshed_write_plan.generation() > write_plan.generation());
+    try std.testing.expectEqual(
+        write_plan.plan().generated_templates.len + 1,
+        refreshed_write_plan.plan().generated_templates.len,
+    );
+
     var embedding_request_count: usize = 0;
     for (generated) |request| {
         if (request.kind != .dense_embedding) continue;

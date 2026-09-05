@@ -183,7 +183,7 @@ pub fn estimateStructuredFilterSample(
         const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         defer alloc.free(raw_key);
         sampled += 1;
-        const logical_value = try relational_store.materializeStoredValueAlloc(alloc, doc.key, doc.value);
+        const logical_value = try core.index_manager.materializeStoredValueAlloc(alloc, doc.key, doc.value);
         defer alloc.free(logical_value);
         if (try prepared_filter.matchesStored(alloc, raw_key, logical_value)) {
             matched += 1;

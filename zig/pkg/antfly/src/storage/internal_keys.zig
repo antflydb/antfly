@@ -230,6 +230,33 @@ pub fn decodeBodyView(body: []const u8) !?[]const u8 {
     return body;
 }
 
+pub fn decodeBodyIntoList(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    body: []const u8,
+) ![]const u8 {
+    out.clearRetainingCapacity();
+    try out.resize(alloc, maxDecodedLen(body));
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    while (in_pos < body.len) {
+        const byte = body[in_pos];
+        if (byte != 0) {
+            out.items[out_pos] = byte;
+            in_pos += 1;
+            out_pos += 1;
+            continue;
+        }
+        if (in_pos + 1 >= body.len or body[in_pos + 1] != 0xff)
+            return error.InvalidInternalUserKey;
+        out.items[out_pos] = 0;
+        in_pos += 2;
+        out_pos += 1;
+    }
+    out.shrinkRetainingCapacity(out_pos);
+    return out.items;
+}
+
 fn maxDecodedLen(body: []const u8) usize {
     return body.len;
 }
@@ -1301,6 +1328,19 @@ pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8
     if (!isStoredDocumentRowKey(key)) return null;
     const term = findComponentTerminator(key, 1).?;
     return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+/// Decode a primary-row identity without allocating in the common case. Keys
+/// containing escaped NUL bytes reuse caller-owned scratch across scan rows.
+pub fn decodeStoredDocumentRowKeyScratch(
+    scratch: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    key: []const u8,
+) !?[]const u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    const body = key[1..term];
+    return (try decodeBodyView(body)) orelse try decodeBodyIntoList(scratch, alloc, body);
 }
 
 pub fn decodeDocumentComponentAlloc(alloc: Allocator, key: []const u8) !?[]u8 {

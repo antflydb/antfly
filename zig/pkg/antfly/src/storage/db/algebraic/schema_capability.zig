@@ -2480,15 +2480,6 @@ test "relational projection yields typed cells" {
     const active = row.cell(relationalColumnIndex(plan, "active").?).?;
     try std.testing.expect(active.value.bool_val);
 
-    const encoded = try relational_row_codec.serialize(alloc, &.{
-        .{ .path = "qty", .value_type = .i64_val, .value = typedValue(qty.value) },
-        .{ .path = "ts", .value_type = .u64_val, .value = typedValue(ts.value) },
-    });
-    defer alloc.free(encoded);
-    const reconstructed = try relational_row_codec.reconstructValueAlloc(alloc, encoded);
-    defer alloc.free(reconstructed);
-    try std.testing.expectEqualStrings("{\"qty\":7,\"ts\":1000}", reconstructed);
-
     // A nullable column omitted from the document yields no cell.
     var sparse = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"id":"x","amount":0.0}

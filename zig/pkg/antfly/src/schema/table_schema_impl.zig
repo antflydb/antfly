@@ -578,7 +578,21 @@ fn validateDocumentJsonWithPhysicalFields(
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const root = switch (parsed.value) {
+    try validateDocumentValueWithPhysicalFields(alloc, schema, &parsed.value, physical_fields);
+}
+
+/// Validate an already parsed document. Relational storage preparation uses
+/// this entry point so validation, extraction, hashing, and row encoding share
+/// one exact-number parse tree.
+pub fn validateDocumentValueWithPhysicalFields(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    value: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+) !void {
+    if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
+
+    const root = switch (value.*) {
         .object => |object| object,
         else => return error.InvalidBatchRequest,
     };
@@ -595,7 +609,7 @@ fn validateDocumentJsonWithPhysicalFields(
     if (document_schema) |resolved_document_schema| {
         root_property = makeRootDocumentProperty(resolved_document_schema);
         validation_context.root_property = &root_property.?;
-        try validateDocumentFieldValueWithContext(&validation_context, root_property.?, &parsed.value, false);
+        try validateDocumentFieldValueWithContext(&validation_context, root_property.?, value, false);
         try collectComposedObjectFieldCoverage(&validation_context, root_property.?, root, schema.enforce_types, &root_composition_evaluated_fields, false);
     }
     var it = root.iterator();
@@ -652,7 +666,7 @@ fn validateDocumentJsonWithPhysicalFields(
     if (physical_fields.len > 0) {
         var path = std.ArrayListUnmanaged(u8).empty;
         defer path.deinit(alloc);
-        try validatePhysicalDocumentValue(alloc, physical_fields, &path, parsed.value, false);
+        try validatePhysicalDocumentValue(alloc, physical_fields, &path, value.*, false);
     }
 }
 

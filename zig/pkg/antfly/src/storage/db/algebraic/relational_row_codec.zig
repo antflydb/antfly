@@ -12,9 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Candidate on-disk codec for a relational document's typed columns. Public
-//! relational schema mutations remain gated until this payload is wired
-//! through the synchronous base-row write/read lifecycle.
+//! On-disk codec for a relational document's typed columns.
 //!
 //! Once that lifecycle is enabled, the base row is the document's projected
 //! typed columns rather than a JSON blob; `db.get` will decode the row and
@@ -28,54 +26,38 @@
 //! column scans over this packed representation while the physical column layout
 //! evolves.
 //!
-//! **Self-describing on purpose.** Each cell stores the column's JSON `path`,
-//! physical `value_type`, the `is_json` flag, and the typed value — everything
-//! reconstruction needs. So base-row readers decode and reconstruct without a
-//! schema lookup, and reconstruction works even while the table schema is
-//! mid-change. The value representation is `typed_doc_values` (the same types
-//! the search segments persist), and the per-value formatter (`appendCellValue`)
-//! is shared with the segment read path so a document reconstructs *byte for
-//! byte identically* whether served from columns in a segment or from the
-//! relational row store. That single-formatter guarantee is the whole point of
-//! this layer.
+//! Version 2 binds a row to an immutable schema epoch and stores values by stable column ordinal,
+//! so paths and types are not repeated in every row. Each row deterministically
+//! chooses the smaller of a dense fixed/offset body and a sparse ordinal/payload
+//! directory; both retain targeted projection without penalizing wide optional
+//! schemas.
 //!
-//! Format (little-endian):
-//!   magic   [4] = "AROW"
-//!   version u32 = 1
-//!   count   u32              -- number of cells (present columns only)
-//!   per cell:
-//!     path_len   u32, path bytes
-//!     flags      u8          -- bit0: is_json, bit1: is_null
-//!     value_type u8          -- typed_doc_values.ValueType tag
-//!     payload (omitted when is_null):
-//!       u64_val   : 8 bytes
-//!       i64_val   : 8 bytes (two's-complement bit pattern)
-//!       f64_val   : 8 bytes (bitcast)
-//!       bool_val  : 1 byte
-//!       geo_point : 16 bytes (lat f64, lon f64)
-//!       bytes_val : u32 len + len bytes
-//!       numeric_val: subtype u8 + 8 bytes (exact u64/i64/f64 domain)
-//!
-//! Cells are stored in declared-column order, and only present columns are
-//! stored (absent nullable columns are skipped) — matching the segment path,
-//! which emits columns in order and skips absent ones, so the reconstructed JSON
-//! is identical.
-//!
-//! Relational mode is new, so there is no legacy on-disk format to stay
-//! compatible with; a single row version is assumed.
+//! AROW v2 is the first supported relational row format. Rows always carry a
+//! schema version, semantic content hash, presence/null bitmaps, a canonical
+//! dense or sparse ordinal body, and a physical checksum. There is no
+//! schemaless or pre-v2 compatibility path.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const geo_mod = @import("../../../search/geo.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
+const runtime_schema = @import("../../schema.zig");
 
 pub const magic: [4]u8 = "AROW".*;
-pub const version: u32 = 1;
+pub const ordinal_version: u32 = 2;
 
-const flag_is_json: u8 = 1;
-const flag_is_null: u8 = 2;
-const known_flags: u8 = flag_is_json | flag_is_null;
-const min_encoded_cell_len: usize = @sizeOf(u32) + 2;
+pub const semantic_hash_len: usize = std.crypto.hash.Blake3.digest_length;
+// magic + format + schema epoch + reserved capabilities + semantic hash +
+// resolved logical write timestamp. Bitmap and section sizes are schema-derived
+// and are deliberately omitted. The timestamp is physical/system metadata: it
+// participates in the checksum but never in the semantic content hash.
+const ordinal_semantic_hash_offset: usize = 16;
+const ordinal_write_timestamp_offset: usize = ordinal_semantic_hash_offset + semantic_hash_len;
+const ordinal_header_len: usize = ordinal_write_timestamp_offset + @sizeOf(u64);
+const checksum_len: usize = @sizeOf(u32);
+const capability_sparse_slots: u32 = 1;
+const known_ordinal_capabilities: u32 = capability_sparse_slots;
+const sparse_entry_len: usize = @sizeOf(u32) * 2; // ordinal + payload start
 
 /// One reconstructable column value. Owns nothing: `path` and (for `bytes_val`)
 /// the value bytes borrow either the caller's buffers (when serializing) or the
@@ -93,6 +75,137 @@ pub const Cell = struct {
     value: typed_dv.TypedValue,
 };
 
+/// Immutable addressing metadata compiled once per schema epoch. It turns a
+/// column ordinal into either a fixed byte offset or a variable offset-table
+/// slot without rescanning all preceding columns for every projected value.
+pub const PhysicalLayout = struct {
+    alloc: Allocator,
+    schema_version: u32,
+    column_count: u32,
+    bitmap_len: u32,
+    fixed_len: u32,
+    variable_count: u32,
+    fixed_offsets: []u32,
+    variable_indexes: []u32,
+    /// Column ordinals sorted by logical name for stable semantic hashing.
+    hash_ordinals: []u32,
+
+    const not_applicable = std.math.maxInt(u32);
+
+    pub fn init(alloc: Allocator, table_schema: runtime_schema.TableSchema) !PhysicalLayout {
+        const columns = table_schema.relational_columns;
+        const column_count = std.math.cast(u32, columns.len) orelse return error.InvalidSchema;
+        const fixed_offsets = try alloc.alloc(u32, columns.len);
+        errdefer alloc.free(fixed_offsets);
+        const variable_indexes = try alloc.alloc(u32, columns.len);
+        errdefer alloc.free(variable_indexes);
+        const hash_ordinals = try alloc.alloc(u32, columns.len);
+        errdefer alloc.free(hash_ordinals);
+        var fixed_pos: usize = 0;
+        var variable_index: usize = 0;
+        for (columns, 0..) |column, ordinal| {
+            hash_ordinals[ordinal] = @intCast(ordinal);
+            if (isVariableColumn(column)) {
+                fixed_offsets[ordinal] = not_applicable;
+                variable_indexes[ordinal] = std.math.cast(u32, variable_index) orelse return error.InvalidSchema;
+                variable_index += 1;
+            } else {
+                fixed_offsets[ordinal] = std.math.cast(u32, fixed_pos) orelse return error.InvalidSchema;
+                variable_indexes[ordinal] = not_applicable;
+                fixed_pos = std.math.add(usize, fixed_pos, fixedColumnWidth(column)) catch return error.InvalidSchema;
+            }
+        }
+        std.mem.sort(u32, hash_ordinals, columns, struct {
+            fn lessThan(schema_columns: []const runtime_schema.RelationalColumn, lhs: u32, rhs: u32) bool {
+                return std.mem.lessThan(u8, schema_columns[lhs].name, schema_columns[rhs].name);
+            }
+        }.lessThan);
+        return .{
+            .alloc = alloc,
+            .schema_version = table_schema.version,
+            .column_count = column_count,
+            .bitmap_len = std.math.cast(u32, (columns.len + 7) / 8) orelse return error.InvalidSchema,
+            .fixed_len = std.math.cast(u32, fixed_pos) orelse return error.InvalidSchema,
+            .variable_count = std.math.cast(u32, variable_index) orelse return error.InvalidSchema,
+            .fixed_offsets = fixed_offsets,
+            .variable_indexes = variable_indexes,
+            .hash_ordinals = hash_ordinals,
+        };
+    }
+
+    pub fn deinit(self: *PhysicalLayout) void {
+        self.alloc.free(self.fixed_offsets);
+        self.alloc.free(self.variable_indexes);
+        self.alloc.free(self.hash_ordinals);
+        self.* = undefined;
+    }
+
+    /// Resolve a logical top-level name without rebuilding a map per request.
+    /// `hash_ordinals` is already name-sorted for semantic hashing, so it also
+    /// serves as the immutable epoch's projection index.
+    pub fn ordinalForName(
+        self: *const PhysicalLayout,
+        columns: []const runtime_schema.RelationalColumn,
+        name: []const u8,
+    ) ?usize {
+        if (columns.len != self.hash_ordinals.len) return null;
+        var lower: usize = 0;
+        var upper: usize = self.hash_ordinals.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const ordinal: usize = self.hash_ordinals[middle];
+            switch (std.mem.order(u8, columns[ordinal].name, name)) {
+                .lt => lower = middle + 1,
+                .gt => upper = middle,
+                .eq => return ordinal,
+            }
+        }
+        return null;
+    }
+};
+
+/// A request's exact field selection resolved once against an immutable schema
+/// epoch. Ordinals retain caller order and are deduplicated during compilation.
+pub const OrdinalProjectionPlan = struct {
+    alloc: Allocator,
+    schema_version: u32,
+    ordinals: []u32,
+
+    pub fn init(
+        alloc: Allocator,
+        table_schema: runtime_schema.TableSchema,
+        layout: *const PhysicalLayout,
+        fields: []const []const u8,
+    ) !OrdinalProjectionPlan {
+        if (layout.schema_version != table_schema.version or
+            layout.column_count != table_schema.relational_columns.len)
+            return error.RelationalRowSchemaMismatch;
+        const ordinals = try alloc.alloc(u32, fields.len);
+        errdefer alloc.free(ordinals);
+        const emitted = try alloc.alloc(u8, layout.bitmap_len);
+        defer alloc.free(emitted);
+        @memset(emitted, 0);
+        var count: usize = 0;
+        for (fields) |field| {
+            const ordinal = layout.ordinalForName(table_schema.relational_columns, field) orelse continue;
+            if (bitmapBit(emitted, ordinal)) continue;
+            setBitmapBit(emitted, ordinal);
+            ordinals[count] = @intCast(ordinal);
+            count += 1;
+        }
+        return .{
+            .alloc = alloc,
+            .schema_version = table_schema.version,
+            .ordinals = try alloc.realloc(ordinals, count),
+        };
+    }
+
+    pub fn deinit(self: *OrdinalProjectionPlan) void {
+        self.alloc.free(self.ordinals);
+        self.* = undefined;
+    }
+};
+
 /// True if `value` begins with the typed-row magic. Lets the KV read chokepoint
 /// tell a serialized relational row apart from any other stored value without a
 /// schema lookup.
@@ -100,106 +213,1046 @@ pub fn looksLikeRow(value: []const u8) bool {
     return value.len >= magic.len and std.mem.eql(u8, value[0..magic.len], &magic);
 }
 
-/// Serialize a document's cells. Caller owns the result.
-pub fn serialize(alloc: Allocator, cells: []const Cell) ![]u8 {
-    const encoded_len = try serializedLenWithAllocator(alloc, cells);
-    const buf = try alloc.alloc(u8, encoded_len);
-    errdefer alloc.free(buf);
-    _ = serializeIntoUnchecked(buf, cells);
-    return buf;
+/// Encode the schema-bound ordinal row format. Paths and physical types live
+/// in the immutable schema layout rather than being repeated in every row.
+/// Offsets are emitted for variable-width ordinals; a compiled physical layout
+/// supplies direct fixed offsets and variable-table indexes for projection.
+pub fn serializeOrdinal(
+    alloc: Allocator,
+    schema_version: u32,
+    columns: []const runtime_schema.RelationalColumn,
+    cells: []const Cell,
+    semantic_hash: [semantic_hash_len]u8,
+) ![]u8 {
+    return try serializeOrdinalInternal(alloc, schema_version, columns, cells, semantic_hash, null, true, true);
 }
 
-/// Return the exact number of bytes required by `serializeInto`.
-pub fn serializedLen(cells: []const Cell) !usize {
-    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
-    return serializedLenWithAllocator(stack.get(), cells);
+/// Trusted encoder for cells projected from an already-parsed and validated
+/// PreparedRow. It retains type/layout checks but does not parse JSON-backed
+/// cells again merely to prove that generated canonical JSON is valid.
+pub fn serializePreparedOrdinal(
+    alloc: Allocator,
+    schema_version: u32,
+    columns: []const runtime_schema.RelationalColumn,
+    cells: []const Cell,
+    semantic_hash: [semantic_hash_len]u8,
+) ![]u8 {
+    return try serializeOrdinalInternal(alloc, schema_version, columns, cells, semantic_hash, null, false, true);
 }
 
-fn serializedLenWithAllocator(alloc: Allocator, cells: []const Cell) !usize {
-    try validateCells(alloc, cells);
-    const count = std.math.cast(u32, cells.len) orelse return error.InvalidRelationalRow;
-    _ = count;
-    var encoded_len: usize = magic.len + 2 * @sizeOf(u32);
-    for (cells) |cell| {
-        _ = std.math.cast(u32, cell.path.len) orelse return error.InvalidRelationalRow;
-        encoded_len = try serializedLenAdd(encoded_len, @sizeOf(u32) + cell.path.len + 2);
-        if (cell.is_null) continue;
-        encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
-            .u64_val, .i64_val, .f64_val => @sizeOf(u64),
-            .numeric_val => 1 + @sizeOf(u64),
-            .bool_val => 1,
-            .geo_point => 2 * @sizeOf(u64),
-            .bytes_val => |bytes| blk: {
-                _ = std.math.cast(u32, bytes.len) orelse return error.InvalidRelationalRow;
-                break :blk @sizeOf(u32) + bytes.len;
-            },
-        });
+pub fn serializePreparedOrdinalWithLayout(
+    alloc: Allocator,
+    schema_version: u32,
+    columns: []const runtime_schema.RelationalColumn,
+    cells: []const Cell,
+    semantic_hash: [semantic_hash_len]u8,
+    layout: *const PhysicalLayout,
+) ![]u8 {
+    if (layout.schema_version != schema_version or layout.column_count != columns.len)
+        return error.RelationalRowSchemaMismatch;
+    return try serializeOrdinalInternal(alloc, schema_version, columns, cells, semantic_hash, layout, false, true);
+}
+
+/// PreparedRow computes the logical digest from the same resolved ordinal
+/// values immediately after body construction. Leave the checksum slot pending
+/// so installing that digest performs the row's only CRC pass.
+pub fn serializePreparedOrdinalDeferredHash(
+    alloc: Allocator,
+    schema_version: u32,
+    columns: []const runtime_schema.RelationalColumn,
+    cells: []const Cell,
+    layout: ?*const PhysicalLayout,
+) ![]u8 {
+    const zero_hash = std.mem.zeroes([semantic_hash_len]u8);
+    if (layout) |compiled| {
+        if (compiled.schema_version != schema_version or compiled.column_count != columns.len)
+            return error.RelationalRowSchemaMismatch;
     }
-    return encoded_len;
+    return try serializeOrdinalInternal(alloc, schema_version, columns, cells, zero_hash, layout, false, false);
 }
 
-/// Serialize into caller-owned storage and return the initialized prefix.
-pub fn serializeInto(buf: []u8, cells: []const Cell) ![]u8 {
-    const encoded_len = try serializedLen(cells);
-    if (buf.len < encoded_len) return error.NoSpaceLeft;
-    return serializeIntoUnchecked(buf[0..encoded_len], cells);
-}
+fn serializeOrdinalInternal(
+    alloc: Allocator,
+    schema_version: u32,
+    columns: []const runtime_schema.RelationalColumn,
+    cells: []const Cell,
+    semantic_hash: [semantic_hash_len]u8,
+    layout: ?*const PhysicalLayout,
+    validate_json_cells: bool,
+    finalize_checksum: bool,
+) ![]u8 {
+    _ = std.math.cast(u32, columns.len) orelse return error.InvalidRelationalRow;
+    const bitmap_len: usize = if (layout) |compiled| compiled.bitmap_len else (columns.len + 7) / 8;
+    const fixed_len: usize = if (layout) |compiled| compiled.fixed_len else try fixedSectionLen(columns);
+    const variable_count: usize = if (layout) |compiled| compiled.variable_count else countVariableColumns(columns);
+    const offsets_len = if (variable_count == 0)
+        0
+    else
+        try std.math.mul(usize, variable_count + 1, @sizeOf(u32));
+    var variable_payload_len: usize = 0;
+    var sparse_payload_len: usize = 0;
+    var cell_index: usize = 0;
+    for (columns) |column| {
+        if (cell_index < cells.len) {
+            const cell = cells[cell_index];
+            if (std.mem.eql(u8, cell.path, column.path)) {
+                if (cell.value_type != columnValueType(column.column_type) or cell.is_json != column.is_json)
+                    return error.InvalidRelationalRow;
+                if (validate_json_cells) try validateCell(alloc, cell);
+                if (!cell.is_null and isVariableColumn(column)) {
+                    const bytes = switch (cell.value) {
+                        .bytes_val => |value| value,
+                        else => return error.InvalidRelationalRow,
+                    };
+                    variable_payload_len = std.math.add(usize, variable_payload_len, bytes.len) catch
+                        return error.InvalidRelationalRow;
+                }
+                if (!cell.is_null) {
+                    const payload_len = if (isVariableColumn(column)) cell.value.bytes_val.len else fixedColumnWidth(column);
+                    sparse_payload_len = std.math.add(usize, sparse_payload_len, payload_len) catch
+                        return error.InvalidRelationalRow;
+                }
+                cell_index += 1;
+            }
+        }
+    }
+    if (cell_index != cells.len) return error.InvalidRelationalRow;
+    _ = std.math.cast(u32, variable_payload_len) orelse return error.InvalidRelationalRow;
+    _ = std.math.cast(u32, sparse_payload_len) orelse return error.InvalidRelationalRow;
 
-fn serializeIntoUnchecked(buf: []u8, cells: []const Cell) []u8 {
-    const encoded_len = buf.len;
-    const out = buf[0..encoded_len];
+    const bitmap_sections_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
+    const dense_static_len = try serializedLenAdd(fixed_len, offsets_len);
+    const dense_body_len = try serializedLenAdd(dense_static_len, variable_payload_len);
+    const sparse_entries_len = try std.math.mul(usize, cells.len, sparse_entry_len);
+    const sparse_directory_len = try serializedLenAdd(
+        @sizeOf(u32) * 2,
+        sparse_entries_len,
+    );
+    const sparse_body_len = try serializedLenAdd(sparse_directory_len, sparse_payload_len);
+    // The representation is selected solely from schema and logical presence,
+    // making canonical re-encoding deterministic across processes.
+    const sparse = sparse_body_len < dense_body_len;
+    const capabilities: u32 = if (sparse) capability_sparse_slots else 0;
+    const total_len = try serializedLenAdd(
+        try serializedLenAdd(ordinal_header_len + checksum_len, bitmap_sections_len),
+        if (sparse) sparse_body_len else dense_body_len,
+    );
+    const out = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(out);
     var pos: usize = 0;
     @memcpy(out[pos..][0..magic.len], &magic);
     pos += magic.len;
-    writeU32(out, &pos, version);
-    writeU32(out, &pos, @intCast(cells.len));
-    for (cells) |cell| {
-        writeU32(out, &pos, @intCast(cell.path.len));
-        @memcpy(out[pos..][0..cell.path.len], cell.path);
-        pos += cell.path.len;
-        out[pos] = (if (cell.is_json) flag_is_json else 0) |
-            (if (cell.is_null) flag_is_null else 0);
-        out[pos + 1] = @intFromEnum(cell.value_type);
-        pos += 2;
-        if (cell.is_null) continue;
-        switch (cell.value) {
-            .u64_val => |value| writeU64(out, &pos, value),
-            .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
-            .f64_val => |value| writeU64(out, &pos, @bitCast(value)),
-            .numeric_val => |value| switch (value) {
-                .u64_val => |number| {
-                    out[pos] = 0;
-                    pos += 1;
-                    writeU64(out, &pos, number);
-                },
-                .i64_val => |number| {
-                    out[pos] = 1;
-                    pos += 1;
-                    writeU64(out, &pos, @bitCast(number));
-                },
-                .f64_val => |number| {
-                    out[pos] = 2;
-                    pos += 1;
-                    writeU64(out, &pos, @bitCast(number));
-                },
-            },
-            .bool_val => |value| {
-                out[pos] = if (value) 1 else 0;
-                pos += 1;
-            },
-            .geo_point => |value| {
-                writeU64(out, &pos, @bitCast(value.lat));
-                writeU64(out, &pos, @bitCast(value.lon));
-            },
-            .bytes_val => |bytes| {
-                writeU32(out, &pos, @intCast(bytes.len));
-                @memcpy(out[pos..][0..bytes.len], bytes);
-                pos += bytes.len;
-            },
+    writeU32(out, &pos, ordinal_version);
+    writeU32(out, &pos, schema_version);
+    writeU32(out, &pos, capabilities);
+    @memcpy(out[pos..][0..semantic_hash.len], &semantic_hash);
+    pos += semantic_hash.len;
+    writeU64(out, &pos, 0);
+    const present = out[pos..][0..bitmap_len];
+    @memset(present, 0);
+    pos += bitmap_len;
+    const nulls = out[pos..][0..bitmap_len];
+    @memset(nulls, 0);
+    pos += bitmap_len;
+    if (sparse) {
+        writeU32(out, &pos, @intCast(cells.len));
+        const entries_start = pos;
+        pos += sparse_entries_len;
+        const terminal_offset_pos = pos;
+        pos += @sizeOf(u32);
+        const sparse_payload = out[pos..][0..sparse_payload_len];
+        pos += sparse_payload_len;
+
+        cell_index = 0;
+        var payload_pos: usize = 0;
+        for (columns, 0..) |column, ordinal| {
+            if (cell_index >= cells.len or !std.mem.eql(u8, cells[cell_index].path, column.path)) continue;
+            const cell = cells[cell_index];
+            setBitmapBit(present, ordinal);
+            if (cell.is_null) setBitmapBit(nulls, ordinal);
+            const entry_pos = entries_start + cell_index * sparse_entry_len;
+            std.mem.writeInt(u32, out[entry_pos..][0..4], @intCast(ordinal), .little);
+            std.mem.writeInt(u32, out[entry_pos + 4 ..][0..4], @intCast(payload_pos), .little);
+            if (!cell.is_null) {
+                if (isVariableColumn(column)) {
+                    const bytes = cell.value.bytes_val;
+                    @memcpy(sparse_payload[payload_pos..][0..bytes.len], bytes);
+                    payload_pos += bytes.len;
+                } else {
+                    const width = fixedColumnWidth(column);
+                    try encodeOrdinalFixed(sparse_payload[payload_pos..][0..width], cell);
+                    payload_pos += width;
+                }
+            }
+            cell_index += 1;
         }
+        std.mem.writeInt(u32, out[terminal_offset_pos..][0..4], @intCast(payload_pos), .little);
+        std.debug.assert(cell_index == cells.len and payload_pos == sparse_payload_len);
+    } else {
+        const fixed = out[pos..][0..fixed_len];
+        @memset(fixed, 0);
+        pos += fixed_len;
+        const offsets_start = pos;
+        pos += offsets_len;
+        const variable_payload = out[pos..][0..variable_payload_len];
+        pos += variable_payload_len;
+
+        cell_index = 0;
+        var fixed_pos: usize = 0;
+        var variable_index: usize = 0;
+        var variable_pos: usize = 0;
+        for (columns, 0..) |column, ordinal| {
+            const variable = isVariableColumn(column);
+            if (variable) std.mem.writeInt(u32, out[offsets_start + variable_index * 4 ..][0..4], @intCast(variable_pos), .little);
+            if (cell_index < cells.len) {
+                const cell = cells[cell_index];
+                if (std.mem.eql(u8, cell.path, column.path)) {
+                    setBitmapBit(present, ordinal);
+                    if (cell.is_null) {
+                        setBitmapBit(nulls, ordinal);
+                    } else if (variable) {
+                        const bytes = cell.value.bytes_val;
+                        @memcpy(variable_payload[variable_pos..][0..bytes.len], bytes);
+                        variable_pos += bytes.len;
+                    } else {
+                        const width = fixedColumnWidth(column);
+                        try encodeOrdinalFixed(fixed[fixed_pos..][0..width], cell);
+                    }
+                    cell_index += 1;
+                }
+            }
+            if (variable) {
+                variable_index += 1;
+                std.mem.writeInt(u32, out[offsets_start + variable_index * 4 ..][0..4], @intCast(variable_pos), .little);
+            } else fixed_pos += fixedColumnWidth(column);
+        }
+        std.debug.assert(fixed_pos == fixed_len and variable_index == variable_count and variable_pos == variable_payload_len);
     }
+    const checksum = if (finalize_checksum) std.hash.Crc32.hash(out[0..pos]) else 0;
+    writeU32(out, &pos, checksum);
     std.debug.assert(pos == out.len);
     return out;
+}
+
+pub fn rowSchemaVersion(value: []const u8) !u32 {
+    if (!looksLikeRow(value)) return error.InvalidRelationalRow;
+    if (value.len < 8) return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    const row_version = readU32(value, &pos);
+    if (row_version != ordinal_version or value.len < ordinal_header_len + checksum_len)
+        return error.UnsupportedRelationalRowVersion;
+    return readU32(value, &pos);
+}
+
+/// Return the canonical logical digest embedded by AROW v2. Verify the physical
+/// checksum before trusting it: a same-content overwrite should repair a
+/// damaged row, not mistake an intact digest header for intact payload bytes.
+pub fn rowSemanticHash(value: []const u8) ![semantic_hash_len]u8 {
+    const digest = try rowSemanticHashTrusted(value);
+    const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
+    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum)
+        return error.RelationalRowChecksumMismatch;
+    return digest;
+}
+
+/// Read the embedded semantic digest after the caller has already performed a
+/// strict row decode in the same storage snapshot.
+pub fn rowSemanticHashTrusted(value: []const u8) ![semantic_hash_len]u8 {
+    if (!looksLikeRow(value)) return error.InvalidRelationalRow;
+    if (value.len < 8) return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    const row_version = readU32(value, &pos);
+    if (row_version != ordinal_version or value.len < ordinal_header_len + checksum_len)
+        return error.UnsupportedRelationalRowVersion;
+    _ = readU32(value, &pos); // schema version
+    if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
+    std.debug.assert(pos == ordinal_semantic_hash_offset);
+    var digest: [semantic_hash_len]u8 = undefined;
+    @memcpy(&digest, value[pos..][0..semantic_hash_len]);
+    return digest;
+}
+
+/// Return the resolved timestamp used for TTL visibility. The strict variant
+/// authenticates the complete physical row before exposing system metadata.
+pub fn rowWriteTimestampNs(value: []const u8) !u64 {
+    const timestamp = try rowWriteTimestampNsTrusted(value);
+    const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
+    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum)
+        return error.RelationalRowChecksumMismatch;
+    return timestamp;
+}
+
+pub fn rowWriteTimestampNsTrusted(value: []const u8) !u64 {
+    _ = try rowSemanticHashTrusted(value);
+    return std.mem.readInt(u64, value[ordinal_write_timestamp_offset..][0..@sizeOf(u64)], .little);
+}
+
+/// Install the semantic digest after a PreparedRow has encoded its already
+/// validated ordinal cells. Updating the physical checksum keeps the operation
+/// equivalent to supplying the digest to the encoder without a second row
+/// traversal.
+pub fn setOrdinalSemanticHash(value: []u8, digest: [semantic_hash_len]u8) !void {
+    if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value))
+        return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    if (readU32(value, &pos) != ordinal_version) return error.UnsupportedRelationalRowVersion;
+    _ = readU32(value, &pos);
+    if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
+    @memcpy(value[ordinal_semantic_hash_offset..][0..semantic_hash_len], &digest);
+    const checksum = std.hash.Crc32.hash(value[0 .. value.len - checksum_len]);
+    std.mem.writeInt(u32, value[value.len - checksum_len ..][0..checksum_len], checksum, .little);
+}
+
+/// Install request-resolved system metadata after preparation. This remains
+/// separate from the semantic digest so identical logical rows retain the same
+/// user-visible hash when their write/expiry timestamp changes.
+pub fn setOrdinalWriteTimestampNs(value: []u8, timestamp_ns: u64) !void {
+    if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value))
+        return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    if (readU32(value, &pos) != ordinal_version) return error.UnsupportedRelationalRowVersion;
+    _ = readU32(value, &pos);
+    if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
+    std.mem.writeInt(u64, value[ordinal_write_timestamp_offset..][0..@sizeOf(u64)], timestamp_ns, .little);
+    const checksum = std.hash.Crc32.hash(value[0 .. value.len - checksum_len]);
+    std.mem.writeInt(u32, value[value.len - checksum_len ..][0..checksum_len], checksum, .little);
+}
+
+pub fn reconstructOrdinalValueAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+) ![]u8 {
+    const parsed = try parseOrdinal(value, table_schema);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    for (table_schema.relational_columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        const cell = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn reconstructOrdinalValueWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) ![]u8 {
+    const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    for (table_schema.relational_columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn validateOrdinal(value: []const u8, table_schema: runtime_schema.TableSchema) !void {
+    const parsed = try parseOrdinal(value, table_schema);
+    for (table_schema.relational_columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        _ = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
+    }
+}
+
+pub fn validateOrdinalWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !void {
+    const parsed = try parseOrdinalWithLayout(value, table_schema, layout);
+    for (table_schema.relational_columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        _ = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
+    }
+}
+
+/// Strictly validate once and expose borrowed typed cells by ordinal. Restore,
+/// scrubbing, and projected readers can then operate without reconstructing a
+/// complete JSON object or reparsing scalar values.
+pub fn collectOrdinalCellsWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    cells: []?Cell,
+) ![semantic_hash_len]u8 {
+    if (cells.len != table_schema.relational_columns.len) return error.InvalidArgument;
+    @memset(cells, null);
+    const parsed = try parseOrdinalWithLayout(value, table_schema, layout);
+    for (table_schema.relational_columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        cells[ordinal] = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
+    }
+    return parsed.semantic_hash;
+}
+
+pub fn findCellByOrdinal(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    ordinal: usize,
+) !?Cell {
+    if (ordinal >= table_schema.relational_columns.len) return null;
+    const parsed = try parseOrdinal(value, table_schema);
+    if (!bitmapBit(parsed.present, ordinal)) return null;
+    return try ordinalCell(parsed, table_schema.relational_columns, table_schema.relational_columns[ordinal], ordinal);
+}
+
+pub fn findCellByOrdinalWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    ordinal: usize,
+) !?Cell {
+    if (ordinal >= table_schema.relational_columns.len) return null;
+    const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    if (!bitmapBit(parsed.present, ordinal)) return null;
+    const column = table_schema.relational_columns[ordinal];
+    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+    return try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+}
+
+/// Reconstruct only selected top-level columns. Callers preflight that field
+/// expressions are exact names (no exclusions, wildcards, or nested paths).
+pub fn projectOrdinalFieldsWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    fields: []const []const u8,
+) ![]u8 {
+    var plan = try OrdinalProjectionPlan.init(alloc, table_schema, layout, fields);
+    defer plan.deinit();
+    return try projectOrdinalPlanWithLayoutAlloc(alloc, value, table_schema, layout, plan);
+}
+
+pub fn projectOrdinalPlanWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    plan: OrdinalProjectionPlan,
+) ![]u8 {
+    if (plan.schema_version != table_schema.version) return error.RelationalRowSchemaMismatch;
+    const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    for (plan.ordinals) |ordinal_raw| {
+        const ordinal: usize = ordinal_raw;
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        const column = table_schema.relational_columns[ordinal];
+        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Multi-column projection after the exact row bytes were authenticated by a
+/// storage block/page checksum or a strict AROW checksum read in the same
+/// snapshot. Header, bitmap, target-slot, type, and JSON bounds remain checked;
+/// unrelated payload and sparse-directory entries are not rescanned.
+pub fn projectOrdinalFieldsTrustedWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    fields: []const []const u8,
+) ![]u8 {
+    var plan = try OrdinalProjectionPlan.init(alloc, table_schema, layout, fields);
+    defer plan.deinit();
+    return try projectOrdinalPlanTrustedWithLayoutAlloc(alloc, value, table_schema, layout, plan);
+}
+
+pub fn projectOrdinalPlanTrustedWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    plan: OrdinalProjectionPlan,
+) ![]u8 {
+    if (layout.schema_version != table_schema.version or
+        layout.column_count != table_schema.relational_columns.len or
+        plan.schema_version != table_schema.version)
+        return error.RelationalRowSchemaMismatch;
+    const parsed = try parseOrdinalInternal(value, table_schema, layout, false, false);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    for (plan.ordinals) |ordinal_raw| {
+        const ordinal: usize = ordinal_raw;
+        if (!bitmapBit(parsed.present, ordinal)) continue;
+        const column = table_schema.relational_columns[ordinal];
+        const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Project one column after the containing storage page/block has already
+/// authenticated the row. Structural header and target-slot bounds remain
+/// checked, but this avoids hashing and validating unrelated payload bytes.
+pub fn findCellByOrdinalTrusted(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+    ordinal: usize,
+) !?Cell {
+    if (ordinal >= table_schema.relational_columns.len) return null;
+    const parsed = try parseOrdinalInternal(value, table_schema, layout, false, false);
+    if (!bitmapBit(parsed.present, ordinal)) return null;
+    const column = table_schema.relational_columns[ordinal];
+    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+    return try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+}
+
+const ParsedOrdinal = struct {
+    value: []const u8,
+    present: []const u8,
+    nulls: []const u8,
+    fixed: []const u8,
+    offsets_start: usize,
+    payload: []const u8,
+    capabilities: u32,
+    sparse_entries_start: usize = 0,
+    sparse_entry_count: usize = 0,
+    sparse_terminal_offset_pos: usize = 0,
+    semantic_hash: [semantic_hash_len]u8,
+    layout: ?*const PhysicalLayout = null,
+};
+
+/// Parsed, immutable addressing view over one AROW. Filter, projection, and
+/// index execution can resolve several ordinals after paying header/bitmap
+/// validation once, without materializing the enclosing JSON object.
+pub const OrdinalRowView = struct {
+    parsed: ParsedOrdinal,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+
+    pub fn ordinalForName(self: OrdinalRowView, name: []const u8) ?usize {
+        return self.layout.ordinalForName(self.table_schema.relational_columns, name);
+    }
+
+    pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
+        if (ordinal >= self.table_schema.relational_columns.len) return null;
+        if (!bitmapBit(self.parsed.present, ordinal)) return null;
+        const column = self.table_schema.relational_columns[ordinal];
+        const payload = try ordinalPayloadSliceChecked(self.parsed, column, ordinal);
+        return try ordinalCellFromPayload(column, payload, bitmapBit(self.parsed.nulls, ordinal));
+    }
+};
+
+pub fn ordinalRowView(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !OrdinalRowView {
+    return .{
+        .parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout),
+        .table_schema = table_schema,
+        .layout = layout,
+    };
+}
+
+/// Storage pages with authenticated values may omit the row CRC pass. Bounds,
+/// schema identity, capabilities, and addressed cell types remain validated.
+pub fn ordinalRowViewTrusted(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !OrdinalRowView {
+    if (layout.schema_version != table_schema.version or
+        layout.column_count != table_schema.relational_columns.len)
+        return error.RelationalRowSchemaMismatch;
+    return .{
+        .parsed = try parseOrdinalInternal(value, table_schema, layout, false, false),
+        .table_schema = table_schema,
+        .layout = layout,
+    };
+}
+
+fn parseOrdinal(value: []const u8, table_schema: runtime_schema.TableSchema) !ParsedOrdinal {
+    return try parseOrdinalInternal(value, table_schema, null, true, true);
+}
+
+fn parseOrdinalWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !ParsedOrdinal {
+    if (layout.schema_version != table_schema.version or
+        layout.column_count != table_schema.relational_columns.len)
+        return error.RelationalRowSchemaMismatch;
+    return try parseOrdinalInternal(value, table_schema, layout, true, true);
+}
+
+fn parseOrdinalWithLayoutRead(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !ParsedOrdinal {
+    if (layout.schema_version != table_schema.version or
+        layout.column_count != table_schema.relational_columns.len)
+        return error.RelationalRowSchemaMismatch;
+    return try parseOrdinalInternal(value, table_schema, layout, true, false);
+}
+
+fn parseOrdinalInternal(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: ?*const PhysicalLayout,
+    verify_checksum: bool,
+    canonical: bool,
+) !ParsedOrdinal {
+    if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value)) return error.InvalidRelationalRow;
+    if (verify_checksum) {
+        const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
+        if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum) return error.RelationalRowChecksumMismatch;
+    }
+    var pos: usize = magic.len;
+    if (readU32(value, &pos) != ordinal_version) return error.UnsupportedRelationalRowVersion;
+    if (readU32(value, &pos) != table_schema.version) return error.RelationalRowSchemaMismatch;
+    const capabilities = readU32(value, &pos);
+    if (capabilities & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
+    const sparse = capabilities & capability_sparse_slots != 0;
+    const bitmap_len: usize = if (layout) |compiled| compiled.bitmap_len else (table_schema.relational_columns.len + 7) / 8;
+    const expected_bitmap_len: usize = if (layout) |compiled| compiled.bitmap_len else (table_schema.relational_columns.len + 7) / 8;
+    if (bitmap_len != expected_bitmap_len) return error.InvalidRelationalRow;
+    const fixed_len: usize = if (layout) |compiled| compiled.fixed_len else (fixedSectionLen(table_schema.relational_columns) catch return error.InvalidRelationalRow);
+    const expected_fixed_len: usize = if (layout) |compiled| compiled.fixed_len else (fixedSectionLen(table_schema.relational_columns) catch return error.InvalidRelationalRow);
+    if (fixed_len != expected_fixed_len)
+        return error.RelationalRowSchemaMismatch;
+    const variable_count: usize = if (layout) |compiled| compiled.variable_count else countVariableColumns(table_schema.relational_columns);
+    const expected_variable_count: usize = if (layout) |compiled| compiled.variable_count else countVariableColumns(table_schema.relational_columns);
+    if (variable_count != expected_variable_count) return error.RelationalRowSchemaMismatch;
+    var semantic_hash: [semantic_hash_len]u8 = undefined;
+    @memcpy(&semantic_hash, value[pos..][0..semantic_hash_len]);
+    pos += semantic_hash_len;
+    _ = readU64(value, &pos); // resolved logical write timestamp
+    const bitmap_sections_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
+    if (bitmap_sections_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+    const present = value[pos..][0..bitmap_len];
+    pos += bitmap_len;
+    const nulls = value[pos..][0..bitmap_len];
+    pos += bitmap_len;
+    for (nulls, present) |null_byte, present_byte| if (null_byte & ~present_byte != 0) return error.InvalidRelationalRow;
+    if (table_schema.relational_columns.len % 8 != 0 and bitmap_len != 0) {
+        const used_bits: u3 = @intCast(table_schema.relational_columns.len % 8);
+        const unused_mask: u8 = ~((@as(u8, 1) << used_bits) - 1);
+        if (present[bitmap_len - 1] & unused_mask != 0 or nulls[bitmap_len - 1] & unused_mask != 0)
+            return error.InvalidRelationalRow;
+    }
+    var parsed: ParsedOrdinal = undefined;
+    if (sparse) {
+        if (@sizeOf(u32) * 2 > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        const entry_count: usize = readU32(value, &pos);
+        if (entry_count > table_schema.relational_columns.len) return error.InvalidRelationalRow;
+        const entries_len = std.math.mul(usize, entry_count, sparse_entry_len) catch return error.InvalidRelationalRow;
+        const directory_len = std.math.add(usize, entries_len, @sizeOf(u32)) catch return error.InvalidRelationalRow;
+        if (directory_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        const entries_start = pos;
+        const terminal_offset_pos = pos + entries_len;
+        pos += directory_len;
+        const payload = value[pos .. value.len - checksum_len];
+        const terminal_offset = std.mem.readInt(u32, value[terminal_offset_pos..][0..4], .little);
+        if (terminal_offset != payload.len) return error.InvalidRelationalRow;
+        if (verify_checksum or canonical) {
+            var previous_ordinal: ?u32 = null;
+            var previous_offset: u32 = 0;
+            for (0..entry_count) |entry_index| {
+                const entry_pos = entries_start + entry_index * sparse_entry_len;
+                const ordinal = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
+                const offset = std.mem.readInt(u32, value[entry_pos + 4 ..][0..4], .little);
+                if (ordinal >= table_schema.relational_columns.len or
+                    (previous_ordinal != null and ordinal <= previous_ordinal.?) or
+                    !bitmapBit(present, ordinal) or offset < previous_offset or offset > payload.len)
+                    return error.InvalidRelationalRow;
+                previous_ordinal = ordinal;
+                previous_offset = offset;
+            }
+            if (terminal_offset < previous_offset or entry_count != bitmapPopulation(present))
+                return error.InvalidRelationalRow;
+        }
+        parsed = .{
+            .value = value,
+            .present = present,
+            .nulls = nulls,
+            .fixed = &.{},
+            .offsets_start = 0,
+            .payload = payload,
+            .capabilities = capabilities,
+            .sparse_entries_start = entries_start,
+            .sparse_entry_count = entry_count,
+            .sparse_terminal_offset_pos = terminal_offset_pos,
+            .semantic_hash = semantic_hash,
+            .layout = layout,
+        };
+        if (canonical) {
+            for (0..entry_count) |entry_index| {
+                const entry_pos = entries_start + entry_index * sparse_entry_len;
+                const ordinal: usize = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
+                const slot = sparsePayloadSlice(parsed, ordinal) orelse return error.InvalidRelationalRow;
+                const column = table_schema.relational_columns[ordinal];
+                if (bitmapBit(nulls, ordinal)) {
+                    if (slot.len != 0) return error.NonCanonicalRelationalRow;
+                } else if (!isVariableColumn(column) and slot.len != fixedColumnWidth(column)) {
+                    return error.InvalidRelationalRow;
+                }
+            }
+        }
+    } else {
+        const offsets_len = if (variable_count == 0)
+            0
+        else
+            std.math.mul(usize, variable_count + 1, @sizeOf(u32)) catch return error.InvalidRelationalRow;
+        const fixed_start = pos;
+        const offsets_start = std.math.add(usize, fixed_start, fixed_len) catch return error.InvalidRelationalRow;
+        const payload_start = std.math.add(usize, offsets_start, offsets_len) catch return error.InvalidRelationalRow;
+        if (payload_start > value.len - checksum_len) return error.InvalidRelationalRow;
+        const payload_len = value.len - checksum_len - payload_start;
+        if (canonical) {
+            if (variable_count == 0) {
+                if (payload_len != 0) return error.InvalidRelationalRow;
+            } else {
+                var previous: u32 = 0;
+                for (0..variable_count + 1) |ordinal| {
+                    const offset = std.mem.readInt(u32, value[offsets_start + ordinal * 4 ..][0..4], .little);
+                    if (offset < previous or offset > payload_len) return error.InvalidRelationalRow;
+                    previous = offset;
+                }
+                if (previous != payload_len) return error.InvalidRelationalRow;
+            }
+        }
+        parsed = .{
+            .value = value,
+            .present = present,
+            .nulls = nulls,
+            .fixed = value[fixed_start..][0..fixed_len],
+            .offsets_start = offsets_start,
+            .payload = value[payload_start..][0..payload_len],
+            .capabilities = capabilities,
+            .semantic_hash = semantic_hash,
+            .layout = layout,
+        };
+    }
+    // Unset and null slots must have a unique zero/empty physical encoding.
+    // This makes byte equality meaningful during restore verification.
+    if (canonical) {
+        if (sparse != (try shouldUseSparseRepresentation(parsed, table_schema.relational_columns, fixed_len, variable_count)))
+            return error.NonCanonicalRelationalRow;
+        for (table_schema.relational_columns, 0..) |column, ordinal| {
+            if (!bitmapBit(present, ordinal)) {
+                if (column.required) return error.InvalidRelationalRow;
+            } else if (bitmapBit(nulls, ordinal) and !column.allows_null) {
+                return error.InvalidRelationalRow;
+            }
+            if (sparse and !bitmapBit(present, ordinal)) continue;
+            if (bitmapBit(present, ordinal) and !bitmapBit(nulls, ordinal)) continue;
+            const slot = ordinalPayloadSlice(parsed, table_schema.relational_columns, column, ordinal);
+            if (isVariableColumn(column)) {
+                if (slot.len != 0) return error.NonCanonicalRelationalRow;
+            } else {
+                for (slot) |byte| if (byte != 0) return error.NonCanonicalRelationalRow;
+            }
+        }
+    }
+    return parsed;
+}
+
+fn shouldUseSparseRepresentation(
+    parsed: ParsedOrdinal,
+    columns: []const runtime_schema.RelationalColumn,
+    fixed_len: usize,
+    variable_count: usize,
+) !bool {
+    var dense_variable_payload_len: usize = 0;
+    var sparse_payload_len: usize = 0;
+    for (columns, 0..) |column, ordinal| {
+        if (!bitmapBit(parsed.present, ordinal) or bitmapBit(parsed.nulls, ordinal)) continue;
+        const slot = ordinalPayloadSlice(parsed, columns, column, ordinal);
+        if (isVariableColumn(column)) dense_variable_payload_len = std.math.add(usize, dense_variable_payload_len, slot.len) catch
+            return error.InvalidRelationalRow;
+        sparse_payload_len = std.math.add(usize, sparse_payload_len, slot.len) catch
+            return error.InvalidRelationalRow;
+    }
+    const dense_offsets_len = if (variable_count == 0) 0 else std.math.mul(usize, variable_count + 1, @sizeOf(u32)) catch return error.InvalidRelationalRow;
+    const dense_static_len = std.math.add(usize, fixed_len, dense_offsets_len) catch return error.InvalidRelationalRow;
+    const dense_body_len = std.math.add(usize, dense_static_len, dense_variable_payload_len) catch
+        return error.InvalidRelationalRow;
+    const entry_count = bitmapPopulation(parsed.present);
+    const sparse_directory_len = std.math.add(
+        usize,
+        @sizeOf(u32) * 2,
+        std.math.mul(usize, entry_count, sparse_entry_len) catch return error.InvalidRelationalRow,
+    ) catch return error.InvalidRelationalRow;
+    const sparse_body_len = std.math.add(usize, sparse_directory_len, sparse_payload_len) catch
+        return error.InvalidRelationalRow;
+    return sparse_body_len < dense_body_len;
+}
+
+fn ordinalCell(
+    parsed: ParsedOrdinal,
+    columns: []const runtime_schema.RelationalColumn,
+    column: runtime_schema.RelationalColumn,
+    ordinal: usize,
+) !Cell {
+    const is_null = bitmapBit(parsed.nulls, ordinal);
+    const payload = ordinalPayloadSlice(parsed, columns, column, ordinal);
+    return try ordinalCellFromPayload(column, payload, is_null);
+}
+
+fn ordinalCellFromPayload(
+    column: runtime_schema.RelationalColumn,
+    payload: []const u8,
+    is_null: bool,
+) !Cell {
+    const value_type = columnValueType(column.column_type);
+    const typed_value = if (is_null)
+        zeroValue(value_type)
+    else
+        try decodeOrdinalPayload(payload, value_type);
+    const cell: Cell = .{
+        .path = column.path,
+        .value_type = value_type,
+        .is_json = column.is_json,
+        .is_null = is_null,
+        .value = typed_value,
+    };
+    if (!cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
+    if (!is_null and value_type == .bytes_val) {
+        if (column.is_json) {
+            if (!(try std.json.validate(std.heap.page_allocator, cell.value.bytes_val))) return error.InvalidRelationalRow;
+        } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val) and column.column_type != .blob) {
+            return error.InvalidRelationalRow;
+        }
+    }
+    return cell;
+}
+
+fn ordinalPayloadSliceChecked(
+    parsed: ParsedOrdinal,
+    column: runtime_schema.RelationalColumn,
+    ordinal: usize,
+) ![]const u8 {
+    if (parsed.capabilities & capability_sparse_slots != 0)
+        return sparsePayloadSlice(parsed, ordinal) orelse return error.InvalidRelationalRow;
+    const layout = parsed.layout orelse return error.InvalidRelationalRow;
+    if (isVariableColumn(column)) {
+        const index: usize = layout.variable_indexes[ordinal];
+        const start: usize = @intCast(std.mem.readInt(u32, parsed.value[parsed.offsets_start + index * 4 ..][0..4], .little));
+        const end: usize = @intCast(std.mem.readInt(u32, parsed.value[parsed.offsets_start + (index + 1) * 4 ..][0..4], .little));
+        if (start > end or end > parsed.payload.len) return error.InvalidRelationalRow;
+        return parsed.payload[start..end];
+    }
+    const start: usize = layout.fixed_offsets[ordinal];
+    const width = fixedColumnWidth(column);
+    if (start > parsed.fixed.len or width > parsed.fixed.len - start) return error.InvalidRelationalRow;
+    return parsed.fixed[start..][0..width];
+}
+
+fn ordinalPayloadSlice(
+    parsed: ParsedOrdinal,
+    columns: []const runtime_schema.RelationalColumn,
+    column: runtime_schema.RelationalColumn,
+    ordinal: usize,
+) []const u8 {
+    if (parsed.capabilities & capability_sparse_slots != 0)
+        return sparsePayloadSlice(parsed, ordinal) orelse &.{};
+    if (isVariableColumn(column)) {
+        const index: usize = if (parsed.layout) |layout| layout.variable_indexes[ordinal] else variableIndexBefore(columns, ordinal);
+        const start: usize = @intCast(std.mem.readInt(u32, parsed.value[parsed.offsets_start + index * 4 ..][0..4], .little));
+        const end: usize = @intCast(std.mem.readInt(u32, parsed.value[parsed.offsets_start + (index + 1) * 4 ..][0..4], .little));
+        return parsed.payload[start..end];
+    }
+    const start: usize = if (parsed.layout) |layout| layout.fixed_offsets[ordinal] else fixedOffsetBefore(columns, ordinal);
+    return parsed.fixed[start..][0..fixedColumnWidth(column)];
+}
+
+fn sparsePayloadSlice(parsed: ParsedOrdinal, target_ordinal: usize) ?[]const u8 {
+    var lower: usize = 0;
+    var upper: usize = parsed.sparse_entry_count;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        const entry_pos = parsed.sparse_entries_start + middle * sparse_entry_len;
+        const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
+        if (ordinal < target_ordinal) {
+            lower = middle + 1;
+        } else if (ordinal > target_ordinal) {
+            upper = middle;
+        } else {
+            const start: usize = std.mem.readInt(u32, parsed.value[entry_pos + 4 ..][0..4], .little);
+            const end: usize = if (middle + 1 < parsed.sparse_entry_count)
+                std.mem.readInt(u32, parsed.value[entry_pos + sparse_entry_len + 4 ..][0..4], .little)
+            else
+                std.mem.readInt(u32, parsed.value[parsed.sparse_terminal_offset_pos..][0..4], .little);
+            if (start > end or end > parsed.payload.len) return null;
+            return parsed.payload[start..end];
+        }
+    }
+    return null;
+}
+
+fn bitmapPopulation(bitmap: []const u8) usize {
+    var count: usize = 0;
+    for (bitmap) |byte| count += @popCount(byte);
+    return count;
+}
+
+fn encodeOrdinalFixed(out: []u8, cell: Cell) !void {
+    var pos: usize = 0;
+    switch (cell.value) {
+        .u64_val => |value| writeU64(out, &pos, value),
+        .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
+        .f64_val => |value| writeU64(out, &pos, @bitCast(value)),
+        .bool_val => |value| {
+            if (out.len != 1) return error.InvalidRelationalRow;
+            out[0] = @intFromBool(value);
+            pos = 1;
+        },
+        .geo_point => |value| {
+            writeU64(out, &pos, @bitCast(value.lat));
+            writeU64(out, &pos, @bitCast(value.lon));
+        },
+        .bytes_val, .numeric_val => return error.InvalidRelationalRow,
+    }
+    if (pos != out.len) return error.InvalidRelationalRow;
+}
+
+fn appendOrdinalPayload(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cell: Cell) !void {
+    var fixed: [17]u8 = undefined;
+    var pos: usize = 0;
+    switch (cell.value) {
+        .u64_val => |value| writeU64(&fixed, &pos, value),
+        .i64_val => |value| writeU64(&fixed, &pos, @bitCast(value)),
+        .f64_val => |value| writeU64(&fixed, &pos, @bitCast(value)),
+        .bool_val => |value| {
+            fixed[0] = @intFromBool(value);
+            pos = 1;
+        },
+        .geo_point => |value| {
+            writeU64(&fixed, &pos, @bitCast(value.lat));
+            writeU64(&fixed, &pos, @bitCast(value.lon));
+        },
+        .numeric_val => |value| switch (value) {
+            .u64_val => |number| {
+                fixed[0] = 0;
+                pos = 1;
+                writeU64(&fixed, &pos, number);
+            },
+            .i64_val => |number| {
+                fixed[0] = 1;
+                pos = 1;
+                writeU64(&fixed, &pos, @bitCast(number));
+            },
+            .f64_val => |number| {
+                fixed[0] = 2;
+                pos = 1;
+                writeU64(&fixed, &pos, @bitCast(number));
+            },
+        },
+        .bytes_val => |bytes| return try out.appendSlice(alloc, bytes),
+    }
+    try out.appendSlice(alloc, fixed[0..pos]);
+}
+
+fn decodeOrdinalPayload(payload: []const u8, value_type: typed_dv.ValueType) !typed_dv.TypedValue {
+    return switch (value_type) {
+        .u64_val => if (payload.len == 8) .{ .u64_val = std.mem.readInt(u64, payload[0..8], .little) } else error.InvalidRelationalRow,
+        .i64_val => if (payload.len == 8) .{ .i64_val = @bitCast(std.mem.readInt(u64, payload[0..8], .little)) } else error.InvalidRelationalRow,
+        .f64_val => if (payload.len == 8) .{ .f64_val = @bitCast(std.mem.readInt(u64, payload[0..8], .little)) } else error.InvalidRelationalRow,
+        .bool_val => if (payload.len == 1 and payload[0] <= 1) .{ .bool_val = payload[0] == 1 } else error.InvalidRelationalRow,
+        .geo_point => if (payload.len == 16) .{ .geo_point = .{
+            .lat = @bitCast(std.mem.readInt(u64, payload[0..8], .little)),
+            .lon = @bitCast(std.mem.readInt(u64, payload[8..16], .little)),
+        } } else error.InvalidRelationalRow,
+        .bytes_val => .{ .bytes_val = payload },
+        .numeric_val => if (payload.len != 9) error.InvalidRelationalRow else switch (payload[0]) {
+            0 => .{ .numeric_val = .{ .u64_val = std.mem.readInt(u64, payload[1..9], .little) } },
+            1 => .{ .numeric_val = .{ .i64_val = @bitCast(std.mem.readInt(u64, payload[1..9], .little)) } },
+            2 => .{ .numeric_val = .{ .f64_val = @bitCast(std.mem.readInt(u64, payload[1..9], .little)) } },
+            else => error.InvalidRelationalRow,
+        },
+    };
+}
+
+fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
+    return switch (column_type) {
+        .datetime => .u64_val,
+        .integer => .i64_val,
+        .number => .f64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        .string, .blob, .geoshape, .json => .bytes_val,
+    };
+}
+
+fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
+    return switch (column.column_type) {
+        .string, .blob, .geoshape, .json => true,
+        .datetime, .integer, .number, .boolean, .geopoint => false,
+    };
+}
+
+fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
+    return switch (column.column_type) {
+        .datetime, .integer, .number => 8,
+        .boolean => 1,
+        .geopoint => 16,
+        .string, .blob, .geoshape, .json => 0,
+    };
+}
+
+fn fixedSectionLen(columns: []const runtime_schema.RelationalColumn) !usize {
+    var result: usize = 0;
+    for (columns) |column| result = std.math.add(usize, result, fixedColumnWidth(column)) catch
+        return error.InvalidRelationalRow;
+    return result;
+}
+
+fn countVariableColumns(columns: []const runtime_schema.RelationalColumn) usize {
+    var count: usize = 0;
+    for (columns) |column| count += @intFromBool(isVariableColumn(column));
+    return count;
+}
+
+fn fixedOffsetBefore(columns: []const runtime_schema.RelationalColumn, ordinal: usize) usize {
+    var result: usize = 0;
+    for (columns[0..ordinal]) |column| result += fixedColumnWidth(column);
+    return result;
+}
+
+fn variableIndexBefore(columns: []const runtime_schema.RelationalColumn, ordinal: usize) usize {
+    var result: usize = 0;
+    for (columns[0..ordinal]) |column| result += @intFromBool(isVariableColumn(column));
+    return result;
+}
+
+fn setBitmapBit(bitmap: []u8, ordinal: usize) void {
+    bitmap[ordinal / 8] |= @as(u8, 1) << @intCast(ordinal % 8);
+}
+
+fn bitmapBit(bitmap: []const u8, ordinal: usize) bool {
+    return bitmap[ordinal / 8] & (@as(u8, 1) << @intCast(ordinal % 8)) != 0;
 }
 
 fn serializedLenAdd(current: usize, additional: usize) !usize {
@@ -268,165 +1321,6 @@ fn writeU64(buf: []u8, pos: *usize, value: u64) void {
     pos.* += @sizeOf(u64);
 }
 
-/// A decoded row. `cells` and the `path`/`bytes_val` slices they reference
-/// borrow `data` (the stored value), so the row is valid only while `data` is.
-pub const Row = struct {
-    cells: []Cell,
-
-    pub fn deinit(self: *Row, alloc: Allocator) void {
-        alloc.free(self.cells);
-    }
-};
-
-/// Decode a row. The returned cell slice is heap-allocated (free via
-/// `Row.deinit`); `path` and `bytes_val` borrow `data`.
-pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
-    var cursor = try RowCursor.init(alloc, data);
-    defer cursor.deinit();
-    const cells = try alloc.alloc(Cell, cursor.count);
-    errdefer alloc.free(cells);
-
-    for (cells) |*cell| cell.* = (try cursor.next()) orelse return error.InvalidRelationalRow;
-    try cursor.finish();
-
-    return .{ .cells = cells };
-}
-
-/// Validate a serialized row without allocating a decoded cell array. This is
-/// used by paths that only need a few cells but must still reject malformed
-/// authoritative packed rows before trusting derived index payloads.
-pub fn validate(data: []const u8) !void {
-    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
-    var cursor = try RowCursor.init(stack.get(), data);
-    defer cursor.deinit();
-    while (try cursor.next()) |_| {}
-    try cursor.finish();
-}
-
-fn validateCellCount(remaining: usize, count: u32) !void {
-    if (count > remaining / min_encoded_cell_len) return error.InvalidRelationalRow;
-}
-
-pub const CellLookup = struct {
-    path: []const u8,
-    alternate_path: []const u8 = "",
-};
-
-/// Collect several cells from one serialized row scan. This validates the row
-/// while scanning, but only copies matching cell descriptors into `out`; the
-/// returned cells still borrow `value`.
-pub fn collectCellsByLookup(value: []const u8, lookups: []const CellLookup, out: []?Cell) !void {
-    if (lookups.len != out.len) return error.InvalidArgument;
-    for (out) |*item| item.* = null;
-    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
-    var cursor = try RowCursor.init(stack.get(), value);
-    defer cursor.deinit();
-    while (try cursor.next()) |cell| {
-        for (lookups, 0..) |lookup, lookup_index| {
-            if (out[lookup_index] != null) continue;
-            if (std.mem.eql(u8, cell.path, lookup.path) or
-                (lookup.alternate_path.len != 0 and std.mem.eql(u8, cell.path, lookup.alternate_path)))
-            {
-                out[lookup_index] = cell;
-            }
-        }
-    }
-    try cursor.finish();
-}
-
-const RowCursor = struct {
-    alloc: Allocator,
-    data: []const u8,
-    pos: usize,
-    count: u32,
-    read_count: u32 = 0,
-    seen: std.StringHashMapUnmanaged(void) = .empty,
-
-    fn init(alloc: Allocator, data: []const u8) !RowCursor {
-        if (data.len < magic.len + 8) return error.InvalidRelationalRow;
-        if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
-        var pos: usize = magic.len;
-        const ver = readU32(data, &pos);
-        if (ver != version) return error.UnsupportedRelationalRowVersion;
-        const count = readU32(data, &pos);
-        try validateCellCount(data.len - pos, count);
-        var cursor = RowCursor{ .alloc = alloc, .data = data, .pos = pos, .count = count };
-        errdefer cursor.seen.deinit(alloc);
-        try cursor.seen.ensureTotalCapacity(alloc, count);
-        return cursor;
-    }
-
-    fn deinit(self: *RowCursor) void {
-        self.seen.deinit(self.alloc);
-    }
-
-    fn next(self: *RowCursor) !?Cell {
-        if (self.read_count == self.count) return null;
-        const cell = try readCellAt(self.data, &self.pos);
-        try validateCell(self.alloc, cell);
-        const entry = try self.seen.getOrPut(self.alloc, cell.path);
-        if (entry.found_existing) return error.InvalidRelationalRow;
-        self.read_count += 1;
-        return cell;
-    }
-
-    fn finish(self: RowCursor) !void {
-        if (self.read_count != self.count or self.pos != self.data.len) return error.InvalidRelationalRow;
-    }
-};
-
-/// Decode the cell at `pos.*`, advancing `pos`. Shared by full deserialization
-/// and the single-column accessor. The `path`/`bytes_val` slices borrow `data`.
-fn readCellAt(data: []const u8, pos: *usize) !Cell {
-    const path = try readStr(data, pos);
-    if (pos.* + 2 > data.len) return error.InvalidRelationalRow;
-    const flags = data[pos.*];
-    const value_type = valueTypeFromByte(data[pos.* + 1]) orelse return error.InvalidRelationalRow;
-    pos.* += 2;
-    if (flags & ~known_flags != 0) return error.InvalidRelationalRow;
-    if (flags & flag_is_json != 0 and value_type != .bytes_val) return error.InvalidRelationalRow;
-
-    const is_null = flags & flag_is_null != 0;
-    const value: typed_dv.TypedValue = if (is_null) zeroValue(value_type) else switch (value_type) {
-        .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
-        .i64_val => .{ .i64_val = @bitCast(try readU64Checked(data, pos)) },
-        .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
-        .numeric_val => .{ .numeric_val = try readNumericValue(data, pos) },
-        .bool_val => blk: {
-            if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
-            if (data[pos.*] > 1) return error.InvalidRelationalRow;
-            const b = data[pos.*] == 1;
-            pos.* += 1;
-            break :blk .{ .bool_val = b };
-        },
-        .geo_point => blk: {
-            const lat: f64 = @bitCast(try readU64Checked(data, pos));
-            const lon: f64 = @bitCast(try readU64Checked(data, pos));
-            break :blk .{ .geo_point = .{ .lat = lat, .lon = lon } };
-        },
-        .bytes_val => blk: {
-            if (pos.* + 4 > data.len) return error.InvalidRelationalRow;
-            const len = readU32(data, pos);
-            if (pos.* + len > data.len) return error.InvalidRelationalRow;
-            const bytes = data[pos.* .. pos.* + len];
-            pos.* += len;
-            break :blk .{ .bytes_val = bytes };
-        },
-    };
-
-    const cell: Cell = .{
-        .path = path,
-        .value_type = value_type,
-        .is_json = (flags & flag_is_json) != 0,
-        .is_null = is_null,
-        .value = value,
-    };
-    if (!std.unicode.utf8ValidateSlice(cell.path) or !cellValueIsSerializable(cell)) {
-        return error.InvalidRelationalRow;
-    }
-    return cell;
-}
-
 fn zeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
     return switch (value_type) {
         .u64_val => .{ .u64_val = 0 },
@@ -439,49 +1333,9 @@ fn zeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
     };
 }
 
-/// Look up a single column by its JSON path directly from a serialized row,
-/// without allocating the full cell array. Returns the decoded cell (its
-/// `path`/`bytes_val` borrow `value`) or null if the row has no such column.
-/// This is the Seam B accessor: a field-scoped consumer (e.g. an enrichment
-/// `source_field`) reads one column instead of reconstructing the whole
-/// document. Returns null for a non-row value.
-pub fn findCellByPath(value: []const u8, path: []const u8) !?Cell {
-    if (!looksLikeRow(value)) return null;
-    var stack = std.heap.stackFallback(2048, std.heap.page_allocator);
-    var cursor = try RowCursor.init(stack.get(), value);
-    defer cursor.deinit();
-    var found: ?Cell = null;
-    while (try cursor.next()) |cell| {
-        if (found == null and std.mem.eql(u8, cell.path, path)) found = cell;
-    }
-    try cursor.finish();
-    return found;
-}
-
-/// Reconstruct a document's canonical JSON directly from a serialized typed-row
-/// value. Schema-free. Caller owns the returned bytes.
-pub fn reconstructValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    var cursor = try RowCursor.init(alloc, value);
-    defer cursor.deinit();
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    try out.append(alloc, '{');
-    var needs_comma = false;
-    while (try cursor.next()) |cell| {
-        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
-        needs_comma = true;
-    }
-    try cursor.finish();
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
 /// Materialize a document-mode stored value as JSON by returning an owned copy.
-/// Relational rows must go through `reconstructValueAlloc` at a relational row
-/// keyspace read seam; this generic document path intentionally has no AROW
-/// fallback because relational mode is a new format with no legacy primary-row
-/// compatibility contract.
+/// Relational rows require an immutable schema layout at their read seam; this
+/// generic document path intentionally has no AROW fallback.
 pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     return try alloc.dupe(u8, value);
 }
@@ -559,7 +1413,7 @@ fn appendValidatedCellValue(
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
         .bytes_val => {
             if (cell.is_json) {
-                // RowCursor/appendCellValue validates this exactly once before
+                // The ordinal parser and appendCellValue validate this before
                 // reaching the hot formatting path.
                 try out.appendSlice(alloc, cell.value.bytes_val);
             } else {
@@ -609,329 +1463,143 @@ fn hexDigit(value: u8) u8 {
     return if (value < 10) '0' + value else 'a' + (value - 10);
 }
 
-fn valueTypeFromByte(tag: u8) ?typed_dv.ValueType {
-    if (tag >= std.meta.fields(typed_dv.ValueType).len) return null;
-    return @enumFromInt(tag);
-}
-
 fn readU32(data: []const u8, pos: *usize) u32 {
     const val = std.mem.readInt(u32, data[pos.*..][0..4], .little);
     pos.* += 4;
     return val;
 }
 
-fn readU64Checked(data: []const u8, pos: *usize) !u64 {
-    if (pos.* + 8 > data.len) return error.InvalidRelationalRow;
+fn readU64(data: []const u8, pos: *usize) u64 {
     const val = std.mem.readInt(u64, data[pos.*..][0..8], .little);
     pos.* += 8;
     return val;
 }
 
-fn readNumericValue(data: []const u8, pos: *usize) !typed_dv.NumericValue {
-    if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
-    const tag = data[pos.*];
-    pos.* += 1;
-    const raw = try readU64Checked(data, pos);
-    return switch (tag) {
-        0 => .{ .u64_val = raw },
-        1 => .{ .i64_val = @bitCast(raw) },
-        2 => .{ .f64_val = @bitCast(raw) },
-        else => error.InvalidRelationalRow,
-    };
-}
-
-fn readStr(data: []const u8, pos: *usize) ![]const u8 {
-    if (pos.* + 4 > data.len) return error.InvalidRelationalRow;
-    const len = readU32(data, pos);
-    if (pos.* + len > data.len) return error.InvalidRelationalRow;
-    const s = data[pos.*..][0..len];
-    pos.* += len;
-    return s;
-}
-
-test "relational row codec round-trips every value type and reconstructs canonical JSON" {
+test "ordinal rows bind layout support projection checksum and canonical bytes" {
     const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "name", .path = "name", .column_type = .string, .required = true },
+        .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
+        .{ .name = "active", .path = "active", .column_type = .boolean, .allows_null = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+        .{ .name = "note", .path = "note", .column_type = .string },
+    };
+    const schema = runtime_schema.TableSchema{
+        .version = 7,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
     const cells = [_]Cell{
-        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
-        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
-        .{ .path = "exact_int", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .i64_val = -9007199254740993 } } },
-        .{ .path = "exact_uint", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .u64_val = 9007199254740993 } } },
-        .{ .path = "fraction", .value_type = .numeric_val, .value = .{ .numeric_val = .{ .f64_val = 10.5 } } },
-        .{ .path = "ts", .value_type = .u64_val, .value = .{ .u64_val = 1000 } },
-        .{ .path = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
-        .{ .path = "loc", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 1.5, .lon = -2.5 } } },
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"k\":1}" } },
+        .{ .path = "name", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
+        .{ .path = "count", .value_type = .i64_val, .value = .{ .i64_val = -42 } },
+        .{ .path = "active", .value_type = .bool_val, .is_null = true, .value = .{ .bool_val = false } },
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"x\":1}" } },
     };
 
-    const encoded = try serialize(alloc, &cells);
+    const semantic_hash = [_]u8{0x5a} ** semantic_hash_len;
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, semantic_hash);
     defer alloc.free(encoded);
-    try std.testing.expect(looksLikeRow(encoded));
-
-    var row = try deserialize(alloc, encoded);
-    defer row.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 9), row.cells.len);
-    try std.testing.expectEqualStrings("id", row.cells[0].path);
-    try std.testing.expectEqualStrings("abc", row.cells[0].value.bytes_val);
-    try std.testing.expectEqual(@as(f64, 12.5), row.cells[1].value.f64_val);
-    try std.testing.expectEqual(typed_dv.NumericValue{ .i64_val = -9007199254740993 }, row.cells[2].value.numeric_val);
-    try std.testing.expectEqual(typed_dv.NumericValue{ .u64_val = 9007199254740993 }, row.cells[3].value.numeric_val);
-    try std.testing.expectEqual(typed_dv.NumericValue{ .f64_val = 10.5 }, row.cells[4].value.numeric_val);
-    try std.testing.expectEqual(@as(u64, 1000), row.cells[5].value.u64_val);
-    try std.testing.expect(row.cells[6].value.bool_val);
-    try std.testing.expectEqual(@as(f64, -2.5), row.cells[7].value.geo_point.lon);
-    try std.testing.expect(row.cells[8].is_json);
-
-    const json = try reconstructDocumentAlloc(alloc, row.cells);
-    defer alloc.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"id\":\"abc\",\"amount\":12.5,\"exact_int\":-9007199254740993,\"exact_uint\":9007199254740993,\"fraction\":10.5,\"ts\":1000,\"active\":true,\"loc\":{\"lat\":1.5,\"lon\":-2.5},\"payload\":{\"k\":1}}",
-        json,
+    try std.testing.expectEqual(@as(usize, 99), encoded.len);
+    const stored_semantic_hash = try rowSemanticHash(encoded);
+    try std.testing.expectEqualSlices(u8, &semantic_hash, &stored_semantic_hash);
+    try std.testing.expectEqual(@as(u64, 0), try rowWriteTimestampNs(encoded));
+    try setOrdinalWriteTimestampNs(encoded, 123_456);
+    try std.testing.expectEqual(@as(u64, 123_456), try rowWriteTimestampNs(encoded));
+    const timestamped_semantic_hash = try rowSemanticHash(encoded);
+    try std.testing.expectEqualSlices(u8, &semantic_hash, &timestamped_semantic_hash);
+    var physical_layout = try PhysicalLayout.init(alloc, schema);
+    defer physical_layout.deinit();
+    const trusted_projected = (try findCellByOrdinalTrusted(encoded, schema, &physical_layout, 1)).?;
+    try std.testing.expectEqual(@as(i64, -42), trusted_projected.value.i64_val);
+    try std.testing.expectEqual(@as(u32, 7), try rowSchemaVersion(encoded));
+    try validateOrdinal(encoded, schema);
+    const projected = (try findCellByOrdinal(encoded, schema, 1)).?;
+    try std.testing.expectEqual(@as(i64, -42), projected.value.i64_val);
+    try std.testing.expect((try findCellByOrdinal(encoded, schema, 4)) == null);
+    const projected_json = try projectOrdinalFieldsWithLayoutAlloc(
+        alloc,
+        encoded,
+        schema,
+        &physical_layout,
+        &.{ "payload", "name" },
     );
-}
-
-test "relational row codec reconstructs an empty row" {
-    const alloc = std.testing.allocator;
-    const encoded = try serialize(alloc, &.{});
-    defer alloc.free(encoded);
-    var row = try deserialize(alloc, encoded);
-    defer row.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), row.cells.len);
-    const json = try reconstructDocumentAlloc(alloc, row.cells);
-    defer alloc.free(json);
-    try std.testing.expectEqualStrings("{}", json);
-}
-
-test "relational row codec preserves explicit null cells" {
-    const alloc = std.testing.allocator;
-    const encoded = try serialize(alloc, &.{
-        .{ .path = "name", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "ignored" } },
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .is_null = true, .value = .{ .bytes_val = "ignored" } },
-        .{ .path = "active", .value_type = .bool_val, .is_null = true, .value = .{ .bool_val = true } },
-    });
-    defer alloc.free(encoded);
-
-    var row = try deserialize(alloc, encoded);
-    defer row.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), row.cells.len);
-    for (row.cells) |cell| try std.testing.expect(cell.is_null);
-
-    const reconstructed = try reconstructValueAlloc(alloc, encoded);
-    defer alloc.free(reconstructed);
-    try std.testing.expectEqualStrings("{\"name\":null,\"payload\":null,\"active\":null}", reconstructed);
-
-    var segment_json = std.ArrayListUnmanaged(u8).empty;
-    defer segment_json.deinit(alloc);
-    try segment_json.append(alloc, '{');
-    try appendCellValue(alloc, &segment_json, "name", .bytes_val, false, true, .{ .bytes_val = "ignored" }, false);
-    try appendCellValue(alloc, &segment_json, "active", .bool_val, false, true, .{ .bool_val = true }, true);
-    try segment_json.append(alloc, '}');
-    try std.testing.expectEqualStrings("{\"name\":null,\"active\":null}", segment_json.items);
-}
-
-test "relational row codec escapes string paths and values" {
-    const alloc = std.testing.allocator;
-    const cells = [_]Cell{
-        .{ .path = "na\"me", .value_type = .bytes_val, .value = .{ .bytes_val = "a\"b" } },
-        .{ .path = "slash\\path", .value_type = .bytes_val, .value = .{ .bytes_val = "line\n tab\t nul\x00" } },
-    };
-    const encoded = try serialize(alloc, &cells);
-    defer alloc.free(encoded);
-    var row = try deserialize(alloc, encoded);
-    defer row.deinit(alloc);
-    const json = try reconstructDocumentAlloc(alloc, row.cells);
-    defer alloc.free(json);
-    try std.testing.expectEqualStrings("{\"na\\\"me\":\"a\\\"b\",\"slash\\\\path\":\"line\\n tab\\t nul\\u0000\"}", json);
-}
-
-test "relational row codec rejects bad magic, version, and truncation" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(!looksLikeRow("XXXX"));
-    try std.testing.expect(!looksLikeRow("AR"));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, "XXXXxxxxxxxx"));
-    try std.testing.expectError(error.InvalidRelationalRow, validate("XXXXxxxxxxxx"));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, "AROW"));
-    try std.testing.expectError(error.InvalidRelationalRow, validate("AROW"));
-
-    // Valid header claiming one cell but no cell bytes -> truncation error.
-    var buf: [12]u8 = undefined;
-    @memcpy(buf[0..4], &magic);
-    std.mem.writeInt(u32, buf[4..8], version, .little);
-    std.mem.writeInt(u32, buf[8..12], 1, .little);
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, &buf));
-    try std.testing.expectError(error.InvalidRelationalRow, validate(&buf));
-
-    // Unsupported version.
-    var verbuf: [12]u8 = undefined;
-    @memcpy(verbuf[0..4], &magic);
-    std.mem.writeInt(u32, verbuf[4..8], version + 1, .little);
-    std.mem.writeInt(u32, verbuf[8..12], 0, .little);
-    try std.testing.expectError(error.UnsupportedRelationalRowVersion, deserialize(alloc, &verbuf));
-    try std.testing.expectError(error.UnsupportedRelationalRowVersion, validate(&verbuf));
-
-    // Reject an attacker-controlled count before trying to allocate it.
-    std.mem.writeInt(u32, buf[8..12], std.math.maxInt(u32), .little);
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, &buf));
-    try std.testing.expectError(error.InvalidRelationalRow, validate(&buf));
-}
-
-test "relational row codec rejects non-canonical and trailing encodings" {
-    const alloc = std.testing.allocator;
-    const cells = [_]Cell{
-        .{ .path = "", .value_type = .bool_val, .value = .{ .bool_val = true } },
-    };
-    const encoded = try serialize(alloc, &cells);
-    defer alloc.free(encoded);
-
-    var malformed: [20]u8 = undefined;
-    @memcpy(malformed[0..encoded.len], encoded);
-
-    malformed[16] = 0x80; // unknown flag bit
-    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0..encoded.len]));
-
-    malformed[16] = 0;
-    malformed[18] = 2; // booleans are canonically 0 or 1
-    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0..encoded.len]));
-
-    @memcpy(malformed[0..encoded.len], encoded);
-    malformed[encoded.len] = 0;
-    try std.testing.expectError(error.InvalidRelationalRow, validate(malformed[0 .. encoded.len + 1]));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, malformed[0 .. encoded.len + 1]));
-    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(malformed[0 .. encoded.len + 1], ""));
-}
-
-test "relational row codec rejects mismatched and non-JSON-safe cells" {
-    const alloc = std.testing.allocator;
-    const mismatched = [_]Cell{
-        .{ .path = "value", .value_type = .u64_val, .value = .{ .bool_val = true } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serializedLen(&mismatched));
-
-    const non_finite = [_]Cell{
-        .{ .path = "value", .value_type = .f64_val, .value = .{ .f64_val = std.math.nan(f64) } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &non_finite));
-
-    const invalid_json = [_]Cell{
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{" } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_json));
-    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_json));
-
-    const invalid_utf8 = [_]Cell{
-        .{ .path = "value", .value_type = .bytes_val, .value = .{ .bytes_val = "\xff" } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_utf8));
-    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &invalid_utf8));
-
-    const invalid_geopoint = [_]Cell{
-        .{ .path = "location", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 91, .lon = 0 } } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_geopoint));
-
-    const invalid_path = [_]Cell{
-        .{ .path = "\xff", .value_type = .bool_val, .value = .{ .bool_val = true } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &invalid_path));
-
-    const duplicate_paths = [_]Cell{
-        .{ .path = "value", .value_type = .bool_val, .value = .{ .bool_val = true } },
-        .{ .path = "value", .value_type = .bool_val, .value = .{ .bool_val = false } },
-    };
-    try std.testing.expectError(error.InvalidRelationalRow, serialize(alloc, &duplicate_paths));
-    try std.testing.expectError(error.InvalidRelationalRow, reconstructDocumentAlloc(alloc, &duplicate_paths));
-
-    const finite = [_]Cell{
-        .{ .path = "", .value_type = .f64_val, .value = .{ .f64_val = 1 } },
-    };
-    const corrupted = try serialize(alloc, &finite);
-    defer alloc.free(corrupted);
-    std.mem.writeInt(u64, corrupted[18..26], @bitCast(std.math.nan(f64)), .little);
-    try std.testing.expectError(error.InvalidRelationalRow, validate(corrupted));
-}
-
-test "relational row readers reject corrupt JSON and duplicate paths" {
-    const alloc = std.testing.allocator;
-    const text_row = try serialize(alloc, &.{
-        .{ .path = "title", .value_type = .bytes_val, .value = .{ .bytes_val = "a" } },
-    });
-    defer alloc.free(text_row);
-    text_row[text_row.len - 1] = 0xff;
-    try std.testing.expectError(error.InvalidRelationalRow, validate(text_row));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, text_row));
-    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(text_row, "title"));
-
-    const json_row = try serialize(alloc, &.{
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{}" } },
-    });
-    defer alloc.free(json_row);
-    const json_offset = std.mem.indexOf(u8, json_row, "{}") orelse return error.TestUnexpectedResult;
-    json_row[json_offset + 1] = 'x';
-    try std.testing.expectError(error.InvalidRelationalRow, validate(json_row));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, json_row));
-    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(json_row, "payload"));
-
-    const duplicate_row = try serialize(alloc, &.{
-        .{ .path = "a", .value_type = .bool_val, .value = .{ .bool_val = true } },
-        .{ .path = "b", .value_type = .bool_val, .value = .{ .bool_val = false } },
-    });
-    defer alloc.free(duplicate_row);
-    // Header (12) + first bool cell (8) + second path length (4).
-    duplicate_row[24] = 'a';
-    try std.testing.expectError(error.InvalidRelationalRow, validate(duplicate_row));
-    try std.testing.expectError(error.InvalidRelationalRow, deserialize(alloc, duplicate_row));
-    try std.testing.expectError(error.InvalidRelationalRow, findCellByPath(duplicate_row, "a"));
-    var found: [1]?Cell = undefined;
-    try std.testing.expectError(
-        error.InvalidRelationalRow,
-        collectCellsByLookup(duplicate_row, &.{.{ .path = "a" }}, &found),
+    defer alloc.free(projected_json);
+    try std.testing.expectEqualStrings("{\"payload\":{\"x\":1},\"name\":\"alpha\"}", projected_json);
+    const trusted_projected_json = try projectOrdinalFieldsTrustedWithLayoutAlloc(
+        alloc,
+        encoded,
+        schema,
+        &physical_layout,
+        &.{ "payload", "name" },
     );
+    defer alloc.free(trusted_projected_json);
+    try std.testing.expectEqualStrings(projected_json, trusted_projected_json);
+
+    const json = try reconstructOrdinalValueAlloc(alloc, encoded, schema);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings("{\"name\":\"alpha\",\"count\":-42,\"active\":null,\"payload\":{\"x\":1}}", json);
+
+    var wrong_schema = schema;
+    wrong_schema.version = 8;
+    try std.testing.expectError(error.RelationalRowSchemaMismatch, validateOrdinal(encoded, wrong_schema));
+
+    const corrupt = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - checksum_len - 1] ^= 1;
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, validateOrdinal(corrupt, schema));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, rowSemanticHash(corrupt));
+
+    const unsupported = try alloc.dupe(u8, encoded);
+    defer alloc.free(unsupported);
+    std.mem.writeInt(u32, unsupported[12..16], 1 << 31, .little);
+    const unsupported_checksum = std.hash.Crc32.hash(unsupported[0 .. unsupported.len - checksum_len]);
+    std.mem.writeInt(u32, unsupported[unsupported.len - checksum_len ..][0..checksum_len], unsupported_checksum, .little);
+    try std.testing.expectError(error.UnsupportedRelationalRowVersion, rowSemanticHash(unsupported));
+    try std.testing.expectError(error.UnsupportedRelationalRowVersion, validateOrdinal(unsupported, schema));
+
+    // A null fixed-width slot must remain zero even under a valid checksum.
+    const noncanonical = try alloc.dupe(u8, encoded);
+    defer alloc.free(noncanonical);
+    const fixed_start = ordinal_header_len + 2; // two one-byte bitmaps
+    noncanonical[fixed_start + 8] = 1; // boolean slot after the i64 slot
+    const checksum = std.hash.Crc32.hash(noncanonical[0 .. noncanonical.len - checksum_len]);
+    std.mem.writeInt(u32, noncanonical[noncanonical.len - checksum_len ..][0..checksum_len], checksum, .little);
+    try std.testing.expectError(error.NonCanonicalRelationalRow, validateOrdinal(noncanonical, schema));
 }
 
-test "findCellByPath reads a single column without full deserialization" {
+test "ordinal rows use sparse slots for wide optional schemas" {
     const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "c0", .path = "c0", .column_type = .integer },
+        .{ .name = "c1", .path = "c1", .column_type = .integer },
+        .{ .name = "c2", .path = "c2", .column_type = .integer },
+        .{ .name = "c3", .path = "c3", .column_type = .integer },
+        .{ .name = "c4", .path = "c4", .column_type = .integer },
+        .{ .name = "c5", .path = "c5", .column_type = .integer },
+        .{ .name = "c6", .path = "c6", .column_type = .integer },
+        .{ .name = "c7", .path = "c7", .column_type = .integer },
+        .{ .name = "c8", .path = "c8", .column_type = .integer },
+        .{ .name = "c9", .path = "c9", .column_type = .integer },
+        .{ .name = "c10", .path = "c10", .column_type = .integer },
+        .{ .name = "c11", .path = "c11", .column_type = .integer },
+        .{ .name = "c12", .path = "c12", .column_type = .integer },
+        .{ .name = "c13", .path = "c13", .column_type = .integer },
+        .{ .name = "c14", .path = "c14", .column_type = .integer },
+        .{ .name = "c15", .path = "c15", .column_type = .integer },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .version = 9,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
     const cells = [_]Cell{
-        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
-        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
-        .{ .path = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .path = "c15", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
     };
-    const encoded = try serialize(alloc, &cells);
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x33} ** semantic_hash_len);
     defer alloc.free(encoded);
-    try validate(encoded);
-
-    const id = (try findCellByPath(encoded, "id")).?;
-    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, id.value_type);
-    try std.testing.expectEqualStrings("abc", id.value.bytes_val);
-
-    const amount = (try findCellByPath(encoded, "amount")).?;
-    try std.testing.expectEqual(@as(f64, 12.5), amount.value.f64_val);
-
-    try std.testing.expect((try findCellByPath(encoded, "missing")) == null);
-    // Non-row value yields null, not an error.
-    try std.testing.expect((try findCellByPath("{\"id\":\"x\"}", "id")) == null);
-}
-
-test "collectCellsByLookup validates and reads several columns in one scan" {
-    const alloc = std.testing.allocator;
-    const cells = [_]Cell{
-        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
-        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
-        .{ .path = "payload.note", .value_type = .bytes_val, .value = .{ .bytes_val = "memo" } },
-    };
-    const encoded = try serialize(alloc, &cells);
-    defer alloc.free(encoded);
-
-    const lookups = [_]CellLookup{
-        .{ .path = "id" },
-        .{ .path = "note", .alternate_path = "payload.note" },
-        .{ .path = "missing" },
-    };
-    var found: [lookups.len]?Cell = undefined;
-    try collectCellsByLookup(encoded, lookups[0..], found[0..]);
-    try std.testing.expectEqualStrings("abc", found[0].?.value.bytes_val);
-    try std.testing.expectEqualStrings("memo", found[1].?.value.bytes_val);
-    try std.testing.expect(found[2] == null);
-
-    var bad: [1]?Cell = undefined;
-    try std.testing.expectError(error.InvalidRelationalRow, collectCellsByLookup("not-a-row", lookups[0..1], bad[0..]));
-    try std.testing.expectError(error.InvalidArgument, collectCellsByLookup(encoded, lookups[0..2], bad[0..]));
+    try std.testing.expectEqual(capability_sparse_slots, std.mem.readInt(u32, encoded[12..16], .little));
+    try std.testing.expect(encoded.len < ordinal_header_len + 2 * 2 + 16 * 8 + checksum_len);
+    try validateOrdinal(encoded, schema);
+    try std.testing.expect((try findCellByOrdinal(encoded, schema, 0)) == null);
+    try std.testing.expectEqual(@as(i64, 42), (try findCellByOrdinal(encoded, schema, 15)).?.value.i64_val);
 }

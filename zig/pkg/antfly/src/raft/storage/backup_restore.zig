@@ -919,6 +919,7 @@ fn applyPortableRestore(
         .prefer_existing_identity_namespace = true,
         .import_derived_indexes = true,
         .embedding_source_fields = embedding_source_fields,
+        .unpublished_staging = true,
     });
     portable_backup.validateCompleteDatabaseImageAlloc(alloc, db.core.store) catch |err| switch (err) {
         error.OutOfMemory => return err,

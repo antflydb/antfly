@@ -928,6 +928,14 @@ pub const DocStore = struct {
         return try self.beginReadTxnWithBlockCacheAdmission(.retain);
     }
 
+    /// Runtime namespaces authenticate persisted blocks before exposing value
+    /// slices (and memory namespaces are process-owned). LMDB values require an
+    /// AROW checksum at the relational boundary because its page contract does
+    /// not provide an application-visible per-value integrity witness.
+    pub fn valuesAreAuthenticated(self: *const DocStore) bool {
+        return self.kind == .runtime;
+    }
+
     pub fn beginReadTxnWithBlockCacheAdmission(
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,

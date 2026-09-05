@@ -55,12 +55,23 @@ Relational mode is therefore mostly *wiring and a required-schema contract*
 over things that are already built, plus one genuinely new query operator
 (the columnar table scan).
 
-## The pivotal decision: authoritative packed rows
+## The pivotal decision: schema-bound authoritative rows
 
-The base store uses one self-describing packed row per document. Declared
-scalars are stored in their physical typed representation; nullable absence and
-explicit null remain distinct; `json` columns retain their exact JSON subtree
-bytes. The legacy zstd whole-document blob is not double-written.
+The base store uses one `AROW v2` row per document, bound to an immutable schema
+epoch. Declared scalars are stored by stable column ordinal in physical typed
+representation; nullable absence and explicit null remain distinct; `json`
+columns retain their canonical JSON subtree bytes. Paths and physical types
+live once in the epoch's `PhysicalLayout`, not in every row. The legacy zstd
+whole-document blob is not double-written.
+
+Each row carries its schema version, a semantic content hash, and a physical
+checksum. The semantic hash is computed from canonical typed logical values and
+therefore survives equivalent storage-format migrations. The checksum covers
+the encoded bytes and detects corruption. Presence/null bitmaps identify
+logical state. Each row deterministically uses the smaller of two canonical
+bodies: dense fixed-width slots plus a variable offset table for populated
+schemas, or a sorted ordinal/payload directory for wide sparse schemas. Both
+support direct projection without reconstructing the whole document.
 
 Segment-level typed columns remain a derived acceleration structure. They can
 be added for scans, predicates, sorts, and aggregations without changing point
@@ -92,7 +103,7 @@ In `relational` mode the following are implied/enforced:
   dynamic rules inside `json` columns require the later JSON-subdocument
   lifecycle integration.
 
-The parsed public schema is cached once per schema generation inside the DB.
+The parsed public schema is compiled once per immutable schema generation inside the DB.
 Every storage entry point validates its final post-transform rows against that
 same cached contract, including embedded batches, transaction prepares,
 replicated callers, and recovery resolution. API validation remains an early
@@ -152,20 +163,50 @@ First-cut physical mapping:
 
 ### Write path
 
-The authoritative base value is one self-describing `AROW` payload per
-document. It stores each present column's path, physical type, null state, and
-typed value. Point reads reconstruct canonical JSON without a schema lookup;
-metadata and derived-artifact keyspaces are never passed through the row
-decoder. Portable backup format v2 retains the packed payload and row key kind
-exactly, including timestamps and relational schema metadata.
+Every request pins one immutable `SchemaView`. JSON is parsed once into an owned
+`PreparedRelationalWrite`; one schema-guided preparation fills ordinal logical
+values for public-schema validation, special-field and index extraction, the
+canonical semantic hash, TTL resolution, and `AROW v2` encoding. Ordinary rows
+borrow the request body for derived consumers instead of copying it; rows with
+reserved fields clone and stringify one stripped logical tree. Large batches
+prepare on the bounded runtime worker pool into one ref-counted arena per
+worker, so allocator synchronization occurs at page granularity without one
+allocator/page chain per row. Store keys, compatibility deletes, timestamps,
+and derived write effects are prepared from a ref-counted immutable
+`WritePlanSnapshot`. Graph/vector extraction and generated-enrichment templates
+are compiled once per durable catalog generation, so foreground work does not
+hold a live catalog lease per row. Slow embedding and asset provider calls run
+before the exclusive DB apply fence, allowing ordinary commits to continue. A
+bounded optimistic retry rebuilds preparation if either pinned generation
+changes; the exclusive apply section checks only the schema epoch and write-plan
+generation before committing primary rows, identity metadata, catalog state,
+indexes/outboxes, and transaction markers atomically.
 
-Portable restore performs a bounded-memory two-pass preflight. The first pass
-binds the archive header, runtime schema, public schema, and physical row mode;
-the second validates each packed row against those authoritative schemas.
-Mixed document/relational keyspaces, v1 relational flags, schema-mode
-mismatches, and schema-invalid rows fail before the destination is mutated.
-After import, an already-open DB reloads the durable schema and refreshes every
-schema-dependent runtime context before reads, writes, or index rebuilds resume.
+Ordered transforms use the same prepared-row path. Their durable base values
+and versions are captured under the shared apply fence, the effective rows are
+coalesced and prepared without the exclusive fence, and commit revalidates the
+pinned read set before applying. A changed base causes a bounded retry rather
+than a stale transform. Per-row generated-enrichment plans borrow strings from
+the pinned immutable write plan and allocate only their filtered consumer
+vectors, avoiding configuration-sized allocation and copying per document.
+
+The durable table catalog records storage mode, active schema version, format
+capabilities, index build state, and whether user data exists. Exact cardinality
+remains in transactional identity metadata, so ordinary writes update the
+catalog only on meaningful state transitions. First-schema admission is O(1)
+after a one-time streaming reconciliation of legacy stores.
+
+Portable backup uses a manifest-first `AFB2` stream. Runtime and public schemas
+are persisted by version before row blocks. Restore validates each row with its
+declared immutable layout, recomputes its logical hash directly from typed
+ordinal cells, canonical-checks JSON subcolumns, and invokes the matching
+compiled public validator only for higher-order schema constraints. Per-row
+scratch arenas are recycled, and block/footer checksums are verified while the
+archive streams into an unpublished staging database. Each decoded AFB2 block
+is validated and imported in the same pass; it is not parsed once for validation
+and again for application. Only a completely validated stage is atomically
+published, giving bounded memory, cancellation safety, and no partially visible
+restore.
 
 `schema_capability.projectRelationalRowJsonAlloc` parses and turns a document into one typed
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
@@ -206,7 +247,7 @@ the canonical decimal domain without a floating-point tolerance.
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
-**Remaining columnar-index integration seam:** `TypedDocValuesWriter` is a segment-level
+**Columnar-index integration seam:** `TypedDocValuesWriter` is a segment-level
 accumulator (all docs in a segment → one `build()`), not a per-document store,
 so populating columns belongs in the segment builder that owns the write batch,
 not in the per-document `writeDocFacts`. The seam is: add
@@ -217,19 +258,35 @@ the batch, plus a per-column null bitmap for explicit null document IDs, then
 persist each built section. The typed value stream identifies present values,
 the null bitmap identifies explicit nulls, and membership in neither means the
 column was absent. Segment reconstruction must pass that null state through
-`relational_row_codec.appendCellValue`. In Phase B this is also where the JSON
-blob write is dropped for non-`json` columns.
+`relational_row_codec.appendCellValue`. The authoritative base row already
+avoids a duplicate JSON blob; this seam adds a derived scan accelerator.
 
 ### Query path
 
-The relational win is predicate pushdown. The planner gains a **columnar table
-scan** operator that reads `typed_doc_values` chunks directly (`readU64Chunk`,
-range bounds, term equality) for predicates on typed columns, instead of
-routing every filter through the full-text index. Projection is served by
-`ColumnarReader.readDoc(projection)`. Joins and `GROUP BY`-over-join are
-unchanged — they already exist (see `JOINS.md`, `ALGEBRAIC.md`).
+The relational base-row path compiles exact scalar and nested-JSON predicates
+to stable ordinals. A scan authenticates and parses the AROW directory once,
+then evaluates those predicates without reconstructing the document; unsupported
+predicate shapes fall back to logical JSON for correctness. Projection uses the
+same compiled ordinal layout. TTL reads the physical write timestamp directly
+from the authenticated row header, and vector rebuilds decode only their target
+ordinal. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
+`JOINS.md`, `ALGEBRAIC.md`).
+
+First-party cross-node scans use one response-streamed request per shard. The
+remote shard therefore holds one read transaction for the requested range and
+the caller applies byte-level backpressure while decoding rows. Custom request
+executors that do not implement streaming retain the bounded row-paged fallback.
+
+Segment `typed_doc_values` remain a complementary future accelerator for broad
+range scans and aggregations. They are not required for direct AROW projection
+or filtering and never become a second row authority.
 
 ### Schema evolution
+
+Schema changes durably write an immutable runtime layout and public validator,
+then atomically switch the catalog's active version. Requests keep their pinned
+epoch alive through reference counting; point reads use an RCU acquisition fast
+path, and historical versions load lazily when old rows are encountered.
 
 `schema_capability.classifyChange` already distinguishes additive changes
 (new algebraic field → no rebuild) from breaking algebraic changes (removed or
@@ -247,13 +304,19 @@ physical representation and backfill plan are compatible.
   transactions, recovery, replay, scans, indexing, TTL, split handoff, and
   portable backup operate on dedicated packed-row keys while returning logical
   JSON at API boundaries.
-- **Phase 2B — segment typed-column persistence (pending).** Wire per-column
+- **Phase 2B — immutable epochs, prepared rows, and staged restore (complete).**
+  Versioned layouts/validators, ordinal AROW v2, transactional catalog/outbox,
+  bounded concurrent preparation, and manifest-first staged restore.
+- **Phase 3 — ordinal execution (complete).** Compiled predicate/projection
+  plans, physical-header TTL, and direct-ordinal vector extraction avoid full
+  document reconstruction on the relational hot paths.
+- **Phase 4 — segment typed-column persistence (optional accelerator).** Wire per-column
   `TypedDocValuesWriter` accumulation into the segment builder and persist the
-  sections (see "Remaining columnar-index integration seam" above).
-- **Phase 3 — columnar scan + predicate pushdown.** Table-scan operator over
+  sections (see "Columnar-index integration seam" above).
+- **Phase 5 — segment columnar scan + predicate pushdown.** Table-scan operator over
   `typed_doc_values`; route typed-column predicates to it; columnar projection
   on read.
-- **Phase 4 — unified columnar reads.** Serve projections from segment columns
+- **Phase 6 — unified columnar reads.** Serve projections from segment columns
   when available and fall back to the authoritative packed base row. There is
   no retained whole-document JSON blob for relational rows today.
 

@@ -2520,19 +2520,46 @@ pub const AntflyApiHandler = struct {
             else => err,
         };
         defer input.deinit(ctx.allocator);
-        var result = self.internalGroupOperations().scan(
+        const request = operationContext(ctx, null);
+        input.opts.execution_deadline_ns = request.deadline_ns;
+        if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
+            input.opts.cancellation = request.cancellation;
+        const HttpScanSink = struct {
+            ctx: *httpx.Context,
+            writer: ?httpx.Context.StreamWriter = null,
+
+            fn sink(state: *@This()) table_reads.ScanStreamSink {
+                return .{ .context = state, .start_fn = start, .write_fn = write };
+            }
+
+            fn start(raw: ?*anyopaque) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                if (state.writer == null)
+                    state.writer = try state.ctx.streamResponseWithContentType(200, "application/x-ndjson");
+            }
+
+            fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                if (state.writer == null) try start(state);
+                try state.writer.?.write(bytes);
+            }
+        };
+        var stream = HttpScanSink{ .ctx = ctx };
+        const found = self.internalGroupOperations().scanStream(
             ctx.allocator,
-            operationContext(ctx, null),
+            request,
             params.group_id,
             params.table_name,
             input.from,
             input.to,
             input.opts,
-        ) catch |err| return internalGroupErrorResponse(ctx, err);
-        defer result.deinit(ctx.allocator);
-        _ = ctx.status(200);
-        try ctx.setHeader("content-type", "application/x-ndjson");
-        _ = ctx.response.body(result.ndjson);
+            stream.sink(),
+        ) catch |err| {
+            if (stream.writer != null) return err;
+            return internalGroupErrorResponse(ctx, err);
+        };
+        if (!found) return internalGroupErrorResponse(ctx, error.NotFound);
+        try stream.writer.?.close();
         return ctx.response.build();
     }
 
@@ -5340,6 +5367,11 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
+        const request = operationContext(ctx, authenticated_identity);
+        scan_req.opts.execution_deadline_ns = request.deadline_ns;
+        if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
+            scan_req.opts.cancellation = request.cancellation;
+
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
@@ -5351,41 +5383,72 @@ pub const AntflyApiHandler = struct {
             return ctx.text("not found");
         };
 
-        var result = (source.scan(
+        const HttpScanSink = struct {
+            ctx: *httpx.Context,
+            writer: ?httpx.Context.StreamWriter = null,
+
+            fn sink(state: *@This()) table_reads.ScanStreamSink {
+                return .{ .context = state, .start_fn = start, .write_fn = write };
+            }
+
+            fn start(raw: ?*anyopaque) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                if (state.writer != null) return;
+                state.writer = try state.ctx.streamResponseWithContentType(200, "application/x-ndjson");
+            }
+
+            fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                if (state.writer == null) try start(state);
+                try state.writer.?.write(bytes);
+            }
+        };
+        var stream = HttpScanSink{ .ctx = ctx };
+        const found = source.scanStream(
             alloc,
             decoded_table_name,
             scan_req.from,
             scan_req.to,
             scan_req.opts,
             .read_index,
-        ) catch |err| switch (err) {
-            error.TableNotFound => {
-                _ = ctx.status(404);
-                return ctx.text("not found");
-            },
-            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
-                _ = ctx.status(503);
-                return ctx.text("read requires primary");
-            },
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
-                _ = ctx.status(503);
-                return ctx.text("standby read unavailable");
-            },
-            error.PersistentDescriptorAdmissionExhausted,
-            error.StorageReadTemporarilyUnavailable,
-            => {
-                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
-                return respondOwnedApiResponse(ctx, &response);
-            },
-            else => return err,
-        }) orelse {
+            stream.sink(),
+        ) catch |err| {
+            if (stream.writer != null) return err;
+            return switch (err) {
+                error.TableNotFound => {
+                    _ = ctx.status(404);
+                    return ctx.text("not found");
+                },
+                error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
+                    _ = ctx.status(503);
+                    return ctx.text("read requires primary");
+                },
+                error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
+                    _ = ctx.status(503);
+                    return ctx.text("standby read unavailable");
+                },
+                error.PersistentDescriptorAdmissionExhausted,
+                error.StorageReadTemporarilyUnavailable,
+                => {
+                    var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+                    return respondOwnedApiResponse(ctx, &response);
+                },
+                error.Canceled => {
+                    _ = ctx.status(408);
+                    return ctx.text("request canceled");
+                },
+                error.DeadlineExceeded => {
+                    _ = ctx.status(504);
+                    return ctx.text("request deadline exceeded");
+                },
+                else => return err,
+            };
+        };
+        if (!found) {
             _ = ctx.status(404);
             return ctx.text("not found");
-        };
-        defer result.deinit(alloc);
-
-        try ctx.setHeader("content-type", "application/x-ndjson");
-        _ = ctx.response.body(result.ndjson);
+        }
+        try stream.writer.?.close();
         return ctx.response.build();
     }
 
@@ -8522,7 +8585,7 @@ test "httpx inference connection propagates failures after stream commit" {
     const Target = struct {
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             const stream = context.stream;
-            if (stream.start.?(stream.context, 200) != .ok or
+            if (stream.start.?(stream.context, 200, inference_connection_abi.Bytes.init("text/event-stream; charset=utf-8")) != .ok or
                 stream.write.?(stream.context, inference_connection_abi.Bytes.init("data: partial\n\n")) != .ok)
             {
                 return inference_connection_abi.statusFromError(error.Unavailable);
@@ -8535,7 +8598,7 @@ test "httpx inference connection propagates failures after stream commit" {
         bytes: [32]u8 = undefined,
         len: usize = 0,
 
-        fn start(raw: ?*anyopaque, status: u16) !void {
+        fn start(raw: ?*anyopaque, status: u16, _: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
             self.started = status == 200;
         }
