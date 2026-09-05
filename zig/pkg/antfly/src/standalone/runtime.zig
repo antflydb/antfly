@@ -5283,7 +5283,9 @@ fn inferenceProviderEmbedDenseTextsWithContext(
     return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
         .model = model,
         .texts = texts,
-    }, context);
+        .task_type = context.task_type.canonical(),
+        .instruction = context.instruction,
+    }, context.request);
 }
 
 fn inferenceProviderEmbedSparseTexts(
@@ -5321,7 +5323,9 @@ fn inferenceProviderEmbedDensePartsWithContext(
     return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
         .model = model,
         .parts = parts,
-    }, context);
+        .task_type = context.task_type.canonical(),
+        .instruction = context.instruction,
+    }, context.request);
 }
 
 fn inferenceProviderRerankTexts(

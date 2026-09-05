@@ -300,7 +300,7 @@ fn getEmbeddingWeight(cb: *const ComputeBackend, config: gpt_mod.Config) !ops.CT
     }
     return switch (config.family) {
         .gpt2 => cb.getWeight("wte.weight"),
-        .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .phi => cb.getWeight("model.embed_tokens.weight"),
+        .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .phi => cb.getWeight("model.embed_tokens.weight"),
         else => cb.getWeight("model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
     };
 }

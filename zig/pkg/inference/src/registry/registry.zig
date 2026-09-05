@@ -21,6 +21,8 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
+pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
+pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -49,6 +51,8 @@ const DiscoverKindMode = enum {
 
 test {
     _ = download;
+    _ = qwen3vl_catalog;
+    _ = qwen3_embedding_catalog;
 }
 
 /// Friendly short names accepted by user-facing commands in place of a full
@@ -466,10 +470,58 @@ pub const ModelRegistry = struct {
         defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
+        const progress_sink: download.ProgressSink = .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
-        });
+        };
+        if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant)) {
+            try download.downloadPinnedQwen3VlRerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else {
+            try download.downloadModel(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                projector_selection,
+                progress_sink,
+            );
+        }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);
@@ -1663,9 +1715,25 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
-/// Resolve a model name by variant suffix.
+fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8) bool {
+    const marker = "--antfly-";
+    if (!std.mem.startsWith(u8, candidate, requested_name) or
+        candidate.len != requested_name.len + marker.len + 16 or
+        !std.mem.eql(u8, candidate[requested_name.len..][0..marker.len], marker))
+    {
+        return false;
+    }
+    for (candidate[candidate.len - 16 ..]) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return false;
+    }
+    return true;
+}
+
+/// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
 /// prefixed with "requested-" and returns the shortest deterministic match.
+/// Managed variant directories are deliberately excluded: their suffix is an
+/// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
 /// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
@@ -1698,7 +1766,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
             else => return err,
         };
         if (entry_kind != .directory) continue;
-        if (std.mem.startsWith(u8, entry.name, prefix)) {
+        if (std.mem.startsWith(u8, entry.name, prefix) and
+            !isManagedVariantInstallLeaf(requested_name, entry.name))
+        {
             if (best_name == null or entry.name.len < best_name.?.len or
                 (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
             {
@@ -1786,7 +1856,7 @@ test "explicit model variants use distinct stable install directories" {
     try std.testing.expectEqualStrings("/models/owner/model", auto);
 }
 
-test "resolveVariant finds nested explicit variant install" {
+test "resolveVariant ignores opaque managed variant install hashes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1796,11 +1866,24 @@ test "resolveVariant finds nested explicit variant install" {
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
+    try std.testing.expect(try resolveVariant(allocator, io, models_dir, "owner/model") == null);
+}
+
+test "resolveVariant retains legacy suffix resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
     const resolved = (try resolveVariant(allocator, io, models_dir, "owner/model")) orelse
         return error.ExpectedVariantResolution;
     defer allocator.free(resolved);
 
-    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model-q4_0" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }

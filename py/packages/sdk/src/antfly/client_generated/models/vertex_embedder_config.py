@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="VertexEmbedderConfig")
 
@@ -18,7 +22,10 @@ class VertexEmbedderConfig:
 
     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
 
-    **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+    **Example Model:** gemini-embedding-001 (default, 3072 dims)
+
+    Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+    instead of being flattened or silently discarded.
 
     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 
@@ -36,8 +43,13 @@ class VertexEmbedderConfig:
                 set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'. Default: 'us-central1'.
             credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
                 external-account). Alternative to the default ADC chain.
-            dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001;
-                128-1408 for multimodalembedding). Default: 3072.
+            dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+                Default: 3072.
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
     provider: VertexEmbedderConfigProvider
@@ -46,6 +58,7 @@ class VertexEmbedderConfig:
     location: str | Unset = "us-central1"
     credentials_path: str | Unset = UNSET
     dimension: int | Unset = 3072
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +73,10 @@ class VertexEmbedderConfig:
         credentials_path = self.credentials_path
 
         dimension = self.dimension
+
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -77,11 +94,15 @@ class VertexEmbedderConfig:
             field_dict["credentials_path"] = credentials_path
         if dimension is not UNSET:
             field_dict["dimension"] = dimension
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
         provider = VertexEmbedderConfigProvider(d.pop("provider"))
 
@@ -95,6 +116,13 @@ class VertexEmbedderConfig:
 
         dimension = d.pop("dimension", UNSET)
 
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         vertex_embedder_config = cls(
             provider=provider,
             model=model,
@@ -102,6 +130,7 @@ class VertexEmbedderConfig:
             location=location,
             credentials_path=credentials_path,
             dimension=dimension,
+            retrieval=retrieval,
         )
 
         vertex_embedder_config.additional_properties = d

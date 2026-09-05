@@ -89,14 +89,19 @@ stop here and use [Troubleshooting](#troubleshooting).
 
 ### Install the text embedding model
 
-Now pull BGE-M3 for high-quality text-to-text search. [Antfly
-inference](/docs/guides/inference) runs the model locally without an external
-API:
+Now pull the text embedding model used for semantic search. [Antfly
+inference](/docs/guides/inference) runs models locally without an external API:
 
 ```bash
-antfly inference pull hf:BAAI/bge-m3 --tasks embed
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference list
 ```
+
+Qwen3-Embedding uses an instruction for search queries but embeds indexed
+documents without it. Antfly applies that distinction automatically: index and
+artifact writes use the document role, while semantic searches use the query
+role. The Q8_0 bundle runs on native CPU on Linux and macOS, and uses Metal
+automatically when it is available.
 
 If the running standalone process does not detect the newly installed model,
 restart it once before creating the embeddings index.
@@ -142,7 +147,7 @@ antfly table create --table wikipedia \
     "template": "{{title}} {{body}}",
     "embedder": {
       "provider": "antfly",
-      "model": "BAAI/bge-m3"
+      "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
     },
     "chunker": {
       "provider": "antfly",
@@ -166,7 +171,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
         "template": "{{title}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "BAAI/bge-m3"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -196,7 +201,7 @@ await client.tables.create('wikipedia', {
       template: '{{title}} {{body}}',
       embedder: {
         provider: 'antfly',
-        model: 'BAAI/bge-m3',
+        model: 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
       },
       chunker: {
         provider: 'antfly',
@@ -222,7 +227,7 @@ client.create_table(
             'template': '{{title}} {{body}}',
             'embedder': {
                 'provider': 'antfly',
-                'model': 'BAAI/bge-m3',
+                'model': 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
             },
             'chunker': {
                 'provider': 'antfly',
@@ -252,8 +257,8 @@ if err != nil {
 	log.Fatal(err)
 }
 
-embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "BAAI/bge-m3",
+embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
+	Model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
 })
 if err != nil { log.Fatal(err) }
 
@@ -291,7 +296,7 @@ client.create_table("wikipedia", &json!({
             "template": "{{title}} {{body}}",
             "embedder": {
                 "provider": "antfly",
-                "model": "BAAI/bge-m3"
+                "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
             },
             "chunker": {
                 "provider": "antfly",

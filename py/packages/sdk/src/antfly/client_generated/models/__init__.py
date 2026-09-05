@@ -210,6 +210,7 @@ from .embedder_config import EmbedderConfig
 from .embedder_provider import EmbedderProvider
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_retrieval_config import EmbeddingRetrievalConfig
 from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
@@ -1212,6 +1213,7 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
+    "EmbeddingRetrievalConfig",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
