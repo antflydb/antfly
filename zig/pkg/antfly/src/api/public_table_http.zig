@@ -272,6 +272,7 @@ pub const TableApi = struct {
     pub const ExecuteCreateIndexError = error{
         Canceled,
         DeadlineExceeded,
+        MetadataMutationOutcomeUnknown,
         NotLeader,
         NotFound,
         Conflict,
@@ -293,6 +294,7 @@ pub const TableApi = struct {
     pub const ExecuteDeleteIndexError = error{
         Canceled,
         DeadlineExceeded,
+        MetadataMutationOutcomeUnknown,
         NotLeader,
         NotFound,
         Conflict,
@@ -700,17 +702,34 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
+pub const MetadataMutationOutcome = enum {
+    unknown,
+};
+
+const index_mutation_outcome_unknown_json =
+    "{\"error\":\"metadata_mutation_outcome_unknown\",\"message\":\"index mutation outcome is unknown; observe index state before retrying\",\"retryable\":false}";
+
 pub const OwnedResponse = struct {
     status: u16,
     body: []u8,
     json: bool = false,
     retry_after_seconds: ?u32 = null,
+    metadata_mutation_outcome: ?MetadataMutationOutcome = null,
 
     pub fn deinit(self: *OwnedResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
         self.* = undefined;
     }
 };
+
+fn indexMutationOutcomeUnknownResponse(alloc: std.mem.Allocator) !OwnedResponse {
+    return .{
+        .status = 409,
+        .body = try alloc.dupe(u8, index_mutation_outcome_unknown_json),
+        .json = true,
+        .metadata_mutation_outcome = .unknown,
+    };
+}
 
 pub const storage_read_temporarily_unavailable_body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}";
 pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
@@ -1968,6 +1987,7 @@ pub fn handleTableCreateIndex(
 ) !OwnedResponse {
     const response_body = api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataMutationOutcomeUnknown => return try indexMutationOutcomeUnknownResponse(alloc),
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
@@ -2011,12 +2031,13 @@ pub fn handleTableDeleteIndex(
 ) !OwnedResponse {
     api.executeTableDeleteIndex(alloc, table_name, index_name) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataMutationOutcomeUnknown => return try indexMutationOutcomeUnknownResponse(alloc),
         error.NotLeader => return err,
-        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
-        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
-        error.DependencyConflict => return .{ .status = 409, .body = try alloc.dupe(u8, "artifact dependency prevents deletion") },
-        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
+        error.DependencyConflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"artifact_dependency_conflict\",\"message\":\"artifact dependency prevents deletion\",\"retryable\":false}"), .json = true },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index delete failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
@@ -2685,6 +2706,106 @@ test "public table api carries borrowed cancellation into batch execution" {
     try std.testing.expectError(error.Canceled, api.executeTableBatch(std.testing.allocator, "docs", .{}));
     try std.testing.expectError(error.Canceled, api.executeTableQueryRequest(std.testing.allocator, "docs", "{}", null));
     try std.testing.expectError(error.Canceled, api.executeTableQueryView(std.testing.allocator, "docs", .published));
+}
+
+test "public index mutations preserve an explicit outcome-unknown contract" {
+    const Backend = struct {
+        delete_dependency_conflict: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = executeDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.MetadataMutationOutcomeUnknown;
+        }
+
+        fn executeDeleteIndex(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteDeleteIndexError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.delete_dependency_conflict) return error.DependencyConflict;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+
+    var backend = Backend{};
+    var create_response = try handleTableCreateIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        "{}",
+        backend.iface(),
+    );
+    defer create_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), create_response.status);
+    try std.testing.expect(create_response.json);
+    try std.testing.expectEqual(MetadataMutationOutcome.unknown, create_response.metadata_mutation_outcome.?);
+    try std.testing.expectEqual(@as(?u32, null), create_response.retry_after_seconds);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, index_mutation_outcome_unknown_json, create_response.body);
+
+    var delete_response = try handleTableDeleteIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        backend.iface(),
+    );
+    defer delete_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), delete_response.status);
+    try std.testing.expect(delete_response.json);
+    try std.testing.expectEqual(MetadataMutationOutcome.unknown, delete_response.metadata_mutation_outcome.?);
+    try std.testing.expectEqual(@as(?u32, null), delete_response.retry_after_seconds);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, index_mutation_outcome_unknown_json, delete_response.body);
+
+    backend.delete_dependency_conflict = true;
+    var dependency_response = try handleTableDeleteIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        backend.iface(),
+    );
+    defer dependency_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), dependency_response.status);
+    try std.testing.expect(dependency_response.json);
+    try std.testing.expect(dependency_response.metadata_mutation_outcome == null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"error\":\"artifact_dependency_conflict\",\"message\":\"artifact dependency prevents deletion\",\"retryable\":false}",
+        dependency_response.body,
+    );
 }
 
 test "public create index exposes retryable storage descriptor exhaustion" {

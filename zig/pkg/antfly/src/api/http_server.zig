@@ -2228,6 +2228,14 @@ fn runPostMutationRound(svc: anytype) !void {
     }
 }
 
+/// The mutation method is the commit boundary. This round only accelerates
+/// projection/reconciliation and therefore cannot revoke an acknowledged
+/// commit or its exact stamp when authority moves immediately afterward.
+fn runPostCommitMutationRound(svc: anytype, operation: []const u8) void {
+    runPostMutationRound(svc) catch |err|
+        std.log.warn("metadata mutation committed; immediate reconciliation deferred operation={s} err={s}", .{ operation, @errorName(err) });
+}
+
 fn replaceTableDefinitionOnService(
     svc: anytype,
     expected: metadata_table_manager.TableRecord,
@@ -2235,7 +2243,7 @@ fn replaceTableDefinitionOnService(
 ) !void {
     try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     try svc.replaceTableDefinition(expected, replacement);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "replace_table_definition_legacy");
 }
 
 fn validateTableDefinitionReplacementOnService(
@@ -2264,7 +2272,7 @@ fn replaceTableDefinitionOnServiceStamped(
 ) !metadata_api.CatalogMutationStamp {
     try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     const stamp = try svc.replaceTableDefinitionStamped(expected, replacement);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "replace_table_definition");
     return stamp;
 }
 
@@ -2277,7 +2285,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, table.table_id);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "drop_table");
 }
 
 fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !u32 {
@@ -2309,7 +2317,7 @@ fn mutateSchemaOnService(
         if (expected_version != null and err == error.TableGenerationChanged) return error.SchemaVersionChanged;
         return err;
     };
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "mutate_schema");
     return .{
         .version = version,
         .schema_json = try alloc.dupe(u8, updated.schema_json),
@@ -2330,7 +2338,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "create_index_legacy");
 }
 
 fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -2350,7 +2358,7 @@ fn dropIndexOnServiceStamped(svc: anytype, alloc: std.mem.Allocator, table_name:
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     const stamp = try svc.replaceTableDefinitionStamped(table.*, updated_record);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "drop_index");
     return stamp;
 }
 
@@ -2366,7 +2374,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "put_artifact_enrichment");
 }
 
 fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
@@ -2382,7 +2390,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
-    try runPostMutationRound(svc);
+    runPostCommitMutationRound(svc, "delete_artifact_enrichment");
 }
 
 fn persistRestoreTableIntent(
@@ -12587,6 +12595,7 @@ pub const ApiHttpServer = struct {
         // even when this index is not itself an artifact consumer, so every
         // create-index mutation uses whole-definition compare-and-swap.
         const mutation_stamp = self.source.replaceTableDefinitionStamped(table_before, replacement) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -12720,6 +12729,7 @@ pub const ApiHttpServer = struct {
         defer if (prepared_installation) |*prepared| prepared.deinit(self);
         try ensureTableOperationActive(request);
         const mutation_stamp = self.source.dropIndexStamped(alloc, table_name, index_name) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -16951,6 +16961,7 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         },
         replacement_calls: usize = 0,
         round_calls: usize = 0,
+        round_error: ?anyerror = null,
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
@@ -16973,6 +16984,7 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         }
         fn runRound(self: *@This()) !void {
             self.round_calls += 1;
+            if (self.round_error) |err| return err;
         }
     };
 
@@ -17016,6 +17028,86 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
     try std.testing.expectEqual(@as(usize, 1), service.replacement_calls);
     try std.testing.expectEqual(@as(usize, 1), service.round_calls);
     try std.testing.expectEqualStrings("updated", service.table.description);
+
+    // The v0.2 receipt-free capability still knows that its replacement call
+    // completed. A failed opportunistic round may delay visibility but cannot
+    // turn the committed mutation into a replayable request failure.
+    service.round_error = error.NotLeader;
+    var legacy_replacement = service.table;
+    legacy_replacement.description = "updated again";
+    try replaceTableDefinitionOnService(&service, service.table, legacy_replacement);
+    try std.testing.expectEqual(@as(usize, 2), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 2), service.round_calls);
+    try std.testing.expectEqualStrings("updated again", service.table.description);
+}
+
+test "stamped catalog mutations retain their commit stamp when the post-commit round fails" {
+    const expected_stamp: metadata_api.CatalogMutationStamp = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .term = 7,
+        .index = 19,
+    };
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 42,
+            .name = "docs",
+            .indexes_json = "{\"search\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+            .placement_role = "data",
+        },
+        replacement_calls: usize = 0,
+        round_calls: usize = 0,
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn replaceTableDefinitionStamped(
+            self: *@This(),
+            expected: metadata_table_manager.TableRecord,
+            replacement: metadata_table_manager.TableRecord,
+        ) !metadata_api.CatalogMutationStamp {
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(self.table, expected));
+            try std.testing.expectEqual(expected.table_id, replacement.table_id);
+            self.replacement_calls += 1;
+            return expected_stamp;
+        }
+
+        fn runRound(self: *@This()) !void {
+            self.round_calls += 1;
+            return error.NotLeader;
+        }
+    };
+
+    var service = FakeService{};
+    var replacement = service.table;
+    replacement.description = "updated";
+    const replace_stamp = try replaceTableDefinitionOnServiceStamped(
+        &service,
+        service.table,
+        replacement,
+    );
+    try std.testing.expect(metadata_api.CatalogMutationStamp.eql(expected_stamp, replace_stamp));
+
+    const drop_stamp = try dropIndexOnServiceStamped(
+        &service,
+        std.testing.allocator,
+        "docs",
+        "search",
+    );
+    try std.testing.expect(metadata_api.CatalogMutationStamp.eql(expected_stamp, drop_stamp));
+    try std.testing.expectEqual(@as(usize, 2), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 2), service.round_calls);
 }
 
 fn borrowedTestRestoreManifest(backup_id: []const u8, table_name: []const u8) backups_api.TableBackupManifest {
@@ -35570,6 +35662,109 @@ test "api http server create index installs exact visible config and defers lagg
     fallback_server.index_installation_mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), delete_queued_after_supervisor);
     try std.testing.expectEqual(@as(usize, 0), reserved_after_supervisor);
+}
+
+test "api http server exposes ambiguous index mutations without a replay signal" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 42,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        },
+        create_calls: usize = 0,
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .replace_table_definition_stamped = replaceTableDefinitionStamped,
+                .drop_index_stamped = dropIndexStamped,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn replaceTableDefinitionStamped(
+            ptr: *anyopaque,
+            _: metadata_table_manager.TableRecord,
+            _: metadata_table_manager.TableRecord,
+        ) !?metadata_api.CatalogMutationStamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+
+        fn dropIndexStamped(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) !metadata_api.CatalogMutationStamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drop_calls += 1;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    const expected_body =
+        "{\"error\":\"metadata_mutation_outcome_unknown\",\"message\":\"index mutation outcome is unknown; observe index state before retrying\",\"retryable\":false}";
+
+    var create_response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs/indexes/search",
+        .content_type = "application/json",
+        .body = "{\"type\":\"full_text\",\"field\":\"body\"}",
+    });
+    defer create_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), create_response.status);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        create_response.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse
+            return error.MissingMutationOutcomeHeader,
+    );
+    try std.testing.expect(create_response.header("Retry-After") == null);
+    try std.testing.expect(create_response.header(http_common.metadata_mutation_not_admitted_header) == null);
+    try ant_json.testing.expectEqualJsonText(alloc, expected_body, create_response.body);
+
+    var drop_response = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs/indexes/search",
+    });
+    defer drop_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), drop_response.status);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        drop_response.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse
+            return error.MissingMutationOutcomeHeader,
+    );
+    try std.testing.expect(drop_response.header("Retry-After") == null);
+    try std.testing.expect(drop_response.header(http_common.metadata_mutation_not_admitted_header) == null);
+    try ant_json.testing.expectEqualJsonText(alloc, expected_body, drop_response.body);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.drop_calls);
 }
 
 test "api http server create index expands schema-derived algebraic config" {

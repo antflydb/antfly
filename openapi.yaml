@@ -5397,7 +5397,7 @@ paths:
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/IndexMutationConflict'
         '422':
           description: Graph resolver destinations cannot be bound to this credential type
           content:
@@ -5424,6 +5424,12 @@ paths:
           description: Index dropped successfully
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/IndexMutationConflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -25483,6 +25489,27 @@ components:
         $ref: '#/components/schemas/StatefulGraphResult'
       description: Stateful graph results keyed by operation name. Legacy values are possible only when
         the corresponding request used graph_searches.
+    IndexMutationConflictError:
+      type: object
+      additionalProperties: false
+      description: An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the
+        mutation may already have committed and callers must observe index state before deciding whether
+        to issue another mutation.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - table_mutation_conflict
+            - artifact_dependency_conflict
+            - metadata_mutation_outcome_unknown
+        message:
+          type: string
+        retryable:
+          type: boolean
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true
@@ -28586,6 +28613,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationConflict:
+      description: The index mutation conflicts with current state, or its commit outcome could not be
+        proven.
+      headers:
+        X-Antfly-Raft-Mutation-Outcome:
+          required: false
+          description: Present with value `unknown-v1` only when the mutation may already have committed
+            and must not be blindly retried.
+          schema:
+            type: string
+            enum:
+              - unknown-v1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IndexMutationConflictError'
     MethodNotAllowed:
       description: Method not allowed for this resource
       content:

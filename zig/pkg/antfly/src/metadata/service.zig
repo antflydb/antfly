@@ -457,6 +457,192 @@ pub const MetadataProposalReceipt = struct {
     index: u64,
 };
 
+/// Complete a table-definition CAS against the exact Raft entry that admitted
+/// it. Errors before receipt assignment retain their ordinary retry semantics;
+/// once a receipt exists, any failure to prove application is explicitly
+/// ambiguous and must never be exposed as a safe replay signal.
+fn replaceTableDefinitionStampedWithReceipt(
+    service: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !metadata_api.CatalogMutationStamp {
+    if (expected.table_id == 0 or
+        replacement.table_id != expected.table_id or
+        !std.mem.eql(u8, replacement.name, expected.name))
+        return error.InvalidTableDefinitionReplacement;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const baseline_fence = try store.getTableTransitionFence(
+        service.metadata_group_id,
+        expected.table_id,
+    );
+    if (baseline_fence.active()) return error.TableTransitionActive;
+    const metadata_incarnation = (try service.metadataIncarnation()) orelse
+        return error.MissingMetadataIncarnation;
+    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
+        .expected = expected,
+        .replacement = replacement,
+    } });
+
+    service.waitForTransitionApplied(receipt) catch |err| {
+        std.log.warn(
+            "table definition mutation outcome became ambiguous after admission table={s} table_id={} term={} index={} err={s}",
+            .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) },
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    };
+
+    // Exact receipt application makes the local projection authoritative for
+    // this command. Inspect it once; polling leadership after admission would
+    // incorrectly turn a committed mutation into a retryable NotLeader error.
+    const current = store.getTable(
+        service.alloc,
+        service.metadata_group_id,
+        expected.table_id,
+    ) catch |err| {
+        std.log.warn(
+            "table definition mutation applied but projection observation failed table={s} table_id={} term={} index={} err={s}",
+            .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) },
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    } orelse {
+        std.log.warn(
+            "table definition mutation applied but table is absent from projection table={s} table_id={} term={} index={}",
+            .{ expected.name, expected.table_id, receipt.term, receipt.index },
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    };
+    defer metadata_table_manager.freeTable(service.alloc, current);
+    if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+        .metadata_group_id = service.metadata_group_id,
+        .metadata_incarnation = metadata_incarnation,
+        .term = receipt.term,
+        .index = receipt.index,
+    };
+    // A later command may already have superseded or even reverted this exact
+    // definition. Without a durable per-command apply result, any non-exact
+    // projection is ambiguous; never turn it back into a replayable conflict.
+    std.log.warn(
+        "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
+        .{ expected.name, expected.table_id, receipt.term, receipt.index },
+    );
+    return error.MetadataMutationOutcomeUnknown;
+}
+
+test "table definition stamp distinguishes rejection from post-admission ambiguity" {
+    const FakeStore = struct {
+        current: metadata_table_manager.TableRecord,
+        reads: usize = 0,
+
+        fn getTableTransitionFence(
+            _: *@This(),
+            _: u64,
+            _: u64,
+        ) !metadata_storage.raft_apply_store.TableTransitionFence {
+            return .{};
+        }
+
+        fn getTable(
+            self: *@This(),
+            alloc: std.mem.Allocator,
+            _: u64,
+            _: u64,
+        ) !?metadata_table_manager.TableRecord {
+            self.reads += 1;
+            return try metadata_table_manager.cloneTable(alloc, self.current);
+        }
+    };
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64 = 1,
+        store: FakeStore,
+        proposal_error: ?anyerror = null,
+        wait_error: ?anyerror = null,
+        wait_calls: usize = 0,
+
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+
+        fn metadataIncarnation(_: *@This()) !?metadata_api.MetadataClusterIncarnation {
+            return "0123456789abcdef0123456789abcdef".*;
+        }
+
+        fn proposeTransitionCommandWithReceipt(
+            self: *@This(),
+            _: metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            if (self.proposal_error) |err| return err;
+            return .{ .term = 7, .index = 19 };
+        }
+
+        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+            try std.testing.expectEqual(@as(u64, 7), receipt.term);
+            try std.testing.expectEqual(@as(u64, 19), receipt.index);
+            self.wait_calls += 1;
+            if (self.wait_error) |err| return err;
+        }
+    };
+
+    const expected: metadata_table_manager.TableRecord = .{
+        .table_id = 42,
+        .name = "docs",
+        .description = "before",
+    };
+    var replacement = expected;
+    replacement.description = "after";
+
+    var rejected: FakeService = .{
+        .alloc = std.testing.allocator,
+        .store = .{ .current = expected },
+        .proposal_error = error.NotLeader,
+    };
+    try std.testing.expectError(
+        error.NotLeader,
+        replaceTableDefinitionStampedWithReceipt(&rejected, expected, replacement),
+    );
+    try std.testing.expectEqual(@as(usize, 0), rejected.wait_calls);
+    try std.testing.expectEqual(@as(usize, 0), rejected.store.reads);
+
+    const ambiguous_errors = [_]anyerror{
+        error.NotLeader,
+        error.MetadataProposalApplyTimeout,
+    };
+    for (ambiguous_errors) |wait_error| {
+        var ambiguous: FakeService = .{
+            .alloc = std.testing.allocator,
+            .store = .{ .current = expected },
+            .wait_error = wait_error,
+        };
+        try std.testing.expectError(
+            error.MetadataMutationOutcomeUnknown,
+            replaceTableDefinitionStampedWithReceipt(&ambiguous, expected, replacement),
+        );
+        try std.testing.expectEqual(@as(usize, 1), ambiguous.wait_calls);
+        try std.testing.expectEqual(@as(usize, 0), ambiguous.store.reads);
+    }
+
+    var committed: FakeService = .{
+        .alloc = std.testing.allocator,
+        .store = .{ .current = replacement },
+    };
+    const stamp = try replaceTableDefinitionStampedWithReceipt(&committed, expected, replacement);
+    try std.testing.expectEqual(@as(u64, 7), stamp.term);
+    try std.testing.expectEqual(@as(u64, 19), stamp.index);
+    try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), committed.store.reads);
+
+    var superseded: FakeService = .{
+        .alloc = std.testing.allocator,
+        .store = .{ .current = expected },
+    };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        replaceTableDefinitionStampedWithReceipt(&superseded, expected, replacement),
+    );
+    try std.testing.expectEqual(@as(usize, 1), superseded.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), superseded.store.reads);
+}
+
 /// A compact drop command derived from one coherent storage read transaction.
 /// Keeping the range membership and its generation together prevents a newly
 /// applied range from being orphaned without making the Raft entry grow with
@@ -3291,6 +3477,10 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
         error.CdcWorkLeaseLost,
         error.CdcWorkShuttingDown,
         error.CdcWorkLeaseRenewalTimeout,
+        // A newly provisioned data group can be temporarily leaderless while
+        // its hosted owner installs and elects the group. That is source-local
+        // CDC deferral, unlike loss of this metadata service's own authority.
+        error.GroupLeaderUnavailable,
         error.MetadataMutationApplyTimeout,
         error.Timeout,
         error.FileNotFound,
@@ -3360,6 +3550,7 @@ test "metadata CDC round error policy isolates expected recovery failures" {
         error.ForeignQueryFailed,
         error.ForeignProviderIdentityMismatch,
         error.ExactCutoverProviderIdentityMismatch,
+        error.GroupLeaderUnavailable,
     };
     for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
 
@@ -4506,57 +4697,7 @@ pub const MetadataService = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
-        if (expected.table_id == 0 or
-            replacement.table_id != expected.table_id or
-            !std.mem.eql(u8, replacement.name, expected.name))
-            return error.InvalidTableDefinitionReplacement;
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const baseline_fence = try store.getTableTransitionFence(
-            self.metadata_group_id,
-            expected.table_id,
-        );
-        if (baseline_fence.active()) return error.TableTransitionActive;
-        const metadata_incarnation = (try self.metadataIncarnation()) orelse
-            return error.MissingMetadataIncarnation;
-        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
-            .expected = expected,
-            .replacement = replacement,
-        } });
-
-        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        while (platform_time.monotonicNs() < deadline_ns) {
-            const current = (try store.getTable(
-                self.alloc,
-                self.metadata_group_id,
-                expected.table_id,
-            )) orelse return error.TableNotFound;
-            defer metadata_table_manager.freeTable(self.alloc, current);
-            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
-                .metadata_group_id = self.metadata_group_id,
-                .metadata_incarnation = metadata_incarnation,
-                .term = receipt.term,
-                .index = receipt.index,
-            };
-            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
-                return error.TableGenerationChanged;
-
-            const fence = try store.getTableTransitionFence(
-                self.metadata_group_id,
-                expected.table_id,
-            );
-            if (fence.active() or fence.generation != baseline_fence.generation)
-                return error.TableTransitionActive;
-
-            self.lockRuntime();
-            {
-                defer self.unlockRuntime();
-                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
-                    return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
-            }
-            platform_clock.Clock.real().sleepMs(1);
-        }
-        return error.MetadataMutationApplyTimeout;
+        return replaceTableDefinitionStampedWithReceipt(self, expected, replacement);
     }
 
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
@@ -7174,61 +7315,7 @@ pub const MetadataHttpService = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
-        if (expected.table_id == 0 or
-            replacement.table_id != expected.table_id or
-            !std.mem.eql(u8, replacement.name, expected.name))
-            return error.InvalidTableDefinitionReplacement;
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const baseline_fence = try store.getTableTransitionFence(
-            self.metadata_group_id,
-            expected.table_id,
-        );
-        if (baseline_fence.active()) return error.TableTransitionActive;
-        const metadata_incarnation = (try self.metadataIncarnation()) orelse
-            return error.MissingMetadataIncarnation;
-        const receipt = try self.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
-            .expected = expected,
-            .replacement = replacement,
-        } });
-
-        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
-        while (platform_time.monotonicNs() < deadline_ns) {
-            const current = (try store.getTable(
-                self.alloc,
-                self.metadata_group_id,
-                expected.table_id,
-            )) orelse return error.TableNotFound;
-            defer metadata_table_manager.freeTable(self.alloc, current);
-            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
-                .metadata_group_id = self.metadata_group_id,
-                .metadata_incarnation = metadata_incarnation,
-                .term = receipt.term,
-                .index = receipt.index,
-            };
-            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
-                return error.TableGenerationChanged;
-
-            const fence = try store.getTableTransitionFence(
-                self.metadata_group_id,
-                expected.table_id,
-            );
-            if (fence.active() or fence.generation != baseline_fence.generation)
-                return error.TableTransitionActive;
-
-            self.lockRuntime();
-            {
-                defer self.unlockRuntime();
-                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
-                    return error.NotLeader;
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
-                } else {
-                    try self.raft.runRaftRoundOnly();
-                }
-            }
-            platform_clock.Clock.real().sleepMs(1);
-        }
-        return error.MetadataMutationApplyTimeout;
+        return replaceTableDefinitionStampedWithReceipt(self, expected, replacement);
     }
 
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {

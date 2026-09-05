@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.index_mutation_conflict_error import IndexMutationConflictError
 from ...types import Response
 
 
@@ -26,7 +27,9 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | Error | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | Error | IndexMutationConflictError | None:
     if response.status_code == 201:
         response_201 = cast(Any, None)
         return response_201
@@ -35,6 +38,21 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         response_400 = Error.from_dict(response.json())
 
         return response_400
+
+    if response.status_code == 404:
+        response_404 = Error.from_dict(response.json())
+
+        return response_404
+
+    if response.status_code == 405:
+        response_405 = Error.from_dict(response.json())
+
+        return response_405
+
+    if response.status_code == 409:
+        response_409 = IndexMutationConflictError.from_dict(response.json())
+
+        return response_409
 
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
@@ -47,7 +65,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | Error]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | Error | IndexMutationConflictError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -61,7 +81,7 @@ def sync_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | Error]:
+) -> Response[Any | Error | IndexMutationConflictError]:
     """Drop an index from a table
 
     Args:
@@ -73,7 +93,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[Any | Error | IndexMutationConflictError]
     """
 
     kwargs = _get_kwargs(
@@ -93,7 +113,7 @@ def sync(
     index_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | Error | None:
+) -> Any | Error | IndexMutationConflictError | None:
     """Drop an index from a table
 
     Args:
@@ -105,7 +125,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        Any | Error | IndexMutationConflictError
     """
 
     return sync_detailed(
@@ -120,7 +140,7 @@ async def asyncio_detailed(
     index_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | Error]:
+) -> Response[Any | Error | IndexMutationConflictError]:
     """Drop an index from a table
 
     Args:
@@ -132,7 +152,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[Any | Error | IndexMutationConflictError]
     """
 
     kwargs = _get_kwargs(
@@ -150,7 +170,7 @@ async def asyncio(
     index_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | Error | None:
+) -> Any | Error | IndexMutationConflictError | None:
     """Drop an index from a table
 
     Args:
@@ -162,7 +182,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        Any | Error | IndexMutationConflictError
     """
 
     return (

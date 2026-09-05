@@ -939,6 +939,16 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader("Retry-After", retry_after);
             }
         }
+        if (@hasField(Response, "metadata_mutation_outcome")) {
+            if (resp.metadata_mutation_outcome) |outcome| {
+                try ctx.setHeader(
+                    metadata_http_routes.Routes.raft_mutation_outcome_header,
+                    switch (outcome) {
+                        .unknown => metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                    },
+                );
+            }
+        }
         _ = ctx.response.body(resp.body);
         return ctx.response.build();
     }
