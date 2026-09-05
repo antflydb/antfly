@@ -30,6 +30,7 @@ const build_options = @import("build_options");
 const jinja = @import("jinja");
 
 pub const qwen3_vl_gguf_bundle_family = "qwen3_vl_gguf_bundle/v1";
+pub const qwen3_vl_safetensors_bundle_family = "qwen3_vl_safetensors_bundle/v1";
 pub const qwen3_vl_reranker_gguf_bundle_family = "qwen3_vl_reranker_gguf_bundle/v1";
 pub const qwen3_vl_reranker_safetensors_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
 
@@ -527,6 +528,10 @@ pub const ModelManifest = struct {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
     }
 
+    pub fn isQwen3VlGenerationSafetensorsBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_safetensors_bundle_family);
+    }
+
     pub fn isQwen3VlReranker(self: *const ModelManifest) bool {
         return self.isQwen3VlRerankerGgufBundle() or
             self.isQwen3VlRerankerSafetensorsBundle() or
@@ -536,10 +541,19 @@ pub const ModelManifest = struct {
     }
 
     pub fn isQwen3VlBundle(self: *const ModelManifest) bool {
-        return self.isQwen3VlGgufBundle() or self.isQwen3VlRerankerSafetensorsBundle();
+        return self.isQwen3VlGgufBundle() or
+            self.isQwen3VlGenerationSafetensorsBundle() or
+            self.isQwen3VlRerankerSafetensorsBundle();
     }
 
     pub fn hasIncompleteQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        if (self.isQwen3VlGenerationSafetensorsBundle()) {
+            return self.safetensors_path == null or
+                self.config_path == null or
+                self.tokenizer_json_path == null or
+                self.tokenizer_config_path == null or
+                self.preprocessor_config_path == null;
+        }
         if (self.isQwen3VlRerankerSafetensorsBundle()) {
             return self.safetensors_path == null or
                 self.config_path == null or
@@ -2526,8 +2540,11 @@ fn parseInferenceBundleJsonInternal(
         }
         return;
     }
-    if (std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family)) {
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_safetensors_bundle_family) or
+        std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family))
+    {
         const model = obj.get("model") orelse obj.get("safetensors");
+        const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
         if (model == null or model.? != .string or model.?.string.len == 0) {
             if (catalog != null) return;
             const owned_family = try allocator.dupe(u8, bundle_family);
@@ -2537,7 +2554,7 @@ fn parseInferenceBundleJsonInternal(
             try setManifestInputs(allocator, manifest, &.{ "text", "image" });
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
-            manifest.model_type = .reranker;
+            manifest.model_type = if (is_reranker) .reranker else .generator;
             manifest.model_type_origin = .bundle;
             return;
         }
@@ -2551,7 +2568,7 @@ fn parseInferenceBundleJsonInternal(
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.safetensors_path, model_path);
-        manifest.model_type = .reranker;
+        manifest.model_type = if (is_reranker) .reranker else .generator;
         manifest.model_type_origin = .bundle;
         return;
     }
@@ -3955,6 +3972,26 @@ test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
     generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
     generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
     try std.testing.expect(!generation.hasIncompleteQwen3VlGgufBundle());
+
+    var safetensors_generation = ModelManifest{ .allocator = allocator };
+    defer safetensors_generation.deinit();
+    try parseInferenceBundleJson(&safetensors_generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expect(safetensors_generation.isQwen3VlGenerationSafetensorsBundle());
+    try std.testing.expect(!safetensors_generation.isQwen3VlReranker());
+    try std.testing.expect(safetensors_generation.isQwen3VlBundle());
+    try std.testing.expectEqual(ModelType.generator, safetensors_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, safetensors_generation.model_type_origin);
+    try std.testing.expectEqualStrings("qwen3_vl", safetensors_generation.config_model_arch);
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_generation.nativeWeightArtifactKind().?);
+    try std.testing.expect(safetensors_generation.hasIncompleteQwen3VlGgufBundle());
+
+    safetensors_generation.config_path = try allocator.dupe(u8, "config.json");
+    safetensors_generation.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    safetensors_generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    safetensors_generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    try std.testing.expect(!safetensors_generation.hasIncompleteQwen3VlGgufBundle());
 
     var reranker = ModelManifest{ .allocator = allocator };
     defer reranker.deinit();

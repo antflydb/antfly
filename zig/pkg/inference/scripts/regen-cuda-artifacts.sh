@@ -199,6 +199,7 @@ required_symbols=(
   termite_embedding_lookup_f16_weight_f32
   termite_embedding_lookup_i32_f16_weight_f32
   termite_attention_f32_block
+  termite_qwen3vl_vision_attention_tc_bf16_m32n16
   termite_attention_f32_bert_prefill_s256_hd64_q16
   termite_attention_f32_bert_prefill_s256_hd64_mma
   termite_cross_attention_f32
@@ -237,6 +238,8 @@ required_symbols=(
   termite_primitive_slice_f32
   termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32
+  termite_qwen3vl_mrope_f32
+  termite_qwen3vl_vision_rope_f32
   termite_rope_per_item_f32
   termite_rope_decode_scalars_f32
   termite_rope_scaled_decode_scalars_f32

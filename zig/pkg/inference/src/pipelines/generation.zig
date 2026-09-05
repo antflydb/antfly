@@ -3740,7 +3740,64 @@ pub const NativeGenerationPipeline = struct {
                 if (has_audio) return error.NativeAudioGenerationNotImplemented;
                 if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
-                if (self.gpt_config.family == .qwen3_5) {
+                if (self.gpt_config.family == .qwen3_vl) {
+                    if (!decode_state.isPaged()) return error.InvalidModelForGeneration;
+                    if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
+                    const per_image_budget = expanded_prompt_token_limit / images.len;
+                    if (per_image_budget < 64) return error.InputTokenLimitExceeded;
+                    const per_image_limit = @min(@as(usize, 576), per_image_budget);
+                    var projected = if (config.qwen3vl_parity_json_path != null)
+                        try qwen3vl_projector.encodeProjectedImagesResidentForQualification(
+                            &self.cb,
+                            allocator,
+                            self.gpt_config,
+                            images,
+                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                        )
+                    else
+                        try qwen3vl_projector.encodeProjectedImagesResident(
+                            &self.cb,
+                            allocator,
+                            self.gpt_config,
+                            images,
+                            .{ .max_images = 8, .max_merged_tokens = per_image_limit },
+                        );
+                    defer projected.deinit();
+                    var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
+                        self.tokenizer,
+                        allocator,
+                        prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                        self.gpt_config,
+                    );
+                    defer qwen_encoded.deinit();
+                    var qwen_prompt_tokens: usize = 0;
+                    while (qwen_prompt_tokens < qwen_encoded.attention_mask.len and qwen_encoded.attention_mask[qwen_prompt_tokens] != 0) : (qwen_prompt_tokens += 1) {}
+                    if (qwen_prompt_tokens == 0) return error.EmptyPrompt;
+                    prepared_qwen3vl_prompt = try qwen3vl_projector.prepareExpandedPromptEmbeddings(
+                        &self.cb,
+                        allocator,
+                        self.gpt_config,
+                        qwen_encoded.ids[0..qwen_prompt_tokens],
+                        projected,
+                        expanded_prompt_token_limit,
+                    );
+                    if (config.qwen3vl_parity_json_path) |parity_path| {
+                        try writeQwen3VlParityEvidence(
+                            allocator,
+                            self.io orelse return error.MissingIo,
+                            parity_path,
+                            config.qwen3vl_parity_patch_path,
+                            qwen_encoded.ids[0..qwen_prompt_tokens],
+                            &prepared_qwen3vl_prompt.?,
+                            &projected,
+                        );
+                    }
+                    decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
+                    decode_state.qwen3vl_text_only = false;
+                } else if (self.gpt_config.family == .qwen3_5) {
                     debugGenerationStage("qwen3.5 multimodal load preprocessor", .{});
                     const prep_cfg = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
                     debugGenerationStage("qwen3.5 multimodal encode prompt max_tokens={d}", .{expanded_prompt_token_limit});
