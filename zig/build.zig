@@ -3737,6 +3737,7 @@ pub fn build(b: *std.Build) void {
         "backend runtime rejects API lane leases after shutdown begins",
         "backend runtime control lane leases are isolated from API leases",
         "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime API lane preserves filesystem operations",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "table runtime snapshot cache preserves active managed admission proof",

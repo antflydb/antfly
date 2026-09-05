@@ -17,7 +17,6 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
-const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -728,10 +727,6 @@ pub const BackendRuntime = struct {
     native_storage_pool: *storage_io.NativeStoragePool,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
-    /// One immutable vtable is shared by every owned Threaded lane. The
-    /// userdata still selects the lane; only netConnectIp is replaced so
-    /// POSIX completion races have consistent, cancellation-safe semantics.
-    threaded_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -798,8 +793,6 @@ pub const BackendRuntime = struct {
                 errdefer deinitIoLane(alloc, inference_io_impl);
                 const control_io_impl = try initIoLane(alloc, threaded_io_limits.service);
                 errdefer deinitIoLane(alloc, control_io_impl);
-                const threaded_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
-                errdefer alloc.destroy(threaded_io_vtable);
 
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
@@ -808,7 +801,6 @@ pub const BackendRuntime = struct {
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
-                runtime.threaded_io_vtable = threaded_io_vtable;
                 runtime.raft_inbound_io_impl = raft_inbound_io_impl;
                 runtime.raft_outbound_io_impl = raft_outbound_io_impl;
                 runtime.api_io_impl = api_io_impl;
@@ -864,10 +856,6 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
-        if (self.threaded_io_vtable) |vtable| {
-            self.alloc.destroy(vtable);
-            self.threaded_io_vtable = null;
-        }
         self.native_storage_pool.deinit();
         self.alloc.destroy(self.native_storage_pool);
         self.lsm_owner_clone_registry.deinit();
@@ -878,12 +866,12 @@ pub const BackendRuntime = struct {
 
     pub fn io(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.io_impl) |io_impl| self.threadedIo(io_impl) else null;
-    }
-
-    fn threadedIo(self: *BackendRuntime, io_impl: *IoImpl) Io {
-        const vtable = self.threaded_io_vtable orelse return io_impl.io();
-        return threaded_connect_io.io(io_impl, vtable);
+        // Runtime lanes are general-purpose executors: callers use them for
+        // filesystem, randomness, timers, and task scheduling as well as
+        // transport work. Keep their native vtable identity intact. Network
+        // adapters such as StdHttpExecutor install connector overrides at the
+        // HTTP-client boundary where the narrower contract is valid.
+        return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
 
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
@@ -961,7 +949,7 @@ pub const BackendRuntime = struct {
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_inbound_io_impl) |io_impl| self.threadedIo(io_impl) else self.io();
+        return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -971,7 +959,7 @@ pub const BackendRuntime = struct {
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_outbound_io_impl) |io_impl| self.threadedIo(io_impl) else self.io();
+        return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -989,7 +977,7 @@ pub const BackendRuntime = struct {
     /// the executor lane and must outlive every borrower.
     pub fn apiIo(self: *BackendRuntime) ?Io {
         const io_impl = self.apiIoImpl() orelse return null;
-        return self.threadedIo(io_impl);
+        return io_impl.io();
     }
 
     pub const ApiLaneLease = struct {
@@ -1043,7 +1031,7 @@ pub const BackendRuntime = struct {
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
-        return self.threadedIo(io_impl);
+        return io_impl.io();
     }
 
     pub const InferenceLaneLease = struct {
@@ -1085,7 +1073,7 @@ pub const BackendRuntime = struct {
     pub fn controlIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
-        return self.threadedIo(io_impl);
+        return io_impl.io();
     }
 
     pub const ControlLaneLease = struct {
@@ -2154,30 +2142,58 @@ test "backend runtime inference lane has an isolated bounded executor" {
         std.Io.Limit.limited(threaded_io_limits.inference),
         handle.ptr().inference_io_impl.?.concurrent_limit,
     );
-    try std.testing.expect(inference_io.vtable == handle.ptr().threaded_io_vtable.?);
-    try std.testing.expect(
-        inference_io.vtable.netConnectIp != handle.ptr().inference_io_impl.?.io().vtable.netConnectIp,
-    );
+    try std.testing.expect(inference_io.vtable == handle.ptr().inference_io_impl.?.io().vtable);
 }
 
-test "backend runtime exposes the cancellation-safe connector on every owned lane" {
+test "backend runtime API lane preserves filesystem operations" {
     if (builtin.os.tag == .freestanding) return;
 
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const runtime = handle.ptr();
-    const safe_vtable = runtime.threaded_io_vtable.?;
-    const lanes = [_]Io{
-        runtime.io().?,
-        runtime.raftInboundIo().?,
-        runtime.raftOutboundIo().?,
-        runtime.apiIo().?,
-        runtime.inferenceIo().?,
-        runtime.controlIo().?,
+    const api_io = handle.ptr().apiIo().?;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        api_io,
+        root,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(absolute_root);
+    const missing = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/missing",
+        .{absolute_root},
+    );
+    defer std.testing.allocator.free(missing);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(api_io, missing, .{}),
+    );
+
+    const Worker = struct {
+        io: std.Io,
+        path: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = std.Io.Dir.cwd().statFile(self.io, self.path, .{}) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
     };
-    for (lanes) |lane| try std.testing.expect(lane.vtable == safe_vtable);
-    try std.testing.expect(safe_vtable.netConnectIp != runtime.io_impl.?.io().vtable.netConnectIp);
+    var worker: Worker = .{ .io = api_io, .path = missing };
+    var future = std.Io.async(api_io, Worker.run, .{&worker});
+    future.await(api_io);
+    try std.testing.expectEqual(error.FileNotFound, worker.err.?);
 }
 
 test "backend runtime rejects control lane leases after shutdown begins" {
