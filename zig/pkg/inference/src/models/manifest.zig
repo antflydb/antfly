@@ -2172,6 +2172,17 @@ fn replaceOwnedStringArray(
     target.* = replacement;
 }
 
+fn parseEmbeddingTaskContractJson(value: std.json.Value) !EmbeddingTaskContract {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    if (std.mem.eql(u8, value.string, "symmetric")) return .symmetric;
+    // `required` is the legacy fail-closed spelling. `profiled` still starts in
+    // the unresolved state and becomes profiled only after both roles have
+    // actually been declared.
+    if (std.mem.eql(u8, value.string, "profiled") or
+        std.mem.eql(u8, value.string, "required")) return .required;
+    return error.InvalidEmbeddingTaskProfile;
+}
+
 fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !void {
     // An explicit profile replaces inferred config.json defaults. Mark it
     // unresolved first so malformed or partial role mappings fail closed in
@@ -2180,11 +2191,8 @@ fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !v
     manifest.embedding_profile.task_contract = .required;
     if (value != .object) return;
 
-    if (value.object.get("task_contract")) |contract| {
-        if (contract == .string and std.mem.eql(u8, contract.string, "symmetric")) {
-            manifest.embedding_profile.task_contract = .symmetric;
-        }
-    }
+    if (value.object.get("task_contract")) |contract|
+        manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(contract);
     if (value.object.get("query")) |query| {
         if (query == .object) {
             if (query.object.get("prefix")) |prefix| {
@@ -2265,15 +2273,7 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         if (v == .bool) manifest.normalize = v.bool;
     }
     if (obj.get("embedding_task_contract")) |v| {
-        if (v == .string) {
-            if (std.mem.eql(u8, v.string, "symmetric")) {
-                manifest.embedding_profile.task_contract = .symmetric;
-            } else if (std.mem.eql(u8, v.string, "profiled")) {
-                manifest.embedding_profile.task_contract = .required;
-            } else if (std.mem.eql(u8, v.string, "required")) {
-                manifest.embedding_profile.task_contract = .required;
-            }
-        }
+        manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(v);
     }
     if (obj.get("embedding_profile")) |v| try parseEmbeddingProfileJson(manifest, v);
     // Legacy flat fields remain read-compatible. New manifests should use
@@ -3425,6 +3425,28 @@ test "task-required embedding manifests fail without a complete profile" {
         \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
     );
     try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
+}
+
+test "embedding task contract declarations reject unknown values and types" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_task_contract":true}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profile"}}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":1}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
 }
 
 test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {

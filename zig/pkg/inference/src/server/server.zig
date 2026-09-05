@@ -3142,7 +3142,11 @@ test "loaded model listing preserves managed variant identity without exposing c
     try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", identifier);
 }
 
-const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
+const RequestModelResolutionErrorKind = enum { invalid, missing, ambiguous, internal };
+
+const ambiguous_model_error_code = "AMBIGUOUS_MODEL";
+const ambiguous_model_error_message = "model identifier matches multiple installed variants";
+const ambiguous_model_error_hint = "Run `antfly inference list` and specify an exact owner/name:variant";
 
 const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
@@ -3161,7 +3165,33 @@ fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKin
     return switch (err) {
         error.InvalidModelIdentifier, error.ModelOutsideModelsDir => .invalid,
         error.ModelNotFound, error.ModelNotSpecified, error.FileNotFound, error.NotDir => .missing,
+        error.AmbiguousModelIdentifier => .ambiguous,
         else => .internal,
+    };
+}
+
+fn batchModelResolutionError(err: anyerror) api.GenerateBatchError {
+    return switch (requestModelResolutionErrorKind(err)) {
+        .invalid => .{
+            .code = "INVALID_REQUEST",
+            .message = "model must be a relative identifier within models_dir",
+            .retryable = false,
+        },
+        .missing => .{
+            .code = "MODEL_NOT_FOUND",
+            .message = "model not found",
+            .retryable = false,
+        },
+        .ambiguous => .{
+            .code = ambiguous_model_error_code,
+            .message = ambiguous_model_error_message,
+            .retryable = false,
+        },
+        .internal => .{
+            .code = "MODEL_RESOLUTION_FAILED",
+            .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err),
+            .retryable = true,
+        },
     };
 }
 
@@ -5443,6 +5473,11 @@ pub const Node = struct {
                 .@"error" = "MODEL_NOT_FOUND",
                 .message = "model not found",
                 .hint = "Run `antfly inference list`; pull the requested model or restart with --models-dir <path>",
+            }),
+            .ambiguous => ctx.status(409).json(.{
+                .@"error" = ambiguous_model_error_code,
+                .message = ambiguous_model_error_message,
+                .hint = ambiguous_model_error_hint,
             }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",
@@ -8916,11 +8951,7 @@ pub const Node = struct {
             } orelse break;
             const first_body = body.requests[first_idx].body;
             const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, first_body.model, "generators") catch |err| {
-                results[first_idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
-                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
-                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
-                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
-                };
+                results[first_idx].@"error" = batchModelResolutionError(err);
                 pending[first_idx] = false;
                 continue;
             };
@@ -10826,7 +10857,7 @@ pub const Node = struct {
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
+            .invalid, .ambiguous, .internal => return requestModelResolutionError(ctx, err),
         }
 
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
@@ -10859,7 +10890,7 @@ pub const Node = struct {
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
+            .invalid, .ambiguous, .internal => return requestModelResolutionError(ctx, err),
         }
 
         return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -11678,7 +11709,7 @@ pub const Node = struct {
                 return path;
             } else |err| switch (requestModelResolutionErrorKind(err)) {
                 .missing => continue,
-                .invalid, .internal => return err,
+                .invalid, .ambiguous, .internal => return err,
             }
         }
         return error.ModelNotFound;
@@ -17175,6 +17206,29 @@ test "HTTP model identifiers reject path and malformed variant syntax" {
 
     try std.testing.expectEqual(RequestModelResolutionErrorKind.invalid, requestModelResolutionErrorKind(error.InvalidModelIdentifier));
     try std.testing.expectEqual(RequestModelResolutionErrorKind.missing, requestModelResolutionErrorKind(error.ModelNotFound));
+    try std.testing.expectEqual(RequestModelResolutionErrorKind.ambiguous, requestModelResolutionErrorKind(error.AmbiguousModelIdentifier));
+
+    const batch_error = batchModelResolutionError(error.AmbiguousModelIdentifier);
+    try std.testing.expectEqualStrings(ambiguous_model_error_code, batch_error.code);
+    try std.testing.expectEqualStrings(ambiguous_model_error_message, batch_error.message);
+    try std.testing.expect(!batch_error.retryable);
+}
+
+test "ambiguous model resolution returns an actionable conflict response" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try Node.requestModelResolutionError(&ctx, error.AmbiguousModelIdentifier);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"AMBIGUOUS_MODEL\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
 }
 
 test "HTTP model resolution is canonical and contained while trusted resolution accepts absolute paths" {
