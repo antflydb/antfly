@@ -1339,9 +1339,10 @@ pub const IndexManager = struct {
     // prevents those appenders and idle maintenance from consuming the same
     // generation number through a delta checkpoint.
     vector_block_base_staging: std.atomic.Value(bool) = .init(false),
-    // Public readiness remains closed from stable-tip vector publication
-    // through posting-generation flattening. Queries may still lease the new
-    // mmap generation, but readiness cannot hand the compactor to query one.
+    // The owning index's public readiness remains closed from stable-tip
+    // vector publication through posting-generation flattening. Siblings keep
+    // serving from any generation that independently matches their posting
+    // sequence and scoped cardinality.
     vector_block_stable_tip_finalizing: std.atomic.Value(bool) = .init(false),
     // Valid only while vector_block_stable_tip_finalizing is true. The owner
     // may use a leading exact-vector generation to repair the in-memory
@@ -3196,6 +3197,18 @@ pub const IndexManager = struct {
         return manifest.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
     }
 
+    fn vectorBlockStableTipFinalizingEntry(
+        self: *const IndexManager,
+        entry: *const DenseIndex,
+    ) bool {
+        if (!self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
+        const owner = self.vector_block_stable_tip_index.load(.acquire);
+        // The owner pointer is published immediately after the finalizer
+        // claim. Conservatively close the sub-instruction transition window;
+        // once present, only that generation's readiness is fenced.
+        return owner == 0 or owner == @intFromPtr(entry);
+    }
+
     fn vectorBlockReadyAtSequenceAndCount(
         self: *IndexManager,
         source_sequence: u64,
@@ -3252,8 +3265,8 @@ pub const IndexManager = struct {
 
     pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
-        if (self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
         const entry = self.denseIndex(name) orelse return false;
+        if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         // Public replay/status watermarks can include unrelated table metadata
         // writes. Exact-vector consistency is tied to the immutable HBC
         // generation lease, whose durable posting boundary is the sequence
@@ -3298,8 +3311,8 @@ pub const IndexManager = struct {
         expected_count: u64,
     ) bool {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
-        if (self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
         const entry = self.denseIndex(name) orelse return false;
+        if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         return self.vectorBlockReadyAtSequenceAndCount(
             source_sequence,
             entry,
@@ -3310,6 +3323,15 @@ pub const IndexManager = struct {
     pub fn vectorBlockBaseMaintenanceNeeded(self: *IndexManager) bool {
         if (self.vector_block_storage == null) return false;
         for (self.dense_indexes.items) |*entry| {
+            // A blocked repair generation deliberately does not match the
+            // active posting cardinality yet. Its durable repair owner must
+            // build and publish postings before the shared exact-vector plane
+            // can certify this index. Treating that dependency as projection
+            // debt makes the broad maintenance lane repeatedly rebuild the
+            // same table-wide base and starves the repair that can resolve it.
+            // Serviceable operator rebuilds are not skipped because
+            // repairUnavailable() is false for their retained generation.
+            if (self.repairUnavailable(entry.config.name)) continue;
             if (self.vectorBlockReadyForDenseIndex(entry.config.name)) continue;
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence();
             const generation = self.acquireVectorBlockGeneration() orelse {
@@ -4289,15 +4311,6 @@ pub const IndexManager = struct {
         // than a readiness prerequisite.
         if (native_generation_self_contained) {
             _ = try entry.index.requestExperimentalPostingCheckpointForIdle();
-            const topology_result = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
-                std.log.warn("recursive HBC topology rebuild deferred index={s} sequence={} err={s}", .{
-                    entry.config.name,
-                    source_sequence,
-                    @errorName(err),
-                });
-                break :blk TopologyRebuildMaintenanceResult.deferred;
-            };
-            if (topology_result == .deferred) return .pending;
             self.vector_block_candidate_sequence.store(0, .release);
             self.vector_block_candidate_since_ns.store(0, .release);
             return .progressed;
@@ -4319,100 +4332,9 @@ pub const IndexManager = struct {
         };
 
         try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
-        const topology_result = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
-            // This is optional topology maintenance. The freshly published
-            // exact-vector base and existing HBC tree remain authoritative if
-            // admission or reconstruction fails.
-            std.log.warn("recursive HBC topology rebuild deferred index={s} sequence={} err={s}", .{
-                entry.config.name,
-                source_sequence,
-                @errorName(err),
-            });
-            break :blk TopologyRebuildMaintenanceResult.deferred;
-        };
-        if (topology_result == .deferred) {
-            // Vector publication succeeded, but topology admission is a
-            // separate optional operation. Retain the candidate so a later
-            // idle pass retries against this already-current vector base.
-            return .progressed;
-        }
         self.vector_block_candidate_sequence.store(0, .release);
         self.vector_block_candidate_since_ns.store(0, .release);
         return .progressed;
-    }
-
-    const TopologyRebuildMaintenanceResult = enum {
-        /// Topology rebuilding is disabled, already current, or permanently
-        /// outside the configured workspace ceiling. No retry debt remains.
-        not_needed,
-        /// This pass atomically published a replacement topology.
-        completed,
-        /// The topology is stale but a transient prerequisite or resource
-        /// admission boundary prevented rebuilding it. Retain retry debt.
-        deferred,
-    };
-
-    fn maybeRebuildRecursiveTopologyFromVectorBlocks(
-        self: *IndexManager,
-        entry: *DenseIndex,
-    ) !TopologyRebuildMaintenanceResult {
-        const max_workspace_bytes = hbcRecursiveTopologyRebuildMaxWorkspaceBytes();
-        if (max_workspace_bytes == 0) return .not_needed;
-        const algorithm = hbcTopologyRebuildAlgorithm();
-        const generation = self.acquireVectorBlockGeneration() orelse return .deferred;
-        defer generation.release();
-        const epoch = generation.opened.store.topologyEpoch() orelse return .deferred;
-        if (try entry.index.topologyRebuildMarkerMatches(
-            algorithm,
-            epoch.base_generation,
-            epoch.wal_mutation_sequence,
-        )) return .not_needed;
-        const workspace_bytes = entry.index.topologyRebuildWorkspaceBytes(algorithm) orelse return .not_needed;
-        if (workspace_bytes > max_workspace_bytes) {
-            std.log.info("recursive HBC topology rebuild skipped by workspace bound index={s} required_bytes={} max_bytes={}", .{
-                entry.config.name,
-                workspace_bytes,
-                max_workspace_bytes,
-            });
-            return .not_needed;
-        }
-
-        var reservation: ?resource_manager_mod.Reservation = if (self.resource_manager) |manager|
-            // A complete topology generation is one indivisible progress unit.
-            // It runs under the per-index apply mutex in quiescent maintenance,
-            // so admit one bounded oversized unit while still enforcing both
-            // slice serialization and the process-wide physical envelope.
-            manager.reserveBoundedOversizedSingle(.dense_repair_working_set, workspace_bytes, 4) catch |err| {
-                std.log.info("recursive HBC topology rebuild awaiting resource admission index={s} workspace_bytes={} err={s}", .{
-                    entry.config.name,
-                    workspace_bytes,
-                    @errorName(err),
-                });
-                return .deferred;
-            }
-        else
-            null;
-        defer if (reservation) |*held| held.release();
-
-        const stats = (try entry.index.rebuildTopologyFromCurrentVectors(
-            max_workspace_bytes,
-            algorithm,
-            epoch.base_generation,
-            epoch.wal_mutation_sequence,
-        )) orelse return .deferred;
-        std.log.info(
-            "HBC topology rebuilt index={s} algorithm={s} vectors={} retired_nodes={} created_nodes={} workspace_bytes={} elapsed_ms={}",
-            .{
-                entry.config.name,
-                @tagName(algorithm),
-                stats.vectors,
-                stats.retired_nodes,
-                stats.created_nodes,
-                stats.workspace_bytes,
-                stats.elapsed_ns / std.time.ns_per_ms,
-            },
-        );
-        return .completed;
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
@@ -7652,16 +7574,33 @@ pub const IndexManager = struct {
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
-            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             // Capture ownership is protected by the same per-index apply
             // mutex as replay. Without this fence, catch-up can observe an
             // active maintenance capture, decline to start its own capture,
             // then mutate after maintenance has published and released it.
-            // Holding the mutex through maintenance publication makes the
-            // two legal cases explicit: maintenance either joins an already
-            // active source window or fully finishes before that window starts.
-            lockAtomicWithBackoff(entry.apply_mutex);
+            // Holding the mutex through maintenance publication makes the two
+            // legal cases explicit: maintenance either joins an already active
+            // source window or fully finishes before that window starts. Under
+            // foreground pressure, probe rather than queue behind a mutation;
+            // a completed builder still publishes at the next gap without
+            // adding head-of-line latency to the writer it is meant to yield to.
+            const foreground_busy = entry.index.shouldDeferOptionalPostingMaintenance();
+            if (foreground_busy) {
+                if (!entry.apply_mutex.tryLock()) continue;
+            } else {
+                lockAtomicWithBackoff(entry.apply_mutex);
+            }
             defer entry.apply_mutex.unlock();
+
+            // A completed immutable builder is already past its expensive
+            // work. Publish it before optional-maintenance deferral so a full
+            // WAL cannot remain wedged behind a continuous foreground stream.
+            // This is a bounded CURRENT/read-generation handoff, not a corpus
+            // compaction on the maintenance caller.
+            if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) {
+                total_steps += 1;
+            }
+            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
 
             // A write path observed a tree-link inconsistency (stale parent
             // pointer / dangling node reference): run a bounded repair sweep
@@ -7775,6 +7714,7 @@ pub const IndexManager = struct {
     pub fn runVectorBlockMaintenance(self: *IndexManager) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (self.repairUnavailable(entry.config.name)) continue;
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
@@ -7793,6 +7733,12 @@ pub const IndexManager = struct {
         const primary = self.primary_store orelse return 0;
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            // Initial-build and fail-closed repair generations are owned by
+            // the repair scheduler. Their expected posting count is
+            // intentionally stale, so using it to validate the shared vector
+            // base creates a dependency inversion: projection maintenance
+            // fails before posting repair is allowed to run.
+            if (self.repairUnavailable(entry.config.name)) continue;
             lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             const source_sequence = primary.lastReplaySequence(0);
@@ -21398,18 +21344,6 @@ pub const IndexManager = struct {
         const value = stressEnvUsize("ANTFLY_HBC_BULK_INGEST_BULK_BUILD_MIN_ITEMS", 1024);
         hbc_bulk_ingest_bulk_build_min_items_cache.store(value +% 1, .monotonic);
         return value;
-    }
-
-    fn hbcRecursiveTopologyRebuildMaxWorkspaceBytes() u64 {
-        return @intCast(stressEnvUsize("ANTFLY_HBC_RECURSIVE_TOPOLOGY_REBUILD_MAX_BYTES", 0));
-    }
-
-    fn hbcTopologyRebuildAlgorithm() hbc_mod.TopologyRebuildAlgorithm {
-        const raw_z = getenv("ANTFLY_HBC_TOPOLOGY_REBUILD_ALGORITHM") orelse return .global_kmeans;
-        const raw = std.mem.span(raw_z);
-        if (std.mem.eql(u8, raw, "recursive")) return .recursive;
-        if (std.mem.eql(u8, raw, "hierarchical_kmeans")) return .hierarchical_kmeans;
-        return .global_kmeans;
     }
 
     fn hbcBulkRebuildLeafMinMembers() usize {

@@ -12002,6 +12002,16 @@ pub const DataServer = struct {
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
+        // Store identity must be able to bootstrap before a newly introduced
+        // runtime-status envelope is activated. Advertise the dense-native
+        // capability only after metadata has durably selected the framed V16
+        // profile; the ordinary status heartbeat then upgrades this record and
+        // participates in the separate dense-authority capability floor.
+        var protocol_snapshot = try remote_metadata.fetchSnapshot();
+        defer freeAdminSnapshotOwned(self.alloc, &protocol_snapshot);
+        const dense_native_capability = denseNativeCapabilityForRuntimeStatusVersion(
+            protocol_snapshot.status.runtime_status_protocol_activated_version,
+        );
         const owned_api_url = if (registration.api_url.len == 0) try self.baseUri(self.alloc) else null;
         defer if (owned_api_url) |url| self.alloc.free(url);
         const api_url = if (registration.api_url.len > 0) registration.api_url else owned_api_url.?;
@@ -12017,7 +12027,7 @@ pub const DataServer = struct {
             .reporter_incarnation = try self.reporterIncarnation(),
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
-            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
+            .dense_native_storage_protocol_version = dense_native_capability,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -12703,6 +12713,9 @@ pub const DataServer = struct {
         retainCurrentReallocationRequestObservations(group_statuses, snapshot.reallocation_request);
 
         const capacity = self.observeStoreCapacityForStatus();
+        const dense_native_capability = denseNativeCapabilityForRuntimeStatusVersion(
+            snapshot.status.runtime_status_protocol_activated_version,
+        );
 
         const candidate_report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
@@ -12710,7 +12723,7 @@ pub const DataServer = struct {
             .embedding_activity_sequence = self.embedding_activity_report_sequence.fetchAdd(1, .monotonic),
             .reporter_incarnation = reporter_incarnation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
-            .dense_native_storage_protocol_version = antfly.metadata.table_manager.dense_native_storage_protocol_version,
+            .dense_native_storage_protocol_version = dense_native_capability,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -20215,6 +20228,14 @@ fn runtimeStatusReadyForStoreRegistration(ready_version: u16) bool {
     );
 }
 
+fn denseNativeCapabilityForRuntimeStatusVersion(activated_version: u16) u16 {
+    if (!metadata_runtime_status_protocol.profileSatisfies(
+        activated_version,
+        metadata_runtime_status_protocol.dense_native_capability_record_version,
+    )) return 0;
+    return antfly.metadata.table_manager.dense_native_storage_protocol_version;
+}
+
 test "data store registration waits for native generation capability acknowledgment" {
     const expected = antfly.metadata.table_manager.StoreRecord{
         .store_id = 101,
@@ -20238,7 +20259,14 @@ test "data store registration waits for native generation capability acknowledgm
     try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.v0_2_0_record_version));
     try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
     try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.current_record_version));
-    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(16));
+
+    try std.testing.expectEqual(@as(u16, 0), denseNativeCapabilityForRuntimeStatusVersion(0));
+    try std.testing.expectEqual(@as(u16, 0), denseNativeCapabilityForRuntimeStatusVersion(12));
+    try std.testing.expectEqual(@as(u16, 0), denseNativeCapabilityForRuntimeStatusVersion(15));
+    try std.testing.expectEqual(
+        antfly.metadata.table_manager.dense_native_storage_protocol_version,
+        denseNativeCapabilityForRuntimeStatusVersion(16),
+    );
 }
 
 fn findRangeByGroupId(

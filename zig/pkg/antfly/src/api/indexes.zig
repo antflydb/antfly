@@ -1847,16 +1847,6 @@ fn publicShardIndexRuntimeView(
     // this after aggregation can erase unrelated live catch-up on a sibling.
     if (publicIndexRepairState(item) != null and repairActiveGenerationServiceable(item)) return view;
 
-    if (item.kind == .dense_vector and async_indexing.dense_projection_finalizing) {
-        // Native exact-vector publication is table-writer runtime state. It
-        // can become pending after the cached per-index materialization
-        // snapshot was recorded, so project it here while shard ownership and
-        // its AsyncIndexingStats are still paired.
-        view.dense_vector_projection_pending = true;
-        view.backfill_active = true;
-        view.backfill_progress = @min(view.backfill_progress, 0.999);
-    }
-
     const dense_catch_up = async_indexing.dense_catch_up;
     if (!dense_catch_up.active) return view;
     view.catch_up_active = true;
@@ -5324,7 +5314,7 @@ test "native dense vector projection remains public readiness debt after externa
     try std.testing.expect(aggregate.dense_vector_projection_pending);
 }
 
-test "writer native vector finalization projects through cached shard status" {
+test "table-wide native vector work does not block an independently ready index" {
     const cached: db_mod.types.DBIndexStats = .{
         .name = "vec",
         .kind = .dense_vector,
@@ -5336,9 +5326,9 @@ test "writer native vector finalization projects through cached shard status" {
     const view = publicShardIndexRuntimeView(cached, .{
         .dense_projection_finalizing = true,
     });
-    try std.testing.expect(view.dense_vector_projection_pending);
-    try std.testing.expect(view.backfill_active);
-    try std.testing.expectEqual(@as(f64, 0.999), view.backfill_progress);
+    try std.testing.expect(!view.dense_vector_projection_pending);
+    try std.testing.expect(!view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
 }
 
 fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_generation: u64, expected_config_hash: u64) bool {

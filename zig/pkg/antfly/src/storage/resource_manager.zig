@@ -82,6 +82,11 @@ else
     };
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
+// Percentage-only reserves strand tens or hundreds of GiB on large volumes
+// and can prevent the small repair that restores query service. Planned
+// candidate bytes are reserved independently, so this cap is additional
+// emergency durability headroom rather than the maintenance work budget.
+const default_disk_safety_floor_max_bytes: u64 = 16 * 1024 * MiB;
 
 pub const Slice = enum(u8) {
     lsm_block_table_cache,
@@ -328,11 +333,12 @@ pub const Options = struct {
     /// bounded by the derived-backlog byte budget.
     derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
-    /// index configuration. The larger of the fixed floor and this fraction
-    /// of observed capacity is kept available for WAL, checkpoints, and
-    /// foreground durability.
+    /// index configuration. The larger of the fixed floor and the bounded
+    /// capacity fraction is kept available for WAL, checkpoints, and
+    /// foreground durability. A zero max preserves an uncapped fraction.
     disk_safety_floor_bytes: u64 = default_disk_safety_floor_bytes,
     disk_safety_floor_divisor: u64 = default_disk_safety_floor_divisor,
+    disk_safety_floor_max_bytes: u64 = default_disk_safety_floor_max_bytes,
     /// Internal query-embedding cache policy. Serving layers consume this
     /// policy but cannot override it independently of the node manager.
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
@@ -624,6 +630,7 @@ const DerivedRecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
@@ -760,6 +767,7 @@ pub const ResourceManager = struct {
     derived_backlog_throttle_window_sequences: usize,
     disk_safety_floor_bytes: u64,
     disk_safety_floor_divisor: u64,
+    disk_safety_floor_max_bytes: u64,
     capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
     query_embedding_cache_budget: cache_budget.CacheBudget,
     query_embedding_cache_ttl_ns: u64,
@@ -793,6 +801,7 @@ pub const ResourceManager = struct {
             .derived_backlog_throttle_window_sequences = options.derived_backlog_throttle_window_sequences,
             .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
             .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
+            .disk_safety_floor_max_bytes = options.disk_safety_floor_max_bytes,
             .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
@@ -1484,7 +1493,11 @@ pub const ResourceManager = struct {
         var floor = self.disk_safety_floor_bytes;
         if (self.disk_safety_floor_divisor != 0) {
             if (observation.capacity_bytes) |capacity| {
-                floor = @max(floor, capacity / self.disk_safety_floor_divisor);
+                var proportional = capacity / self.disk_safety_floor_divisor;
+                if (self.disk_safety_floor_max_bytes != 0) {
+                    proportional = @min(proportional, self.disk_safety_floor_max_bytes);
+                }
+                floor = @max(floor, proportional);
             }
         }
         return floor;
@@ -3504,6 +3517,32 @@ test "resource manager coordinates growable capacity by physical domain" {
     try std.testing.expectEqual(@as(u64, 2), stats.denials);
     try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
     try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "capacity percentage safety floor is capped on large volumes" {
+    var manager = ResourceManager.init(.{
+        .disk_safety_floor_bytes = 10,
+        .disk_safety_floor_divisor = 20,
+        .disk_safety_floor_max_bytes = 30,
+    });
+    defer manager.deinit(std.testing.allocator);
+    const observation = CapacityObservation{
+        .available_bytes = 100,
+        .capacity_bytes = 1000,
+    };
+
+    // Five percent would reserve 50 bytes. The independent 30-byte emergency
+    // cap leaves room for 70 bytes of explicitly accounted maintenance.
+    var admitted = try manager.reserveCapacity(std.testing.allocator, 7, 70, observation, 0);
+    defer admitted.release();
+    try std.testing.expectError(
+        error.CapacityUnavailable,
+        manager.reserveCapacity(std.testing.allocator, 7, 1, observation, 0),
+    );
+    const domains = try manager.capacityDomainStats(std.testing.allocator);
+    defer std.testing.allocator.free(domains);
+    try std.testing.expectEqual(@as(usize, 1), domains.len);
+    try std.testing.expectEqual(@as(u64, 30), domains[0].last_safety_floor_bytes);
 }
 
 test "capacity reservation revalidation fails closed when available space falls" {

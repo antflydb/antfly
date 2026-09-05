@@ -4739,6 +4739,78 @@ scratch. The 57-second replay drain also shows that stable-tip work should
 coalesce adjacent dirty sequences into larger bounded transactions; it must not
 restore synchronous foreground pressure.
 
+#### Bounded WAL recovery and lifecycle-only publication
+
+Review of the asynchronous handoff found two lifecycle holes that do not
+appear in a clean benchmark run. First, the posting WAL's independent format
+limit was treated as fatal by the derived worker even though a completed or
+restartable checkpoint can release that capacity. Second, native authority
+could become durable while an asynchronous builder still borrowed the legacy
+LSM; the blocked detach was then forgotten until another mutation or restart.
+
+`PostingWalTooLarge` is now explicit recoverable backpressure with bounded
+worker backoff. The rejection path promotes the current builder, or starts a
+full immutable builder when a prior failure left none. The mandatory
+maintenance lane publishes only builders whose corpus work is already
+complete, before optional foreground-pressure deferral. It never joins the
+builder or performs a corpus scan under the per-index apply fence. Native
+authority records legacy retirement as pending and drains it at the first safe
+publication/capture boundary, so the compatibility LSM cannot remain resident
+indefinitely.
+
+The quiescent recursive topology experiment was removed from production
+maintenance and from the qualification script. Its clustering implementation
+interleaves corpus CPU work with live-tree writes, so a resource reservation
+does not make it safe to execute under the mutation fence. A future topology
+optimizer must construct a complete immutable `TopologyPlan` from a pinned
+search/vector generation outside that fence, then publish with an epoch/CURRENT
+compare-and-swap. Until that design exists, the qualified native layout keeps
+the existing topology rather than exposing a disabled-by-default path capable
+of multi-second foreground stalls.
+
+The framed V16 runtime-status rollout also requires a two-phase bootstrap.
+Advertising the dense-native capability in a data node's initial store record
+made metadata reject that record until V16 activation, while the absent store
+could not progress to its normal capability heartbeat. Initial registration
+now uses the strongest already-activated status profile. Once V16 is durable,
+the ordinary status report upgrades the store capability and the independent
+dense-native cluster floor can activate. Native authority remains disabled
+until that second floor is committed; no readiness or migration fact is
+downgraded to make an old protocol appear safe.
+
+Back-to-back public index creation exposed a separate dependency inversion.
+The shared exact-vector file is table-wide, while native posting authority and
+repair admission are index-generation scoped. A newly admitted external index
+can therefore have its exact artifact durably present while its fail-closed
+posting repair still has an empty active generation. Broad startup maintenance
+was validating the table-wide file against that deliberately stale posting
+count, publishing the file, returning
+`VectorBlockPublishedGenerationNotReady`, and retrying before the only owner
+capable of fixing the count was scheduled.
+
+Projection maintenance now skips only repair generations whose serving gate is
+blocked. Their durable repair owner builds and atomically activates postings;
+the next ordinary projection pass then certifies the index against the already
+available shared exact plane. Healthy indexes and operator rebuilds that retain
+a serviceable generation are unchanged. Public readiness likewise derives
+from each index's immutable posting/vector generation token rather than the
+table-wide `dense_projection_finalizing` worker flag. The latter remains useful
+aggregate telemetry, but can no longer make every sibling index report 99.9%
+while unrelated projection work is active. The public-API regression with two
+back-to-back external indexes, an immediate `full_index` batch, readiness, and
+queries now completes in 4.43 seconds in Debug.
+
+The same regression then exposed a node-wide admission issue on large or
+cache-backed volumes. A raw five-percent disk reserve scales to about 46 GiB
+on a 926 GiB filesystem; with 35 GiB actually free it rejected a fully
+accounted 320 MiB shadow repair forever, even though the repair was the only
+owner capable of restoring query service. The disk governor now keeps
+`max(1 GiB, min(5% of capacity, 16 GiB))` as additional emergency durability
+headroom. Candidate, replay, and cleanup bytes remain separately and fully
+reserved, so this removes pathological proportional slack rather than
+weakening repair accounting. The preserved public-API regression completes in
+4.03 seconds in Debug on that below-five-percent-free host after this change.
+
 ## Next checks
 
 1. Coalesce adjacent stable-tip replay sequences into larger bounded HBC WAL

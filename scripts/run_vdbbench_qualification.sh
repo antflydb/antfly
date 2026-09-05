@@ -23,9 +23,6 @@ usage() {
   echo "  --native-hbc             Enable the HBC native posting WAL/segment store" >&2
   echo "  --vector-blocks          Build/use the shared mmap exact-vector projection" >&2
   echo "  --vector-block-encoding MODE  Exact projection encoding (float32 or float16)" >&2
-  echo "  --recursive-topology-max-workspace-mb N" >&2
-  echo "                           Enable bounded quiescent recursive topology rebuild" >&2
-  echo "  --topology-rebuild-algorithm MODE  recursive, global_kmeans, or hierarchical_kmeans" >&2
   echo "  --centroid-directory MODE  HBC centroid routing mode (auto, hbc, flat_rabitq, or flat_exact)" >&2
   echo "  --flat-probe-count N     Initial flat centroid posting wave (0: search width)" >&2
   echo "  --posting-idle-max-postings N  Background dirty-posting batch per index" >&2
@@ -50,7 +47,6 @@ usage() {
   echo "  VDBBENCH_PROFILE_DATASET Dataset directory for detailed profiling (default: inferred from case)" >&2
   echo "  VDBBENCH_VECTOR_BLOCKS Build/use the shared mmap exact-vector projection (default: 0)" >&2
   echo "  VDBBENCH_VECTOR_BLOCK_ENCODING Exact projection encoding (default: float16)" >&2
-  echo "  VDBBENCH_RECURSIVE_TOPOLOGY_MAX_WORKSPACE_MB Bounded recursive topology workspace (default: disabled)" >&2
   echo "  VDBBENCH_RESUME_AFTER_LIVE Restart/query an existing run root (default: 0)" >&2
   echo "  VDBBENCH_RESUME_CONCURRENT Run concurrent search after a warm resume (default: 0)" >&2
   echo "  VDBBENCH_LABEL_SUFFIX Required unique suffix for a resume run (for example: -budget-1024)" >&2
@@ -94,8 +90,6 @@ label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
 native_hbc=0
 vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
 vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float16}
-recursive_topology_max_workspace_mb=${VDBBENCH_RECURSIVE_TOPOLOGY_MAX_WORKSPACE_MB:-}
-topology_rebuild_algorithm=${VDBBENCH_TOPOLOGY_REBUILD_ALGORITHM:-global_kmeans}
 diagnostic_profile_only=0
 centroid_directory_mode=${VDBBENCH_HBC_CENTROID_DIRECTORY_MODE:-}
 flat_probe_count=${VDBBENCH_HBC_FLAT_PROBE_COUNT:-}
@@ -121,8 +115,6 @@ while [[ $# -gt 0 ]]; do
     --native-hbc) native_hbc=1; shift ;;
     --vector-blocks) vector_blocks=1; shift ;;
     --vector-block-encoding) [[ $# -ge 2 ]] || usage; vector_block_encoding=$2; shift 2 ;;
-    --recursive-topology-max-workspace-mb) [[ $# -ge 2 ]] || usage; recursive_topology_max_workspace_mb=$2; shift 2 ;;
-    --topology-rebuild-algorithm) [[ $# -ge 2 ]] || usage; topology_rebuild_algorithm=$2; shift 2 ;;
     --centroid-directory) [[ $# -ge 2 ]] || usage; centroid_directory_mode=$2; shift 2 ;;
     --flat-probe-count) [[ $# -ge 2 ]] || usage; flat_probe_count=$2; shift 2 ;;
     --posting-idle-max-postings) [[ $# -ge 2 ]] || usage; posting_idle_max_postings=$2; shift 2 ;;
@@ -150,18 +142,6 @@ if [[ "$vector_block_encoding" != "float32" && "$vector_block_encoding" != "floa
   exit 2
 fi
 export ANTFLY_HBC_VECTOR_BLOCK_ENCODING=$vector_block_encoding
-if [[ -n "$recursive_topology_max_workspace_mb" ]]; then
-  if [[ ! "$recursive_topology_max_workspace_mb" =~ ^[1-9][0-9]*$ ]]; then
-    echo "recursive topology workspace must be a positive integer in MiB" >&2
-    exit 2
-  fi
-  export ANTFLY_HBC_RECURSIVE_TOPOLOGY_REBUILD_MAX_BYTES=$((recursive_topology_max_workspace_mb * 1024 * 1024))
-fi
-if [[ "$topology_rebuild_algorithm" != "recursive" && "$topology_rebuild_algorithm" != "global_kmeans" && "$topology_rebuild_algorithm" != "hierarchical_kmeans" ]]; then
-  echo "topology rebuild algorithm must be recursive, global_kmeans, or hierarchical_kmeans" >&2
-  exit 2
-fi
-export ANTFLY_HBC_TOPOLOGY_REBUILD_ALGORITHM=$topology_rebuild_algorithm
 if [[ -n "$centroid_directory_mode" ]]; then
   if [[ "$centroid_directory_mode" != "auto" && "$centroid_directory_mode" != "hbc" && "$centroid_directory_mode" != "flat_rabitq" && "$centroid_directory_mode" != "flat_exact" ]]; then
     echo "centroid directory mode must be auto, hbc, flat_rabitq, or flat_exact" >&2
@@ -287,7 +267,7 @@ fi
 
 mkdir -p "$run_root/results"
 if [[ "$resume_after_live" != "1" ]]; then
-  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$recursive_topology_max_workspace_mb" "$topology_rebuild_algorithm" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
+  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
 import json
 import os
 import subprocess
@@ -313,8 +293,6 @@ experiment_environment_names = (
     native_hbc,
     vector_blocks,
     vector_block_encoding,
-    recursive_topology_max_workspace_mb,
-    topology_rebuild_algorithm,
     centroid_directory_mode,
     flat_probe_count,
 ) = sys.argv[1:]
@@ -342,12 +320,6 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "native_hbc_posting_store": native_hbc == "1",
             "native_exact_vector_blocks": vector_blocks == "1",
             "vector_block_encoding": vector_block_encoding,
-            "recursive_topology_max_workspace_mb": (
-                int(recursive_topology_max_workspace_mb)
-                if recursive_topology_max_workspace_mb
-                else None
-            ),
-            "topology_rebuild_algorithm": topology_rebuild_algorithm,
             "centroid_directory_mode": centroid_directory_mode or None,
             "flat_centroid_probe_count": int(flat_probe_count) if flat_probe_count else None,
             "load_lifecycle": "public_api_online_incremental",

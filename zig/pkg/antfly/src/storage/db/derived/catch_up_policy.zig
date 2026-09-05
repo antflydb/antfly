@@ -75,6 +75,7 @@ pub const RecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
@@ -106,6 +107,7 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
         error.ResourceBudgetExceeded,
+        error.PostingWalTooLarge,
         error.PersistentDescriptorAdmissionExhausted,
         error.TextMergeBackpressureTimeout,
         error.TextMergeBackpressureUnavailable,
@@ -329,6 +331,10 @@ test "text merge admission failures remain recoverable for derived replay" {
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureUnavailable));
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeRuntimeShutdown));
     try std.testing.expect(!isRecoverableAdmissionError(error.TextPublicationExceedsSegmentLimit));
+}
+
+test "posting WAL capacity remains recoverable for derived replay" {
+    try std.testing.expect(isRecoverableAdmissionError(error.PostingWalTooLarge));
 }
 
 test "full text replay policy bounds work by item count as well as bytes" {

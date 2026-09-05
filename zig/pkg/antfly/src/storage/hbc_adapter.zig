@@ -3937,8 +3937,9 @@ const managedPostingCheckpointHardWalBytes: u64 = 256 * 1024 * 1024;
 // bounded chain supported by the durable checkpoint format so sustained
 // ingestion does not repeatedly rewrite the growing base. Cold lookup cost is
 // still capped at eight immutable patches before decoded node/quantized caches
-// take over, and the 256 MiB WAL ceiling remains the synchronous recovery-debt
-// bound. Query/restart qualification covers the deliberately larger chain.
+// take over. At 256 MiB the builder receives mandatory progress priority; the
+// independent WAL format limit remains an explicit, recoverable backpressure
+// boundary. Query/restart qualification covers the deliberately larger chain.
 const managedPostingMaxDeltaSegments: usize = vectorindex_posting_wal.Checkpoint.max_delta_segments;
 
 pub const TopologyRebuildAlgorithm = enum {
@@ -4064,6 +4065,16 @@ pub const HBCIndex = struct {
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
+    /// Native authority can become durable while an opportunistic checkpoint
+    /// still borrows storage owned by the compatibility LSM. Record the
+    /// retirement request explicitly and drain it only at a boundary where no
+    /// caller retains a Store pointer that detachment may invalidate.
+    legacy_lsm_detach_pending: bool = false,
+    /// Tracks the native control-file half of authority publication separately
+    /// from the compatibility LSM metadata marker. This avoids an unnecessary
+    /// control-file rewrite/fsync during the normal post-publication detach,
+    /// while still repairing an interrupted legacy transition on reopen.
+    experimental_posting_native_authority_persisted: bool = false,
     /// Selects the native WAL as the mutation authority for a complete,
     /// immutable base generation. Legacy indexes may still mirror mutations
     /// into an optional posting sidecar, but must keep mutating their LSM so
@@ -5294,6 +5305,7 @@ pub const HBCIndex = struct {
             .published_generation = .init(0),
             .experimental_posting_wal_authoritative = .init(posting_wal_authoritative),
             .experimental_posting_wal_authoritative_persisted = posting_wal_authoritative,
+            .experimental_posting_native_authority_persisted = opened == .native,
             .published_spare_flight = published_spare_flight,
             .rng = go_rand.GoPcg.init(effective_config.quantizer_seed, 1024),
             .quantizer = quantizer,
@@ -8311,6 +8323,7 @@ pub const HBCIndex = struct {
             self.refreshExperimentalPostingReadGenerationBestEffort(posting_store.covered_source_sequence);
         }
         self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
+        self.scheduleLegacyLsmDetachAfterNativeActivation();
         return true;
     }
 
@@ -8376,8 +8389,9 @@ pub const HBCIndex = struct {
     /// Starts or publishes opportunistic posting compaction at an explicit
     /// database-idle boundary. Building remains off the caller: readiness is
     /// bounded by the durable WAL commit, while later maintenance/write/close
-    /// paths can publish the completed staged segment. The hard WAL ceiling in
-    /// maintainExperimentalPostingCheckpoint remains the only join point.
+    /// paths can publish the completed staged segment. The hard WAL threshold
+    /// promotes builder progress; an independently recoverable capacity error
+    /// provides explicit backpressure if publication still cannot keep up.
     pub fn requestExperimentalPostingCheckpointForIdle(self: *HBCIndex) !bool {
         if (!self.experimental_posting_sidecar_managed or
             !self.experimental_posting_wal_authoritative.load(.acquire) or
@@ -8409,8 +8423,37 @@ pub const HBCIndex = struct {
             _ = try self.startExperimentalPostingCheckpointBuild(posting_store, null);
         }
         const generation_after = posting_store.latestSegmentGeneration() orelse 0;
-        return generation_after != generation_before or
+        const progressed = generation_after != generation_before or
             (!build_before and self.experimental_posting_checkpoint_build != null);
+        // `posting_store` is dead after this point. Detachment may close and
+        // recreate its borrowed storage handle without invalidating a caller.
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
+        return progressed;
+    }
+
+    /// Publishes only a checkpoint that has already finished staging. Unlike
+    /// optional maintenance admission, this handoff remains eligible during
+    /// sustained foreground traffic: it performs no corpus scan and is the
+    /// operation that releases a full WAL's recoverable capacity pressure.
+    pub fn publishReadyExperimentalPostingCheckpointForRecovery(self: *HBCIndex) !bool {
+        if (!self.experimental_posting_sidecar_managed or
+            !self.experimental_posting_wal_authoritative.load(.acquire) or
+            self.write_session_depth != 0 or
+            self.experimental_posting_capture_enabled or
+            self.experimental_posting_maintenance_capture_active)
+        {
+            return false;
+        }
+        const build = self.experimental_posting_checkpoint_build orelse return false;
+        if (!build.completed.load(.acquire)) return false;
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        const progressed = try self.publishCompletedExperimentalPostingCheckpointBuild(
+            &self.experimental_posting_write_store.?,
+        );
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
+        return progressed;
     }
 
     /// At a caller-proven stable publication boundary, flatten every committed
@@ -8529,12 +8572,11 @@ pub const HBCIndex = struct {
             // irreversible marker. A crash on either side therefore selects
             // one complete authority, never a half-published native tree.
             try self.experimental_posting_write_store.?.markAuthoritative();
+            self.experimental_posting_native_authority_persisted = true;
             self.experimental_posting_wal_authoritative_persisted = true;
             self.experimental_posting_wal_authoritative.store(true, .release);
-            // Retry reclamation if an earlier best-effort detach was blocked.
-            // The authority marker and immutable generation make either owner
-            // safe until the compatibility handle can be released.
-            self.detachLegacyLsmAfterNativeActivationBestEffort();
+            self.scheduleLegacyLsmDetachAfterNativeActivation();
+            self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
         }
     }
 
@@ -8565,6 +8607,38 @@ pub const HBCIndex = struct {
             covered_source_sequence,
             .{ .sync = options.sync },
         ) catch |first_err| {
+            // Capacity rejection happens before append I/O and therefore is
+            // never an ambiguous commit. Reopening would reread a WAL that can
+            // already be hundreds of MiB, only to deterministically reject the
+            // same batch again. Promote the retained checkpoint builder and
+            // let derived replay retry after its short publication handoff.
+            if (first_err == error.PostingWalTooLarge) {
+                // A compatibility sidecar is invalidated by the enclosing
+                // capture failure and falls back to its complete LSM. Starting
+                // a builder there would make invalidation join and discard it
+                // on this response path. Only WAL authority needs mandatory
+                // native capacity recovery.
+                const wal_authoritative = self.experimental_posting_wal_authoritative.load(.acquire);
+                if (wal_authoritative and self.experimental_posting_checkpoint_build == null) {
+                    _ = self.startExperimentalPostingCheckpointBuild(
+                        &self.experimental_posting_write_store.?,
+                        .full,
+                    ) catch |start_err| {
+                        // The capacity error remains the retry contract. Keep
+                        // the compactor failure visible without replacing it
+                        // with an error the worker might classify as fatal.
+                        std.log.warn("dense posting WAL capacity recovery could not start checkpoint err={s}", .{
+                            @errorName(start_err),
+                        });
+                    };
+                }
+                if (wal_authoritative) {
+                    if (self.experimental_posting_checkpoint_build) |build| {
+                        build.force_progress.store(true, .release);
+                    }
+                }
+                return first_err;
+            }
             self.closeExperimentalPostingWalWriter();
             self.experimental_posting_write_store = self.openExperimentalPostingStore() catch |reopen_err| {
                 std.log.err("dense posting WAL append recovery failed append_err={s} reopen_err={s}", .{
@@ -8611,6 +8685,8 @@ pub const HBCIndex = struct {
         defer posting_store.deinit();
         try posting_store.invalidate();
         self.experimental_posting_sidecar_managed = false;
+        self.experimental_posting_native_authority_persisted = false;
+        self.legacy_lsm_detach_pending = false;
     }
 
     pub fn persistExperimentalPostingSidecarAtAppliedSequence(
@@ -8689,6 +8765,9 @@ pub const HBCIndex = struct {
                 @errorName(err),
             });
         };
+        // Maintenance no longer owns `posting_store`. A checkpoint published
+        // above may have removed the last retirement blocker.
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
     }
 
     fn beginExperimentalPostingMutationCaptureOwned(
@@ -8899,7 +8978,8 @@ pub const HBCIndex = struct {
     fn cancelExperimentalPostingMaintenanceCapture(self: *HBCIndex) void {
         self.cancelExperimentalPostingMutationCapture();
         self.experimental_posting_maintenance_capture_active = false;
-        self.detachLegacyLsmAfterNativeActivationBestEffort();
+        self.scheduleLegacyLsmDetachAfterNativeActivation();
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
     }
 
     /// Completes an independently committed maintenance transaction without
@@ -8912,7 +8992,8 @@ pub const HBCIndex = struct {
     ) !void {
         defer {
             self.experimental_posting_maintenance_capture_active = false;
-            self.detachLegacyLsmAfterNativeActivationBestEffort();
+            self.scheduleLegacyLsmDetachAfterNativeActivation();
+            self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
         }
         if (!self.experimentalPostingCaptureHasMutations()) {
             self.cancelExperimentalPostingMutationCapture();
@@ -9121,7 +9202,8 @@ pub const HBCIndex = struct {
             .record_count = @intCast(commit_workspace.records.items.len),
             .wal_committed_bytes = posting_store.wal_committed_bytes,
         };
-        self.detachLegacyLsmAfterNativeActivationBestEffort();
+        self.scheduleLegacyLsmDetachAfterNativeActivation();
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
         return append_stats;
     }
 
@@ -10455,7 +10537,8 @@ pub const HBCIndex = struct {
         generation_owned = false;
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_overlay_collapsed_wal_bytes = state.wal_committed_bytes;
-        self.detachLegacyLsmAfterNativeActivationBestEffort();
+        self.scheduleLegacyLsmDetachAfterNativeActivation();
+        self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
     }
 
     /// Physical retirement is deliberately separate from native authority.
@@ -10486,8 +10569,15 @@ pub const HBCIndex = struct {
         }
     }
 
-    fn detachLegacyLsmAfterNativeActivationBestEffort(self: *HBCIndex) void {
-        if (!self.nativeHbcAuthoritative() or
+    fn scheduleLegacyLsmDetachAfterNativeActivation(self: *HBCIndex) void {
+        if (self.nativeHbcAuthoritative() and self.env_owner == .lsm) {
+            self.legacy_lsm_detach_pending = true;
+        }
+    }
+
+    fn drainLegacyLsmDetachAfterNativeActivationBestEffort(self: *HBCIndex) void {
+        if (!self.legacy_lsm_detach_pending or
+            !self.nativeHbcAuthoritative() or
             !self.experimentalPostingReadGenerationLoaded() or
             self.write_session_depth != 0 or
             self.experimental_posting_capture_enabled or
@@ -10497,20 +10587,24 @@ pub const HBCIndex = struct {
             return;
         }
         if (self.env_owner != .lsm) return;
-        if (self.experimental_posting_write_store == null) {
-            self.experimental_posting_write_store = self.openExperimentalPostingStore() catch |err| {
-                std.log.warn("HBC native authority marker could not open mutation store err={s}", .{@errorName(err)});
+        if (!self.experimental_posting_native_authority_persisted) {
+            if (self.experimental_posting_write_store == null) {
+                self.experimental_posting_write_store = self.openExperimentalPostingStore() catch |err| {
+                    std.log.warn("HBC native authority marker could not open mutation store err={s}", .{@errorName(err)});
+                    return;
+                };
+            }
+            self.experimental_posting_write_store.?.markAuthoritative() catch |err| {
+                std.log.warn("HBC native authority marker publication failed err={s}", .{@errorName(err)});
                 return;
             };
+            self.experimental_posting_native_authority_persisted = true;
         }
-        self.experimental_posting_write_store.?.markAuthoritative() catch |err| {
-            std.log.warn("HBC native authority marker publication failed err={s}", .{@errorName(err)});
-            return;
-        };
         const native = hbc_backend.NativeBackend.detachFromLsm(self.alloc, &self.env_owner.lsm) catch |err| {
             std.log.warn("HBC native generation could not release legacy LSM backend err={s}", .{@errorName(err)});
             return;
         };
+        self.legacy_lsm_detach_pending = false;
 
         // Store handles and a retained posting Store can borrow the LSM's
         // internally-owned NativeStorage object. Drop them before closing the
@@ -21954,6 +22048,54 @@ test "max-chain full checkpoint starts below the hard WAL budget" {
     try std.testing.expect(managedPostingFullCheckpointWalBytes < managedPostingCheckpointHardWalBytes);
 }
 
+test "posting WAL capacity rejection starts mandatory checkpoint recovery" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1.0, 0.0 }, "doc:1");
+    try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false });
+    // Isolate the WAL-authority recovery branch without transitioning storage
+    // ownership; authority activation itself has separate lifecycle coverage.
+    idx.experimental_posting_wal_authoritative.store(true, .release);
+
+    if (idx.experimental_posting_write_store == null) {
+        idx.experimental_posting_write_store = try idx.openExperimentalPostingStore();
+    }
+    const posting_store = &idx.experimental_posting_write_store.?;
+    const original_wal_bytes = posting_store.wal_committed_bytes;
+    posting_store.wal_committed_bytes = std.math.maxInt(u64);
+    defer posting_store.wal_committed_bytes = original_wal_bytes;
+    const coverage = [_]posting_segment_store_mod.BatchRecord{.{
+        .kind = .coverage,
+        .posting_id = 0,
+        .source_sequence = 1,
+        .payload = &.{},
+    }};
+    try std.testing.expectError(
+        error.PostingWalTooLarge,
+        idx.appendExperimentalPostingBatchDurably(
+            try posting_store.nextBatchId(),
+            &coverage,
+            1,
+            .{},
+        ),
+    );
+    const build = idx.experimental_posting_checkpoint_build orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(build.force_progress.load(.acquire));
+}
+
 test "posting WAL mutations provide read your writes without derived LSM persistence" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -22363,6 +22505,79 @@ test "stable generation finalization bootstraps capture-free rebuild into native
             std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
         );
     }
+}
+
+test "completed checkpoint publication drains deferred legacy LSM detach" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const Loader = struct {
+        fn load(_: *anyopaque, loader_alloc: Allocator, vector_id: u64, _: []const u8) ![]f32 {
+            const vector: []const f32 = switch (vector_id) {
+                1 => &.{ 1.0, 0.0 },
+                2 => &.{ 0.0, 1.0 },
+                else => return error.NotFound,
+            };
+            return try loader_alloc.dupe(f32, vector);
+        }
+    };
+    var loader_context: u8 = 0;
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer idx.close();
+    idx.setExternalVectorLoader(&loader_context, Loader.load);
+
+    // Establish one complete native base while the compatibility LSM remains
+    // authoritative, then append a WAL delta that a full builder can retain.
+    try idx.batchInsertWithMetadataOptions(&.{.{
+        .vector_id = 1,
+        .vector = &.{ 1.0, 0.0 },
+        .metadata = "doc:1",
+    }}, .{ .skip_vector_store = true });
+    try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(1, .{ .flatten = false });
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.batchInsertWithMetadataOptions(&.{.{
+        .vector_id = 2,
+        .vector = &.{ 0.0, 1.0 },
+        .metadata = "doc:2",
+    }}, .{ .skip_vector_store = true });
+    try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+    try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(
+        &idx.experimental_posting_write_store.?,
+        .full,
+    ));
+
+    // Authority publication is durable immediately, but the active builder
+    // still borrows storage owned by the LSM. Retirement must remain pending
+    // rather than being forgotten when this first drain attempt is blocked.
+    idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(2, .{
+        .flatten = false,
+        .make_authoritative = true,
+    });
+    try std.testing.expect(idx.experimentalPostingWalAuthoritative());
+    try std.testing.expect(idx.env_owner == .lsm);
+    try std.testing.expect(idx.legacy_lsm_detach_pending);
+
+    idx.experimental_posting_checkpoint_build.?.awaitCompletion();
+    try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+    try std.testing.expect(idx.experimental_posting_checkpoint_build == null);
+    try std.testing.expect(idx.env_owner == .native);
+    try std.testing.expect(!idx.legacy_lsm_detach_pending);
+
+    var results = try idx.search(&.{ 0.0, 1.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
+    try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
 }
 
 test "posting WAL capture can begin inside a streaming replay session" {

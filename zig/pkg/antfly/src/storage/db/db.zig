@@ -27576,12 +27576,11 @@ pub const DB = struct {
             normalizeReplayStatusFromDurableCheckpoint(item);
             if (item.kind == .dense_vector and
                 self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(item.name) and
-                (runtime_stats.async_indexing.dense_projection_finalizing or
-                    !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
-                        item.name,
-                        item.replay_applied_sequence,
-                        dense_vector_active_count,
-                    )))
+                !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
+                    item.name,
+                    item.replay_applied_sequence,
+                    dense_vector_active_count,
+                ))
             {
                 // When the native exact-vector projection is enabled it is
                 // part of query readiness, not best-effort maintenance. Apply
@@ -28055,12 +28054,11 @@ pub const DB = struct {
                     }
                     item.catch_up_phase = async_indexing.dense_catch_up.phase;
                     if (self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(cfg.name) and
-                        (async_indexing.dense_projection_finalizing or
-                            !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
-                                cfg.name,
-                                item.replay_applied_sequence,
-                                item.doc_count,
-                            )))
+                        !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
+                            cfg.name,
+                            item.replay_applied_sequence,
+                            item.doc_count,
+                        ))
                     {
                         item.backfill_active = true;
                         item.backfill_progress = @min(item.backfill_progress, 0.999);
@@ -91193,6 +91191,47 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     });
 
     for (configs) |config| {
+        const entry = db.core.index_manager.denseIndex(config.name) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+        try std.testing.expectEqual(
+            @as(?u64, 1),
+            try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, config.name),
+        );
+    }
+
+    // Stable-tip publication owns one posting generation even though its
+    // exact-vector file is shared by the table. Preserve the independently
+    // certified sibling instead of projecting the owner's short fence onto
+    // every dense index.
+    {
+        const owner = db.core.index_manager.denseIndex(configs[0].name) orelse
+            return error.TestUnexpectedResult;
+        db.core.index_manager.vector_block_stable_tip_index.store(@intFromPtr(owner), .release);
+        db.core.index_manager.vector_block_stable_tip_sequence.store(
+            try db.core.loadAppliedSequence(alloc, configs[0].name),
+            .release,
+        );
+        db.core.index_manager.vector_block_stable_tip_finalizing.store(true, .release);
+        defer {
+            db.core.index_manager.vector_block_stable_tip_sequence.store(0, .release);
+            db.core.index_manager.vector_block_stable_tip_index.store(0, .release);
+            db.core.index_manager.vector_block_stable_tip_finalizing.store(false, .release);
+        }
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        const owner_stats = for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, configs[0].name)) break item;
+        } else return error.TestUnexpectedResult;
+        const sibling_stats = for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, configs[1].name)) break item;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(owner_stats.dense_vector_projection_pending);
+        try std.testing.expect(!sibling_stats.dense_vector_projection_pending);
+    }
+
+    for (configs) |config| {
         const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
         defer alloc.free(counter_key);
         var counter_value: [8]u8 = undefined;
@@ -91370,6 +91409,20 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 12), checkpoint.generation);
+
+    // The worker claim is table-wide observability, not an index-local
+    // readiness fence. Another dense index may begin projection work after
+    // this generation becomes complete; the immutable generation token above
+    // must remain independently serviceable.
+    db.async_context.dense_projection_finalizing.store(true, .release);
+    defer db.async_context.dense_projection_finalizing.store(false, .release);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    const dense_stats = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, config.name)) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
+    try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
 test "db empty inline dense generation finalizes without scanning primary documents" {
