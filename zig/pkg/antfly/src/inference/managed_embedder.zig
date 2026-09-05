@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
+const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
 const credential_safety = @import("../common/credential_safety.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
@@ -456,6 +457,10 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     truncate: []u8 = "",
+    /// Borrowed from the owning ManagedEmbedder. Keeping the credential
+    /// manager alive across requests preserves ADC tokens and serializes
+    /// refreshes instead of reminting a token for every embedding operation.
+    google_credentials: ?*google_auth.CredentialManager = null,
     bedrock_credentials: bedrock_provider.CredentialCache = .{},
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
@@ -749,10 +754,36 @@ fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbe
     });
 }
 
+fn createManagedGoogleCredentialManager(
+    alloc: std.mem.Allocator,
+    io: ?std.Io,
+    entries: []ManagedEmbeddingEntry,
+) !?*google_auth.CredentialManager {
+    var has_vertex = false;
+    for (entries) |entry| {
+        if (entry.provider == .vertex) {
+            has_vertex = true;
+            break;
+        }
+    }
+    if (!has_vertex) return null;
+
+    const manager = try alloc.create(google_auth.CredentialManager);
+    manager.* = google_auth.CredentialManager.init(
+        alloc,
+        io orelse std.Io.Threaded.global_single_threaded.io(),
+    );
+    for (entries) |*entry| {
+        if (entry.provider == .vertex) entry.google_credentials = manager;
+    }
+    return manager;
+}
+
 pub const ManagedEmbedder = struct {
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
     pacer_scope_keys: [][]u8 = &.{},
+    google_credentials: ?*google_auth.CredentialManager = null,
 
     pub fn initFromIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !ManagedEmbedder {
         return try initFromIndexesJsonWithOptions(alloc, indexes_json, .{});
@@ -812,10 +843,21 @@ pub const ManagedEmbedder = struct {
         }
         try attachRequestPacers(alloc, entries.items, &pacer_scope_keys);
 
+        const google_credentials = try createManagedGoogleCredentialManager(
+            alloc,
+            options.io,
+            entries.items,
+        );
+        errdefer if (google_credentials) |manager| {
+            manager.deinit();
+            alloc.destroy(manager);
+        };
+
         return .{
             .alloc = alloc,
             .entries = try entries.toOwnedSlice(alloc),
             .pacer_scope_keys = try pacer_scope_keys.toOwnedSlice(alloc),
+            .google_credentials = google_credentials,
         };
     }
 
@@ -827,6 +869,10 @@ pub const ManagedEmbedder = struct {
             self.alloc.free(scope_key);
         }
         if (self.pacer_scope_keys.len > 0) self.alloc.free(self.pacer_scope_keys);
+        if (self.google_credentials) |manager| {
+            manager.deinit();
+            self.alloc.destroy(manager);
+        }
         self.* = undefined;
     }
 
@@ -2826,9 +2872,13 @@ fn semanticIdentityFieldsEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
 fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
     if (std.mem.eql(u8, name, "multimodal")) return .{ .bool = false };
     if (std.mem.eql(u8, name, "region") or
+        std.mem.eql(u8, name, "project_id") or
         std.mem.eql(u8, name, "request_format") or
         std.mem.eql(u8, name, "input_type") or
-        std.mem.eql(u8, name, "truncate"))
+        std.mem.eql(u8, name, "truncate") or
+        std.mem.eql(u8, name, "query_input_type") or
+        std.mem.eql(u8, name, "document_input_type") or
+        std.mem.eql(u8, name, "query_instruction"))
     {
         return .{ .string = "" };
     }
@@ -2864,6 +2914,62 @@ fn validateCatalogSemanticProducerOwner(
         if (!semanticIdentityFieldsEqual(field.value_ptr.*, producer_field))
             return error.InvalidEmbeddingArtifactProducer;
     }
+
+    // The owner-to-producer pass above accepts omitted fields at their
+    // canonical defaults. Compare in the other direction as well so a
+    // producer cannot add a non-default retrieval role or deployment field
+    // that was absent from the admitted owner identity.
+    var producer_fields = producer.object.iterator();
+    while (producer_fields.next()) |field| {
+        const owner_field = owner_identity.value.object.get(field.key_ptr.*) orelse
+            semanticIdentityDefaultField(field.key_ptr.*) orelse
+            return error.InvalidEmbeddingArtifactProducer;
+        if (!semanticIdentityFieldsEqual(field.value_ptr.*, owner_field))
+            return error.InvalidEmbeddingArtifactProducer;
+    }
+}
+
+pub fn testCatalogSemanticIdentityRejectsProducerOnlyFields() !void {
+    const owner_identity =
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":""}
+    ;
+    var producer = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":"","query_input_type":"custom_query"}
+    ,
+        .{},
+    );
+    defer producer.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateCatalogSemanticProducerOwner(std.testing.allocator, producer.value, .{
+            .sparse = false,
+            .dimensions = 1024,
+            .semantic_producer_json = owner_identity,
+            .index_value = .null,
+        }),
+    );
+
+    var canonical_default = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":"","query_input_type":""}
+    ,
+        .{},
+    );
+    defer canonical_default.deinit();
+    try validateCatalogSemanticProducerOwner(std.testing.allocator, canonical_default.value, .{
+        .sparse = false,
+        .dimensions = 1024,
+        .semantic_producer_json = owner_identity,
+        .index_value = .null,
+    });
+}
+
+test "catalog semantic identity rejects producer-only retrieval fields" {
+    try testCatalogSemanticIdentityRejectsProducerOnlyFields();
 }
 
 fn validateCatalogEmbeddingProducerOwnership(
@@ -4620,11 +4726,22 @@ fn embedBatchWithVertex(
     if (texts.len == 0) return error.EmptyEmbeddingResponse;
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
+    const token_source = if (entry.google_credentials) |manager|
+        manager.tokenSource(
+            if (entry.credentials_path.len > 0) entry.credentials_path else null,
+            vertex_provider.vertex_auth_scope,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.MissingVertexCredentials,
+        }
+    else
+        null;
     var provider = try vertex_provider.Provider.init(alloc, &http, .{
         .base_url = entry.base_url,
         .project_id = if (entry.project_id.len > 0) entry.project_id else null,
         .location = entry.location,
         .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
+        .token_source = token_source,
     });
     defer provider.deinit();
 
@@ -4966,6 +5083,43 @@ pub fn testVertexEmbeddingRequestPlanning() !void {
 
 test "Vertex embedding request planning matches model-specific wire limits" {
     try testVertexEmbeddingRequestPlanning();
+}
+
+pub fn testManagedVertexCredentialManagerLifetime() !void {
+    var entries = [_]ManagedEmbeddingEntry{
+        .{
+            .alloc = std.testing.allocator,
+            .index_name = @constCast("first"),
+            .provider = .vertex,
+            .model = @constCast("gemini-embedding-001"),
+            .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
+            .dimensions = 3072,
+        },
+        .{
+            .alloc = std.testing.allocator,
+            .index_name = @constCast("second"),
+            .provider = .vertex,
+            .model = @constCast("text-embedding-005"),
+            .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
+            .dimensions = 768,
+        },
+    };
+    const manager = (try createManagedGoogleCredentialManager(
+        std.testing.allocator,
+        null,
+        &entries,
+    )).?;
+    defer {
+        manager.deinit();
+        std.testing.allocator.destroy(manager);
+    }
+
+    try std.testing.expect(entries[0].google_credentials == manager);
+    try std.testing.expect(entries[1].google_credentials == manager);
+}
+
+test "managed Vertex entries share a lifetime-scoped Google credential manager" {
+    try testManagedVertexCredentialManagerLifetime();
 }
 
 fn vertexEmbeddingRequestCount(model: []const u8, input_count: usize) usize {

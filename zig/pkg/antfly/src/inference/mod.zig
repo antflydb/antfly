@@ -80,6 +80,8 @@ test "embedding provider request helpers" {
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
     try managed_embedder.testCohereBatchLimit();
     try managed_embedder.testVertexEmbeddingRequestPlanning();
+    try managed_embedder.testManagedVertexCredentialManagerLifetime();
+    try managed_embedder.testCatalogSemanticIdentityRejectsProducerOnlyFields();
     try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
 }
 

@@ -19,7 +19,7 @@ const inference = @import("types.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 
 const Allocator = std.mem.Allocator;
-const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
+pub const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const GeminiOptions = struct {
     base_url: []const u8 = "https://generativelanguage.googleapis.com/v1beta",
