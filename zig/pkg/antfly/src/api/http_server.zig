@@ -3543,7 +3543,8 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
+            .network_io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
+            .filesystem_io = if (self.cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3615,6 +3616,11 @@ pub const ApiHttpServer = struct {
         return runtime.apiIo();
     }
 
+    pub fn sharedApiNetworkIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return runtime.apiNetworkIo();
+    }
+
     /// Local backup repositories need the API lane's native filesystem
     /// contract. Remote repositories retain the cancellation-safe connector
     /// used by request-scoped network transport.
@@ -3629,7 +3635,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
+    pub fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
         const runtime = self.cfg.backend_runtime orelse return null;
         return runtime.apiFilesystemIo();
     }
@@ -4060,7 +4066,8 @@ pub const ApiHttpServer = struct {
                         .node_config = self.server.cfg.node_config,
                         .connection = target.connection,
                         .required_capability = "backup.write",
-                        .io = io,
+                        .network_io = self.server.sharedApiNetworkIo(),
+                        .filesystem_io = self.server.sharedApiFilesystemIo(),
                     },
                 ) catch |err| {
                     std.log.warn("cluster backup maintenance location open deferred class={s}", .{@errorName(err)});
@@ -4297,7 +4304,8 @@ pub const ApiHttpServer = struct {
                     .node_config = self.server.cfg.node_config,
                     .connection = self.connection,
                     .required_capability = "backup.write",
-                    .io = io,
+                    .network_io = self.server.sharedApiNetworkIo(),
+                    .filesystem_io = self.server.sharedApiFilesystemIo(),
                 },
             );
             defer location.deinit(self.server.owner_alloc);
@@ -11515,11 +11523,68 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn tableConfigContainsIndex(alloc: std.mem.Allocator, indexes_json: []const u8, index_name: []const u8) !bool {
+    const CatalogIndexUse = enum {
+        full_text,
+        dense,
+        sparse,
+        graph,
+    };
+
+    fn tableConfigContainsCompatibleIndex(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        index_name: []const u8,
+        use: CatalogIndexUse,
+    ) !bool {
         if (index_name.len == 0) return false;
         var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return false;
-        lookup.deinit();
-        return true;
+        defer lookup.deinit();
+        const index_type = indexes_api.inferIndexType(index_name, lookup.config) orelse return false;
+        return switch (use) {
+            .full_text => index_type == .full_text,
+            .graph => index_type == .graph,
+            .dense, .sparse => blk: {
+                if (index_type != .embeddings or lookup.config != .object) break :blk false;
+                const sparse = if (lookup.config.object.get("sparse")) |value|
+                    value == .bool and value.bool
+                else
+                    false;
+                break :blk sparse == (use == .sparse);
+            },
+        };
+    }
+
+    /// Mirror `resolveFilterTextIndexEntry`: an explicit primary is tried
+    /// first, then the root index if it is text, then the implicit text index
+    /// only when the catalog contains exactly one text index.
+    fn tableConfigResolvesFilterTextIndex(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        primary_text_index_name: ?[]const u8,
+        root_index_name: ?[]const u8,
+    ) !bool {
+        if (primary_text_index_name) |name| {
+            if (try tableConfigContainsCompatibleIndex(alloc, indexes_json, name, .full_text)) return true;
+        }
+        if (root_index_name) |name| {
+            if (try tableConfigContainsCompatibleIndex(alloc, indexes_json, name, .full_text)) return true;
+        }
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        const indexes = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        var text_count: usize = 0;
+        var it = indexes.iterator();
+        while (it.next()) |entry| {
+            if (indexes_api.inferIndexType(entry.key_ptr.*, entry.value_ptr.*) == .full_text) {
+                text_count += 1;
+                if (text_count > 1) return false;
+            }
+        }
+        return text_count == 1;
     }
 
     fn queryReferencesOnlyCatalogIndexes(
@@ -11536,24 +11601,61 @@ pub const ApiHttpServer = struct {
         // build lifecycle and must not be rewritten as retryable.
         var referenced = false;
         if (req.index_name) |name| {
+            if (db_query_search.requestBindsRootTextIndex(req)) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .full_text)) return false;
+            }
+            if (req.dense != null) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .dense)) return false;
+            }
+            if (req.sparse != null) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .sparse)) return false;
+            }
+            switch (req.query) {
+                .dense_knn => {
+                    referenced = true;
+                    if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .dense)) return false;
+                },
+                .sparse_knn => {
+                    referenced = true;
+                    if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .sparse)) return false;
+                },
+                else => {},
+            }
+        }
+        if (db_query_search.requestBindsFilterTextIndex(req)) {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, name)) return false;
+            if (!try tableConfigResolvesFilterTextIndex(
+                self.alloc,
+                table.indexes_json,
+                req.primary_text_index_name,
+                req.index_name,
+            )) return false;
         }
         for (req.full_text_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .full_text)) return false;
         }
         for (req.dense_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .dense)) return false;
         }
         for (req.sparse_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .sparse)) return false;
+        }
+        switch (req.query) {
+            .graph => |query| {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .graph)) return false;
+            },
+            else => {},
         }
         for (req.graph_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.query.index_name, .graph)) return false;
         }
         if (!referenced) return false;
 
@@ -14282,7 +14384,8 @@ pub const ApiHttpServer = struct {
                     self.tableApi(.{}),
                     self.cfg.secret_store,
                     self.cfg.node_config,
-                    self.sharedApiIo(),
+                    self.sharedApiNetworkIo(),
+                    self.sharedApiFilesystemIo(),
                 );
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
@@ -15677,7 +15780,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
@@ -15764,7 +15868,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
 
@@ -16110,7 +16215,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = state.connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| {
             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -22778,7 +22884,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"full_text_index_v0\":{},\"graph_idx\":{\"type\":\"graph\",\"edge_types\":[]}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -22820,7 +22926,11 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
     defer server.deinit();
 
-    const catalog_request: db_mod.types.SearchRequest = .{ .index_name = "semantic_idx" };
+    const vector = [_]f32{ 0.1, 0.2, 0.3 };
+    const catalog_request: db_mod.types.SearchRequest = .{
+        .index_name = "semantic_idx",
+        .dense = .{ .vector = &vector },
+    };
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
@@ -22838,6 +22948,109 @@ test "api http classifies catalog-to-serving index convergence without runtime s
         FakeReads.source(),
         "docs",
         unknown_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const mismatched_primary_text_request: db_mod.types.SearchRequest = .{
+        .index_name = "semantic_idx",
+        .query = .{ .match = .{ .field = "body", .text = "hello" } },
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_primary_text_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_primary_text_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const text_catalog_request: db_mod.types.SearchRequest = .{
+        .index_name = "full_text_index_v0",
+        .filter_query_json = "{\"match_all\":{}}",
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", text_catalog_request));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        text_catalog_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const filtered_dense_catalog_request: db_mod.types.SearchRequest = .{
+        .index_name = "semantic_idx",
+        .primary_text_index_name = "full_text_index_v0",
+        .dense = .{ .vector = &vector },
+        .filter_text = .{ .term = .{ .field = "body", .term = "hello" } },
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", filtered_dense_catalog_request));
+
+    var fallback_filtered_dense_request = filtered_dense_catalog_request;
+    fallback_filtered_dense_request.primary_text_index_name = null;
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", fallback_filtered_dense_request));
+
+    var fallback_from_mismatched_filter_index_request = filtered_dense_catalog_request;
+    fallback_from_mismatched_filter_index_request.primary_text_index_name = "semantic_idx";
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", fallback_from_mismatched_filter_index_request));
+
+    const graph_catalog_request: db_mod.types.SearchRequest = .{
+        .query = .{ .graph = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        } },
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", graph_catalog_request));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        graph_catalog_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const mismatched_graph_request: db_mod.types.SearchRequest = .{
+        .query = .{ .graph = .{
+            .query_type = .neighbors,
+            .index_name = "semantic_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        } },
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_graph_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_graph_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"full_text_index_v0\":{},\"graph_idx\":{\"type\":\"graph\",\"edge_types\":[]}}";
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "semantic_idx", .dense));
+    try std.testing.expect(!try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "semantic_idx", .sparse));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "sparse_idx", .sparse));
+    try std.testing.expect(!try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "sparse_idx", .dense));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "full_text_index_v0", .full_text));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "graph_idx", .graph));
+
+    const mismatched_request: db_mod.types.SearchRequest = .{
+        .full_text_queries = &.{.{
+            .name = "$full_text_results",
+            .index_name = "semantic_idx",
+            .query = .{ .match_all = {} },
+        }},
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_request,
         .read_index,
         .{ .resolve = &server },
     ));

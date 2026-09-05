@@ -125,6 +125,27 @@ test "google auth transport borrows a shared io runtime" {
     try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
 }
 
+test "google auth owns a filesystem fallback for a network-only authority" {
+    const alloc = std.testing.allocator;
+    var network_impl = std.Io.Threaded.init(alloc, .{});
+    defer network_impl.deinit();
+    const network_io = network_impl.io();
+
+    const cfg = try metadataConfigAlloc(alloc, default_scope);
+    var source = try CachedTokenSource.initWithAuthorities(alloc, cfg, network_io, null);
+    defer source.deinit();
+    try std.testing.expect(source.owned_httpx.?.io_impl == null);
+    try std.testing.expect(source.owned_filesystem_io != null);
+    try std.testing.expect(source.io.?.userdata == network_io.userdata);
+    try std.testing.expect(source.filesystem_io.?.userdata != network_io.userdata);
+
+    const compatible_cfg = try metadataConfigAlloc(alloc, default_scope);
+    var compatible = try CachedTokenSource.initWithIo(alloc, compatible_cfg, network_io);
+    defer compatible.deinit();
+    try std.testing.expect(compatible.owned_filesystem_io == null);
+    try std.testing.expect(compatible.filesystem_io.?.userdata == network_io.userdata);
+}
+
 pub const ServiceAccount = struct {
     project_id: ?[]u8 = null,
     private_key_id: ?[]u8 = null,
@@ -237,25 +258,46 @@ pub const CachedTokenSource = struct {
     request_ctx: ?*anyopaque,
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
+    owned_filesystem_io: ?*std.Io.Threaded,
+    /// Network authority also used for refresh serialization.
     io: ?std.Io,
+    /// Filesystem authority for ADC and external-account subject-token files.
+    filesystem_io: ?std.Io,
     mutex: std.Io.Mutex = .init,
     cached_token: ?AccessToken = null,
 
     pub fn init(alloc: Allocator, cfg: Config) !CachedTokenSource {
-        return try initWithIo(alloc, cfg, null);
+        return try initWithAuthorities(alloc, cfg, null, null);
     }
 
     pub fn initWithIo(alloc: Allocator, cfg: Config, shared_io: ?std.Io) !CachedTokenSource {
+        return try initWithAuthorities(alloc, cfg, shared_io, shared_io);
+    }
+
+    pub fn initWithAuthorities(
+        alloc: Allocator,
+        cfg: Config,
+        network_io: ?std.Io,
+        filesystem_io: ?std.Io,
+    ) !CachedTokenSource {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = try HttpxTransport.init(alloc, shared_io);
+        transport.* = try HttpxTransport.init(alloc, network_io);
+        errdefer transport.deinit();
+        const owned_filesystem_io: ?*std.Io.Threaded = if (filesystem_io == null and network_io != null) blk: {
+            const owned = try alloc.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(alloc, .{});
+            break :blk owned;
+        } else null;
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .request_ctx = transport,
             .request_fn = HttpxTransport.request,
             .owned_httpx = transport,
+            .owned_filesystem_io = owned_filesystem_io,
             .io = transport.client.io,
+            .filesystem_io = filesystem_io orelse if (owned_filesystem_io) |owned| owned.io() else transport.client.io,
         };
     }
 
@@ -271,7 +313,9 @@ pub const CachedTokenSource = struct {
             .request_ctx = request_ctx,
             .request_fn = request_fn,
             .owned_httpx = null,
+            .owned_filesystem_io = null,
             .io = null,
+            .filesystem_io = null,
         };
     }
 
@@ -279,6 +323,10 @@ pub const CachedTokenSource = struct {
         if (self.owned_httpx) |transport| {
             transport.deinit();
             self.alloc.destroy(transport);
+        }
+        if (self.owned_filesystem_io) |owned| {
+            owned.deinit();
+            self.alloc.destroy(owned);
         }
         if (self.cached_token) |*token| token.deinit(self.alloc);
         self.cfg.deinit(self.alloc);
@@ -460,7 +508,7 @@ pub const CachedTokenSource = struct {
 
     fn externalSubjectTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ExternalAccount) ![]u8 {
         const raw = if (account.subject_token_file) |path| blk: {
-            const io = self.io orelse return error.MissingIoRuntime;
+            const io = self.filesystem_io orelse return error.MissingIoRuntime;
             break :blk try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024 * 1024));
         } else if (account.subject_token_url) |url| blk: {
             var response = try self.request_fn(
@@ -844,15 +892,28 @@ fn defaultAdcPathAlloc(alloc: Allocator) !?[]u8 {
 }
 
 pub fn tokenSourceFromEnvAlloc(alloc: Allocator, scope: []const u8) !*CachedTokenSource {
-    var cfg = try configFromEnvAlloc(alloc, scope);
+    return try tokenSourceFromEnvWithAuthoritiesAlloc(alloc, scope, null, null);
+}
+
+pub fn tokenSourceFromEnvWithAuthoritiesAlloc(
+    alloc: Allocator,
+    scope: []const u8,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
+) !*CachedTokenSource {
+    var cfg = try configFromEnvWithIoAlloc(alloc, scope, filesystem_io);
     errdefer cfg.deinit(alloc);
     const source = try alloc.create(CachedTokenSource);
     errdefer alloc.destroy(source);
-    source.* = try CachedTokenSource.init(alloc, cfg);
+    source.* = try CachedTokenSource.initWithAuthorities(alloc, cfg, network_io, filesystem_io);
     return source;
 }
 
 pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
+    return try configFromEnvWithIoAlloc(alloc, scope, null);
+}
+
+pub fn configFromEnvWithIoAlloc(alloc: Allocator, scope: []const u8, filesystem_io: ?std.Io) !Config {
     if (try envOwned(alloc, "GOOGLE_SERVICE_ACCOUNT_JSON")) |json| {
         defer alloc.free(json);
         const account = try parseServiceAccountJsonAlloc(alloc, json);
@@ -860,11 +921,11 @@ pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
     }
     if (try envOwned(alloc, "GOOGLE_APPLICATION_CREDENTIALS")) |path| {
         defer alloc.free(path);
-        return try configFromFileAlloc(alloc, path, scope);
+        return try configFromFileAllocWithIo(alloc, path, scope, filesystem_io);
     }
     if (try defaultAdcPathAlloc(alloc)) |path| {
         defer alloc.free(path);
-        if (configFromFileAlloc(alloc, path, scope)) |cfg| {
+        if (configFromFileAllocWithIo(alloc, path, scope, filesystem_io)) |cfg| {
             return cfg;
         } else |err| switch (err) {
             error.FileNotFound => {},

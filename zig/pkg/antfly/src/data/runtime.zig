@@ -6007,8 +6007,9 @@ pub const DataServer = struct {
             .manager = api_server_cfg.user_manager,
             .auth_enabled = api_server_cfg.auth_enabled,
         });
-        const restore_io = if (self.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
-        _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
+        const restore_network_io = if (self.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
+        const restore_filesystem_io = if (self.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
+        _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_network_io, restore_filesystem_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
         _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
         if (self.backend_runtime) |runtime| {
@@ -6031,7 +6032,7 @@ pub const DataServer = struct {
                 .manager = api_server_cfg.user_manager,
                 .auth_enabled = api_server_cfg.auth_enabled,
             });
-            _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
+            _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_network_io, restore_filesystem_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = try apply_sm.write_source.withHAMirror(ha_primary_mirror);
@@ -16758,7 +16759,8 @@ pub const DataServer = struct {
                             .secret_store = cfg.api_server_cfg.secret_store,
                             .node_config = cfg.api_server_cfg.node_config,
                             .required_capability = "restore.read",
-                            .io = api_io_impl.io(),
+                            .network_io = raft_backend_runtime.apiNetworkIo(),
+                            .filesystem_io = raft_backend_runtime.apiFilesystemIo(),
                         },
                     }, .{
                         .http = .{

@@ -5860,6 +5860,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_connections_test_mod,
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
+            "connection filesystem probes use the explicit filesystem authority",
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
@@ -5962,6 +5963,9 @@ pub fn build(b: *std.Build) void {
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
             "owned backup runtime has a finite worker ceiling",
+            "remote backup connection retains network io instead of filesystem io",
+            "dynamic gcs credentials borrow distinct network and filesystem authorities",
+            "dynamic s3 profile and web identity retain explicit credential authorities",
             "backup staging uses configured storage authority and exclusive generations",
             "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
@@ -8373,6 +8377,8 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
+    unit_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+    unit_test_step.dependOn(&run_lib_api_connections_tests.step);
     unit_test_step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
 
     const db_enrichment_tests = b.addTest(.{

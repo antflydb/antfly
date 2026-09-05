@@ -1718,9 +1718,10 @@ pub fn handleTableBackup(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
-    return handleTableBackupExpectedFence(alloc, table_name, body, null, api, secret_store, node_config, io);
+    return handleTableBackupExpectedFence(alloc, table_name, body, null, api, secret_store, node_config, network_io, filesystem_io);
 }
 
 pub fn handleTableBackupExpectedFence(
@@ -1731,7 +1732,8 @@ pub fn handleTableBackupExpectedFence(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
@@ -1749,7 +1751,8 @@ pub fn handleTableBackupExpectedFence(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "backup.write",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -1820,7 +1823,8 @@ pub fn handleTableRestore(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -1835,7 +1839,8 @@ pub fn handleTableRestore(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "restore.read",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -1899,6 +1904,7 @@ test "public table backup and restore require named connections" {
         null,
         null,
         null,
+        null,
     );
     defer backup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup.status);
@@ -1909,6 +1915,7 @@ test "public table backup and restore require named connections" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
         null,
@@ -4886,6 +4893,7 @@ test "public table backup handler maps unsupported multi-range error" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -4939,6 +4947,7 @@ test "public table backup handler rejects an existing backup id" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -5012,6 +5021,7 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
             null,
             &node_config,
             null,
+            null,
         );
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.status, resp.status);
@@ -5073,6 +5083,7 @@ test "public table backup handler accepts portable format" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5125,6 +5136,7 @@ test "public table restore handler maps target already exists" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5175,6 +5187,7 @@ test "public table restore handler maps unsupported multi-range error" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -5227,6 +5240,7 @@ test "public table restore handler reports artifact integrity failures" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5278,6 +5292,7 @@ test "public table restore handler reports committed durability pending" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5328,6 +5343,7 @@ test "public table restore handler reports confirmed durability" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);

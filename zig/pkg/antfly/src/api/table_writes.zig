@@ -8500,10 +8500,12 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn withRestoreAccess(
         self: *ProvisionedTableWriteSource,
         node_config: ?*const @import("../common/config.zig").Config,
-        io: ?std.Io,
+        network_io: ?std.Io,
+        filesystem_io: ?std.Io,
     ) *ProvisionedTableWriteSource {
         self.restore_open_options.node_config = node_config;
-        self.restore_open_options.io = io;
+        self.restore_open_options.network_io = network_io;
+        self.restore_open_options.filesystem_io = filesystem_io;
         return self;
     }
 
