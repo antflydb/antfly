@@ -820,17 +820,23 @@ fn validateManagedEmbeddingLookupNames(
 }
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
-    const credential_source_hash = managedEmbeddingCredentialSourceIdentity(entry).stableHash();
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
-        @tagName(entry.provider),
-        entry.base_url,
-        entry.model,
-        entry.project_id,
-        credential_source_hash,
-        @intFromBool(entry.sparse),
-        entry.requests_per_minute,
-        entry.burst,
-    });
+    // The global pacer registry is an execution boundary. Hash the complete,
+    // length-framed scope instead of interpolating user-controlled fields or
+    // reducing the credential identity to a lossy machine-sized hash.
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    credential_source_identity.updateField(&hasher, "antfly-managed-embedding-pacer-v1");
+    credential_source_identity.updateField(&hasher, @tagName(entry.provider));
+    credential_source_identity.updateField(&hasher, entry.base_url);
+    credential_source_identity.updateField(&hasher, entry.model);
+    credential_source_identity.updateField(&hasher, entry.project_id);
+    managedEmbeddingCredentialSourceIdentity(entry).updateHash(&hasher);
+    hashQueryCacheU64(&hasher, @intFromBool(entry.sparse));
+    hashQueryCacheU64(&hasher, entry.requests_per_minute);
+    hashQueryCacheU64(&hasher, entry.burst);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
 }
 
 pub fn testManagedEmbeddingCredentialSourceIdentities() !void {
@@ -876,6 +882,20 @@ pub fn testManagedEmbeddingCredentialSourceIdentities() !void {
     const file_scope = try requestPacerScopeKeyAlloc(alloc, &vertex_file_a);
     defer alloc.free(file_scope);
     try std.testing.expect(!std.mem.eql(u8, default_scope, file_scope));
+
+    // These two scopes collided under delimiter-based concatenation because
+    // the separator could be moved between adjacent user-controlled fields.
+    var framed_a = base;
+    framed_a.model = @constCast("alpha\x1fbeta");
+    framed_a.project_id = @constCast("gamma");
+    var framed_b = base;
+    framed_b.model = @constCast("alpha");
+    framed_b.project_id = @constCast("beta\x1fgamma");
+    const framed_scope_a = try requestPacerScopeKeyAlloc(alloc, &framed_a);
+    defer alloc.free(framed_scope_a);
+    const framed_scope_b = try requestPacerScopeKeyAlloc(alloc, &framed_b);
+    defer alloc.free(framed_scope_b);
+    try std.testing.expect(!std.mem.eql(u8, framed_scope_a, framed_scope_b));
 }
 
 test "managed embedding execution identities include every credential source" {

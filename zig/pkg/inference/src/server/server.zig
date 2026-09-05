@@ -2962,7 +2962,7 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     for (discovered) |entry| {
         // Read only listing metadata. Full manifest loading parses large GGUF
         // tokenizer tables and was the dominant cost of readiness discovery.
-        var man = manifest_mod.loadListingFromDir(allocator, entry.path) catch continue;
+        var man = (try manifest_mod.loadListingCandidateFromDir(allocator, entry.path)) orelse continue;
         defer man.deinit();
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) continue;
 

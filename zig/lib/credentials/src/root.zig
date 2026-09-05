@@ -116,12 +116,6 @@ pub const CredentialSourceIdentity = struct {
         }
     }
 
-    pub fn stableHash(self: CredentialSourceIdentity) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        self.updateHash(&hasher);
-        return hasher.final();
-    }
-
     fn one(kind: Kind, component: []const u8) CredentialSourceIdentity {
         var identity = CredentialSourceIdentity{ .kind = kind };
         identity.setComponent(0, component);

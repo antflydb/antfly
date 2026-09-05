@@ -1081,6 +1081,36 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     return manifest;
 }
 
+/// Load one candidate during registry-wide discovery. Candidate-local
+/// publication, artifact, and metadata failures make that candidate
+/// undiscoverable; process and I/O resource failures must still abort the scan
+/// so callers do not publish an incomplete inventory under resource pressure.
+pub fn loadListingCandidateFromDir(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+) !?ModelManifest {
+    return loadListingFromDir(allocator, model_dir_path) catch |err| {
+        if (isListingDiscoveryOperationalError(err)) return err;
+        return null;
+    };
+}
+
+fn isListingDiscoveryOperationalError(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.ThreadQuotaExceeded,
+        error.LockedMemoryLimitExceeded,
+        error.InputOutput,
+        error.DeviceBusy,
+        error.Canceled,
+        => true,
+        else => false,
+    };
+}
+
 fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     if (manifest.gliner_model_type.len > 0) return;
     if (!std.mem.eql(u8, manifest.config_model_arch, "extractor") and !hasGlinerPathHint(catalog.model_dir_path)) return;
@@ -2355,12 +2385,10 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     // Legacy flat fields remain read-compatible. New manifests should use
     // embedding_profile.query/document.prefix.
     if (obj.get("query_prefix")) |v| {
-        if (v != .string) return error.InvalidEmbeddingTaskProfile;
-        try setEmbeddingProfilePrefix(manifest, .query, v.string);
+        try applyLegacyEmbeddingProfilePrefix(manifest, .query, v);
     }
     if (obj.get("document_prefix")) |v| {
-        if (v != .string) return error.InvalidEmbeddingTaskProfile;
-        try setEmbeddingProfilePrefix(manifest, .document, v.string);
+        try applyLegacyEmbeddingProfilePrefix(manifest, .document, v);
     }
     if (obj.get("embedding_style")) |v| {
         manifest.embedding_style = try parseEmbeddingStyleJson(v);
@@ -3041,6 +3069,27 @@ fn setEmbeddingProfilePrefix(
     transform.declared = true;
 }
 
+fn applyLegacyEmbeddingProfilePrefix(
+    manifest: *ModelManifest,
+    role: EmbeddingProfileRole,
+    value: std.json.Value,
+) !void {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    const transform = switch (role) {
+        .query => &manifest.embedding_profile.query,
+        .document => &manifest.embedding_profile.document,
+    };
+    // Legacy flat fields remain read-compatible, but a manifest cannot declare
+    // two different execution contracts for the same role. Identical duplicate
+    // declarations are accepted to support rolling manifest migrations.
+    if (transform.declared) {
+        if (!std.mem.eql(u8, transform.prefix, value.string))
+            return error.InvalidEmbeddingTaskProfile;
+        return;
+    }
+    try setEmbeddingProfilePrefix(manifest, role, value.string);
+}
+
 fn setEmbeddingInstructionTemplate(manifest: *ModelManifest, value: []const u8) !void {
     const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
     replaceOwnedString(manifest.allocator, &manifest.embedding_profile.instruction_template, owned);
@@ -3529,6 +3578,33 @@ test "duplicate embedding contract declarations must agree" {
             \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
         ),
     );
+}
+
+test "canonical and legacy embedding prefixes must agree" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"query_prefix":"other: "}
+        ,
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"document_prefix":"other: "}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var matching = ModelManifest{ .allocator = allocator };
+    defer matching.deinit();
+    try parseModelManifestJson(&matching, allocator,
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"query_prefix":"query: ","document_prefix":"document: "}
+    );
+    try finalizeEmbeddingProfile(&matching);
+    try std.testing.expectEqualStrings("query: ", matching.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("document: ", matching.embedding_profile.document.prefix);
 }
 
 test "embedding task contract declarations reject unknown values and types" {

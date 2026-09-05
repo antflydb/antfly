@@ -8,6 +8,7 @@ const credentials = @import("antfly_credentials");
 const secrets = @import("secrets.zig");
 
 pub const CredentialSourceIdentity = credentials.CredentialSourceIdentity;
+pub const updateField = credentials.updateField;
 
 pub fn fromSecretValue(secret: ?secrets.SecretValue) CredentialSourceIdentity {
     const value = secret orelse return CredentialSourceIdentity.none();
@@ -36,7 +37,6 @@ pub fn testCredentialSourceIdentities() !void {
     const env_var = secrets.SecretValue{ .env_var = @constCast("same") };
     try std.testing.expect(!fromSecretValue(literal).eql(fromSecretValue(reference)));
     try std.testing.expect(!fromSecretValue(reference).eql(fromSecretValue(env_var)));
-    try std.testing.expect(fromSecretValue(literal).stableHash() != fromSecretValue(reference).stableHash());
 }
 
 test "credential source identities preserve provider and locator boundaries" {
