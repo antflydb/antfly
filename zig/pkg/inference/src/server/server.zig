@@ -2799,6 +2799,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 }
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
         error.Timeout => ctx.status(504).json(.{
             .@"error" = "INFERENCE_TIMEOUT",
@@ -2814,7 +2815,6 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "INFERENCE_FAILED",
             .message = @errorName(err),
@@ -8406,17 +8406,19 @@ pub const Node = struct {
         } else 1;
         var admission_lease = self.model_manager.acquireRunResourceEstimates(
             admission_requests[0..admission_request_count],
-        ) catch |err| switch (err) {
-            error.ResourceLimitExceeded => return ctx.status(400).json(.{
-                .@"error" = "MODEL_RESOURCE_LIMIT",
-                .message = "request exceeds the configured inference resource budget",
-            }),
-            error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
-            // Ownership configuration errors should have failed startup before
-            // request surfaces were published. Keep the HTTP boundary total so
-            // a violated invariant is reported as an internal failure instead
-            // of widening this inferred error set into a compile failure.
-            else => return inferenceFailureResponse(ctx, err),
+        ) catch |err| {
+            if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+            return switch (err) {
+                error.ResourceLimitExceeded => ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
+                    .message = "request exceeds the configured inference resource budget",
+                }),
+                // Ownership configuration errors should have failed startup before
+                // request surfaces were published. Keep the HTTP boundary total so
+                // a violated invariant is reported as an internal failure instead
+                // of widening this inferred error set into a compile failure.
+                else => inferenceFailureResponse(ctx, err),
+            };
         };
         defer admission_lease.release();
 
@@ -9169,7 +9171,7 @@ pub const Node = struct {
     }
 
     fn batchAdmissionError(err: anyerror) api.GenerateBatchError {
-        const retryable = err == error.ResourceTemporarilyUnavailable;
+        const retryable = isTransientInferenceCapacityError(err);
         return .{
             .code = if (retryable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
             .message = if (retryable)
@@ -15492,6 +15494,14 @@ test "generate batch capacity errors include actionable retry metadata" {
         busy_admission.retry_after_ms.valueOrNull(),
     );
 
+    const saturated_admission = Node.batchAdmissionError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_admission.code);
+    try std.testing.expect(saturated_admission.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        saturated_admission.retry_after_ms.valueOrNull(),
+    );
+
     const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", permanent.code);
     try std.testing.expectEqual(false, permanent.retryable);
@@ -16529,6 +16539,14 @@ test "fail-fast embedding capacity response exposes retry contract" {
         @as(i64, transient_capacity_retry_after_ms),
         parsed.value.retry_after_ms,
     );
+
+    const saturated = embedDenseInputFailure(error.ConcurrencyUnavailable);
+    try std.testing.expectEqual(@as(u16, 503), saturated.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated.code);
+    const saturated_item = embedItemFailure(0, error.ConcurrencyUnavailable, "execution");
+    try std.testing.expectEqual(@as(u16, 503), saturated_item.status);
+    try std.testing.expect(saturated_item.retryable);
+    try std.testing.expectEqual(@as(?i64, transient_capacity_retry_after_ms), saturated_item.retry_after_ms);
 }
 
 test "cold model load executor saturation exposes retry contract" {
@@ -16599,6 +16617,12 @@ test "inference lifetime errors preserve timeout and cancellation semantics" {
     defer cancelled_response.deinit();
     try std.testing.expectEqual(@as(u16, 408), cancelled_response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, cancelled_response.body.?, "INFERENCE_CANCELLED") != null);
+
+    var saturated_response = try inferenceFailureResponse(&ctx, error.ConcurrencyUnavailable);
+    defer saturated_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), saturated_response.status.code);
+    try std.testing.expectEqualStrings(transient_capacity_retry_after_seconds, saturated_response.header("Retry-After").?);
+    try std.testing.expect(std.mem.indexOf(u8, saturated_response.body.?, "MODEL_RESOURCE_BUSY") != null);
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -17545,6 +17569,10 @@ test "generation live pressure is an actionable retryable capacity error" {
     const batch_error = batchGenerationError(error.ResourceTemporarilyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", batch_error.code);
     try std.testing.expect(batch_error.retryable);
+
+    const saturated_batch_error = batchGenerationError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_batch_error.code);
+    try std.testing.expect(saturated_batch_error.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -19258,6 +19286,11 @@ const EmbedDenseInputFailure = struct {
 };
 
 fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .status = 503,
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+    };
     return switch (err) {
         error.ImageDecodeFailed => .{
             .status = 400,
@@ -19269,11 +19302,6 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         },
-        error.ResourceTemporarilyUnavailable => .{
-            .status = 503,
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        },
         else => .{
             .status = 500,
             .code = "INFERENCE_FAILED",
@@ -19283,7 +19311,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 }
 
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-    if (err == error.ResourceTemporarilyUnavailable) {
+    if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
     }
     const failure = embedDenseInputFailure(err);
@@ -19348,6 +19376,15 @@ const DenseEmbedPartialResult = struct {
 };
 
 fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .index = @intCast(index),
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+        .stage = stage,
+        .retryable = true,
+        .status = 503,
+        .retry_after_ms = transient_capacity_retry_after_ms,
+    };
     return switch (err) {
         error.ImageDecodeFailed => .{
             .index = @intCast(index),
@@ -19364,15 +19401,6 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
             .stage = stage,
             .retryable = false,
             .status = 400,
-        },
-        error.ResourceTemporarilyUnavailable => .{
-            .index = @intCast(index),
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-            .stage = stage,
-            .retryable = true,
-            .status = 503,
-            .retry_after_ms = transient_capacity_retry_after_ms,
         },
         else => .{
             .index = @intCast(index),
@@ -21429,6 +21457,12 @@ fn generationMemoryBudgetResponse(
 }
 
 fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .status = 503,
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+        .retryable = true,
+    };
     return switch (err) {
         error.PromptTooLong => .{
             .status = 400,
@@ -21441,12 +21475,6 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .code = "MEMORY_BUDGET_EXCEEDED",
             .message = memory_budget_exceeded_message,
             .retryable = false,
-        },
-        error.ResourceTemporarilyUnavailable => .{
-            .status = 503,
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-            .retryable = true,
         },
         else => null,
     };
@@ -21465,7 +21493,7 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-    if (err == error.ResourceTemporarilyUnavailable)
+    if (isTransientInferenceCapacityError(err))
         return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
         return ctx.status(failure.status).json(.{
