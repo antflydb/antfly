@@ -809,6 +809,7 @@ const ExactWireCapabilities = struct {
     result_cardinality: work.ResultCardinality,
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
+    framed_attachments: bool,
     task_limits: work.TaskResourceLimits = .{},
 };
 
@@ -932,6 +933,13 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
     ) orelse return error.InvalidInferenceCapabilities;
     const borrowed_value = object.get("borrowed_attachments") orelse return error.InvalidInferenceCapabilities;
     if (borrowed_value != .bool) return error.InvalidInferenceCapabilities;
+    // This feature bit is additive within the v4 object. Older clients ignore
+    // unknown object fields, while newer clients can negotiate framed bodies
+    // without making a rolling server upgrade invalidate the whole catalog.
+    const framed_attachments = if (object.get("framed_attachments")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
     return .{
         .modalities = .{
             .text = hasString(modality_values, "text"),
@@ -945,6 +953,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .result_cardinality = result_cardinality,
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
+        .framed_attachments = framed_attachments,
         .task_limits = if (version >= 4) try parseTaskResourceLimits(object) else .{},
     };
 }
@@ -1021,6 +1030,7 @@ pub fn parseModelCapabilities(
         // cannot turn that concrete route into a borrowed-memory invocation,
         // even if a misconfigured upstream publishes its local ABI fact.
         .borrowed_attachments = false,
+        .framed_attachments = if (exact) |value| value.framed_attachments else false,
     };
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
@@ -1340,6 +1350,15 @@ test "remote Antfly capability v4 preserves extensible MIME and task limits" {
             .schema_bytes = 8193,
         }),
     );
+}
+
+test "remote Antfly capability v4 negotiates framed attachment transport" {
+    const payload =
+        \\{"embedders":{"clipclap":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"embed","input_modalities":["image"],"accepted_mime_types":["image/png"],"input_granularity":"page","output":"embedding","result_cardinality":"one_per_item","prompt_policy":"explicit","borrowed_attachments":false,"framed_attachments":true,"task_limits":{"max_text_bytes_per_item":null,"max_input_tokens_per_item":null,"max_output_tokens_per_item":null,"max_candidates_per_request":null,"max_schema_bytes":null},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
+    ;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "clipclap", .embed)).?;
+    try std.testing.expect(capabilities.framed_attachments);
+    try std.testing.expect(!capabilities.borrowed_attachments);
 }
 
 test "remote Antfly exact capabilities reject image MIME unsupported by local codec" {

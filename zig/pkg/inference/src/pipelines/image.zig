@@ -994,6 +994,35 @@ test "preprocessing slab growth remains physically capped" {
     try std.testing.expect(tracking.peak_live_bytes <= budget.max_bytes);
 }
 
+test "preprocessing slab admission follows physical growth deltas" {
+    const Recorder = struct {
+        calls: [3][2]usize = undefined,
+        len: usize = 0,
+        deny_above: usize = 8192,
+
+        fn grow(context: *anyopaque, current: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (target > self.deny_above) return error.ResourceTemporarilyUnavailable;
+            self.calls[self.len] = .{ current, target };
+            self.len += 1;
+        }
+    };
+    var recorder = Recorder{};
+    var budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+        std.testing.allocator,
+        4096,
+        16 * 1024,
+        .{ .context = &recorder, .grow = Recorder.grow },
+    );
+    defer budget.deinit();
+    try budget.ensureCapacity(8192);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.ensureCapacity(16 * 1024));
+    try std.testing.expectEqual(@as(usize, 8192), budget.slab.len);
+    try std.testing.expectEqual(@as(usize, 2), recorder.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4096 }, &recorder.calls[0]);
+    try std.testing.expectEqualSlices(usize, &.{ 4096, 8192 }, &recorder.calls[1]);
+}
+
 test "preprocessing slab growth failure leaves no retired backing allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var budget = try SharedPreprocessBudget.initResizableWithBacking(failing.allocator(), 4096, 8192);
@@ -1471,12 +1500,22 @@ pub fn preprocessBatchWithOptions(
 /// ceiling is a hard aggregate limit for every allocation made by the image
 /// codecs in an active wave. The caller-owned output tensor is admitted by the
 /// model runtime separately and is intentionally not charged here.
+pub const ScratchAdmission = struct {
+    context: *anyopaque,
+    /// Admit the additional physical bytes before the codec slab grows from
+    /// `current_bytes` to `target_bytes`. Implementations retain every acquired
+    /// delta until preprocessing returns, so concurrent requests cannot overbook
+    /// the process while the slab is replaced between waves.
+    grow: *const fn (*anyopaque, usize, usize) anyerror!void,
+};
+
 pub const BatchPreprocessOptions = struct {
     max_workers: usize = 8,
     max_inflight_decoded_bytes: usize = 128 * 1024 * 1024,
     /// Production runtimes pass their leased inference executor here. Offline
     /// and test callers may omit it and use the synchronous linalg fallback.
     io: ?std.Io = null,
+    scratch_admission: ?ScratchAdmission = null,
 };
 
 /// Decode and preprocess directly into a caller-owned batch tensor. Output
@@ -1717,6 +1756,7 @@ const SharedPreprocessBudget = struct {
     live_bytes: std.atomic.Value(usize) = .init(0),
     peak_live_bytes: std.atomic.Value(usize) = .init(0),
     limit_exceeded: std.atomic.Value(bool) = .init(false),
+    scratch_admission: ?ScratchAdmission = null,
 
     fn init(max_live_bytes: usize) !@This() {
         return initResizableWithBacking(std.heap.page_allocator, max_live_bytes, max_live_bytes);
@@ -1727,13 +1767,24 @@ const SharedPreprocessBudget = struct {
     }
 
     fn initResizableWithBacking(backing: std.mem.Allocator, initial_bytes: usize, max_bytes: usize) !@This() {
+        return initResizableAdmittedWithBacking(backing, initial_bytes, max_bytes, null);
+    }
+
+    fn initResizableAdmittedWithBacking(
+        backing: std.mem.Allocator,
+        initial_bytes: usize,
+        max_bytes: usize,
+        scratch_admission: ?ScratchAdmission,
+    ) !@This() {
         if (initial_bytes == 0 or initial_bytes > max_bytes) return error.InvalidBatchPreprocessOptions;
+        if (scratch_admission) |admission| try admission.grow(admission.context, 0, initial_bytes);
         const slab = try backing.alignedAlloc(u8, .of(FreeBlock), initial_bytes);
         var self = @This(){
             .backing = backing,
             .slab = slab,
             .max_bytes = max_bytes,
             .free_head = null,
+            .scratch_admission = scratch_admission,
         };
         self.resetFreeList();
         return self;
@@ -1755,6 +1806,9 @@ const SharedPreprocessBudget = struct {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         const target = @min(requested_bytes, self.max_bytes);
         if (target <= self.slab.len) return;
+
+        if (self.scratch_admission) |admission|
+            try admission.grow(admission.context, self.slab.len, target);
 
         const retired = self.slab;
         self.slab = retired[0..0];
@@ -2024,10 +2078,11 @@ fn runBorrowedRasterPreprocessBatch(
     ));
     var tasks: [maximum_preprocess_workers]BorrowedRasterPreprocessTask = undefined;
     var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
-    var scratch_budget = try SharedPreprocessBudget.initResizableWithBacking(
+    var scratch_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
         backing_allocator,
         preprocessSlabBytesForWave(0, worker_limit, options.max_inflight_decoded_bytes),
         options.max_inflight_decoded_bytes,
+        options.scratch_admission,
     );
     defer scratch_budget.deinit();
     const scratch_allocator = scratch_budget.allocator();
@@ -2114,10 +2169,11 @@ fn runBoundedPreprocessBatch(
     // of this request without per-wave mmap/munmap churn.
     const first_wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
     const first_wave_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..first_wave_len]);
-    var wave_budget = try SharedPreprocessBudget.initResizableWithBacking(
+    var wave_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
         std.heap.page_allocator,
         preprocessSlabBytesForWave(first_wave_bytes, first_wave_len, options.max_inflight_decoded_bytes),
         options.max_inflight_decoded_bytes,
+        options.scratch_admission,
     );
     defer wave_budget.deinit();
     const wave_allocator = wave_budget.allocator();

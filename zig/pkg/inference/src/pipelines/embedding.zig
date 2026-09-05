@@ -38,6 +38,36 @@ const resident_ops = @import("../graph/resident_ops.zig");
 
 const qwen3_embedding_resident_override_level = 4;
 
+/// Owns the exact codec-slab admission deltas requested by image preprocessing.
+/// Slabs grow geometrically between waves, so retaining the deltas makes the
+/// process-wide reservation equal the largest physical slab without charging
+/// every request the configured 128 MiB safety ceiling.
+const PreprocessScratchAdmission = struct {
+    allocator: std.mem.Allocator,
+    session: backends.Session,
+    permits: std.ArrayListUnmanaged(session_mod.RunPermit) = .empty,
+
+    fn descriptor(self: *@This()) image.ScratchAdmission {
+        return .{ .context = self, .grow = growOpaque };
+    }
+
+    fn growOpaque(context: *anyopaque, current_bytes: usize, target_bytes: usize) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (target_bytes < current_bytes) return error.InvalidBatchPreprocessOptions;
+        const additional = target_bytes - current_bytes;
+        if (additional == 0) return;
+        var permit = try self.session.admitHostPreprocess(additional);
+        errdefer permit.deinit();
+        try self.permits.append(self.allocator, permit);
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.permits.items) |*permit| permit.deinit();
+        self.permits.deinit(self.allocator);
+        self.permits = .empty;
+    }
+};
+
 const TextInputTensorSet = struct {
     items: [3]Tensor = undefined,
     len: usize = 0,
@@ -794,15 +824,16 @@ pub const EmbeddingPipeline = struct {
             encoded_bytes = std.math.add(usize, encoded_bytes, encoded.len) catch
                 return error.ResourceLimitExceeded;
         }
-        const preprocess_options = image.BatchPreprocessOptions{ .io = self.config.preprocess_io };
-        const preprocess_resident_bytes = std.math.add(
-            usize,
-            std.math.add(usize, encoded_bytes, pixel_bytes) catch return error.ResourceLimitExceeded,
-            preprocess_options.max_inflight_decoded_bytes,
-        ) catch return error.ResourceLimitExceeded;
-        // This host-only lease covers caller-retained media, the normalized
-        // tensor, and the aggregate codec slab. It remains live while waiting
-        // for the model mutex, but does not reserve serialized backend scratch.
+        var scratch_admission = PreprocessScratchAdmission{ .allocator = alloc, .session = vs };
+        defer scratch_admission.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{
+            .io = self.config.preprocess_io,
+            .scratch_admission = scratch_admission.descriptor(),
+        };
+        const preprocess_resident_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        // Caller-retained media and the normalized tensor have a stable lease.
+        // Codec slabs acquire exact, independently releasable deltas as they grow.
         var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
         defer preprocess_permit.deinit();
 
@@ -831,6 +862,7 @@ pub const EmbeddingPipeline = struct {
             ),
         }
         logEmbedTiming("image.preprocess", batch, preprocess_start);
+        scratch_admission.deinit();
 
         // Build input tensor
         const sz: i64 = @intCast(img_size);
@@ -948,12 +980,14 @@ pub const EmbeddingPipeline = struct {
             raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
                 return error.ResourceLimitExceeded;
         }
-        const preprocess_options = image.BatchPreprocessOptions{ .io = self.config.preprocess_io };
-        const preprocess_resident_bytes = std.math.add(
-            usize,
-            std.math.add(usize, raster_bytes, pixel_bytes) catch return error.ResourceLimitExceeded,
-            preprocess_options.max_inflight_decoded_bytes,
-        ) catch return error.ResourceLimitExceeded;
+        var scratch_admission = PreprocessScratchAdmission{ .allocator = alloc, .session = vs };
+        defer scratch_admission.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{
+            .io = self.config.preprocess_io,
+            .scratch_admission = scratch_admission.descriptor(),
+        };
+        const preprocess_resident_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
         var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
         defer preprocess_permit.deinit();
 
@@ -983,6 +1017,7 @@ pub const EmbeddingPipeline = struct {
             ),
         }
         logEmbedTiming("image.preprocess.raster", batch, preprocess_start);
+        scratch_admission.deinit();
 
         const sz: i64 = @intCast(img_size);
         const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };

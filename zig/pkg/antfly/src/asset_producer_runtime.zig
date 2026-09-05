@@ -4157,9 +4157,18 @@ fn singleReaderImage(alloc: Allocator, url: []const u8) !ReaderSource {
     return .{ .images = images };
 }
 
-fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []const readers.Result) ![]u8 {
+fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []readers.Result) ![]u8 {
     if (isJsonContentType(content_type)) {
         return try std.json.Stringify.valueAlloc(alloc, results, .{});
+    }
+
+    // The document executor emits one page per outer request. Transfer that
+    // reader-owned text directly into the common result envelope instead of
+    // serializing/copying it only for enrichment to parse it back as text.
+    if (results.len == 1) {
+        const text = @constCast(results[0].text);
+        results[0].text = &.{};
+        return text;
     }
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -4169,6 +4178,18 @@ fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []co
         try out.appendSlice(alloc, result.text);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+test "plain singleton reader output transfers its text buffer" {
+    const allocator = std.testing.allocator;
+    const text = try allocator.dupe(u8, "page text");
+    var results = [_]readers.Result{.{ .text = text }};
+    defer readers.deinitResult(allocator, &results[0]);
+    const output = try encodeReaderResults(allocator, "text/plain", &results);
+    defer allocator.free(output);
+    try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(output.ptr));
+    try std.testing.expectEqualStrings("page text", output);
+    try std.testing.expectEqual(@as(usize, 0), results[0].text.len);
 }
 
 fn isJsonContentType(content_type: []const u8) bool {

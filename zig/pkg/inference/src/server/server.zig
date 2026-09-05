@@ -7415,13 +7415,56 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(std.json.Value)) orelse
+        const uses_attachment_envelope = if (ctx.header("Content-Type")) |content_type| blk: {
+            const separator = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+            break :blk std.ascii.eqlIgnoreCase(
+                std.mem.trim(u8, content_type[0..separator], " \t"),
+                httpx.attachment_envelope.content_type,
+            );
+        } else false;
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = attachmentEnvelopeErrorMessage(err),
+                });
+            };
+            break :blk std.json.parseFromSlice(
+                std.json.Value,
+                ctx.allocator,
+                attachment_envelope.?.metadata,
+                .{},
+            ) catch {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be valid JSON",
+                });
+            };
+        } else (try ctx.parseJson(std.json.Value)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const request = parseEmbedRequest(parsed.value) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedRequestParseErrorMessage(err),
+            });
+        };
+        const borrowed_attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        validateEmbedAttachmentReferences(ctx.allocator, request.input, borrowed_attachments.len) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedAttachmentReferenceErrorMessage(err),
             });
         };
 
@@ -7438,7 +7481,10 @@ pub const Node = struct {
             });
         };
 
-        const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(request.input));
+        const media_admission = requestMediaAdmission(
+            self,
+            denseEmbedRequestMediaShapeWithAttachments(request.input, borrowed_attachments),
+        );
         const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), media_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
         var reserved_units = admission_units;
@@ -7540,8 +7586,8 @@ pub const Node = struct {
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         const download_context = DenseEmbedRequestContext{ .io = ctx.io };
         var inputs = switch (request.error_policy) {
-            .fail_fast => parseDenseEmbedInputsWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
-            .per_item => parseDenseEmbedInputsPerItemWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
+            .fail_fast => parseDenseEmbedInputsWithBudgetContextAndAttachments(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
+            .per_item => parseDenseEmbedInputsPerItemWithBudgetContextAndAttachments(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context, borrowed_attachments),
         } catch |err| {
             if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
             if (isDenseEmbedRequestAbort(err)) return err;
@@ -16351,7 +16397,9 @@ fn appendResolvedInferenceCapabilities(
     try jsonEncodeString(buf, allocator, resolvedTaskResultCardinality(resolved_task));
     try buf.appendSlice(allocator, ",\"prompt_policy\":");
     try jsonEncodeString(buf, allocator, resolvedTaskPromptPolicy(resolved_task));
-    try buf.appendSlice(allocator, ",\"borrowed_attachments\":false,\"task_limits\":{");
+    try buf.appendSlice(allocator, ",\"borrowed_attachments\":false,\"framed_attachments\":");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"task_limits\":{");
     inline for ([_]struct { name: []const u8, value: ?usize }{
         .{ .name = "max_text_bytes_per_item", .value = resolved.max_text_bytes_per_item },
         .{ .name = "max_input_tokens_per_item", .value = resolved.max_input_tokens_per_item },
@@ -17108,6 +17156,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 4), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
+    try std.testing.expect(!resolved.object.get("framed_attachments").?.bool);
     try std.testing.expectEqualStrings(
         if (expected_native) "native" else "serial_compatibility",
         resolved.object.get("batch").?.object.get("mode").?.string,
@@ -17148,6 +17197,7 @@ test "standalone inference catalog validates extensible MIME against executor co
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(resolved.object.get("framed_attachments").?.bool);
     const mime_values = resolved.object.get("accepted_mime_types").?.array.items;
     var found_gif = false;
     for (mime_values) |value| if (std.mem.eql(u8, value.string, "image/gif")) {
@@ -22040,6 +22090,81 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+fn attachmentEnvelopeErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.AttachmentEnvelopeTooLarge => "attachment envelope exceeds configured limits",
+        error.UnsupportedAttachmentEnvelope => "unsupported attachment envelope version or flags",
+        else => "malformed attachment envelope",
+    };
+}
+
+fn embedAttachmentReferenceErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.AttachmentReferenceRequired => "every framed attachment must be referenced exactly once",
+        error.AttachmentIndexMustBeInteger => "attachment_index must be a non-negative integer",
+        error.AttachmentIndexOutOfBounds => "attachment_index is outside the framed attachment table",
+        error.DuplicateAttachmentReference => "an attachment may be referenced only once",
+        error.UnexpectedAttachmentReference => "attachment content parts require the framed attachment transport",
+        else => "invalid attachment reference",
+    };
+}
+
+fn validateEmbedAttachmentReferences(
+    allocator: std.mem.Allocator,
+    input: std.json.Value,
+    attachment_count: usize,
+) !void {
+    var seen = try allocator.alloc(bool, attachment_count);
+    defer if (seen.len > 0) allocator.free(seen);
+    @memset(seen, false);
+    var references: usize = 0;
+    if (input == .array) for (input.array.items) |item| {
+        if (item != .object) continue;
+        const type_value = item.object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "attachment")) continue;
+        if (attachment_count == 0) return error.UnexpectedAttachmentReference;
+        const index_value = item.object.get("attachment_index") orelse
+            return error.AttachmentIndexMustBeInteger;
+        if (index_value != .integer or index_value.integer < 0)
+            return error.AttachmentIndexMustBeInteger;
+        const index: usize = std.math.cast(usize, index_value.integer) orelse
+            return error.AttachmentIndexOutOfBounds;
+        if (index >= attachment_count) return error.AttachmentIndexOutOfBounds;
+        if (seen[index]) return error.DuplicateAttachmentReference;
+        seen[index] = true;
+        references += 1;
+    };
+    if (references != attachment_count) return error.AttachmentReferenceRequired;
+}
+
+test "framed embedding attachments require one unique reference each" {
+    const allocator = std.testing.allocator;
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"attachment\",\"attachment_index\":1},{\"type\":\"text\",\"text\":\"caption\"},{\"type\":\"attachment\",\"attachment_index\":0}]",
+        .{},
+    );
+    defer valid.deinit();
+    try validateEmbedAttachmentReferences(allocator, valid.value, 2);
+
+    var duplicate = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"attachment\",\"attachment_index\":0},{\"type\":\"attachment\",\"attachment_index\":0}]",
+        .{},
+    );
+    defer duplicate.deinit();
+    try std.testing.expectError(
+        error.DuplicateAttachmentReference,
+        validateEmbedAttachmentReferences(allocator, duplicate.value, 2),
+    );
+    try std.testing.expectError(
+        error.UnexpectedAttachmentReference,
+        validateEmbedAttachmentReferences(allocator, valid.value, 0),
+    );
+}
+
 /// Configure query/document prefixes from the model-owned embedding task
 /// profile (including Jina, Qwen3-Embedding, and Nomic). Returns an
 /// owned prefix buffer when a per-request instruction was rendered; the
@@ -22178,7 +22303,7 @@ fn parseDenseEmbedInputsWithBudget(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
 ) !ParsedDenseEmbedInputs {
-    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null, &.{});
 }
 
 fn parseDenseEmbedInputsWithBudgetAndContext(
@@ -22189,7 +22314,19 @@ fn parseDenseEmbedInputsWithBudgetAndContext(
     media_budget: *RequestMediaBudget,
     request_context: DenseEmbedRequestContext,
 ) !ParsedDenseEmbedInputs {
-    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context, &.{});
+}
+
+fn parseDenseEmbedInputsWithBudgetContextAndAttachments(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context, attachments);
 }
 
 fn parseDenseEmbedInputsWithBudgetOptionalContext(
@@ -22199,9 +22336,12 @@ fn parseDenseEmbedInputsWithBudgetOptionalContext(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
     request_context: ?DenseEmbedRequestContext,
+    attachments: []const httpx.attachment_envelope.Attachment,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
+
+    for (attachments) |attachment| try media_budget.add(attachment.data.len);
 
     switch (input) {
         .string => |value| {
@@ -22213,7 +22353,7 @@ fn parseDenseEmbedInputsWithBudgetOptionalContext(
             if (arr.items.len == 0) return parsed;
 
             for (arr.items, 0..) |item, index| {
-                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context);
+                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context, attachments);
             }
 
             parsed.total_count = arr.items.len;
@@ -22310,7 +22450,7 @@ fn parseDenseEmbedInputsPerItemWithBudget(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
 ) !ParsedDenseEmbedInputs {
-    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null, &.{});
 }
 
 fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
@@ -22321,7 +22461,19 @@ fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
     media_budget: *RequestMediaBudget,
     request_context: DenseEmbedRequestContext,
 ) !ParsedDenseEmbedInputs {
-    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context, &.{});
+}
+
+fn parseDenseEmbedInputsPerItemWithBudgetContextAndAttachments(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context, attachments);
 }
 
 fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
@@ -22331,14 +22483,17 @@ fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
     request_context: ?DenseEmbedRequestContext,
+    attachments: []const httpx.attachment_envelope.Attachment,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
 
+    for (attachments) |attachment| try media_budget.add(attachment.data.len);
+
     switch (input) {
         .string => |value| {
             parsed.total_count = 1;
-            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0, media_budget, request_context) catch |err| {
+            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0, media_budget, request_context, attachments) catch |err| {
                 if (isDenseEmbedRequestAbort(err)) return err;
                 try parsed.parse_errors.append(allocator, embedInputItemFailure(0, err));
             };
@@ -22346,7 +22501,7 @@ fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
         .array => |arr| {
             parsed.total_count = arr.items.len;
             for (arr.items, 0..) |item, index| {
-                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context) catch |err| {
+                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context, attachments) catch |err| {
                     if (isDenseEmbedRequestAbort(err)) return err;
                     try parsed.parse_errors.append(allocator, embedInputItemFailure(index, err));
                 };
@@ -22428,6 +22583,7 @@ fn appendDenseEmbedInput(
     index: usize,
     media_budget: *RequestMediaBudget,
     request_context: ?DenseEmbedRequestContext,
+    attachments: []const httpx.attachment_envelope.Attachment,
 ) !void {
     if (item == .string) {
         if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
@@ -22486,6 +22642,25 @@ fn appendDenseEmbedInput(
             mime_value.string,
             index,
             true,
+        );
+    }
+
+    if (std.mem.eql(u8, part_type, "attachment")) {
+        const index_value = obj.get("attachment_index") orelse return error.AttachmentIndexMustBeInteger;
+        if (index_value != .integer or index_value.integer < 0)
+            return error.AttachmentIndexMustBeInteger;
+        const attachment_index = std.math.cast(usize, index_value.integer) orelse
+            return error.AttachmentIndexOutOfBounds;
+        if (attachment_index >= attachments.len) return error.AttachmentIndexOutOfBounds;
+        const attachment = attachments[attachment_index];
+        return appendDenseEmbedBinary(
+            allocator,
+            manifest,
+            parsed,
+            attachment.data,
+            attachment.mime_type,
+            index,
+            false,
         );
     }
 
@@ -24610,6 +24785,20 @@ fn denseEmbedRequestMediaShape(input: std.json.Value) RequestMediaAdmissionShape
         const mime = part.object.get("mime_type") orelse continue;
         if (data != .string or mime != .string) continue;
         shape.addInline(data.string.len, std.ascii.startsWithIgnoreCase(mime.string, "image/"));
+    }
+    return shape;
+}
+
+fn denseEmbedRequestMediaShapeWithAttachments(
+    input: std.json.Value,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) RequestMediaAdmissionShape {
+    var shape = denseEmbedRequestMediaShape(input);
+    for (attachments) |attachment| {
+        const is_image = std.ascii.startsWithIgnoreCase(attachment.mime_type, "image/");
+        const is_audio = std.ascii.startsWithIgnoreCase(attachment.mime_type, "audio/");
+        shape.addBorrowed(attachment.data.len, is_image);
+        shape.has_audio = shape.has_audio or is_audio;
     }
     return shape;
 }

@@ -617,6 +617,17 @@ pub const ReadingPipeline = struct {
 
         const step_tokens = try allocator.alloc(i64, batch);
         defer allocator.free(step_tokens);
+        const active_rows = try allocator.alloc(usize, batch);
+        defer allocator.free(active_rows);
+        const next_active_rows = try allocator.alloc(usize, batch);
+        defer allocator.free(next_active_rows);
+        const next_step_tokens = try allocator.alloc(i64, batch);
+        defer allocator.free(next_step_tokens);
+        const retained_cache_rows = try allocator.alloc(u32, batch);
+        defer allocator.free(retained_cache_rows);
+        for (active_rows, 0..) |*row, index| row.* = index;
+        var active_count = batch;
+        var row_compaction_supported = true;
         for (0..dec_len) |idx| {
             for (0..batch) |b| step_tokens[b] = dec_ids[b * max_len + idx];
             const prefix_step_start = nowNs();
@@ -650,7 +661,7 @@ pub const ReadingPipeline = struct {
                     allocator,
                     florence_cfg,
                     hidden,
-                    batch,
+                    active_count,
                 );
                 hidden_live = false;
                 defer cb.free(logits_tensor);
@@ -659,22 +670,22 @@ pub const ReadingPipeline = struct {
                     if (try cb.argmaxRows(
                         logits_tensor,
                         0,
-                        batch,
+                        active_count,
                         florence_cfg.vocab_size,
                         allocator,
                     )) |selected_tokens| {
                         defer allocator.free(selected_tokens);
-                        finished_count += try applyFlorenceBatchSelectedTokens(
+                        finished_count += try applyFlorenceBatchSelectedTokensActive(
                             dec_ids,
-                            batch,
                             max_len,
                             dec_len,
                             finished,
                             lengths,
                             selected_tokens,
+                            active_rows[0..active_count],
                             self.config.eos_token_id,
                             self.config.pad_token_id,
-                            step_tokens,
+                            step_tokens[0..active_count],
                         );
                         selected_on_device = true;
                     }
@@ -683,9 +694,8 @@ pub const ReadingPipeline = struct {
                     const logits = try cb.toFloat32(logits_tensor, allocator);
                     defer allocator.free(logits);
 
-                    finished_count += try applyFlorenceBatchGreedyStep(
+                    finished_count += try applyFlorenceBatchGreedyStepActive(
                         dec_ids,
-                        batch,
                         max_len,
                         dec_len,
                         finished,
@@ -694,10 +704,11 @@ pub const ReadingPipeline = struct {
                         florence_cfg.vocab_size,
                         0,
                         florence_cfg.vocab_size,
+                        active_rows[0..active_count],
                         self.config.eos_token_id,
                         self.config.pad_token_id,
                         self.config.no_repeat_ngram_size,
-                        step_tokens,
+                        step_tokens[0..active_count],
                     );
                 }
             }
@@ -705,12 +716,37 @@ pub const ReadingPipeline = struct {
             dec_len += 1;
             decoder_steps += 1;
             if (dec_len < max_len and finished_count < batch) {
+                if (row_compaction_supported) {
+                    var next_active_count: usize = 0;
+                    for (active_rows[0..active_count], 0..) |original_row, cache_row| {
+                        if (finished[original_row]) continue;
+                        retained_cache_rows[next_active_count] = @intCast(cache_row);
+                        next_active_rows[next_active_count] = original_row;
+                        next_step_tokens[next_active_count] = step_tokens[cache_row];
+                        next_active_count += 1;
+                    }
+                    if (next_active_count < active_count) {
+                        if (try florence_arch.compactDecoderIncrementalCache(
+                            cb,
+                            allocator,
+                            florence_cfg,
+                            &cache,
+                            retained_cache_rows[0..next_active_count],
+                        )) {
+                            @memcpy(active_rows[0..next_active_count], next_active_rows[0..next_active_count]);
+                            @memcpy(step_tokens[0..next_active_count], next_step_tokens[0..next_active_count]);
+                            active_count = next_active_count;
+                        } else {
+                            row_compaction_supported = false;
+                        }
+                    }
+                }
                 const decoder_run_start = nowNs();
                 hidden_opt = try florence_arch.decoderForwardIncrementalBatchStepFinalHiddenTensor(
                     cb,
                     allocator,
                     florence_cfg,
-                    step_tokens,
+                    step_tokens[0..active_count],
                     &cache,
                 );
                 const decoder_run_ns = nowNs() - decoder_run_start;
@@ -1923,6 +1959,55 @@ fn applyFlorenceBatchGreedyStep(
     return newly_finished;
 }
 
+fn applyFlorenceBatchGreedyStepActive(
+    decoder_ids: []i64,
+    max_len: usize,
+    decoder_len: usize,
+    finished: []bool,
+    lengths: []usize,
+    logits: []const f32,
+    logits_row_stride: usize,
+    logits_tail_offset: usize,
+    vocab_size: usize,
+    active_rows: []const usize,
+    eos_token_id: i32,
+    pad_token_id: i32,
+    no_repeat_ngram_size: usize,
+    step_tokens: []i64,
+) !usize {
+    if (decoder_len >= max_len or finished.len != lengths.len or active_rows.len != step_tokens.len or vocab_size == 0)
+        return error.InvalidInputShape;
+    var newly_finished: usize = 0;
+    for (active_rows, 0..) |original_row, active_row| {
+        if (original_row >= finished.len) return error.InvalidInputShape;
+        const row_offset = std.math.mul(usize, original_row, max_len) catch return error.InvalidInputShape;
+        if (row_offset > decoder_ids.len or max_len > decoder_ids.len - row_offset) return error.InvalidInputShape;
+        const row = decoder_ids[row_offset..][0..max_len];
+        if (finished[original_row]) {
+            row[decoder_len] = @as(i64, pad_token_id);
+            step_tokens[active_row] = @as(i64, pad_token_id);
+            continue;
+        }
+        const batch_logits_offset = std.math.mul(usize, active_row, logits_row_stride) catch return error.InvalidInputShape;
+        const logits_offset = std.math.add(usize, batch_logits_offset, logits_tail_offset) catch return error.InvalidInputShape;
+        if (logits_offset > logits.len or vocab_size > logits.len - logits_offset) return error.InvalidInputShape;
+        const best_id = selectGreedyToken(logits[logits_offset..][0..vocab_size], row[0..decoder_len], no_repeat_ngram_size);
+        if (eos_token_id >= 0 and best_id == @as(usize, @intCast(eos_token_id))) {
+            finished[original_row] = true;
+            newly_finished += 1;
+            lengths[original_row] = decoder_len;
+            row[decoder_len] = @as(i64, pad_token_id);
+            step_tokens[active_row] = @as(i64, pad_token_id);
+        } else {
+            const token: i64 = @intCast(best_id);
+            row[decoder_len] = token;
+            lengths[original_row] = decoder_len + 1;
+            step_tokens[active_row] = token;
+        }
+    }
+    return newly_finished;
+}
+
 fn applyFlorenceBatchSelectedTokens(
     decoder_ids: []i64,
     batch: usize,
@@ -1960,6 +2045,48 @@ fn applyFlorenceBatchSelectedTokens(
             row[decoder_len] = token;
             lengths[b] = decoder_len + 1;
             if (step_tokens) |tokens| tokens[b] = token;
+        }
+    }
+    return newly_finished;
+}
+
+fn applyFlorenceBatchSelectedTokensActive(
+    decoder_ids: []i64,
+    max_len: usize,
+    decoder_len: usize,
+    finished: []bool,
+    lengths: []usize,
+    selected_tokens: []const u32,
+    active_rows: []const usize,
+    eos_token_id: i32,
+    pad_token_id: i32,
+    step_tokens: []i64,
+) !usize {
+    if (decoder_len >= max_len or finished.len != lengths.len or
+        selected_tokens.len != active_rows.len or step_tokens.len != active_rows.len)
+        return error.InvalidInputShape;
+    var newly_finished: usize = 0;
+    for (selected_tokens, active_rows, 0..) |best_id, original_row, active_row| {
+        if (original_row >= finished.len) return error.InvalidInputShape;
+        const row_offset = std.math.mul(usize, original_row, max_len) catch return error.InvalidInputShape;
+        if (row_offset > decoder_ids.len or max_len > decoder_ids.len - row_offset) return error.InvalidInputShape;
+        const row = decoder_ids[row_offset..][0..max_len];
+        if (finished[original_row]) {
+            row[decoder_len] = @as(i64, pad_token_id);
+            step_tokens[active_row] = @as(i64, pad_token_id);
+            continue;
+        }
+        if (eos_token_id >= 0 and best_id == @as(u32, @intCast(eos_token_id))) {
+            finished[original_row] = true;
+            newly_finished += 1;
+            lengths[original_row] = decoder_len;
+            row[decoder_len] = @as(i64, pad_token_id);
+            step_tokens[active_row] = @as(i64, pad_token_id);
+        } else {
+            const token: i64 = @intCast(best_id);
+            row[decoder_len] = token;
+            lengths[original_row] = decoder_len + 1;
+            step_tokens[active_row] = token;
         }
     }
     return newly_finished;
@@ -2056,6 +2183,39 @@ test "Florence device-selected batch tokens preserve mixed EOS state" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 0, 9, 0 }, decoder_ids[0..max_len]);
     try std.testing.expectEqualSlices(i64, &.{ 1, 7, 0, 0 }, decoder_ids[max_len .. max_len * 2]);
     try std.testing.expectEqualSlices(i64, &.{ 1, 0, 0, 0 }, decoder_ids[max_len * 2 ..]);
+}
+
+test "Florence compacted active rows preserve original result identity" {
+    const max_len: usize = 4;
+    var decoder_ids = [_]i64{
+        1, 4, 0, 0,
+        1, 5, 0, 0,
+        1, 6, 0, 0,
+        1, 7, 0, 0,
+    };
+    var finished = [_]bool{ true, false, true, false };
+    var lengths = [_]usize{ 2, 2, 2, 2 };
+    var step_tokens = [_]i64{ 0, 0 };
+
+    try std.testing.expectEqual(@as(usize, 1), try applyFlorenceBatchSelectedTokensActive(
+        &decoder_ids,
+        max_len,
+        2,
+        &finished,
+        &lengths,
+        &.{ 2, 9 },
+        &.{ 1, 3 },
+        2,
+        0,
+        &step_tokens,
+    ));
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &finished);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 2, 3 }, &lengths);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 9 }, &step_tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4, 0, 0 }, decoder_ids[0..max_len]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 5, 0, 0 }, decoder_ids[max_len .. max_len * 2]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 6, 0, 0 }, decoder_ids[max_len * 2 .. max_len * 3]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 7, 9, 0 }, decoder_ids[max_len * 3 ..]);
 }
 
 fn selectGreedyToken(logits: []const f32, prefix: []const i64, no_repeat_ngram_size: usize) usize {

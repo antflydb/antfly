@@ -425,6 +425,10 @@ pub const TaskResourceLimits = struct {
 /// catalog property.
 pub const AttachmentTransport = enum {
     borrowed_binary,
+    /// Raw attachments are copied once into a versioned HTTP envelope. The
+    /// wire size stays linear in the source bytes without base64 expansion,
+    /// while admission accounts for source and request-body residency.
+    framed_binary,
     base64_payload,
     data_uri,
 
@@ -437,7 +441,7 @@ pub const AttachmentTransport = enum {
         raw_bytes: usize,
         mime_type_len: usize,
     ) !usize {
-        if (self == .borrowed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .framed_binary) return raw_bytes;
         const rounded = std.math.add(usize, raw_bytes, 2) catch
             return error.InferenceEncodedBytesExceeded;
         const encoded = std.math.mul(usize, rounded / 3, 4) catch
@@ -462,6 +466,8 @@ pub const AttachmentTransport = enum {
         mime_type_len: usize,
     ) !usize {
         if (self == .borrowed_binary) return raw_bytes;
+        if (self == .framed_binary)
+            return std.math.mul(usize, raw_bytes, 2) catch error.InferenceEncodedBytesExceeded;
         const wire_bytes = try self.wireSize(raw_bytes, mime_type_len);
         const retained_wire = if (self == .data_uri)
             std.math.mul(usize, wire_bytes, 2) catch return error.InferenceEncodedBytesExceeded
@@ -481,7 +487,7 @@ pub const AttachmentTransport = enum {
         item_count: usize,
     ) !usize {
         if (item_count == 0) return 0;
-        if (self == .borrowed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .framed_binary) return raw_bytes;
         const encoded = try AttachmentTransport.base64_payload.wireSize(raw_bytes, 0);
         const padding_slack = std.math.mul(usize, item_count - 1, 4) catch
             return error.InferenceEncodedBytesExceeded;
@@ -506,6 +512,8 @@ pub const AttachmentTransport = enum {
         item_count: usize,
     ) !usize {
         if (self == .borrowed_binary) return raw_bytes;
+        if (self == .framed_binary)
+            return std.math.mul(usize, raw_bytes, 2) catch error.InferenceEncodedBytesExceeded;
         const wire_bytes = try self.batchWireSizeUpperBound(raw_bytes, mime_type_len, item_count);
         // URI adapters retain the encoded URI while their downstream provider
         // serializes it into a JSON request body. Account for both copies.
@@ -775,6 +783,10 @@ pub const InferenceCapabilities = struct {
     // use this to select byte accounting: transport is an executor property
     // and is supplied explicitly through AttachmentTransport.
     borrowed_attachments: bool = false,
+    /// The resolved HTTP route accepts the versioned metadata + raw attachment
+    /// envelope. Unlike borrowed_attachments, this is a wire capability and
+    /// is therefore safe to advertise across process boundaries.
+    framed_attachments: bool = false,
     /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
     /// This is never inferred from image modality or encoded attachment support.
     borrowed_rasters: bool = false,
@@ -1075,10 +1087,15 @@ test "attachment transport separates wire and peak resident representations" {
         try AttachmentTransport.base64_payload.wireSize(3, "image/png".len),
     );
     try std.testing.expectEqual(
+        @as(usize, 3),
+        try AttachmentTransport.framed_binary.wireSize(3, "image/png".len),
+    );
+    try std.testing.expectEqual(
         "data:image/png;base64,AQID".len,
         try AttachmentTransport.data_uri.wireSize(3, "image/png".len),
     );
     try std.testing.expectEqual(@as(usize, 7), try AttachmentTransport.base64_payload.peakResidentSize(3, 0));
+    try std.testing.expectEqual(@as(usize, 6), try AttachmentTransport.framed_binary.peakResidentSize(3, 0));
     try std.testing.expectEqual(
         @as(usize, 3 + 2 * "data:image/png;base64,AQID".len),
         try AttachmentTransport.data_uri.peakResidentSize(3, "image/png".len),

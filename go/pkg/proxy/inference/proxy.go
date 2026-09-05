@@ -2825,14 +2825,45 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no operation-eligible inference endpoints", http.StatusServiceUnavailable)
 		return
 	}
-	// Turn the process-wide memory ceiling into a concurrency limit. The merged
-	// catalog and each active worker's raw body, RawMessage copy, and transient
-	// task-inventory parse can coexist; endpoints beyond the admitted worker count
-	// are processed by those same workers sequentially.
-	workerCount, catalogBytes, planErr := modelCatalogFanoutPlan(len(targets), p.catalogAdmission.Limit())
-	if planErr != nil {
-		http.Error(w, "inference model catalog memory limit cannot admit one worker", http.StatusServiceUnavailable)
-		return
+	type catalogResult struct {
+		target   catalogTarget
+		catalog  modelCatalogSnapshot
+		eligible bool
+		err      error
+	}
+
+	// Immutable catalog snapshots need only the merged-response reservation. Find
+	// them before sizing the fetch fanout so a hot catalog request does not consume
+	// one 40 MiB worker allowance per endpoint or wait behind unrelated fetches.
+	// The incarnation check below still rejects a snapshot whose endpoint changes
+	// after this partition.
+	cachedResults := make([]catalogResult, 0, len(targets))
+	misses := make([]catalogTarget, 0, len(targets))
+	for _, target := range targets {
+		catalog, cached := p.registry.catalogSnapshotAtIncarnation(target.address, target.incarnation, authorization)
+		if !cached {
+			misses = append(misses, target)
+			continue
+		}
+		if model != "" && !canonicalCatalogContainsTaskModel(catalog, taskScope, model) {
+			cachedResults = append(cachedResults, catalogResult{target: target})
+			continue
+		}
+		cachedResults = append(cachedResults, catalogResult{target: target, catalog: catalog, eligible: true})
+	}
+
+	// Turn the process-wide memory ceiling into a concurrency limit for actual
+	// misses. Cached snapshots are immutable and already charged to the registry;
+	// only the merged response coexists with them here.
+	workerCount := 0
+	catalogBytes := int64(maxMergedModelCatalogBytes)
+	if len(misses) > 0 {
+		var planErr error
+		workerCount, catalogBytes, planErr = modelCatalogFanoutPlan(len(misses), p.catalogAdmission.Limit())
+		if planErr != nil {
+			http.Error(w, "inference model catalog memory limit cannot admit one worker", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	if err := p.catalogAdmission.Acquire(r.Context(), catalogBytes); err != nil {
 		status := http.StatusServiceUnavailable
@@ -2843,54 +2874,58 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer p.catalogAdmission.Release(catalogBytes)
-
-	type catalogResult struct {
-		target   catalogTarget
-		catalog  modelCatalogSnapshot
-		eligible bool
-		err      error
+	// Admission may wait behind another request. Never turn a snapshot that
+	// expired or was evicted during that wait into a fresh capability lease;
+	// the next request will enter the miss path and fetch it under worker
+	// admission.
+	for _, result := range cachedResults {
+		if !p.registry.catalogSnapshotFreshAtIncarnation(result.target.address, result.target.incarnation, authorization) {
+			http.Error(w, "inference model catalog cache changed during admission", http.StatusServiceUnavailable)
+			return
+		}
 	}
-	results := make(chan catalogResult)
-	jobs := make(chan catalogTarget, len(targets))
-	for _, target := range targets {
+
+	results := make(chan catalogResult, len(targets))
+	for _, result := range cachedResults {
+		results <- result
+	}
+	jobs := make(chan catalogTarget, len(misses))
+	for _, target := range misses {
 		jobs <- target
 	}
 	close(jobs)
 	for range workerCount {
 		go func() {
 			for target := range jobs {
-				catalog, cached := p.registry.catalogSnapshotAtIncarnation(target.address, target.incarnation, authorization)
-				if !cached {
-					address := target.address
-					request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
-					if err != nil {
-						results <- catalogResult{err: err}
-						continue
-					}
-					if authorization != "" {
-						request.Header.Set("Authorization", authorization)
-					}
-					response, err := p.registry.client.Do(request)
-					if err != nil {
-						results <- catalogResult{err: err}
-						continue
-					}
-					if response.StatusCode < 200 || response.StatusCode >= 300 {
-						_ = response.Body.Close()
-						results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
-						continue
-					}
-					body, err := io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
+				address := target.address
+				request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
+				if err != nil {
+					results <- catalogResult{err: err}
+					continue
+				}
+				if authorization != "" {
+					request.Header.Set("Authorization", authorization)
+				}
+				response, err := p.registry.client.Do(request)
+				if err != nil {
+					results <- catalogResult{err: err}
+					continue
+				}
+				if response.StatusCode < 200 || response.StatusCode >= 300 {
 					_ = response.Body.Close()
-					if err != nil || len(body) > maxModelCatalogBytes {
-						results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
-						continue
-					}
-					catalog, _, err = parseCanonicalModelCatalog(body)
-					if err != nil {
-						results <- catalogResult{err: err}
-						continue
-					}
+					results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
+					continue
+				}
+				body, err := io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
+				_ = response.Body.Close()
+				if err != nil || len(body) > maxModelCatalogBytes {
+					results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
+					continue
+				}
+				catalog, _, err := parseCanonicalModelCatalog(body)
+				if err != nil {
+					results <- catalogResult{err: err}
+					continue
 				}
 				if model != "" && !canonicalCatalogContainsTaskModel(catalog, taskScope, model) {
 					results <- catalogResult{target: target}
@@ -3714,6 +3749,15 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 		result["borrowed_attachments"] = false
 		version = 3
 		if aVersion >= 4 && bVersion >= 4 {
+			aFramed, aok := optionalInferenceCapabilityBool(a, "framed_attachments")
+			bFramed, bok := optionalInferenceCapabilityBool(b, "framed_attachments")
+			if !aok || !bok {
+				return nil, false
+			}
+			// Framing is safe to advertise through a pooled proxy only when
+			// every eligible upstream endpoint accepts it. Absence is the
+			// rolling-upgrade-compatible spelling of false.
+			result["framed_attachments"] = aFramed && bFramed
 			aLimits, aok := a["task_limits"].(map[string]any)
 			bLimits, bok := b["task_limits"].(map[string]any)
 			if !aok || !bok {
@@ -3770,6 +3814,15 @@ var exactPromptPolicies = map[string]bool{"explicit": true, "model_default": tru
 var taskLimitFields = []string{
 	"max_text_bytes_per_item", "max_input_tokens_per_item", "max_output_tokens_per_item",
 	"max_candidates_per_request", "max_schema_bytes",
+}
+
+func optionalInferenceCapabilityBool(capabilities map[string]any, field string) (bool, bool) {
+	value, found := capabilities[field]
+	if !found {
+		return false, true
+	}
+	parsed, ok := value.(bool)
+	return parsed, ok
 }
 
 func validExactInferenceCapabilities(capabilities map[string]any, version int) bool {
@@ -3848,6 +3901,9 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 	}
 	_, ok = capabilities["borrowed_attachments"].(bool)
 	if !ok {
+		return false
+	}
+	if _, ok := optionalInferenceCapabilityBool(capabilities, "framed_attachments"); !ok {
 		return false
 	}
 	if version >= 4 {

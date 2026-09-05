@@ -8458,6 +8458,10 @@ pub fn build(b: *std.Build) void {
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    // Sparse lifecycle tests reach BackendRuntime through shared storage code;
+    // its lazy PDF lane is part of that module graph even when the test itself
+    // does not render a document.
+    sparse_test_mod.addImport("antfly_pdf", pdf_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
     });

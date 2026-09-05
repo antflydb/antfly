@@ -1651,6 +1651,8 @@ pub const ManagedEmbedder = struct {
         const capabilities = try denseCapabilities(ptr, alloc, embedding_name);
         const attachment_transport: inference_work.AttachmentTransport = if (entry.antfly_provider != null)
             .borrowed_binary
+        else if (entry.provider == .antfly and capabilities.framed_attachments)
+            .framed_binary
         else
             .base64_payload;
         if (items.len == 0) return try alloc.alloc([]const f32, 0);
@@ -1731,6 +1733,14 @@ pub const ManagedEmbedder = struct {
     ) !db_embedder.DensePartInvocationMemory {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        const local = entry.antfly_provider;
+        const attachment_transport: inference_work.AttachmentTransport = if (local != null)
+            .borrowed_binary
+        else if (entry.provider == .antfly and
+            (try denseCapabilities(ptr, self.alloc, embedding_name)).framed_attachments)
+            .framed_binary
+        else
+            .base64_payload;
         const vector_values = std.math.mul(usize, shape.item_count, @as(usize, dims)) catch
             return error.InferenceEncodedBytesExceeded;
         const vector_bytes = std.math.mul(usize, vector_values, @sizeOf(f32)) catch
@@ -1770,13 +1780,20 @@ pub const ManagedEmbedder = struct {
             return error.InferenceEncodedBytesExceeded;
         var fixed = std.math.add(usize, request_envelope, response_and_parser) catch
             return error.InferenceEncodedBytesExceeded;
+        // The framed builder retains its small JSON metadata while allocating
+        // and filling the final body. Raw attachment residency is accounted by
+        // AttachmentTransport; charge this non-media overlap here.
+        if (attachment_transport == .framed_binary) fixed = std.math.add(
+            usize,
+            fixed,
+            request_envelope,
+        ) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, vector_copies) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, item_control_bytes) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, shape.preparation_bytes) catch
             return error.InferenceEncodedBytesExceeded;
-        const local = entry.antfly_provider;
         if (local) |provider| {
             if (!provider.owns_invocation_admission)
                 return error.InferenceInvocationMemoryUnavailable;
@@ -1785,7 +1802,7 @@ pub const ManagedEmbedder = struct {
                 return error.InferenceEncodedBytesExceeded;
         }
         return .{
-            .attachment_transport = if (local != null) .borrowed_binary else .base64_payload,
+            .attachment_transport = attachment_transport,
             .fixed_bytes = fixed,
             .allocator_limit_bytes = fixed,
             .allocator_owner = if (local != null) .executor else .caller,
@@ -5041,6 +5058,7 @@ fn textEmbeddingInvocationShape(texts: []const []const u8) !inference_work.Invoc
 fn densePartsInvocationShape(
     alloc: std.mem.Allocator,
     parts: []const template_mod.ContentPart,
+    attachment_transport: inference_work.AttachmentTransport,
 ) !inference_work.InvocationShape {
     var shape = inference_work.InvocationShape{ .item_count = 1 };
     var media_parts: usize = 0;
@@ -5072,7 +5090,7 @@ fn densePartsInvocationShape(
             mergeModalities(&shape.modalities, try modalityForContentType(media.mime_type));
             media_parts = std.math.add(usize, media_parts, 1) catch
                 return error.InferenceMediaPartLimitExceeded;
-            const wire_bytes = try inference_work.AttachmentTransport.base64_payload.wireSize(
+            const wire_bytes = try attachment_transport.wireSize(
                 media.data.len,
                 media.mime_type.len,
             );
@@ -5112,7 +5130,7 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
         .{ .text = "ocr" },
         .{ .media_url = image_url },
     };
-    const shape = try densePartsInvocationShape(std.testing.allocator, &parts);
+    const shape = try densePartsInvocationShape(std.testing.allocator, &parts, .base64_payload);
     try std.testing.expectEqual(@as(usize, 1), shape.item_count);
     try std.testing.expect(shape.modalities.text);
     try std.testing.expect(shape.modalities.image);
@@ -5121,12 +5139,24 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
     try std.testing.expectEqual(@as(u64, 6), shape.decoded_pixels);
     try std.testing.expectEqual(@as(usize, 1), shape.max_media_parts_per_item);
 
+    var png = [_]u8{0} ** 24;
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 3, .big);
+    const binary_parts = [_]template_mod.ContentPart{.{
+        .binary = .{ .mime_type = "image/png", .data = &png },
+    }};
+    const framed_shape = try densePartsInvocationShape(std.testing.allocator, &binary_parts, .framed_binary);
+    const base64_shape = try densePartsInvocationShape(std.testing.allocator, &binary_parts, .base64_payload);
+    try std.testing.expectEqual(@as(usize, 24), framed_shape.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 32), base64_shape.encoded_media_bytes);
+
     const invalid = [_]template_mod.ContentPart{
         .{ .media_url = "data:audio/wav;base64,YWFh" },
     };
     try std.testing.expectError(
         error.UnsupportedInferenceMimeType,
-        densePartsInvocationShape(std.testing.allocator, &invalid),
+        densePartsInvocationShape(std.testing.allocator, &invalid, .base64_payload),
     );
 }
 
@@ -5137,6 +5167,24 @@ fn bindRemoteEmbeddingLease(
     headers: []const [2][]const u8,
     operation_deadline_ns: u64,
     shape: inference_work.InvocationShape,
+) !remote_capabilities.CapabilityLease {
+    const lease = try acquireRemoteEmbeddingLease(
+        entry,
+        http,
+        provider,
+        headers,
+        operation_deadline_ns,
+    );
+    if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.embed, shape);
+    return lease;
+}
+
+fn acquireRemoteEmbeddingLease(
+    entry: *const ManagedEmbeddingEntry,
+    http: *httpx.Client,
+    provider: *antfly_provider_mod.Provider,
+    headers: []const [2][]const u8,
+    operation_deadline_ns: u64,
 ) !remote_capabilities.CapabilityLease {
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const lease = try cache.getOrDiscoverLeaseWithContext(
@@ -5150,9 +5198,50 @@ fn bindRemoteEmbeddingLease(
             .cancellation = entry.cancellation orelse .none,
         },
     );
-    if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.embed, shape);
+    // Providers are reused across invocations, but transport support belongs
+    // to this concrete lease. Reset first so a legacy or downgraded route can
+    // never inherit framed mode from an earlier endpoint.
+    provider.setFramedAttachments(false);
+    if (lease.capabilities) |capabilities| {
+        provider.setFramedAttachments(capabilities.framed_attachments);
+    }
     if (lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
     if (lease.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+    return lease;
+}
+
+fn bindRemoteEmbeddingPartsLease(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    http: *httpx.Client,
+    provider: *antfly_provider_mod.Provider,
+    headers: []const [2][]const u8,
+    operation_deadline_ns: u64,
+    parts: []const template_mod.ContentPart,
+    independently_addressable: bool,
+) !remote_capabilities.CapabilityLease {
+    const lease = try acquireRemoteEmbeddingLease(
+        entry,
+        http,
+        provider,
+        headers,
+        operation_deadline_ns,
+    );
+    if (lease.capabilities) |capabilities| {
+        const transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
+            .framed_binary
+        else
+            .base64_payload;
+        if (independently_addressable) {
+            try validateDensePartItemInvocation(alloc, capabilities, transport, parts);
+        } else {
+            try capabilities.validateInvocation(
+                .embed,
+                try densePartsInvocationShape(alloc, parts, transport),
+            );
+            try validateDensePartsMimeTypes(capabilities, parts);
+        }
+    }
     return lease;
 }
 
@@ -5247,16 +5336,16 @@ fn embedWithEntryPartsForTask(
         }
         var capability_header_storage: [2][2][]const u8 = undefined;
         const capability_headers = remoteEmbeddingHeaders(entry, auth_header_owned, &capability_header_storage);
-        const capability_lease = try bindRemoteEmbeddingLease(
+        _ = try bindRemoteEmbeddingPartsLease(
+            alloc,
             entry,
             http,
             &provider,
             capability_headers,
             operation_deadline_ns,
-            try densePartsInvocationShape(alloc, parts),
+            parts,
+            false,
         );
-        if (capability_lease.capabilities) |capabilities|
-            try validateDensePartsMimeTypes(capabilities, parts);
         try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
         var result = provider.embedPartsWithTask(
@@ -5579,20 +5668,16 @@ fn embedPartItemsWithEntry(
     }
     const capability_headers = capability_header_storage[0..capability_header_count];
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    const capability_lease = try capability_cache.getOrDiscoverLeaseWithContext(
+    _ = try bindRemoteEmbeddingPartsLease(
+        alloc,
+        entry,
         http,
-        entry.base_url,
-        entry.model,
-        .embed,
+        &provider,
         capability_headers,
-        .{
-            .deadline_ns = operation_deadline_ns,
-            .cancellation = entry.cancellation orelse .none,
-        },
+        operation_deadline_ns,
+        items,
+        true,
     );
-    if (capability_lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
-    if (capability_lease.descriptor_revision) |revision|
-        try provider.setCapabilityRevision(revision.slice());
     try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
 
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {

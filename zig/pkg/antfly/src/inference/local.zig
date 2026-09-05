@@ -198,6 +198,75 @@ fn embedPartsRequestJsonAlloc(
     return body;
 }
 
+fn embedPartsAttachmentEnvelopeAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+) ![]u8 {
+    var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+    defer attachments.deinit(alloc);
+    var metadata: std.Io.Writer.Allocating = .init(alloc);
+    defer metadata.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &metadata.writer };
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(model);
+    try stringify.objectField("input");
+    try stringify.beginArray();
+    for (parts) |part| {
+        try stringify.beginObject();
+        switch (part) {
+            .text => |text| {
+                try stringify.objectField("type");
+                try stringify.write("text");
+                try stringify.objectField("text");
+                try stringify.write(text);
+            },
+            .media_url => |url| {
+                try stringify.objectField("type");
+                try stringify.write("image_url");
+                try stringify.objectField("image_url");
+                try stringify.beginObject();
+                try stringify.objectField("url");
+                try stringify.write(url);
+                try stringify.endObject();
+            },
+            .binary => |binary_part| {
+                const attachment_index = attachments.items.len;
+                try attachments.append(alloc, .{
+                    .mime_type = binary_part.mime_type,
+                    .data = binary_part.data,
+                });
+                try stringify.objectField("type");
+                try stringify.write("attachment");
+                try stringify.objectField("attachment_index");
+                try stringify.write(attachment_index);
+            },
+        }
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+    try stringify.objectField("encoding_format");
+    try stringify.write("float");
+    if (task_type) |value| {
+        try stringify.objectField("task_type");
+        try stringify.write(value);
+    }
+    if (instruction) |value| {
+        try stringify.objectField("instruction");
+        try stringify.write(value);
+    }
+    try stringify.endObject();
+    return httpx.attachment_envelope.encodeAlloc(alloc, metadata.written(), attachments.items);
+}
+
+fn hasBinaryPart(parts: []const template_mod.ContentPart) bool {
+    for (parts) |part| if (part == .binary) return true;
+    return false;
+}
+
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
@@ -208,7 +277,7 @@ pub const Provider = struct {
     source_table: ?[]u8 = null,
     capability_token: ?[]u8 = null,
     capability_revision: ?[]u8 = null,
-    request_header_storage: [4][2][]const u8 = undefined,
+    request_header_storage: [5][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -218,6 +287,7 @@ pub const Provider = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
+    framed_attachments: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -314,6 +384,10 @@ pub const Provider = struct {
         self.max_response_bytes = max_response_bytes;
     }
 
+    pub fn setFramedAttachments(self: *Provider, supported: bool) void {
+        self.framed_attachments = supported;
+    }
+
     /// Build the task-neutral controls for every request sent to a distributed
     /// Antfly inference node. Keeping this in one helper prevents a newly added
     /// model family or wire encoding from silently dropping deadline,
@@ -326,6 +400,27 @@ pub const Provider = struct {
         return .{
             .json = json_body,
             .headers = self.requestHeaders(),
+            .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        };
+    }
+
+    fn controlledBodyRequest(
+        self: *Provider,
+        body: []const u8,
+        content_type_value: []const u8,
+        fallback_timeout_ms: ?u64,
+    ) httpx.RequestOptions {
+        const base_headers = self.requestHeaders();
+        const count = if (base_headers) |headers| headers.len else 0;
+        self.request_header_storage[count] = .{ "Content-Type", content_type_value };
+        return .{
+            .body = body,
+            .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
             .max_response_size = self.max_response_bytes,
             .cancellation = if (self.cancellation) |token|
@@ -477,6 +572,14 @@ pub const Provider = struct {
         task_type: ?[]const u8,
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
+        if (self.framed_attachments and hasBinaryPart(parts)) {
+            const body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction);
+            defer alloc.free(body);
+            return try self.embedBody(
+                alloc,
+                self.controlledBodyRequest(body, httpx.attachment_envelope.content_type, null),
+            );
+        }
         const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);
         defer alloc.free(json_body);
         return try self.embedJsonBody(alloc, json_body);
@@ -527,9 +630,17 @@ pub const Provider = struct {
     }
 
     fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8) !inference.EmbedResult {
+        return self.embedBody(alloc, self.controlledJsonRequest(json_body, null));
+    }
+
+    fn embedBody(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        options: httpx.RequestOptions,
+    ) !inference.EmbedResult {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
-        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
+        var resp = try self.http.post(url, options);
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -812,7 +923,7 @@ test "antfly dense JSON response cleanup is allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
-test "antfly embed parts streams binary base64 into one request body" {
+test "antfly embed parts uses the framed attachment transport" {
     return testEmbedPartsRequestRoundTrip();
 }
 
@@ -834,7 +945,7 @@ test "antfly embed request carries retrieval task and instruction" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\":\"retrieve relevant encyclopedia passages\"") != null);
 }
 
-test "antfly embed parts preserves binary base64 until request serialization" {
+test "antfly embed parts lends raw binary through its request envelope" {
     return testEmbedPartsRequestRoundTrip();
 }
 
@@ -848,9 +959,17 @@ fn testEmbedPartsRequestRoundTrip() !void {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqual(httpx.Method.POST, req.method);
             try std.testing.expectEqualStrings("/embed", req.path);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"data\":\"AQID\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mime_type\":\"image/png\"") != null);
+            try std.testing.expectEqualStrings(
+                httpx.attachment_envelope.content_type,
+                req.header("Content-Type") orelse return error.TestExpectedContentType,
+            );
+            var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings("image/png", envelope.attachments[0].mime_type);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, envelope.attachments[0].data);
+            try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"type\":\"attachment\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"attachment_index\":0") != null);
         }
     };
 
@@ -874,6 +993,7 @@ fn testEmbedPartsRequestRoundTrip() !void {
 
             var provider = Provider.init(a, &client, base);
             defer provider.deinit();
+            provider.setFramedAttachments(true);
 
             var result = provider.embedParts(a, "clipclap", &.{
                 .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },

@@ -352,16 +352,20 @@ pointer/count consistency, indexes, MIME types, byte limits, and per-item
 cardinality before borrowing memory. Unsupported remote transports perform
 base64 or multipart adaptation only at their final provider boundary.
 
-For distributed Antfly-to-Antfly traffic, framed binary metadata plus bounded
-attachment segments is a future transport optimization; current HTTP adapters
-still use their explicit JSON/data-URI compatibility representation. The future
-metadata frame should carry item identities, MIME essences, attachment indexes,
-lengths, and checksums, with subsequent bounded frames carrying bytes. A
-receiver must admit the declared aggregate before reading segments and validate
-actual lengths before preprocessing. External providers and older nodes would
-retain JSON/data-URI adaptation selected by the leased route capability. This
-would remove base64 expansion without weakening the borrowed-attachment
-logical contract already used in-process.
+Distributed Antfly-to-Antfly embedding traffic now negotiates a versioned
+binary envelope containing bounded JSON metadata, attachment descriptors, MIME
+essences, and raw attachment bytes. The receiver validates reserved fields,
+declared lengths, aggregate limits, trailing data, attachment indexes, and exact
+reference cardinality before preprocessing. `framed_attachments` is an additive
+v4 capability bit: older clients ignore it, newer clients default it to false
+for older nodes, and the leased concrete route remains the sole transport
+authority. External providers and unconverted task endpoints retain their
+admitted JSON/data-URI representation. The envelope codec is task-neutral, but
+reader, generator, reranker, extractor, chunker, rewriter, and transcriber
+endpoints must each adopt and advertise it only when their parser and admission
+path consume the raw attachments; model capability alone never implies wire
+support. A later streaming variant may add per-frame checksums and flow control
+without changing the logical borrowed-attachment contract.
 
 Per-item identity removes the current need to split otherwise compatible local
 batches at document boundaries solely for profiling. Cross-document batching
@@ -2707,6 +2711,57 @@ The hardening above follows these long-term rules:
     reject definitely oversized envelopes before decoding or model loading,
     while malformed payloads that fit the limit still receive the precise
     syntax error. Direct and batch generation now apply the same ordering.
+110. **Implemented after codec-admission performance review:** image embedding
+    no longer reserves the configured 128-MiB codec ceiling for every request.
+    The shared preprocessing slab asks the backend session for exact physical
+    growth deltas before its initial allocation and each between-wave resize,
+    retains those permits while the slab exists, and releases them immediately
+    after preprocessing. Caller media and the normalized tensor retain their
+    independent stable lease, so concurrent requests cannot overbook memory and
+    small images no longer suffer a worst-case scratch charge.
+111. **Implemented after artifact-probe performance review:** durable PDF page
+    embedding computes every page identity once, opens one short-lived immutable
+    read snapshot, and checks final and staged artifacts through borrowed values.
+    This removes two transaction setups and full stored-vector copies per page.
+    Out-of-memory remains fatal, ordinary cache read failures remain conservative
+    misses, and the snapshot is released before rendering or inference begins.
+112. **Implemented after planner hot-path review:** PDF OCR creates page metadata
+    once and lends it to both invocation planning and execution. Retained page
+    bytes use prefix sums, and visual embedding compiles count-indexed,
+    route-resolved invocation-memory plans once per document so later windows
+    and fallback sizes perform constant-time lookups without repeated capability
+    discovery. Temporary prototypes are released or transferred transactionally
+    with the render window.
+113. **Implemented after mixed-EOS decoder review:** native Florence incremental
+    decoding tracks cache rows separately from original result rows. When a page
+    reaches EOS, CUDA and Metal gather the surviving cross-attention cache,
+    self-attention cache, and masks into a transactionally built smaller batch;
+    subsequent decoder, LM-head, and argmax work excludes finished pages while
+    output identity and order remain original-page indexed. A backend without
+    row gathering retains the prior padded compatibility behavior.
+114. **Implemented after local OCR representation review:** a singleton plain
+    reader result transfers its owned text buffer into the producer result
+    envelope instead of joining/copying it. Enrichment recognizes non-JSON text
+    before invoking the JSON parser, while structured generator and extractor
+    results keep their typed parsing rules. The remaining allocator-domain copy
+    is the one required to move bounded invocation output into durable document
+    ownership.
+115. **Implemented after catalog-admission performance review:** the proxy
+    partitions immutable, incarnation-fenced catalog cache hits before sizing
+    worker admission. Hot catalog requests reserve only the bounded merged
+    response; actual misses alone determine fetch fanout. Snapshots are checked
+    again after a potentially blocking admission wait, and endpoint incarnation
+    is still validated before merge, so the optimization cannot mint a lease
+    from expired routing state.
+116. **Implemented after distributed embedding transport review:** remote
+    Antfly visual embedding can send raw page bytes in the shared
+    `application/vnd.antfly.attachments.v1` envelope instead of materializing
+    base64 JSON. The capability-negotiated route accounts for simultaneous
+    source and framed-body residency; the inference node borrows slices from the
+    bounded request body and validates one exact attachment reference per input.
+    Older nodes and external providers remain on their existing admitted
+    transport. The v4 feature bit is intentionally additive, preserving rolling
+    compatibility in both upgrade directions.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2880,9 +2935,10 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   images and text chunks. It never silently pools a document. The integration
   fixture exercises the same bounded two-page render window through fake
   Florence reader, Gemma generator, and ClipClap embedder boundaries.
-- Mixed-EOS Florence batch decoding uses the same row update helper for the KV
-  and full-decoder paths and has a regression test proving that finished rows
-  remain padded while active rows retain independent lengths.
+- Mixed-EOS Florence batch decoding preserves original result identity while
+  compacting supported KV caches to unfinished rows. Unsupported backends keep
+  finished rows padded through the compatibility path, and regression coverage
+  verifies independent lengths and original-row updates.
 
 PDF OCR and durable page-image embedding can prefetch exactly one second render
 window. The current window remains admitted while the speculative window
@@ -3854,11 +3910,11 @@ The following remain qualification work rather than architectural blockers:
   physical lane because renderer scratch benefits from worker affinity; any
   additional split must remain beneath the same aggregate ceiling and preserve
   shutdown ordering.
-- Whether distributed inference should gain a framed binary side channel for
-  attachments. Linked execution uses borrowed encoded or raster bytes today;
-  remote nodes intentionally retain encoded JSON/base64 compatibility until a
-  versioned transport supplies framing, authentication, checksums, flow
-  control, cancellation, and per-item provenance.
+- Whether the buffered v1 distributed attachment envelope should gain a
+  streaming/checksummed variant, and which additional task endpoints should
+  advertise it after their task-specific parsers and admission paths consume
+  raw attachments. Embedding is implemented; unsupported endpoints, older
+  nodes, and external providers retain JSON/base64 compatibility.
 - Whether cross-request broker adapters should be enabled for a model family is
   executor-specific. The task-neutral broker exists, but a family must expose a
   genuinely fused native batch implementation before it may opt in; accepting

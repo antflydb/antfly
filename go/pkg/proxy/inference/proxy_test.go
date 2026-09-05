@@ -5252,6 +5252,48 @@ func TestScopedCatalogReducesFanoutToFitRetainedByteLimit(t *testing.T) {
 	}
 }
 
+func TestScopedCatalogCacheHitNeedsNoWorkerAdmission(t *testing.T) {
+	t.Parallel()
+
+	const address = "http://reader.internal"
+	p := NewProxy(Config{
+		DefaultPool:             RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:         time.Minute,
+		MaxRetainedCatalogBytes: maxMergedModelCatalogBytes,
+		Logger:                  zap.NewNop(),
+	})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("cached catalog unexpectedly fetched")
+	})}
+	p.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	operations := map[string]map[OperationType]bool{
+		"owner/reader": {OperationType("read"): true},
+	}
+	p.registry.mu.RLock()
+	endpoint := p.registry.endpoints[address]
+	p.registry.mu.RUnlock()
+	if endpoint == nil {
+		t.Fatal("registered endpoint missing")
+	}
+	p.registry.updateModelCatalogForEndpoint(
+		address,
+		endpoint,
+		endpoint.incarnation,
+		[]byte(`{"readers":{"owner/reader":{}}}`),
+		"",
+		operations,
+	)
+
+	recorder := httptest.NewRecorder()
+	p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models?model=owner%2Freader&task=read", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if used := p.catalogAdmission.Used(); used != 0 {
+		t.Fatalf("catalog admission leaked %d bytes", used)
+	}
+}
+
 func TestConservativeCapabilitiesDoNotOverpromiseAcrossUnknownLimits(t *testing.T) {
 	left := map[string]any{
 		"task": "read",
@@ -5339,6 +5381,46 @@ func TestConservativeCapabilitiesV3PreservesExactContract(t *testing.T) {
 	merged, ok = conservativeInferenceCapabilities(left, right)
 	if !ok || merged["borrowed_attachments"] != false {
 		t.Fatalf("proxy leaked an upstream borrowed-memory claim: %#v", merged)
+	}
+}
+
+func TestConservativeCapabilitiesV4RequiresEveryEndpointToSupportFramedAttachments(t *testing.T) {
+	base := func(framed *bool) map[string]any {
+		capabilities := map[string]any{
+			"version": float64(4), "task": "embed",
+			"input_modalities": []any{"image"}, "accepted_mime_types": []any{"image/png"},
+			"input_granularity": "page", "output": "embedding",
+			"result_cardinality": "one_per_item", "prompt_policy": "explicit",
+			"borrowed_attachments": false,
+			"task_limits": map[string]any{
+				"max_text_bytes_per_item": nil, "max_input_tokens_per_item": nil,
+				"max_output_tokens_per_item": nil, "max_candidates_per_request": nil,
+				"max_schema_bytes": nil,
+			},
+			"batch": map[string]any{
+				"mode": "native", "preferred_items": float64(4), "max_items": float64(8),
+				"max_encoded_media_bytes": float64(4096), "max_decoded_pixels": float64(8192),
+				"max_media_parts_per_item": float64(1), "per_item_failures": true,
+			},
+		}
+		if framed != nil {
+			capabilities["framed_attachments"] = *framed
+		}
+		return capabilities
+	}
+	trueValue := true
+	merged, ok := conservativeInferenceCapabilities(base(&trueValue), base(&trueValue))
+	if !ok || merged["framed_attachments"] != true {
+		t.Fatalf("uniform framed support was not preserved: %#v", merged)
+	}
+	merged, ok = conservativeInferenceCapabilities(base(&trueValue), base(nil))
+	if !ok || merged["framed_attachments"] != false {
+		t.Fatalf("mixed-version framed support was not weakened: %#v", merged)
+	}
+	malformed := base(nil)
+	malformed["framed_attachments"] = "yes"
+	if _, ok := conservativeInferenceCapabilities(base(&trueValue), malformed); ok {
+		t.Fatal("malformed framed attachment capability was accepted")
 	}
 }
 

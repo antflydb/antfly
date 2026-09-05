@@ -139,6 +139,182 @@ pub const DecoderIncrementalCache = struct {
     }
 };
 
+/// Remove completed decoder rows while preserving their original relative
+/// order. The replacement cache is built transactionally: unsupported backend
+/// row-gathering returns false without mutating `cache`, and any error leaves the
+/// original cache intact. Device backends can therefore shrink decoder and
+/// LM-head batch dimensions as soon as pages reach EOS.
+pub fn compactDecoderIncrementalCache(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    cache: *DecoderIncrementalCache,
+    retained_rows: []const u32,
+) !bool {
+    if (retained_rows.len == 0 or retained_rows.len > cache.batch) return error.InvalidInputShape;
+    if (retained_rows.len == cache.batch) return true;
+    const expected_encoder_mask_len = std.math.mul(usize, cache.batch, cache.enc_seq) catch
+        return error.InvalidInputShape;
+    if (cache.batch == 0 or cache.enc_seq == 0 or
+        cache.cross.keys.len != config.decoder_layers or
+        cache.cross.values.len != config.decoder_layers or
+        cache.self.keys.len != config.decoder_layers or
+        cache.self.values.len != config.decoder_layers or
+        cache.encoder_mask.len != expected_encoder_mask_len or
+        cache.self_mask.len == 0 or cache.self_mask.len % cache.batch != 0 or
+        (cache.self.preallocated and cache.self.len > cache.self.capacity)) return error.InvalidInputShape;
+    var previous: ?u32 = null;
+    for (retained_rows) |row| {
+        if (row >= cache.batch or (previous != null and row <= previous.?)) return error.InvalidInputShape;
+        previous = row;
+    }
+
+    const old_batch = cache.batch;
+    const old_enc_seq = cache.enc_seq;
+    const next_batch = retained_rows.len;
+    const cross_rows = std.math.mul(usize, next_batch, cache.enc_seq) catch return error.InvalidInputShape;
+    const cross_row_ids = try allocator.alloc(u32, cross_rows);
+    defer allocator.free(cross_row_ids);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        for (0..cache.enc_seq) |token| {
+            const source = std.math.add(
+                usize,
+                std.math.mul(usize, source_batch, cache.enc_seq) catch return error.InvalidInputShape,
+                token,
+            ) catch return error.InvalidInputShape;
+            cross_row_ids[dst_batch * cache.enc_seq + token] = std.math.cast(u32, source) orelse
+                return error.InvalidInputShape;
+        }
+    }
+
+    const self_row_stride = if (cache.self.preallocated) cache.self.capacity else cache.self.len;
+    if (self_row_stride == 0) return error.InvalidInputShape;
+    const self_rows = std.math.mul(usize, next_batch, self_row_stride) catch return error.InvalidInputShape;
+    const self_row_ids = try allocator.alloc(u32, self_rows);
+    defer allocator.free(self_row_ids);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        for (0..self_row_stride) |token| {
+            const source = std.math.add(
+                usize,
+                std.math.mul(usize, source_batch, self_row_stride) catch return error.InvalidInputShape,
+                token,
+            ) catch return error.InvalidInputShape;
+            self_row_ids[dst_batch * self_row_stride + token] = std.math.cast(u32, source) orelse
+                return error.InvalidInputShape;
+        }
+    }
+
+    const next_cross_keys = try allocator.alloc(CT, config.decoder_layers);
+    var next_cross_keys_len: usize = 0;
+    const next_cross_values = allocator.alloc(CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        return err;
+    };
+    var next_cross_values_len: usize = 0;
+    const next_self_keys = allocator.alloc(?CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        return err;
+    };
+    @memset(next_self_keys, null);
+    const next_self_values = allocator.alloc(?CT, config.decoder_layers) catch |err| {
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        allocator.free(next_self_keys);
+        return err;
+    };
+    @memset(next_self_values, null);
+    var next_cache_owned = true;
+    defer if (next_cache_owned) {
+        for (next_cross_keys[0..next_cross_keys_len]) |tensor| cb.free(tensor);
+        for (next_cross_values[0..next_cross_values_len]) |tensor| cb.free(tensor);
+        for (next_self_keys) |maybe| if (maybe) |tensor| cb.free(tensor);
+        for (next_self_values) |maybe| if (maybe) |tensor| cb.free(tensor);
+        allocator.free(next_cross_keys);
+        allocator.free(next_cross_values);
+        allocator.free(next_self_keys);
+        allocator.free(next_self_values);
+    };
+
+    for (0..config.decoder_layers) |layer| {
+        next_cross_keys[layer] = (try cb.takeRows(
+            cache.cross.keys[layer],
+            cross_row_ids,
+            cross_rows,
+            config.d_model,
+        )) orelse return false;
+        next_cross_keys_len += 1;
+        next_cross_values[layer] = (try cb.takeRows(
+            cache.cross.values[layer],
+            cross_row_ids,
+            cross_rows,
+            config.d_model,
+        )) orelse return false;
+        next_cross_values_len += 1;
+        next_self_keys[layer] = (try cb.takeRows(
+            cache.self.keys[layer] orelse return error.InvalidInputShape,
+            self_row_ids,
+            self_rows,
+            config.d_model,
+        )) orelse return false;
+        next_self_values[layer] = (try cb.takeRows(
+            cache.self.values[layer] orelse return error.InvalidInputShape,
+            self_row_ids,
+            self_rows,
+            config.d_model,
+        )) orelse return false;
+    }
+
+    const encoder_mask = try allocator.alloc(i64, cross_rows);
+    errdefer allocator.free(encoder_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * cache.enc_seq;
+        @memcpy(
+            encoder_mask[dst_batch * cache.enc_seq ..][0..cache.enc_seq],
+            cache.encoder_mask[source..][0..cache.enc_seq],
+        );
+    }
+    const old_self_mask_stride = cache.self_mask.len / old_batch;
+    const self_mask_len = std.math.mul(usize, next_batch, old_self_mask_stride) catch
+        return error.InvalidInputShape;
+    const self_mask = try allocator.alloc(i64, self_mask_len);
+    errdefer allocator.free(self_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * old_self_mask_stride;
+        @memcpy(
+            self_mask[dst_batch * old_self_mask_stride ..][0..old_self_mask_stride],
+            cache.self_mask[source..][0..old_self_mask_stride],
+        );
+    }
+
+    var old_cross = cache.cross;
+    var old_self = cache.self;
+    const old_encoder_mask = cache.encoder_mask;
+    const old_self_mask = cache.self_mask;
+    cache.* = .{
+        .cross = .{ .keys = next_cross_keys, .values = next_cross_values },
+        .self = .{
+            .keys = next_self_keys,
+            .values = next_self_values,
+            .len = old_self.len,
+            .capacity = old_self.capacity,
+            .preallocated = old_self.preallocated,
+        },
+        .encoder_mask = encoder_mask,
+        .self_mask = self_mask,
+        .batch = next_batch,
+        .enc_seq = old_enc_seq,
+    };
+    next_cross_keys_len = 0;
+    next_cross_values_len = 0;
+    next_cache_owned = false;
+    old_cross.deinit(cb, allocator);
+    old_self.deinit(cb, allocator);
+    allocator.free(old_encoder_mask);
+    allocator.free(old_self_mask);
+    return true;
+}
+
 const VisionForwardResult = struct {
     features: []f32,
     seq_len: usize,
