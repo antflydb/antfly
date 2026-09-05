@@ -1548,12 +1548,15 @@ fn embedTimingNowNs() u128 {
     };
 }
 
-const DenseEmbedRequestContext = struct {
+/// Couples request-scoped execution control to the I/O runtime used by a
+/// synchronous media fetch. Keep this transport-neutral: scraping adapts the
+/// callback to HTTP, S3, and file implementations.
+const InferenceDownloadRequestContext = struct {
     io: std.Io,
-    deadline_ns: ?u64 = null,
+    control: InferenceExecutionControl = .{},
 };
 
-fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
+fn remainingInferenceDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
     const deadline: u128 = deadline_ns orelse return null;
     if (now_ns >= deadline) return error.Timeout;
     const remaining_ns = deadline - now_ns;
@@ -1561,15 +1564,53 @@ fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
     return @intCast(timeout_ms);
 }
 
-fn denseEmbedDownloadContext(context: DenseEmbedRequestContext) !scraping.DownloadContext {
+fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !scraping.DownloadContext {
+    try context.control.check();
+    const CancellationAdapter = struct {
+        fn isCancelled(raw: *const anyopaque) bool {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            request.control.check() catch return true;
+            return false;
+        }
+    };
     return .{
         .io = context.io,
-        .timeout_ms = try remainingDirectEmbeddingDeadlineMs(context.deadline_ns, embedTimingNowNs()),
+        .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
+        .cancellation = .{
+            .ptr = context,
+            .is_cancelled_fn = CancellationAdapter.isCancelled,
+        },
     };
 }
 
+fn downloadContentForInferenceRequest(
+    alloc: std.mem.Allocator,
+    request_context: ?InferenceDownloadRequestContext,
+    url: []const u8,
+    security: *const scraping.ContentSecurityConfig,
+    s3_credentials: ?*const scraping.S3CredentialsConfig,
+) !scraping.DownloadedContent {
+    const download_context = if (request_context) |*context|
+        try inferenceDownloadContext(context)
+    else
+        null;
+    const downloaded = (if (download_context) |context|
+        scraping.downloadContentAllocWithContext(alloc, context, url, security, s3_credentials)
+    else
+        scraping.downloadContentAlloc(alloc, url, security, s3_credentials)) catch |err| {
+        if (request_context) |context| context.control.check() catch |control_err| return control_err;
+        return err;
+    };
+    errdefer {
+        var owned = downloaded;
+        owned.deinit(alloc);
+    }
+    if (request_context) |context| try context.control.check();
+    return downloaded;
+}
+
 fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
-    _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
+    _ = try remainingInferenceDeadlineMs(deadline_ns, embedTimingNowNs());
 }
 
 fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
@@ -1608,13 +1649,11 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
                     recovery_attempted = true;
                     continue;
                 }
-            } else if (err == error.Timeout) {
-                // A deadline failure is not retried inline: quarantine the
-                // exact runtime and let the durable caller retry after its
-                // backoff, at which point acquisition selects another healthy
-                // backend when one is available.
-                adapter.quarantine(&handle);
             }
+            // A request deadline can expire during tokenization, admission, or
+            // while waiting for the model lane. It is not evidence that the
+            // backend runtime is corrupt, so release it normally. Backends that
+            // detect runtime corruption must report a specific integrity error.
             return err;
         };
         adapter.succeed(&handle);
@@ -1673,10 +1712,6 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
             handle.retire();
         }
 
-        fn quarantine(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
-            handle.quarantine();
-        }
-
         fn release(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
             handle.release();
         }
@@ -1704,7 +1739,6 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
         acquire_count: usize = 0,
         execute_count: usize = 0,
         retire_count: usize = 0,
-        quarantine_count: usize = 0,
         release_count: usize = 0,
         succeed_count: usize = 0,
 
@@ -1735,12 +1769,6 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
             self.release_count += 1;
         }
 
-        fn quarantine(self: *@This(), handle: *Handle) void {
-            std.debug.assert(handle.active);
-            handle.active = false;
-            self.quarantine_count += 1;
-        }
-
         fn succeed(self: *@This(), _: *Handle) void {
             self.succeed_count += 1;
         }
@@ -1769,8 +1797,8 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     var timeout = Probe{ .mode = .timeout };
     try std.testing.expectError(error.Timeout, runEmbeddingRuntimeRecoveryLoop(&timeout));
     try std.testing.expectEqual(@as(usize, 1), timeout.acquire_count);
-    try std.testing.expectEqual(@as(usize, 1), timeout.quarantine_count);
-    try std.testing.expectEqual(@as(usize, 0), timeout.release_count);
+    try std.testing.expectEqual(@as(usize, 0), timeout.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), timeout.release_count);
 }
 
 test "embedding runtime recovery is limited to weight integrity failures" {
@@ -1784,13 +1812,31 @@ test "embedding runtime recovery is limited to weight integrity failures" {
     try std.testing.expect(!shouldAbortDensePartialFallback(error.ResourceTemporarilyUnavailable));
 }
 
-test "dense embed download deadline is a nonzero remaining ceiling" {
-    try std.testing.expect((try remainingDirectEmbeddingDeadlineMs(null, 100)) == null);
-    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(100, 100));
-    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(99, 100));
-    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(101, 100));
-    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms, 0));
-    try std.testing.expectEqual(@as(?u64, 2), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms + 1, 0));
+test "inference download deadline is a nonzero remaining ceiling" {
+    try std.testing.expect((try remainingInferenceDeadlineMs(null, 100)) == null);
+    try std.testing.expectError(error.Timeout, remainingInferenceDeadlineMs(100, 100));
+    try std.testing.expectError(error.Timeout, remainingInferenceDeadlineMs(99, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingInferenceDeadlineMs(101, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingInferenceDeadlineMs(std.time.ns_per_ms, 0));
+    try std.testing.expectEqual(@as(?u64, 2), try remainingInferenceDeadlineMs(std.time.ns_per_ms + 1, 0));
+}
+
+test "inference download context carries request cancellation" {
+    const State = struct {
+        cancelled: bool,
+        fn isCancelled(raw: ?*anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.cancelled;
+        }
+    };
+    var state = State{ .cancelled = true };
+    const request_context = InferenceDownloadRequestContext{
+        .io = std.testing.io,
+        .control = .{
+            .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
+        },
+    };
+    try std.testing.expectError(error.Cancelled, inferenceDownloadContext(&request_context));
 }
 
 test "dense embed parser contexts reject expired image fetches" {
@@ -1802,7 +1848,10 @@ test "dense embed parser contexts reject expired image fetches" {
         .model_type = .embedder,
         .visual_model_path = "visual.onnx",
     };
-    const context = DenseEmbedRequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+    const context = InferenceDownloadRequestContext{
+        .io = std.testing.io,
+        .control = .{ .deadline_ns = 0 },
+    };
 
     var fail_fast_input = try std.json.parseFromSlice(
         std.json.Value,
@@ -2674,6 +2723,10 @@ fn rejectDisallowedModel(
 const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
+fn isTransientInferenceCapacityError(err: anyerror) bool {
+    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable;
+}
+
 fn transientCapacityFailureResponse(
     ctx: *httpx.Context,
     code: []const u8,
@@ -2711,6 +2764,7 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
         error.Timeout => ctx.status(504).json(.{
             .@"error" = "INFERENCE_TIMEOUT",
@@ -2734,7 +2788,6 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "model resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
         => modelArtifactsChangingResponse(ctx),
@@ -4927,7 +4980,7 @@ pub const Node = struct {
             &admission_manifest,
             input,
             &media_budget,
-            .{ .io = io, .deadline_ns = deadline_ns },
+            .{ .io = io, .control = .{ .deadline_ns = deadline_ns } },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -5061,7 +5114,7 @@ pub const Node = struct {
             &admission_manifest,
             parts,
             &media_budget,
-            .{ .io = io, .deadline_ns = control.deadline_ns },
+            .{ .io = io, .control = control },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -5201,7 +5254,8 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        const request_io = io_impl.io();
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
         const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
@@ -5222,7 +5276,15 @@ pub const Node = struct {
                 .untrusted => .untrusted,
                 .trusted_internal => .trusted_internal,
             };
-            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes, inline_content_trust);
+            var item = try downloadReadBatchContentWithContext(
+                self,
+                allocator,
+                image_url,
+                batch_byte_cap,
+                batch_bytes,
+                inline_content_trust,
+                .{ .io = request_io, .control = control },
+            );
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
             try decoded_budget.addImage(item.data);
@@ -5306,11 +5368,18 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+        const request_io = io_impl.io();
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "transcribers");
         defer self.allocator.free(model_path);
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        var downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, request.url, &media_budget);
+        var downloaded = try downloadRemoteContentWithBudgetForRequestWithContext(
+            self,
+            allocator,
+            .{ .io = request_io, .control = control },
+            request.url,
+            &media_budget,
+        );
         defer downloaded.deinit(allocator);
         const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
         const resident_bytes = if (std.mem.startsWith(u8, request.url, "data:"))
@@ -5508,6 +5577,7 @@ pub const Node = struct {
             options.prompt,
             options.max_tokens,
             media_admission.byte_cap,
+            .{ .io = io_impl.io(), .control = execution_control orelse .{} },
         );
         defer parsed_inputs.deinit();
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
@@ -6545,13 +6615,16 @@ pub const Node = struct {
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        const download_context = DenseEmbedRequestContext{ .io = ctx.io };
+        const download_context = InferenceDownloadRequestContext{
+            .io = ctx.io,
+            .control = execution_control,
+        };
         var inputs = switch (request.error_policy) {
             .fail_fast => parseDenseEmbedInputsWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
             .per_item => parseDenseEmbedInputsPerItemWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
         } catch |err| {
             if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
-            if (isDenseEmbedRequestAbort(err)) return err;
+            if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedInputParseErrorMessage(err),
@@ -6889,7 +6962,13 @@ pub const Node = struct {
         var image_count: usize = 0;
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.documents) |doc| {
-            const parsed = parseChatMessageContentToTextAndImagesWithBudget(self, ctx.allocator, doc.content, &media_budget) catch |err| switch (err) {
+            const parsed = parseChatMessageContentToTextAndImagesWithBudgetAndContext(
+                self,
+                ctx.allocator,
+                doc.content,
+                &media_budget,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| switch (err) {
                 error.InvalidImageDataUri => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid image data URI" }),
                 error.RemoteContentTooLarge,
                 error.RemoteContentNotAllowed,
@@ -6898,7 +6977,8 @@ pub const Node = struct {
                 error.RemoteContentUnavailable,
                 => return remoteContentErrorResponse(ctx, err),
                 error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "multimodal rerank documents only support text and image content parts" }),
-                error.OutOfMemory, error.Timeout, error.Canceled => return err,
+                error.OutOfMemory => return err,
+                error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
                 else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
             };
             image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
@@ -7222,7 +7302,12 @@ pub const Node = struct {
         var draft_model_path_storage: ?[]const u8 = null;
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
-        var owned_messages = self.parseGenerateMessagesWithBudget(ctx.allocator, body, &media_budget) catch |err| {
+        var owned_messages = self.parseGenerateMessagesWithBudgetAndContext(
+            ctx.allocator,
+            body,
+            &media_budget,
+            .{ .io = ctx.io, .control = execution_control },
+        ) catch |err| {
             if (err == error.InvalidImageUrl) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -8652,6 +8737,26 @@ pub const Node = struct {
         body: api.GenerateRequest,
         media_budget: *RequestMediaBudget,
     ) !OwnedGenerateMessages {
+        return self.parseGenerateMessagesWithBudgetOptionalContext(allocator, body, media_budget, null);
+    }
+
+    fn parseGenerateMessagesWithBudgetAndContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+        request_context: InferenceDownloadRequestContext,
+    ) !OwnedGenerateMessages {
+        return self.parseGenerateMessagesWithBudgetOptionalContext(allocator, body, media_budget, request_context);
+    }
+
+    fn parseGenerateMessagesWithBudgetOptionalContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+        request_context: ?InferenceDownloadRequestContext,
+    ) !OwnedGenerateMessages {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         errdefer {
             for (messages.items) |msg| allocator.free(msg.content);
@@ -8716,7 +8821,10 @@ pub const Node = struct {
                                     } else if (iu == .string) break :blk iu.string;
                                     return error.InvalidImageUrl;
                                 };
-                                const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url_str, media_budget);
+                                const downloaded = if (request_context) |context|
+                                    try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url_str, media_budget)
+                                else
+                                    try downloadRemoteContentWithBudgetForRequest(self, allocator, url_str, media_budget);
                                 defer allocator.free(downloaded.content_type);
                                 var owns_downloaded_data = true;
                                 errdefer if (owns_downloaded_data) allocator.free(downloaded.data);
@@ -9030,6 +9138,12 @@ pub const Node = struct {
     }
 
     fn batchModelLoadError(err: anyerror) api.GenerateBatchError {
+        if (isTransientInferenceCapacityError(err)) return .{
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .retryable = true,
+            .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
+        };
         return switch (err) {
             error.UnknownModelCompatibility => .{
                 .code = "UNKNOWN_MODEL_COMPATIBILITY",
@@ -9045,12 +9159,6 @@ pub const Node = struct {
                 .code = "MODEL_RESOURCE_LIMIT",
                 .message = "model resource plan exceeds the configured inference budget",
                 .retryable = false,
-            },
-            error.ResourceTemporarilyUnavailable => .{
-                .code = "MODEL_RESOURCE_BUSY",
-                .message = "insufficient inference capacity is currently available",
-                .retryable = true,
-                .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
@@ -9274,7 +9382,13 @@ pub const Node = struct {
         var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
         for (body.requests, 0..) |item, idx| {
             if (!pending[idx]) continue;
-            owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
+            owned_messages[idx] = parseGenerateMessagesWithBudgetAndContext(
+                self,
+                ctx.allocator,
+                item.body,
+                &media_budget,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 results[idx].@"error" = generateBatchMessageParseError(err).?;
                 break :blk .{ .allocator = ctx.allocator };
@@ -10097,6 +10211,26 @@ pub const Node = struct {
         content: api.ChatMessageContent,
         media_budget: *RequestMediaBudget,
     ) !ParsedMultimodalRerankDocument {
+        return self.parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(allocator, content, media_budget, null);
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudgetAndContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+        request_context: InferenceDownloadRequestContext,
+    ) !ParsedMultimodalRerankDocument {
+        return self.parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(allocator, content, media_budget, request_context);
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+        request_context: ?InferenceDownloadRequestContext,
+    ) !ParsedMultimodalRerankDocument {
         var text_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer text_buf.deinit(allocator);
         var qwen_content_buf = std.ArrayListUnmanaged(u8).empty;
@@ -10143,7 +10277,10 @@ pub const Node = struct {
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
                             try images.append(allocator, decoded.data);
                         } else {
-                            const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
+                            const downloaded = if (request_context) |context|
+                                try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url, media_budget)
+                            else
+                                try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
                             defer allocator.free(downloaded.content_type);
                             errdefer allocator.free(downloaded.data);
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
@@ -11698,7 +11835,14 @@ pub const Node = struct {
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (body.images, 0..) |img_url, i| {
-            var item = downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
+            var item = downloadReadBatchContentForRequest(
+                self,
+                ctx.allocator,
+                img_url.url,
+                batch_byte_cap,
+                batch_bytes,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| switch (err) {
                 error.ReadBatchTooLarge => return ctx.status(413).json(.{
                     .@"error" = "BATCH_TOO_LARGE",
                     .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
@@ -12222,7 +12366,14 @@ pub const Node = struct {
 
         var batch_bytes: usize = 0;
         for (images, 0..) |img_url, i| {
-            const downloaded = try downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes);
+            const downloaded = try downloadReadBatchContentForRequest(
+                self,
+                ctx.allocator,
+                img_url.url,
+                batch_byte_cap,
+                batch_bytes,
+                .{ .io = ctx.io, .control = httpInferenceExecutionControl(ctx) },
+            );
             defer ctx.allocator.free(downloaded.content_type);
             errdefer ctx.allocator.free(downloaded.data);
 
@@ -13447,6 +13598,7 @@ fn parseDirectExtractionInputs(
     prompt: ?[]const u8,
     max_tokens: ?usize,
     max_media_bytes: usize,
+    request_context: InferenceDownloadRequestContext,
 ) !DirectExtractionInputs {
     var media_budget = RequestMediaBudget.init(max_media_bytes);
     var out = DirectExtractionInputs{
@@ -13457,7 +13609,7 @@ fn parseDirectExtractionInputs(
     errdefer out.deinit();
 
     for (inputs) |input| {
-        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget);
+        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget, request_context);
     }
     if (out.texts.items.len > 0 and out.images.items.len > 0) return error.UnsupportedInput;
     if (out.texts.items.len == 0 and out.images.items.len == 0) return error.UnsupportedInput;
@@ -13470,6 +13622,7 @@ fn appendDirectExtractionContent(
     out: *DirectExtractionInputs,
     content_json: []const u8,
     media_budget: *RequestMediaBudget,
+    request_context: InferenceDownloadRequestContext,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
     defer parsed.deinit();
@@ -13502,13 +13655,13 @@ fn appendDirectExtractionContent(
                     else
                         null;
                     if (url) |value| {
-                        try appendDownloadedExtractionImage(node, allocator, out, value, media_budget);
+                        try appendDownloadedExtractionImage(node, allocator, out, value, media_budget, request_context);
                         saw_media = true;
                     }
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
                     if (part.object.get("url")) |url_value| {
                         if (url_value == .string) {
-                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget);
+                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget, request_context);
                             saw_media = true;
                         }
                     } else if (part.object.get("data")) |data_value| {
@@ -13548,8 +13701,15 @@ fn appendDownloadedExtractionImage(
     out: *DirectExtractionInputs,
     url: []const u8,
     media_budget: *RequestMediaBudget,
+    request_context: InferenceDownloadRequestContext,
 ) !void {
-    const downloaded = try downloadRemoteContentWithBudgetForRequest(node, allocator, url, media_budget);
+    const downloaded = try downloadRemoteContentWithBudgetForRequestWithContext(
+        node,
+        allocator,
+        request_context,
+        url,
+        media_budget,
+    );
     defer allocator.free(downloaded.content_type);
     errdefer allocator.free(downloaded.data);
     if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
@@ -15320,6 +15480,10 @@ test "generate batch capacity errors include actionable retry metadata" {
         busy_load.retry_after_ms.valueOrNull(),
     );
 
+    const saturated_load = Node.batchModelLoadError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_load.code);
+    try std.testing.expect(saturated_load.retryable);
+
     const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_admission.code);
     try std.testing.expectEqual(true, busy_admission.retryable);
@@ -16258,6 +16422,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
         &out,
         "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YWJj\"}}]",
         &media_budget,
+        .{ .io = std.testing.io },
     );
     try std.testing.expectEqual(first_uri.len, media_budget.used_bytes);
     try std.testing.expectError(
@@ -16268,6 +16433,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
             &out,
             "[{\"type\":\"media\",\"data\":\"ZGVm\"}]",
             &media_budget,
+            .{ .io = std.testing.io },
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), out.images.items.len);
@@ -16283,15 +16449,16 @@ test "direct extraction content releases temporary ownership on every allocation
             var out = DirectExtractionInputs{ .allocator = allocator };
             defer out.deinit();
             var budget = RequestMediaBudget.init(32);
-            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget, .{ .io = std.testing.io });
             try appendDirectExtractionContent(
                 target,
                 allocator,
                 &out,
                 "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
                 &budget,
+                .{ .io = std.testing.io },
             );
-            try appendDirectExtractionContent(target, allocator, &out, "42", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "42", &budget, .{ .io = std.testing.io });
             try std.testing.expectEqual(@as(usize, 3), out.texts.items.len);
         }
     };
@@ -16362,6 +16529,21 @@ test "fail-fast embedding capacity response exposes retry contract" {
         @as(i64, transient_capacity_retry_after_ms),
         parsed.value.retry_after_ms,
     );
+}
+
+test "cold model load executor saturation exposes retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.ConcurrencyUnavailable);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(transient_capacity_retry_after_seconds, response.header("Retry-After").?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOURCE_BUSY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
 test "changing model publication returns an explicit retry contract" {
@@ -18743,7 +18925,7 @@ fn parseDenseEmbedInputsWithBudgetAndContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
 }
@@ -18754,7 +18936,7 @@ fn parseDenseEmbedInputsWithBudgetOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18796,7 +18978,7 @@ fn parseDirectDenseEmbedInputsWithContext(
     manifest: *const manifest_mod.ModelManifest,
     parts: []const Node.DirectDenseEmbedPart,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, request_context);
 }
@@ -18807,7 +18989,7 @@ fn parseDirectDenseEmbedInputsOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     parts: []const Node.DirectDenseEmbedPart,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18875,7 +19057,7 @@ fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
 }
@@ -18886,7 +19068,7 @@ fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18922,7 +19104,7 @@ fn appendDenseEmbedImageUrl(
     url: []const u8,
     index: usize,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !void {
     if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
     const downloaded = if (request_context) |context|
@@ -18982,7 +19164,7 @@ fn appendDenseEmbedInput(
     item: std.json.Value,
     index: usize,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !void {
     if (item == .string) {
         if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
@@ -21082,7 +21264,7 @@ const RemoteContentRequestFailure = struct {
 
 fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
     return switch (err) {
-        error.OutOfMemory, error.Timeout, error.Canceled => err,
+        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => err,
         error.StreamTooLong => error.RemoteContentTooLarge,
         error.HostNotAllowed,
         error.PathNotAllowed,
@@ -21108,7 +21290,7 @@ fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
 }
 
 fn isDenseEmbedRequestAbort(err: anyerror) bool {
-    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled;
+    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled;
 }
 
 fn downloadRemoteContentWithBudgetForRequest(
@@ -21123,7 +21305,7 @@ fn downloadRemoteContentWithBudgetForRequest(
 fn downloadRemoteContentWithBudgetForRequestWithContext(
     self: *Node,
     alloc: std.mem.Allocator,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
     url: []const u8,
     budget: *RequestMediaBudget,
 ) !scraping.DownloadedContent {
@@ -21133,7 +21315,7 @@ fn downloadRemoteContentWithBudgetForRequestWithContext(
 fn downloadRemoteContentWithBudgetForRequestOptionalContext(
     self: *Node,
     alloc: std.mem.Allocator,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
     url: []const u8,
     budget: *RequestMediaBudget,
 ) !scraping.DownloadedContent {
@@ -21156,16 +21338,15 @@ fn downloadRemoteContentWithBudgetForRequestOptionalContext(
     else
         remaining_u64;
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
-    const download_context = if (request_context) |context|
-        try denseEmbedDownloadContext(context)
-    else
-        null;
+    if (request_context) |context| try context.control.check();
     if (comptime builtin.is_test) request_work_test_counters.media_fetch_attempts += 1;
-    var downloaded = (if (download_context) |context|
-        scraping.downloadContentAllocWithContext(alloc, context, url, &bounded_security, s3_credentials)
-    else
-        scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials)) catch |err|
-        return normalizeRemoteContentRequestError(err);
+    var downloaded = downloadContentForInferenceRequest(
+        alloc,
+        request_context,
+        url,
+        &bounded_security,
+        s3_credentials,
+    ) catch |err| return normalizeRemoteContentRequestError(err);
     errdefer downloaded.deinit(alloc);
     try budget.add(inline_budget_bytes orelse downloaded.data.len);
     return downloaded;
@@ -21342,6 +21523,8 @@ fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror
 
 fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (err == error.OutOfMemory) return err;
+    if (err == error.Timeout or err == error.Canceled or err == error.Cancelled)
+        return inferenceFailureResponse(ctx, err);
     const failure = remoteContentRequestFailure(err) orelse return err;
     return ctx.status(failure.status).json(.{
         .@"error" = failure.code,
@@ -21379,6 +21562,46 @@ fn downloadReadBatchContent(
     current_bytes: usize,
     inline_content_trust: InlineContentTrust,
 ) !scraping.DownloadedContent {
+    return downloadReadBatchContentOptionalContext(
+        self,
+        alloc,
+        url,
+        max_bytes,
+        current_bytes,
+        inline_content_trust,
+        null,
+    );
+}
+
+fn downloadReadBatchContentWithContext(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+    inline_content_trust: InlineContentTrust,
+    request_context: InferenceDownloadRequestContext,
+) !scraping.DownloadedContent {
+    return downloadReadBatchContentOptionalContext(
+        self,
+        alloc,
+        url,
+        max_bytes,
+        current_bytes,
+        inline_content_trust,
+        request_context,
+    );
+}
+
+fn downloadReadBatchContentOptionalContext(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+    inline_content_trust: InlineContentTrust,
+    request_context: ?InferenceDownloadRequestContext,
+) !scraping.DownloadedContent {
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
     const remaining_u64: u64 = @intCast(remaining);
@@ -21387,7 +21610,7 @@ fn downloadReadBatchContent(
     // absent or empty override into an allow-all policy for this read path.
     var bounded_security = boundedReadContentSecurity(effectiveRequestContentSecurity(self), url, remaining_u64, inline_content_trust);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
-    return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
+    return downloadContentForInferenceRequest(alloc, request_context, url, &bounded_security, s3_credentials);
 }
 
 fn downloadReadBatchContentForRequest(
@@ -21396,8 +21619,9 @@ fn downloadReadBatchContentForRequest(
     url: []const u8,
     max_bytes: usize,
     current_bytes: usize,
+    request_context: InferenceDownloadRequestContext,
 ) !scraping.DownloadedContent {
-    return downloadReadBatchContent(self, alloc, url, max_bytes, current_bytes, .untrusted) catch |err| {
+    return downloadReadBatchContentWithContext(self, alloc, url, max_bytes, current_bytes, .untrusted, request_context) catch |err| {
         if (err == error.ReadBatchTooLarge) return err;
         return normalizeRemoteContentRequestError(err);
     };

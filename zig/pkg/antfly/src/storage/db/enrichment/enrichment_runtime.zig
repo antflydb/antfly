@@ -1573,7 +1573,12 @@ const InferenceControlFailurePolicy = struct {
 const InferenceRecoveryState = struct {
     adaptive_batch_max: usize = std.math.maxInt(usize),
     circuit_open_until_ns: u64 = 0,
+    successful_batches_at_cap: u16 = 0,
+    smallest_failed_batch: usize = std.math.maxInt(usize),
 };
+
+const adaptive_growth_successes: u16 = 8;
+const adaptive_probe_successes: u16 = 64;
 
 fn lockInferenceRecovery(runtime: *EnrichmentRuntime) void {
     while (!runtime.inference_recovery_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1635,6 +1640,8 @@ fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: Infere
         defer runtime.inference_recovery_mutex.unlock();
         const entry = runtime.inference_recovery.getOrPut(runtime.alloc, recovery_key) catch return;
         if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.successful_batches_at_cap = 0;
+        entry.value_ptr.smallest_failed_batch = @min(entry.value_ptr.smallest_failed_batch, batch_items);
         if (policy.next_batch_cap) |reduced| {
             entry.value_ptr.adaptive_batch_max = @min(entry.value_ptr.adaptive_batch_max, reduced);
         } else if (policy.open_circuit) {
@@ -1670,15 +1677,33 @@ fn recoveryBatchCap(runtime: *EnrichmentRuntime, recovery_key: InferenceRecovery
         std.math.maxInt(usize);
 }
 
-fn noteInferenceControlSuccess(runtime: *EnrichmentRuntime, recovery_key: InferenceRecoveryKey) void {
+fn noteInferenceControlSuccess(runtime: *EnrichmentRuntime, recovery_key: InferenceRecoveryKey, batch_items: usize) void {
     lockInferenceRecovery(runtime);
     defer runtime.inference_recovery_mutex.unlock();
     const state = runtime.inference_recovery.getPtr(recovery_key) orelse return;
     state.circuit_open_until_ns = 0;
-    if (state.adaptive_batch_max != std.math.maxInt(usize)) {
-        state.adaptive_batch_max = std.math.mul(usize, state.adaptive_batch_max, 2) catch
-            std.math.maxInt(usize);
+    if (state.adaptive_batch_max == std.math.maxInt(usize) or batch_items < state.adaptive_batch_max) return;
+
+    // Only a successful batch at the active cap is evidence that the cap can
+    // grow. Grow gradually after sustained success, and probe a previously
+    // failing boundary much less often to avoid timeout/success oscillation.
+    if (state.smallest_failed_batch != std.math.maxInt(usize) and
+        batch_items >= state.smallest_failed_batch)
+    {
+        state.smallest_failed_batch = std.math.maxInt(usize);
     }
+    state.successful_batches_at_cap +|= 1;
+    const next = std.math.add(
+        usize,
+        state.adaptive_batch_max,
+        @max(@as(usize, 1), state.adaptive_batch_max / 4),
+    ) catch std.math.maxInt(usize);
+    const probing_failed_boundary = state.smallest_failed_batch != std.math.maxInt(usize) and
+        next >= state.smallest_failed_batch;
+    const required = if (probing_failed_boundary) adaptive_probe_successes else adaptive_growth_successes;
+    if (state.successful_batches_at_cap < required) return;
+    state.adaptive_batch_max = next;
+    state.successful_batches_at_cap = 0;
 }
 
 fn effectiveRequestEmbedBatchItems(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) usize {
@@ -2609,7 +2634,7 @@ fn assetProducerProduceGuarded(
         alloc.free(produced);
         return err;
     };
-    noteInferenceControlSuccess(runtime, recovery_key);
+    noteInferenceControlSuccess(runtime, recovery_key, 1);
     return produced;
 }
 
@@ -2635,7 +2660,7 @@ fn assetProducerProduceBatchGuarded(
         alloc.free(produced);
         return err;
     };
-    noteInferenceControlSuccess(runtime, recovery_key);
+    noteInferenceControlSuccess(runtime, recovery_key, requests.len);
     return produced;
 }
 
@@ -2673,7 +2698,7 @@ fn embedDenseWithRetry(
             runtime.alloc.free(vector);
             return err;
         };
-        noteInferenceControlSuccess(runtime, recovery_key);
+        noteInferenceControlSuccess(runtime, recovery_key, 1);
         return vector;
     }
 }
@@ -2712,7 +2737,7 @@ fn embedDenseBatchWithRetry(
             embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
             return err;
         };
-        noteInferenceControlSuccess(runtime, recovery_key);
+        noteInferenceControlSuccess(runtime, recovery_key, texts.len);
         return vectors;
     }
 }
@@ -2751,7 +2776,7 @@ fn embedDensePartsWithRetry(
             runtime.alloc.free(vector);
             return err;
         };
-        noteInferenceControlSuccess(runtime, recovery_key);
+        noteInferenceControlSuccess(runtime, recovery_key, 1);
         return vector;
     }
 }
@@ -2790,7 +2815,7 @@ fn embedSparseWithRetry(
             owned_sparse.deinit(runtime.alloc);
             return err;
         };
-        noteInferenceControlSuccess(runtime, recovery_key);
+        noteInferenceControlSuccess(runtime, recovery_key, 1);
         return sparse;
     }
 }
@@ -2828,7 +2853,7 @@ fn embedSparseBatchWithRetry(
             embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
             return err;
         };
-        noteInferenceControlSuccess(runtime, recovery_key);
+        noteInferenceControlSuccess(runtime, recovery_key, texts.len);
         return sparse_batch;
     }
 }
@@ -4755,12 +4780,17 @@ test "inference recovery is scoped by model and backend" {
     try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, metal_key));
     try std.testing.expectEqual(std.math.maxInt(usize), recoveryBatchCap(&runtime, cpu_key));
 
+    noteInferenceControlSuccess(&runtime, metal_key, 4);
+    try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, metal_key));
+    for (1..adaptive_growth_successes) |_| noteInferenceControlSuccess(&runtime, metal_key, 4);
+    try std.testing.expectEqual(@as(usize, 5), recoveryBatchCap(&runtime, metal_key));
+
     noteInferenceControlFailure(&runtime, metal_key, error.Timeout, 1);
     try std.testing.expectError(error.InferenceCircuitOpen, checkProviderInvocation(&runtime, metal_key, true));
     try checkProviderInvocation(&runtime, cpu_key, true);
-    noteInferenceControlSuccess(&runtime, metal_key);
+    noteInferenceControlSuccess(&runtime, metal_key, 1);
     try checkProviderInvocation(&runtime, metal_key, true);
-    try std.testing.expectEqual(@as(usize, 8), recoveryBatchCap(&runtime, metal_key));
+    try std.testing.expectEqual(@as(usize, 5), recoveryBatchCap(&runtime, metal_key));
 }
 
 test "asset inference recovery uses one identity from plan through provider call" {
