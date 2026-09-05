@@ -8296,6 +8296,7 @@ pub fn build(b: *std.Build) void {
         "query merge validates included graph search metric status list",
         "query merge rejects malformed graph search metric payloads",
         "query merge rejects malformed graph search traversal payloads",
+        "query merge rejects unqualified graph search identity collisions without collapsing qualified identities",
         "query merge rejects malformed graph search hit payloads",
         "query merge preserves failed graph metric status across shard fan-in",
         "query merge requires comparable graph search metric generations across shards",

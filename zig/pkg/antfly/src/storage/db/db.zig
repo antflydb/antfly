@@ -231,6 +231,7 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const graph_mod = @import("../../graph/graph.zig");
+const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -29340,65 +29341,54 @@ pub const DB = struct {
 
         var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, score_snapshot.status);
         errdefer result_status.deinit(result.alloc);
-        for (result.hits, score_snapshot.scores) |*hit, metric_score_optional| {
-            const metric_score = metric_score_optional orelse rerank.missing_score;
-            const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0.0;
-            const final_score = clampF64ToF32(rerank.base_weight * base_score + rerank.weight * metric_score);
+        const selected = try graph_metric_rerank.selectPageAlloc(
+            result.alloc,
+            result.hits,
+            score_snapshot.scores,
+            .{
+                .base_weight = rerank.base_weight,
+                .metric_weight = rerank.weight,
+                .missing_score = rerank.missing_score,
+            },
+            req.offset,
+            req.limit,
+        );
+        defer result.alloc.free(selected);
+        for (selected) |selection| {
+            const hit = &result.hits[selection.original_index];
             var details = types.GraphMetricRerankScoreDetails{
                 .index_name = try result.alloc.dupe(u8, rerank.index_name),
                 .metric_name = undefined,
-                .base_score = base_score,
+                .base_score = selection.base_score,
                 .base_weight = rerank.base_weight,
-                .metric_score = metric_score_optional,
-                .metric_score_used = metric_score,
+                .metric_score = selection.metric_score,
+                .metric_score_used = selection.metric_score_used,
                 .metric_weight = rerank.weight,
-                .missing_score_used = metric_score_optional == null,
-                .final_score = final_score,
+                .missing_score_used = selection.metric_score == null,
+                .final_score = selection.final_score,
                 .published_generation = score_snapshot.status.published_generation,
             };
             errdefer result.alloc.free(details.index_name);
             details.metric_name = try result.alloc.dupe(u8, rerank.metric_name);
             if (hit.score_details) |*old| old.deinit(result.alloc);
             hit.score_details = details;
-            hit.score = final_score;
+            hit.score = selection.final_score;
         }
-        std.mem.sort(types.SearchHit, result.hits, {}, struct {
-            fn lessThan(_: void, a: types.SearchHit, b: types.SearchHit) bool {
-                const a_score = a.score orelse 0.0;
-                const b_score = b.score orelse 0.0;
-                if (a_score == b_score) return std.mem.lessThan(u8, a.id, b.id);
-                return a_score > b_score;
-            }
-        }.lessThan);
-        try pageGraphMetricRerankedHits(result, req.offset, req.limit);
-        if (result.graph_metric_rerank_status) |*old| old.deinit(result.alloc);
-        result.graph_metric_rerank_status = result_status;
-    }
-
-    fn pageGraphMetricRerankedHits(result: *types.SearchResult, offset: u32, limit: u32) !void {
         const old_hits = result.hits;
-        const start = @min(@as(usize, offset), old_hits.len);
-        const keep_len = @min(@as(usize, limit), old_hits.len - start);
-        if (start == 0 and keep_len == old_hits.len) return;
-
-        const kept = try result.alloc.alloc(types.SearchHit, keep_len);
-        for (old_hits, 0..) |*hit, i| {
-            if (i >= start and i < start + keep_len) {
-                kept[i - start] = hit.*;
-                hit.* = undefined;
-            } else {
-                hit.deinit(result.alloc);
-            }
+        const retained = try result.alloc.alloc(bool, old_hits.len);
+        defer result.alloc.free(retained);
+        const kept = try result.alloc.alloc(types.SearchHit, selected.len);
+        @memset(retained, false);
+        for (selected, 0..) |selection, i| {
+            retained[selection.original_index] = true;
+            kept[i] = old_hits[selection.original_index];
+            old_hits[selection.original_index] = undefined;
         }
+        for (old_hits, retained) |*hit, keep| if (!keep) hit.deinit(result.alloc);
         if (old_hits.len > 0) result.alloc.free(old_hits);
         result.hits = kept;
-    }
-
-    fn clampF64ToF32(value: f64) f32 {
-        const max = std.math.floatMax(f32);
-        if (value > max) return max;
-        if (value < -max) return -max;
-        return @floatCast(value);
+        if (result.graph_metric_rerank_status) |*old| old.deinit(result.alloc);
+        result.graph_metric_rerank_status = result_status;
     }
 
     fn executeGraphMetricQuery(
@@ -29407,16 +29397,14 @@ pub const DB = struct {
         named: types.NamedGraphMetricQuery,
     ) !types.GraphMetricResult {
         const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
-        var status = try entry.index.graphMetricStatus(named.query.metric_name);
-        defer status.deinit(entry.index.alloc);
-        if (status.published_generation == 0) return error.MetricNotReady;
-        if (named.query.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+        var metric_snapshot = try entry.index.graphMetricTopKSnapshotAlloc(
+            named.query.metric_name,
+            named.query.top_k,
+        );
+        defer metric_snapshot.deinit(entry.index.alloc);
+        if (named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
 
-        const raw_scores = try entry.index.graphMetricTopK(named.query.metric_name, named.query.top_k);
-        defer {
-            for (raw_scores) |*score| score.deinit(entry.index.alloc);
-            if (raw_scores.len > 0) entry.index.alloc.free(raw_scores);
-        }
+        const raw_scores = metric_snapshot.scores;
         const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
         var initialized_scores: usize = 0;
         errdefer {
@@ -29433,7 +29421,7 @@ pub const DB = struct {
         errdefer alloc.free(index_name);
         const metric_name = try alloc.dupe(u8, named.query.metric_name);
         errdefer alloc.free(metric_name);
-        var owned_status = try cloneGraphMetricStatusFromGraph(alloc, status);
+        var owned_status = try cloneGraphMetricStatusFromGraph(alloc, metric_snapshot.status);
         errdefer owned_status.deinit(alloc);
         return .{
             .name = name,

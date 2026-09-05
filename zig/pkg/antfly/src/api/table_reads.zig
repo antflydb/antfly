@@ -31642,7 +31642,7 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
     };
 
     const ExecutorState = struct {
-        query_calls: usize = 0,
+        query_calls: std.atomic.Value(usize) = .init(0),
 
         fn iface(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -31651,7 +31651,7 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
         fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            self.query_calls += 1;
+            _ = self.query_calls.fetchAdd(1, .monotonic);
             if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7331/tables/docs/query")) {
                 return .{
                     .status = 200,
@@ -31728,7 +31728,7 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
         },
         .limit = 0,
     }, .read_index));
-    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls.load(.monotonic));
 }
 
 test "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations" {

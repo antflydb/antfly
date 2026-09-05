@@ -1052,16 +1052,19 @@ const GraphAggregateResultBuilder = struct {
 const GraphSearchResultBuilder = struct {
     name: []u8,
     nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
+    node_identities: graph_node_identity.BorrowedMap(void) = .{},
     paths: std.ArrayListUnmanaged(db_mod.types.GraphPath) = .empty,
     matches: std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch) = .empty,
     aggregates: std.ArrayListUnmanaged(GraphAggregateResultBuilder) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
+    hit_identities: graph_node_identity.BorrowedMap(void) = .{},
     metric_status: std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus) = .empty,
     total_hits: u32 = 0,
     truncated: bool = false,
 
     fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
+        self.node_identities.deinit(alloc);
         for (self.nodes.items) |*node| node.deinit(alloc);
         self.nodes.deinit(alloc);
         for (self.paths.items) |path| graph_paths.freePath(alloc, path);
@@ -1072,6 +1075,7 @@ const GraphSearchResultBuilder = struct {
         self.aggregates.deinit(alloc);
         for (self.hits.items) |*hit| hit.deinit(alloc);
         self.hits.deinit(alloc);
+        self.hit_identities.deinit(alloc);
         for (self.metric_status.items) |*status| status.deinit(alloc);
         self.metric_status.deinit(alloc);
         self.* = undefined;
@@ -1176,6 +1180,33 @@ const GraphSearchResultBuilder = struct {
         };
     }
 };
+
+fn ensureGraphIdentityIndexCapacity(
+    alloc: std.mem.Allocator,
+    budget: *graph_work_budget.WorkBudget,
+    operation: []const u8,
+    query: graph_query_mod.GraphQuery,
+    index: *graph_node_identity.BorrowedMap(void),
+    next_count: usize,
+) !void {
+    const target_capacity = try graph_work_budget.hashMapCapacityForCount(
+        next_count,
+        std.hash_map.default_max_load_percentage,
+    );
+    if (target_capacity <= index.capacity()) return;
+    const old_bytes = try graph_work_budget.hashMapRetainedBytes(
+        graph_node_identity.Ref,
+        void,
+        index.capacity(),
+    );
+    const new_bytes = try graph_work_budget.hashMapRetainedBytes(
+        graph_node_identity.Ref,
+        void,
+        target_capacity,
+    );
+    try retainGraphMergeBytes(budget, operation, query, new_bytes - old_bytes);
+    try index.ensureTotalCapacity(alloc, next_count);
+}
 
 fn graphQueryByName(
     queries: []const db_mod.types.NamedGraphQuery,
@@ -1650,11 +1681,37 @@ test "distributed graph result accounting includes shared metric storage and sta
     try std.testing.expectEqual(baseline + expected_extra, usage);
 }
 
+fn graphMetricScoreComesBefore(
+    left: db_mod.types.GraphMetricScore,
+    right: db_mod.types.GraphMetricScore,
+) bool {
+    if (left.score != right.score) return left.score > right.score;
+    return std.mem.lessThan(u8, left.node, right.node);
+}
+
+fn graphMetricScoreWorstFirst(
+    _: void,
+    left: db_mod.types.GraphMetricScore,
+    right: db_mod.types.GraphMetricScore,
+) std.math.Order {
+    if (graphMetricScoreComesBefore(left, right)) return .gt;
+    if (graphMetricScoreComesBefore(right, left)) return .lt;
+    return .eq;
+}
+
+const GraphMetricScoreQueue = std.PriorityQueue(
+    db_mod.types.GraphMetricScore,
+    void,
+    graphMetricScoreWorstFirst,
+);
+
 const GraphMetricResultBuilder = struct {
     name: []u8,
     index_name: []u8,
     metric_name: []u8,
-    scores: std.ArrayListUnmanaged(db_mod.types.GraphMetricScore) = .empty,
+    scores: GraphMetricScoreQueue = .empty,
+    score_nodes: std.StringHashMapUnmanaged(void) = .empty,
+    score_limit: usize,
     status: ?db_mod.types.GraphMetricStatus = null,
 
     fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
@@ -1663,15 +1720,16 @@ const GraphMetricResultBuilder = struct {
         if (self.metric_name.len > 0) alloc.free(self.metric_name);
         for (self.scores.items) |*score| score.deinit(alloc);
         self.scores.deinit(alloc);
+        self.score_nodes.deinit(alloc);
         if (self.status) |*status| status.deinit(alloc);
         self.* = undefined;
     }
 
     fn toOwned(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator, top_k: u32) !db_mod.types.GraphMetricResult {
+        const status = self.status orelse return error.InvalidQueryResponse;
         std.sort.pdq(db_mod.types.GraphMetricScore, self.scores.items, {}, struct {
             fn lessThan(_: void, a: db_mod.types.GraphMetricScore, b: db_mod.types.GraphMetricScore) bool {
-                if (a.score != b.score) return a.score > b.score;
-                return std.mem.order(u8, a.node, b.node) == .lt;
+                return graphMetricScoreComesBefore(a, b);
             }
         }.lessThan);
 
@@ -1680,25 +1738,16 @@ const GraphMetricResultBuilder = struct {
         else
             @min(self.scores.items.len, @as(usize, @intCast(top_k)));
         const scores = try alloc.alloc(db_mod.types.GraphMetricScore, count);
-        var initialized: usize = 0;
-        errdefer {
-            for (scores[0..initialized]) |*score| score.deinit(alloc);
-            alloc.free(scores);
-        }
-        for (self.scores.items[0..count], 0..) |score, i| {
-            scores[i] = .{
-                .node = try alloc.dupe(u8, score.node),
-                .score = score.score,
-            };
-            initialized += 1;
-        }
+        for (self.scores.items[0..count], 0..) |score, i| scores[i] = score;
+        for (self.scores.items[count..]) |*score| score.deinit(alloc);
+        self.scores.items.len = 0;
 
         return .{
             .name = self.name,
             .index_name = self.index_name,
             .metric_name = self.metric_name,
             .scores = scores,
-            .status = self.status orelse return error.InvalidQueryResponse,
+            .status = status,
         };
     }
 };
@@ -1722,21 +1771,41 @@ fn mergeGraphMetricResults(
                 for (builders.items, 0..) |builder, i| {
                     if (std.mem.eql(u8, builder.name, metric_result.name)) break :blk i;
                 }
+                const name = try alloc.dupe(u8, metric_result.name);
+                errdefer alloc.free(name);
+                const index_name = try alloc.dupe(u8, metric_result.index_name);
+                errdefer alloc.free(index_name);
+                const metric_name = try alloc.dupe(u8, metric_result.metric_name);
+                errdefer alloc.free(metric_name);
                 try builders.append(alloc, .{
-                    .name = try alloc.dupe(u8, metric_result.name),
-                    .index_name = try alloc.dupe(u8, metric_result.index_name),
-                    .metric_name = try alloc.dupe(u8, metric_result.metric_name),
+                    .name = name,
+                    .index_name = index_name,
+                    .metric_name = metric_name,
+                    .score_limit = graphMetricQueryTopK(req, metric_result.name),
                 });
                 break :blk builders.items.len - 1;
             };
             var builder = &builders.items[idx];
             try ensureGraphMetricResultComparable(builder, metric_result);
-            try validateGraphMetricScoreNodesUnique(builder.scores.items, metric_result.scores);
             for (metric_result.scores) |score| {
-                try builder.scores.append(alloc, .{
+                if (!std.math.isFinite(score.score)) return error.UnsupportedQueryRequest;
+                if (builder.score_nodes.contains(score.node)) return error.UnsupportedQueryRequest;
+                try builder.score_nodes.ensureUnusedCapacity(alloc, 1);
+                builder.score_nodes.putAssumeCapacityNoClobber(score.node, {});
+                const should_retain = builder.score_limit == 0 or
+                    builder.scores.count() < builder.score_limit or
+                    graphMetricScoreComesBefore(score, builder.scores.peek().?);
+                if (!should_retain) continue;
+                const owned = db_mod.types.GraphMetricScore{
                     .node = try alloc.dupe(u8, score.node),
                     .score = score.score,
-                });
+                };
+                errdefer alloc.free(owned.node);
+                if (builder.score_limit != 0 and builder.scores.count() == builder.score_limit) {
+                    var removed = builder.scores.pop().?;
+                    removed.deinit(alloc);
+                }
+                try builder.scores.push(alloc, owned);
             }
             if (builder.status) |*status| {
                 try mergeGraphMetricStatusInto(alloc, status, metric_result.status);
@@ -1938,21 +2007,6 @@ fn validateGraphMetricStatusSchemaAndFilterCompatible(
         return error.UnsupportedQueryRequest;
     }
     if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
-}
-
-fn validateGraphMetricScoreNodesUnique(
-    existing_scores: []const db_mod.types.GraphMetricScore,
-    incoming_scores: []const db_mod.types.GraphMetricScore,
-) !void {
-    for (incoming_scores, 0..) |incoming, i| {
-        if (!std.math.isFinite(incoming.score)) return error.UnsupportedQueryRequest;
-        for (incoming_scores[0..i]) |previous| {
-            if (std.mem.eql(u8, previous.node, incoming.node)) return error.UnsupportedQueryRequest;
-        }
-        for (existing_scores) |existing| {
-            if (std.mem.eql(u8, existing.node, incoming.node)) return error.UnsupportedQueryRequest;
-        }
-    }
 }
 
 fn graphMetricQueryTopK(req: db_mod.types.SearchRequest, query_name: []const u8) u32 {
@@ -2224,23 +2278,6 @@ fn validateGraphResultNodePayload(node: graph_query_mod.GraphResultNode) !void {
     }
 }
 
-fn validateGraphResultNodeKeyUnique(
-    existing: []const graph_query_mod.GraphResultNode,
-    incoming: []const graph_query_mod.GraphResultNode,
-    key: []const u8,
-) !void {
-    for (existing) |node| {
-        if (std.mem.eql(u8, node.key, key)) return error.UnsupportedQueryRequest;
-    }
-    var seen: usize = 0;
-    for (incoming) |node| {
-        if (std.mem.eql(u8, node.key, key)) {
-            seen += 1;
-            if (seen > 1) return error.UnsupportedQueryRequest;
-        }
-    }
-}
-
 fn validateGraphPathPayload(path: db_mod.types.GraphPath) !void {
     if (path.nodes.len != path.edges.len + 1) return error.UnsupportedQueryRequest;
     if (path.length != path.edges.len) return error.UnsupportedQueryRequest;
@@ -2261,23 +2298,6 @@ fn validateGraphSearchHitPayload(hit: db_mod.types.SearchHit) !void {
     if (hit.score_details != null) return error.UnsupportedQueryRequest;
     if (hit.score) |score| {
         if (!std.math.isFinite(score)) return error.UnsupportedQueryRequest;
-    }
-}
-
-fn validateGraphSearchHitIdUnique(
-    existing: []const db_mod.types.SearchHit,
-    incoming: []const db_mod.types.SearchHit,
-    id: []const u8,
-) !void {
-    for (existing) |hit| {
-        if (std.mem.eql(u8, hit.id, id)) return error.UnsupportedQueryRequest;
-    }
-    var seen: usize = 0;
-    for (incoming) |hit| {
-        if (std.mem.eql(u8, hit.id, id)) {
-            seen += 1;
-            if (seen > 1) return error.UnsupportedQueryRequest;
-        }
     }
 }
 
@@ -2657,9 +2677,18 @@ pub const GraphSearchResultsAccumulator = struct {
             }
             for (graph_result.nodes) |node| {
                 try validateGraphResultNodePayload(node);
-                try validateGraphResultNodeKeyUnique(builder.nodes.items, graph_result.nodes, node.key);
+                const identity = graph_node_identity.Ref{ .table = node.table, .key = node.key };
+                if (builder.node_identities.contains(identity)) return error.UnsupportedQueryRequest;
                 if (builder.nodes.items.len >= public_limits.max_graph_result_items)
                     return error.QueryCandidateBudgetExceeded;
+                try ensureGraphIdentityIndexCapacity(
+                    self.alloc,
+                    merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.node_identities,
+                    builder.nodes.items.len + 1,
+                );
                 try ensureGraphMergeListCapacity(
                     graph_query_mod.GraphResultNode,
                     self.alloc,
@@ -2677,6 +2706,11 @@ pub const GraphSearchResultsAccumulator = struct {
                 );
                 const owned = try cloneGraphResultNode(self.alloc, node);
                 builder.nodes.appendAssumeCapacity(owned);
+                const stored = &builder.nodes.items[builder.nodes.items.len - 1];
+                builder.node_identities.putAssumeCapacityNoClobber(.{
+                    .table = stored.table,
+                    .key = stored.key,
+                }, {});
             }
             for (graph_result.paths) |path| {
                 try validateGraphPathPayload(path);
@@ -2787,9 +2821,18 @@ pub const GraphSearchResultsAccumulator = struct {
             }
             for (graph_result.hits) |hit| {
                 try validateGraphSearchHitPayload(hit);
-                try validateGraphSearchHitIdUnique(builder.hits.items, graph_result.hits, hit.id);
+                const identity = graph_node_identity.Ref{ .table = hit.source_table, .key = hit.id };
+                if (builder.hit_identities.contains(identity)) return error.UnsupportedQueryRequest;
                 if (builder.hits.items.len >= public_limits.max_graph_hydrated_bindings)
                     return error.QueryCandidateBudgetExceeded;
+                try ensureGraphIdentityIndexCapacity(
+                    self.alloc,
+                    merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.hit_identities,
+                    builder.hits.items.len + 1,
+                );
                 try ensureGraphMergeListCapacity(
                     db_mod.types.SearchHit,
                     self.alloc,
@@ -2807,6 +2850,11 @@ pub const GraphSearchResultsAccumulator = struct {
                 );
                 const owned = try hit.clone(self.alloc);
                 builder.hits.appendAssumeCapacity(owned);
+                const stored = &builder.hits.items[builder.hits.items.len - 1];
+                builder.hit_identities.putAssumeCapacityNoClobber(.{
+                    .table = stored.source_table,
+                    .key = stored.id,
+                }, {});
             }
             for (graph_result.metric_status) |status| {
                 try mergeGraphSearchMetricStatus(self.alloc, &builder.metric_status, status);
@@ -6840,6 +6888,58 @@ test "query merge rejects malformed graph search traversal payloads" {
     };
     defer bad_length.deinit();
     try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{bad_length}, 0, 10));
+}
+
+test "query merge rejects unqualified graph search identity collisions without collapsing qualified identities" {
+    const alloc = std.testing.allocator;
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"root"} },
+        },
+    }};
+    var left_nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "shared",
+        .table = "people",
+        .depth = 1,
+        .distance = 1,
+    }};
+    var right_nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "shared",
+        .table = "companies",
+        .depth = 1,
+        .distance = 1,
+    }};
+    var left_hits = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("shared"),
+        .source_table = @constCast("people"),
+    }};
+    var right_hits = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("shared"),
+        .source_table = @constCast("companies"),
+    }};
+    var left_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("neighbors"),
+        .nodes = &left_nodes,
+        .hits = &left_hits,
+        .total_hits = 1,
+    }};
+    var right_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("neighbors"),
+        .nodes = &right_nodes,
+        .hits = &right_hits,
+        .total_hits = 1,
+    }};
+    const shards = [_]db_mod.types.SearchResult{
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &left_graph },
+        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &right_graph },
+    };
+    var merged = try mergeSearchResults(alloc, .{ .graph_queries = &queries }, &shards, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].hits.len);
 }
 
 test "query merge rejects malformed graph search hit payloads" {

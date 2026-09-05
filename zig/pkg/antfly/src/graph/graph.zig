@@ -5749,6 +5749,22 @@ pub const GraphIndex = struct {
         }
     };
 
+    /// Owned top-K view pinned to the same reverse-store snapshot as its
+    /// publication status. Public query code must use this instead of issuing
+    /// independent status and rank reads: publication may advance and retire
+    /// an old generation between two transactions.
+    pub const GraphMetricTopKSnapshot = struct {
+        status: GraphMetricStatus,
+        scores: []GraphMetricScore,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            self.status.deinit(alloc);
+            for (self.scores) |*score| score.deinit(alloc);
+            if (self.scores.len > 0) alloc.free(self.scores);
+            self.* = undefined;
+        }
+    };
+
     /// Multiple published metric columns pinned to one reverse-store snapshot.
     /// This is the query boundary used by metric filtering and ordering so a
     /// concurrent publication can never mix generations across dependencies.
@@ -13006,6 +13022,35 @@ pub const GraphIndex = struct {
         const generation = try self.metricPublishedGeneration(&txn, metric_name);
         if (generation == 0) return error.MetricNotReady;
 
+        return self.graphMetricTopKInTxnAlloc(&txn, metric_name, generation, limit);
+    }
+
+    pub fn graphMetricTopKSnapshotAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        limit: usize,
+    ) !GraphMetricTopKSnapshot {
+        if (limit > graph_metric_rank_entry_limit) return error.InvalidGraphMetricTopK;
+        _ = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var status = try self.graphMetricStatusInTxn(metric_name, &txn);
+        errdefer status.deinit(self.alloc);
+        if (status.published_generation == 0) return error.MetricNotReady;
+        const scores = if (limit == 0)
+            try self.alloc.alloc(GraphMetricScore, 0)
+        else
+            try self.graphMetricTopKInTxnAlloc(&txn, metric_name, status.published_generation, limit);
+        return .{ .status = status, .scores = scores };
+    }
+
+    fn graphMetricTopKInTxnAlloc(
+        self: *GraphIndex,
+        txn: anytype,
+        metric_name: []const u8,
+        generation: u64,
+        limit: usize,
+    ) ![]GraphMetricScore {
         // Current materializations maintain a score-ordered secondary keyspace,
         // so ordinary top-K reads touch only K entries. Keep the node-keyed scan
         // below as an upgrade fallback for materializations written by older
@@ -13165,19 +13210,45 @@ pub const GraphIndex = struct {
         errdefer self.alloc.free(scores);
         @memset(scores, null);
         if (generation == 0 or nodes.len == 0) return scores;
+        const PendingScoreLoad = struct {
+            original_index: usize,
+            key: []u8,
+
+            fn lessThan(_: void, left: @This(), right: @This()) bool {
+                return std.mem.order(u8, left.key, right.key) == .lt;
+            }
+        };
+
         var generation_buf: [20]u8 = undefined;
         const generation_text = try std.fmt.bufPrint(&generation_buf, "{d}", .{generation});
-        var score_key = std.ArrayListUnmanaged(u8).empty;
-        defer score_key.deinit(self.alloc);
+        const pending = try self.alloc.alloc(PendingScoreLoad, nodes.len);
+        var initialized: usize = 0;
+        defer {
+            for (pending[0..initialized]) |item| self.alloc.free(item.key);
+            self.alloc.free(pending);
+        }
         for (nodes, 0..) |node, i| {
+            var score_key = std.ArrayListUnmanaged(u8).empty;
+            errdefer score_key.deinit(self.alloc);
             try self.writeGraphMetricKey(&score_key, &.{ metric_name, "score", generation_text, node });
-            const raw = txn.get(score_key.items) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
+            pending[i] = .{ .original_index = i, .key = try score_key.toOwnedSlice(self.alloc) };
+            initialized += 1;
+        }
+        std.mem.sort(PendingScoreLoad, pending, {}, PendingScoreLoad.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, pending.len);
+        defer self.alloc.free(read_keys);
+        const read_values = try self.alloc.alloc(?[]const u8, pending.len);
+        defer self.alloc.free(read_values);
+        @memset(read_values, null);
+        for (pending, 0..) |item, i| read_keys[i] = item.key;
+        try txn.getManySorted(read_keys, read_values);
+
+        for (pending, read_values) |item, maybe_raw| {
+            const raw = maybe_raw orelse continue;
             const score = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
             if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
-            scores[i] = score;
+            scores[item.original_index] = score;
         }
         return scores;
     }

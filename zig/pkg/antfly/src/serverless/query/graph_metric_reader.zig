@@ -135,8 +135,23 @@ const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: 
 const max_score_range_requests: usize = 32;
 const max_top_score_range_requests: usize = 64;
 const max_parallel_score_range_requests: usize = 8;
+/// Bound aggregate live payload memory as well as request count. Coalescing
+/// deliberately makes ranges variable-sized, so a count-only fanout can turn
+/// eight harmless-looking reads into a large transient allocation spike.
+const max_parallel_score_range_bytes: usize = 32 * 1024 * 1024;
 const coalesced_score_window_bytes: u64 = 8 * 1024 * 1024;
 const ranked_fetch_window_bytes: usize = 8 * 1024 * 1024;
+
+fn scoreRangeBatchEnd(ranges: []const ScoreFetchRange, start: usize) usize {
+    var end = start;
+    var bytes: usize = 0;
+    while (end < ranges.len and end - start < max_parallel_score_range_requests) : (end += 1) {
+        const next_bytes = std.math.add(usize, bytes, ranges[end].len) catch break;
+        if (end > start and next_bytes > max_parallel_score_range_bytes) break;
+        bytes = next_bytes;
+    }
+    return end;
+}
 
 pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_id: []const u8) !?Score {
     const node_ids = [_][]const u8{node_id};
@@ -268,7 +283,7 @@ pub fn scoresAlloc(
     defer alloc.free(fetch_ranges);
     var fetch_start: usize = 0;
     while (fetch_start < fetch_ranges.len) {
-        const fetch_end = @min(fetch_start + max_parallel_score_range_requests, fetch_ranges.len);
+        const fetch_end = scoreRangeBatchEnd(fetch_ranges, fetch_start);
         const range_batch = fetch_ranges[fetch_start..fetch_end];
         var fetched_ranges = try fetchScoreRangeBatchAlloc(
             alloc,
@@ -513,6 +528,13 @@ fn fetchScoreRangeBatchAlloc(
     ranges: []const ScoreFetchRange,
 ) !FetchedScoreRanges {
     if (ranges.len > max_parallel_score_range_requests)
+        return error.GraphMetricQueryBudgetExceeded;
+    var requested_bytes: usize = 0;
+    for (ranges) |range| {
+        requested_bytes = std.math.add(usize, requested_bytes, range.len) catch
+            return error.GraphMetricQueryBudgetExceeded;
+    }
+    if (requested_bytes > max_parallel_score_range_bytes)
         return error.GraphMetricQueryBudgetExceeded;
     const payloads = try alloc.alloc([]u8, ranges.len);
     @memset(payloads, @constCast((&[_]u8{})[0..]));
@@ -763,7 +785,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     defer alloc.free(fetch_ranges);
     var fetch_start: usize = 0;
     while (fetch_start < fetch_ranges.len) {
-        const fetch_end = @min(fetch_start + max_parallel_score_range_requests, fetch_ranges.len);
+        const fetch_end = scoreRangeBatchEnd(fetch_ranges, fetch_start);
         const range_batch = fetch_ranges[fetch_start..fetch_end];
         var fetched_ranges = try fetchScoreRangeBatchAlloc(alloc, session, metric_index, control.header.version, routing.entries, range_batch);
         defer fetched_ranges.deinit(alloc);
