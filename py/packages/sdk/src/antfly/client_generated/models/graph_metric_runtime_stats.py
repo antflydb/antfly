@@ -32,6 +32,11 @@ class GraphMetricRuntimeStats:
             lease_acquire_failures (int | Unset):
             lost_leases (int | Unset):
             last_acquired_ms (int | Unset):
+            lease_expires_at_ms (int | Unset): Cached expiry of the currently held maintenance lease, or zero when no lease
+                is held.
+            lease_renew_after_ms (int | Unset): Earliest time the runtime will renew its maintenance lease, or zero when no
+                lease is held.
+            renewal_count (int | Unset): Number of durable maintenance lease renewals completed by this runtime.
             started (bool | Unset):
             shutdown (bool | Unset):
             notified (bool | Unset):
@@ -78,6 +83,9 @@ class GraphMetricRuntimeStats:
     lease_acquire_failures: int | Unset = UNSET
     lost_leases: int | Unset = UNSET
     last_acquired_ms: int | Unset = UNSET
+    lease_expires_at_ms: int | Unset = UNSET
+    lease_renew_after_ms: int | Unset = UNSET
+    renewal_count: int | Unset = UNSET
     started: bool | Unset = UNSET
     shutdown: bool | Unset = UNSET
     notified: bool | Unset = UNSET
@@ -140,6 +148,12 @@ class GraphMetricRuntimeStats:
         lost_leases = self.lost_leases
 
         last_acquired_ms = self.last_acquired_ms
+
+        lease_expires_at_ms = self.lease_expires_at_ms
+
+        lease_renew_after_ms = self.lease_renew_after_ms
+
+        renewal_count = self.renewal_count
 
         started = self.started
 
@@ -232,6 +246,12 @@ class GraphMetricRuntimeStats:
             field_dict["lost_leases"] = lost_leases
         if last_acquired_ms is not UNSET:
             field_dict["last_acquired_ms"] = last_acquired_ms
+        if lease_expires_at_ms is not UNSET:
+            field_dict["lease_expires_at_ms"] = lease_expires_at_ms
+        if lease_renew_after_ms is not UNSET:
+            field_dict["lease_renew_after_ms"] = lease_renew_after_ms
+        if renewal_count is not UNSET:
+            field_dict["renewal_count"] = renewal_count
         if started is not UNSET:
             field_dict["started"] = started
         if shutdown is not UNSET:
@@ -331,6 +351,12 @@ class GraphMetricRuntimeStats:
 
         last_acquired_ms = d.pop("last_acquired_ms", UNSET)
 
+        lease_expires_at_ms = d.pop("lease_expires_at_ms", UNSET)
+
+        lease_renew_after_ms = d.pop("lease_renew_after_ms", UNSET)
+
+        renewal_count = d.pop("renewal_count", UNSET)
+
         started = d.pop("started", UNSET)
 
         shutdown = d.pop("shutdown", UNSET)
@@ -406,6 +432,9 @@ class GraphMetricRuntimeStats:
             lease_acquire_failures=lease_acquire_failures,
             lost_leases=lost_leases,
             last_acquired_ms=last_acquired_ms,
+            lease_expires_at_ms=lease_expires_at_ms,
+            lease_renew_after_ms=lease_renew_after_ms,
+            renewal_count=renewal_count,
             started=started,
             shutdown=shutdown,
             notified=notified,

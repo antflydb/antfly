@@ -6137,6 +6137,12 @@ pub const GraphMetricRuntimeStats = struct {
     lease_acquire_failures: ?i64 = null,
     lost_leases: ?i64 = null,
     last_acquired_ms: ?i64 = null,
+    /// Cached expiry of the currently held maintenance lease, or zero when no lease is held.
+    lease_expires_at_ms: ?i64 = null,
+    /// Earliest time the runtime will renew its maintenance lease, or zero when no lease is held.
+    lease_renew_after_ms: ?i64 = null,
+    /// Number of durable maintenance lease renewals completed by this runtime.
+    renewal_count: ?i64 = null,
     started: ?bool = null,
     shutdown: ?bool = null,
     notified: ?bool = null,
@@ -6184,6 +6190,9 @@ pub const GraphMetricRuntimeStats = struct {
         .{ "lease_acquire_failures", "lease_acquire_failures", true },
         .{ "lost_leases", "lost_leases", true },
         .{ "last_acquired_ms", "last_acquired_ms", true },
+        .{ "lease_expires_at_ms", "lease_expires_at_ms", true },
+        .{ "lease_renew_after_ms", "lease_renew_after_ms", true },
+        .{ "renewal_count", "renewal_count", true },
         .{ "started", "started", true },
         .{ "shutdown", "shutdown", true },
         .{ "notified", "notified", true },
@@ -6280,6 +6289,18 @@ pub const GraphMetricRuntimeStats = struct {
         }
         if (self.last_acquired_ms) |value| {
             try jw.objectField("last_acquired_ms");
+            try jw.write(value);
+        }
+        if (self.lease_expires_at_ms) |value| {
+            try jw.objectField("lease_expires_at_ms");
+            try jw.write(value);
+        }
+        if (self.lease_renew_after_ms) |value| {
+            try jw.objectField("lease_renew_after_ms");
+            try jw.write(value);
+        }
+        if (self.renewal_count) |value| {
+            try jw.objectField("renewal_count");
             try jw.write(value);
         }
         if (self.started) |value| {

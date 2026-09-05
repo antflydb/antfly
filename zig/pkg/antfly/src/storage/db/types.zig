@@ -2606,6 +2606,9 @@ pub const GraphMetricRuntimeStats = struct {
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
     started: bool = false,
     shutdown: bool = false,
     notified: bool = false,
@@ -2652,6 +2655,9 @@ pub const GraphMetricRuntimeStats = struct {
             self.lease_acquire_failures != 0 or
             self.lost_leases != 0 or
             self.last_acquired_ms != 0 or
+            self.lease_expires_at_ms != 0 or
+            self.lease_renew_after_ms != 0 or
+            self.renewal_count != 0 or
             self.started or
             self.shutdown or
             self.notified or

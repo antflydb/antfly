@@ -900,6 +900,9 @@ fn buildProjectionFromTopologyAlloc(
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (!requirements.satisfies(topologyRequirementsForKind(options.config.kind)))
         return error.InvalidGraphMetricBuildOptions;
+    if (requirements.incoming == .degrees and requirements.outgoing == .degrees) {
+        return try buildDegreeProjectionFromTopologyAlloc(alloc, topology, decoded_retained_bytes, options);
+    }
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
@@ -1004,6 +1007,103 @@ fn buildProjectionFromTopologyAlloc(
         requirements,
         options.cancellation,
     );
+    return projection;
+}
+
+/// Degree-only materializations do not need edge ordinals after counting.
+/// Count directly from the compiled edge-type runs in one O(E) pass instead
+/// of copying projected edges and scanning them twice more to build CSR.
+fn buildDegreeProjectionFromTopologyAlloc(
+    alloc: Allocator,
+    topology: CompiledTopology,
+    decoded_retained_bytes: usize,
+    options: BuildOptions,
+) !Projection {
+    if (topology.source_node_count > options.limits.max_nodes or topology.source_edge_count > options.limits.max_edges)
+        return error.GraphMetricBuildBudgetExceeded;
+    var projection = Projection{
+        .source_node_count = topology.source_node_count,
+        .source_edge_count = topology.source_edge_count,
+    };
+    errdefer projection.deinit(alloc);
+    var filter = try EdgeFilterIndex.init(alloc, options.config.edge_filter);
+    defer filter.deinit(alloc);
+    const allowed_edge_types = try alloc.alloc(bool, topology.edge_types.len);
+    defer alloc.free(allowed_edge_types);
+    for (topology.edge_types, 0..) |edge_type, edge_type_id| {
+        allowed_edge_types[edge_type_id] = filter.allows(edge_type);
+    }
+
+    var active_nodes = try std.DynamicBitSetUnmanaged.initEmpty(alloc, topology.node_ids.len);
+    defer active_nodes.deinit(alloc);
+    const incoming_counts = try alloc.alloc(u32, topology.node_ids.len);
+    defer alloc.free(incoming_counts);
+    const outgoing_counts = try alloc.alloc(u32, topology.node_ids.len);
+    defer alloc.free(outgoing_counts);
+    @memset(incoming_counts, 0);
+    @memset(outgoing_counts, 0);
+    var projected_edge_count: usize = 0;
+    for (allowed_edge_types, 0..) |allowed, edge_type_id| {
+        if (!allowed) continue;
+        const range_start: usize = @intCast(topology.edge_type_offsets[edge_type_id]);
+        const range_end: usize = @intCast(topology.edge_type_offsets[edge_type_id + 1]);
+        if (range_start > range_end or range_end > topology.edges.len) return error.InvalidGraphMetricBuildOptions;
+        for (topology.edges[range_start..range_end]) |edge| {
+            projected_edge_count = std.math.add(usize, projected_edge_count, 1) catch
+                return error.GraphMetricBuildBudgetExceeded;
+            if (projected_edge_count > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
+            if (projected_edge_count % 4096 == 0) try options.cancellation.check();
+            incoming_counts[edge.target] = std.math.add(u32, incoming_counts[edge.target], 1) catch
+                return error.GraphMetricBuildBudgetExceeded;
+            outgoing_counts[edge.source] = std.math.add(u32, outgoing_counts[edge.source], 1) catch
+                return error.GraphMetricBuildBudgetExceeded;
+            active_nodes.set(edge.source);
+            active_nodes.set(edge.target);
+        }
+    }
+    const projected_node_count = active_nodes.count();
+    if (projected_node_count > options.limits.max_nodes) return error.GraphMetricBuildBudgetExceeded;
+    var construction_peak = std.math.add(usize, decoded_retained_bytes, topology.retained_bytes) catch
+        return error.GraphMetricBuildBudgetExceeded;
+    try addPeakArrayBytes(&construction_peak, topology.edge_types.len, bool);
+    try addPeakArrayBytes(&construction_peak, std.math.divCeil(usize, topology.node_ids.len, @bitSizeOf(usize)) catch
+        return error.GraphMetricBuildBudgetExceeded, usize);
+    try addPeakArrayBytes(&construction_peak, topology.node_ids.len, u32);
+    try addPeakArrayBytes(&construction_peak, topology.node_ids.len, u32);
+    try addPeakArrayBytes(&construction_peak, projected_node_count, []const u8);
+    try addPeakArrayBytes(&construction_peak, projected_node_count + 1, u32);
+    try addPeakArrayBytes(&construction_peak, projected_node_count + 1, u32);
+    if (construction_peak > options.limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
+
+    try projection.node_ids.ensureTotalCapacityPrecise(alloc, projected_node_count);
+    const incoming_offsets = try alloc.alloc(u32, projected_node_count + 1);
+    errdefer alloc.free(incoming_offsets);
+    const outgoing_offsets = try alloc.alloc(u32, projected_node_count + 1);
+    errdefer alloc.free(outgoing_offsets);
+    incoming_offsets[0] = 0;
+    outgoing_offsets[0] = 0;
+    var local_index: usize = 0;
+    for (topology.node_ids, 0..) |node_id, global_ordinal| {
+        if (!active_nodes.isSet(global_ordinal)) continue;
+        projection.node_ids.appendAssumeCapacity(node_id);
+        projection.node_id_bytes = std.math.add(usize, projection.node_id_bytes, node_id.len) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        incoming_offsets[local_index + 1] = std.math.add(u32, incoming_offsets[local_index], incoming_counts[global_ordinal]) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        outgoing_offsets[local_index + 1] = std.math.add(u32, outgoing_offsets[local_index], outgoing_counts[global_ordinal]) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        local_index += 1;
+    }
+    std.debug.assert(local_index == projected_node_count);
+    projection.topology = .{
+        .node_count = projected_node_count,
+        .edge_count = projected_edge_count,
+        .requirements = .degree,
+        .incoming_offsets = incoming_offsets,
+        .incoming_sources = @constCast(&[_]u32{}),
+        .outgoing_offsets = outgoing_offsets,
+        .outgoing_targets = @constCast(&[_]u32{}),
+    };
     return projection;
 }
 
@@ -1536,6 +1636,12 @@ test "serverless graph metric topology does not alias qualified endpoints with l
     defer projection.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), projection.node_ids.items.len);
     try std.testing.expectEqual(@as(usize, 1), projection.edgeCount());
+    try std.testing.expectEqual(@as(usize, 0), projection.ordinals.count());
+    const compact = projection.topology.?;
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1 }, compact.incoming_offsets);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1 }, compact.outgoing_offsets);
+    try std.testing.expectEqual(@as(usize, 0), compact.incoming_sources.len);
+    try std.testing.expectEqual(@as(usize, 0), compact.outgoing_targets.len);
 }
 
 test "serverless graph metric topology admission tracks distinct edge types" {

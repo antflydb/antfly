@@ -1280,6 +1280,10 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    /// Lock-free cursors give bounded scheduler sweeps stable round-robin
+    /// fairness while the catalog shared lock keeps the indexed slices stable.
+    graph_metric_coordinator_cursor: std.atomic.Value(usize) = .init(0),
+    graph_metric_worker_cursor: std.atomic.Value(usize) = .init(0),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -5764,6 +5768,53 @@ pub const IndexManager = struct {
         now_ms: ?u64 = null,
     };
 
+    const GraphMetricScheduleEntry = struct {
+        entry: *GraphIndex,
+        config: *const graph_mod.GraphMetricConfig,
+    };
+
+    const GraphMetricScheduleIterator = struct {
+        manager: *IndexManager,
+        graph_index: usize,
+        metric_index: usize,
+
+        fn init(manager: *IndexManager, start: usize) GraphMetricScheduleIterator {
+            var remaining = start;
+            for (manager.graph_indexes.items, 0..) |entry, graph_index| {
+                if (remaining < entry.metric_configs.len) return .{
+                    .manager = manager,
+                    .graph_index = graph_index,
+                    .metric_index = remaining,
+                };
+                remaining -= entry.metric_configs.len;
+            }
+            unreachable;
+        }
+
+        fn next(self: *GraphMetricScheduleIterator) GraphMetricScheduleEntry {
+            const entry = &self.manager.graph_indexes.items[self.graph_index];
+            const result: GraphMetricScheduleEntry = .{
+                .entry = entry,
+                .config = &entry.metric_configs[self.metric_index],
+            };
+            self.metric_index += 1;
+            if (self.metric_index == entry.metric_configs.len) {
+                self.metric_index = 0;
+                while (true) {
+                    self.graph_index = (self.graph_index + 1) % self.manager.graph_indexes.items.len;
+                    if (self.manager.graph_indexes.items[self.graph_index].metric_configs.len != 0) break;
+                }
+            }
+            return result;
+        }
+    };
+
+    fn graphMetricScheduleEntryCount(self: *IndexManager) usize {
+        var total: usize = 0;
+        for (self.graph_indexes.items) |entry| total +|= entry.metric_configs.len;
+        return total;
+    }
+
     pub const GraphMetricPlannedSchedulerSweepResult = struct {
         metrics_scanned: usize = 0,
         active_builds: usize = 0,
@@ -5999,8 +6050,7 @@ pub const IndexManager = struct {
             var index_scheduled_builds: usize = 0;
             decision.active_builds += index_active_builds;
             for (entry.metric_configs) |cfg| {
-                var status = try entry.index.graphMetricStatus(cfg.name);
-                defer status.deinit(entry.index.alloc);
+                const status = try entry.index.graphMetricSchedulerStatus(cfg.name, null);
                 if (status.maintenance_paused) continue;
 
                 if (status.state == .building or status.phase == .cleanup_old_generations) {
@@ -6035,10 +6085,13 @@ pub const IndexManager = struct {
     }
 
     fn graphMetricIndexActiveBuilds(entry: *GraphIndex) !usize {
+        return graphMetricIndexActiveBuildsAt(entry, null);
+    }
+
+    fn graphMetricIndexActiveBuildsAt(entry: *GraphIndex, now_ms: ?u64) !usize {
         var active_builds: usize = 0;
         for (entry.metric_configs) |cfg| {
-            var status = try entry.index.graphMetricStatus(cfg.name);
-            defer status.deinit(entry.index.alloc);
+            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, now_ms);
             if (status.maintenance_paused) continue;
             if (status.state == .building or status.phase == .cleanup_old_generations) {
                 if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
@@ -6145,81 +6198,85 @@ pub const IndexManager = struct {
             0;
         var scheduled_builds: usize = 0;
 
-        for (self.graph_indexes.items) |*entry| {
-            const index_active_builds = if (options.auto_idle_options != null)
-                try graphMetricIndexActiveBuilds(entry)
-            else
-                0;
-            var index_scheduled_builds: usize = 0;
-            for (entry.metric_configs) |cfg| {
-                if (result.metrics_scanned >= options.max_metrics) {
-                    result.budget_exhausted = true;
-                    return result;
-                }
-                result.metrics_scanned += 1;
-
-                var status = try entry.index.graphMetricStatus(cfg.name);
-                defer status.deinit(entry.index.alloc);
-                if (status.maintenance_paused) continue;
-                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
-
-                var active = status.state == .building;
-                if (!active and options.start_background_builds and cfg.refresh == .background) {
-                    switch (status.state) {
-                        .not_ready, .stale, .failed => {
-                            if (status.state == .failed) {
-                                // Preserve terminal failures for the same
-                                // generation, but do not let a superseded
-                                // snapshot permanently block newer graph
-                                // traffic. A newer dirty generation is a new
-                                // unit of work, not a blind retry.
-                                const failed_generation = if (status.recent_failures.len > 0)
-                                    status.recent_failures[0].target_generation
-                                else
-                                    status.target_edge_generation;
-                                if (failed_generation >= status.target_edge_generation) continue;
-                            }
-                            if (options.auto_idle_options) |auto_options| {
-                                if (!graphMetricShouldAutoStartQueuedBuild(
-                                    entry.metric_configs,
-                                    cfg,
-                                    auto_options,
-                                    active_builds_before_start,
-                                    scheduled_builds,
-                                    index_active_builds,
-                                    index_scheduled_builds,
-                                )) continue;
-                            } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
-                            var started = entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation) catch |err| switch (err) {
-                                error.GraphMetricDisabled => continue,
-                                else => return err,
-                            };
-                            defer started.deinit(entry.index.alloc);
-                            result.builds_started += 1;
-                            scheduled_builds += 1;
-                            index_scheduled_builds += 1;
-                            active = true;
-                        },
-                        .disabled, .fresh, .building => {},
-                    }
-                }
-                if (!active) continue;
-                result.active_builds += 1;
-
-                const step = (if (options.now_ms) |now_ms|
-                    entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
-                else
-                    entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
-                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
-                    else => return err,
-                };
-                result.coordinator_steps += 1;
-                if (step.advanced_phase) result.phases_advanced += 1;
-                if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {
-                    result.published += 1;
-                }
-                if (step.failed_build) result.failed_builds += 1;
+        const entry_count = self.graphMetricScheduleEntryCount();
+        if (entry_count == 0) return result;
+        const start = self.graph_metric_coordinator_cursor.fetchAdd(1, .monotonic) % entry_count;
+        var schedule = GraphMetricScheduleIterator.init(self, start);
+        var counted_entry: ?*GraphIndex = null;
+        var index_active_builds: usize = 0;
+        var index_scheduled_builds: usize = 0;
+        for (0..entry_count) |_| {
+            const scheduled = schedule.next();
+            const entry = scheduled.entry;
+            const cfg = scheduled.config.*;
+            if (options.auto_idle_options != null and counted_entry != entry) {
+                counted_entry = entry;
+                index_active_builds = try graphMetricIndexActiveBuildsAt(entry, options.now_ms);
+                index_scheduled_builds = 0;
             }
+            if (result.metrics_scanned >= options.max_metrics) {
+                result.budget_exhausted = true;
+                return result;
+            }
+            result.metrics_scanned += 1;
+
+            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+            if (status.maintenance_paused) continue;
+            if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+
+            var active = status.state == .building;
+            if (!active and options.start_background_builds and cfg.refresh == .background) {
+                switch (status.state) {
+                    .not_ready, .stale, .failed => {
+                        if (status.state == .failed) {
+                            // Preserve terminal failures for the same
+                            // generation, but do not let a superseded
+                            // snapshot permanently block newer graph
+                            // traffic. A newer dirty generation is a new
+                            // unit of work, not a blind retry.
+                            const failed_generation = status.failed_target_generation;
+                            if (failed_generation >= status.target_edge_generation) continue;
+                        }
+                        if (options.auto_idle_options) |auto_options| {
+                            if (!graphMetricShouldAutoStartQueuedBuild(
+                                entry.metric_configs,
+                                cfg,
+                                auto_options,
+                                active_builds_before_start,
+                                scheduled_builds,
+                                index_active_builds,
+                                index_scheduled_builds,
+                            )) continue;
+                        } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                        var started = entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation) catch |err| switch (err) {
+                            error.GraphMetricDisabled => continue,
+                            else => return err,
+                        };
+                        defer started.deinit(entry.index.alloc);
+                        result.builds_started += 1;
+                        scheduled_builds += 1;
+                        index_scheduled_builds += 1;
+                        active = true;
+                    },
+                    .disabled, .fresh, .building => {},
+                }
+            }
+            if (!active) continue;
+            result.active_builds += 1;
+
+            const step = (if (options.now_ms) |now_ms|
+                entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
+            else
+                entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
+                error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
+                else => return err,
+            };
+            result.coordinator_steps += 1;
+            if (step.advanced_phase) result.phases_advanced += 1;
+            if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {
+                result.published += 1;
+            }
+            if (step.failed_build) result.failed_builds += 1;
         }
         return result;
     }
@@ -6249,67 +6306,70 @@ pub const IndexManager = struct {
         var result = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_pages == 0) return result;
 
-        for (self.graph_indexes.items) |*entry| {
-            for (entry.metric_configs) |cfg| {
-                if (result.worker_steps >= options.max_pages) {
-                    result.budget_exhausted = true;
-                    return result;
-                }
+        const entry_count = self.graphMetricScheduleEntryCount();
+        if (entry_count == 0) return result;
+        const start = self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
+        var schedule = GraphMetricScheduleIterator.init(self, start);
+        for (0..entry_count) |_| {
+            const scheduled = schedule.next();
+            const entry = scheduled.entry;
+            const cfg = scheduled.config.*;
+            if (result.worker_steps >= options.max_pages) {
+                result.budget_exhausted = true;
+                return result;
+            }
 
-                if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(cfg.name)) {
-                    result.metrics_scanned += 1;
-                    result.worker_steps += 1;
-                    result.pages_completed += 1;
-                    continue;
-                }
-                if (try entry.index.cleanupFailedGraphMetricBuildJobPage(cfg.name)) {
-                    result.metrics_scanned += 1;
-                    result.worker_steps += 1;
-                    result.pages_completed += 1;
-                    continue;
-                }
-                var status = try entry.index.graphMetricStatus(cfg.name);
-                defer status.deinit(entry.index.alloc);
-                if (status.maintenance_paused) continue;
-                if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(cfg.name)) {
-                    result.metrics_scanned += 1;
-                    result.worker_steps += 1;
-                    result.pages_completed += 1;
-                    continue;
-                }
-                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
-                const active = status.state == .building or status.phase == .cleanup_old_generations;
-                if (!active) continue;
+            if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(cfg.name)) {
                 result.metrics_scanned += 1;
-                result.active_builds += 1;
-
-                const step = (if (options.now_ms) |now_ms|
-                    entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
-                else
-                    entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
-                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
-                    // Graph mutations may supersede a snapshot after the
-                    // coordinator sweep but before this worker sweep. Treat
-                    // that as expected scheduler churn: the coordinator owns
-                    // durable failure/cancellation and will retire the exact
-                    // stale job on its next tick. A worker must neither turn
-                    // normal write traffic into a runtime error nor race a
-                    // replacement lease by failing a job it no longer owns.
-                    error.GraphMetricBuildSuperseded => continue,
-                    else => return err,
-                };
                 result.worker_steps += 1;
-                if (step.claimed_page) result.pages_claimed += 1;
-                if (step.completed_page) result.pages_completed += 1;
-                if (step.advanced_phase) result.phases_advanced += 1;
-                if (result.worker_steps >= options.max_pages) {
-                    var after_status = try entry.index.graphMetricStatus(cfg.name);
-                    defer after_status.deinit(entry.index.alloc);
-                    if (graphMetricStatusHasRunnableWorkerPage(after_status, options.worker_id, options.now_ms)) {
-                        result.budget_exhausted = true;
-                    }
-                    return result;
+                result.pages_completed += 1;
+                continue;
+            }
+            if (try entry.index.cleanupFailedGraphMetricBuildJobPage(cfg.name)) {
+                result.metrics_scanned += 1;
+                result.worker_steps += 1;
+                result.pages_completed += 1;
+                continue;
+            }
+            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+            if (status.maintenance_paused) continue;
+            if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(cfg.name)) {
+                result.metrics_scanned += 1;
+                result.worker_steps += 1;
+                result.pages_completed += 1;
+                continue;
+            }
+            if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+            const active = status.state == .building or status.phase == .cleanup_old_generations;
+            if (!active) continue;
+            result.metrics_scanned += 1;
+            result.active_builds += 1;
+
+            const step = (if (options.now_ms) |now_ms|
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
+            else
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
+                error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
+                // Graph mutations may supersede a snapshot after the
+                // coordinator sweep but before this worker sweep. Treat
+                // that as expected scheduler churn: the coordinator owns
+                // durable failure/cancellation and will retire the exact
+                // stale job on its next tick. A worker must neither turn
+                // normal write traffic into a runtime error nor race a
+                // replacement lease by failing a job it no longer owns.
+                error.GraphMetricBuildSuperseded => continue,
+                else => return err,
+            };
+            result.worker_steps += 1;
+            if (step.claimed_page) result.pages_claimed += 1;
+            if (step.completed_page) result.pages_completed += 1;
+            if (step.advanced_phase) result.phases_advanced += 1;
+            if (result.worker_steps >= options.max_pages) {
+                const after_status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+                if (after_status.state == .building or after_status.phase == .cleanup_old_generations) {
+                    result.budget_exhausted = true;
                 }
+                return result;
             }
         }
         return result;

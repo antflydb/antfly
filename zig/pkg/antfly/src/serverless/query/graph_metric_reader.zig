@@ -560,20 +560,37 @@ fn planScoreFetchRangesAlloc(
             try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
         }
     } else {
-        var active_window: ?u64 = null;
-        for (entries, block_counts, 0..) |entry, count, block_index| {
-            if (count == 0) continue;
-            if (entry.offset < score_data_offset) return error.InvalidGraphMetricSegment;
-            const window = (entry.offset - score_data_offset) / coalesced_score_window_bytes;
-            if (active_window == null or active_window.? != window) {
-                try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
-                active_window = window;
-            } else {
-                const range = &ranges.items[ranges.items.len - 1];
-                const entry_end = std.math.add(u64, entry.offset, entry.len) catch return error.InvalidGraphMetricSegment;
-                range.last_block = block_index;
-                range.len = std.math.cast(usize, entry_end - range.offset) orelse return error.GraphMetricQueryBudgetExceeded;
+        // Cache identity must be independent of the exact candidate set.
+        // Materialize complete immutable block windows whenever any block in
+        // the window is touched so overlapping queries reuse the same
+        // authenticated on-disk record instead of caching overlapping ranges.
+        var first_block: usize = 0;
+        while (first_block < entries.len) {
+            const first = entries[first_block];
+            if (first.offset < score_data_offset) return error.InvalidGraphMetricSegment;
+            if (first.len > coalesced_score_window_bytes) return error.GraphMetricQueryBudgetExceeded;
+            var last_block = first_block;
+            var window_touched = block_counts[first_block] != 0;
+            while (last_block + 1 < entries.len) {
+                const next = entries[last_block + 1];
+                if (next.offset < first.offset) return error.InvalidGraphMetricSegment;
+                const next_end = std.math.add(u64, next.offset, next.len) catch
+                    return error.InvalidGraphMetricSegment;
+                if (next_end - first.offset > coalesced_score_window_bytes) break;
+                last_block += 1;
+                window_touched = window_touched or block_counts[last_block] != 0;
             }
+            if (window_touched) {
+                const last_end = std.math.add(u64, entries[last_block].offset, entries[last_block].len) catch
+                    return error.InvalidGraphMetricSegment;
+                try ranges.append(alloc, .{
+                    .first_block = first_block,
+                    .last_block = last_block,
+                    .offset = first.offset,
+                    .len = std.math.cast(usize, last_end - first.offset) orelse return error.GraphMetricQueryBudgetExceeded,
+                });
+            }
+            first_block = last_block + 1;
         }
     }
     if (ranges.items.len > max_score_range_requests) return error.GraphMetricQueryBudgetExceeded;
@@ -1096,6 +1113,31 @@ test "serverless graph metric range planning caps broad point batches" {
         error.GraphMetricQueryBudgetExceeded,
         fetchScoreRangeBatchAlloc(alloc, &unused_session, 0, 0, &.{}, &oversized_batch),
     );
+}
+
+test "serverless graph metric broad point ranges have candidate-independent cache identity" {
+    const alloc = std.testing.allocator;
+    var entries: [40]metric_segment.codec.RoutingEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .first_node_id = "node",
+        .offset = index * 128 * 1024,
+        .len = 128 * 1024,
+    };
+    var first_counts: [40]usize = @splat(1);
+    var second_counts: [40]usize = @splat(1);
+    first_counts[0] = 0;
+    second_counts[1] = 0;
+    const first = try planScoreFetchRangesAlloc(alloc, &entries, &first_counts, 0);
+    defer alloc.free(first);
+    const second = try planScoreFetchRangesAlloc(alloc, &entries, &second_counts, 0);
+    defer alloc.free(second);
+    try std.testing.expectEqual(first.len, second.len);
+    for (first, second) |left, right| {
+        try std.testing.expectEqual(left.first_block, right.first_block);
+        try std.testing.expectEqual(left.last_block, right.last_block);
+        try std.testing.expectEqual(left.offset, right.offset);
+        try std.testing.expectEqual(left.len, right.len);
+    }
 }
 
 test "serverless graph metric top range planning coalesces contiguous blocks" {

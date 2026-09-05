@@ -474,6 +474,9 @@ pub fn expectPublicIndexRuntimeStatusMetadata() !void {
     try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "worker_count"));
     try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "takeover_count"));
     try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lost_leases"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lease_expires_at_ms"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lease_renew_after_ms"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "renewal_count"));
     try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "total_pages_claimed"));
     try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "last_pages_completed"));
     try std.testing.expect(@hasDecl(client_generated, "GraphMetricRuntimeStats"));

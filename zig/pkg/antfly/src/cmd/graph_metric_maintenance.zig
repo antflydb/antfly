@@ -768,6 +768,9 @@ fn releaseServiceRuntimeOwner(
         stats.lease_owned = server_stats.lease_owned;
         stats.has_lease = server_stats.has_lease;
         stats.last_acquired_ms = server_stats.last_acquired_ms;
+        stats.lease_expires_at_ms = server_stats.lease_expires_at_ms;
+        stats.lease_renew_after_ms = server_stats.lease_renew_after_ms;
+        stats.renewal_count = server_stats.renewal_count;
     } else if (parsed.released) {
         stats.has_lease = false;
     }
@@ -813,6 +816,9 @@ fn mergeServiceStats(
     stats.lease_acquire_failures += server_stats.lease_acquire_failures;
     stats.lost_leases += server_stats.lost_leases;
     stats.last_acquired_ms = server_stats.last_acquired_ms;
+    stats.lease_expires_at_ms = server_stats.lease_expires_at_ms;
+    stats.lease_renew_after_ms = server_stats.lease_renew_after_ms;
+    stats.renewal_count += server_stats.renewal_count;
     stats.durable_progress_ticks += server_stats.durable_progress_ticks;
     stats.idle_ticks += server_stats.idle_ticks;
     stats.error_ticks += server_stats.error_ticks;

@@ -11133,6 +11133,21 @@ export interface components {
             lost_leases?: number;
             /** Format: uint64 */
             last_acquired_ms?: number;
+            /**
+             * Format: uint64
+             * @description Cached expiry of the currently held maintenance lease, or zero when no lease is held.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Earliest time the runtime will renew its maintenance lease, or zero when no lease is held.
+             */
+            lease_renew_after_ms?: number;
+            /**
+             * Format: uint64
+             * @description Number of durable maintenance lease renewals completed by this runtime.
+             */
+            renewal_count?: number;
             started?: boolean;
             shutdown?: boolean;
             notified?: boolean;

@@ -3109,6 +3109,9 @@ fn aggregateGraphMetricRuntimeStats(dst: *db_mod.types.GraphMetricRuntimeStats, 
     dst.lease_acquire_failures +|= src.lease_acquire_failures;
     dst.lost_leases +|= src.lost_leases;
     dst.last_acquired_ms = @max(dst.last_acquired_ms, src.last_acquired_ms);
+    dst.lease_expires_at_ms = @max(dst.lease_expires_at_ms, src.lease_expires_at_ms);
+    dst.lease_renew_after_ms = @max(dst.lease_renew_after_ms, src.lease_renew_after_ms);
+    dst.renewal_count +|= src.renewal_count;
     dst.started = dst.started or src.started;
     dst.shutdown = dst.shutdown or src.shutdown;
     dst.notified = dst.notified or src.notified;

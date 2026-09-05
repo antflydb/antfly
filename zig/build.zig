@@ -8218,6 +8218,7 @@ pub fn build(b: *std.Build) void {
         "graph metric runtime worker pool identity",
         "graph metric runtime boundary tick",
         "ownership state tracks lease takeover and loss",
+        "ownership state renews only at the cached renewal deadline",
         "graph metric query shape bounds clauses and unique dependencies",
         "borrowed graph metric names do not allocate per node",
         "graph metric column selection retains deterministic bounded top k",

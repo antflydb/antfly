@@ -2644,6 +2644,18 @@ components:
         last_acquired_ms:
           type: integer
           format: uint64
+        lease_expires_at_ms:
+          type: integer
+          format: uint64
+          description: "Cached expiry of the currently held maintenance lease, or zero when no lease is held."
+        lease_renew_after_ms:
+          type: integer
+          format: uint64
+          description: "Earliest time the runtime will renew its maintenance lease, or zero when no lease is held."
+        renewal_count:
+          type: integer
+          format: uint64
+          description: "Number of durable maintenance lease renewals completed by this runtime."
         started:
           type: boolean
         shutdown:

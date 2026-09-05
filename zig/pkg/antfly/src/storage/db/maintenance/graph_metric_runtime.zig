@@ -35,6 +35,7 @@ fn yieldToBackground(db: anytype) void {
 }
 
 const TestHelpers = if (builtin.is_test) @import("../test_support.zig") else struct {};
+const max_runtime_workers: usize = 64;
 
 pub const Role = enum {
     combined,
@@ -86,6 +87,9 @@ pub const Stats = struct {
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
     started: bool = false,
     shutdown: bool = false,
     notified: bool = false,
@@ -457,10 +461,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn runOnceDetailed(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (!self.config.enabled) return .{};
         self.recordTickStarted();
-        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
-            self.recordTickSuccess(.{});
-            return .{};
-        }
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -485,10 +485,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             const err = error.InvalidGraphMetricRuntimeRole;
             self.recordTickError(err);
             return err;
-        }
-        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
-            self.recordTickSuccess(.{});
-            return .{};
         }
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
@@ -518,10 +514,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             const err = error.InvalidGraphMetricBuildWorker;
             self.recordTickError(err);
             return err;
-        }
-        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
-            self.recordTickSuccess(.{});
-            return .{};
         }
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
@@ -554,10 +546,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         if (!self.config.enabled) return .{};
         self.recordTickStarted();
-        if (!self.ensureRuntimeLease(self.config.clock.nowRealtimeMs())) {
-            self.recordTickSuccess(.{});
-            return .{};
-        }
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
@@ -580,6 +568,53 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self: *GraphMetricRuntime,
         now_ms: u64,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        const worker_ids = self.config.planned_options.worker_ids;
+        const page_budget = self.config.planned_options.max_pages_per_round;
+        if (worker_ids.len > 1 and page_budget > 1) {
+            const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
+            const width = @min(worker_ids.len, page_budget);
+            var results: [max_runtime_workers]index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = @splat(.{});
+            var failures: [max_runtime_workers]?anyerror = @splat(null);
+            const Worker = struct {
+                fn run(
+                    boundary: MaintenanceBoundary,
+                    worker_id: []const u8,
+                    max_pages: usize,
+                    tick_ms: u64,
+                    result: *index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult,
+                    failure: *?anyerror,
+                ) void {
+                    result.* = boundary.runWorker(.{
+                        .worker_id = worker_id,
+                        .max_pages = max_pages,
+                        .now_ms = tick_ms,
+                    }) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var group: Io.Group = .init;
+            const pages_per_worker = page_budget / width;
+            const extra_pages = page_budget % width;
+            for (worker_ids[0..width], 0..) |worker_id, index| {
+                group.async(io, Worker.run, .{
+                    self.maintenance_boundary,
+                    worker_id,
+                    pages_per_worker + @intFromBool(index < extra_pages),
+                    now_ms,
+                    &results[index],
+                    &failures[index],
+                });
+            }
+            try group.await(io);
+            var total: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = .{};
+            for (0..width) |index| {
+                if (failures[index]) |err| return err;
+                total.add(results[index]);
+            }
+            return total;
+        }
         return try self.maintenance_boundary.runWorkerPool(.{
             .worker_id = self.config.planned_options.worker_id,
             .worker_ids = self.config.planned_options.worker_ids,
@@ -694,6 +729,9 @@ fn applyOwnershipStats(stats_snapshot: *Stats, ownership_stats: ownership_mod.St
     stats_snapshot.lease_acquire_failures = ownership_stats.lease_acquire_failures;
     stats_snapshot.lost_leases = ownership_stats.lost_leases;
     stats_snapshot.last_acquired_ms = ownership_stats.last_acquired_ms;
+    stats_snapshot.lease_expires_at_ms = ownership_stats.lease_expires_at_ms;
+    stats_snapshot.lease_renew_after_ms = ownership_stats.lease_renew_after_ms;
+    stats_snapshot.renewal_count = ownership_stats.renewal_count;
 }
 
 pub fn identityHash(value: []const u8) u64 {
@@ -800,6 +838,8 @@ fn validateWorkerIdentities(config: Config) !void {
         }
         return;
     }
+    if (config.planned_options.worker_ids.len > max_runtime_workers)
+        return error.InvalidGraphMetricRuntimeConfig;
 
     for (config.planned_options.worker_ids, 0..) |worker_id, i| {
         if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
