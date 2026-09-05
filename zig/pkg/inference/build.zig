@@ -971,6 +971,7 @@ pub fn build(b: *std.Build) void {
 
     const qwen3vl_python_contracts = b.addSystemCommand(&.{
         "python3",
+        "-B",
         "-m",
         "unittest",
         "discover",
@@ -984,6 +985,23 @@ pub fn build(b: *std.Build) void {
         "Test Qwen3-VL oracle, qualification, high-precision, MPS, and MLX benchmark contracts",
     );
     qwen3vl_python_contracts_step.dependOn(&qwen3vl_python_contracts.step);
+
+    const qwen3_embedding_python_contracts = b.addSystemCommand(&.{
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/qwen3_embedding",
+        "-p",
+        "test_*.py",
+    });
+    const qwen3_embedding_python_contracts_step = b.step(
+        "test-qwen3-embedding-python-contracts",
+        "Test Qwen3-Embedding oracle, qualification, and endpoint benchmark contracts",
+    );
+    qwen3_embedding_python_contracts_step.dependOn(&qwen3_embedding_python_contracts.step);
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
