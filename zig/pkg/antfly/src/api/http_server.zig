@@ -23386,9 +23386,11 @@ test "api http server obtains query embedding policy from resource manager" {
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const selected_io = ApiHttpServer.queryEmbeddingCacheIo(.{ .backend_runtime = runtime.ptr() });
+    const raw_runtime_io = runtime.ptr().apiIoImpl().?.io();
     const runtime_io = runtime.ptr().apiIo().?;
     try std.testing.expect(selected_io.userdata == runtime_io.userdata);
     try std.testing.expect(selected_io.vtable == runtime_io.vtable);
+    try std.testing.expect(selected_io.vtable != raw_runtime_io.vtable);
     try std.testing.expect(selected_io.vtable != runtime.ptr().apiFilesystemIo().?.vtable);
 }
 
