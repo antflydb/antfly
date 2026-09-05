@@ -9659,6 +9659,17 @@ test "resolved document unit spool replays in order and cleans its attempt prefi
     try std.testing.expectEqualStrings("first", capture.text.items[0]);
     try std.testing.expectEqualStrings("second", capture.text.items[1]);
 
+    // A new operation scavenges the artifact-wide private prefix before it
+    // constructs the next attempt. Keep that ownership at the operation
+    // boundary: it must also run on fingerprint fast paths where no new spool
+    // is constructed.
+    const artifact_root = try internal_keys.documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        alloc,
+        "doc:spool",
+        "pages",
+    );
+    defer alloc.free(artifact_root);
+    try clearPrivateStorePrefix(null, alloc, &erased_store, artifact_root);
     var replacement = try RuntimeDocumentUnitSpool.init(null, &erased_store, alloc, alloc, "doc:spool", "pages", "2:def");
     defer replacement.deinit();
     const stale = try backend_scan.scanPrefix(alloc, &erased_store, spool.root);
