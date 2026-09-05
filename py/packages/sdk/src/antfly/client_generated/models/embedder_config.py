@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.embedder_provider import EmbedderProvider
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="EmbedderConfig")
 
@@ -196,32 +200,59 @@ class EmbedderConfig:
             multimodal (bool | Unset): Declare that this model supports non-text content (images, audio, video, PDFs),
                 even if the model isn't in Antfly's built-in model registry yet.
 
-                When `true`, Antfly treats the model as multimodal and will send binary content
-                (images, audio, etc.) to the provider instead of extracting text. The provider's
-                API is still responsible for accepting the content — this flag just tells Antfly
-                not to strip it.
+                When `true`, Antfly treats the model as multimodal and sends binary content
+                (images, audio, etc.) through an embedding adapter that supports content parts.
+                Antfly currently provides that contract for local Antfly inference and Bedrock;
+                text-only provider adapters reject media rather than silently discarding it.
 
-                Not needed for models already in the registry (e.g., `multimodalembedding`,
-                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
 
                 **Example:**
                 ```json
                 {
-                  "provider": "vertex",
+                  "provider": "antfly",
                   "model": "some-future-multimodal-model",
                   "multimodal": true
                 }
                 ```
+            query_input_type (str | Unset): Deprecated compatibility form of
+                `retrieval.query_input_type`. New configurations should use the
+                nested `retrieval` object.
+            document_input_type (str | Unset): Deprecated compatibility form of
+                `retrieval.document_input_type`. New configurations should use
+                the nested `retrieval` object.
+            query_instruction (str | Unset): Deprecated compatibility form of
+                `retrieval.query_instruction`. New configurations should use the
+                nested `retrieval` object.
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
     provider: EmbedderProvider
     multimodal: bool | Unset = UNSET
+    query_input_type: str | Unset = UNSET
+    document_input_type: str | Unset = UNSET
+    query_instruction: str | Unset = UNSET
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
 
         multimodal = self.multimodal
+
+        query_input_type = self.query_input_type
+
+        document_input_type = self.document_input_type
+
+        query_instruction = self.query_instruction
+
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -232,19 +263,46 @@ class EmbedderConfig:
         )
         if multimodal is not UNSET:
             field_dict["multimodal"] = multimodal
+        if query_input_type is not UNSET:
+            field_dict["query_input_type"] = query_input_type
+        if document_input_type is not UNSET:
+            field_dict["document_input_type"] = document_input_type
+        if query_instruction is not UNSET:
+            field_dict["query_instruction"] = query_instruction
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
         provider = EmbedderProvider(d.pop("provider"))
 
         multimodal = d.pop("multimodal", UNSET)
 
+        query_input_type = d.pop("query_input_type", UNSET)
+
+        document_input_type = d.pop("document_input_type", UNSET)
+
+        query_instruction = d.pop("query_instruction", UNSET)
+
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         embedder_config = cls(
             provider=provider,
             multimodal=multimodal,
+            query_input_type=query_input_type,
+            document_input_type=document_input_type,
+            query_instruction=query_instruction,
+            retrieval=retrieval,
         )
 
         embedder_config.additional_properties = d

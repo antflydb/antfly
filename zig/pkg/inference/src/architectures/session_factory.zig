@@ -2755,7 +2755,7 @@ fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8,
     if (!std.mem.eql(u8, raw_name, normalized_name)) return false;
     return switch (arch_config) {
         .gpt => |cfg| switch (cfg.family) {
-            .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
+            .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
             else => false,
         },
         else => false,
@@ -2848,6 +2848,10 @@ fn collectMissingRequiredGptWeights(
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.input_layernorm.bias", .{layer});
         }
         try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
+        if (config.family == .qwen3 or config.family == .qwen3_vl) {
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+        }
         if (config.family == .qwen2 or config.family == .phi) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.bias", .{layer});
         }
@@ -4322,6 +4326,37 @@ fn recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(
     };
 }
 
+/// Large dense safetensors models have two independently real residency
+/// domains in GPU-hosted execution: the lazily faulted source mapping and the
+/// prepared backend weights. The generic GPU cache is intentionally too small
+/// for a complete 2B BF16 model, so qualified bundle families need an explicit
+/// floor sized from their immutable weight artifact rather than failing midway
+/// through the decoder after a partial publication.
+fn recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(
+    model_weight_bytes: u64,
+) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes()) return .{};
+    const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(6));
+    const backend_floor = clampBytes(total_bytes +| mib(512), gib(4), gib(8));
+    const combined_floor = clampBytes(host_floor +| backend_floor +| gib(1), gib(8), gib(14));
+    return .{
+        .host_limit_bytes = host_floor,
+        .backend_limit_bytes = backend_floor,
+        .combined_limit_bytes = combined_floor,
+    };
+}
+
+fn recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(
+    model_weight_bytes: u64,
+) runtime.tier.cache.Budget {
+    const floor = recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(model_weight_bytes);
+    return .{
+        .host_limit_bytes = floor.host_limit_bytes,
+        .backend_limit_bytes = floor.backend_limit_bytes,
+    };
+}
+
 fn isBgeM3DenseEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
     if (!std.mem.eql(u8, manifest.config_model_arch, "xlm-roberta")) return false;
     return switch (arch_config) {
@@ -4356,10 +4391,9 @@ fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.me
     // The official dense BGE-M3 checkpoint is F32 and mmap-backed. Metal keeps
     // those source views alive while preparing reusable F16 projection slots
     // (or the explicit F32 rollback), so the host cache must be able to account
-    // for the complete artifact. The
-    // ordinary GPU defaults already cover the prepared projections and the
-    // persistent embedding table on supported machines; these are minimums,
-    // not an override of an explicit serving limit.
+    // for the complete artifact. The ordinary GPU defaults already cover the
+    // prepared projections and the persistent embedding table on supported
+    // machines; these are minimums, not an override of an explicit limit.
     const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(4));
     const backend_floor = clampBytes((total_bytes *| 3) / 4 +| gib(1), gib(3), gib(6));
     const combined_floor = clampBytes(host_floor +| backend_floor +| mib(512), gib(6), gib(10));
@@ -4623,6 +4657,23 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(model_weight_bytes, prefer_f32_dense_tensors)
     else
         runtime.tier.cache.Budget{};
+    const dense_safetensors_budget_floor = if (shouldUseLargeQwen3VlRerankerSafetensorsBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(model_weight_bytes)
+    else
+        runtime.tier.memory.Limits{};
+    const dense_safetensors_shared_cache_floor = if (shouldUseLargeQwen3VlRerankerSafetensorsBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(model_weight_bytes)
+    else
+        runtime.tier.cache.Budget{};
+    // Qwen3-VL's external projector is mapped only by an image rerank request,
+    // not by the decoder session. Reserve a host envelope for that mapped GGUF
+    // and bounded preprocessing before request-time admission; otherwise a
+    // correctly loaded Q8 reranker can fail every qualified 2 MP image with a
+    // generic 2 GiB host-cache limit.
+    const qwen3vl_reranker_gguf_budget_floor = if (shouldUseQwen3VlRerankerGgufBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(model_weight_bytes)
+    else
+        runtime.tier.memory.Limits{};
     const bge_m3_budget_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
         recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes)
     else
@@ -4631,10 +4682,28 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedBgeM3SharedCacheBudget(model_weight_bytes)
     else
         runtime.tier.cache.Budget{};
-    const budget_floor = widenLimits(widenLimits(lazy_quant_budget_floor, gemma_budget_floor), bge_m3_budget_floor);
+    const budget_floor = widenLimits(
+        widenLimits(
+            widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
+            widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
+        ),
+        bge_m3_budget_floor,
+    );
     const shared_cache_floor = runtime.tier.cache.Budget{
-        .host_limit_bytes = @max(@max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes), bge_m3_shared_cache_floor.host_limit_bytes),
-        .backend_limit_bytes = @max(@max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes), bge_m3_shared_cache_floor.backend_limit_bytes),
+        .host_limit_bytes = @max(
+            @max(
+                @max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes),
+                dense_safetensors_shared_cache_floor.host_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.host_limit_bytes,
+        ),
+        .backend_limit_bytes = @max(
+            @max(
+                @max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes),
+                dense_safetensors_shared_cache_floor.backend_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.backend_limit_bytes,
+        ),
     };
     const plan_context: runtime.tier.planner.PlanContext = blk: {
         var ctx = defaultPlanContextForBackend(.gpu);
@@ -4696,6 +4765,46 @@ fn shouldUseLargeGpuHostedMultimodalGemmaBudgets(
     return switch (arch_config) {
         .gpt => |cfg| cfg.family == .gemma and !cfg.usesMoe() and cfg.isMultimodal(),
         else => false,
+    };
+}
+
+fn shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) bool {
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes() or
+        !manifest.isQwen3VlRerankerSafetensorsBundle()) return false;
+    return switch (arch_config) {
+        .gpt => |cfg| cfg.family == .qwen3_vl and !cfg.usesMoe(),
+        else => false,
+    };
+}
+
+fn shouldUseQwen3VlRerankerGgufBudgets(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) bool {
+    if (model_weight_bytes == 0 or !manifest.isQwen3VlRerankerGgufBundle()) return false;
+    return switch (arch_config) {
+        .gpt => |cfg| cfg.family == .qwen3_vl and !cfg.usesMoe(),
+        else => false,
+    };
+}
+
+/// A Qwen3-VL reranker keeps its decoder resident, then maps the external
+/// Q8 projector for image requests. The host bucket must fit both artifacts
+/// plus bounded image preprocessing. This is a limit floor rather than a
+/// permanent reservation; per-run admission still charges the projector and
+/// scratch exactly, and an explicit operator limit remains authoritative.
+fn recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(
+    model_weight_bytes: u64,
+) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0) return .{};
+    const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    return .{
+        .host_limit_bytes = clampBytes(total_bytes +| gib(1), gib(3), gib(6)),
     };
 }
 
@@ -6983,6 +7092,29 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
 
+            if (self.task == .classifier and cfg.family == .qwen3_vl) {
+                if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
+                    return error.MissingInputs;
+                }
+                const attention_mask = inputs[1].asInt64();
+                const logits = try gpt_arch.qwen3VlRerankerLogits(
+                    &cb,
+                    allocator,
+                    cfg,
+                    input_ids,
+                    attention_mask,
+                    batch,
+                    seq_len,
+                );
+                defer allocator.free(logits);
+                const shape = [_]i64{ @intCast(batch), 1 };
+                var output_tensor = try Tensor.initFloat32(allocator, "logits", &shape, logits);
+                errdefer output_tensor.deinit();
+                const result = try allocator.alloc(Tensor, 1);
+                result[0] = output_tensor;
+                return result;
+            }
+
             // Return hidden states (not logits) — used for embedding extraction.
             const hidden = try gpt_arch.hiddenForward(&cb, allocator, cfg, input_ids, batch, seq_len, null);
             defer allocator.free(hidden);
@@ -7758,6 +7890,13 @@ fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
 
 fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .classifier and self.arch_config == .gpt and
+        self.arch_config.gpt.family == .qwen3_vl)
+    {
+        return &.{
+            .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } },
+        };
+    }
     if (self.task == .classifier and (self.arch_config == .bert or self.arch_config == .deberta or self.arch_config == .layoutlmv3)) {
         return &.{
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1 } },
@@ -7899,6 +8038,50 @@ test "large multimodal gemma gpu_hosted budget floor widens dense limits" {
     try std.testing.expect(floor.host_limit_bytes >= 2 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.backend_limit_bytes);
+}
+
+test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
+    const weight_bytes = gib(4);
+    const floor = recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(weight_bytes);
+    try std.testing.expectEqual(weight_bytes + mib(256), floor.host_limit_bytes);
+    try std.testing.expectEqual(weight_bytes + mib(512), floor.backend_limit_bytes);
+    try std.testing.expectEqual(weight_bytes * 2 + gib(1) + mib(768), floor.combined_limit_bytes);
+
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_safetensors_bundle_family,
+    };
+    try std.testing.expect(shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+        weight_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3_vl } },
+    ));
+    try std.testing.expect(!shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+        weight_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen2 } },
+    ));
+}
+
+test "Qwen3-VL reranker GGUF budget reserves image projector host envelope" {
+    const decoder_bytes = @as(u64, 1_834_438_720);
+    const floor = recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(decoder_bytes);
+    try std.testing.expectEqual(gib(3), floor.host_limit_bytes);
+
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family,
+    };
+    try std.testing.expect(shouldUseQwen3VlRerankerGgufBudgets(
+        decoder_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3_vl } },
+    ));
+    try std.testing.expect(!shouldUseQwen3VlRerankerGgufBudgets(
+        decoder_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3 } },
+    ));
 }
 
 test "session budget widening preserves higher explicit limits" {

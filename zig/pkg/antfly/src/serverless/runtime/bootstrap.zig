@@ -432,6 +432,7 @@ pub const OwnedStack = struct {
     external_source_plan_resolver: build_mod.ExternalSourcePublicationPlanResolver = undefined,
     api: api_mod.Service,
     query_cache: ?query_mod.QueryCache = null,
+    embedding_provider_runtime: managed_embedder.ProviderRuntime,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
     dense_query_index_name: ?[]u8 = null,
     sparse_query_index_name: []u8 = undefined,
@@ -444,6 +445,8 @@ pub const OwnedStack = struct {
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
+        self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);
+        errdefer self.embedding_provider_runtime.deinit();
         self.s3_client_pool = try S3ClientPool.init(alloc);
         errdefer self.s3_client_pool.deinit();
         self.gcs_client_pool = GcsClientPool.init(alloc, self.s3_client_pool.io_impl.io());
@@ -569,6 +572,7 @@ pub const OwnedStack = struct {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
                 .remote_content = cfg.remote_content,
+                .provider_runtime = &self.embedding_provider_runtime,
             };
             var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
             errdefer query_embedder.deinit();
@@ -595,6 +599,7 @@ pub const OwnedStack = struct {
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
         try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
+        self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
@@ -626,6 +631,7 @@ pub const OwnedStack = struct {
     pub fn deinit(self: *OwnedStack) void {
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
+        self.embedding_provider_runtime.deinit();
         if (self.dense_query_index_name) |index_name| self.alloc.free(index_name);
         self.alloc.free(self.sparse_query_index_name);
         if (self.owned_foreign_registry) |registry| {

@@ -105,6 +105,31 @@ Notes:
 If `tasks` is absent, antfly inference should infer them from `type`, model files, and
 known architecture rules.
 
+Task-sensitive embedders declare their exact text rendering contract rather
+than relying on a model-name branch:
+
+```json
+{
+  "type": "embedder",
+  "embedding_profile": {
+    "task_contract": "profiled",
+    "query": {
+      "prefix": "search_query: "
+    },
+    "document": {
+      "prefix": "search_document: "
+    }
+  }
+}
+```
+
+Instruction-aware models may add `query.instruction_template`; the template
+must contain exactly one `{instruction}` marker. A manifest can use
+`"embedding_task_contract": "required"` when metadata proves the model is
+task-sensitive but cannot supply a trusted profile. Such a model is rejected at
+admission until a complete profile is provided. Symmetric embedders need no
+profile.
+
 ## Task Inference
 
 Inference should be conservative and loader-aware.

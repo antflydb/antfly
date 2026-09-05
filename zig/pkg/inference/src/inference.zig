@@ -48,6 +48,9 @@ pub const architectures = struct {
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
     pub const projector_format = @import("architectures/projector_format.zig");
+    pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
+    pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
+    pub const qwen3vl_reranker = @import("architectures/qwen3vl_reranker.zig");
 };
 pub const finetune = @import("finetune/root.zig");
 pub const finetune_cli = @import("finetune/cli/root.zig");
@@ -119,6 +122,10 @@ test {
     _ = architectures;
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
+    _ = architectures.qwen3vl_plan;
+    _ = architectures.qwen3vl_projector;
+    _ = architectures.qwen3vl_reranker;
+    _ = @import("architectures/gpt.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("server/model_manager.zig");
     _ = finetune;

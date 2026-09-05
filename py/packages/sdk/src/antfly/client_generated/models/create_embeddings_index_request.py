@@ -17,10 +17,13 @@ if TYPE_CHECKING:
     from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.bedrock_embedder_config import BedrockEmbedderConfig
     from ..models.chunker_config import ChunkerConfig
+    from ..models.cohere_embedder_config import CohereEmbedderConfig
     from ..models.enrichment_config import EnrichmentConfig
+    from ..models.google_embedder_config import GoogleEmbedderConfig
     from ..models.index_execution_config import IndexExecutionConfig
     from ..models.ollama_embedder_config import OllamaEmbedderConfig
     from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+    from ..models.vertex_embedder_config import VertexEmbedderConfig
 
 
 T = TypeVar("T", bound="CreateEmbeddingsIndexRequest")
@@ -65,8 +68,9 @@ class CreateEmbeddingsIndexRequest:
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
             product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
         mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
-        embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset):
-            Embedding provider configuration accepted when Antfly creates and
+        embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | CohereEmbedderConfig | GoogleEmbedderConfig |
+            OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset | VertexEmbedderConfig): Embedding provider configuration
+            accepted when Antfly creates and
             maintains an embeddings index. This purpose-specific subset reuses the
             canonical provider configurations; it does not define a second provider
             namespace.
@@ -95,7 +99,16 @@ class CreateEmbeddingsIndexRequest:
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
-    embedder: AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset = UNSET
+    embedder: (
+        AntflyEmbedderConfig
+        | BedrockEmbedderConfig
+        | CohereEmbedderConfig
+        | GoogleEmbedderConfig
+        | OllamaEmbedderConfig
+        | OpenAIEmbedderConfig
+        | Unset
+        | VertexEmbedderConfig
+    ) = UNSET
     chunker: ChunkerConfig | Unset = UNSET
     top_k: int | Unset = 10
     min_weight: float | Unset = 0.0
@@ -105,8 +118,11 @@ class CreateEmbeddingsIndexRequest:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.bedrock_embedder_config import BedrockEmbedderConfig
+        from ..models.cohere_embedder_config import CohereEmbedderConfig
+        from ..models.google_embedder_config import GoogleEmbedderConfig
         from ..models.ollama_embedder_config import OllamaEmbedderConfig
         from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+        from ..models.vertex_embedder_config import VertexEmbedderConfig
 
         type_ = self.type_.value
 
@@ -164,6 +180,12 @@ class CreateEmbeddingsIndexRequest:
         elif isinstance(self.embedder, OpenAIEmbedderConfig):
             embedder = self.embedder.to_dict()
         elif isinstance(self.embedder, BedrockEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, CohereEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, GoogleEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, VertexEmbedderConfig):
             embedder = self.embedder.to_dict()
         else:
             embedder = self.embedder.to_dict()
@@ -240,10 +262,13 @@ class CreateEmbeddingsIndexRequest:
         from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.bedrock_embedder_config import BedrockEmbedderConfig
         from ..models.chunker_config import ChunkerConfig
+        from ..models.cohere_embedder_config import CohereEmbedderConfig
         from ..models.enrichment_config import EnrichmentConfig
+        from ..models.google_embedder_config import GoogleEmbedderConfig
         from ..models.index_execution_config import IndexExecutionConfig
         from ..models.ollama_embedder_config import OllamaEmbedderConfig
         from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+        from ..models.vertex_embedder_config import VertexEmbedderConfig
 
         d = dict(src_dict)
         type_ = CreateEmbeddingsIndexRequestType(d.pop("type"))
@@ -309,7 +334,16 @@ class CreateEmbeddingsIndexRequest:
 
         def _parse_embedder(
             data: object,
-        ) -> AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset:
+        ) -> (
+            AntflyEmbedderConfig
+            | BedrockEmbedderConfig
+            | CohereEmbedderConfig
+            | GoogleEmbedderConfig
+            | OllamaEmbedderConfig
+            | OpenAIEmbedderConfig
+            | Unset
+            | VertexEmbedderConfig
+        ):
             if isinstance(data, Unset):
                 return data
             try:
@@ -336,11 +370,35 @@ class CreateEmbeddingsIndexRequest:
                 return componentsschemas_index_embedder_config_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_3 = CohereEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_4 = GoogleEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_5 = VertexEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_5
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_index_embedder_config_type_3 = AntflyEmbedderConfig.from_dict(data)
+            componentsschemas_index_embedder_config_type_6 = AntflyEmbedderConfig.from_dict(data)
 
-            return componentsschemas_index_embedder_config_type_3
+            return componentsschemas_index_embedder_config_type_6
 
         embedder = _parse_embedder(d.pop("embedder", UNSET))
 

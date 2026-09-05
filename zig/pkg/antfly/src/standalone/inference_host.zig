@@ -138,11 +138,15 @@ test "standalone linked inference ABI validates the supported function-table pre
 const ModelTextsRequest = struct {
     model: []const u8,
     texts: []const []const u8,
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 const ModelPartsRequest = struct {
     model: []const u8,
     parts: []const antfly.template.ContentPart,
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 const RerankTextsRequest = struct {
@@ -448,7 +452,15 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io, deadline_ns, parsed.value.model, parsed.value.texts)
+                try state.node.embedDenseTextsDirectWithContextAndTask(
+                    state.alloc,
+                    state.io,
+                    deadline_ns,
+                    parsed.value.model,
+                    parsed.value.texts,
+                    parsed.value.task_type,
+                    parsed.value.instruction,
+                )
             else
                 try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
             defer {
@@ -477,6 +489,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.parts,
                 state.io,
                 if (operation == .embed_dense_parts_with_context) deadline_ns else null,
+                if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
+                if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
             defer {
                 for (result) |values| alloc.free(values);
@@ -1039,7 +1053,15 @@ fn localAntflyEmbedDenseTextsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
+    return try node.embedDenseTextsDirectWithContextAndTask(
+        alloc,
+        context.request.io,
+        context.request.deadline_ns,
+        model,
+        texts,
+        context.task_type.canonical(),
+        context.instruction,
+    );
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(
@@ -1049,11 +1071,21 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     parts: []const antfly.template.ContentPart,
     io: std.Io,
     deadline_ns: ?u64,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
     defer alloc.free(direct_parts);
-    return try node.embedDensePartsDirectWithContext(alloc, io, deadline_ns, model, direct_parts);
+    return try node.embedDensePartsDirectWithContextAndTask(
+        alloc,
+        io,
+        deadline_ns,
+        model,
+        direct_parts,
+        task_type,
+        instruction,
+    );
 }
 
 pub fn localAntflyDirectDenseParts(
@@ -1070,16 +1102,6 @@ pub fn localAntflyDirectDenseParts(
         } },
     };
     return out;
-}
-
-fn localAntflyEmbedDensePartsWithContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
 }
 
 fn localAntflyEmbedSparseTexts(

@@ -76,6 +76,10 @@ fn projectorFixtureBytes(allocator: std.mem.Allocator, kind: projector_format_mo
             .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
             .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
         },
+        .clip_qwen3vl_image => &[_]gguf_mod.format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+            .{ .key = "clip.projector_type", .value = .{ .string = "qwen3vl_merger" } },
+        },
         .clip_gemma4_image => &[_]gguf_mod.format.MetadataEntry{
             .{ .key = "general.architecture", .value = .{ .string = "clip" } },
             .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4v" } },

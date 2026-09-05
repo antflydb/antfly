@@ -22,6 +22,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const bedrock = @import("bedrock.zig");
 const vertex = @import("vertex.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 
 /// Mirrors the inference registry's task taxonomy plus "other" for models
 /// whose task type the provider's listing API does not classify.
@@ -106,7 +107,7 @@ const default_timeout_ms: u64 = 5_000;
 pub fn listModels(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
     const timeout = if (timeout_ms == 0) default_timeout_ms else timeout_ms;
     return switch (ep.provider) {
-        .openai => try listOpenAi(alloc, http, ep, timeout, "https://api.openai.com"),
+        .openai => try listOpenAi(alloc, http, ep, timeout, provider_defaults.openai_origin),
         .openrouter => try listOpenAi(alloc, http, ep, timeout, "https://openrouter.ai/api/v1"),
         .ollama => try listOllama(alloc, http, ep, timeout),
         .gemini => try listGemini(alloc, http, ep, timeout),
@@ -131,7 +132,7 @@ fn listOpenAi(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listOllama(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    var base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else "http://localhost:11434", "/");
+    var base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else provider_defaults.ollama_origin, "/");
     if (std.mem.endsWith(u8, base, "/v1")) base = base[0 .. base.len - "/v1".len];
     const url = try std.fmt.allocPrint(alloc, "{s}/api/tags", .{base});
     defer alloc.free(url);
@@ -141,7 +142,7 @@ fn listOllama(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listGemini(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    const base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else "https://generativelanguage.googleapis.com/v1beta", "/");
+    const base = provider_defaults.normalizedBase(ep.url, provider_defaults.gemini_v1beta_base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models?pageSize=200", .{base});
     defer alloc.free(url);
     const headers = [_][2][]const u8{.{ "x-goog-api-key", ep.api_key orelse "" }};
@@ -151,13 +152,13 @@ fn listGemini(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listVertex(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    const base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else "https://aiplatform.googleapis.com/v1beta1", "/");
+    const base = provider_defaults.normalizedBase(ep.url, provider_defaults.vertex_v1beta1_base);
     const project_id = if (ep.project_id.len > 0)
         ep.project_id
     else
         (try vertex.vertexProjectIdFromConfigAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null) orelse return error.MissingVertexCredentials);
     defer if (ep.project_id.len == 0) alloc.free(project_id);
-    const location = if (ep.location.len > 0) ep.location else "us-central1";
+    const location = if (ep.location.len > 0) ep.location else provider_defaults.default_google_location;
     const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models?pageSize=100", .{ base, project_id, location });
     defer alloc.free(url);
     const auth = try vertex.mintAuthorizationValueAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null);
@@ -184,7 +185,7 @@ fn listAnthropic(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, ti
 }
 
 fn listCohere(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    const raw = if (ep.url.len > 0) ep.url else "https://api.cohere.com";
+    const raw = if (ep.url.len > 0) ep.url else provider_defaults.cohere_origin;
     const base = try appendPathIfMissing(alloc, std.mem.trimEnd(u8, raw, "/"), "/v1");
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models?page_size=100", .{base});
@@ -195,7 +196,7 @@ fn listCohere(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listBedrock(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    const region = if (ep.region.len > 0) ep.region else "us-east-1";
+    const region = if (ep.region.len > 0) ep.region else provider_defaults.default_aws_region;
     const body = try bedrock.listFoundationModelsBodyAlloc(alloc, http, region, if (ep.url.len > 0) ep.url else null, timeout_ms);
     defer alloc.free(body);
     return try parseBedrockFoundationModels(alloc, body);

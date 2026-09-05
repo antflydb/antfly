@@ -173,13 +173,11 @@ pub const Eval = struct {
             },
             .for_stmt => |for_stmt| {
                 if (for_stmt.open_strip_left) self.stripTrailingWhitespace();
-                if (for_stmt.open_strip_right) self.strip_next = true;
 
                 const iterable = try self.evalExpr(for_stmt.iterable);
                 const items = switch (iterable) {
                     .list => |l| l,
                     else => {
-                        if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                         if (for_stmt.close_strip_right) self.strip_next = true;
                         return;
                     },
@@ -187,7 +185,7 @@ pub const Eval = struct {
 
                 if (items.len == 0) {
                     for (for_stmt.else_body) |child| try self.execNode(child);
-                    if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
+                    if (for_stmt.else_body.len != 0 and for_stmt.close_strip_left) self.stripTrailingWhitespace();
                     if (for_stmt.close_strip_right) self.strip_next = true;
                     return;
                 }
@@ -225,9 +223,13 @@ pub const Eval = struct {
                     loop_map.put(self.arena, "revindex0", Value.int(@intCast(items.len - i - 1))) catch return;
                     scope.put(self.arena, "loop", .{ .map = loop_map }) catch return;
 
+                    // The whitespace adjacent to a for/endfor tag is part of
+                    // the repeated body. Jinja applies both controls on every
+                    // iteration, not just at the outer loop boundary.
+                    if (for_stmt.open_strip_right) self.strip_next = true;
                     for (for_stmt.body) |child| try self.execNode(child);
+                    if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                 }
-                if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                 if (for_stmt.close_strip_right) self.strip_next = true;
             },
             .set_stmt => |set| {
@@ -1010,6 +1012,38 @@ test "eval for strip whitespace" {
     var eval = Eval.init(a, &ctx);
     const result = try eval.exec(nodes);
     try std.testing.expectEqualStrings("ab", result);
+}
+
+test "for tag whitespace control is applied on every iteration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const items = [_]Value{ Value.str("a"), Value.str("b") };
+    var ctx = ValueMap{};
+    try ctx.put(a, "items", .{ .list = &items });
+
+    const parser = @import("parser.zig");
+    const nodes = try parser.Parser.parse("{% for x in items %}{{ x }}\n{%- endfor %}", a);
+    var eval = Eval.init(a, &ctx);
+    const result = try eval.exec(nodes);
+    try std.testing.expectEqualStrings("ab", result);
+}
+
+test "for opening right-strip does not escape an empty loop body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const items = [_]Value{};
+    var ctx = ValueMap{};
+    try ctx.put(a, "items", .{ .list = &items });
+
+    const parser = @import("parser.zig");
+    const nodes = try parser.Parser.parse("A{% for x in items -%} skipped{% else %}  else{% endfor %}  Z", a);
+    var eval = Eval.init(a, &ctx);
+    const result = try eval.exec(nodes);
+    try std.testing.expectEqualStrings("A  else  Z", result);
 }
 
 test "eval set strip whitespace" {

@@ -1,0 +1,7 @@
+# Kept deliberately separate from the frozen Transformers oracle.  MLX-VLM
+# carries its own Transformer dependency line and must never perturb the
+# canonical Qwen3-VL parity environment.
+# Qwen3-VL's processor applies a Jinja chat template at benchmark runtime;
+# Transformers exposes Jinja as an optional dependency, so pin it explicitly.
+jinja2==3.1.6
+mlx-vlm==0.6.17
