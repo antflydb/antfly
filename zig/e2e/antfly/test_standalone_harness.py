@@ -18,6 +18,7 @@ import pytest
 import requests
 
 import conftest as e2e_conftest
+import helpers
 import test_standalone as standalone
 
 
@@ -161,3 +162,45 @@ def test_request_failure_attaches_one_bounded_server_log_tail():
     assert f"omitted {omitted} earlier server-log characters" in message
     assert message.endswith("actionable-tail")
     assert raised.value.__cause__ is None
+
+
+def _http_error(status: int, body: bytes, **headers: str) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    response._content = body
+    response.headers.update(headers)
+    return requests.HTTPError(response=response)
+
+
+def test_wait_until_retries_structured_retryable_service_unavailable():
+    calls = 0
+
+    def probe() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _http_error(
+                503,
+                b'{"code":"index_rebuilding","retryable":true}',
+                **{"Content-Type": "application/json", "Retry-After": "0"},
+            )
+        return "ready"
+
+    assert helpers.wait_until(probe, timeout_s=1.0, interval_s=0) == "ready"
+    assert calls == 2
+
+
+def test_wait_until_preserves_nonretryable_service_unavailable():
+    expected = _http_error(
+        503,
+        b'{"code":"storage_failed","retryable":false}',
+        **{"Content-Type": "application/json"},
+    )
+
+    def probe() -> None:
+        raise expected
+
+    with pytest.raises(requests.HTTPError) as raised:
+        helpers.wait_until(probe, timeout_s=1.0)
+
+    assert raised.value is expected

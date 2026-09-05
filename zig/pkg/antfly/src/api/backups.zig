@@ -2650,6 +2650,7 @@ const RemoteBackupStore = struct {
     fn writeFile(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        source_io: std.Io,
         suffix: []const u8,
         src_path: []const u8,
         content_type: []const u8,
@@ -2659,7 +2660,7 @@ const RemoteBackupStore = struct {
         try self.ensureBucketWithCancellation(cancellation);
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        var result = try self.client.putFileWithIo(self.io, self.bucket, key, src_path, .{
+        var result = try self.client.putFileWithIo(source_io, self.bucket, key, src_path, .{
             .content_type = content_type,
             .cancellation = objectCancellationToken(cancellation),
         });
@@ -3008,15 +3009,16 @@ const RemoteBackupStore = struct {
         };
     }
 
-    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, dest_path: []const u8) !void {
+    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, destination_io: std.Io, suffix: []const u8, dest_path: []const u8) !void {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
+        try self.client.getFileWithIo(destination_io, self.bucket, key, dest_path, .{});
     }
 
     fn copyFileVerified(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         suffix: []const u8,
         destination_path: []const u8,
         expected_size: u64,
@@ -3031,10 +3033,10 @@ const RemoteBackupStore = struct {
             return error.BackupArtifactIntegrityMismatch;
         const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
         if (std.fs.path.dirname(destination_path)) |parent|
-            try ensureDirPathWithIo(self.io, parent);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, destination_path) catch {};
-        var destination = try fs_paths.createFilePortable(self.io, destination_path, .{ .truncate = true });
-        defer destination.close(self.io);
+            try ensureDirPathWithIo(destination_io, parent);
+        errdefer std.Io.Dir.cwd().deleteFile(destination_io, destination_path) catch {};
+        var destination = try fs_paths.createFilePortable(destination_io, destination_path, .{ .truncate = true });
+        defer destination.close(destination_io);
 
         const object_cancellation = object_storage.CancellationToken.fromCallback(
             cancellation.ptr,
@@ -3058,7 +3060,7 @@ const RemoteBackupStore = struct {
             defer result.deinit(alloc);
             if (result.body.len != wanted) return error.SourceFileChanged;
             hasher.update(result.body);
-            try destination.writePositionalAll(self.io, result.body, offset);
+            try destination.writePositionalAll(destination_io, result.body, offset);
             offset += wanted;
         }
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -3066,7 +3068,7 @@ const RemoteBackupStore = struct {
         const actual = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &actual, expected_sha256))
             return error.BackupArtifactIntegrityMismatch;
-        try destination.sync(self.io);
+        try destination.sync(destination_io);
     }
 
     fn listObjectsPage(
@@ -3106,6 +3108,7 @@ const RemoteBackupStore = struct {
     fn uploadDirectoryRecursive(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        source_io: std.Io,
         src_path: []const u8,
         dest_suffix: []const u8,
         cancellation: CancellationToken,
@@ -3113,7 +3116,7 @@ const RemoteBackupStore = struct {
         try cancellation.check();
         try self.ensureBucketWithCancellation(cancellation);
 
-        const io = self.io;
+        const io = source_io;
 
         var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
         defer src_dir.close(io);
@@ -3144,18 +3147,22 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, 1000, .none);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, 1000, .none);
     }
 
     fn downloadDirectoryRecursiveWithCancellation(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         src_suffix: []const u8,
         dest_path: []const u8,
         cancellation: CancellationToken,
     ) !void {
         return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(
             alloc,
+            destination_io,
             src_suffix,
             dest_path,
             1000,
@@ -3164,12 +3171,15 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
-        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, page_size, .none);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, page_size, .none);
     }
 
     fn downloadDirectoryRecursiveWithPageSizeAndCancellation(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         src_suffix: []const u8,
         dest_path: []const u8,
         page_size: u32,
@@ -3193,7 +3203,7 @@ const RemoteBackupStore = struct {
         // Preserve that fast path for uncancellable callers; restore jobs use
         // per-object transfers so active provider requests can be interrupted.
         if (object_cancellation == null) {
-            if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
+            if (try self.client.getPrefixWithIo(destination_io, self.bucket, key_prefix, dest_path)) |downloaded| {
                 if (downloaded == 0) return error.FileNotFound;
                 return;
             }
@@ -3224,7 +3234,7 @@ const RemoteBackupStore = struct {
                 try validateArtifactRelativePath(rel);
                 const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
                 defer alloc.free(dest_file);
-                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{
+                try self.client.getFileWithIo(destination_io, self.bucket, entry.key, dest_file, .{
                     .cancellation = object_cancellation,
                 });
                 found = true;
@@ -13813,16 +13823,39 @@ pub fn copyDirectoryToLocationWithCancellation(
     src_path: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    return copyDirectoryToLocationUsingIoWithCancellation(
+        alloc,
+        null,
+        location,
+        backup_id,
+        group_id,
+        src_path,
+        cancellation,
+    );
+}
+
+pub fn copyDirectoryToLocationUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    filesystem_io: ?std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    group_id: u64,
+    src_path: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    // `filesystem_io` owns only the local source tree. Remote object clients
+    // retain their configured transport I/O for repository requests.
     try cancellation.check();
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const dest_root = try shardSnapshotPath(alloc, backup_root, backup_id, group_id);
             defer alloc.free(dest_root);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
             try copyDirectoryRecursiveWithIo(
                 alloc,
-                io_impl.io(),
+                source_io,
                 src_path,
                 dest_root,
                 .transient,
@@ -13832,7 +13865,7 @@ pub fn copyDirectoryToLocationWithCancellation(
         .remote => |*store| {
             const dest_suffix = try shardSnapshotRelPath(alloc, backup_id, group_id);
             defer alloc.free(dest_suffix);
-            try store.uploadDirectoryRecursive(alloc, src_path, dest_suffix, cancellation);
+            try store.uploadDirectoryRecursive(alloc, source_io, src_path, dest_suffix, cancellation);
         },
     }
 }
@@ -13848,14 +13881,14 @@ pub fn copyDirectoryFromLocation(
 
 pub fn copyDirectoryFromLocationUsingIo(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    destination_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
     return try copyDirectoryFromLocationUsingIoWithCancellation(
         alloc,
-        shared_io,
+        destination_io,
         location,
         snapshot_path,
         dest_path,
@@ -13865,28 +13898,28 @@ pub fn copyDirectoryFromLocationUsingIo(
 
 pub fn copyDirectoryFromLocationUsingIoWithCancellation(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    filesystem_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    // `filesystem_io` owns only the local destination tree. Remote object
+    // clients retain their configured transport I/O for repository requests.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_root);
-            if (shared_io) |io|
-                try copyDirectoryRecursiveWithIo(alloc, io, src_root, dest_path, .transient, cancellation)
-            else {
-                var io_impl = std.Io.Threaded.init(alloc, .{});
-                defer io_impl.deinit();
-                try copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_root, dest_path, .transient, cancellation);
-            }
+            try copyDirectoryRecursiveWithIo(alloc, destination_io, src_root, dest_path, .transient, cancellation);
         },
         .remote => |*store| try store.downloadDirectoryRecursiveWithCancellation(
             alloc,
+            destination_io,
             snapshot_path,
             dest_path,
             cancellation,
@@ -13905,23 +13938,24 @@ pub fn copyFileFromLocation(
 
 pub fn copyFileFromLocationUsingIo(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    filesystem_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    // The explicit I/O authority is for the local destination, not transport.
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_path);
-            if (shared_io) |io|
-                try copyFileAbsoluteWithIoOptions(io, src_path, dest_path, .transient)
-            else
-                try copyFileAbsoluteWithDurability(src_path, dest_path, .transient);
+            try copyFileAbsoluteWithIoOptions(destination_io, src_path, dest_path, .transient);
         },
         .remote => |*store| {
-            try store.readFile(alloc, trimLeftSlash(snapshot_path), dest_path);
+            try store.readFile(alloc, destination_io, trimLeftSlash(snapshot_path), dest_path);
         },
     }
 }
@@ -14008,6 +14042,7 @@ pub fn copyFileFromLocationVerifiedUsingIo(
         },
         .remote => |*store| try store.copyFileVerified(
             alloc,
+            io,
             trimLeftSlash(relative_path),
             destination_path,
             expected_size,
@@ -14042,25 +14077,47 @@ pub fn copyFileToLocationWithCancellation(
     content_type: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    return copyFileToLocationUsingIoWithCancellation(
+        alloc,
+        null,
+        location,
+        snapshot_path,
+        src_path,
+        content_type,
+        cancellation,
+    );
+}
+
+pub fn copyFileToLocationUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    filesystem_io: ?std.Io,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    src_path: []const u8,
+    content_type: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    // The explicit I/O authority is for the local source, not transport.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(dest_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
             try copyFileAbsoluteWithIoOptionsCancellable(
-                io_impl.io(),
+                source_io,
                 src_path,
                 dest_path,
                 .durable,
                 cancellation,
             );
-            try syncPathAncestorsWithIo(io_impl.io(), std.fs.path.dirname(dest_path) orelse ".");
+            try syncPathAncestorsWithIo(source_io, std.fs.path.dirname(dest_path) orelse ".");
         },
         .remote => |*store| {
-            try store.writeFile(alloc, trimLeftSlash(snapshot_path), src_path, content_type, cancellation);
+            try store.writeFile(alloc, source_io, trimLeftSlash(snapshot_path), src_path, content_type, cancellation);
         },
     }
 }
@@ -16202,10 +16259,15 @@ fn writePortableListValidationFixture(
 ) !void {
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}.afb", .{fixture_backup_id});
     defer alloc.free(artifact_path);
+    const payload = "payload";
+    var integrity = try portableBytesIntegrityAlloc(alloc, payload);
+    defer integrity.deinit(alloc);
     const shards = [_]ShardSnapshot{.{
         .group_id = 1,
         .start_key = "",
         .snapshot_path = artifact_path,
+        .artifact_size_bytes = integrity.size_bytes,
+        .artifact_sha256 = integrity.sha256,
     }};
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 1,
@@ -16214,12 +16276,6 @@ fn writePortableListValidationFixture(
     };
     var manifest = try createManifest(alloc, fixture_backup_id, .portable, &table, &shards);
     defer manifest.deinit(alloc);
-    const payload = "payload";
-    var integrity = try portableBytesIntegrityAlloc(alloc, payload);
-    const mutable_shard = &@constCast(manifest.shards)[0];
-    mutable_shard.artifact_size_bytes = integrity.size_bytes;
-    mutable_shard.artifact_sha256 = integrity.sha256;
-    integrity = undefined;
     switch (location.*) {
         .file => |backup_root| {
             const absolute_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
@@ -21101,7 +21157,7 @@ test "native backup directory copy preserves nested files" {
         ),
     };
     defer remote_location.deinit(alloc);
-    try remote_location.remote.uploadDirectoryRecursive(alloc, src, expected.snapshot_path, .none);
+    try remote_location.remote.uploadDirectoryRecursive(alloc, std.testing.io, src, expected.snapshot_path, .none);
     const remote_verified_top_path = try std.fmt.allocPrint(alloc, "{s}/verified/remote-top.sst", .{root});
     defer alloc.free(remote_verified_top_path);
     try copyFileFromLocationVerifiedUsingIo(

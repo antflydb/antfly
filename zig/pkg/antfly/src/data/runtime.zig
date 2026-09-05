@@ -5674,6 +5674,27 @@ pub const DataServer = struct {
         return lo < groups.len and groups[lo].group_id == group_id;
     }
 
+    fn retainSortedDeferredStartupCatchUpGroup(
+        groups: []const antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
+        retained: []bool,
+        group_id: u64,
+    ) void {
+        std.debug.assert(groups.len == retained.len);
+        var lo: usize = 0;
+        var hi = groups.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (groups[mid].group_id < group_id) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        while (lo < groups.len and groups[lo].group_id == group_id) : (lo += 1) {
+            retained[lo] = true;
+        }
+    }
+
     const StartupCatchUpCompletion = struct {
         dirty: bool,
         not_before_ms: u64,
@@ -14418,14 +14439,19 @@ pub const DataServer = struct {
             return stats;
         };
         defer self.alloc.free(deferred_groups);
-        if (!full_scan) {
-            std.mem.sort(
-                antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
-                deferred_groups,
-                {},
-                deferredStartupCatchUpLessThan,
-            );
-        }
+        std.mem.sort(
+            antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
+            deferred_groups,
+            {},
+            deferredStartupCatchUpLessThan,
+        );
+        const retained_deferred_groups = self.alloc.alloc(bool, deferred_groups.len) catch |err| {
+            _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
+            std.log.warn("provisioned startup catch-up deferred-group retention allocation failed err={s}", .{@errorName(err)});
+            return stats;
+        };
+        defer self.alloc.free(retained_deferred_groups);
+        @memset(retained_deferred_groups, false);
         if (!full_scan and deferred_groups.len == 0) {
             inspection_complete = true;
             return stats;
@@ -14455,8 +14481,6 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
-
-        if (local_group_ids.len == 0) return stats;
 
         // Group ids are the routing identity and are unique within the catalog.
         // Walk ranges once with logarithmic membership checks instead of the
@@ -14588,6 +14612,11 @@ pub const DataServer = struct {
                 // enforces provisioned_startup_catch_up_interval_ms.
                 stats.debt_remaining = true;
                 stats.unparked_debt_remaining = true;
+                retainSortedDeferredStartupCatchUpGroup(
+                    deferred_groups,
+                    retained_deferred_groups,
+                    group_id,
+                );
                 continue;
             }
             if (result.quarantined) {
@@ -14623,12 +14652,14 @@ pub const DataServer = struct {
         }
 
         inspection_complete = true;
-        if (!stats.debt_remaining) {
-            // Admission clears live keys as it succeeds. Any exact key left
-            // after a complete debt-free pass no longer maps to a local route
-            // in this catalog snapshot, so retire it instead of retaining an
-            // unbounded topology tombstone.
-            for (deferred_groups) |deferred| {
+        // Admission clears the live key before inspecting a shard and creates
+        // a new generation if later work defers again. Retire every captured
+        // generation that did not remain blocked at admission. This makes
+        // stale topology keys independent: unrelated replay, quarantine, or
+        // restore debt can no longer keep them alive indefinitely. The
+        // generation fence preserves any deferral published during this scan.
+        for (deferred_groups, retained_deferred_groups) |deferred, retained| {
+            if (!retained) {
                 self.liveRuntimeWriteSource().clearDeferredStartupCatchUpGroupIfUnchanged(deferred);
             }
         }
@@ -27522,6 +27553,10 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     try std.testing.expect(DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 7));
     try std.testing.expect(DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 11));
     try std.testing.expect(!DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 9));
+    var retained = [_]bool{ false, false };
+    DataServer.retainSortedDeferredStartupCatchUpGroup(&deferred, &retained, 11);
+    try std.testing.expect(!retained[0]);
+    try std.testing.expect(retained[1]);
     try std.testing.expect(containsSortedU64(&.{ 7, 11 }, 7));
     try std.testing.expect(containsSortedU64(&.{ 7, 11 }, 11));
     try std.testing.expect(!containsSortedU64(&.{ 7, 11 }, 9));
@@ -28060,6 +28095,20 @@ test "data runtime startup catch-up retains deferred inspection despite clean ca
         try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
         server.write_source.write_cache = &write_cache;
 
+        // Seed an exact retry for a group that has already disappeared from
+        // the catalog. The live docs group below remains busy, so this proves
+        // stale cleanup is per captured generation rather than gated on the
+        // aggregate pass being debt free.
+        var removed_activity = server.write_source.tryBeginGroupRefreshActivity("removed", 88).?;
+        const removed_result = try server.write_source.catchUpTableGroupBestEffortWithMetadata(
+            alloc,
+            88,
+            "removed",
+            .{},
+        );
+        try std.testing.expect(removed_result.busy);
+        removed_activity.deinit();
+
         try write_cache.beginBulkIngestLocked("docs");
         {
             lockAtomic(server.write_source.localDbMutex());
@@ -28089,6 +28138,10 @@ test "data runtime startup catch-up retains deferred inspection despite clean ca
         // the cached status reports no debt. The uninspected shard must still
         // retain the coalesced retry after this pass completes.
         try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
+        const deferred = try server.write_source.snapshotDeferredStartupCatchUpGroups(alloc);
+        defer alloc.free(deferred);
+        try std.testing.expectEqual(@as(usize, 1), deferred.len);
+        try std.testing.expectEqual(@as(u64, 77), deferred[0].group_id);
     }
 }
 
