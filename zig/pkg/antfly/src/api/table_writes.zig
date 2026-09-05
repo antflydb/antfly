@@ -10708,24 +10708,27 @@ pub const ProvisionedTableWriteSource = struct {
         entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
     }
 
-    fn markRepairHandoffOwnerAuditCompleteBestEffort(
+    fn authorizeRepairHandoffOwnerPublicationBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
-    ) void {
+    ) ?RepairHandoffPublicationToken {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        const index = self.findTableActivityLocked(table_name, group_id) orelse return;
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return null;
         const entry = &self.active_table_activities.items[index];
-        if (entry.repair_handoff_status_pending == 0) return;
+        if (entry.repair_handoff_status_pending == 0) return null;
         // This transition is reserved for the aggregate scheduler owner after
         // its durable repair-state read under the group operation lease. A DB
         // clear callback may only observe that debt: callback invocations copy
         // their hook under a mutex and can complete in the opposite order from
-        // their durable mutations.
+        // their durable mutations. Return the authorization directly to that
+        // owner: a generic status callback must never be able to borrow and
+        // settle another operation's completion receipt.
         entry.repair_handoff_clear_observed = true;
         entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
+        return .{ .generation = entry.repair_handoff_generation };
     }
 
     fn invalidateRepairHandoffOwnerAuditBestEffort(
@@ -13331,10 +13334,10 @@ pub const ProvisionedTableWriteSource = struct {
         event: db_mod.QueryVisibilityEvent,
     ) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        // Cached owners release repair handoff authority only after a fresh
-        // post-clear observation is successfully published. Sources without a
-        // status cache have no publication plane to wait for: their next live
-        // status request is itself authoritative.
+        // Cached owners release repair handoff authority only from the exact
+        // final-audit owner after its post-clear observation is published.
+        // Sources without a status cache have no publication plane to wait
+        // for: their next live status request is itself authoritative.
         defer if (self.runtime_status_cache == null) switch (event.change) {
             .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
                 _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
@@ -13367,16 +13370,13 @@ pub const ProvisionedTableWriteSource = struct {
             },
             .index_repair_progress => {
                 // The DB scheduler already matched this edge to an exact
-                // revision-scoped progress wait. Initial materialization stays
-                // on its resident build lane; waking the corruption-repair
-                // owner for every generated batch would create a group-wide
-                // no-op loop. Exact repair progress still wakes immediately,
-                // while an unknown-scope event remains conservative.
-                self.notifyLocalIndexRepairDebt(
-                    table_name,
-                    group_id,
-                    if (isInitialBuildVisibilityEvent(event)) .observe_debt else .signal_runnable,
-                );
+                // revision-scoped progress wait. Progress is a level fact, not
+                // a new ownership handoff: minting a queue receipt for every
+                // page would turn a cooperative build into an immediate
+                // repair loop. The selected owner already retains its durable
+                // route, while structural/operator completion signals use the
+                // separate causal `signal_runnable` edge below.
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .observe_debt);
                 return;
             },
             .index_repair_pending => {
@@ -14797,6 +14797,7 @@ pub const ProvisionedTableWriteSource = struct {
         );
         result.index_repair_paused = false;
         result.repair_health = .non_terminal;
+        var repair_handoff_publication: ?RepairHandoffPublicationToken = null;
         if (final_restore_repair_needed and final_index_load_failure) {
             // Restore cannot prove projection availability while any required
             // generation is unavailable. Preserve the original fail-closed
@@ -14822,7 +14823,7 @@ pub const ProvisionedTableWriteSource = struct {
             result.index_repair_pending = false;
             result.index_repair_paused = final_repair_summary.paused != 0;
             if (result.index_repair_paused) result.had_debt = true;
-            self.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
+            repair_handoff_publication = self.authorizeRepairHandoffOwnerPublicationBestEffort(table_name, group_id);
         }
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
         if (result.terminalDegraded()) {
@@ -14843,11 +14844,27 @@ pub const ProvisionedTableWriteSource = struct {
                 .consistent,
                 null,
                 null,
+                repair_handoff_publication,
                 db,
             ));
             startup_status_active = false;
         } else {
-            try finishManagedMaintenanceStatusPublication(self, table_name, publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
+            if (repair_handoff_publication != null) {
+                try finishManagedMaintenanceStatusPublication(self, table_name, publishRuntimeStatusSnapshotWithStartupPhaseMode(
+                    self,
+                    alloc,
+                    table_name,
+                    group_id,
+                    .idle,
+                    .consistent,
+                    null,
+                    null,
+                    repair_handoff_publication,
+                    db,
+                ));
+            } else {
+                try finishManagedMaintenanceStatusPublication(self, table_name, publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
+            }
             startup_status_active = false;
         }
         // A fenced status observation cannot carry its clear authorization
@@ -17821,11 +17838,15 @@ pub const ProvisionedTableWriteSource = struct {
         else
             null;
         errdefer if (owned_activation_target) |*target| target.deinit(alloc);
-        // Requeue removes and reinserts one key, so one spare slot makes every
-        // retry allocation-free. Heap admission is O(log n); exact duplicate
-        // detection remains expected O(1) and does not scan unrelated work.
-        try self.structural_reconcile_tables.ensureUnusedCapacity(alloc, 2);
-        try self.structural_reconcile_keys.ensureUnusedCapacity(alloc, 2);
+        // Active requests are absent from the heap but retain keyed ownership.
+        // Reserve for every keyed owner plus this admission so all concurrent
+        // workers can requeue without allocating. Heap admission is O(log n);
+        // exact duplicate detection remains expected O(1).
+        try self.structural_reconcile_tables.ensureTotalCapacity(
+            alloc,
+            self.structural_reconcile_keys.count() + 1,
+        );
+        try self.structural_reconcile_keys.ensureUnusedCapacity(alloc, 1);
         try self.structural_reconcile_inflight_groups.ensureTotalCapacity(
             alloc,
             structural_reconcile_dispatch_workers,
@@ -29205,6 +29226,7 @@ fn publishRuntimeStatusSnapshot(
         .best_effort,
         null,
         null,
+        null,
         db,
     );
 }
@@ -29223,6 +29245,7 @@ fn publishRuntimeStatusSnapshotConsistent(
         group_id,
         .idle,
         .consistent,
+        null,
         null,
         null,
         db,
@@ -29247,6 +29270,7 @@ fn publishTargetedRuntimeStatusSnapshotConsistent(
         .consistent,
         index_name,
         &result,
+        null,
         db,
     );
     return result;
@@ -29469,6 +29493,7 @@ fn publishRuntimeStatusSnapshotConsistentIfAvailable(
         .consistent_if_available,
         null,
         null,
+        null,
         db,
     );
 }
@@ -29481,7 +29506,7 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
     phase: db_mod.types.StartupCatchUpPhase,
     db: *db_mod.DB,
 ) !void {
-    try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, phase, .best_effort, null, null, db);
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, phase, .best_effort, null, null, null, db);
 }
 
 const RuntimeStatusSnapshotMode = enum {
@@ -29516,15 +29541,11 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     mode: RuntimeStatusSnapshotMode,
     target_index_name: ?[]const u8,
     publication_result: ?*runtime_status.TableRuntimeSnapshotCache.PublishResult,
+    repair_handoff_publication: ?ProvisionedTableWriteSource.RepairHandoffPublicationToken,
     db: *db_mod.DB,
 ) !void {
-    const repair_handoff_token = source.captureRepairHandoffPublicationTokenBestEffort(
-        table_name,
-        group_id,
-        true,
-    );
     const snapshot_cache = source.runtime_status_cache orelse {
-        if (repair_handoff_token) |token| {
+        if (repair_handoff_publication) |token| {
             _ = source.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
         }
         return;
@@ -29561,8 +29582,14 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     // causal boundary that makes status authoritative again. Unrelated dense
     // or enrichment work remains visible as ordinary catch-up diagnostics and
     // cannot indefinitely hold another index's status fence.
-    if (repair_handoff_token) |token| {
-        _ = source.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
+    if (repair_handoff_publication) |token| {
+        // Completion is acknowledged only by the exact owner publication
+        // authorized after the durable audit. A newer generic observation is
+        // not equivalent proof: retain the scheduler receipt and retry under
+        // ownership instead of letting a stale-observation result consume it.
+        if (result != .published) return error.RuntimeStatusPublicationContended;
+        if (!source.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token))
+            return error.RuntimeStatusPublicationContended;
     }
     _ = source.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
 }
@@ -29661,6 +29688,10 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
             var status = cached_status;
             defer status.deinit(alloc);
+            const retain_authoritative_metadata = startupObservationMayRetainAuthority(
+                status.metadata,
+                lsm_root_generation,
+            );
             var startup = startupCatchUpStatsForPhase(phase, db);
             const cached_startup = status.stats.async_indexing.startup;
             if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
@@ -29673,7 +29704,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             // before layering the startup progress fields onto them.
             _ = try refreshRuntimeStatusStatsIfAvailable(alloc, &status, db);
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
-            markStartupRuntimeStatus(&status, startup);
+            if (!retain_authoritative_metadata) markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
             result = try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
         } else {
@@ -29698,6 +29729,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     var status_initialized = false;
     var status_from_cached_best_effort = false;
     var cached_best_effort_source: runtime_status.RuntimeStatusSource = .unknown;
+    var retained_authoritative_metadata: ?runtime_status.RuntimeStatusMetadata = null;
     defer {
         if (status_initialized) {
             var owned = status;
@@ -29706,6 +29738,11 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     }
     if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
         cached_startup = cached_status.stats.async_indexing.startup;
+        if (publication_kind == .runtime and phase != .idle and
+            startupObservationMayRetainAuthority(cached_status.metadata, lsm_root_generation))
+        {
+            retained_authoritative_metadata = cached_status.metadata;
+        }
         switch (mode) {
             .best_effort => {
                 cached_best_effort_source = cached_status.metadata.source;
@@ -29796,6 +29833,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             markStartupRuntimeStatus(&status, startup)
         else
             markRuntimeStatusFromDb(&status, phase);
+        if (retained_authoritative_metadata) |metadata| status.replaceMetadata(metadata);
         status.metadata.lsm_root_generation = lsm_root_generation;
         return try publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status);
     }
@@ -30361,6 +30399,19 @@ fn markStartupRuntimeStatus(
     setRuntimeStatusMetadata(status, .startup_catch_up, startupRuntimeStatusFreshness(startup.phase));
 }
 
+fn startupObservationMayRetainAuthority(
+    metadata: runtime_status.RuntimeStatusMetadata,
+    opened_root_generation: u64,
+) bool {
+    if (metadata.freshness != .fresh or
+        metadata.lsm_root_generation != opened_root_generation)
+        return false;
+    return switch (metadata.source) {
+        .live_writer_publish, .background_refresh, .remote_store => true,
+        .unknown, .synthetic_config, .cached_snapshot, .startup_catch_up, .rebuild_state_quarantine => false,
+    };
+}
+
 fn clearStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStatus) void {
     status.stats.async_indexing.startup.active = false;
     status.stats.async_indexing.startup.phase = .idle;
@@ -30399,6 +30450,7 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
         .stats = .{},
     };
     var status_initialized = false;
+    var retain_authoritative_metadata = false;
     defer {
         if (status_initialized) {
             var owned = status;
@@ -30410,6 +30462,12 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |owned_status| {
             status = owned_status;
             status_initialized = true;
+            if (db) |managed_db| {
+                retain_authoritative_metadata = startupObservationMayRetainAuthority(
+                    status.metadata,
+                    managed_db.core.index_manager.lsm_root_generation,
+                );
+            }
             var merged_startup = startup;
             if (!merged_startup.wal_retention_known) {
                 const cached_startup = status.stats.async_indexing.startup;
@@ -30458,8 +30516,19 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
     if (!status_initialized) return;
 
     status.group_id = group_id;
+    if (db) |managed_db| {
+        const opened_root_generation = managed_db.core.index_manager.lsm_root_generation;
+        if (opened_root_generation != source.visibleRootGeneration(group_id))
+            return error.RuntimeStatusPublicationFenced;
+        status.metadata.lsm_root_generation = opened_root_generation;
+    }
     if (startup.active) {
-        markStartupRuntimeStatus(&status, startup);
+        // Startup/opening is activity, not a serving-authority revocation. A
+        // later inspection of the same root may overlap the completion owner;
+        // retain its fresh authority while exposing the new activity through
+        // async_indexing.startup. Explicit root, target, and repair fences are
+        // independent and still revoke the affected authority.
+        if (!retain_authoritative_metadata) markStartupRuntimeStatus(&status, startup);
     } else if (db == null) {
         var merged_startup = status.stats.async_indexing.startup;
         db_mod.types.accumulateStartupCatchUpStats(&merged_startup, startup);
@@ -30579,7 +30648,10 @@ fn finishManagedMaintenanceStatusPublication(
         // owner. Otherwise the maintenance owner can retire after its final
         // idle snapshot loses the fence, leaving the preceding catching-up
         // heartbeat visible indefinitely even though durable work completed.
-        error.RuntimeStatusPublicationFenced, error.WriterLocked => {
+        error.RuntimeStatusPublicationFenced,
+        error.RuntimeStatusPublicationContended,
+        error.WriterLocked,
+        => {
             source.markWriteCacheDirty(table_name);
             source.notifyLocalChange(table_name, .runtime_status);
             return;
@@ -30790,6 +30862,7 @@ fn catchUpManagedDb(
             group_id,
             .startup_catch_up,
             .consistent,
+            null,
             null,
             null,
             db,
@@ -43356,6 +43429,61 @@ test "active structural key coalesces duplicate and requeues allocation free" {
     try std.testing.expectEqual(ProvisionedTableWriteSource.StructuralReconcileOwnership.queued, source.structural_reconcile_keys.get(active.scheduler_key).?);
 }
 
+test "all structural workers retain allocation-free requeue capacity during admission bursts" {
+    const alloc = std.testing.allocator;
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-requeue-reservations",
+        catalog.iface(),
+    );
+    defer source.deinit();
+    source.structural_reconcile_scheduled.store(true, .release);
+
+    var name_buffer: [64]u8 = undefined;
+    for (0..8) |i| {
+        const name = try std.fmt.bufPrint(&name_buffer, "semantic-{d}", .{i});
+        try source.enqueueTableIndexStructuralReconcile("docs", name);
+    }
+
+    const worker_count = ProvisionedTableWriteSource.structural_reconcile_dispatch_workers;
+    var active: [worker_count]ProvisionedTableWriteSource.StructuralReconcileRequest = undefined;
+    var active_count: usize = 0;
+    var requeued_count: usize = 0;
+    defer for (active[requeued_count..active_count]) |request| {
+        source.finishStructuralReconcileOwnership(request);
+        var owned = request;
+        owned.handoffDeferredRepairDebt(&source);
+        owned.deinit(alloc);
+    };
+
+    const io = source.table_activity_threaded.io();
+    source.structural_reconcile_mutex.lockUncancelable(io);
+    while (active_count < active.len) : (active_count += 1) {
+        active[active_count] = source.structural_reconcile_tables.pop().?;
+        source.structural_reconcile_keys.getPtr(active[active_count].scheduler_key).?.* = .active;
+    }
+    source.structural_reconcile_mutex.unlock(io);
+
+    // Keep the heap just below its original growth boundary while four
+    // workers own requests outside it. Capacity must follow total keyed
+    // ownership, not only the currently queued item count.
+    for (8..23) |i| {
+        const name = try std.fmt.bufPrint(&name_buffer, "semantic-{d}", .{i});
+        try source.enqueueTableIndexStructuralReconcile("docs", name);
+    }
+    try std.testing.expect(
+        source.structural_reconcile_tables.capacity() >= source.structural_reconcile_keys.count(),
+    );
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (&active) |*request| {
+        source.requeueActiveStructuralReconcile(request, failing.allocator());
+        requeued_count += 1;
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 23), source.structural_reconcile_tables.count());
+}
+
 test "structural scheduler burst uses keyed coalescing and FIFO deadlines" {
     var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
     var source = ProvisionedTableWriteSource.init(
@@ -44844,7 +44972,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7001);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -44887,7 +45015,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         .index_repair_cleared,
     );
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7002);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7002);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -44905,7 +45033,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7003);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7003);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -44949,7 +45077,7 @@ test "repair handoff status settles after authoritative cached publication" {
     // A repair result can be sampled before a resident writer emits a newer
     // pending edge. Route retention must preserve that edge without replaying
     // the stale owner audit as a clear.
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7001);
     source.markRepairHandoffPendingBestEffort("docs", 7001);
     var stale_completion = ProvisionedTableWriteSource.StartupCatchUpResult{
         .index_repair_repaired = true,
@@ -44970,7 +45098,7 @@ test "repair handoff status settles after authoritative cached publication" {
     );
     try std.testing.expect(source.captureRepairHandoffPublicationTokenBestEffort("docs", 7001, true) == null);
 
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
+    const publication_authorization = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7001).?;
     var publication_retry = ProvisionedTableWriteSource.StartupCatchUpResult{};
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &publication_retry);
     try std.testing.expect(publication_retry.index_repair_pending);
@@ -44987,7 +45115,23 @@ test "repair handoff status settles after authoritative cached publication" {
     try std.testing.expect(paused.index_repair_pending);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
+    // A generic publisher may observe the same durable DB after the owner
+    // audit, but it does not own that audit's completion receipt.
     try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        &source,
+        alloc,
+        "docs",
+        7001,
+        .idle,
+        .consistent,
+        null,
+        null,
+        publication_authorization,
+        &db,
+    );
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
@@ -45070,7 +45214,7 @@ test "live repair final audit excludes concurrent group mutation through publica
     source.releaseStructuralReconcileStatus("docs");
     // Model a previous clear audit whose publication was fenced. Admission of
     // this pass must revoke it before the long, unlocked scan begins.
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7001);
 
     const PublicationProbe = struct {
         source: *ProvisionedTableWriteSource,
@@ -45307,7 +45451,7 @@ test "terminal repair publication settles handoff or retains one fenced retry" {
     source.reserveStructuralReconcileStatus("docs");
     source.ensureStructuralRepairHandoffStatus("docs", 7002);
     source.releaseStructuralReconcileStatus("docs");
-    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7002);
+    _ = source.authorizeRepairHandoffOwnerPublicationBestEffort("docs", 7002);
     const Fence = struct {
         cache: *runtime_status.TableRuntimeSnapshotCache,
         calls: usize = 0,
@@ -47113,7 +47257,7 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     var preserved = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
     preserved.deinit(alloc);
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.signal_runnable,
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.observe_debt,
         hooks.debt.?,
     );
     try std.testing.expectEqual(changes_before_progress, hooks.changes);
@@ -50140,6 +50284,42 @@ test "startup async overlay replaces async stats while preserving cached table s
     try std.testing.expectEqual(@as(u64, 10880), status.stats.async_indexing.dense_catch_up.current_applied_entries);
 }
 
+test "later startup activity cannot revoke authority for the same runtime root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/startup-activity-retains-authority",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var visible_generation = db.core.index_manager.lsm_root_generation;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);
+    try publishStartupCatchUpRuntimeStatusSnapshot(&source, alloc, "docs", 7001, .{
+        .active = true,
+        .phase = .opening_db,
+    }, &db, null);
+
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.active);
+    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.opening_db, statuses.items[0].stats.async_indexing.startup.phase);
+}
+
 test "startup catch-up stats for path include table and index-local wal retention" {
     const alloc = std.testing.allocator;
 
@@ -50269,8 +50449,10 @@ test "runtime status snapshot with startup phase refreshes live table stats for 
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.startup_catch_up, statuses.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.catching_up, statuses.items[0].metadata.freshness);
+    // The fresh same-root observation remains serving authority; startup is
+    // independently visible as activity on that observation.
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.background_refresh, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
     try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.source_doc_count);
     try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.artifact_rebuild, statuses.items[0].stats.async_indexing.startup.phase);

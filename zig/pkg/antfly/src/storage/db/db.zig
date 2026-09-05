@@ -27491,6 +27491,7 @@ pub const DB = struct {
                         item.node_count = hbc_stats.node_count;
                         item.root_node = hbc_stats.root_node;
                         item.serving_snapshot_revision = published.generation;
+                        item.serving_snapshot_owner_id = self.backend_owner_id;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
@@ -63274,6 +63275,7 @@ test "db vector status revalidates stale repair admission without a query" {
         if (std.mem.eql(u8, index_stats.name, "dense_status")) {
             observed_dense = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(db.backend_owner_id, index_stats.serving_snapshot_owner_id);
         } else if (std.mem.eql(u8, index_stats.name, "sparse_status")) {
             observed_sparse = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
