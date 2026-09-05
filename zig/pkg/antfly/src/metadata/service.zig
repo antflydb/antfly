@@ -3485,6 +3485,10 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
         error.Timeout,
         error.FileNotFound,
         error.InvalidQueryRequest,
+        // The hosted data owner serializes writers. CDC hitting an already
+        // active local writer is ordinary bounded contention, not a failed
+        // maintenance job; the next scheduled round owns the retry.
+        error.LsmRootWriterAlreadyOpen,
         error.WriterLocked,
         error.LmdbUnexpected,
         error.Corrupted,
@@ -3551,6 +3555,8 @@ test "metadata CDC round error policy isolates expected recovery failures" {
         error.ForeignProviderIdentityMismatch,
         error.ExactCutoverProviderIdentityMismatch,
         error.GroupLeaderUnavailable,
+        error.LsmRootWriterAlreadyOpen,
+        error.WriterLocked,
     };
     for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
 
