@@ -218,6 +218,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             concurrent_output_allocator: ?Allocator = null,
             executor_io: ?std.Io = null,
         };
+
+        pub const default_render_bytes_per_pixel_reserve: usize = 12;
         pub const PageRenderResult = struct {
             page_number: usize,
             rendered: ?RenderedPagePng = null,
@@ -276,6 +278,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         }
 
         pub fn renderPreparedPagesRasterBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PreparedPageRenderPlan, _: PageRenderBatchOptions) anyerror!RenderedPageRasterBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn estimatePreparedPageRenderWaveScratchBytes(_: *const reader.Reader, _: []const PreparedPageRenderPlan, _: usize, _: usize) anyerror!usize {
             return error.PdfRenderingUnavailable;
         }
 
@@ -464,6 +470,7 @@ pub const PdfPageRenderGeometry = pdf.PageRenderGeometry;
 pub const PreparedPdfPageRenderPlan = pdf.PreparedPageRenderPlan;
 pub const PdfPageRenderExecutor = pdf.PageRenderExecutor;
 pub const PdfPageRenderBatchOptions = pdf.PageRenderBatchOptions;
+pub const default_pdf_render_bytes_per_pixel_reserve = pdf.default_render_bytes_per_pixel_reserve;
 pub const RenderedPdfPageBatch = pdf.RenderedPageBatch;
 pub const RenderedPdfPageRasterBatch = pdf.RenderedPageRasterBatch;
 pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
@@ -562,6 +569,20 @@ pub const PdfRenderSession = struct {
 
     pub fn preparePageRenderPlan(self: *PdfRenderSession, request: PdfPageRenderRequest) !PreparedPdfPageRenderPlan {
         return try pdf.prepareParsedPageRenderPlan(&self.parsed, request);
+    }
+
+    pub fn estimatePreparedWaveScratchBytes(
+        self: *const PdfRenderSession,
+        plans: []const PreparedPdfPageRenderPlan,
+        max_parallel_pages: usize,
+        bytes_per_pixel_reserve: usize,
+    ) !usize {
+        return try pdf.estimatePreparedPageRenderWaveScratchBytes(
+            &self.parsed,
+            plans,
+            max_parallel_pages,
+            bytes_per_pixel_reserve,
+        );
     }
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {

@@ -385,13 +385,14 @@ pub const ReadingPipeline = struct {
         const pixel_values = try self.allocator.alloc(f32, pixel_count);
         defer self.allocator.free(pixel_values);
         resetLastReadTelemetry();
-        try image.preprocessBorrowedRasterBatchInto(
+        try image.preprocessBorrowedRasterBatchIntoWithOptions(
             pixel_values,
             rasters,
             img_size,
             self.config.image_mean,
             self.config.image_std,
             self.config.resample,
+            .{ .io = self.config.preprocess_io },
         );
         return self.readBatchNativeFlorencePixels(
             pixel_values,

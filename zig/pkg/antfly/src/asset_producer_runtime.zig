@@ -249,7 +249,16 @@ pub const Runtime = struct {
 
         const client = try alloc.create(httpx.Client);
         errdefer alloc.destroy(client);
-        var client_config = httpx.ClientConfig{ .keep_alive = false };
+        // This runtime is the ownership boundary for remote inference
+        // transport, so its pool lives exactly as long as the producer and is
+        // reused across document windows. The httpx pools are internally
+        // synchronized; disable ambient cookies because model credentials are
+        // supplied explicitly per request.
+        var client_config = httpx.ClientConfig{
+            .keep_alive = true,
+            .cookies_enabled = false,
+            .cache_resolved_addresses = true,
+        };
         // Operation-specific ceilings are applied on provider requests. This
         // client-wide value is only an outer safety maximum and must not turn a
         // catalog or a configured large extraction into an unrelated 4 MiB

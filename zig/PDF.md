@@ -2655,6 +2655,58 @@ The hardening above follows these long-term rules:
     The leader owns only the result pointer array and transfers every item into
     its matching slot, removing the second text/fields/regions/provenance copy
     without weakening independent ticket lifetimes.
+103. **Implemented after render-admission review:** PDF OCR and page-image
+    embedding reserve the scratch required by the largest planned worker wave,
+    not the renderer's configured ceiling. The planner uses prepared geometry,
+    fork metadata, decode working-set limits, and the bytes-per-pixel reserve;
+    it reduces wave parallelism before reducing the item window and applies the
+    same reduction to a partial resource grant before rejecting it. This
+    leaves genuinely unused process credit available for another document or
+    the one admitted prefetch window.
+104. **Implemented after replay-cost review:** visual page artifacts use a
+    versioned canonical input identity covering the complete source digest,
+    page number, renderer contract, effective model pixel limit, page-output
+    cap, local raster versus encoded transport, dimensions, and semantic model
+    producer. The planner checks final artifacts and fenced generation stages
+    before rendering, forms sparse ordered windows from only missing pages, and
+    sends only those pages to inference. Successful window stages survive a
+    later-page failure and are reused by a retry in the same lease generation;
+    a new lease epoch receives a disjoint private namespace. Publication still
+    promotes every required stage, removes stale page artifacts, and advances
+    coverage in one fenced transaction.
+105. **Implemented after raster-preprocessing review:** borrowed raster batches
+    assign disjoint final tensor slices and preprocess them with bounded jobs on
+    the backend runtime's lazy inference lane. The completed float buffer is
+    adopted by the input tensor instead of copied into a second allocation, so
+    admission and peak residency reflect one normalized tensor plus the
+    borrowed raster window. Error collection remains deterministic by input
+    index and the serial compatibility path remains available without an
+    executor.
+106. **Implemented after legacy-discovery cancellation review:** a 404/405/501
+    discovery result may still publish the conservative legacy cache entry for
+    other callers, but the owner that performed discovery retains its own
+    cancellation or deadline outcome. Cache publication no longer converts a
+    canceled operation into successful fallback work.
+107. **Implemented after distributed transport review:** an owned asset
+    producer runtime now owns a synchronized, bounded keep-alive connection
+    pool and resolved-address cache for its full lifetime. Remote document
+    windows reuse TCP/TLS connections instead of constructing a fresh
+    connection for every model call; cookies remain disabled so explicit
+    per-request authorization cannot acquire ambient cross-request state.
+108. **Implemented after pipeline-overlap review:** primary PDF OCR uses the
+    same operator-controlled one-window prefetch as durable visual embedding.
+    The next render owns a thread-safe allocator and an independent composite
+    lease while inference consumes the current window. The parsed session has
+    only one renderer caller, cancellation is combined with an operation-local
+    deadline, all exits join the worker, and failed speculative admission or
+    expiry falls back to synchronous rendering after releasing the current
+    lease.
+109. **Implemented after generation preflight review:** multimodal generation
+    retains a structural decoded-size fact for inline base64 even when its
+    alphabet or pad bits are invalid. Resolved model byte limits therefore
+    reject definitely oversized envelopes before decoding or model loading,
+    while malformed payloads that fit the limit still receive the precise
+    syntax error. Direct and batch generation now apply the same ordering.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2832,13 +2884,13 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   and full-decoder paths and has a regression test proving that finished rows
   remain padded while active rows retain independent lengths.
 
-Durable page-image embedding can prefetch exactly one second render window.
-The current window remains admitted while the speculative window acquires its
-own composite lease, so the resource manager observes and bounds their combined
-peak before the second render starts. If that reservation cannot be acquired,
-the current window completes and releases first, then the same page range is
-prepared synchronously. OCR and every executor without an explicit overlap
-policy retain acquire-render-infer-release sequencing.
+PDF OCR and durable page-image embedding can prefetch exactly one second render
+window. The current window remains admitted while the speculative window
+acquires its own composite lease, so the resource manager observes and bounds
+their combined peak before the second render starts. If that reservation cannot
+be acquired, the current window completes and releases first, then the same page
+range is prepared synchronously. Every executor without an explicit overlap
+policy retains acquire-render-infer-release sequencing.
 
 ## Required invariants
 
@@ -3208,12 +3260,15 @@ CPU render:  [ window N ] [ window N+1 ] [ window N+2 ]
 model:                    [ window N   ] [ window N+1 ]
 ```
 
-Durable visual embedding enables this with `prefetch_batches = 1`. The active
-window and prefetched window each own a composite scratch/output reservation;
-the second reservation is acquired while the first remains live, which admits
-their combined peak before rendering. Values greater than one are hard-clamped
-because they recreate whole-document buffering without a useful pipeline
-stage. `prefetch_batches = 0` restores strictly sequential execution.
+PDF OCR and durable visual embedding enable this with `prefetch_batches = 1`.
+The active window and prefetched window each own a composite scratch/output
+reservation; the second reservation is acquired while the first remains live,
+which admits their combined peak before rendering. The shared parsed session
+has only one render-window caller at a time: the foreground consumes already
+rendered buffers while the worker prepares the next window. Values greater than
+one are hard-clamped because they recreate whole-document buffering without a
+useful pipeline stage. `prefetch_batches = 0` restores strictly sequential
+execution.
 
 If the inference queue is saturated, rendering must stop at the admitted
 window. Likewise, a render scheduler with no permits must not reserve an
@@ -3577,11 +3632,12 @@ fallback at unsupported provider boundaries.
 
 ### Phase 5: Render/OCR pipeline overlap
 
-Status: complete for durable visual embedding; OCR retains the sequential
-baseline. The active window releases its scratch and output credit as soon as
-its consumer finishes. At most one speculative window may acquire a second
-composite lease against the still-live first lease; inability to admit the
-combined peak falls back to synchronous preparation after release.
+Status: complete for PDF OCR and durable visual embedding. The active window
+releases its scratch and output credit as soon as its consumer finishes. At
+most one speculative window may acquire a second composite lease against the
+still-live first lease; inability to admit the combined peak falls back to
+synchronous preparation after release. Cancellation and every exit path join
+the speculative task before destroying its document session.
 
 - Keep prefetch operator-controlled and hard-cap it at one window.
 - Keep every live render and invocation byte under a composite reservation.

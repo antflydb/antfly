@@ -7837,12 +7837,6 @@ pub const Node = struct {
         // Admission precedes model resolution and media decoding so rejected
         // requests cannot consume model or download work first.
         const media_shape = generateRequestMediaShape(body);
-        if (media_shape.invalid_inline_media) {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "invalid base64 media data",
-            });
-        }
         const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(estimateGenerateRequestAdmissionUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -7881,6 +7875,12 @@ pub const Node = struct {
                 .retryable = failure.batch.retryable,
             });
         };
+        if (media_shape.invalid_inline_media) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "invalid base64 media data",
+            });
+        }
         var draft_model_path_storage: ?[]const u8 = null;
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
@@ -10092,9 +10092,6 @@ pub const Node = struct {
             if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
                 results[idx].@"error" = batch_err;
                 pending[idx] = false;
-            } else if (media_shapes[idx].invalid_inline_media) {
-                results[idx].@"error" = generateBatchMessageParseError(error.InvalidGenerateMediaBase64).?;
-                pending[idx] = false;
             }
         }
 
@@ -10170,6 +10167,11 @@ pub const Node = struct {
                 results[idx].@"error" = generateExecutorContractError(err).batch;
                 pending[idx] = false;
             };
+            if (!pending[idx]) continue;
+            if (media_shapes[idx].invalid_inline_media) {
+                results[idx].@"error" = generateBatchMessageParseError(error.InvalidGenerateMediaBase64).?;
+                pending[idx] = false;
+            }
         }
 
         self.metrics.incRequest("generate_batch");
@@ -17656,6 +17658,7 @@ test "generate batch media planner bounds inline and unknown remote windows" {
     );
     try std.testing.expectEqual(@as(usize, 4), media_shapes[0].inline_transport_bytes);
     try std.testing.expectEqual(@as(usize, 1), media_shapes[0].decoded_inline_media_bytes);
+    try std.testing.expectEqual(@as(usize, 1), media_shapes[0].preflight_decoded_inline_media_bytes);
     const invalid_json =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"YR=="}]}]}
     ;
@@ -17665,6 +17668,7 @@ test "generate batch media planner bounds inline and unknown remote windows" {
     try std.testing.expect(invalid_shape.invalid_inline_media);
     try std.testing.expectEqual(@as(usize, "YR==".len), invalid_shape.inline_transport_bytes);
     try std.testing.expectEqual(@as(usize, 0), invalid_shape.decoded_inline_media_bytes);
+    try std.testing.expectEqual(@as(usize, 1), invalid_shape.preflight_decoded_inline_media_bytes);
     try std.testing.expect(generateBatchWindowCompatible(
         parsed.value.requests[0].body,
         parsed.value.requests[1].body,
@@ -23370,6 +23374,11 @@ const RequestMediaAdmissionShape = struct {
     // contracts and batch windows are expressed in these model-facing bytes,
     // not in base64/data-URI transport bytes.
     decoded_inline_media_bytes: usize = 0,
+    // Structurally derivable decoded size, retained even when the payload has
+    // invalid alphabet or pad bits. This lets an authoritative model byte
+    // ceiling reject a definitely oversized envelope before syntax validation
+    // or allocation, without charging valid base64 by its larger wire size.
+    preflight_decoded_inline_media_bytes: usize = 0,
     invalid_inline_media: bool = false,
     // Direct callers already own decoded media. It is part of the logical
     // media budget but is borrowed and therefore resident only once.
@@ -23386,11 +23395,23 @@ const RequestMediaAdmissionShape = struct {
         self.addInline(source.len, is_image);
         const decoded_bytes = decodedMediaDataSize(source) catch {
             self.invalid_inline_media = true;
+            if (structuralDecodedMediaSize(source)) |structural_bytes| {
+                self.preflight_decoded_inline_media_bytes = std.math.add(
+                    usize,
+                    self.preflight_decoded_inline_media_bytes,
+                    structural_bytes,
+                ) catch std.math.maxInt(usize);
+            }
             return;
         };
         self.decoded_inline_media_bytes = std.math.add(
             usize,
             self.decoded_inline_media_bytes,
+            decoded_bytes,
+        ) catch std.math.maxInt(usize);
+        self.preflight_decoded_inline_media_bytes = std.math.add(
+            usize,
+            self.preflight_decoded_inline_media_bytes,
             decoded_bytes,
         ) catch std.math.maxInt(usize);
     }
@@ -23409,6 +23430,11 @@ const RequestMediaAdmissionShape = struct {
             usize,
             self.decoded_inline_media_bytes,
             other.decoded_inline_media_bytes,
+        ) catch std.math.maxInt(usize);
+        self.preflight_decoded_inline_media_bytes = std.math.add(
+            usize,
+            self.preflight_decoded_inline_media_bytes,
+            other.preflight_decoded_inline_media_bytes,
         ) catch std.math.maxInt(usize);
         self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, other.borrowed_bytes) catch std.math.maxInt(usize);
         self.invalid_inline_media = self.invalid_inline_media or other.invalid_inline_media;
@@ -23447,7 +23473,7 @@ const RequestMediaAdmissionShape = struct {
     fn knownEncodedMediaBytes(self: RequestMediaAdmissionShape) usize {
         return std.math.add(
             usize,
-            self.decoded_inline_media_bytes,
+            self.preflight_decoded_inline_media_bytes,
             self.borrowed_bytes,
         ) catch std.math.maxInt(usize);
     }
@@ -24372,6 +24398,19 @@ fn decodedMediaDataSize(data: []const u8) !usize {
     return data_uri_mod.validateCanonicalStandardBase64(data);
 }
 
+/// Return a decoded-size fact without validating base64 alphabet or canonical
+/// pad bits. Length and trailing padding completely determine the decoded
+/// allocation for a structurally shaped base64 payload, so callers may apply
+/// a smaller authoritative byte ceiling before reporting malformed syntax.
+fn structuralDecodedMediaSize(data: []const u8) ?usize {
+    const payload = if (data_uri_mod.hasScheme(data)) blk: {
+        const parsed = data_uri_mod.parseRequired(data) catch return null;
+        if (parsed.encoding != .base64) return null;
+        break :blk parsed.payload;
+    } else data;
+    return std.base64.standard.Decoder.calcSizeForSlice(payload) catch null;
+}
+
 fn encodedMediaBudgetSize(data: []const u8) !usize {
     // Size data URIs independently of their transfer encoding. The scraping
     // layer accepts both base64 and percent-encoded payloads, and both must be
@@ -24399,6 +24438,16 @@ test "inference media decoder accepts complete RFC 2397 data URIs" {
     defer omitted.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain;charset=US-ASCII", omitted.mime_type.?);
     try std.testing.expectError(error.InvalidBase64, decodeDataUri(alloc, "data:image/png;base64,YR=="));
+}
+
+test "media preflight derives allocation size before base64 syntax validation" {
+    try std.testing.expectEqual(@as(?usize, 12), structuralDecodedMediaSize("not-valid-base64"));
+    try std.testing.expectEqual(@as(?usize, 8), structuralDecodedMediaSize("AQIDBAUGBwg="));
+    try std.testing.expectEqual(
+        @as(?usize, 8),
+        structuralDecodedMediaSize("data:image/png;base64,AQIDBAUGBwg="),
+    );
+    try std.testing.expect(structuralDecodedMediaSize("%%%") == null);
 }
 
 fn decodeDataUriWithBudget(

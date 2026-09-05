@@ -8010,13 +8010,6 @@ const PdfEmbeddingRenderedWindow = union(enum) {
         }
         self.* = undefined;
     }
-
-    fn sourceBytes(self: *const @This(), index: usize) []const u8 {
-        return switch (self.*) {
-            .encoded => |batch| batch.results[index].rendered.?.png,
-            .raster => |batch| batch.results[index].rendered.?.bytes,
-        };
-    }
 };
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
@@ -8152,15 +8145,16 @@ const RuntimePdfRenderBatch = union(enum) {
 };
 
 const RuntimePdfRenderWindow = struct {
+    metadata_alloc: Allocator,
     unit_indices: []usize,
     batch: RuntimePdfRenderBatch,
     lease: *PdfWindowCompositeLease,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    fn deinit(self: *@This()) void {
         switch (self.batch) {
             inline else => |*batch| batch.deinit(self.lease.allocator()),
         }
-        alloc.free(self.unit_indices);
+        self.metadata_alloc.free(self.unit_indices);
         self.lease.destroy();
         self.* = undefined;
     }
@@ -8203,6 +8197,22 @@ const RuntimePdfRenderWindow = struct {
         return switch (self.batch) {
             inline else => |batch| batch.thread_spawn_fallbacks,
         };
+    }
+};
+
+const RuntimePdfRenderCancellation = struct {
+    deadline: document_extraction_mod.PdfRenderDeadline,
+    external: document_extraction_mod.PdfCancellationProbe,
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        self.deadline.probe().check() catch return true;
+        self.external.check() catch return true;
+        return false;
+    }
+
+    fn probe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
     }
 };
 
@@ -8965,6 +8975,7 @@ fn renderRuntimePdfWindow(
     units: []const document_extraction_mod.Unit,
     start_index: usize,
     use_borrowed_rasters: bool,
+    cancellation: document_extraction_mod.PdfCancellationProbe,
 ) !RuntimePdfRenderWindow {
     var invocation_cancellation: AssetInvocationCancellation = undefined;
     const invocation_producer = scopedAssetProducer(runtime, producer, &invocation_cancellation);
@@ -9019,6 +9030,7 @@ fn renderRuntimePdfWindow(
     // render/inference peak they describe.
     var window_lease: ?*PdfWindowCompositeLease = null;
     errdefer if (window_lease) |lease| lease.destroy();
+    var render_parallel_pages: usize = 1;
     const memory_budget = blk: {
         const prototype_parts = try alloc.alloc([]u8, requests.items.len);
         var initialized_parts: usize = 0;
@@ -9098,11 +9110,28 @@ fn renderRuntimePdfWindow(
                     candidate_count,
                     retained_raw_bytes,
                 );
+            var candidate_parallel_pages = @min(
+                config.pdf_render_max_parallel_pages,
+                candidate_count,
+            );
+            var required_scratch_bytes: usize = 0;
+            while (candidate_parallel_pages > 0) : (candidate_parallel_pages -= 1) {
+                required_scratch_bytes = try session.estimatePreparedWaveScratchBytes(
+                    prepared_plans[0..candidate_count],
+                    candidate_parallel_pages,
+                    document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
+                );
+                if (required_scratch_bytes <= max_inflight_bytes) break;
+            }
+            if (candidate_parallel_pages == 0) {
+                if (candidate_count > 1) continue;
+                return error.DocumentExtractionWorkingSetTooLarge;
+            }
             const lease = PdfWindowCompositeLease.create(
-                runtime.alloc,
-                runtime.alloc,
+                alloc,
+                alloc,
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager,
-                max_inflight_bytes,
+                required_scratch_bytes,
                 required_output_bytes,
                 1,
             ) catch |err| {
@@ -9112,6 +9141,21 @@ fn renderRuntimePdfWindow(
             };
             var lease_owned = true;
             defer if (lease_owned) lease.destroy();
+            while (candidate_parallel_pages > 0 and
+                lease.scratchBytesPerWindow() < required_scratch_bytes)
+            {
+                candidate_parallel_pages -= 1;
+                if (candidate_parallel_pages > 0)
+                    required_scratch_bytes = try session.estimatePreparedWaveScratchBytes(
+                        prepared_plans[0..candidate_count],
+                        candidate_parallel_pages,
+                        document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
+                    );
+            }
+            if (candidate_parallel_pages == 0) {
+                if (candidate_count > 1) continue;
+                return error.DocumentExtractionWorkingSetTooLarge;
+            }
             const candidate_budget = (if (use_borrowed_rasters)
                 splitOwnedPdfRasterInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
@@ -9134,6 +9178,7 @@ fn renderRuntimePdfWindow(
             if (pdfOutputAllowancesFit(candidate_budget.retained_bytes, singleton_allowances[0..candidate_count])) {
                 requests.items.len = candidate_count;
                 unit_indices.items.len = candidate_count;
+                render_parallel_pages = candidate_parallel_pages;
                 if (!use_borrowed_rasters) {
                     for (requests.items, singleton_allowances[0..candidate_count], 0..) |*request, allowance, i| {
                         request.max_output_bytes = @min(request.max_output_bytes.?, allowance);
@@ -9149,11 +9194,14 @@ fn renderRuntimePdfWindow(
         return error.DocumentExtractionWorkingSetTooLarge;
     };
 
-    const parallel_pages = @max(@as(usize, 1), @min(config.pdf_render_max_parallel_pages, requests.items.len));
+    const parallel_pages = render_parallel_pages;
     const waves = (requests.items.len + parallel_pages - 1) / parallel_pages;
     const retry_waves = std.math.mul(usize, waves, maximum_pdf_page_render_attempts) catch std.math.maxInt(usize);
     const timeout_ms = std.math.mul(u64, runtime.syncWaitTimeoutMs(), retry_waves) catch std.math.maxInt(u64);
-    var deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+    var render_cancellation = RuntimePdfRenderCancellation{
+        .deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms),
+        .external = cancellation,
+    };
     const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
     var batch: RuntimePdfRenderBatch = if (use_borrowed_rasters)
         .{ .raster = try renderPreparedPdfRasterWindowBatchAlloc(runtime, session, lease.allocator(), prepared_plans[0..requests.items.len], .{
@@ -9163,7 +9211,7 @@ fn renderRuntimePdfWindow(
             .max_inflight_bytes = memory_budget.scratch_bytes,
             .max_retained_raster_bytes = memory_budget.retained_bytes,
             .profile = .ocr,
-            .cancellation = deadline.probe(),
+            .cancellation = render_cancellation.probe(),
             .executor_io = runtime.config.io,
         }) }
     else
@@ -9174,13 +9222,14 @@ fn renderRuntimePdfWindow(
             .max_inflight_bytes = memory_budget.scratch_bytes,
             .max_retained_png_bytes = memory_budget.retained_bytes,
             .profile = .ocr,
-            .cancellation = deadline.probe(),
+            .cancellation = render_cancellation.probe(),
             .executor_io = runtime.config.io,
         }) };
     errdefer switch (batch) {
         inline else => |*value| value.deinit(lease.allocator()),
     };
     const result = RuntimePdfRenderWindow{
+        .metadata_alloc = alloc,
         .unit_indices = try unit_indices.toOwnedSlice(alloc),
         .batch = batch,
         .lease = lease,
@@ -9188,6 +9237,79 @@ fn renderRuntimePdfWindow(
     window_lease = null;
     return result;
 }
+
+/// Serializes access to the document-scoped PDF session while allowing one
+/// fully admitted render window to run on an Io worker during inference for
+/// the preceding window. The renderer itself may still use its bounded page
+/// lane; no second caller touches the session until this preparation returns.
+const RuntimePdfRenderWindowPreparer = struct {
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    coordinator: *RuntimePdfOcrCoordinator,
+    config: document_extraction_mod.Config,
+    batch_policy: GeneratedTextBatchPolicy,
+    producer_type: asset_producer_mod.ProducerType,
+    producer_config_json: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    source_fingerprint: []const u8,
+    units: []const document_extraction_mod.Unit,
+    use_borrowed_rasters: bool,
+    cancel_requested: *const std.atomic.Value(bool),
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        return self.cancel_requested.load(.acquire) or
+            platform_time.monotonicNs() >= self.coordinator.deadline.deadline_ns;
+    }
+
+    fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn prepare(self: *const @This(), start_index: usize) !RuntimePdfRenderWindow {
+        if (self.cancel_requested.load(.acquire)) return error.Canceled;
+        self.coordinator.beginOperation(self.runtime.syncWaitTimeoutMs());
+        self.coordinator.session.setCancellationProbe(self.cancellationProbe());
+        const available_bytes = try self.coordinator.availableRenderBytes();
+        var window = try renderRuntimePdfWindow(
+            self.runtime,
+            std.heap.smp_allocator,
+            self.producer,
+            &self.coordinator.session,
+            self.config,
+            available_bytes,
+            self.batch_policy,
+            self.producer_type,
+            self.producer_config_json,
+            self.route_type,
+            self.source_content_type,
+            self.source_fingerprint,
+            self.units,
+            start_index,
+            self.use_borrowed_rasters,
+            self.cancellationProbe(),
+        );
+        errdefer window.deinit();
+        if (self.cancel_requested.load(.acquire)) return error.Canceled;
+        return window;
+    }
+};
+
+const RuntimePdfRenderWindowPrefetch = struct {
+    preparer: *const RuntimePdfRenderWindowPreparer,
+    start_index: usize,
+    started_ns: u64,
+    window: ?RuntimePdfRenderWindow = null,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.window = self.preparer.prepare(self.start_index) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
 
 fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     runtime: *EnrichmentRuntime,
@@ -9297,19 +9419,46 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     }
 
     var batch_bytes: usize = 0;
-    var pdf_session: ?*document_extraction_mod.PdfRenderSession = null;
     var pdf_render_window: ?RuntimePdfRenderWindow = null;
+    var pdf_prefetch_cancel_requested: std.atomic.Value(bool) = .init(false);
+    var pdf_window_preparer: ?RuntimePdfRenderWindowPreparer = null;
+    var pdf_prefetch_job = RuntimePdfRenderWindowPrefetch{
+        .preparer = undefined,
+        .start_index = 0,
+        .started_ns = 0,
+    };
+    var pdf_prefetch_future: ?Io.Future(void) = null;
+    const pdf_prefetch_io = runtime.config.io;
     defer {
+        pdf_prefetch_cancel_requested.store(true, .release);
+        if (pdf_prefetch_future) |*future| {
+            if (pdf_prefetch_io) |io| future.await(io);
+        }
+        if (pdf_prefetch_job.window) |*window| window.deinit();
         const content_alloc = if (pdf_render_window) |*window| window.allocator() else working_alloc;
         clearRuntimeGeneratedTextBatchParts(content_alloc, &parts_values);
         clearRuntimeGeneratedTextBatchMedia(content_alloc, &rendered_values, &media_values);
         clearRuntimeGeneratedTextBatchRasters(content_alloc, &rendered_raster_values, &raster_values);
-        if (pdf_render_window) |*window| window.deinit(working_alloc);
+        if (pdf_render_window) |*window| window.deinit();
     }
     var pdf_render_cursor: usize = 0;
     if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
         const coordinator = pdf_coordinator orelse return error.InvalidPdfRenderCoordinator;
-        pdf_session = &coordinator.session;
+        pdf_window_preparer = .{
+            .runtime = runtime,
+            .producer = invocation_producer,
+            .coordinator = coordinator,
+            .config = config,
+            .batch_policy = admitted_batch_policy,
+            .producer_type = producer_type,
+            .producer_config_json = config_json,
+            .route_type = route_type,
+            .source_content_type = source_content_type,
+            .source_fingerprint = source_fingerprint,
+            .units = units,
+            .use_borrowed_rasters = use_pdf_borrowed_rasters,
+            .cancel_requested = &pdf_prefetch_cancel_requested,
+        };
     }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
@@ -9332,37 +9481,59 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                         requests.clearRetainingCapacity();
                         unit_indices.clearRetainingCapacity();
                         batch_bytes = 0;
-                        window.deinit(working_alloc);
+                        window.deinit();
                         pdf_render_window = null;
                     }
-                    const window_started_ns = runtime.config.clock.nowRealtimeNs();
-                    // Recompute the worker allowance immediately before every
-                    // window from the coordinator's persistent live state.
-                    const coordinator = pdf_coordinator.?;
-                    coordinator.beginOperation(runtime.syncWaitTimeoutMs());
-                    const available_bytes = try coordinator.availableRenderBytes();
-                    pdf_render_window = renderRuntimePdfWindow(
-                        runtime,
-                        working_alloc,
-                        invocation_producer,
-                        pdf_session.?,
-                        config,
-                        available_bytes,
-                        admitted_batch_policy,
-                        producer_type,
-                        config_json,
-                        route_type,
-                        source_content_type,
-                        source_fingerprint,
-                        units,
-                        idx,
-                        use_pdf_borrowed_rasters,
-                    ) catch |err| {
-                        logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(err), window_started_ns);
-                        return err;
-                    };
+                    const preparer = if (pdf_window_preparer) |*value|
+                        value
+                    else
+                        return error.InvalidPdfRenderCoordinator;
+                    var window_started_ns = runtime.config.clock.nowRealtimeNs();
+                    if (pdf_prefetch_future) |*future| {
+                        future.await(pdf_prefetch_io.?);
+                        pdf_prefetch_future = null;
+                        window_started_ns = pdf_prefetch_job.started_ns;
+                        if (pdf_prefetch_job.err) |err| {
+                            pdf_prefetch_job.err = null;
+                            logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(err), window_started_ns);
+                            // A speculative second window may not fit beside
+                            // the active one, or may expire behind slow model
+                            // inference. Retry after releasing that window so
+                            // bounded backpressure preserves serial behavior.
+                            if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
+                                return err;
+                            window_started_ns = runtime.config.clock.nowRealtimeNs();
+                            pdf_render_window = preparer.prepare(idx) catch |sync_err| {
+                                logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(sync_err), window_started_ns);
+                                return sync_err;
+                            };
+                        } else {
+                            pdf_render_window = pdf_prefetch_job.window orelse return error.MissingPdfRenderWindow;
+                            pdf_prefetch_job.window = null;
+                        }
+                    } else {
+                        pdf_render_window = preparer.prepare(idx) catch |err| {
+                            logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(err), window_started_ns);
+                            return err;
+                        };
+                    }
                     logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, pdf_render_window.?.unit_indices, &pdf_render_window.?, null, window_started_ns);
                     pdf_render_cursor = 0;
+
+                    const next_start_index = pdf_render_window.?.unit_indices[pdf_render_window.?.unit_indices.len - 1] +| 1;
+                    if (next_start_index < units.len and generatedPdfRenderPrefetchBatches() != 0) if (pdf_prefetch_io) |io| {
+                        std.debug.assert(pdf_prefetch_future == null);
+                        std.debug.assert(pdf_prefetch_job.window == null);
+                        pdf_prefetch_job = .{
+                            .preparer = preparer,
+                            .start_index = next_start_index,
+                            .started_ns = runtime.config.clock.nowRealtimeNs(),
+                        };
+                        // Executor saturation is an optimization miss, not a
+                        // document failure; the next boundary falls back to
+                        // synchronous preparation.
+                        pdf_prefetch_future = io.concurrent(RuntimePdfRenderWindowPrefetch.run, .{&pdf_prefetch_job}) catch null;
+                    };
                 }
                 if (pdf_render_window.?.unit_indices[pdf_render_cursor] != idx) return error.InvalidPdfRenderWindow;
                 switch (pdf_render_window.?.batch) {
@@ -14851,6 +15022,49 @@ fn appendFullTextDeleteDocumentToWindow(
     });
 }
 
+const pdf_page_embedding_identity_version = "antfly-pdf-page-embedding-v1";
+
+fn updatePdfPageEmbeddingHashInt(hasher: *std.hash.XxHash64, comptime T: type, value: T) void {
+    var encoded: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &encoded, value, .little);
+    hasher.update(&encoded);
+}
+
+/// Stable identity of a page-level visual embedding input. Hashing the source
+/// document and complete transform contract lets an idempotent replay skip PDF
+/// rendering as well as model inference. The explicit version is bumped when
+/// renderer/preprocessing semantics change; transport is included because PNG
+/// output limits and raw-raster preprocessing are intentionally distinct.
+fn pdfPageEmbeddingSourceHash(
+    content_sha256: []const u8,
+    page_number: usize,
+    semantic_producer: []const u8,
+    render_config: document_extraction_mod.Config,
+    model_pixel_cap: u64,
+    page_output_bytes_cap: usize,
+    use_borrowed_rasters: bool,
+    expected_dims: u32,
+) u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    hasher.update(pdf_page_embedding_identity_version);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(content_sha256.len));
+    hasher.update(content_sha256);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_number));
+    updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
+    updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
+    updatePdfPageEmbeddingHashInt(&hasher, u32, @intCast(minimum_pdf_page_render_dimension));
+    updatePdfPageEmbeddingHashInt(&hasher, u32, @intCast(maximum_pdf_page_render_attempts));
+    updatePdfPageEmbeddingHashInt(&hasher, u64, model_pixel_cap);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_output_bytes_cap));
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(maximum_pdf_page_inline_png_bytes));
+    updatePdfPageEmbeddingHashInt(&hasher, u8, @intFromBool(use_borrowed_rasters));
+    updatePdfPageEmbeddingHashInt(&hasher, u32, expected_dims);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(semantic_producer.len));
+    hasher.update(semantic_producer);
+    return hasher.final();
+}
+
 fn appendOwnedDenseEmbeddingsToWindow(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
@@ -14934,7 +15148,7 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
 }
 
 const PdfEmbeddingPreparedWindow = struct {
-    first_page: usize,
+    first_item: usize,
     count: usize,
     lease: *PdfWindowCompositeLease,
     rendered: PdfEmbeddingRenderedWindow,
@@ -14957,7 +15171,8 @@ const PdfEmbeddingWindowPreparer = struct {
     capabilities: inference_work.InferenceCapabilities,
     batch_items: usize,
     batch_bytes: usize,
-    page_count: usize,
+    page_output_bytes_cap: usize,
+    pending_pages: []const usize,
     use_borrowed_rasters: bool,
     cancel_requested: *const std.atomic.Value(bool),
 
@@ -14971,7 +15186,7 @@ const PdfEmbeddingWindowPreparer = struct {
         return .{ .context = self, .is_cancelled_fn = isCancelled };
     }
 
-    fn prepare(self: *const @This(), first_page: usize) !PdfEmbeddingPreparedWindow {
+    fn prepare(self: *const @This(), first_item: usize) !PdfEmbeddingPreparedWindow {
         // A speculative window is prepared on an Io worker while the
         // enrichment worker consumes and stages the current window. Keep all
         // allocations reachable from that task on a thread-safe allocator;
@@ -14980,7 +15195,8 @@ const PdfEmbeddingWindowPreparer = struct {
         const concurrent_alloc = std.heap.smp_allocator;
         self.coordinator.beginOperation(self.runtime.config.sync_wait_timeout_ms);
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
-        var count = @min(self.batch_items, self.page_count - first_page + 1);
+        if (first_item >= self.pending_pages.len) return error.InvalidPdfRenderWindow;
+        var count = @min(self.batch_items, self.pending_pages.len - first_item);
         const available_bytes = @min(
             try self.coordinator.availableRenderBytes(),
             self.render_config.pdf_render_max_inflight_bytes,
@@ -14993,7 +15209,7 @@ const PdfEmbeddingWindowPreparer = struct {
             minimum_pdf_page_render_dimension,
         );
         for (requests, 0..) |*page_request, i| page_request.* = .{
-            .page_number = first_page + i,
+            .page_number = self.pending_pages[first_item + i],
             .requested_dpi = self.render_config.ocr_render_dpi,
             .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
             .max_dimension = self.render_config.ocr_max_rendered_dimension,
@@ -15012,29 +15228,13 @@ const PdfEmbeddingWindowPreparer = struct {
             prepared_plans,
             model_pixel_cap,
         );
-        const singleton_memory = try self.dense_embedder.partInvocationMemoryForMime(
-            self.embedding_name,
-            1,
-            "image/png",
-            self.expected_dims,
-        );
-        const per_page_bytes = if (self.use_borrowed_rasters)
-            1
-        else
-            @min(
-                maximum_pdf_page_inline_png_bytes,
-                try singleton_memory.attachment_transport.maxRawBytesForLimits(
-                    "image/png".len,
-                    1,
-                    self.batch_bytes,
-                    std.math.maxInt(usize),
-                ),
-            );
+        const per_page_bytes = self.page_output_bytes_cap;
         if (per_page_bytes == 0) return error.DocumentExtractionWorkingSetTooLarge;
 
         var window_lease: ?*PdfWindowCompositeLease = null;
         errdefer if (window_lease) |lease| lease.destroy();
         var memory_budget: ?PdfRenderMemoryBudget = null;
+        var render_parallel_pages: usize = 1;
         var candidate_count = count;
         while (candidate_count > 0) : (candidate_count -= 1) {
             const invocation_memory = try self.dense_embedder.partInvocationMemoryForMime(
@@ -15066,11 +15266,28 @@ const PdfEmbeddingWindowPreparer = struct {
                     candidate_count,
                     retained_raw_bytes,
                 );
+            var candidate_parallel_pages = @min(
+                self.render_config.pdf_render_max_parallel_pages,
+                candidate_count,
+            );
+            var required_scratch_bytes: usize = 0;
+            while (candidate_parallel_pages > 0) : (candidate_parallel_pages -= 1) {
+                required_scratch_bytes = try self.coordinator.session.estimatePreparedWaveScratchBytes(
+                    prepared_plans[0..candidate_count],
+                    candidate_parallel_pages,
+                    document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
+                );
+                if (required_scratch_bytes <= available_bytes) break;
+            }
+            if (candidate_parallel_pages == 0) {
+                if (candidate_count > 1) continue;
+                return error.DocumentExtractionWorkingSetTooLarge;
+            }
             const lease = PdfWindowCompositeLease.create(
                 concurrent_alloc,
                 concurrent_alloc,
                 self.resource_manager,
-                available_bytes,
+                required_scratch_bytes,
                 required_output_bytes,
                 1,
             ) catch |err| {
@@ -15080,6 +15297,21 @@ const PdfEmbeddingWindowPreparer = struct {
             };
             var lease_owned = true;
             defer if (lease_owned) lease.destroy();
+            while (candidate_parallel_pages > 0 and
+                lease.scratchBytesPerWindow() < required_scratch_bytes)
+            {
+                candidate_parallel_pages -= 1;
+                if (candidate_parallel_pages > 0)
+                    required_scratch_bytes = try self.coordinator.session.estimatePreparedWaveScratchBytes(
+                        prepared_plans[0..candidate_count],
+                        candidate_parallel_pages,
+                        document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
+                    );
+            }
+            if (candidate_parallel_pages == 0) {
+                if (candidate_count > 1) continue;
+                return error.DocumentExtractionWorkingSetTooLarge;
+            }
             const candidate_budget = (if (self.use_borrowed_rasters)
                 splitOwnedPdfRasterInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
@@ -15102,6 +15334,7 @@ const PdfEmbeddingWindowPreparer = struct {
             if (retained_raw_bytes <= candidate_budget.retained_bytes) {
                 count = candidate_count;
                 memory_budget = candidate_budget;
+                render_parallel_pages = candidate_parallel_pages;
                 window_lease = lease;
                 lease_owned = false;
                 break;
@@ -15118,7 +15351,7 @@ const PdfEmbeddingWindowPreparer = struct {
         }
         const render_options = document_extraction_mod.PdfPageRenderBatchOptions{
             .max_batch_pages = count,
-            .max_parallel_pages = @min(self.render_config.pdf_render_max_parallel_pages, count),
+            .max_parallel_pages = render_parallel_pages,
             .max_inflight_pixels = @min(self.render_config.pdf_render_max_inflight_pixels, model_pixel_cap),
             .max_inflight_bytes = admitted_memory.scratch_bytes,
             .max_retained_png_bytes = admitted_memory.retained_bytes,
@@ -15145,7 +15378,7 @@ const PdfEmbeddingWindowPreparer = struct {
             ) };
         errdefer rendered.deinit(lease.allocator());
         return .{
-            .first_page = first_page,
+            .first_item = first_item,
             .count = count,
             .lease = lease,
             .rendered = rendered,
@@ -15155,12 +15388,12 @@ const PdfEmbeddingWindowPreparer = struct {
 
 const PdfEmbeddingWindowPrefetch = struct {
     preparer: *const PdfEmbeddingWindowPreparer,
-    first_page: usize,
+    first_item: usize,
     window: ?PdfEmbeddingPreparedWindow = null,
     err: ?anyerror = null,
 
     fn run(self: *@This()) void {
-        self.window = self.preparer.prepare(self.first_page) catch |err| {
+        self.window = self.preparer.prepare(self.first_item) catch |err| {
             self.err = err;
             return;
         };
@@ -15454,33 +15687,123 @@ fn processPdfPageImageEmbedding(
     );
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     try heartbeatEnrichmentLease(runtime);
+    const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+    const page_output_bytes_cap = if (use_borrowed_rasters)
+        1
+    else blk: {
+        const singleton_memory = try dense_embedder.partInvocationMemoryForMime(
+            embedding_name,
+            1,
+            "image/png",
+            request.expected_dims,
+        );
+        break :blk @min(
+            maximum_pdf_page_inline_png_bytes,
+            try singleton_memory.attachment_transport.maxRawBytesForLimits(
+                "image/png".len,
+                1,
+                batch_bytes,
+                std.math.maxInt(usize),
+            ),
+        );
+    };
+    if (page_output_bytes_cap == 0) return error.DocumentExtractionWorkingSetTooLarge;
+    const page_source_hashes = try runtime.alloc.alloc(u64, page_count);
+    defer runtime.alloc.free(page_source_hashes);
+
     const fence_epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
-    const source_hash = std.mem.readInt(u64, prepared_source.content_sha256[0..@sizeOf(u64)], .little);
-    const stage_attempt_id = try std.fmt.allocPrint(
-        runtime.alloc,
-        "epoch-{d}:sequence-{d}:attempt-{d}:source-{x}",
-        .{ fence_epoch, request.sequence, requestAttemptNumber(runtime), source_hash },
+    const generation_hash = pdfPageEmbeddingSourceHash(
+        &prepared_source.content_sha256,
+        0,
+        request.producer_json,
+        render_config,
+        model_pixel_cap,
+        page_output_bytes_cap,
+        use_borrowed_rasters,
+        request.expected_dims,
     );
-    defer runtime.alloc.free(stage_attempt_id);
-    var attempt_stages_owned = true;
-    defer if (attempt_stages_owned) clearPdfPageEmbeddingAttemptStages(
-        runtime,
-        request.doc_key,
-        requestArtifactName(request),
-        embedding_name,
-        stage_attempt_id,
-    ) catch {};
+    // Retries by the same fenced generation reuse page stages. A new lease
+    // epoch gets a distinct namespace so a superseded writer can never race a
+    // replacement's private output.
+    const stage_generation_id = try std.fmt.allocPrint(
+        runtime.alloc,
+        "epoch-{d}:sequence-{d}:source-{x}",
+        .{ fence_epoch, request.sequence, generation_hash },
+    );
+    defer runtime.alloc.free(stage_generation_id);
 
     var desired_page_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeKeyList(runtime.alloc, desired_page_keys.items);
+    var promotion_page_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer promotion_page_keys.deinit(runtime.alloc);
     var staged_page_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeKeyList(runtime.alloc, staged_page_keys.items);
+    var pending_pages = std.ArrayListUnmanaged(usize).empty;
+    defer pending_pages.deinit(runtime.alloc);
     var base_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     defer {
         for (base_embeddings.items) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         base_embeddings.deinit(runtime.alloc);
     }
-
+    for (1..page_count + 1) |page_number| {
+        const source_hash = pdfPageEmbeddingSourceHash(
+            &prepared_source.content_sha256,
+            page_number,
+            request.producer_json,
+            render_config,
+            model_pixel_cap,
+            page_output_bytes_cap,
+            use_borrowed_rasters,
+            request.expected_dims,
+        );
+        page_source_hashes[page_number - 1] = source_hash;
+        const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{page_number});
+        defer runtime.alloc.free(unit_id);
+        const page_key = try internal_keys.documentUnitArtifactKeyAlloc(
+            runtime.alloc,
+            request.doc_key,
+            requestArtifactName(request),
+            unit_id,
+        );
+        var page_key_owned = true;
+        errdefer if (page_key_owned) runtime.alloc.free(page_key);
+        const artifact_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
+        var artifact_key_owned = true;
+        errdefer if (artifact_key_owned) runtime.alloc.free(artifact_key);
+        if (!try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+            const stage_key = try pdfPageEmbeddingStageKeyAlloc(
+                runtime.alloc,
+                request.doc_key,
+                requestArtifactName(request),
+                embedding_name,
+                stage_generation_id,
+                unit_id,
+            );
+            var stage_key_owned = true;
+            defer if (stage_key_owned) runtime.alloc.free(stage_key);
+            if (try shouldSkipEmbeddingArtifact(runtime, stage_key, source_hash)) {
+                try staged_page_keys.append(runtime.alloc, stage_key);
+                stage_key_owned = false;
+                try promotion_page_keys.append(runtime.alloc, page_key);
+            } else try pending_pages.append(runtime.alloc, page_number);
+        }
+        const index_name = try runtime.alloc.dupe(u8, embedding_name);
+        errdefer if (artifact_key_owned) runtime.alloc.free(index_name);
+        const parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key);
+        errdefer if (artifact_key_owned) runtime.alloc.free(parent_doc_key);
+        const embedding_doc_key = try runtime.alloc.dupe(u8, page_key);
+        errdefer if (artifact_key_owned) runtime.alloc.free(embedding_doc_key);
+        try desired_page_keys.append(runtime.alloc, page_key);
+        page_key_owned = false;
+        try base_embeddings.append(runtime.alloc, .{
+            .index_name = index_name,
+            .parent_doc_key = parent_doc_key,
+            .doc_key = embedding_doc_key,
+            .artifact_key = artifact_key,
+            .vector = &.{},
+        });
+        artifact_key_owned = false;
+    }
     var prefetch_cancel_requested: std.atomic.Value(bool) = .init(false);
     const window_preparer = PdfEmbeddingWindowPreparer{
         .runtime = runtime,
@@ -15493,7 +15816,8 @@ fn processPdfPageImageEmbedding(
         .capabilities = capabilities,
         .batch_items = batch_items,
         .batch_bytes = batch_bytes,
-        .page_count = page_count,
+        .page_output_bytes_cap = page_output_bytes_cap,
+        .pending_pages = pending_pages.items,
         .use_borrowed_rasters = use_borrowed_rasters,
         .cancel_requested = &prefetch_cancel_requested,
     };
@@ -15501,7 +15825,7 @@ fn processPdfPageImageEmbedding(
     const prefetch_batches = generatedPdfRenderPrefetchBatches();
     var prefetch_job = PdfEmbeddingWindowPrefetch{
         .preparer = &window_preparer,
-        .first_page = 0,
+        .first_item = 0,
     };
     var prefetch_future: ?Io.Future(void) = null;
     defer {
@@ -15511,19 +15835,25 @@ fn processPdfPageImageEmbedding(
         }
         if (prefetch_job.window) |*prepared| prepared.deinit();
     }
-    var current_window: ?PdfEmbeddingPreparedWindow = try window_preparer.prepare(1);
+    // A fully matching generation needs no PDF rendering or inference. The
+    // canonical page identity includes every transform/model input below, so
+    // this fast path is independent of encoded-versus-raster transport bytes.
+    var current_window: ?PdfEmbeddingPreparedWindow = if (pending_pages.items.len == 0)
+        null
+    else
+        try window_preparer.prepare(0);
     defer if (current_window) |*prepared| prepared.deinit();
 
     while (current_window) |*current| {
         try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
-        const next_first_page = current.first_page + current.count;
-        if (next_first_page <= page_count and prefetch_batches != 0) if (prefetch_io) |io| {
+        const next_first_item = current.first_item + current.count;
+        if (next_first_item < pending_pages.items.len and prefetch_batches != 0) if (prefetch_io) |io| {
             std.debug.assert(prefetch_future == null);
             std.debug.assert(prefetch_job.window == null);
             prefetch_job = .{
                 .preparer = &window_preparer,
-                .first_page = next_first_page,
+                .first_item = next_first_item,
             };
             // Prefetch is an optimization. Executor saturation or a temporary
             // task-spawn failure must preserve the synchronous baseline.
@@ -15536,7 +15866,8 @@ fn processPdfPageImageEmbedding(
             .encoded => |batch| try embedRenderedPdfPageBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
             .raster => |batch| try embedRenderedPdfPageRasterBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
         };
-        defer embedded.deinit(lease.allocator());
+        var embedded_owned = true;
+        defer if (embedded_owned) embedded.deinit(lease.allocator());
         try embedding_lease_guard.check();
         try heartbeatEnrichmentLease(runtime);
 
@@ -15558,67 +15889,51 @@ fn processPdfPageImageEmbedding(
             for (stage_writes.items) |write| runtime.alloc.free(@constCast(write.value));
             stage_writes.deinit(runtime.alloc);
         }
-        for (embedded.results, 0..) |result, result_index| {
+        for (embedded.results) |result| {
             const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{result.page_number});
             defer runtime.alloc.free(unit_id);
-            const page_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), unit_id);
-            var page_key_owned = true;
-            errdefer if (page_key_owned) runtime.alloc.free(page_key);
-            try desired_page_keys.append(runtime.alloc, page_key);
-            page_key_owned = false;
+            if (result.page_number == 0 or result.page_number > page_count)
+                return error.InvalidPdfRenderBatch;
+            const page_key = desired_page_keys.items[result.page_number - 1];
             const stage_key = try pdfPageEmbeddingStageKeyAlloc(
                 runtime.alloc,
                 request.doc_key,
                 requestArtifactName(request),
                 embedding_name,
-                stage_attempt_id,
+                stage_generation_id,
                 unit_id,
             );
             var stage_key_owned = true;
             errdefer if (stage_key_owned) runtime.alloc.free(stage_key);
             try staged_page_keys.append(runtime.alloc, stage_key);
             stage_key_owned = false;
-            const page_source_hash = enrichment_artifact_codec.hashEmbeddingSource(
-                rendered.sourceBytes(result_index),
-                request.producer_json,
-            );
+            try promotion_page_keys.append(runtime.alloc, page_key);
             const staged_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(
                 runtime.alloc,
-                page_source_hash,
+                page_source_hashes[result.page_number - 1],
                 result.vector.?,
             );
             var staged_payload_owned = true;
             errdefer if (staged_payload_owned) runtime.alloc.free(staged_payload);
             try stage_writes.append(runtime.alloc, .{ .key = stage_key, .value = staged_payload });
             staged_payload_owned = false;
-            const artifact_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
-            var embedding_owned = true;
-            errdefer if (embedding_owned) runtime.alloc.free(artifact_key);
-            const index_name = try runtime.alloc.dupe(u8, embedding_name);
-            errdefer if (embedding_owned) runtime.alloc.free(index_name);
-            const parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key);
-            errdefer if (embedding_owned) runtime.alloc.free(parent_doc_key);
-            const embedding_doc_key = try runtime.alloc.dupe(u8, page_key);
-            errdefer if (embedding_owned) runtime.alloc.free(embedding_doc_key);
-            const embedding = derived_types.DerivedDenseEmbeddingWrite{
-                .index_name = index_name,
-                .parent_doc_key = parent_doc_key,
-                .doc_key = embedding_doc_key,
-                .artifact_key = artifact_key,
-                .vector = &.{},
-            };
-            try base_embeddings.append(runtime.alloc, embedding);
-            embedding_owned = false;
         }
-        // Attempt-scoped stage records are invisible until the final publish.
+        // Generation-scoped stage records are invisible until final publish
+        // and deliberately survive a retry of this same fenced generation.
         // Commit one already-bounded render window atomically instead of opening
         // and committing a writer transaction for every page.
         try embedding_lease_guard.check();
-        try storePutBatchWithRetry(runtime, stage_writes.items, &.{});
+        if (stage_writes.items.len > 0)
+            try storePutBatchWithRetry(runtime, stage_writes.items, &.{});
         try embedding_lease_guard.check();
+        // The result vectors are allocated by the window allocator. Release
+        // them before destroying the render window and its allocator owner.
+        // The conditional defer above still covers every error return.
+        embedded.deinit(lease.allocator());
+        embedded_owned = false;
         current.deinit();
         current_window = null;
-        if (next_first_page > page_count) break;
+        if (next_first_item >= pending_pages.items.len) break;
 
         if (prefetch_future) |*future| {
             future.await(prefetch_io.?);
@@ -15634,13 +15949,13 @@ fn processPdfPageImageEmbedding(
                     return err;
                 try embedding_lease_guard.check();
                 try checkProviderFailureGuard(runtime);
-                current_window = try window_preparer.prepare(next_first_page);
+                current_window = try window_preparer.prepare(next_first_item);
             } else {
                 current_window = prefetch_job.window orelse return error.MissingPdfRenderWindow;
                 prefetch_job.window = null;
             }
         } else {
-            current_window = try window_preparer.prepare(next_first_page);
+            current_window = try window_preparer.prepare(next_first_item);
         }
     }
 
@@ -15674,7 +15989,7 @@ fn processPdfPageImageEmbedding(
         request.doc_key,
         requestArtifactName(request),
         embedding_name,
-        stage_attempt_id,
+        stage_generation_id,
     );
     defer freeKeyList(runtime.alloc, obsolete_stage_keys);
     // Transfer every stage-related owner in one allocation-safe operation and
@@ -15685,11 +16000,11 @@ fn processPdfPageImageEmbedding(
         runtime,
         window,
         desired_page_keys.items,
+        promotion_page_keys.items,
         staged_page_keys.items,
         embedding_name,
         &obsolete_stage_keys,
     );
-    attempt_stages_owned = false;
 }
 
 fn pdfPageEmbeddingStageKeyAlloc(
@@ -15811,11 +16126,26 @@ fn queuePdfPageEmbeddingCommit(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
     desired_page_keys: []const []const u8,
+    promotion_page_keys: []const []const u8,
     staged_page_keys: []const []const u8,
     embedding_name: []const u8,
     obsolete_stage_keys: *[][]u8,
 ) !void {
-    if (staged_page_keys.len != desired_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
+    if (staged_page_keys.len != promotion_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
+    for (promotion_page_keys, 0..) |page_key, index| {
+        var desired = false;
+        for (desired_page_keys) |candidate| {
+            if (std.mem.eql(u8, candidate, page_key)) {
+                desired = true;
+                break;
+            }
+        }
+        if (!desired) return error.InvalidPdfPageEmbeddingStage;
+        for (promotion_page_keys[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, page_key))
+                return error.InvalidPdfPageEmbeddingStage;
+        }
+    }
     const promotions = try runtime.alloc.alloc(GeneratedArtifactPromotion, staged_page_keys.len);
     var initialized: usize = 0;
     errdefer {
@@ -15825,7 +16155,7 @@ fn queuePdfPageEmbeddingCommit(
         }
         if (promotions.len > 0) runtime.alloc.free(promotions);
     }
-    for (desired_page_keys, staged_page_keys, 0..) |page_key, stage_key, index| {
+    for (promotion_page_keys, staged_page_keys, 0..) |page_key, stage_key, index| {
         const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
         errdefer runtime.alloc.free(final_key);
         const owned_stage_key = try runtime.alloc.dupe(u8, stage_key);
@@ -15924,6 +16254,18 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
     try std.testing.expect(!std.mem.eql(u8, colon_left, colon_right));
 }
 
+test "PDF page embedding identity covers source page transform and transport" {
+    const digest_a = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const digest_b = [_]u8{0x22} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const config = document_extraction_mod.Config{};
+    const baseline = pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768);
+    try std.testing.expectEqual(baseline, pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_b, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 2, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-b", config, 10_000_000, 4 * 1024 * 1024, true, 768));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, false, 768));
+}
+
 test "durable enrichment PDF page embedding queues complete staged generations without publishing" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
@@ -15984,6 +16326,7 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     try storePutWithRetry(&runtime, final_three, old_one);
     try storePutWithRetry(&runtime, stage_one, new_one);
     try storePutWithRetry(&runtime, abandoned_stage, new_one);
+    try std.testing.expect(try shouldSkipEmbeddingArtifact(&runtime, stage_one, 2));
     const unrelated_state = try assetStateKeyAlloc(
         alloc,
         "doc:1",
@@ -16037,6 +16380,7 @@ test "durable enrichment PDF page embedding queues complete staged generations w
         &runtime,
         &window,
         &.{ page_one, page_two },
+        &.{ page_one, page_two },
         &.{ stage_one, stage_two },
         "visual_v1",
         &obsolete_stage_keys,
@@ -16046,6 +16390,36 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     try std.testing.expectEqualStrings(abandoned_stage, window.artifact_delete_keys.items[0]);
     try std.testing.expectEqualStrings(stage_one, window.artifact_promotions.items[0].staged_key);
     try std.testing.expectEqualStrings(final_one, window.artifact_promotions.items[0].final_key);
+    var changed_only_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer changed_only_window.deinit();
+    var no_obsolete_stages: [][]u8 = &.{};
+    try queuePdfPageEmbeddingCommit(
+        &runtime,
+        &changed_only_window,
+        &.{ page_one, page_two },
+        &.{page_two},
+        &.{stage_two},
+        "visual_v1",
+        &no_obsolete_stages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), changed_only_window.artifact_promotions.items.len);
+    try std.testing.expectEqualStrings(stage_two, changed_only_window.artifact_promotions.items[0].staged_key);
+    try std.testing.expectEqualStrings(final_two, changed_only_window.artifact_promotions.items[0].final_key);
+    var invalid_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer invalid_window.deinit();
+    var no_invalid_obsolete_stages: [][]u8 = &.{};
+    try std.testing.expectError(
+        error.InvalidPdfPageEmbeddingStage,
+        queuePdfPageEmbeddingCommit(
+            &runtime,
+            &invalid_window,
+            &.{page_one},
+            &.{page_two},
+            &.{stage_two},
+            "visual_v1",
+            &no_invalid_obsolete_stages,
+        ),
+    );
     const unpublished_one = try storeGetAlloc(&runtime, final_one);
     defer alloc.free(unpublished_one);
     try std.testing.expectEqualSlices(u8, old_one, unpublished_one);

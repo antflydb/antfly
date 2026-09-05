@@ -896,36 +896,43 @@ pub const EmbeddingPipeline = struct {
             .batch = batch,
             .sequence = 1,
             .input_bytes = pixel_bytes,
-            .host_preprocess_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
-                return error.ResourceLimitExceeded,
+            // The preprocessing buffer is adopted as the input tensor below,
+            // so it has one live representation rather than a temporary plus
+            // a copied tensor. Borrowed renderer rasters remain separately
+            // resident for the duration of preprocessing.
+            .host_preprocess_bytes = raster_bytes,
         });
         defer run_permit.deinit();
 
         const pixel_values = try alloc.alloc(f32, pixel_elements);
-        defer alloc.free(pixel_values);
+        var pixel_values_owned = true;
+        defer if (pixel_values_owned) alloc.free(pixel_values);
         const preprocess_start = embedTimingStart(self.print_timing);
         switch (self.config.image_preprocess_profile) {
-            .default => try image.preprocessBorrowedRasterBatchInto(
+            .default => try image.preprocessBorrowedRasterBatchIntoWithOptions(
                 pixel_values,
                 rasters,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
                 .bilinear,
+                .{ .io = self.config.preprocess_io },
             ),
-            .clip => try image.preprocessClipBorrowedRasterBatchInto(
+            .clip => try image.preprocessClipBorrowedRasterBatchIntoWithOptions(
                 pixel_values,
                 rasters,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
+                .{ .io = self.config.preprocess_io },
             ),
         }
         logEmbedTiming("image.preprocess.raster", batch, preprocess_start);
 
         const sz: i64 = @intCast(img_size);
         const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
-        var pv_tensor = try Tensor.initFloat32(alloc, "pixel_values", &pv_shape, pixel_values);
+        var pv_tensor = try Tensor.initFloat32Owned(alloc, "pixel_values", &pv_shape, pixel_values);
+        pixel_values_owned = false;
         defer pv_tensor.deinit();
 
         if (self.visual_projection) |proj| {

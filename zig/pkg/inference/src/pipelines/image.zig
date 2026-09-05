@@ -641,6 +641,44 @@ test "borrowed raster CLIP preprocessing preserves strided center crop semantics
     for (actual[4..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-6);
 }
 
+test "borrowed raster preprocessing uses caller executor without reordering" {
+    const red = [_]u8{
+        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255,
+    };
+    const blue = [_]u8{
+        0, 0, 255, 255, 0, 0, 255, 255,
+        0, 0, 255, 255, 0, 0, 255, 255,
+    };
+    const rasters = [_]antfly_image.BorrowedRasterAttachment{
+        .{ .bytes = &red, .width = 2, .height = 2, .stride_bytes = 8, .page_number = 1 },
+        .{ .bytes = &blue, .width = 2, .height = 2, .stride_bytes = 8, .page_number = 2 },
+    };
+    var serial: [24]f32 = undefined;
+    var parallel: [24]f32 = undefined;
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        &serial,
+        &rasters,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+        .{ .max_workers = 1 },
+    );
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        &parallel,
+        &rasters,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+        .{ .max_workers = 2, .io = std.testing.io },
+    );
+    try std.testing.expectEqualSlices(f32, &serial, &parallel);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), parallel[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), parallel[12 + 8], 1e-6);
+}
+
 test "bounded batch preprocessing uses a caller-owned executor without changing output" {
     const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
     var serial: [24]f32 = undefined;
@@ -1411,23 +1449,38 @@ pub fn preprocessBorrowedRasterBatchInto(
     std_dev: [3]f32,
     resample: Resample,
 ) !void {
+    return preprocessBorrowedRasterBatchIntoWithOptions(
+        result,
+        rasters,
+        target_size,
+        mean,
+        std_dev,
+        resample,
+        .{},
+    );
+}
+
+pub fn preprocessBorrowedRasterBatchIntoWithOptions(
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+    options: BatchPreprocessOptions,
+) !void {
     const ts: usize = target_size;
     const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
     const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
     const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
     if (result.len != expected_len) return error.InvalidInputShape;
 
-    for (rasters, 0..) |raster, index| {
-        const view = try raster.imageView();
-        try shared.preprocessDecodedWithResampleInto(
-            view,
-            result[index * per_image ..][0..per_image],
-            target_size,
-            mean,
-            std_dev,
-            resample,
-        );
-    }
+    try runBorrowedRasterPreprocessBatch(rasters, result, per_image, .{ .square = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+        .resample = resample,
+    } }, options);
 }
 
 /// CLIP/SigLIP variant of the borrowed-raster fast path. It preserves the
@@ -1440,23 +1493,35 @@ pub fn preprocessClipBorrowedRasterBatchInto(
     mean: [3]f32,
     std_dev: [3]f32,
 ) !void {
+    return preprocessClipBorrowedRasterBatchIntoWithOptions(
+        result,
+        rasters,
+        target_size,
+        mean,
+        std_dev,
+        .{},
+    );
+}
+
+pub fn preprocessClipBorrowedRasterBatchIntoWithOptions(
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) !void {
     const ts: usize = target_size;
     const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
     const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
     const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
     if (result.len != expected_len) return error.InvalidInputShape;
 
-    for (rasters, 0..) |raster, index| {
-        const view = try raster.imageView();
-        try view.validate();
-        preprocessImageViewClip(
-            view,
-            result[index * per_image ..][0..per_image],
-            target_size,
-            mean,
-            std_dev,
-        );
-    }
+    try runBorrowedRasterPreprocessBatch(rasters, result, per_image, .{ .clip = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+    } }, options);
 }
 
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,
@@ -1794,6 +1859,88 @@ const BatchPreprocessTask = struct {
         self.run();
     }
 };
+
+const BorrowedRasterPreprocessTask = struct {
+    raster: antfly_image.BorrowedRasterAttachment,
+    output: []f32,
+    operation: BatchPreprocessOperation,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        const view = self.raster.imageView() catch |err| {
+            self.err = err;
+            return;
+        };
+        switch (self.operation) {
+            .square => |square| shared.preprocessDecodedWithResampleInto(
+                view,
+                self.output,
+                square.target_size,
+                square.mean,
+                square.std_dev,
+                square.resample,
+            ) catch |err| {
+                self.err = err;
+            },
+            .clip => |clip| {
+                view.validate() catch |err| {
+                    self.err = err;
+                    return;
+                };
+                preprocessImageViewClip(
+                    view,
+                    self.output,
+                    clip.target_size,
+                    clip.mean,
+                    clip.std_dev,
+                );
+            },
+        }
+    }
+
+    fn runOpaque(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.run();
+    }
+};
+
+fn runBorrowedRasterPreprocessBatch(
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    result: []f32,
+    per_image: usize,
+    operation: BatchPreprocessOperation,
+    options: BatchPreprocessOptions,
+) !void {
+    if (options.max_workers == 0) return error.InvalidBatchPreprocessOptions;
+    if (rasters.len == 0) return;
+    const cpu_count = linalg.pool.cachedCpuCount();
+    const worker_limit = @max(@as(usize, 1), @min(
+        rasters.len,
+        @min(cpu_count, @min(options.max_workers, maximum_preprocess_workers)),
+    ));
+    var tasks: [maximum_preprocess_workers]BorrowedRasterPreprocessTask = undefined;
+    var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
+    var first: usize = 0;
+    while (first < rasters.len) {
+        const wave_len = @min(worker_limit, rasters.len - first);
+        for (tasks[0..wave_len], 0..) |*task, offset| {
+            const index = first + offset;
+            task.* = .{
+                .raster = rasters[index],
+                .output = result[index * per_image ..][0..per_image],
+                .operation = operation,
+            };
+        }
+        for (jobs[0..wave_len], tasks[0..wave_len]) |*job, *task|
+            job.* = .{ .fn_ptr = BorrowedRasterPreprocessTask.runOpaque, .ctx = task };
+        if (options.io) |io|
+            try linalg.pool.dispatchJobsIo(io, jobs[0..wave_len])
+        else for (jobs[0..wave_len]) |job|
+            job.fn_ptr(job.ctx);
+        for (tasks[0..wave_len]) |task| if (task.err) |err| return err;
+        first += wave_len;
+    }
+}
 
 fn runBoundedPreprocessBatch(
     image_list: []const []const u8,

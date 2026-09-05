@@ -143,6 +143,8 @@ pub const PageRenderExecutor = struct {
 /// Admission policy for one render microbatch. The caller deliberately owns
 /// document-level windowing: requests.len must not exceed max_batch_pages, so
 /// this API cannot accidentally retain a whole large document in memory.
+pub const default_render_bytes_per_pixel_reserve: usize = 12;
+
 pub const PageRenderBatchOptions = struct {
     max_batch_pages: usize = 8,
     max_parallel_pages: usize = 1,
@@ -153,7 +155,7 @@ pub const PageRenderBatchOptions = struct {
     /// the batch scratch budget. This is intentionally separate from encoded
     /// PNG retention because their sizes have very different distributions.
     max_retained_raster_bytes: usize = 256 * 1024 * 1024,
-    bytes_per_pixel_reserve: usize = 12,
+    bytes_per_pixel_reserve: usize = default_render_bytes_per_pixel_reserve,
     profile: RenderProfile = .ocr,
     cancellation: reader.CancellationProbe = .{},
     /// Production callers borrow this from BackendRuntime. When present,
@@ -878,6 +880,54 @@ pub fn prepareParsedPageRenderPlan(
         ._source_ptr = source.ptr,
         ._source_len = source.len,
     };
+}
+
+/// Return the maximum scratch reservation needed by one ordered wave of
+/// prepared pages. Pixel admission may split a wave further at execution, so
+/// this remains a safe upper bound without reserving the renderer's complete
+/// configured ceiling for every window.
+pub fn estimatePreparedPageRenderWaveScratchBytes(
+    parsed: *const reader.Reader,
+    plans: []const PreparedPageRenderPlan,
+    max_parallel_pages: usize,
+    bytes_per_pixel_reserve: usize,
+) !usize {
+    if (plans.len == 0 or max_parallel_pages == 0 or bytes_per_pixel_reserve < 4)
+        return error.InvalidRenderBatchOptions;
+    const worker_fixed = std.math.add(
+        usize,
+        try parsed.renderForkMetadataBytes(),
+        parsed.decode_limits.max_working_set_bytes,
+    ) catch return error.RenderBatchAdmissionExceeded;
+    const wave_width = @min(max_parallel_pages, plans.len);
+    var wave_bytes: usize = 0;
+    var peak_bytes: usize = 0;
+    for (plans, 0..) |plan, index| {
+        if (!plan.matchesSource(parsed)) return error.PreparedPageRenderSourceMismatch;
+        const raster_bytes = std.math.mul(
+            usize,
+            std.math.cast(usize, plan._geometry.pixels) orelse
+                return error.RenderBatchAdmissionExceeded,
+            bytes_per_pixel_reserve,
+        ) catch return error.RenderBatchAdmissionExceeded;
+        wave_bytes = std.math.add(usize, wave_bytes, worker_fixed) catch
+            return error.RenderBatchAdmissionExceeded;
+        wave_bytes = std.math.add(usize, wave_bytes, raster_bytes) catch
+            return error.RenderBatchAdmissionExceeded;
+        if (index >= wave_width) {
+            const expired = plans[index - wave_width];
+            const expired_raster_bytes = std.math.mul(
+                usize,
+                std.math.cast(usize, expired._geometry.pixels) orelse
+                    return error.RenderBatchAdmissionExceeded,
+                bytes_per_pixel_reserve,
+            ) catch return error.RenderBatchAdmissionExceeded;
+            wave_bytes -= worker_fixed;
+            wave_bytes -= expired_raster_bytes;
+        }
+        peak_bytes = @max(peak_bytes, wave_bytes);
+    }
+    return peak_bytes;
 }
 
 /// Resolve the raster geometry for a page using the exact same adaptive rules
@@ -4806,6 +4856,18 @@ test "prepared page plans preserve batch output and reject another source" {
         try std.testing.expectEqual(request.page_number, plan.request().page_number);
         try std.testing.expect(plan.geometry().pixels > 0);
     }
+    const serial_scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 1, 12);
+    const parallel_scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 2, 12);
+    try std.testing.expect(serial_scratch > parsed.decode_limits.max_working_set_bytes);
+    try std.testing.expect(parallel_scratch > serial_scratch);
+    var uneven = [_]PreparedPageRenderPlan{plans[0]} ** 6;
+    const uneven_pixels = [_]u64{ 1, 1, 100, 100, 1, 1 };
+    for (&uneven, uneven_pixels) |*plan, pixels| plan._geometry.pixels = pixels;
+    const worker_fixed = try parsed.renderForkMetadataBytes() + parsed.decode_limits.max_working_set_bytes;
+    try std.testing.expectEqual(
+        worker_fixed * 3 + 201 * 12,
+        try estimatePreparedPageRenderWaveScratchBytes(&parsed, &uneven, 3, 12),
+    );
     const capped_plan = plans[0].withMaxOutputBytes(1234);
     try std.testing.expectEqual(@as(?usize, 1234), capped_plan.request().max_output_bytes);
     try std.testing.expectEqual(plans[0].geometry(), capped_plan.geometry());
@@ -4837,6 +4899,10 @@ test "prepared page plans preserve batch output and reject another source" {
     try std.testing.expectError(
         error.PreparedPageRenderSourceMismatch,
         renderPreparedPagesBatchAlloc(alloc, &another_source, &plans, .{ .max_batch_pages = plans.len }),
+    );
+    try std.testing.expectError(
+        error.PreparedPageRenderSourceMismatch,
+        estimatePreparedPageRenderWaveScratchBytes(&another_source, &plans, 1, 12),
     );
 }
 

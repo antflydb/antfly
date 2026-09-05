@@ -65,6 +65,11 @@ pub const CapabilityLease = struct {
     descriptor_revision: ?CapabilityRevision = null,
 };
 
+fn legacyCapabilityLeaseForOwner(owner_context_error: ?anyerror) !CapabilityLease {
+    if (owner_context_error) |err| return err;
+    return .{ .capabilities = null };
+}
+
 fn monotonicNowNs(io: std.Io) u64 {
     _ = io;
     // Callers pass absolute deadlines produced by antfly_platform.time. Keep
@@ -370,7 +375,7 @@ pub const Cache = struct {
                     break :blk null;
                 };
                 self.mutex.lockUncancelable(self.io);
-                if (owner_context_error == null and self.retireInvalidatedFlightLocked(flight)) {
+                if (self.retireInvalidatedFlightLocked(flight)) {
                     self.mutex.unlock(self.io);
                     continue;
                 }
@@ -392,7 +397,7 @@ pub const Cache = struct {
                     flight.ready.set(self.io);
                     self.releaseFlightLocked(flight);
                     self.mutex.unlock(self.io);
-                    return .{ .capabilities = null };
+                    return legacyCapabilityLeaseForOwner(owner_context_error);
                 }
                 // Authoritative rejection, routing-stale responses, and invalid
                 // contracts revoke the cached plan. Only explicitly transient
@@ -1453,6 +1458,19 @@ test "capability discovery HTTP failures retain authoritative status semantics" 
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(408, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(429, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(503, false));
+}
+
+test "legacy capability discovery preserves owner cancellation after publishing" {
+    try std.testing.expectError(
+        error.Canceled,
+        legacyCapabilityLeaseForOwner(error.Canceled),
+    );
+    try std.testing.expectError(
+        error.Timeout,
+        legacyCapabilityLeaseForOwner(error.Timeout),
+    );
+    const active = try legacyCapabilityLeaseForOwner(null);
+    try std.testing.expect(active.capabilities == null);
 }
 
 test "capability stale revocation prevents transient rediscovery fallback" {
