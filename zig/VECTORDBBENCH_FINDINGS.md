@@ -4809,7 +4809,9 @@ owner capable of restoring query service. The disk governor now keeps
 headroom. Candidate, replay, and cleanup bytes remain separately and fully
 reserved, so this removes pathological proportional slack rather than
 weakening repair accounting. The preserved public-API regression completes in
-4.03 seconds in Debug on that below-five-percent-free host after this change.
+3.79 seconds in Debug on that below-five-percent-free host after merging the
+current `origin/main`. The distributed non-host status/heartbeat regression
+also completes in 3.93 seconds, confirming the merged runtime-status rollout.
 
 ## Next checks
 
@@ -4867,26 +4869,26 @@ weakening repair accounting. The preserved public-API regression completes in
    residency, and bounded parallel scoring—while keeping the demonstrated
    0.990 recall. RaBitQ routing's 1.55-percentage-point loss is outside the
    parity budget and must not become the default merely for latency.
-10. Compare the qualified 128-shard curve (0.9903 recall, 267 peak QPS) against
+13. Compare the qualified 128-shard curve (0.9903 recall, 267 peak QPS) against
     current Circus competitors using identical corpus, payload, recall, and
     concurrency semantics. Report cold and warm separately; never mix source
     mutation or maintenance into the first concurrency sample.
-11. Audit the remaining gap between roughly 595 MB attributable warm-restart
+14. Audit the remaining gap between roughly 595 MB attributable warm-restart
     demand and 2.86 GB cache-inclusive RSS. Classify mmap residency, allocator
     arenas, primary run/index pages, cache leases, and runtime stacks before
     changing budgets; reclaimable file cache must not be mislabeled as demand.
-12. Move candidate-page admission under an explicit resource-manager budget.
+15. Move candidate-page admission under an explicit resource-manager budget.
     The cold r125 concurrency-1 wave was 14.13 QPS while a reopened pass reached
     46.55 QPS. Split per-leaf authentication between compact RaBitQ and wide
     float16/residual planes, prefetch only the routed shell, and evict whole
     pages by generation. Do not restore unbounded mmap warmup merely to hide
     cold latency.
-13. Reduce the remaining 3.60 GiB live high-water in primary/vector
+16. Reduce the remaining 3.60 GiB live high-water in primary/vector
     consolidation. The posting flatten no longer raises the peak; prioritize
     bounded vector-block source reads and primary LSM closure/output windows,
     preserving crash-safe final-shard publication and progress on an
     indivisible compaction closure.
-14. Bound online HBC tree height under adversarially ordered vectors. The Debug
+17. Bound online HBC tree height under adversarially ordered vectors. The Debug
     aggregate's branch-local `flat traversal does not treat a full candidate
     heap as a pruning proof` fixture inserts 128 collinear inner-product vectors
     in increasing order and entered a deeply recursive internal split/range
