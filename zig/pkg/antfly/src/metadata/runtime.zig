@@ -2125,6 +2125,11 @@ test "metadata runtime retries authority loss from control rounds" {
     for (expected_errors) |err| {
         try std.testing.expect(isExpectedControlRoundError(err));
     }
+    // Preserve the intentional distinction between an idempotent background
+    // re-drive and a client mutation whose admission outcome is unknown.
+    try std.testing.expect(!antfly.metadata.authority.isRetryableError(
+        error.MetadataMutationOutcomeUnknown,
+    ));
     try std.testing.expect(!isExpectedControlRoundError(error.OutOfMemory));
     try std.testing.expect(!isExpectedControlRoundError(error.Corrupted));
 }
