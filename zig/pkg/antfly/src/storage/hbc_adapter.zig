@@ -8326,15 +8326,16 @@ pub const HBCIndex = struct {
             return;
         }
         // The builder normally finishes well before the durable tail reaches
-        // the hard policy bound. If it does not, wait only at that bound so
-        // recovery debt cannot grow without limit.
+        // the hard policy bound. If it does not, promote it to mandatory
+        // progress but never join it here: callers own the per-index apply
+        // fence, and waiting would turn corpus I/O into a foreground/replay
+        // stall. The WAL's independent format limit remains the final explicit
+        // backpressure boundary if the promoted builder cannot keep up.
         if (self.experimental_posting_checkpoint_build) |build| {
             if (!build.completed.load(.acquire) and
                 posting_store.wal_committed_bytes >= managedPostingCheckpointHardWalBytes)
             {
                 build.force_progress.store(true, .release);
-                build.awaitCompletion();
-                std.debug.assert(build.completed.load(.acquire));
             }
         }
         _ = try self.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
@@ -8502,13 +8503,13 @@ pub const HBCIndex = struct {
         if (options.flatten) {
             _ = try self.requestExperimentalPostingFullCheckpointForReadiness();
             _ = try self.finishExperimentalPostingCheckpointForReadiness();
-        } else {
-            // A stable-tip caller that deliberately keeps the bounded delta
-            // chain still owns a publication fence. Retire any opportunistic
-            // build started before its final validation; publishing that stale
-            // candidate later could overwrite the state just certified here.
-            self.discardExperimentalPostingCheckpointBuild();
         }
+        // A non-flattening lifecycle fence must never join or discard an
+        // opportunistic build. The builder retained an immutable generation
+        // and a complete WAL-prefix boundary; publication atomically carries
+        // forward every later committed suffix. It is therefore safe to let
+        // that work finish asynchronously, and waiting here would hold the
+        // caller's apply fence across corpus-scale disk I/O.
         if (self.experimentalPostingDurableAppliedSequence() != applied_sequence) {
             return error.PostingCheckpointSequenceMismatch;
         }
@@ -21813,6 +21814,11 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
         // durable bytes as tail.
         try std.testing.expectEqual(source_wal_bytes, flattened_wal_bytes);
         try std.testing.expect(flattened_wal_bytes < posting_store.wal_committed_bytes);
+        const background_build = idx.experimental_posting_checkpoint_build.?;
+        try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(4, .{ .flatten = false });
+        // Logical readiness must neither join nor cancel physical compaction.
+        // The retained prefix plus later WAL tail remains a valid candidate.
+        try std.testing.expectEqual(background_build, idx.experimental_posting_checkpoint_build.?);
 
         // A delayed callback may commit another ordered batch at sequence 4
         // while the segment for the earlier sequence-4 prefix is building.

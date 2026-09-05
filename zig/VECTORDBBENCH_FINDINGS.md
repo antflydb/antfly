@@ -4673,13 +4673,78 @@ This isolates a separate primary-store/request scheduling or residency problem;
 it must not be hidden by increasing the client timeout or described as an
 admission failure.
 
+#### Durable replay admission and asynchronous native authority
+
+Stage profiling located the synchronized timeout precisely. Once the retained
+derived backlog crossed 200 source sequences, a `sync_level=write` request ran
+16 HBC replay sequences synchronously; one 100-row request spent 34.691 seconds
+in `backlog_pressure` while its primary mutation took only milliseconds. The
+threshold therefore coupled response latency to corpus-derived work and did not
+provide a real memory bound.
+
+Derived replay now reserves its exact encoded payload plus queue-entry overhead
+from the node resource manager before primary commit. The reservation transfers
+to the durable sequence after commit without allocating. Exhaustion fails
+before the primary mutation with explicit retryable HTTP 429 backpressure;
+successful `write` requests only notify the independent replay worker. Source
+sequence identity is included in batch profiles, and query/write activity has
+separate maintenance-deferral leases. Coverage-only and non-batch mutation
+paths use the same precommit contract, so no producer can bypass the bound with
+zero-byte records or a best-effort postcommit accounting call.
+
+Native readiness is now distinct from physical consolidation. A certified
+vector base plus its complete WAL/delta suffix is authoritative without a
+million-vector rewrite. The initial empty bootstrap still requires a
+cardinality-certified base. Likewise, stable-tip posting validation publishes
+the applied watermark without flattening. A retained-generation posting
+compactor stages files asynchronously and may later preserve the concurrent WAL
+tail in an atomic publication; neither `runUntilIdle` nor `full_index` joins or
+cancels that build while holding the index apply fence.
+
+The resumed 50K mixed qualification (10 query workers, four write workers,
+100-row public batches) sustained 136.9 query QPS and 1,426.9 rows/s at 0.9762
+recall. Client query p50/p95/p99 were 69.68/100.32/151.87 ms; server p95 was
+32.47 ms. Catch-up completed in 2.72 seconds with no errors. Server-side batch
+work averaged 28.1 ms with a 50-ms p95. Cache-inclusive RSS peaked at 2.78 GiB,
+versus 3.552 GB in the earlier dirty 50K baseline.
+
+At 1M, the first decoupled run eliminated request timeouts but exposed a second
+coupling: stable-tip readiness rewrote the complete vector and posting bases and
+timed out at 120 seconds. Reordering the already-existing exact-overlay proof
+reduced catch-up to 5.81 seconds in a short, heavily contended diagnostic. A
+subsequent run then reproduced the remaining posting bug directly: two 1.50-GB
+full checkpoints under the apply fence produced 24--64-second batch times.
+
+After removing foreground replay pressure and the vector-base rewrite, but
+before removing the final quiescent posting join, a 60-second stress phase
+completed 638 public write batches with server-side batch p95/p99 of 50/75 ms
+and no backlog waits or request errors while sustaining 183.5 query QPS, 1,061
+rows/s, and 0.9905 recall. Server query p95/p99 were 33.59/42.77 ms. That run
+then joined the quiescent full checkpoint and took 117.6 seconds to become
+idle, serving as the negative control.
+
+The final 30-second run used fully asynchronous quiescent publication. It
+sustained 174.9 query QPS and 1,397.7 rows/s at 0.9920 recall with no errors.
+Server query p50/p95/p99 were 17.37/21.79/29.15 ms; server batch p95/p99 were
+39/71 ms. No full checkpoint was started or published by the lifecycle fence,
+and catch-up completed in 57.39 seconds while draining 421 asynchronous replay
+batches. This is a correctness and latency qualification, not an uncontended
+hardware record: other worktrees were compiling on the same host.
+
+The remaining regression is residency, not managed HBC heap. Final HBC cache
+accounting was only 35.6 MiB with zero vector-cache bytes, but cache-inclusive
+RSS peaked at 6.01 GiB. The next memory work must attribute primary
+LSM and mmap/file-cache residency rather than shrinking already-bounded query
+scratch. The 57-second replay drain also shows that stable-tip work should
+coalesce adjacent dirty sequences into larger bounded transactions; it must not
+restore synchronous foreground pressure.
+
 ## Next checks
 
-1. Diagnose the reproducible 1M mixed-write timeout below the public request
-   boundary. Attribute time and retained pages across the primary write/WAL,
-   source mutation capture, centroid refresh, and request executor. Preserve
-   the now-qualified exact admission accounting; do not raise timeouts or scan
-   capacity to obscure the stall.
+1. Coalesce adjacent stable-tip replay sequences into larger bounded HBC WAL
+   transactions. Preserve source-sequence ordering, capture identity, and the
+   precommitted backlog reservation while reducing the final 421-batch/57-second
+   drain. Never put this work back on `sync_level=write`.
 2. Separate allocation-byte admission from memory-bandwidth task admission.
    Exact selected-block bandwidth is now implemented for clean and dirty native
    generations. Add an independently measured scratch/allocation permit and

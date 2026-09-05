@@ -4280,14 +4280,15 @@ pub const IndexManager = struct {
         const since = self.vector_block_candidate_since_ns.load(.acquire);
         if (!immediate_initial_bootstrap and (since == 0 or now -| since < vector_block_quiescence_ns)) return .pending;
 
-        // A sequence-aligned native generation can be finalized entirely from
-        // its immutable blocks and WAL. Keep vector consolidation and posting
-        // validation/flattening under the same readiness fence: publishing the
-        // vector base alone would leave a large posting overlay as query-time
-        // merge and rerank debt. This path is safe under primary LSM pressure
-        // and never turns an upload lull into another source scan.
+        // A sequence-aligned native generation is already query-authoritative.
+        // Its WAL/delta suffix is bounded, immutable to readers, and carries
+        // the same source identity as the certified base. Quiescent
+        // maintenance may start or publish an asynchronously staged posting
+        // checkpoint, but must not join a corpus rewrite under apply_mutex.
+        // Vector delta consolidation is likewise physical maintenance rather
+        // than a readiness prerequisite.
         if (native_generation_self_contained) {
-            try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+            _ = try entry.index.requestExperimentalPostingCheckpointForIdle();
             const topology_result = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
                 std.log.warn("recursive HBC topology rebuild deferred index={s} sequence={} err={s}", .{
                     entry.config.name,
