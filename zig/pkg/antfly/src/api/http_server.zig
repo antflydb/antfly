@@ -3053,7 +3053,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
-        return queryEmbeddingCacheIo(self.cfg);
+        const fallback = std.Io.Threaded.global_single_threaded.io();
+        const runtime = self.cfg.backend_runtime orelse return fallback;
+        return runtime.apiNetworkIo() orelse fallback;
     }
 
     pub fn requestStats(self: *ApiHttpServer) RequestStats {
@@ -3535,7 +3537,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiIo() else null,
+            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -23365,10 +23367,10 @@ test "api http server obtains query embedding policy from resource manager" {
     defer runtime.deinit();
     const selected_io = ApiHttpServer.queryEmbeddingCacheIo(.{ .backend_runtime = runtime.ptr() });
     const raw_runtime_io = runtime.ptr().apiIoImpl().?.io();
-    const runtime_io = runtime.ptr().apiIo().?;
-    try std.testing.expect(selected_io.userdata == runtime_io.userdata);
-    try std.testing.expect(selected_io.vtable == runtime_io.vtable);
-    try std.testing.expect(selected_io.vtable != raw_runtime_io.vtable);
+    const network_runtime_io = runtime.ptr().apiNetworkIo().?;
+    try std.testing.expect(selected_io.userdata == raw_runtime_io.userdata);
+    try std.testing.expect(selected_io.vtable == raw_runtime_io.vtable);
+    try std.testing.expect(selected_io.vtable != network_runtime_io.vtable);
 }
 
 test "api http query parsing preserves operational embedding failures" {

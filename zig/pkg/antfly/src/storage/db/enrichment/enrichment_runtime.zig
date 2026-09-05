@@ -2751,10 +2751,7 @@ fn getOrCreateRequestChunks(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const raw = try storeGetOptionalAllocWithRetry(runtime, doc_store_key);
     if (raw == null) {
         const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
         try cache.append(runtime.alloc, .{
@@ -5265,10 +5262,7 @@ fn processAsset(
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     var raw_owned = true;
     defer if (raw_owned) runtime.alloc.free(raw);
 
@@ -5350,10 +5344,7 @@ fn processAsset(
     var state_value_owned = true;
     defer if (state_value_owned) runtime.alloc.free(state_value);
     if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
-        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
-            std.mem.Allocator.Error.OutOfMemory => return err,
-            else => null,
-        };
+        const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
             try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
@@ -5534,15 +5525,9 @@ fn processDocumentExtractionAsset(
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
     defer runtime.alloc.free(state_key);
-    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_state = try storeGetOptionalAllocWithRetry(runtime, state_key);
     defer if (existing_state) |value| runtime.alloc.free(value);
-    const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_manifest = try storeGetOptionalAllocWithRetry(runtime, manifest_key);
     defer if (existing_manifest) |value| runtime.alloc.free(value);
     var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
     defer freeDocumentArtifactChildRanges(runtime.alloc, previous_child_ranges);
@@ -6182,10 +6167,7 @@ fn deleteDocumentExtractionForRuntime(
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
     try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, manifest_key);
 
-    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_state = try storeGetOptionalAllocWithRetry(runtime, state_key);
     defer if (existing_state) |value| runtime.alloc.free(value);
     if (existing_state) |state| {
         var previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
@@ -8807,10 +8789,7 @@ fn runtimeReconcileGraphEdgeContenders(
 
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
     defer alloc.free(count_key);
-    const raw_count = storeGetAlloc(runtime, count_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_count = try storeGetOptionalAllocWithRetry(runtime, count_key);
     defer if (raw_count) |raw| alloc.free(raw);
     const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
     result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
@@ -10017,10 +9996,7 @@ fn collectPlainDenseBatchItem(
     const embedding_artifact_name = requestEmbeddingName(request);
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return null;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -10337,16 +10313,13 @@ fn getOrCreatePlannedRequests(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => {
-            const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
-            try request_plan_cache.append(runtime.alloc, .{
-                .doc_key = owned_doc_key,
-                .requests = empty,
-            });
-            return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
-        },
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse {
+        const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
+        try request_plan_cache.append(runtime.alloc, .{
+            .doc_key = owned_doc_key,
+            .requests = empty,
+        });
+        return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
     };
     defer runtime.alloc.free(raw);
 
@@ -10779,10 +10752,7 @@ fn processDenseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
@@ -10919,10 +10889,7 @@ fn processSparseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -11358,10 +11325,7 @@ fn embeddingArtifactKey(runtime: *EnrichmentRuntime, base_key: []const u8, artif
 }
 
 fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, source_hash: u64) !bool {
-    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, artifact_key)) orelse return false;
     defer runtime.alloc.free(raw);
     const existing_hash = enrichment_artifact_codec.sourceHash(raw) catch {
         runtime.codec_decode_failures += 1;
@@ -11375,10 +11339,7 @@ fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []cons
 }
 
 fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, value: []const u8) !bool {
-    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, artifact_key)) orelse return false;
     defer runtime.alloc.free(raw);
     if (std.mem.eql(u8, raw, value)) {
         runtime.skip_by_hash_count += 1;
@@ -11388,10 +11349,7 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
 }
 
 fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return false;
     defer runtime.alloc.free(raw);
     if (std.mem.eql(u8, raw, expected_state)) {
         runtime.skip_by_hash_count += 1;
@@ -11777,10 +11735,7 @@ fn ensureRuntimeDocumentExtractionNavigationIndex(
 ) !bool {
     const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(runtime.alloc, doc_key, artifact_name);
     defer runtime.alloc.free(summary_key);
-    const existing_summary = storeGetAlloc(runtime, summary_key) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_summary = try storeGetOptionalAllocWithRetry(runtime, summary_key);
     defer if (existing_summary) |summary| runtime.alloc.free(summary);
     if (existing_summary) |summary| {
         if (try hierarchy_navigation.indexMetadataMatches(runtime.alloc, state, summary, generation)) {
@@ -12906,10 +12861,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
     state_key: []const u8,
     deletes: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return;
     defer runtime.alloc.free(raw);
     if (try graph_asset_state.format(raw) != .v5) return;
     const root = try graph_asset_state.segmentedRoot(raw);
@@ -12925,10 +12877,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
 
 fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]u8 {
     const alloc = runtime.alloc;
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return null;
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
     return switch (try graph_asset_state.format(raw)) {
@@ -12945,7 +12894,14 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
             for (0..root.segment_count) |segment_index| {
                 const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
                 defer alloc.free(segment_key);
-                const segment_raw = storeGetAlloc(runtime, segment_key) catch return error.InvalidGraphAssetState;
+                const segment_raw = storeGetAllocWithRetry(runtime, segment_key) catch |err| switch (err) {
+                    // A committed segmented root makes a missing segment a
+                    // durable format violation. Operational read failures are
+                    // not corruption evidence and must remain retryable at the
+                    // supervised worker boundary.
+                    error.NotFound => return error.InvalidGraphAssetState,
+                    else => return err,
+                };
                 defer alloc.free(segment_raw);
                 encoded_bytes = std.math.add(usize, encoded_bytes, segment_raw.len) catch return error.ResourceLimitExceeded;
                 if (encoded_bytes > graph_asset_state.hard_max_manifest_bytes) return error.ResourceLimitExceeded;
@@ -13087,10 +13043,7 @@ fn deleteStaleChunkArtifacts(
 }
 
 fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
-    const raw = storeGetAlloc(runtime, chunk_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, chunk_key)) orelse return null;
     defer runtime.alloc.free(raw);
 
     const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
@@ -13786,12 +13739,10 @@ fn clearQueuedCoverageTransitions(
 }
 
 fn loadDerivedCoverageOutcomeCounter(runtime: *EnrichmentRuntime, counter_key: []const u8) !?u64 {
-    const raw = storeGetAlloc(runtime, counter_key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    defer runtime.alloc.free(raw);
-    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, counter_key);
+    if (raw == null) return null;
+    defer runtime.alloc.free(raw.?);
+    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw.?);
 }
 
 fn scanDerivedCoverageOutcome(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64, outcome: CoverageOutcome) !u64 {
@@ -14022,10 +13973,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             _ = try counterState(runtime, &counter_states, &counter_indexes, transition, candidate_outcome);
         }
 
-        const existing_value = storeGetAlloc(runtime, transition.marker_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_value = try storeGetOptionalAllocWithRetry(runtime, transition.marker_key);
         defer if (existing_value) |value| runtime.alloc.free(value);
         const existing_outcome: ?CoverageOutcome = if (existing_value) |value|
             std.meta.stringToEnum(CoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
@@ -14416,18 +14364,69 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return try runtime.alloc.dupe(u8, raw);
 }
 
-fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+fn readAllocWithRetry(context: anytype, key: []const u8, comptime read_fn: anytype) ![]u8 {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        return storeGetAlloc(runtime, key) catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
+        return read_fn(context, key) catch |err| {
+            if (err != error.WriterLocked) return err;
+            if (attempt >= writer_locked_retry_count) return err;
+            backoffWriterLockRetry();
+            continue;
         };
     }
+}
+
+fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    return readAllocWithRetry(runtime, key, storeGetAlloc);
+}
+
+/// `NotFound` is the only absence proof. In particular, writer contention is
+/// not evidence that a source document or previously published artifact was
+/// deleted: callers use optional reads to decide whether to retire derived
+/// state, so laundering `WriterLocked` into null can destructively publish an
+/// empty replacement. Retry bounded contention and propagate every remaining
+/// operational failure to the supervised worker boundary.
+fn storeGetOptionalAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) !?[]u8 {
+    return storeGetAllocWithRetry(runtime, key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+test "optional enrichment reads never classify contention as source absence" {
+    const Reader = struct {
+        attempts: usize = 0,
+        value: [5]u8 = "value".*,
+
+        fn get(self: *@This(), _: []const u8) anyerror![]u8 {
+            self.attempts += 1;
+            if (self.attempts == 1) return error.WriterLocked;
+            return &self.value;
+        }
+
+        fn missing(_: *@This(), _: []const u8) anyerror![]u8 {
+            return error.NotFound;
+        }
+
+        fn failed(_: *@This(), _: []const u8) anyerror![]u8 {
+            return error.ReadFailed;
+        }
+    };
+
+    var reader = Reader{};
+    const value = readAllocWithRetry(&reader, "source", Reader.get) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    try std.testing.expectEqualStrings("value", value.?);
+    try std.testing.expectEqual(@as(usize, 2), reader.attempts);
+
+    const missing = readAllocWithRetry(&reader, "source", Reader.missing) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), missing);
+    try std.testing.expectError(error.ReadFailed, readAllocWithRetry(&reader, "source", Reader.failed));
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {

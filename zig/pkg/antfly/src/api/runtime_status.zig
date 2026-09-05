@@ -608,6 +608,10 @@ fn runTestReadGroupRetirementHook() void {
 
 pub const TableRuntimeSnapshotCache = struct {
     const ReadIndexAuthority = struct {
+        kind: db_mod.types.IndexKind,
+        coverage_generation: u64,
+        coverage_config_hash: u64,
+        coverage_identity_ready: bool,
         target_observation_complete: std.atomic.Value(bool),
         observation_stale: std.atomic.Value(bool),
         observation_serviceable: std.atomic.Value(bool),
@@ -616,12 +620,34 @@ pub const TableRuntimeSnapshotCache = struct {
 
         fn init(status: db_mod.types.DBIndexStats) @This() {
             return .{
+                .kind = status.kind,
+                .coverage_generation = status.coverage_generation,
+                .coverage_config_hash = status.coverage_config_hash,
+                .coverage_identity_ready = status.coverage_identity_ready,
                 .target_observation_complete = .init(status.runtime_target_observation_complete),
                 .observation_stale = .init(status.runtime_observation_stale),
                 .observation_serviceable = .init(status.runtime_observation_serviceable),
                 .targeted_sibling = .init(status.runtime_observation_targeted_sibling),
                 .terminal_failure_code = .init(0),
             };
+        }
+
+        fn identityMatches(self: *const @This(), status: db_mod.types.DBIndexStats) bool {
+            return self.kind == status.kind and
+                self.coverage_generation == status.coverage_generation and
+                self.coverage_config_hash == status.coverage_config_hash and
+                self.coverage_identity_ready == status.coverage_identity_ready;
+        }
+
+        fn fenceIdentityMismatch(self: *@This()) void {
+            // The immutable payload still belongs to another incarnation. It
+            // may remain readable as diagnostic history, but authority from a
+            // replacement must never be attached to it under memory pressure.
+            self.target_observation_complete.store(false, .release);
+            self.observation_stale.store(true, .release);
+            self.observation_serviceable.store(false, .release);
+            self.targeted_sibling.store(false, .release);
+            self.storeTerminalFailure(null);
         }
 
         fn store(self: *@This(), status: db_mod.types.DBIndexStats) void {
@@ -2576,6 +2602,10 @@ pub const TableRuntimeSnapshotCache = struct {
             if (comptime builtin.is_test) _ = test_authority_sync_index_visits.fetchAdd(1, .monotonic);
             const index = view_authority.index_by_name.get(index_status.name) orelse continue;
             const index_authority = &view_authority.indexes[index];
+            if (!index_authority.identityMatches(index_status)) {
+                index_authority.fenceIdentityMismatch();
+                continue;
+            }
             index_authority.store(index_status);
             const terminal_failure = if (state.index_authorities.get(index_status.name)) |authority|
                 if (authority.terminal_failures.get(group.status.group_id)) |failure|
@@ -4009,9 +4039,17 @@ fn preserveArtifactVisibilityUsingLookup(
                 dst.coverage_config_hash == cached.coverage_config_hash;
         const same_projection_identity = same_runtime_root and
             (if (derived_index) same_derived_incarnation else same_projection_config);
-        const same_runtime_owner = previous.stats.runtime_owner_id != 0 and
-            previous.stats.runtime_owner_id == incoming.stats.runtime_owner_id;
-        const serving_revision_not_newer = same_runtime_owner and
+        const cached_serving_owner = if (cached.serving_snapshot_owner_id != 0)
+            cached.serving_snapshot_owner_id
+        else
+            previous.stats.runtime_owner_id;
+        const incoming_serving_owner = if (dst.serving_snapshot_owner_id != 0)
+            dst.serving_snapshot_owner_id
+        else
+            incoming.stats.runtime_owner_id;
+        const same_serving_owner = cached_serving_owner != 0 and
+            cached_serving_owner == incoming_serving_owner;
+        const serving_revision_not_newer = same_serving_owner and
             same_projection_identity and
             dst.serving_snapshot_revision <= cached.serving_snapshot_revision;
         // Serving revisions are process-local, so they cannot order snapshots
@@ -4635,6 +4673,7 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.publication_target_ready = cached.publication_target_ready;
     dst.serving_snapshot_ready = cached.serving_snapshot_ready;
     dst.serving_snapshot_revision = cached.serving_snapshot_revision;
+    dst.serving_snapshot_owner_id = cached.serving_snapshot_owner_id;
     dst.text_merge = cached.text_merge;
     dst.hbc_cache = cached.hbc_cache;
     dst.hbc_posting = cached.hbc_posting;
@@ -5168,6 +5207,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .publication_target_ready = item.publication_target_ready,
             .serving_snapshot_ready = item.serving_snapshot_ready,
             .serving_snapshot_revision = item.serving_snapshot_revision,
+            .serving_snapshot_owner_id = item.serving_snapshot_owner_id,
             .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
@@ -8439,6 +8479,8 @@ test "targeted structural publication cannot regress an untouched sibling genera
             .kind = .dense_vector,
             .doc_count = 20,
             .serving_snapshot_ready = true,
+            .serving_snapshot_revision = 4,
+            .serving_snapshot_owner_id = 77,
             .coverage_produced_count = 20,
             .coverage_generation = 41,
             .coverage_config_hash = 91,
@@ -8463,7 +8505,7 @@ test "targeted structural publication cannot regress an untouched sibling genera
         try cache.publishGroup(initial_token, "docs", .{
             .group_id = 7,
             .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
-            .stats = .{ .source_doc_count = 100, .doc_count = 20, .index_count = 2, .indexes = published_indexes[0..] },
+            .stats = .{ .runtime_owner_id = 77, .source_doc_count = 100, .doc_count = 20, .index_count = 2, .indexes = published_indexes[0..] },
         }),
     );
 
@@ -8478,6 +8520,8 @@ test "targeted structural publication cannot regress an untouched sibling genera
             // progressive publication.
             .doc_count = 8,
             .serving_snapshot_ready = true,
+            .serving_snapshot_revision = 2,
+            .serving_snapshot_owner_id = 88,
             .coverage_produced_count = 8,
             .coverage_generation = 41,
             .coverage_config_hash = 91,
@@ -8504,7 +8548,7 @@ test "targeted structural publication cannot regress an untouched sibling genera
         try cache.publishTargetedGroups(structural_token, "docs", "thumbnail", &.{.{
             .group_id = 7,
             .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
-            .stats = .{ .source_doc_count = 100, .doc_count = 8, .index_count = 2, .indexes = structural_indexes[0..] },
+            .stats = .{ .runtime_owner_id = 88, .source_doc_count = 100, .doc_count = 8, .index_count = 2, .indexes = structural_indexes[0..] },
         }}),
     );
 
@@ -8514,9 +8558,49 @@ test "targeted structural publication cannot regress an untouched sibling genera
     const thumbnail = findIndexStatusByName(observed.stats.indexes, "thumbnail").?;
     try std.testing.expectEqual(@as(u64, 20), semantic.doc_count);
     try std.testing.expectEqual(@as(u64, 20), semantic.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 77), semantic.serving_snapshot_owner_id);
     try std.testing.expect(semantic.runtime_observation_targeted_sibling);
     try std.testing.expectEqual(@as(u64, 12), thumbnail.coverage_generation);
     try std.testing.expectEqual(@as(u64, 1), thumbnail.doc_count);
+
+    // Retaining the sibling payload must retain its serving owner too. A
+    // delayed observation from that owner remains ordered even though the
+    // structural sample changed the enclosing group owner and source target.
+    // Without index-scoped ownership this publication could regress 20
+    // searchable artifacts to 12.
+    var delayed_sibling = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .doc_count = 12,
+        .serving_snapshot_ready = true,
+        .serving_snapshot_revision = 2,
+        .serving_snapshot_owner_id = 77,
+        .coverage_produced_count = 12,
+        .coverage_generation = 41,
+        .coverage_config_hash = 91,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .projection_checkpoint_generation = 8,
+        .projection_checkpoint_applied_sequence = 12,
+        .projection_checkpoint_config_hash = 91,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 4,
+    }};
+    const delayed_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(delayed_token, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .runtime_owner_id = 77, .source_doc_count = 100, .index_count = 1, .indexes = delayed_sibling[0..] },
+        }),
+    );
+    var after_delayed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer after_delayed.deinit(alloc);
+    const retained = findIndexStatusByName(after_delayed.stats.indexes, "semantic").?;
+    try std.testing.expectEqual(@as(u64, 20), retained.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), retained.serving_snapshot_revision);
+    try std.testing.expectEqual(@as(u64, 77), retained.serving_snapshot_owner_id);
 }
 
 test "synthetic refresh cannot outrank targeted structural owner observation" {
@@ -10007,6 +10091,84 @@ test "table runtime snapshot cache preserves existing status on replacement allo
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "read mirror allocation failure cannot attach replacement authority to predecessor identity" {
+    const alloc = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    cache.read_view_alloc = failing.allocator();
+    defer cache.deinit();
+
+    var predecessor = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 1,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .runtime_observation_serviceable = true,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(
+        initial,
+        "docs",
+        .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = predecessor[0..] },
+        },
+    ));
+
+    const transition = cache.fenceTargetedIndexPublications("docs", "semantic").?;
+    try std.testing.expect(cache.armTargetedIndexPublications("docs", "semantic", transition));
+    try std.testing.expect(cache.bindTargetedIndexExpectation("docs", "semantic", transition, .{ .exact = .{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 2,
+        .config_hash = 44,
+    } }));
+
+    var replacement = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .serving_snapshot_ready = true,
+        .coverage_generation = 2,
+        .coverage_config_hash = 44,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .runtime_observation_serviceable = true,
+    }};
+    failing.fail_index = failing.alloc_index;
+    const publish = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishTargetedGroupsForTransition(
+        publish,
+        transition,
+        "docs",
+        "semantic",
+        &.{.{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = replacement[0..] },
+        }},
+    ));
+    try std.testing.expect(failing.has_induced_failure);
+
+    // The authoritative mutable cache advanced. The best-effort read mirror
+    // still contains generation 1, so it must remain explicitly fenced until
+    // a later refresh can atomically install generation 2's payload.
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        cache.tables.get("docs").?.groups.get(7).?.stats.indexes[0].coverage_generation,
+    );
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    const stale = findIndexStatusByName(observed.stats.indexes, "semantic").?;
+    try std.testing.expectEqual(@as(u64, 1), stale.coverage_generation);
+    try std.testing.expect(stale.runtime_observation_stale);
+    try std.testing.expect(!stale.runtime_observation_serviceable);
+    try std.testing.expect(!stale.runtime_target_observation_complete);
 }
 
 test "table runtime snapshot cache preserves previous snapshots when replace preserve install fails" {

@@ -1160,11 +1160,36 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     first_floor = int(partial_status["searchable_vectors"])
     first_coverage_floor = int(partial_status["source_coverage"]["covered"])
     first_last_artifacts = first_floor
+    first_last_covered = first_coverage_floor
     first_last_status = partial_status
     first_continuity_samples = 0
 
+    def serving_status_summary(status: dict) -> dict:
+        readiness = status.get("readiness") or {}
+        coverage = status.get("source_coverage") or {}
+        publication = status.get("publication") or {}
+        activity = status.get("activity") or {}
+        return {
+            "incarnation": readiness.get("incarnation"),
+            "state": readiness.get("state"),
+            "queryable": readiness.get("queryable"),
+            "published_revision": readiness.get("published_revision"),
+            "target_revision": readiness.get("target_revision"),
+            "searchable_vectors": status.get("searchable_vectors"),
+            "total_indexed": status.get("total_indexed"),
+            "publication": publication,
+            "source_coverage": coverage,
+            "runtime_present": status.get("runtime_present"),
+            "runtime_fresh": status.get("runtime_fresh"),
+            "activity_phase": activity.get("phase"),
+        }
+
     def assert_first_serving_continuity() -> dict:
-        nonlocal first_last_artifacts, first_last_status, first_continuity_samples
+        nonlocal \
+            first_last_artifacts, \
+            first_last_covered, \
+            first_last_status, \
+            first_continuity_samples
         request_started = time.monotonic()
         status = backup_api.get_index(table_name, index_name)["status"]
         request_elapsed = time.monotonic() - request_started
@@ -1177,14 +1202,18 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         assert readiness.get("queryable") is True, status
         searchable = int(status.get("searchable_vectors", 0))
         assert searchable >= first_last_artifacts, json.dumps(
-            {"previous": first_last_status, "current": status},
+            {
+                "previous": serving_status_summary(first_last_status),
+                "current": serving_status_summary(status),
+            },
             indent=2,
             sort_keys=True,
         )
         first_last_artifacts = searchable
         first_last_status = status
         covered = int((status.get("source_coverage") or {}).get("covered", 0))
-        assert covered >= first_coverage_floor, status
+        assert covered >= first_last_covered, status
+        first_last_covered = covered
         first_continuity_samples += 1
         return status
 

@@ -3090,8 +3090,13 @@ pub const DBIndexStats = struct {
     // this exact dense incarnation. Zero members is still a valid snapshot.
     serving_snapshot_ready: bool = false,
     // Process-local immutable serving revision. It is ordered only when the
-    // enclosing DBStats observations have the same nonzero runtime_owner_id.
+    // serving observation has the same nonzero owner identity.
     serving_snapshot_revision: u64 = 0,
+    // Process-local owner of the immutable serving snapshot above. This is
+    // index-scoped because targeted structural observations can retain a
+    // sibling's serving payload while the enclosing DBStats comes from a
+    // different temporary DB owner.
+    serving_snapshot_owner_id: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,

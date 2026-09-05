@@ -9849,13 +9849,12 @@ pub const DataServer = struct {
             },
             .signal_runnable => {
                 _ = self.provisioned_index_repair_runnable_wake_events.fetchAdd(1, .monotonic);
-                const request_admission = self.coalesceProvisionedIndexRepairRunnableForTable(table_name, group_id) catch |err| {
+                self.signalProvisionedIndexRepairRunnableForTable(table_name, group_id) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.provisioned_index_repair_dirty.store(true, .release);
                     std.log.warn("provisioned index repair runnable signal failed group={} err={s}", .{ group_id, @errorName(err) });
                     return;
                 };
-                if (!request_admission) return;
                 self.maybeRequestProvisionedIndexRepair() catch |err| {
                     // The exact durable queue remains dirty, and the control
                     // loop is a lost-wakeup fallback. Admission pressure must
@@ -14047,23 +14046,6 @@ pub const DataServer = struct {
 
     fn signalProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
         _ = try self.upsertProvisionedIndexRepairQueueEntry(table_name, group_id, 0, .immediate, .unguarded);
-    }
-
-    /// A progress callback can be emitted by the same resident writer while a
-    /// repair quantum is already inspecting that group. Replacing the selected
-    /// generation in that window prevents the quantum's cooperative deferral
-    /// from applying and turns ordinary build progress into an immediate
-    /// repair loop. The active owner already observes the durable scheduler
-    /// directory; coalesce concurrent edges as level observations and retain a
-    /// bounded audit fallback. Outside an active quantum, the edge remains a
-    /// causal wake and clears stale node-local backoff immediately.
-    fn coalesceProvisionedIndexRepairRunnableForTable(self: *DataServer, table_name: []const u8, group_id: u64) !bool {
-        if (self.provisioned_index_repair_active.load(.acquire)) {
-            try self.observeProvisionedIndexRepairForTable(table_name, group_id);
-            return false;
-        }
-        try self.signalProvisionedIndexRepairRunnableForTable(table_name, group_id);
-        return true;
     }
 
     /// Record a periodic level observation of durable repair debt. Unlike a
@@ -28611,7 +28593,7 @@ test "data runtime repair failures preserve durable backoff and increase retry d
     server.removeProvisionedIndexRepair(7001);
 }
 
-test "data runtime coalesces repair progress emitted during an active quantum" {
+test "data runtime preserves causal repair handoff during an active quantum" {
     const alloc = std.testing.allocator;
     var server: DataServer = .{
         .alloc = alloc,
@@ -28634,19 +28616,26 @@ test "data runtime coalesces repair progress emitted during an active quantum" {
     entry.next_retry_at_ms = 42;
     entry.transient_failure_count = 3;
 
-    server.provisioned_index_repair_active.store(true, .release);
-    try std.testing.expect(!try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    // A page-level progress observation belongs to the already-selected
+    // receipt. It must preserve its generation and retry policy.
+    try server.observeProvisionedIndexRepairForTable("docs", 7001);
     try std.testing.expectEqual(selected_generation, entry.wake_generation);
     try std.testing.expectEqual(@as(u64, 42), entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 3), entry.transient_failure_count);
     try std.testing.expect(!entry.immediate_wake_pending);
 
-    server.provisioned_index_repair_active.store(false, .release);
-    try std.testing.expect(try server.coalesceProvisionedIndexRepairRunnableForTable("docs", 7001));
+    // A structural/operator handoff is a causal edge even when another owner
+    // is active. Minting a newer receipt prevents that older owner from
+    // removing the post-completion audit when it retires its selected work.
+    server.provisioned_index_repair_active.store(true, .release);
+    try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     try std.testing.expect(entry.wake_generation != selected_generation);
     try std.testing.expectEqual(@as(u64, 0), entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), entry.transient_failure_count);
     try std.testing.expect(entry.immediate_wake_pending);
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, selected_generation));
+    try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
+    server.provisioned_index_repair_active.store(false, .release);
 }
 
 test "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic" {
