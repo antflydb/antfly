@@ -1714,6 +1714,52 @@ document. They are architectural requirements, not Florence-specific cleanup:
     caps its control-plane batch at 128 items and allocates PDF media staging
     only for `min(pending_pages, admitted_batch_items)`; non-media tasks do not
     allocate those arrays.
+184. **Batch capability was inferred from task/provider names instead of the
+    concrete executor.** A resolved executor now supplies its implemented mode,
+    preferred and maximum item counts, and per-item failure contract. Manifest
+    capabilities may narrow that descriptor but cannot promote a serial loop to
+    native execution. The mapping covers every public model family—reader,
+    generator, embedder, reranker, extractor, chunker, rewriter, and
+    transcriber—without claiming fused execution where it has not landed.
+185. **Sibling document tasks downloaded and prepared the same source
+    independently.** One pending document group now owns a credential-scoped
+    `PreparedDocumentSourceCache`. It charges retained bytes to the global
+    document working-set slice, reuses a download across compatible consumers,
+    prepares the immutable PDF page/xref state once, and lends task-private
+    render forks with independent mutable decoder caches. Cache entries are
+    individually allocated so their addresses remain stable as new source or
+    credential variants are discovered. A fixed SHA-256 identity is retained
+    instead of duplicating a potentially large inline base64 source URL.
+    Retained preparation is charged before transient task-window admission, so
+    a peak reservation cannot starve the cache that it depends upon, and the
+    complete cache dies before the document lease is released.
+186. **Backend runtime construction eagerly allocated every specialized
+    executor lane.** API, inference, control, and raft directions are now lazy
+    lanes owned by `BackendRuntime`; the durable storage lane remains eager
+    because background jobs need it immediately. First publication is
+    serialized, shutdown prevents new activation and drains public lane leases,
+    and an unused subsystem consumes neither lane state nor workers. The
+    inference node also reuses its
+    attached runtime executor across generators, readers, embedders, rerankers,
+    extractors, classifiers, rewriters, transcribers, and warmup. Only an
+    explicitly unattached direct/test invocation creates a call-scoped fallback.
+187. **Encoded-output retries rerendered a PDF page.** A worker now paints the
+    page exactly once. If the encoded PNG exceeds its byte ceiling, it decodes
+    that raster once and performs a bounded sequence of strict-progress
+    bilinear reductions, each sampled from the original pixels to avoid
+    cumulative quality loss. The worker allocator charges the original PNG,
+    decoded raster, resized raster, encoder scratch, and candidate output, and
+    cancellation is checked throughout the resize.
+188. **Enrichment configuration cleanup dropped an owned chunk-provider
+    routing table.** Uninstalled and partially installed configuration now
+    deinitializes the provider before clearing it. The full database suite uses
+    the testing allocator and verifies zero leaks, including the focused
+    ownership regression.
+189. **Integration fixtures bypassed the production capability contract.** The
+    PDF OCR test server now publishes the same versioned reader descriptor that
+    planning requires before accepting work, and the local embedder test names
+    its required model explicitly. CI no longer depends on a production
+    discovery bypass for catalog-less fake endpoints.
 
 ### Post-review implementation contract
 
@@ -2356,6 +2402,8 @@ The hardening above follows these long-term rules:
 76. **Implemented after renderer performance review:** render-output retries
     shrink from the raster's measured dimensions and therefore make strict
     progress even when the configured ceiling is much larger than the page.
+    The page is painted once; bounded candidate encodings are generated from
+    one decode of the original rendered PNG rather than rerendering the PDF.
     One atomic document-batch allocator is the hard aggregate boundary for
     allocations made through the native Zig render forks, while per-lane
     limits remain safety rails; page-wave admission also reserves each page's
@@ -2377,8 +2425,9 @@ The hardening above follows these long-term rules:
     publishes only the renewed scalar expiry under that lock. Every private
     spool mutation and public promotion validates the exact owner/epoch/expiry
     inside its write transaction. Expired attempt prefixes are scavenged before
-    fingerprint fast paths, downloaded PDF bytes are released after preparation,
-    and spilled PDFs retain no duplicate generated-unit cache. Unit replay copies
+    fingerprint fast paths, downloaded PDF bytes and immutable preparation are
+    retained once for compatible tasks in the pending document group, and
+    spilled PDFs retain no duplicate generated-unit cache. Unit replay copies
     a count- and byte-bounded segment, closes its LMDB read transaction, and only
     then invokes a sink that may write. Materialization writes unit, chunk,
     navigation, state, and manifest values solely to an attempt-private
@@ -2463,6 +2512,28 @@ The hardening above follows these long-term rules:
     `Retry-After`. Caller-supplied transports remain in use through a bounded
     wrapper, owned `http.Transport` clones are tracked, and proxy shutdown
     closes idle upstream connections.
+83. **Implemented after executor-capability review:** model-family batch
+    descriptors come from the resolved executor implementation, then intersect
+    endpoint and manifest limits. Serial compatibility remains visible as
+    serial compatibility instead of being advertised as native batching.
+84. **Implemented after document-reuse review:** extraction and page-image
+    embedding within one pending document group share credential-scoped source
+    bytes and immutable PDF preparation. Each consumer still receives a private
+    mutable render/decode session, preserving renderer thread isolation.
+85. **Implemented after runtime-pool review:** specialized backend lanes activate
+    on demand, and all direct inference families prefer the node's attached
+    runtime executor. This removes idle executor allocation and
+    request-scoped executor construction in production; the existing executor
+    implementation continues to staff its worker team only when work arrives.
+86. **Implemented after adaptive-output review:** output-byte retries downsample
+    one decoded renderer result and never re-enter PDF parsing, font/image
+    decoding, or page painting.
+87. **Implemented after CI ownership review:** chunk-provider routing ownership
+    participates in aggregate enrichment-config teardown, closing the leak seen
+    by the base Zig and end-to-end CI jobs.
+88. **Implemented after CI contract review:** fake reader and local embedder
+    fixtures satisfy the public catalog/model contract instead of weakening
+    production discovery to accommodate tests.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3382,7 +3453,10 @@ fallback at unsupported provider boundaries.
 ### Phase 5: Render/OCR pipeline overlap
 
 Status: optional follow-up. The implemented pipeline intentionally keeps
-prefetch at zero.
+prefetch at zero and retains one operation-scoped output credit. Before overlap
+is enabled, admission must become a fair window lease: the active inference
+window and optional prefetched render window are admitted atomically, and each
+lease releases its scratch/output capacity as soon as its consumers finish.
 
 - Add optional one-window prefetch.
 - Admit active OCR and prefetched render memory together.
@@ -3408,12 +3482,15 @@ local model boundary remains a measurement-driven future optimization.
 
 ### Phase 7: Fuse PDF inspection and render preparation if needed
 
-Status: complete. One prepared reader owns inspection and lends immutable
-metadata to render forks. A bounded attempt spool prevents materialization and
+Status: complete within one pending document group. A credential-scoped source
+cache owns the download and one prepared reader, lends immutable metadata to
+task-private render forks, and survives extraction long enough for page-image
+embedding to reuse it. A bounded attempt spool prevents materialization and
 publication from walking the PDF again.
 
-- Parse and transform a PDF once per changed source fingerprint.
-- Keep the prepared handle operation-scoped, never process-global.
+- Parse and transform a PDF once per credential-scoped source in a pending
+  document group.
+- Keep the prepared handle document-group-scoped, never process-global.
 - Replay resolved typed units from bounded attempt storage, then clean that
   private keyspace.
 
@@ -3460,10 +3537,10 @@ The following remain qualification work rather than architectural blockers:
   shared. The safe implementation keeps font and image caches task-local.
 - Whether the conservative source-size, decode-working-set, and
   bytes-per-pixel reservation can be tightened with measured high-water data.
-- Whether profiling justifies distinct lazily activated render and model CPU
-  lanes inside `BackendRuntime`. The default deliberately shares its bounded
-  inference executor so separate subsystems cannot multiply process threads;
-  a split must preserve aggregate admission and runtime-owned shutdown.
+- Whether profiling justifies splitting the lazily activated inference lane
+  into distinct render and model CPU lanes. The default deliberately shares
+  one bounded runtime-owned executor so separate subsystems cannot multiply
+  process threads; a split must preserve aggregate admission and shutdown.
 - Whether the long-term pipeline should retain PNG as the local interchange
   format or move directly to RGB pixels after measuring Phase 4.
 - Whether the attempt spool should eventually use a compact versioned binary

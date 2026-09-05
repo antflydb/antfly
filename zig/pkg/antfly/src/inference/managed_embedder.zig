@@ -7441,7 +7441,7 @@ test "managed embedder routes antfly without api_url to local provider" {
         fn dense(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqualStrings("", model);
+            try std.testing.expectEqualStrings("local-model", model);
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             for (texts, 0..) |_, i| {
@@ -7463,7 +7463,7 @@ test "managed embedder routes antfly without api_url to local provider" {
     };
 
     const indexes_json =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}}}
     ;
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();

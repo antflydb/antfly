@@ -2085,7 +2085,7 @@ fn localModelCapabilitiesInScope(
     const resolved_batch = try inference.server.resolveInferenceBatchCapabilities(
         @tagName(task),
         manifest.capabilities,
-        native_batch_read,
+        inference.server.resolvedExecutorBatchImplementation(@tagName(task), native_batch_read),
         inference.server.requestMediaMaxBytes(node),
         if (max_images > 0) inference.server.requestMediaMaxDecodedPixels(node, max_images) else 0,
         modalities.image,

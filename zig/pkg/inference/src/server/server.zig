@@ -3448,12 +3448,9 @@ pub const Node = struct {
             &self.session_manager,
             &required_backend_scratch,
         );
-        var io_impl: ?std.Io.Threaded = null;
-        defer if (io_impl) |*threaded| threaded.deinit();
-        const io = self.session_manager.io orelse blk: {
-            io_impl = std.Io.Threaded.init(allocator, .{});
-            break :blk io_impl.?.io();
-        };
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*threaded| threaded.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
         // A deployment can replace several sidecars and artifacts without an
         // atomic directory snapshot. Derive and validate the manifest twice so
@@ -3573,6 +3570,23 @@ pub const Node = struct {
         self.model_manager.attachIo(io);
     }
 
+    /// Select the executor for direct model-family work. Production nodes
+    /// attach their process/runtime-owned Io before publication, so request
+    /// paths must reuse it instead of creating and tearing down a thread pool
+    /// per invocation. The owned fallback keeps the standalone direct API
+    /// usable in tests and embeddings where no runtime has been attached.
+    fn inferenceIo(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        caller_io: ?std.Io,
+        owned: *?std.Io.Threaded,
+    ) std.Io {
+        if (caller_io) |io| return io;
+        if (self.session_manager.io) |io| return io;
+        owned.* = std.Io.Threaded.init(allocator, .{});
+        return owned.*.?.io();
+    }
+
     fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
         const counts = try collectDiscoveredModelCounts(
             self.config.models_dir,
@@ -3630,9 +3644,10 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        return try self.embedDenseTextsDirectWithContext(allocator, io_impl.io(), null, model_name, texts);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        return try self.embedDenseTextsDirectWithContext(allocator, io, null, model_name, texts);
     }
 
     pub fn embedDenseTextsDirectWithContext(
@@ -3734,10 +3749,11 @@ pub const Node = struct {
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "embed");
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
@@ -3778,7 +3794,7 @@ pub const Node = struct {
         };
         var attempt = Attempt{
             .allocator = allocator,
-            .io = io_impl.io(),
+            .io = io,
             .texts = texts,
             .executor_contract = executor_contract,
         };
@@ -3816,9 +3832,9 @@ pub const Node = struct {
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = if (io == null) std.Io.Threaded.init(allocator, .{}) else null;
+        var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const request_io = io orelse owned_io.?.io();
+        const request_io = self.inferenceIo(allocator, io, &owned_io);
 
         const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
         defer self.allocator.free(model_path);
@@ -3907,9 +3923,10 @@ pub const Node = struct {
         self.metrics.incRequest("rewrite.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rewriters");
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "rewriters");
         defer self.allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rewrite");
         try validateTextExecutorInvocation(executor_contract, inputs.len, inputs, 0, 0, 0, 0);
@@ -3937,7 +3954,7 @@ pub const Node = struct {
         defer allocator.free(tok_bytes);
         var hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
         defer hf_tok.deinitSelf();
-        const input_tokens = try maxTokenizerTextTokens(allocator, io_impl.io(), hf_tok.tokenizer(), inputs);
+        const input_tokens = try maxTokenizerTextTokens(allocator, io, hf_tok.tokenizer(), inputs);
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = inputs.len,
             .text_bytes_per_item = maxTextBytes(inputs),
@@ -3993,10 +4010,11 @@ pub const Node = struct {
         self.metrics.incRequest("classify.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
         const requested = if (model_name.len > 0) model_name else null;
-        const classifier_path = self.resolveModelPath(io_impl.io(), requested, "classifiers") catch |err| switch (requestModelResolutionErrorKind(err)) {
+        const classifier_path = self.resolveModelPath(io, requested, "classifiers") catch |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => null,
             .invalid, .internal => return err,
         };
@@ -4049,7 +4067,7 @@ pub const Node = struct {
             return try copyDirectClassificationResults(allocator, results);
         }
 
-        const model_path = try self.resolveModelPath(io_impl.io(), requested, "extractors");
+        const model_path = try self.resolveModelPath(io, requested, "extractors");
         defer self.allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
         try validateTextExecutorInvocation(
@@ -4310,9 +4328,9 @@ pub const Node = struct {
         const max_tokens = admission.max_tokens;
         const started_at_ns = embedTimingNowNs();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
         const model_path = self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators") catch |err| {
             std.log.err("direct generator resolve failed model={s}: {s}", .{ model_name, @errorName(err) });
@@ -4652,9 +4670,10 @@ pub const Node = struct {
         if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
         if (model.backend != null and model.backend.? != .cuda)
             return error.A4bPrefetchRequiresCuda;
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
         var manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer manifest.deinit();
@@ -4680,9 +4699,10 @@ pub const Node = struct {
     }
 
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
         const a4b_request = model.a4bRequest();
         var loaded_handle = if (a4b_request) |request|
@@ -4768,9 +4788,10 @@ pub const Node = struct {
         std.log.info("warming inference embedder model={s}", .{model_name});
         const texts = [_][]const u8{"ping"};
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model_name, "embedders");
         defer self.allocator.free(model_path);
         const Attempt = struct {
             allocator: std.mem.Allocator,
@@ -4831,9 +4852,10 @@ pub const Node = struct {
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
         const documents = [_][]const u8{"pong"};
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model_name, "rerankers");
         var model_handle = if (backend) |value|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
@@ -4852,9 +4874,10 @@ pub const Node = struct {
         const task_dir = warmModelTaskDir(model.kind);
         const started_at_ns = embedTimingNowNs();
         std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, task_dir);
         var model_handle = if (model.backend) |backend|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
         else
@@ -4870,9 +4893,10 @@ pub const Node = struct {
         model_name: []const u8,
         input: std.json.Value,
     ) ![][]f32 {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        return try self.embedDenseJsonInputDirectWithContext(allocator, io_impl.io(), null, model_name, input);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        return try self.embedDenseJsonInputDirectWithContext(allocator, io, null, model_name, input);
     }
 
     pub fn embedDenseJsonInputDirectWithContext(
@@ -4929,9 +4953,10 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        return try self.embedDensePartsDirectWithContext(allocator, io_impl.io(), null, model_name, parts);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        return try self.embedDensePartsDirectWithContext(allocator, io, null, model_name, parts);
     }
 
     pub fn embedDensePartsDirectWithContext(
@@ -5125,10 +5150,11 @@ pub const Node = struct {
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
         const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
@@ -5215,9 +5241,10 @@ pub const Node = struct {
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
         const image_datas = try allocator.alloc([]const u8, request.images.len);
@@ -5383,10 +5410,11 @@ pub const Node = struct {
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = try self.resolveModelPath(io_impl.io(), resolved_model_name, "transcribers");
+        const model_path = try self.resolveModelPath(io, resolved_model_name, "transcribers");
         defer self.allocator.free(model_path);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
@@ -5572,12 +5600,13 @@ pub const Node = struct {
             .include_spans = options.include_spans orelse false,
         };
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
 
         const extractor_ctx = extractors_mod.Context{
             .allocator = allocator,
-            .io = io_impl.io(),
+            .io = io,
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
@@ -5695,9 +5724,10 @@ pub const Node = struct {
             .input_ids = input_ids,
         };
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveRequestModelPath(allocator, io, model_name, "extractors");
         defer allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
         const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
@@ -5838,9 +5868,10 @@ pub const Node = struct {
         inputs: []const extracting_api.Input,
         texts: []const []const u8,
     ) ![]u8 {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const model_path = try self.resolveClassificationRequestModelPath(allocator, io_impl.io(), model_name);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveClassificationRequestModelPath(allocator, io, model_name);
         defer allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
         const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
@@ -14916,6 +14947,11 @@ fn appendModelInfo(
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
     const effective_native_batch_read = native_batch_read and effectiveNativeReadBatchSize() > 1;
     const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
+    const resolved_task_for_executor = normalizedInferenceTask(task);
+    const batch_implementation = if (resolved_task_for_executor) |resolved_task|
+        resolvedExecutorBatchImplementation(resolved_task, effective_native_batch_read)
+    else
+        null;
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "image") or
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio") or
@@ -14942,13 +14978,14 @@ fn appendModelInfo(
     try buf.appendSlice(allocator, "{\"capabilities\":[");
     var cap_index: usize = 0;
     for (capabilities) |cap| {
-        // The current generator accepts multimodal batch requests but executes
-        // them serially under the shared model lock. Do not leak a model-owned
-        // aspiration as a resolved node capability.
-        if (std.mem.eql(u8, cap, "native_batch_generate_multimodal")) continue;
-        // An explicit model capability cannot override this process's reader
-        // executor setting. A one-item microbatch is serial in practice.
-        if (std.mem.eql(u8, cap, "native_batch_read") and !effective_native_batch_read) continue;
+        // Native batching is an executor fact. Model manifests may narrow an
+        // implemented path, but cannot promote a serial compatibility loop.
+        if (nativeBatchCapabilityTask(cap)) |capability_task| {
+            const implementation = batch_implementation orelse continue;
+            if (!std.mem.eql(u8, capability_task, resolved_task_for_executor.?) or
+                implementation.mode != .native)
+                continue;
+        }
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, cap);
         cap_index += 1;
@@ -15055,6 +15092,24 @@ fn normalizedInferenceTask(task: []const u8) ?[]const u8 {
     return null;
 }
 
+fn nativeBatchCapabilityTask(capability: []const u8) ?[]const u8 {
+    const mappings = [_]struct { []const u8, []const u8 }{
+        .{ "native_batch_read", "read" },
+        .{ "native_batch_generate", "generate" },
+        .{ "native_batch_generate_multimodal", "generate" },
+        .{ "native_batch_embed", "embed" },
+        .{ "native_batch_rerank", "rerank" },
+        .{ "native_batch_chunk", "chunk" },
+        .{ "native_batch_extract", "extract" },
+        .{ "native_batch_rewrite", "rewrite" },
+        .{ "native_batch_transcribe", "transcribe" },
+    };
+    for (mappings) |mapping| {
+        if (std.mem.eql(u8, capability, mapping[0])) return mapping[1];
+    }
+    return null;
+}
+
 pub const ResolvedInferenceModalities = struct {
     text: bool = false,
     image: bool = false,
@@ -15144,7 +15199,7 @@ fn appendResolvedInferenceCapabilities(
     const resolved = try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
-        native_batch_read,
+        resolvedExecutorBatchImplementation(resolved_task, native_batch_read),
         request_media_max_bytes,
         request_media_max_decoded_pixels,
         accepts_image,
@@ -15343,6 +15398,40 @@ pub const ResolvedInferenceBatchCapabilities = struct {
     max_schema_bytes: ?usize = null,
 };
 
+/// What the concrete executor can actually do, before applying narrower
+/// model-manifest limits. Keeping this separate from the task name prevents a
+/// manifest aspiration from being mistaken for an implemented batch path and
+/// lets new model families add native batching without editing capability
+/// resolution policy.
+pub const ResolvedExecutorBatchImplementation = struct {
+    mode: ResolvedInferenceBatchMode,
+    preferred_items: usize,
+    max_items: usize,
+    per_item_failures: bool,
+};
+
+pub fn resolvedExecutorBatchImplementation(
+    resolved_task: []const u8,
+    native_batch_read: bool,
+) ResolvedExecutorBatchImplementation {
+    const task_max_items = resolvedTaskMaxItems(resolved_task);
+    const native_reader = std.mem.eql(u8, resolved_task, "read") and
+        native_batch_read and effectiveNativeReadBatchSize() > 1;
+    const max_items = if (native_reader)
+        @min(task_max_items, effectiveNativeReadBatchSize())
+    else
+        task_max_items;
+    const preferred_items = @min(@as(usize, 8), max_items);
+    const native = std.mem.eql(u8, resolved_task, "embed") or
+        native_reader;
+    return .{
+        .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
+        .preferred_items = preferred_items,
+        .max_items = max_items,
+        .per_item_failures = std.mem.eql(u8, resolved_task, "generate"),
+    };
+}
+
 pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
     return if (std.mem.eql(u8, resolved_task, "read"))
         max_read_batch_images
@@ -15366,19 +15455,22 @@ pub fn effectiveNativeReadBatchSize() usize {
 pub fn resolveInferenceBatchCapabilities(
     resolved_task: []const u8,
     manifest_capabilities: []const []const u8,
-    native_batch_read: bool,
+    implementation: ResolvedExecutorBatchImplementation,
     request_media_max_bytes: usize,
     request_media_max_decoded_pixels: u64,
     accepts_image: bool,
     accepts_audio: bool,
     accepts_document: bool,
 ) !ResolvedInferenceBatchCapabilities {
-    var max_items = resolvedTaskMaxItems(resolved_task);
-    var preferred_items = @min(@as(usize, 8), max_items);
-    if (std.mem.eql(u8, resolved_task, "read") and native_batch_read) {
-        max_items = @min(max_items, effectiveNativeReadBatchSize());
-        preferred_items = @min(preferred_items, max_items);
-    }
+    if (implementation.max_items == 0 or implementation.preferred_items == 0)
+        return error.InvalidInferenceCapabilities;
+    if (implementation.mode == .none and implementation.max_items != 1)
+        return error.InvalidInferenceCapabilities;
+    // The executor descriptor can only narrow the public task endpoint's
+    // cardinality. A newly added backend must not accidentally bypass the
+    // request parser's independently maintained hard ceiling.
+    var max_items = @min(implementation.max_items, resolvedTaskMaxItems(resolved_task));
+    var preferred_items = @min(implementation.preferred_items, max_items);
     const accepts_media = accepts_image or accepts_audio or accepts_document;
     var max_encoded_media_bytes = if (!accepts_media)
         0
@@ -15425,16 +15517,14 @@ pub fn resolveInferenceBatchCapabilities(
         }
     }
     preferred_items = @min(preferred_items, max_items);
-    const native = std.mem.eql(u8, resolved_task, "embed") or
-        (std.mem.eql(u8, resolved_task, "read") and native_batch_read and max_items > 1);
     return .{
-        .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
+        .mode = if (max_items == 1) .none else implementation.mode,
         .preferred_items = preferred_items,
         .max_items = max_items,
         .max_encoded_media_bytes = max_encoded_media_bytes,
         .max_decoded_pixels = max_decoded_pixels,
         .max_media_parts_per_item = max_media_parts_per_item,
-        .per_item_failures = std.mem.eql(u8, resolved_task, "generate"),
+        .per_item_failures = implementation.per_item_failures,
         .max_text_bytes_per_item = max_text_bytes_per_item,
         .max_input_tokens_per_item = max_input_tokens_per_item,
         .max_output_tokens_per_item = max_output_tokens_per_item,
@@ -15506,7 +15596,10 @@ fn resolvedInferenceExecutorContract(
         .batch = try resolveInferenceBatchCapabilities(
             resolved_task,
             manifest.capabilities,
-            manifest.native_arch_hint == .florence,
+            resolvedExecutorBatchImplementation(
+                resolved_task,
+                manifest.native_arch_hint == .florence,
+            ),
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
             modalities.image,
@@ -15819,6 +15912,87 @@ test "resolved capability item ceilings cover array-oriented model families" {
     try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("rerank"));
     try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("transcribe"));
     try std.testing.expectEqual(@as(usize, 1), resolvedTaskMaxItems("chunk"));
+}
+
+test "resolved batch capabilities are owned by the concrete executor" {
+    const generated = try resolveInferenceBatchCapabilities(
+        "generate",
+        &.{
+            "inference.batch.preferred_items=4",
+            "inference.batch.max_items=12",
+        },
+        .{
+            .mode = .native,
+            .preferred_items = 8,
+            .max_items = 16,
+            .per_item_failures = true,
+        },
+        1024,
+        4096,
+        true,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(ResolvedInferenceBatchMode.native, generated.mode);
+    try std.testing.expectEqual(@as(usize, 4), generated.preferred_items);
+    try std.testing.expectEqual(@as(usize, 12), generated.max_items);
+    try std.testing.expect(generated.per_item_failures);
+
+    const extracted = try resolveInferenceBatchCapabilities(
+        "extract",
+        &.{},
+        .{
+            .mode = .native,
+            .preferred_items = 32,
+            .max_items = 64,
+            .per_item_failures = true,
+        },
+        0,
+        0,
+        false,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(ResolvedInferenceBatchMode.native, extracted.mode);
+    try std.testing.expectEqual(@min(@as(usize, 64), max_serial_family_batch_items), extracted.max_items);
+
+    // An executor descriptor cannot bypass a singleton public request parser.
+    const reranked = try resolveInferenceBatchCapabilities(
+        "rerank",
+        &.{},
+        .{
+            .mode = .native,
+            .preferred_items = 32,
+            .max_items = 64,
+            .per_item_failures = true,
+        },
+        0,
+        0,
+        false,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(ResolvedInferenceBatchMode.none, reranked.mode);
+    try std.testing.expectEqual(@as(usize, 1), reranked.max_items);
+
+    try std.testing.expectError(
+        error.InvalidInferenceCapabilities,
+        resolveInferenceBatchCapabilities(
+            "generate",
+            &.{},
+            .{
+                .mode = .none,
+                .preferred_items = 1,
+                .max_items = 16,
+                .per_item_failures = false,
+            },
+            0,
+            0,
+            false,
+            false,
+            false,
+        ),
+    );
 }
 
 test "standalone inference model catalog publishes resolved native reader batching" {
@@ -18437,6 +18611,21 @@ test "node attachIo wires model session manager" {
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+
+    var owned_io: ?std.Io.Threaded = null;
+    defer if (owned_io) |*io_impl| io_impl.deinit();
+    _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
+    try std.testing.expect(owned_io == null);
+}
+
+test "unattached direct inference owns its executor fallback" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    var owned_io: ?std.Io.Threaded = null;
+    defer if (owned_io) |*io_impl| io_impl.deinit();
+    _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
+    try std.testing.expect(owned_io != null);
 }
 
 test "canonical relation schemas preserve endpoint label constraints" {

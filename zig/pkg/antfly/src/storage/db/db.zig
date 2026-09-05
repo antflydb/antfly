@@ -576,7 +576,20 @@ fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Co
         producer.deinit(alloc);
         cfg.asset_producer = null;
     }
-    cfg.chunk_provider = null;
+    if (cfg.chunk_provider) |*provider| {
+        provider.deinit();
+        cfg.chunk_provider = null;
+    }
+}
+
+test "uninstalled enrichment config releases owned chunk provider routing" {
+    var cfg = enrichment_runtime_mod.Config{
+        .chunk_provider = try (enrichment_runtime_mod.ChunkProvider{
+            .execution = .{ .routing = .{ .source_table = "docs" } },
+        }).ownExecutionStrings(std.testing.allocator),
+    };
+    deinitOwnedEnrichmentConfig(std.testing.allocator, &cfg);
+    try std.testing.expect(cfg.chunk_provider == null);
 }
 
 pub const HAAsyncEffectMirror = struct {

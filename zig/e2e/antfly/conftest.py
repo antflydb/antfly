@@ -1371,6 +1371,52 @@ class PdfOcrE2EServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(f"{INFERENCE_PUBLIC_API_ROOT}/models?"):
+                    body = json.dumps(
+                        {
+                            "readers": {
+                                "antflydb/Florence-2-base": {
+                                    "inputs": ["text", "image"],
+                                    "inference_capabilities": {
+                                        "version": 4,
+                                        "task": "read",
+                                        "input_modalities": ["text", "image"],
+                                        "accepted_mime_types": [
+                                            "image/png",
+                                            "image/jpeg",
+                                        ],
+                                        "input_granularity": "page",
+                                        "output": "read_result",
+                                        "result_cardinality": "one_per_item",
+                                        "prompt_policy": "explicit",
+                                        "borrowed_attachments": False,
+                                        "task_limits": {
+                                            "max_text_bytes_per_item": 65536,
+                                            "max_input_tokens_per_item": 4096,
+                                            "max_output_tokens_per_item": 4096,
+                                            "max_candidates_per_request": None,
+                                            "max_schema_bytes": None,
+                                        },
+                                        "batch": {
+                                            "mode": "native",
+                                            "preferred_items": 8,
+                                            "max_items": 8,
+                                            "max_encoded_media_bytes": 67108864,
+                                            "max_decoded_pixels": 32000000,
+                                            "max_media_parts_per_item": 1,
+                                            "per_item_failures": False,
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path == "/fixtures/two-page.pdf":
                     pdf = outer._pdf
                 elif self.path == "/fixtures/form-xobject-text.pdf":

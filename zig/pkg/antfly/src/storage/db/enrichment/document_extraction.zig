@@ -406,6 +406,7 @@ pub const PdfPageRenderGeometry = pdf.PageRenderGeometry;
 pub const PdfPageRenderBatchOptions = pdf.PageRenderBatchOptions;
 pub const RenderedPdfPageBatch = pdf.RenderedPageBatch;
 pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
+pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 
 /// A stack-owned monotonic deadline suitable for synchronous native PDF
 /// parsing and rendering. The owner must keep this value alive for as long as
@@ -462,9 +463,9 @@ pub const PdfRenderSession = struct {
     /// Build a task-local render session over a prepared document's immutable
     /// xref, trailer, and page index. The prepared source must outlive this
     /// session; mutable decode caches and diagnostics remain independently
-    /// owned by `alloc`.
+    /// owned by `alloc`. The caller must finish `prepareForBatchRendering`
+    /// before publishing the source to other task executors.
     pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
-        try source.prepareForBatchRendering();
         return .{ .parsed = try source.parsed.forkForRendering(alloc, cancellation) };
     }
 

@@ -5422,6 +5422,185 @@ fn runForegroundCatchUpPassOwned(
     }
 }
 
+const PreparedDocumentSourceCache = struct {
+    const SourceIdentity = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+    const Entry = struct {
+        source_identity: SourceIdentity,
+        credential_name: ?[]u8,
+        content: scraping.DownloadedContent,
+        prepared_pdf: ?document_extraction_mod.PdfRenderSession = null,
+        pdf_deadline: document_extraction_mod.PdfRenderDeadline = undefined,
+    };
+
+    const FetchOutcome = union(enum) {
+        ok: *Entry,
+        http_error: scraping.HttpError,
+    };
+
+    backing_alloc: Allocator,
+    budgeted: ?resource_manager_mod.BudgetedAllocator,
+    // Entries are individually allocated so a borrowed preparation remains
+    // stable when the pointer array grows. This matters once compatible task
+    // executors overlap or append another credential/transform variant.
+    entries: std.ArrayListUnmanaged(*Entry) = .empty,
+
+    fn init(runtime: *EnrichmentRuntime) @This() {
+        const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
+        return .{
+            .backing_alloc = runtime.alloc,
+            .budgeted = if (manager) |value|
+                resource_manager_mod.BudgetedAllocator.init(
+                    value,
+                    .document_extraction_working_set,
+                    runtime.alloc,
+                    1,
+                )
+            else
+                null,
+        };
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return if (self.budgeted) |*budgeted| budgeted.allocator() else self.backing_alloc;
+    }
+
+    fn deinit(self: *@This()) void {
+        const alloc = self.allocator();
+        for (self.entries.items) |entry| {
+            if (entry.prepared_pdf) |*session| session.deinit();
+            if (entry.credential_name) |credential_name| alloc.free(credential_name);
+            entry.content.deinit(alloc);
+            alloc.destroy(entry);
+        }
+        self.entries.deinit(alloc);
+        if (self.budgeted) |*budgeted| budgeted.deinit();
+        self.* = undefined;
+    }
+
+    fn fetch(
+        self: *@This(),
+        source_url: []const u8,
+        credential_name: ?[]const u8,
+        config: template_remote.RenderConfig,
+    ) !FetchOutcome {
+        if (self.lookup(source_url, credential_name)) |entry| return .{ .ok = entry };
+
+        const alloc = self.allocator();
+        const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
+            alloc,
+            config,
+            source_url,
+            credential_name,
+        );
+        switch (fetched) {
+            .http_error => |http_error| return .{ .http_error = http_error },
+            .ok => |content| {
+                return .{ .ok = try self.adoptOwned(source_url, credential_name, content) };
+            },
+        }
+    }
+
+    fn lookup(
+        self: *@This(),
+        source_url: []const u8,
+        credential_name: ?[]const u8,
+    ) ?*Entry {
+        const source_identity = sourceIdentity(source_url);
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.source_identity[0..], source_identity[0..]) and
+                optionalStringsEqual(entry.credential_name, credential_name))
+                return entry;
+        }
+        return null;
+    }
+
+    fn adoptOwned(
+        self: *@This(),
+        source_url: []const u8,
+        credential_name: ?[]const u8,
+        content: scraping.DownloadedContent,
+    ) !*Entry {
+        const alloc = self.allocator();
+        var owned_content = content;
+        errdefer owned_content.deinit(alloc);
+        const owned_credential = if (credential_name) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (owned_credential) |value| alloc.free(value);
+        const entry = try alloc.create(Entry);
+        errdefer alloc.destroy(entry);
+        entry.* = .{
+            .source_identity = sourceIdentity(source_url),
+            .credential_name = owned_credential,
+            .content = owned_content,
+        };
+        try self.entries.append(alloc, entry);
+        return entry;
+    }
+
+    fn preparePdf(
+        self: *@This(),
+        entry: *Entry,
+        decode_limits: document_extraction_mod.PdfDecodeLimits,
+        timeout_ms: u64,
+    ) !*document_extraction_mod.PdfRenderSession {
+        if (entry.prepared_pdf) |*session| return session;
+        entry.pdf_deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+        entry.prepared_pdf = document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(
+            self.allocator(),
+            entry.content.data,
+            decode_limits,
+            entry.pdf_deadline.probe(),
+        ) catch |err| return self.classifyPreparationError(err);
+        errdefer {
+            entry.prepared_pdf.?.deinit();
+            entry.prepared_pdf = null;
+        }
+        entry.prepared_pdf.?.prepareForBatchRendering() catch |err|
+            return self.classifyPreparationError(err);
+        return &entry.prepared_pdf.?;
+    }
+
+    fn classifyPreparationError(self: *@This(), err: anyerror) anyerror {
+        if (err == error.OutOfMemory and self.budgeted != null and self.budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    }
+
+    fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+        if (lhs == null or rhs == null) return lhs == null and rhs == null;
+        return std.mem.eql(u8, lhs.?, rhs.?);
+    }
+
+    fn sourceIdentity(source_url: []const u8) SourceIdentity {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(source_url);
+        var digest: SourceIdentity = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+};
+
+test "prepared document source cache isolates credentials and reuses bytes" {
+    const alloc = std.testing.allocator;
+    var cache = PreparedDocumentSourceCache{
+        .backing_alloc = alloc,
+        .budgeted = null,
+    };
+    defer cache.deinit();
+
+    const content_type = try alloc.dupe(u8, "application/pdf");
+    errdefer alloc.free(content_type);
+    const data = try alloc.dupe(u8, "%PDF-a");
+    errdefer alloc.free(data);
+    const first = try cache.adoptOwned("https://example.test/a.pdf", "tenant-a", .{
+        .content_type = content_type,
+        .data = data,
+    });
+    try std.testing.expectEqual(first, cache.lookup("https://example.test/a.pdf", "tenant-a").?);
+    try std.testing.expect(cache.lookup("https://example.test/a.pdf", "tenant-b") == null);
+    try std.testing.expect(cache.lookup("https://example.test/b.pdf", "tenant-a") == null);
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -5436,6 +5615,8 @@ fn processPendingDocumentGroup(
 ) !void {
     try guard.check();
     const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
+    var prepared_sources = PreparedDocumentSourceCache.init(runtime);
+    defer prepared_sources.deinit();
     for (planned) |planned_request| {
         try guard.check();
         var request = planned_request;
@@ -5455,7 +5636,7 @@ fn processPendingDocumentGroup(
         }
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
         switch (request.kind) {
-            .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
+            .asset => processAsset(runtime, request, deferred_assets, &prepared_sources, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
@@ -5465,7 +5646,7 @@ fn processPendingDocumentGroup(
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
-            .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
+            .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, &prepared_sources, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
@@ -5509,6 +5690,7 @@ fn processAsset(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
@@ -5564,7 +5746,7 @@ fn processAsset(
     }
 
     if (producer_cfg.type == .document_extraction) {
-        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, window);
+        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, prepared_sources, window);
         return;
     }
 
@@ -5812,6 +5994,7 @@ fn processDocumentExtractionAsset(
     source_url: []const u8,
     config_json: []const u8,
     manifest_key: []const u8,
+    prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
     const artifact_name = requestArtifactName(request);
@@ -5861,15 +6044,9 @@ fn processDocumentExtractionAsset(
 
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
-    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
-    else
-        null;
-    defer if (download_budgeted) |*allocator| allocator.deinit();
-    const download_alloc = if (download_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
-
-    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
-        download_alloc,
+    const fetched = prepared_sources.fetch(
+        source_url,
+        if (config.credentials.len > 0) config.credentials else null,
         remoteRenderConfig(
             runtime.config.secret_store,
             runtime.config.remote_content,
@@ -5877,10 +6054,9 @@ fn processDocumentExtractionAsset(
             runtime.config.cancellation,
             null,
         ),
-        source_url,
-        if (config.credentials.len > 0) config.credentials else null,
     ) catch |raw_err| {
-        const err: anyerror = if (raw_err == error.OutOfMemory and download_budgeted != null and download_budgeted.?.denied())
+        const err: anyerror = if (raw_err == error.OutOfMemory and
+            prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied())
             error.DocumentExtractionWorkingSetTooLarge
         else
             raw_err;
@@ -5904,8 +6080,8 @@ fn processDocumentExtractionAsset(
         try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
-    const downloaded = switch (fetched) {
-        .ok => |content| content,
+    const prepared_source = switch (fetched) {
+        .ok => |entry| entry,
         .http_error => |http_error| {
             if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
                 return error.RemoteDocumentFetchFailed;
@@ -5932,16 +6108,10 @@ fn processDocumentExtractionAsset(
             return;
         },
     };
-    var downloaded_mut = downloaded;
-    var downloaded_live = true;
-    defer if (downloaded_live) downloaded_mut.deinit(download_alloc);
-    if (download_budgeted != null) {
-        resource_tracker.setExternallyAccountedDownloadedBytes(downloaded_mut.data.len);
-    } else {
-        try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
-    }
+    const downloaded = &prepared_source.content;
+    resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
     const byte_source_fingerprint = if (metadata_fingerprint == null)
-        try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+        try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded.content_type, downloaded.data)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
@@ -5968,7 +6138,7 @@ fn processDocumentExtractionAsset(
     defer if (collection_budgeted) |*allocator| allocator.deinit();
     const collection_alloc = if (collection_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
 
-    const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+    const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded.content_type, downloaded.data);
     // Any remote asset producer (PDF/image OCR, audio transcription, or a
     // future document transform) can exceed the ordinary lease TTL. Keep the
     // current tenure alive through materialization and publication;
@@ -5985,6 +6155,19 @@ fn processDocumentExtractionAsset(
     const batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
     const configured_pdf_decode_limits = config.pdf_decode_limits;
     const configured_pdf_render_inflight_bytes = config.pdf_render_max_inflight_bytes;
+    // Preparation is retained by the document-group cache, so charge its
+    // actual live bytes before reserving the task-local inspection, render,
+    // and provider window. Reserving the whole operation first could consume
+    // the remaining slice and make the cache allocation fail despite a plan
+    // that fits when both owners are considered in the correct order.
+    const prepared_pdf_source = if (source_is_pdf)
+        try prepared_sources.preparePdf(
+            prepared_source,
+            configured_pdf_decode_limits,
+            runtime.syncWaitTimeoutMs(),
+        )
+    else
+        null;
     var pdf_inspection_bytes: usize = 0;
     var pdf_output_bytes: ?usize = null;
     if (source_is_pdf) {
@@ -5993,7 +6176,7 @@ fn processDocumentExtractionAsset(
             runtime.alloc,
             request,
             config,
-            if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
+            if (config.content_type.len > 0) config.content_type else downloaded.content_type,
         );
         const pdf_operation_budget = try resource_tracker.reservePdfOperation(
             configured_pdf_decode_limits.max_working_set_bytes,
@@ -6014,14 +6197,16 @@ fn processDocumentExtractionAsset(
     }
     var pdf_inspection_reservation = ReservedWorkingSetAllocator.init(runtime.alloc, pdf_inspection_bytes);
     const document_extraction_alloc = if (source_is_pdf) pdf_inspection_reservation.allocator() else runtime.alloc;
-    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (source_is_pdf)
-        try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(
+    var pdf_inspection_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (prepared_pdf_source) |source|
+        try document_extraction_mod.PdfRenderSession.initFromPrepared(
             document_extraction_alloc,
-            downloaded_mut.data,
-            extraction_config.pdf_decode_limits,
+            source,
+            pdf_inspection_deadline.probe(),
         )
     else
         null;
+    if (prepared_pdf_session) |*session| try session.setDecodeLimits(extraction_config.pdf_decode_limits);
     defer if (prepared_pdf_session) |*session| session.deinit();
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -6079,7 +6264,7 @@ fn processDocumentExtractionAsset(
         .config = config,
         .batch_policy = batch_policy,
         .source_url = source_url,
-        .source_bytes = downloaded_mut.data,
+        .source_bytes = downloaded.data,
         .doc_key = request.doc_key,
         .artifact_name = artifact_name,
         .desired_unit_keys = &desired_unit_keys,
@@ -6099,20 +6284,22 @@ fn processDocumentExtractionAsset(
         document_extraction_mod.extractPreparedPdfStreaming(
             document_extraction_alloc,
             session,
-            if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded_mut.content_type,
+            if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.ocr_mode,
             extraction_config.ocr_quality,
             collect_ctx.sink(),
         )
     else
-        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded_mut, source_url, extraction_config, collect_ctx.sink());
+        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
     extraction_result catch |raw_err| {
         collect_ctx.releasePdfCoordinator();
         try resource_tracker.releasePdfOperation();
         config.pdf_decode_limits = configured_pdf_decode_limits;
         config.pdf_render_max_inflight_bytes = configured_pdf_render_inflight_bytes;
         const err: anyerror = if (raw_err == error.OutOfMemory and
-            ((collection_budgeted != null and collection_budgeted.?.denied()) or pdf_inspection_reservation.limit_exceeded))
+            ((collection_budgeted != null and collection_budgeted.?.denied()) or
+                (prepared_sources.budgeted != null and prepared_sources.budgeted.?.denied()) or
+                pdf_inspection_reservation.limit_exceeded))
             error.DocumentExtractionWorkingSetTooLarge
         else
             raw_err;
@@ -6123,7 +6310,7 @@ fn processDocumentExtractionAsset(
             artifact_name,
             source_url,
             source_fingerprint,
-            if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
+            if (config.content_type.len > 0) config.content_type else downloaded.content_type,
             @errorName(err),
             "document extraction failed",
             document_extraction_mod.failureStage(err, "document_extraction"),
@@ -6155,9 +6342,6 @@ fn processDocumentExtractionAsset(
     try resource_tracker.setBytes(resource_tracker.locallyAccountedDownloadedBytes());
     if (source_is_pdf) {
         collect_ctx.source_bytes = &.{};
-        downloaded_mut.deinit(download_alloc);
-        downloaded_live = false;
-        try resource_tracker.releaseDownloadedBytes();
     }
 
     const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
@@ -6314,7 +6498,7 @@ fn processDocumentExtractionAsset(
     const store_extraction_result = if (unit_spool) |*spool|
         spool.replay(collect_ctx.info.streamInfo(), store_ctx.sink(), &resource_tracker)
     else
-        document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink());
+        document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded.*, source_url, config, store_ctx.sink());
     store_extraction_result catch |raw_err| {
         if (!source_is_pdf) try resource_tracker.releasePdfOperation();
         config.pdf_decode_limits = configured_pdf_decode_limits;
@@ -13322,6 +13506,7 @@ fn processPdfPageImageEmbedding(
     request: enrichment_types.GeneratedEnrichmentRequest,
     dense_embedder: embedder_mod.DenseEmbedder,
     consumer_indexes: []const []const u8,
+    prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
     if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
@@ -13363,29 +13548,36 @@ fn processPdfPageImageEmbedding(
 
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
-    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
-    else
-        null;
-    defer if (download_budgeted) |*budgeted| budgeted.deinit();
-    const download_alloc = if (download_budgeted) |*budgeted| budgeted.allocator() else runtime.alloc;
-    const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
-        download_alloc,
-        runtime.config.remote_content,
-        runtime.config.secret_store,
+    const fetched = try prepared_sources.fetch(
         source_url,
         null,
+        remoteRenderConfig(
+            runtime.config.secret_store,
+            runtime.config.remote_content,
+            runtime.config.io,
+            runtime.config.cancellation,
+            null,
+        ),
     );
-    var downloaded = switch (fetched) {
-        .ok => |content| content,
+    const prepared_source = switch (fetched) {
+        .ok => |entry| entry,
         .http_error => return error.RemoteDocumentFetchFailed,
     };
-    defer downloaded.deinit(download_alloc);
+    const downloaded = &prepared_source.content;
+    resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
 
     var render_config = document_extraction_mod.Config{};
     applyDocumentExtractionRuntimePolicy(&render_config);
     if (!document_extraction_mod.resolvesToPdf(render_config, source_url, downloaded.content_type, downloaded.data))
         return error.UnsupportedDocumentType;
+    // The cached parser is a retained owner, not render scratch. Admit it
+    // first so the following operation reservation sees the true remaining
+    // process budget instead of starving preparation behind its own peak.
+    const prepared_pdf_source = try prepared_sources.preparePdf(
+        prepared_source,
+        render_config.pdf_decode_limits,
+        runtime.config.sync_wait_timeout_ms,
+    );
     // The renderer deliberately gives each worker a thread-local allocator,
     // so its numeric scratch cap is not itself global admission. Own the full
     // native render grant at the operation boundary before any page worker can
@@ -13427,7 +13619,7 @@ fn processPdfPageImageEmbedding(
     if (pdf_output_budgeted) |*budgeted| try resource_tracker.transferPinnedPdfOutputCredit(budgeted);
     const pdf_output_alloc = if (pdf_output_budgeted) |*budgeted| budgeted.allocator() else runtime.alloc;
     render_config.pdf_render_max_inflight_bytes = pdf_operation_budget.render_bytes;
-    const coordinator = try RuntimePdfOcrCoordinator.create(
+    const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(
         runtime.alloc,
         // Native parser/renderer memory is already globally precharged by
         // pdf_operation_budget. Back it directly so it is locally bounded but
@@ -13435,7 +13627,7 @@ fn processPdfPageImageEmbedding(
         runtime.alloc,
         runtime.config.sync_wait_timeout_ms,
         render_config,
-        downloaded.data,
+        prepared_pdf_source,
     );
     defer coordinator.destroy();
     coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
@@ -14090,6 +14282,7 @@ fn processDenseEmbedding(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
     const dense_embedder = runtime.config.dense_embedder orelse return;
@@ -14102,7 +14295,7 @@ fn processDenseEmbedding(
     }
     if (consumer_indexes.len == 0) return;
     if (request.embedding_input == .pdf_page_images) {
-        return try processPdfPageImageEmbedding(runtime, request, dense_embedder, consumer_indexes, window);
+        return try processPdfPageImageEmbedding(runtime, request, dense_embedder, consumer_indexes, prepared_sources, window);
     }
     if (requestHasChunkSource(request)) {
         var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);

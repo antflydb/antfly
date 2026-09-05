@@ -781,66 +781,68 @@ const PageRenderWorker = struct {
             const finished_ns = monotonicNowNs();
             self.render_elapsed_ns = finished_ns -| render_started_ns;
         }
-        var request = self.request;
-        var attempts: u8 = 0;
-        while (true) {
-            attempts +|= 1;
-            var rendered = (if (attempts == 1)
-                renderParsedPagePngWithGeometryAlloc(
-                    self.budget.allocator(),
-                    &self.parsed.?,
-                    request.page_number,
-                    request.requested_dpi,
-                    request.max_pixels,
-                    self.planned_geometry,
-                    self.profile,
-                    self.compatibility_session,
-                )
+        const request = self.request;
+        var rendered = renderParsedPagePngWithGeometryAlloc(
+            self.budget.allocator(),
+            &self.parsed.?,
+            request.page_number,
+            request.requested_dpi,
+            request.max_pixels,
+            self.planned_geometry,
+            self.profile,
+            self.compatibility_session,
+        ) catch |err| {
+            self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
+                error.RenderWorkerMemoryLimitExceeded
             else
-                renderParsedPagePngAdaptiveWithProfileAndCompatibilityAlloc(
-                    self.budget.allocator(),
-                    &self.parsed.?,
-                    request.page_number,
-                    request.requested_dpi,
-                    request.max_pixels,
-                    request.max_dimension,
-                    self.profile,
-                    self.compatibility_session,
-                )) catch |err| {
-                self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
-                    error.RenderWorkerMemoryLimitExceeded
-                else
-                    err;
-                if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
-                    self.wave_control.stop();
-                return;
-            };
-            const output_limit = request.max_output_bytes orelse {
-                self.rendered = rendered;
-                return;
-            };
-            if (rendered.png.len <= output_limit) {
-                self.rendered = rendered;
-                return;
-            }
-            const minimum = @max(@as(u32, 1), request.min_output_dimension);
-            // Drive retries from the raster that was actually produced. The
-            // configured ceiling can be much larger than an ordinary page;
-            // shrinking that ceiling without crossing the page's real extent
-            // would otherwise repeat the exact same render several times.
-            const rendered_dimension = @max(rendered.width, rendered.height);
-            if (attempts >= request.max_output_attempts or rendered_dimension <= minimum) {
-                rendered.deinit(self.budget.allocator());
-                self.failure = error.RenderedPageOutputTooLarge;
-                return;
-            }
-            const next_dimension = nextBoundedRenderDimension(rendered_dimension, rendered.png.len, output_limit, minimum);
-            std.debug.assert(next_dimension < rendered_dimension);
-            rendered.deinit(self.budget.allocator());
-            request.max_dimension = next_dimension;
-            const dimension_pixels = @as(u64, next_dimension) * @as(u64, next_dimension);
-            request.max_pixels = @min(request.max_pixels, dimension_pixels);
+                err;
+            if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
+                self.wave_control.stop();
+            return;
+        };
+        const output_limit = request.max_output_bytes orelse {
+            self.rendered = rendered;
+            return;
+        };
+        if (rendered.png.len <= output_limit) {
+            self.rendered = rendered;
+            return;
         }
+        const minimum = @max(@as(u32, 1), request.min_output_dimension);
+        const rendered_dimension = @max(rendered.width, rendered.height);
+        if (request.max_output_attempts <= 1 or rendered_dimension <= minimum) {
+            rendered.deinit(self.budget.allocator());
+            self.failure = error.RenderedPageOutputTooLarge;
+            return;
+        }
+
+        const previous_effective_dpi = rendered.effective_dpi;
+        const previous_png = rendered.png;
+        rendered.png = &.{};
+        const resized = render.resizeOwnedPngToOutputLimitAlloc(
+            self.budget.allocator(),
+            previous_png,
+            output_limit,
+            minimum,
+            request.max_output_attempts - 1,
+            self.wave_control.probe(),
+        ) catch |err| {
+            self.failure = if (err == error.OutOfMemory and self.budget.limit_exceeded)
+                error.RenderWorkerMemoryLimitExceeded
+            else
+                err;
+            if (self.failure.? == error.OutOfMemory or self.failure.? == error.Canceled)
+                self.wave_control.stop();
+            return;
+        };
+        rendered.png = resized.png;
+        rendered.width = resized.width;
+        rendered.height = resized.height;
+        rendered.effective_dpi = @max(
+            1,
+            @as(u16, @intCast((@as(u64, previous_effective_dpi) * @max(resized.width, resized.height)) / rendered_dimension)),
+        );
+        self.rendered = rendered;
     }
 };
 
@@ -852,16 +854,6 @@ fn monotonicNowNs() u64 {
         else => return 0,
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-fn nextBoundedRenderDimension(current: u32, encoded_bytes: usize, byte_budget: usize, minimum: u32) u32 {
-    if (current <= minimum) return current;
-    if (encoded_bytes == 0 or byte_budget >= encoded_bytes)
-        return @max(minimum, current - @max(@as(u32, 1), current / 4));
-    const ratio = @as(f64, @floatFromInt(byte_budget)) / @as(f64, @floatFromInt(encoded_bytes));
-    const scale = @min(0.75, @sqrt(ratio) * 0.90);
-    const estimated: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(current)) * scale));
-    return @max(minimum, @min(current - 1, estimated));
 }
 
 fn renderPageReservedBytes(parsed: *const reader.Reader, pixels: u64, options: PageRenderBatchOptions) !usize {

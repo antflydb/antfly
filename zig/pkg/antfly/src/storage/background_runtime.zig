@@ -739,11 +739,16 @@ pub const BackendRuntime = struct {
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
     io_impl: ?*IoImpl = null,
-    raft_inbound_io_impl: ?*IoImpl = null,
-    raft_outbound_io_impl: ?*IoImpl = null,
-    api_io_impl: ?*IoImpl = null,
-    inference_io_impl: ?*IoImpl = null,
-    control_io_impl: ?*IoImpl = null,
+    /// Specialized executor lanes are activated on first use. The runtime is
+    /// their sole owner; this mutex serializes first publication and teardown
+    /// never starts until the corresponding public lease gates are closed.
+    lane_init_mutex: std.atomic.Mutex = .unlocked,
+    lanes_closing: bool = false,
+    raft_inbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    raft_outbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    control_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
@@ -794,17 +799,6 @@ pub const BackendRuntime = struct {
             } else {
                 const io_impl = try initIoLane(alloc, threaded_io_limits.service);
                 errdefer deinitIoLane(alloc, io_impl);
-                const raft_inbound_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, raft_inbound_io_impl);
-                const raft_outbound_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, raft_outbound_io_impl);
-                const api_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, api_io_impl);
-                const inference_io_impl = try initIoLane(alloc, threaded_io_limits.inference);
-                errdefer deinitIoLane(alloc, inference_io_impl);
-                const control_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, control_io_impl);
-
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
                 threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
@@ -812,11 +806,6 @@ pub const BackendRuntime = struct {
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
-                runtime.raft_inbound_io_impl = raft_inbound_io_impl;
-                runtime.raft_outbound_io_impl = raft_outbound_io_impl;
-                runtime.api_io_impl = api_io_impl;
-                runtime.inference_io_impl = inference_io_impl;
-                runtime.control_io_impl = control_io_impl;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
             }
@@ -826,6 +815,14 @@ pub const BackendRuntime = struct {
     }
 
     pub fn deinit(self: *BackendRuntime) void {
+        // Publish the activation fence before closing lease admission. A
+        // caller that committed a gate acquisition just before shutdown may
+        // finish against an already-published lane, but no unused executor can
+        // be constructed once teardown has begun (including the ungated raft
+        // directions, whose callers obey the runtime lifetime contract).
+        lockAtomic(&self.lane_init_mutex);
+        self.lanes_closing = true;
+        self.lane_init_mutex.unlock();
         // Close every lane before waiting for any one of them. Otherwise a
         // borrower could continue entering a later lane while teardown drains
         // an earlier one. These waits are production lifetime enforcement,
@@ -843,25 +840,20 @@ pub const BackendRuntime = struct {
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
         }
-        if (self.api_io_impl) |io_impl| {
+        if (self.api_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.api_io_impl = null;
         }
-        if (self.inference_io_impl) |io_impl| {
+        if (self.inference_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.inference_io_impl = null;
         }
-        if (self.control_io_impl) |io_impl| {
+        if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.control_io_impl = null;
         }
-        if (self.raft_outbound_io_impl) |io_impl| {
+        if (self.raft_outbound_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.raft_outbound_io_impl = null;
         }
-        if (self.raft_inbound_io_impl) |io_impl| {
+        if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.raft_inbound_io_impl = null;
         }
         if (self.io_impl) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -955,27 +947,45 @@ pub const BackendRuntime = struct {
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
+        return if (self.raftInboundIoImpl()) |io_impl| io_impl.io() else null;
     }
 
     pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.raft_inbound_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.raft_inbound_io_impl, threaded_io_limits.service);
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
+        return if (self.raftOutboundIoImpl()) |io_impl| io_impl.io() else null;
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.raft_outbound_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.raft_outbound_io_impl, threaded_io_limits.service);
     }
 
     pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.api_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.api_io_impl, threaded_io_limits.service);
+    }
+
+    fn ensureSpecializedIoLane(
+        self: *BackendRuntime,
+        slot: *std.atomic.Value(?*IoImpl),
+        concurrent_limit: u32,
+    ) ?*IoImpl {
+        if (slot.load(.acquire)) |io_impl| return io_impl;
+        lockAtomic(&self.lane_init_mutex);
+        defer self.lane_init_mutex.unlock();
+        if (self.lanes_closing) return null;
+        if (slot.load(.acquire)) |io_impl| return io_impl;
+        const io_impl = initIoLane(self.alloc, concurrent_limit) catch return null;
+        slot.store(io_impl, .release);
+        return io_impl;
     }
 
     /// Returns the API executor interface without exposing its implementation.
@@ -1036,7 +1046,10 @@ pub const BackendRuntime = struct {
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
+        const io_impl = if (self.backend == .manual)
+            self.io_impl orelse return null
+        else
+            self.ensureSpecializedIoLane(&self.inference_io_impl, threaded_io_limits.inference) orelse return null;
         return io_impl.io();
     }
 
@@ -1078,7 +1091,10 @@ pub const BackendRuntime = struct {
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
+        const io_impl = if (self.backend == .manual)
+            self.io_impl orelse return null
+        else
+            self.ensureSpecializedIoLane(&self.control_io_impl, threaded_io_limits.service) orelse return null;
         return io_impl.io();
     }
 
@@ -2056,7 +2072,14 @@ test "backend runtime API lane leases expose and release the interface" {
     defer handle.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().control_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().raft_inbound_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().raft_outbound_io_impl.load(.acquire) == null);
     var first = try handle.ptr().acquireApiLane();
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) != null);
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
     var second = try handle.ptr().acquireApiLane();
     try std.testing.expectEqual(@as(usize, 2), handle.ptr().outstandingApiLeases());
     const active_stats = handle.ptr().laneStats();
@@ -2091,6 +2114,8 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
 
     while (!runtime.api_lane_gate.isClosed()) std.Thread.yield() catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
+    try std.testing.expect(runtime.inferenceIo() == null);
+    try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
     deinit_thread.join();
@@ -2127,7 +2152,7 @@ test "backend runtime control lane leases are isolated from API leases" {
     try std.testing.expectEqual(@as(u64, 1), stats.control_acquisitions_total);
     _ = api.io();
     _ = control.io();
-    try std.testing.expect(handle.ptr().api_io_impl.? != handle.ptr().control_io_impl.?);
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire).? != handle.ptr().control_io_impl.load(.acquire).?);
 }
 
 test "backend runtime inference lane has an isolated bounded executor" {
@@ -2136,24 +2161,54 @@ test "backend runtime inference lane has an isolated bounded executor" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    // The executor object is runtime-owned, but its worker team is staffed
-    // only after asynchronous work is submitted.
-    try std.testing.expect(handle.ptr().inference_io_impl.?.worker_threads.load(.acquire) == null);
+    // Both the executor object and its eventual worker team are lazy and
+    // runtime-owned.
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
     var inference = try handle.ptr().acquireInferenceLane();
     defer inference.release();
     _ = inference.io();
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire).?.worker_threads.load(.acquire) == null);
     try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingInferenceLeases());
     const stats = handle.ptr().laneStats();
     try std.testing.expectEqual(@as(usize, 1), stats.inference_peak_leases);
     try std.testing.expectEqual(@as(u64, 1), stats.inference_acquisitions_total);
-    try std.testing.expect(handle.ptr().inference_io_impl.? != handle.ptr().api_io_impl.?);
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) == null);
+    var api = try handle.ptr().acquireApiLane();
+    defer api.release();
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire).? != handle.ptr().api_io_impl.load(.acquire).?);
     try std.testing.expectEqual(
         std.Io.Limit.limited(threaded_io_limits.inference),
-        handle.ptr().inference_io_impl.?.concurrent_limit,
+        handle.ptr().inference_io_impl.load(.acquire).?.concurrent_limit,
     );
     try std.testing.expect(
-        @intFromEnum(handle.ptr().inference_io_impl.?.async_limit) <= threaded_io_limits.inference,
+        @intFromEnum(handle.ptr().inference_io_impl.load(.acquire).?.async_limit) <= threaded_io_limits.inference,
     );
+}
+
+test "backend runtime publishes one lazy inference lane under concurrent first use" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
+
+    const caller_count = 16;
+    var published = [_]?*IoImpl{null} ** caller_count;
+    var threads: [caller_count]std.Thread = undefined;
+    for (&threads, &published) |*thread, *observed| {
+        thread.* = try std.Thread.spawn(.{}, struct {
+            fn run(target: *BackendRuntime, result: *?*IoImpl) void {
+                _ = target.inferenceIo();
+                result.* = target.inference_io_impl.load(.acquire);
+            }
+        }.run, .{ runtime, observed });
+    }
+    for (threads) |thread| thread.join();
+
+    const expected = runtime.inference_io_impl.load(.acquire) orelse
+        return error.TestUnexpectedResult;
+    for (published) |observed| try std.testing.expectEqual(expected, observed.?);
 }
 
 test "backend runtime async lane limit is CPU aware" {
