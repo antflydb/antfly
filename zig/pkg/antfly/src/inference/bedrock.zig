@@ -8,13 +8,14 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
     @import("../template.zig");
 
 const HeaderPair = [2][]const u8;
-pub const cohere_max_batch_size: usize = 96;
+pub const cohere_max_batch_size = provider_defaults.cohere_max_embedding_batch_size;
 const single_input_batch_size: usize = 1;
 const imds_default_endpoint = "http://169.254.169.254";
 const ecs_credentials_endpoint = "http://169.254.170.2";
@@ -141,7 +142,7 @@ pub const CredentialCache = struct {
     }
 
     pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
-        var lease = try self.getLeaseForSource(alloc, http, region, source);
+        var lease = try self.getLeaseForSourceWithIo(alloc, http, null, region, source);
         defer lease.release();
         return try lease.credentials().clone(alloc);
     }
@@ -151,6 +152,17 @@ pub const CredentialCache = struct {
     /// the lease keeps credentials alive across signing even when a concurrent
     /// refresh replaces the cache entry.
     pub fn getLeaseForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
+        return try self.getLeaseForSourceWithIo(alloc, http, null, region, source);
+    }
+
+    pub fn getLeaseForSourceWithIo(
+        self: *CredentialCache,
+        alloc: std.mem.Allocator,
+        http: *httpx.Client,
+        filesystem_io: ?std.Io,
+        region: []const u8,
+        source: CredentialSource,
+    ) !Lease {
         const source_key = credentialSourceKey(region, source);
         const io = try self.bindIo(http.io);
         self.mutex.lockUncancelable(io);
@@ -193,7 +205,7 @@ pub const CredentialCache = struct {
             self.refreshing = true;
             self.mutex.unlock(io);
 
-            var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
+            var fresh = resolveCredentialsUncachedWithIo(alloc, http, filesystem_io, region, source) catch |err| {
                 const fallback_now = currentUnixSeconds() catch |clock_err| {
                     self.finishFailedRefresh(io);
                     return clock_err;
@@ -773,9 +785,19 @@ fn vectorFromJson(alloc: std.mem.Allocator, value: std.json.Value) ![]const f32 
 }
 
 fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
+    return try resolveCredentialsUncachedWithIo(alloc, http, null, region, source);
+}
+
+fn resolveCredentialsUncachedWithIo(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    filesystem_io: ?std.Io,
+    region: []const u8,
+    source: CredentialSource,
+) !Credentials {
     return switch (source) {
-        .profile => |profile| try credentialsFromSharedFiles(alloc, profile.name, profile.shared_credentials_file),
-        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, region, identity),
+        .profile => |profile| try credentialsFromSharedFiles(alloc, filesystem_io, profile.name, profile.shared_credentials_file),
+        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, filesystem_io, region, identity),
         .default => blk: {
             if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
                 errdefer alloc.free(access);
@@ -784,27 +806,28 @@ fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, reg
                 const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
                 break :blk .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
             }
-            if (credentialsFromWebIdentityFromEnv(alloc, http, region)) |creds| break :blk creds else |_| {}
+            if (credentialsFromWebIdentityFromEnv(alloc, http, filesystem_io, region)) |creds| break :blk creds else |_| {}
             const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
             defer alloc.free(profile);
-            if (credentialsFromSharedFiles(alloc, profile, null)) |creds| break :blk creds else |_| {}
-            if (credentialsFromEcsMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            if (credentialsFromSharedFiles(alloc, filesystem_io, profile, null)) |creds| break :blk creds else |_| {}
+            if (credentialsFromEcsMetadata(alloc, http, filesystem_io)) |creds| break :blk creds else |_| {}
             if (credentialsFromInstanceMetadata(alloc, http)) |creds| break :blk creds else |_| {}
             return error.MissingAwsCredentials;
         },
     };
 }
 
-fn credentialsFromSharedFiles(alloc: std.mem.Allocator, profile: []const u8, explicit_path: ?[]const u8) !Credentials {
+fn credentialsFromSharedFiles(alloc: std.mem.Allocator, filesystem_io: ?std.Io, profile: []const u8, explicit_path: ?[]const u8) !Credentials {
     const path = if (explicit_path) |value| try alloc.dupe(u8, value) else getEnvOwned(alloc, "AWS_SHARED_CREDENTIALS_FILE") orelse blk: {
         const home = getEnvOwned(alloc, "HOME") orelse return error.MissingAwsCredentials;
         defer alloc.free(home);
         break :blk try std.fmt.allocPrint(alloc, "{s}/.aws/credentials", .{home});
     };
     defer alloc.free(path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const data = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = filesystem_io orelse io_impl.?.io();
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
     defer alloc.free(data);
     return try parseProfileCredentials(alloc, data, profile);
 }
@@ -853,7 +876,7 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
     };
 }
 
-fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
+fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8) !Credentials {
     const role_arn = getEnvOwned(alloc, "AWS_ROLE_ARN") orelse return error.MissingAwsCredentials;
     defer alloc.free(role_arn);
     const token_file = getEnvOwned(alloc, "AWS_WEB_IDENTITY_TOKEN_FILE") orelse return error.MissingAwsCredentials;
@@ -862,7 +885,7 @@ fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Clie
     defer alloc.free(session_name);
     const sts_endpoint = getEnvOwned(alloc, "AWS_STS_ENDPOINT");
     defer if (sts_endpoint) |value| alloc.free(value);
-    return try credentialsFromWebIdentity(alloc, http, region, .{
+    return try credentialsFromWebIdentity(alloc, http, filesystem_io, region, .{
         .role_arn = role_arn,
         .token_file = token_file,
         .session_name = session_name,
@@ -870,10 +893,8 @@ fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Clie
     });
 }
 
-fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, identity: WebIdentityCredentialSource) !Credentials {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const token = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), identity.token_file, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
+fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, identity: WebIdentityCredentialSource) !Credentials {
+    const token = try webIdentityTokenFileAlloc(alloc, filesystem_io, identity.token_file);
     defer alloc.free(token);
 
     const sts_endpoint = if (identity.sts_endpoint) |endpoint| try alloc.dupe(u8, endpoint) else try std.fmt.allocPrint(alloc, "https://sts.{s}.amazonaws.com", .{region});
@@ -899,7 +920,19 @@ fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, reg
     return try parseStsCredentials(alloc, response_body);
 }
 
-fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client) !Credentials {
+fn webIdentityTokenFileAlloc(
+    alloc: std.mem.Allocator,
+    filesystem_io: ?std.Io,
+    path: []const u8,
+) ![]u8 {
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = filesystem_io orelse io_impl.?.io();
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch
+        return error.MissingAwsCredentials;
+}
+
+fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io) !Credentials {
     const full_uri = getEnvOwned(alloc, "AWS_CONTAINER_CREDENTIALS_FULL_URI");
     const relative_uri = if (full_uri == null) getEnvOwned(alloc, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") else null;
     defer if (full_uri) |value| alloc.free(value);
@@ -913,7 +946,7 @@ fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client) !Cr
         return error.MissingAwsCredentials;
     defer alloc.free(url);
 
-    const auth_token = containerAuthorizationToken(alloc);
+    const auth_token = containerAuthorizationToken(alloc, filesystem_io);
     defer if (auth_token) |value| alloc.free(value);
     const headers = if (auth_token) |token| &[_]HeaderPair{.{ "authorization", token }} else &[_]HeaderPair{};
     var resp = http.request(.GET, url, .{ .headers = headers }) catch return error.MissingAwsCredentials;
@@ -974,18 +1007,23 @@ fn imdsToken(alloc: std.mem.Allocator, http: *httpx.Client, endpoint: []const u8
     return try alloc.dupe(u8, std.mem.trim(u8, body, " \t\r\n"));
 }
 
-fn containerAuthorizationToken(alloc: std.mem.Allocator) ?[]u8 {
+fn containerAuthorizationToken(alloc: std.mem.Allocator, filesystem_io: ?std.Io) ?[]u8 {
     if (getEnvOwned(alloc, "AWS_CONTAINER_AUTHORIZATION_TOKEN")) |token| return token;
     const token_file = getEnvOwned(alloc, "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") orelse return null;
     defer alloc.free(token_file);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), token_file, alloc, .limited(1 << 20)) catch return null;
+    return containerAuthorizationTokenFileAlloc(alloc, filesystem_io, token_file) catch null;
+}
+
+fn containerAuthorizationTokenFileAlloc(alloc: std.mem.Allocator, filesystem_io: ?std.Io, token_file: []const u8) ![]u8 {
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const io = filesystem_io orelse io_impl.?.io();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, token_file, alloc, .limited(1 << 20));
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
-    const out = alloc.dupe(u8, trimmed) catch {
+    const out = alloc.dupe(u8, trimmed) catch |err| {
         alloc.free(raw);
-        return null;
+        return err;
     };
     alloc.free(raw);
     return out;
@@ -1465,8 +1503,49 @@ pub fn testCredentialUrlEncoding() !void {
     try std.testing.expectEqualStrings("role/name%20with%20space", path);
 }
 
+pub fn testCredentialFilesUseSuppliedFilesystemAuthority() !void {
+    const alloc = std.testing.allocator;
+    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    defer filesystem_impl.deinit();
+    const filesystem_io = filesystem_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const credentials_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/credentials", .{tmp.sub_path});
+    defer alloc.free(credentials_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{
+        .sub_path = credentials_path,
+        .data = "[archive]\naws_access_key_id = AKIAPROFILE\naws_secret_access_key = profile-secret\naws_session_token = profile-token\n",
+    });
+    var credentials = try credentialsFromSharedFiles(alloc, filesystem_io, "archive", credentials_path);
+    defer credentials.deinit(alloc);
+    try std.testing.expectEqualStrings("AKIAPROFILE", credentials.access_key_id);
+    try std.testing.expectEqualStrings("profile-secret", credentials.secret_access_key);
+    try std.testing.expectEqualStrings("profile-token", credentials.session_token.?);
+
+    const token_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/web-identity-token", .{tmp.sub_path});
+    defer alloc.free(token_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{
+        .sub_path = token_path,
+        .data = "signed-web-identity-token\n",
+    });
+    const token = try webIdentityTokenFileAlloc(alloc, filesystem_io, token_path);
+    defer alloc.free(token);
+    try std.testing.expectEqualStrings("signed-web-identity-token\n", token);
+
+    const container_token_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/container-auth-token", .{tmp.sub_path});
+    defer alloc.free(container_token_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{
+        .sub_path = container_token_path,
+        .data = " container-auth-token \n",
+    });
+    const container_token = try containerAuthorizationTokenFileAlloc(alloc, filesystem_io, container_token_path);
+    defer alloc.free(container_token);
+    try std.testing.expectEqualStrings("container-auth-token", container_token);
+}
+
 pub fn testRequestShapeBatchesByProviderRequest() !void {
-    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-v4"));
+    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-v4:0"));
     try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-english-v3"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-text-v2:0"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-image-v1"));

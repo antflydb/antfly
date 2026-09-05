@@ -1176,6 +1176,7 @@ pub const SemanticStatusResolver = struct {
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
@@ -1213,6 +1214,7 @@ pub const SemanticStatusResolver = struct {
             .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
             .secret_store = self.secret_store,
+            .provider_runtime = self.provider_runtime,
             .query_embedding_cache = self.query_embedding_cache,
             .query_embedding_budget = self.query_embedding_budget,
             .query_embedding_security_domain = self.query_embedding_security_domain,
@@ -2825,6 +2827,7 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
 
     pub const RequestStats = struct {
@@ -3022,6 +3025,7 @@ pub const ApiHttpServer = struct {
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
+            .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
             }),
@@ -3420,6 +3424,7 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
         self.* = undefined;
@@ -3504,6 +3509,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
+            .provider_runtime = &self.embedding_provider_runtime,
             .query_embedding_cache = &self.query_embedding_cache,
             .query_embedding_budget = self.inferenceCacheBudget(),
             .query_embedding_security_domain = security_domain,
@@ -3537,7 +3543,8 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
+            .network_io = if (self.cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null,
+            .filesystem_io = if (self.cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3607,6 +3614,38 @@ pub const ApiHttpServer = struct {
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
         const runtime = self.cfg.backend_runtime orelse return null;
         return runtime.apiIo();
+    }
+
+    pub fn sharedApiNetworkIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return runtime.apiNetworkIo();
+    }
+
+    /// Local backup repositories need the API lane's native filesystem
+    /// contract. Remote repositories retain the cancellation-safe connector
+    /// used by request-scoped network transport.
+    fn backupLocationIo(
+        self: *ApiHttpServer,
+        location: *const backups_api.BackupLocation,
+    ) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return switch (location.*) {
+            .file => runtime.apiFilesystemIo(),
+            .remote => runtime.apiNetworkIo(),
+        };
+    }
+
+    pub fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return runtime.apiFilesystemIo();
+    }
+
+    /// Native shard backup and restore always operate on local files, even
+    /// when the durable repository is remote. Keep that lane distinct from
+    /// the request-cancellable repository connector so a network wrapper can
+    /// never become the executor for DB filesystem work.
+    fn backupStagingIo(self: *ApiHttpServer, fallback: std.Io) std.Io {
+        return self.sharedApiFilesystemIo() orelse fallback;
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -4027,13 +4066,15 @@ pub const ApiHttpServer = struct {
                         .node_config = self.server.cfg.node_config,
                         .connection = target.connection,
                         .required_capability = "backup.write",
-                        .io = io,
+                        .network_io = self.server.sharedApiNetworkIo(),
+                        .filesystem_io = self.server.sharedApiFilesystemIo(),
                     },
                 ) catch |err| {
                     std.log.warn("cluster backup maintenance location open deferred class={s}", .{@errorName(err)});
                     self.rotateToNextTarget();
                     continue;
                 };
+                const repository_io = self.server.backupLocationIo(&location) orelse io;
                 const run_cluster_maintenance = blk: {
                     platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
                     defer self.server.backup_maintenance_mutex.unlock();
@@ -4042,14 +4083,14 @@ pub const ApiHttpServer = struct {
                 if (run_cluster_maintenance) {
                     _ = backups_api.reclaimStaleClusterBackupAttempts(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         now_unix_ns,
                     ) catch |err| {
                         std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
                     };
                 }
-                self.reclaimDueTableAttempts(io, &location, now_unix_ns);
+                self.reclaimDueTableAttempts(repository_io, &location, now_unix_ns);
                 location.deinit(self.server.owner_alloc);
                 self.rotateToNextTarget();
             }
@@ -4263,17 +4304,19 @@ pub const ApiHttpServer = struct {
                     .node_config = self.server.cfg.node_config,
                     .connection = self.connection,
                     .required_capability = "backup.write",
-                    .io = io,
+                    .network_io = self.server.sharedApiNetworkIo(),
+                    .filesystem_io = self.server.sharedApiFilesystemIo(),
                 },
             );
             defer location.deinit(self.server.owner_alloc);
+            const repository_io = self.server.backupLocationIo(&location) orelse io;
             switch (self.attempt) {
                 .table => |table| switch (table.action) {
                     .rollback => {
                         var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
                         const progress = try backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
                             self.server.owner_alloc,
-                            io,
+                            repository_io,
                             &location,
                             table.backup_id,
                             table.artifact_backup_id,
@@ -4287,20 +4330,20 @@ pub const ApiHttpServer = struct {
                     },
                     .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         table.artifact_backup_id,
                     ),
                     .committed_logical_state => _ = try backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         table.backup_id,
                     ),
                 },
                 .cluster => |cluster_attempt| backups_api.cleanupClusterBackupAttemptByIdAtLocation(
                     self.server.owner_alloc,
-                    io,
+                    repository_io,
                     &location,
                     cluster_attempt.attempt_id,
                 ) catch |err| switch (err) {
@@ -6331,6 +6374,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
+            .provider_runtime = &self.embedding_provider_runtime,
             .query_embedding_cache = &self.query_embedding_cache,
             .query_embedding_budget = self.inferenceCacheBudget(),
             .query_embedding_security_domain = .internal,
@@ -8760,6 +8804,7 @@ pub const ApiHttpServer = struct {
         cleanup_safe: *bool,
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const staging_io = self.backupStagingIo(io);
         const remote_repository = switch (backup_location.*) {
             .file => false,
             .remote => true,
@@ -8835,7 +8880,7 @@ pub const ApiHttpServer = struct {
                 .backup_root = local_backup_root,
                 .backup_id = artifact_backup_id,
                 .format = format,
-                .io = io,
+                .io = staging_io,
                 .fence = fence,
                 .cancellation = operation_control.token(),
                 .deadline_ns = operation_control.deadline_ns,
@@ -8883,16 +8928,18 @@ pub const ApiHttpServer = struct {
                 const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(snapshot_root);
                 switch (format) {
-                    .portable => backups_api.copyFileToLocationWithCancellation(
+                    .portable => backups_api.copyFileToLocationUsingIoWithCancellation(
                         self.alloc,
+                        staging_io,
                         backup_location,
                         shard.snapshot_path,
                         snapshot_root,
                         "application/vnd.antfly.backup",
                         operation_control.token(),
                     ) catch |err| return operation_control.normalizeInterruption(err),
-                    .native => backups_api.copyDirectoryToLocationWithCancellation(
+                    .native => backups_api.copyDirectoryToLocationUsingIoWithCancellation(
                         self.alloc,
+                        staging_io,
                         backup_location,
                         artifact_backup_id,
                         shard.group_id,
@@ -8948,7 +8995,9 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         request: api_operation.RequestContext,
     ) ![]backups_api.ShardSnapshot {
-        const io = self.sharedApiIo() orelse return error.BackupStorageUnavailable;
+        const io = self.backupLocationIo(backup_location) orelse
+            return error.BackupStorageUnavailable;
+        const staging_io = self.backupStagingIo(io);
         const writer_not_after = fence.writer_not_after_unix_ns orelse
             return error.InvalidBackupFence;
         const ensure_writer_active = struct {
@@ -8998,7 +9047,7 @@ pub const ApiHttpServer = struct {
             .backup_root = local_backup_root,
             .backup_id = artifact_backup_id,
             .format = format,
-            .io = io,
+            .io = staging_io,
             .fence = fence,
             .target_group_id = group_id,
             .cancellation = operation_control.token(),
@@ -9019,16 +9068,18 @@ pub const ApiHttpServer = struct {
             const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
             defer self.alloc.free(snapshot_root);
             switch (format) {
-                .portable => backups_api.copyFileToLocationWithCancellation(
+                .portable => backups_api.copyFileToLocationUsingIoWithCancellation(
                     self.alloc,
+                    staging_io,
                     backup_location,
                     shard.snapshot_path,
                     snapshot_root,
                     "application/vnd.antfly.backup",
                     operation_control.token(),
                 ) catch |err| return operation_control.normalizeInterruption(err),
-                .native => backups_api.copyDirectoryToLocationWithCancellation(
+                .native => backups_api.copyDirectoryToLocationUsingIoWithCancellation(
                     self.alloc,
+                    staging_io,
                     backup_location,
                     artifact_backup_id,
                     shard.group_id,
@@ -9361,7 +9412,8 @@ pub const ApiHttpServer = struct {
     /// declared checksums, so derive and bind them to the restore intent.
     fn admitExternalRestoreArtifactIntegrity(
         self: *ApiHttpServer,
-        io: std.Io,
+        repository_io: std.Io,
+        staging_io: std.Io,
         backup_location: *backups_api.BackupLocation,
         manifest: *backups_api.TableBackupManifest,
         verification_cache: ?*backups_api.ArtifactVerificationCache,
@@ -9369,7 +9421,7 @@ pub const ApiHttpServer = struct {
         if (manifest.artifact_integrity_mode == .declared) {
             return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                 self.alloc,
-                io,
+                repository_io,
                 backup_location,
                 manifest,
                 verification_cache,
@@ -9380,7 +9432,7 @@ pub const ApiHttpServer = struct {
         switch (backup_location.*) {
             .file => |backup_root| backups_api.deriveManifestArtifactIntegrity(
                 self.alloc,
-                io,
+                staging_io,
                 backup_root,
                 manifest,
             ) catch |err| switch (err) {
@@ -9401,7 +9453,7 @@ pub const ApiHttpServer = struct {
                     defer self.alloc.free(destination);
                     backups_api.copyFileFromLocationUsingIo(
                         self.alloc,
-                        io,
+                        staging_io,
                         backup_location,
                         shard.snapshot_path,
                         destination,
@@ -9412,7 +9464,7 @@ pub const ApiHttpServer = struct {
                 }
                 try backups_api.deriveManifestArtifactIntegrity(
                     self.alloc,
-                    io,
+                    staging_io,
                     staging_root,
                     manifest,
                 );
@@ -9427,7 +9479,8 @@ pub const ApiHttpServer = struct {
     /// checksum-less portable envelope is allowed to derive a new identity.
     fn prepareOwnedRestoreArtifactIntegrity(
         self: *ApiHttpServer,
-        io: std.Io,
+        repository_io: std.Io,
+        staging_io: std.Io,
         backup_location: *backups_api.BackupLocation,
         local_backup_root: []const u8,
         materialize_snapshot: bool,
@@ -9443,7 +9496,7 @@ pub const ApiHttpServer = struct {
                 };
                 return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                     self.alloc,
-                    io,
+                    staging_io,
                     &materialized_location,
                     manifest,
                     verification_cache,
@@ -9451,7 +9504,7 @@ pub const ApiHttpServer = struct {
             }
             return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                 self.alloc,
-                io,
+                repository_io,
                 backup_location,
                 manifest,
                 verification_cache,
@@ -9460,7 +9513,8 @@ pub const ApiHttpServer = struct {
         if (manifest.format != .portable) return error.UnsupportedBackupFormat;
         if (!materialize_snapshot) {
             return self.admitExternalRestoreArtifactIntegrity(
-                io,
+                repository_io,
+                staging_io,
                 backup_location,
                 manifest,
                 verification_cache,
@@ -9468,7 +9522,7 @@ pub const ApiHttpServer = struct {
         }
         try backups_api.deriveManifestArtifactIntegrity(
             self.alloc,
-            io,
+            staging_io,
             local_backup_root,
             manifest,
         );
@@ -9677,6 +9731,14 @@ pub const ApiHttpServer = struct {
 
         const materialize_snapshot = !target_exists or replace_existing;
 
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(backup_location) == null)
+            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        else
+            null;
+        defer if (fallback_io) |*owned| owned.deinit();
+        const repository_io = self.backupLocationIo(backup_location) orelse fallback_io.?.io();
+        const staging_io = self.backupStagingIo(repository_io);
+
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
             .remote => if (materialize_snapshot) try self.createBackupStagingRoot(backup_id) else "",
@@ -9693,18 +9755,14 @@ pub const ApiHttpServer = struct {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
                 switch (manifest.format) {
-                    .portable => try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
-                    .native => try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
+                    .portable => try backups_api.copyFileFromLocationUsingIo(self.alloc, staging_io, backup_location, shard.snapshot_path, dest_root),
+                    .native => try backups_api.copyDirectoryFromLocationUsingIo(self.alloc, staging_io, backup_location, shard.snapshot_path, dest_root),
                 }
             }
         }
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
-            std.Io.Threaded.init(std.heap.page_allocator, .{})
-        else
-            null;
-        defer if (fallback_io) |*owned| owned.deinit();
         try self.prepareOwnedRestoreArtifactIntegrity(
-            self.sharedApiIo() orelse fallback_io.?.io(),
+            repository_io,
+            staging_io,
             backup_location,
             local_backup_root,
             materialize_snapshot,
@@ -9781,7 +9839,7 @@ pub const ApiHttpServer = struct {
                     .reconcile_only = target_exists and !replace_existing,
                     .replace_existing = replace_existing,
                     .publication_hook = publication_hook,
-                    .io = self.sharedApiIo(),
+                    .io = staging_io,
                     .cancellation = cancellation,
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
@@ -10046,7 +10104,7 @@ pub const ApiHttpServer = struct {
             if (node_config.storage.lite_path) |path| break :blk std.fs.path.dirname(path) orelse ".";
             return error.BackupStagingUnavailable;
         };
-        if (self.sharedApiIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
+        if (self.sharedApiFilesystemIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try createBackupStagingRootAt(self.alloc, io_impl.io(), configured_root, generation_id);
@@ -10081,7 +10139,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn destroyBackupStagingRoot(self: *ApiHttpServer, path: []const u8) void {
-        if (self.sharedApiIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
+        if (self.sharedApiFilesystemIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         destroyBackupStagingRootAt(self.alloc, io_impl.io(), path);
@@ -11465,102 +11523,71 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn tableConfigContainsIndex(alloc: std.mem.Allocator, indexes_json: []const u8, index_name: []const u8) !bool {
-        if (index_name.len == 0) return false;
-        var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return false;
-        lookup.deinit();
-        return true;
-    }
-
-    const RuntimeIndexLifecycle = enum {
-        healthy,
-        rebuilding,
-        unavailable,
+    const CatalogIndexUse = enum {
+        full_text,
+        dense,
+        sparse,
+        graph,
     };
 
-    fn runtimeIndexRepairLifecycle(item: db_mod.types.DBIndexStats) index_repair_status.LifecycleProjection {
-        const status = item.index_repair_status orelse index_repair_status.summarize(
-            item.index_repair_id != null,
-            item.index_repair_automation,
-            item.index_repair_phase,
-            item.index_repair_wait_reason,
-            item.index_repair_action_required,
-        );
-        return index_repair_status.projectLifecycle(
-            status,
-            item.index_repair_action_required,
-            item.index_repair_active_generation_serviceable,
-        );
-    }
-
-    fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
-        return metadata.freshness == .fresh or metadata.freshness == .catching_up;
-    }
-
-    fn runtimeIndexLifecycle(
-        statuses: []const runtime_status.LocalTableRuntimeStatus,
-        expected_group_ids: []const u64,
+    fn tableConfigContainsCompatibleIndex(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
         index_name: []const u8,
-    ) RuntimeIndexLifecycle {
-        if (expected_group_ids.len == 0) return .unavailable;
-        var observed_active_build = false;
-        for (expected_group_ids) |group_id| {
-            var observed_group_index = false;
-            var group_active_build = false;
-            for (statuses) |status| {
-                if (status.group_id != group_id) continue;
-                // Quarantine is an explicit fail-closed owner observation and
-                // must dominate healthy or rebuilding candidates retained by
-                // another cache generation.
-                if (status.metadata.source == .rebuild_state_quarantine) return .unavailable;
-                if (!runtimeStatusHasCurrentLifecycleEvidence(status.metadata)) continue;
-                const index = for (status.stats.indexes) |item| {
-                    if (std.mem.eql(u8, item.name, index_name)) break item;
-                } else continue;
-                observed_group_index = true;
-                const repair_lifecycle = runtimeIndexRepairLifecycle(index);
-                // The storage owner supplies an incarnation/version-scoped
-                // serviceability proof. Candidate failure diagnostics remain
-                // visible, but cannot revoke a generation that admission still
-                // serves. Without that proof, actionable repair fails closed.
-                if (index.load_error != null and !repair_lifecycle.active_generation_serviceable) return .unavailable;
-                if (repair_lifecycle.blocks_queryable and repair_lifecycle.action_required) return .unavailable;
-                if (index.backfill_active or
-                    index.replay_catch_up_required or
-                    index.catch_up_active or
-                    repair_lifecycle.blocks_queryable or
-                    repair_lifecycle.present or
-                    index.replay_applied_sequence < index.replay_target_sequence or
-                    index.catch_up_applied_sequence < index.catch_up_target_sequence)
-                {
-                    group_active_build = true;
-                } else if (index.repair_degraded and !repair_lifecycle.active_generation_serviceable) {
-                    return .unavailable;
-                }
-            }
-            if (!observed_group_index) return .unavailable;
-            observed_active_build = observed_active_build or group_active_build;
-        }
-        return if (observed_active_build) .rebuilding else .healthy;
-    }
-
-    fn observeRuntimeIndexLifecycle(
-        statuses: []const runtime_status.LocalTableRuntimeStatus,
-        expected_group_ids: []const u64,
-        index_name: []const u8,
-        observed_rebuilding: *bool,
-    ) bool {
-        return switch (runtimeIndexLifecycle(statuses, expected_group_ids, index_name)) {
-            .healthy => true,
-            .rebuilding => blk: {
-                observed_rebuilding.* = true;
-                break :blk true;
+        use: CatalogIndexUse,
+    ) !bool {
+        if (index_name.len == 0) return false;
+        var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, indexes_json, index_name)) orelse return false;
+        defer lookup.deinit();
+        const index_type = indexes_api.inferIndexType(index_name, lookup.config) orelse return false;
+        return switch (use) {
+            .full_text => index_type == .full_text,
+            .graph => index_type == .graph,
+            .dense, .sparse => blk: {
+                if (index_type != .embeddings or lookup.config != .object) break :blk false;
+                const sparse = if (lookup.config.object.get("sparse")) |value|
+                    value == .bool and value.bool
+                else
+                    false;
+                break :blk sparse == (use == .sparse);
             },
-            .unavailable => false,
         };
     }
 
-    fn queryHasRebuildingCatalogIndex(
+    /// Mirror `resolveFilterTextIndexEntry`: an explicit primary is tried
+    /// first, then the root index if it is text, then the implicit text index
+    /// only when the catalog contains exactly one text index.
+    fn tableConfigResolvesFilterTextIndex(
+        alloc: std.mem.Allocator,
+        indexes_json: []const u8,
+        primary_text_index_name: ?[]const u8,
+        root_index_name: ?[]const u8,
+    ) !bool {
+        if (primary_text_index_name) |name| {
+            if (try tableConfigContainsCompatibleIndex(alloc, indexes_json, name, .full_text)) return true;
+        }
+        if (root_index_name) |name| {
+            if (try tableConfigContainsCompatibleIndex(alloc, indexes_json, name, .full_text)) return true;
+        }
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        const indexes = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        var text_count: usize = 0;
+        var it = indexes.iterator();
+        while (it.next()) |entry| {
+            if (indexes_api.inferIndexType(entry.key_ptr.*, entry.value_ptr.*) == .full_text) {
+                text_count += 1;
+                if (text_count > 1) return false;
+            }
+        }
+        return text_count == 1;
+    }
+
+    fn queryReferencesOnlyCatalogIndexes(
         self: *ApiHttpServer,
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
@@ -11574,56 +11601,72 @@ pub const ApiHttpServer = struct {
         // build lifecycle and must not be rewritten as retryable.
         var referenced = false;
         if (req.index_name) |name| {
+            if (db_query_search.requestBindsRootTextIndex(req)) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .full_text)) return false;
+            }
+            if (req.dense != null) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .dense)) return false;
+            }
+            if (req.sparse != null) {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .sparse)) return false;
+            }
+            switch (req.query) {
+                .dense_knn => {
+                    referenced = true;
+                    if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .dense)) return false;
+                },
+                .sparse_knn => {
+                    referenced = true;
+                    if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, name, .sparse)) return false;
+                },
+                else => {},
+            }
+        }
+        if (db_query_search.requestBindsFilterTextIndex(req)) {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, name)) return false;
+            if (!try tableConfigResolvesFilterTextIndex(
+                self.alloc,
+                table.indexes_json,
+                req.primary_text_index_name,
+                req.index_name,
+            )) return false;
         }
         for (req.full_text_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .full_text)) return false;
         }
         for (req.dense_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .dense)) return false;
         }
         for (req.sparse_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .sparse)) return false;
+        }
+        switch (req.query) {
+            .graph => |query| {
+                referenced = true;
+                if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.index_name, .graph)) return false;
+            },
+            else => {},
         }
         for (req.graph_queries) |query| {
             referenced = true;
-            if (!try tableConfigContainsIndex(self.alloc, table.indexes_json, query.query.index_name)) return false;
+            if (!try tableConfigContainsCompatibleIndex(self.alloc, table.indexes_json, query.query.index_name, .graph)) return false;
         }
         if (!referenced) return false;
 
-        // Unknown or partial runtime state is not proof of an active build.
-        // Merge local and remotely published observations, then require one
-        // current lifecycle fact for every catalog group below.
-        const expected_group_ids = try indexes_api.expectedTableGroupIds(self.alloc, &snapshot, table.table_id);
-        defer if (expected_group_ids.len > 0) self.alloc.free(expected_group_ids);
-        if (expected_group_ids.len == 0) return false;
-        var statuses = (try self.lifecycleTableRuntimeStatusesWithSnapshot(table_name, &snapshot)) orelse return false;
-        defer statuses.deinit(self.alloc);
-
-        // IndexNotFound is retryable only when every referenced catalog index
-        // has usable runtime state and at least one is actively rebuilding. A
-        // failed or missing sibling must retain the actionable original error.
-        var observed_rebuilding = false;
-        if (req.index_name) |name| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, name, &observed_rebuilding)) return false;
-        }
-        for (req.full_text_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
-        }
-        for (req.dense_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
-        }
-        for (req.sparse_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.index_name, &observed_rebuilding)) return false;
-        }
-        for (req.graph_queries) |query| {
-            if (!observeRuntimeIndexLifecycle(statuses.items, expected_group_ids, query.query.index_name, &observed_rebuilding)) return false;
-        }
-        return observed_rebuilding;
+        // The catalog commit and serving-snapshot publication are deliberately
+        // decoupled. IndexNotFound from storage is sufficient proof of that
+        // convergence gap once every explicit name is catalog-valid. Runtime
+        // status publication can lag the same handoff, so requiring it here
+        // both misclassifies the gap as a 500 and adds a distributed status
+        // read to the error path. Persistent build failures remain available
+        // through index status; the query response stays safely retryable.
+        return true;
     }
 
     const MissingIndexLifecycle = union(enum) {
@@ -11631,11 +11674,20 @@ pub const ApiHttpServer = struct {
         rebuilding,
         resolve: *ApiHttpServer,
 
-        fn isRebuilding(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !bool {
+        const Disposition = enum {
+            preserve,
+            invalid_request,
+            rebuilding,
+        };
+
+        fn classify(self: @This(), table_name: []const u8, req: db_mod.types.SearchRequest) !Disposition {
             return switch (self) {
-                .none => false,
-                .rebuilding => true,
-                .resolve => |server| try server.queryHasRebuildingCatalogIndex(table_name, req),
+                .none => .preserve,
+                .rebuilding => .rebuilding,
+                .resolve => |server| if (try server.queryReferencesOnlyCatalogIndexes(table_name, req))
+                    .rebuilding
+                else
+                    .invalid_request,
             };
         }
     };
@@ -11675,12 +11727,15 @@ pub const ApiHttpServer = struct {
                     try sleepNsCancellable(sleep_ns, req.cancellation);
                     continue;
                 },
-                // Only translate a missing physical index when catalog and
-                // runtime lifecycle observations prove that a requested index
-                // is still being published. A genuinely unknown index, or a
-                // supposedly-ready index that disappeared, retains its
-                // diagnostic instead of being masked as transient readiness.
-                error.IndexNotFound => if (try missing_index_lifecycle.isRebuilding(table_name, req)) return error.IndexRebuilding else return err,
+                // A catalog-valid name with no physical reader is a serving
+                // convergence gap. Unknown names are attributed to the public
+                // request instead of leaking a storage error as an internal
+                // 500. Non-public callers can preserve the original error.
+                error.IndexNotFound => switch (try missing_index_lifecycle.classify(table_name, req)) {
+                    .preserve => return err,
+                    .invalid_request => return error.InvalidQueryRequest,
+                    .rebuilding => return error.IndexRebuilding,
+                },
                 error.Timeout, error.Cancelled => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
@@ -11781,12 +11836,12 @@ pub const ApiHttpServer = struct {
             break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
         defer metadata_table_manager.freeTable(self.alloc, table);
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
-        const io = self.sharedApiIo() orelse fallback_io.?.io();
+        const io = self.backupLocationIo(location) orelse fallback_io.?.io();
         // Establish admission before publication. Cancellation remains safe
         // afterward because the operation control drains in-flight work and
         // the reservation rollback path converts uncertain delivery into an
@@ -11886,8 +11941,10 @@ pub const ApiHttpServer = struct {
                 error.Canceled => error.Canceled,
                 error.DeadlineExceeded => error.DeadlineExceeded,
             };
+            const repository_io = self.backupLocationIo(location) orelse return error.InternalFailure;
             self.admitExternalRestoreArtifactIntegrity(
-                self.sharedApiIo() orelse return error.InternalFailure,
+                repository_io,
+                self.backupStagingIo(repository_io),
                 location,
                 &manifest,
                 null,
@@ -13099,12 +13156,12 @@ pub const ApiHttpServer = struct {
             .remote => true,
         };
         const op_alloc = self.alloc;
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
-        const backup_io = self.sharedApiIo() orelse fallback_io.?.io();
+        const backup_io = self.backupLocationIo(location) orelse fallback_io.?.io();
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
@@ -13674,7 +13731,7 @@ pub const ApiHttpServer = struct {
         } else api_operation.CancellationToken.none;
         const restore_connection = req.connection orelse return error.InvalidRequest;
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
-        const restore_io = self.sharedApiIo() orelse return error.InternalFailure;
+        const restore_io = self.backupLocationIo(location) orelse return error.InternalFailure;
 
         try self.ensureRestoreActive(cancellation);
 
@@ -13861,6 +13918,7 @@ pub const ApiHttpServer = struct {
                 };
                 self.admitExternalRestoreArtifactIntegrity(
                     restore_io,
+                    self.backupStagingIo(restore_io),
                     location,
                     &table_manifest,
                     &verification_cache,
@@ -14326,7 +14384,8 @@ pub const ApiHttpServer = struct {
                     self.tableApi(.{}),
                     self.cfg.secret_store,
                     self.cfg.node_config,
-                    self.sharedApiIo(),
+                    self.sharedApiNetworkIo(),
+                    self.sharedApiFilesystemIo(),
                 );
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
@@ -15721,7 +15780,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
@@ -15808,7 +15868,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
 
@@ -15816,7 +15877,7 @@ pub const ApiHttpServer = struct {
             const credential_supported = std.mem.startsWith(u8, identity.credential_principal, "basic:") or
                 std.mem.startsWith(u8, identity.credential_principal, "api-key:");
             if (!credential_supported) {
-                const restore_io = self.sharedApiIo() orelse
+                const restore_io = self.backupLocationIo(&location) orelse
                     return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
                 var verification_cache: backups_api.ArtifactVerificationCache = .{};
                 defer verification_cache.deinit(self.alloc);
@@ -16154,7 +16215,8 @@ pub const ApiHttpServer = struct {
             .node_config = self.cfg.node_config,
             .connection = state.connection,
             .required_capability = "restore.read",
-            .io = self.sharedApiIo(),
+            .network_io = self.sharedApiNetworkIo(),
+            .filesystem_io = self.sharedApiFilesystemIo(),
         }) catch |err| {
             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -17152,6 +17214,32 @@ test "backup staging uses configured storage authority and exclusive generations
         error.PathAlreadyExists,
         ApiHttpServer.createBackupStagingRootAt(alloc, io, configured_root, generation),
     );
+}
+
+test "remote backup staging keeps native filesystem io separate from repository transport" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+    }, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, null);
+    defer server.deinit();
+
+    const repository_io = runtime.ptr().apiNetworkIo().?;
+    const staging_io = server.backupStagingIo(repository_io);
+    const expected_staging_io = runtime.ptr().apiFilesystemIo().?;
+    try std.testing.expect(staging_io.userdata == expected_staging_io.userdata);
+    try std.testing.expect(staging_io.vtable == expected_staging_io.vtable);
+    try std.testing.expect(staging_io.vtable != repository_io.vtable);
 }
 
 fn waitForTerminalRestoreJobAlloc(alloc: std.mem.Allocator, server: *ApiHttpServer, response_body: []const u8) ![]u8 {
@@ -22771,169 +22859,7 @@ test "api http maps missing physical index only for rebuilding lifecycle" {
     ));
 }
 
-test "api http missing index classification requires active rebuild evidence" {
-    const active_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .index_repair_id = 42,
-        .index_repair_phase = "building",
-    }};
-    const active_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(active_indexes[0..]) },
-    }};
-    const expected_group_ids = [_]u64{10};
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
-        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(&.{}, &expected_group_ids, "semantic_idx"),
-    );
-
-    const fresh_missing_and_active = [_]runtime_status.LocalTableRuntimeStatus{
-        .{
-            .group_id = 10,
-            .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
-            .stats = .{},
-        },
-        active_statuses[0],
-    };
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
-        ApiHttpServer.runtimeIndexLifecycle(fresh_missing_and_active[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    const two_group_ids = [_]u64{ 10, 11 };
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(active_statuses[0..], &two_group_ids, "semantic_idx"),
-    );
-    var stale_statuses = active_statuses;
-    stale_statuses[0].metadata.freshness = .stale;
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(stale_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    const terminal_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .repair_degraded = true,
-        .index_repair_id = 42,
-        .index_lifecycle_work_class = .repair,
-        .index_repair_phase = "terminal",
-        .index_repair_status = .failed,
-        .index_repair_action_required = true,
-    }};
-    const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(terminal_indexes[0..]) },
-    }};
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    const paused_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .index_repair_id = 42,
-        .index_lifecycle_work_class = .repair,
-        .index_repair_phase = "building",
-        .index_repair_automation = "paused",
-        .index_repair_status = .paused,
-        .index_repair_action_required = true,
-    }};
-    const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(paused_indexes[0..]) },
-    }};
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    const retained_terminal_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .load_error = "CandidateManifestInvalid",
-        .repair_degraded = true,
-        .index_repair_id = 45,
-        .index_lifecycle_work_class = .repair,
-        .index_repair_phase = "terminal",
-        .index_repair_status = .failed,
-        .index_repair_action_required = true,
-        .index_repair_active_generation_serviceable = true,
-    }};
-    const retained_terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(retained_terminal_indexes[0..]) },
-    }};
-    // Candidate diagnostics remain actionable, but the exact active-generation
-    // proof is authoritative for query admission.
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
-        ApiHttpServer.runtimeIndexLifecycle(retained_terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-
-    const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .repair_degraded = true,
-    }};
-    const degraded_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(degraded_indexes[0..]) },
-    }};
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "semantic_idx"),
-    );
-    try std.testing.expectEqual(
-        ApiHttpServer.RuntimeIndexLifecycle.unavailable,
-        ApiHttpServer.runtimeIndexLifecycle(degraded_statuses[0..], &expected_group_ids, "missing_idx"),
-    );
-
-    // An active build cannot mask an actionable failure from another index in
-    // the same query, regardless of reference order.
-    const mixed_indexes = [_]db_mod.types.DBIndexStats{
-        .{
-            .name = "building_idx",
-            .kind = .dense_vector,
-            .index_repair_id = 43,
-            .index_repair_phase = "building",
-        },
-        .{
-            .name = "failed_idx",
-            .kind = .dense_vector,
-            .repair_degraded = true,
-            .index_repair_id = 44,
-            .index_lifecycle_work_class = .repair,
-            .index_repair_phase = "terminal",
-            .index_repair_status = .failed,
-            .index_repair_action_required = true,
-        },
-    };
-    const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
-        .group_id = 10,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .indexes = @constCast(mixed_indexes[0..]) },
-    }};
-    var observed_rebuilding = false;
-    try std.testing.expect(ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "building_idx", &observed_rebuilding));
-    try std.testing.expect(observed_rebuilding);
-    try std.testing.expect(!ApiHttpServer.observeRuntimeIndexLifecycle(mixed_statuses[0..], &expected_group_ids, "failed_idx", &observed_rebuilding));
-}
-
-test "api http lifecycle classification preserves catching-up writer beside fresh read snapshot" {
+test "api http classifies catalog-to-serving index convergence without runtime status" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -22958,15 +22884,10 @@ test "api http lifecycle classification preserves catching-up writer beside fres
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"full_text_index_v0\":{},\"graph_idx\":{\"type\":\"graph\",\"edge_types\":[]}}",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 10,
-                    .table_id = 1,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -22985,7 +22906,6 @@ test "api http lifecycle classification preserves catching-up writer beside fres
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
-                    .local_runtime_statuses = localRuntimeStatuses,
                 },
             };
         }
@@ -23001,70 +22921,139 @@ test "api http lifecycle classification preserves catching-up writer beside fres
         fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             return error.IndexNotFound;
         }
-
-        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
-            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-            items[0] = .{
-                .group_id = 10,
-                .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
-                // The retained read generation is internally fresh but predates
-                // physical publication of the catalog-visible index.
-                .stats = .{},
-            };
-            return .{ .items = items };
-        }
     };
 
-    const FakeWrites = struct {
-        fn source() table_writes.TableWriteSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .batch = batch,
-                    .local_runtime_statuses = localRuntimeStatuses,
-                },
-            };
-        }
-
-        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
-            return;
-        }
-
-        fn localRuntimeStatuses(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
-            const indexes = try inner_alloc.alloc(db_mod.types.DBIndexStats, 1);
-            errdefer inner_alloc.free(indexes);
-            indexes[0] = .{
-                .name = try inner_alloc.dupe(u8, "semantic_idx"),
-                .kind = .dense_vector,
-                .index_repair_id = 42,
-                .index_repair_phase = "building",
-            };
-            const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-            errdefer {
-                db_mod.types.freeDBStats(inner_alloc, .{
-                    .index_count = 1,
-                    .indexes = indexes,
-                });
-                inner_alloc.free(items);
-            }
-            items[0] = .{
-                .group_id = 10,
-                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
-                .stats = .{
-                    .index_count = 1,
-                    .indexes = indexes,
-                },
-            };
-            return .{ .items = items };
-        }
-    };
-
-    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), FakeWrites.source());
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
     defer server.deinit();
 
-    try std.testing.expect(try server.queryHasRebuildingCatalogIndex("docs", .{
+    const vector = [_]f32{ 0.1, 0.2, 0.3 };
+    const catalog_request: db_mod.types.SearchRequest = .{
         .index_name = "semantic_idx",
-    }));
+        .dense = .{ .vector = &vector },
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", catalog_request));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        catalog_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const unknown_request: db_mod.types.SearchRequest = .{ .index_name = "typo_idx" };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", unknown_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        unknown_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const mismatched_primary_text_request: db_mod.types.SearchRequest = .{
+        .index_name = "semantic_idx",
+        .query = .{ .match = .{ .field = "body", .text = "hello" } },
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_primary_text_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_primary_text_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const text_catalog_request: db_mod.types.SearchRequest = .{
+        .index_name = "full_text_index_v0",
+        .filter_query_json = "{\"match_all\":{}}",
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", text_catalog_request));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        text_catalog_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const filtered_dense_catalog_request: db_mod.types.SearchRequest = .{
+        .index_name = "semantic_idx",
+        .primary_text_index_name = "full_text_index_v0",
+        .dense = .{ .vector = &vector },
+        .filter_text = .{ .term = .{ .field = "body", .term = "hello" } },
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", filtered_dense_catalog_request));
+
+    var fallback_filtered_dense_request = filtered_dense_catalog_request;
+    fallback_filtered_dense_request.primary_text_index_name = null;
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", fallback_filtered_dense_request));
+
+    var fallback_from_mismatched_filter_index_request = filtered_dense_catalog_request;
+    fallback_from_mismatched_filter_index_request.primary_text_index_name = "semantic_idx";
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", fallback_from_mismatched_filter_index_request));
+
+    const graph_catalog_request: db_mod.types.SearchRequest = .{
+        .query = .{ .graph = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        } },
+    };
+    try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", graph_catalog_request));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        graph_catalog_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const mismatched_graph_request: db_mod.types.SearchRequest = .{
+        .query = .{ .graph = .{
+            .query_type = .neighbors,
+            .index_name = "semantic_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        } },
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_graph_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_graph_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
+
+    const indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_idx\":{\"type\":\"embeddings\",\"sparse\":true},\"full_text_index_v0\":{},\"graph_idx\":{\"type\":\"graph\",\"edge_types\":[]}}";
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "semantic_idx", .dense));
+    try std.testing.expect(!try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "semantic_idx", .sparse));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "sparse_idx", .sparse));
+    try std.testing.expect(!try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "sparse_idx", .dense));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "full_text_index_v0", .full_text));
+    try std.testing.expect(try ApiHttpServer.tableConfigContainsCompatibleIndex(alloc, indexes_json, "graph_idx", .graph));
+
+    const mismatched_request: db_mod.types.SearchRequest = .{
+        .full_text_queries = &.{.{
+            .name = "$full_text_results",
+            .index_name = "semantic_idx",
+            .query = .{ .match_all = {} },
+        }},
+    };
+    try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_request));
+    try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
+        alloc,
+        FakeReads.source(),
+        "docs",
+        mismatched_request,
+        .read_index,
+        .{ .resolve = &server },
+    ));
 }
 
 test "api http plain public query preserves outer absolute request deadline" {
@@ -42425,6 +42414,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     defer server.deinit();
     try server.admitExternalRestoreArtifactIntegrity(
         std.testing.io,
+        std.testing.io,
         &location,
         &manifest,
         null,
@@ -42437,6 +42427,8 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {
     const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -42479,7 +42471,7 @@ test "owned restore verifies declared artifact identity instead of accepting sta
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
     };
-    var server = ApiHttpServer.init(alloc, .{}, .{
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{
         .ptr = undefined,
         .vtable = &.{ .status = Fake.status },
     }, null, null);
@@ -42488,7 +42480,8 @@ test "owned restore verifies declared artifact identity instead of accepting sta
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
         server.prepareOwnedRestoreArtifactIntegrity(
-            std.testing.io,
+            runtime.ptr().apiNetworkIo().?,
+            runtime.ptr().apiFilesystemIo().?,
             &location,
             root,
             true,

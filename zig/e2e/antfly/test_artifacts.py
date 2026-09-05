@@ -1275,6 +1275,8 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
 
     def text_projection_intact() -> dict | None:
         detail = stateful_api.get_index(table_name, "document_text")
+        if detail.get("status", {}).get("doc_count") != 1:
+            return None
         result = stateful_api.query_table(
             table_name,
             {
@@ -1283,8 +1285,6 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
                 "limit": 5,
             },
         )
-        if detail.get("status", {}).get("doc_count") != 1:
-            return None
         if doc_key not in _query_hit_ids(result):
             return None
         return {"detail": detail, "result": result}

@@ -7945,6 +7945,34 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
+    /// Returns the complete producer path needed to materialize an index's
+    /// configured artifact sources from primary documents. Index status and
+    /// repair attribution intentionally use `artifactSourceNamesForIndexAlloc`
+    /// so they expose only the public, direct sources. Admission backfill uses
+    /// this transitive closure: forcing only a materialized chunk or embedding
+    /// would omit its upstream asset producer and create durable work that can
+    /// never reach the requested projection.
+    pub fn artifactProducerNamesForIndexAlloc(self: *const IndexManager, alloc: Allocator, name: []const u8) ![][]u8 {
+        var names = std.ArrayListUnmanaged([]u8).fromOwnedSlice(
+            try self.artifactSourceNamesForIndexAlloc(alloc, name),
+        );
+        errdefer {
+            for (names.items) |value| alloc.free(value);
+            names.deinit(alloc);
+        }
+
+        var cursor: usize = 0;
+        while (cursor < names.items.len) : (cursor += 1) {
+            const enrichment = self.getEnrichmentByName(names.items[cursor]) orelse continue;
+            const upstream = enrichment.source_artifact_name;
+            if (upstream.len == 0 or containsOwnedString(names.items, upstream)) continue;
+            const owned_upstream = try alloc.dupe(u8, upstream);
+            errdefer alloc.free(owned_upstream);
+            try names.append(alloc, owned_upstream);
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
     pub fn getEnrichment(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
         return self.getEnrichmentExcluding(kind, name, null);
     }

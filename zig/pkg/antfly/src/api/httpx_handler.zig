@@ -1787,7 +1787,8 @@ pub const AntflyApiHandler = struct {
             .node_config = self.api_server.cfg.node_config,
             .connection = parsed.value.connection,
             .required_capability = "backup.write",
-            .io = self.api_server.sharedApiIo(),
+            .network_io = self.api_server.sharedApiNetworkIo(),
+            .filesystem_io = self.api_server.sharedApiFilesystemIo(),
         }) catch return textResponse(ctx, 400, "invalid backup location");
         defer location.deinit(ctx.allocator);
 
@@ -4215,7 +4216,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), operationContext(ctx, authenticated_identity));
+        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo(), operationContext(ctx, authenticated_identity));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4293,7 +4294,7 @@ pub const AntflyApiHandler = struct {
             backups_api.default_backup_list_limit;
         if (limit == 0 or limit > backups_api.max_backup_list_limit) return try textResponse(ctx, 400, "invalid backup list limit");
         if (params.cursor) |cursor| backups_api.validateBackupId(cursor) catch return try textResponse(ctx, 400, "invalid backup list cursor");
-        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), .{
+        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo(), .{
             .limit = limit,
             .cursor = params.cursor,
         });
@@ -5197,7 +5198,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid backup fence");
         };
-        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

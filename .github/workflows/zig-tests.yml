@@ -361,6 +361,13 @@ jobs:
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
 
+      - name: Run Qwen model parity and promotion contract tests
+        working-directory: zig/pkg/inference
+        run: >-
+          uv run --with numpy==2.4.2 python
+          scripts/run_model_contract_tests.py
+          qwen3_embedding qwen3vl
+
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 

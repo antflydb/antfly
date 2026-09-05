@@ -1175,25 +1175,36 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     }
     assert recovered is not None, json.dumps(recovery_debug, indent=2, sort_keys=True)
 
-    alpha_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "alpha concept",
-            "indexes": [index_name],
-            "limit": 3,
-        },
+    def semantic_query(query: str) -> dict:
+        return stateful_api.query_table(
+            table_name,
+            {
+                "semantic_search": query,
+                "indexes": [index_name],
+                "limit": 3,
+            },
+        )
+
+    # Runtime readiness and query-serving publication are adjacent but
+    # deliberately distinct snapshots. Honor the API's structured retryable
+    # 503 contract at this final boundary. The first successful response is
+    # still asserted immediately so polling cannot hide missing or misranked
+    # results.
+    alpha_query = wait_until(
+        lambda: semantic_query("alpha concept"),
+        timeout_s=30.0,
+        interval_s=0.25,
     )
+    assert alpha_query is not None
     alpha_hits = alpha_query["responses"][0]["hits"]["hits"]
     assert alpha_hits[0]["_id"] == "doc:a"
 
-    beta_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "beta architecture",
-            "indexes": [index_name],
-            "limit": 3,
-        },
+    beta_query = wait_until(
+        lambda: semantic_query("beta architecture"),
+        timeout_s=30.0,
+        interval_s=0.25,
     )
+    assert beta_query is not None
     beta_hits = beta_query["responses"][0]["hits"]["hits"]
     assert beta_hits[0]["_id"] == "doc:b"
 

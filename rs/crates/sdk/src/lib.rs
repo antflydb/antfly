@@ -603,6 +603,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
         api_url: None,
         model: model.into(),
         provider: types::AntflyEmbedderConfigProvider::Antfly,
+        retrieval: None,
     })
 }
 
