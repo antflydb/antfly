@@ -495,6 +495,7 @@ pub const HostedShardDbAdapter = struct {
             .vtable = &.{
                 .fetch_median_key = fetchMedianKey,
                 .schema_index_ready = schemaIndexReady,
+                .activate_index = activateIndex,
             },
         };
     }
@@ -612,6 +613,32 @@ pub const HostedShardDbAdapter = struct {
                 return try local_db.schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
             },
             .remote => return error.UnsupportedOperation,
+        };
+    }
+
+    fn activateIndex(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: metadata_mod.IndexActivationTarget,
+    ) !metadata_mod.IndexActivationProgress {
+        const self: *HostedShardDbAdapter = @ptrCast(@alignCast(ptr));
+        var route = (try api_table_router.resolveGroupRoute(
+            self.alloc,
+            self.catalog,
+            self.router,
+            target.group_id,
+            .prefer_leader,
+        )) orelse return error.UnknownGroup;
+        defer route.deinit(self.alloc);
+        return switch (route) {
+            .local => {
+                const local_db = self.local_db orelse return error.UnsupportedOperation;
+                return try local_db.activateIndex(alloc, target);
+            },
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                return try client.activateGroupIndex(remote.base_uri, target);
+            },
         };
     }
 };

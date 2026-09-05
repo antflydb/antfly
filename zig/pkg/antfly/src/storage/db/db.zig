@@ -918,10 +918,23 @@ pub const IndexRepairVisibility = struct {
     action_required: bool = false,
 };
 
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    index_name: []const u8,
+    kind: types.IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+};
+
 pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
     repair: ?IndexRepairVisibility = null,
     target_sequence: ?u64 = null,
+    target_indexes: []const IndexTargetVisibility = &.{},
+    target_scope_known: bool = false,
     /// An exact clear may leave other durable lifecycle work in the group.
     /// This is a scheduling/replay fact, not an unknown-scope visibility
     /// edge: consumers must audit the group without fencing unrelated index
@@ -2074,14 +2087,29 @@ const TtlCleanupContext = struct {
 const ManagedSyncTargets = struct {
     full_text_indexes: []const []const u8 = &.{},
     all_indexes: []const []const u8 = &.{},
+    // Visibility targets are broader than synchronous wait targets: a record
+    // with a missing dependency, or source work that schedules a generated
+    // downstream artifact, still advances that index's convergence target.
+    // Each identity owns its name so target collection does not need a second
+    // parallel allocation solely to manage name lifetime.
+    target_identities: []const IndexTargetVisibility = &.{},
+    target_scope_known: bool = false,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.full_text_indexes) |name| alloc.free(@constCast(name));
         if (self.full_text_indexes.len > 0) alloc.free(self.full_text_indexes);
         for (self.all_indexes) |name| alloc.free(@constCast(name));
         if (self.all_indexes.len > 0) alloc.free(self.all_indexes);
+        for (self.target_identities) |identity| alloc.free(@constCast(identity.index_name));
+        if (self.target_identities.len > 0) alloc.free(self.target_identities);
         self.* = undefined;
     }
+};
+
+const ManagedIndexCandidate = struct {
+    ref: index_manager_mod.ManagedIndexRef,
+    config: *const types.IndexConfig,
+    consumes_generated_enrichment: bool,
 };
 
 fn cloneManagedSyncTargetsAll(
@@ -4961,15 +4989,40 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityTargetAdvanced(ctx: *AsyncContext, target_sequence: u64) void {
+        notifyQueryVisibilityTargetAdvancedScoped(ctx, target_sequence, &.{}, false);
+    }
+
+    fn notifyQueryVisibilityTargetAdvancedScoped(
+        ctx: *AsyncContext,
+        target_sequence: u64,
+        target_indexes: []const IndexTargetVisibility,
+        target_scope_known: bool,
+    ) void {
         notifyQueryVisibilityEvent(ctx, .{
             .change = .target_advanced,
             .target_sequence = target_sequence,
+            .target_indexes = target_indexes,
+            .target_scope_known = target_scope_known,
         });
     }
 
     fn notifyQueryVisibilityTargetAdvancedContext(ctx: *const BatchExecutionContext, target_sequence: u64) void {
         if (ctx.async_context) |async_ctx|
             notifyQueryVisibilityTargetAdvanced(async_ctx, target_sequence);
+    }
+
+    fn notifyQueryVisibilityTargetAdvancedScopedContext(
+        ctx: *const BatchExecutionContext,
+        target_sequence: u64,
+        targets: ManagedSyncTargets,
+    ) void {
+        if (ctx.async_context) |async_ctx|
+            notifyQueryVisibilityTargetAdvancedScoped(
+                async_ctx,
+                target_sequence,
+                targets.target_identities,
+                targets.target_scope_known,
+            );
     }
 
     fn notifyIndexRepairVisibilityHook(
@@ -7076,7 +7129,12 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
-        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+        notifyQueryVisibilityTargetAdvancedScoped(
+            self.async_context,
+            sequence,
+            sync_targets.target_identities,
+            sync_targets.target_scope_known,
+        );
 
         var pressure_ctx = self.batchContext();
         try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
@@ -7779,6 +7837,8 @@ pub const DB = struct {
                 derived_changed_flags,
                 sequence,
                 include_generated_enrichment_hint,
+                self.core.index_manager,
+                &sync_targets,
             )
         else blk: {
             materialized_derived_batch = try buildDerivedBatch(
@@ -8032,7 +8092,12 @@ pub const DB = struct {
         apply_mutex_held = false;
         snapshot_mutation.release();
         if (append_derived_replay)
-            notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+            notifyQueryVisibilityTargetAdvancedScoped(
+                self.async_context,
+                sequence,
+                sync_targets.target_identities,
+                sync_targets.target_scope_known,
+            );
         releaseHAMutationShared(&ha_mutation);
         if (!opts.bypass_ha_write_gate) {
             const ha_ctx = self.batchContext();
@@ -23399,14 +23464,14 @@ pub const DB = struct {
                 .enrichments => {},
                 .full_text => {
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
-                        try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     }
                 },
                 .full_index => {
-                    try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                    try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
                     }
                 },
             }
@@ -33132,7 +33197,10 @@ fn encodeThinReplayRecordPayload(
     derived_changed_flags: []const bool,
     sequence: u64,
     include_generated_enrichment_hint: bool,
+    index_manager: ?*index_manager_mod.IndexManager,
+    sync_targets_out: ?*ManagedSyncTargets,
 ) ![]u8 {
+    if ((index_manager == null) != (sync_targets_out == null)) return error.InvalidArgument;
     if (derived_changed_flags.len != req.writes.len) return error.InvalidArgument;
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     var changed_doc_key_set = std.StringHashMapUnmanaged(void).empty;
@@ -33272,6 +33340,8 @@ fn encodeThinReplayRecordPayload(
         .target_hints = try target_hints.toOwnedSlice(alloc),
     };
     defer change_journal_mod.deinitRecord(alloc, &record);
+    if (sync_targets_out) |out|
+        out.* = try collectManagedSyncTargetsForRecord(alloc, index_manager.?, record);
     return try change_journal_mod.encodeRecord(alloc, record);
 }
 
@@ -41368,6 +41438,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     };
     var derived_batch = try buildDerivedBatch(ctx.alloc, req, &.{}, deleted_artifact_keys.items, &.{});
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
+    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
+    defer sync_targets.deinit(ctx.alloc);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
     const identity_live_before = (try doc_identity.fastStatsFromStore(ctx.store)).live_ordinals;
@@ -41434,11 +41506,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
-    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
-    defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
@@ -41494,6 +41564,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 }
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
+    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
+    defer sync_targets.deinit(ctx.alloc);
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
@@ -41513,7 +41585,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     apply_mutex_held = false;
     if (snapshot_replay) |*lease| lease.release();
     snapshot_replay = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -49942,16 +50014,141 @@ fn collectGraphMutationsForArtifacts(
     };
 }
 
+const GeneratedEnrichmentNameLookup = struct {
+    all: std.StringHashMapUnmanaged(void) = .empty,
+    embeddings: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        index_manager: *const index_manager_mod.IndexManager,
+    ) !GeneratedEnrichmentNameLookup {
+        var lookup = GeneratedEnrichmentNameLookup{};
+        errdefer lookup.deinit(alloc);
+        try lookup.all.ensureTotalCapacity(alloc, @intCast(index_manager.enrichments.items.len));
+        try lookup.embeddings.ensureTotalCapacity(alloc, @intCast(index_manager.enrichments.items.len));
+        for (index_manager.enrichments.items) |entry| {
+            lookup.all.putAssumeCapacity(entry.name, {});
+            if (entry.kind == .embedding) lookup.embeddings.putAssumeCapacity(entry.name, {});
+        }
+        return lookup;
+    }
+
+    fn deinit(self: *GeneratedEnrichmentNameLookup, alloc: Allocator) void {
+        self.all.deinit(alloc);
+        self.embeddings.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn artifactSourcesContainGeneratedEnrichment(
+    lookup: *const std.StringHashMapUnmanaged(void),
+    names: []const []const u8,
+) bool {
+    for (names) |name| {
+        if (lookup.contains(name)) return true;
+    }
+    return false;
+}
+
+fn collectManagedIndexCandidates(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    classify_generated_dependencies: bool,
+) ![]ManagedIndexCandidate {
+    var generated_names = if (classify_generated_dependencies)
+        try GeneratedEnrichmentNameLookup.init(alloc, index_manager)
+    else
+        GeneratedEnrichmentNameLookup{};
+    defer generated_names.deinit(alloc);
+
+    var candidates = std.ArrayListUnmanaged(ManagedIndexCandidate).empty;
+    errdefer candidates.deinit(alloc);
+    try candidates.ensureTotalCapacity(alloc, index_manager.count());
+
+    for (index_manager.text_indexes.items) |*entry| {
+        const generated = (entry.chunk_name != null and generated_names.all.contains(entry.chunk_name.?)) or
+            artifactSourcesContainGeneratedEnrichment(&generated_names.all, entry.source_artifact_names);
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .full_text },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.dense_indexes.items) |*entry| {
+        const generated = artifactSourcesContainGeneratedEnrichment(
+            &generated_names.embeddings,
+            entry.embedding_names,
+        ) or
+            (!entry.external and entry.embedding_name != null and
+                generated_names.embeddings.contains(entry.embedding_name.?));
+        candidates.appendAssumeCapacity(.{
+            .ref = .{
+                .name = entry.config.name,
+                .kind = .dense_vector,
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+            },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.sparse_indexes.items) |*entry| {
+        const generated = artifactSourcesContainGeneratedEnrichment(
+            &generated_names.embeddings,
+            entry.embedding_names,
+        ) or
+            (!entry.external and entry.embedding_name != null and
+                generated_names.embeddings.contains(entry.embedding_name.?));
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .sparse_vector },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.graph_indexes.items) |*entry| {
+        var generated = false;
+        for (entry.artifact_sources) |source| {
+            if (generated_names.all.contains(source.artifact_name)) {
+                generated = true;
+                break;
+            }
+        }
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .graph },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.algebraic_indexes.items) |*entry| {
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .algebraic },
+            .config = &entry.config,
+            .consumes_generated_enrichment = false,
+        });
+    }
+    for (index_manager.status_only_index_configs) |*cfg| {
+        if (index_manager.loadFailure(cfg.name) != null) continue;
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = cfg.name, .kind = cfg.kind },
+            .config = cfg,
+            .consumes_generated_enrichment = false,
+        });
+    }
+    return try candidates.toOwnedSlice(alloc);
+}
+
 fn collectManagedSyncTargets(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
 ) !ManagedSyncTargets {
-    const managed_indexes = try index_manager.managedIndexes(alloc);
-    defer {
-        for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
-        alloc.free(managed_indexes);
-    }
+    const generated_source_advanced = batchContainsSourceUpsert(batch) and
+        index_manager.hasGeneratedEnrichmentTargets();
+    const managed_indexes = try collectManagedIndexCandidates(
+        alloc,
+        index_manager,
+        generated_source_advanced,
+    );
+    defer alloc.free(managed_indexes);
 
     var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -49963,30 +50160,191 @@ fn collectManagedSyncTargets(
         for (all_indexes.items) |name| alloc.free(@constCast(name));
         all_indexes.deinit(alloc);
     }
+    var target_identities = std.ArrayListUnmanaged(IndexTargetVisibility).empty;
+    errdefer {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+    }
 
-    for (managed_indexes) |index_ref| {
-        if (!batchAffectsManagedIndex(index_manager, batch, index_ref)) continue;
-        try appendUniqueOwnedName(alloc, &all_indexes, index_ref.name);
-        if (index_ref.kind == .full_text) {
-            try appendUniqueOwnedName(alloc, &full_text_indexes, index_ref.name);
+    var target_scope_known = true;
+    for (managed_indexes) |candidate| {
+        const applicability = managedIndexBatchApplicability(index_manager, batch, candidate.ref);
+        switch (applicability) {
+            .irrelevant, .missing_dependency => {},
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &all_indexes, candidate.ref.name);
+                if (candidate.ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, candidate.ref.name);
+            },
+        }
+        if (applicability != .irrelevant or
+            (generated_source_advanced and candidate.consumes_generated_enrichment))
+        {
+            try appendManagedTargetIdentity(
+                alloc,
+                &target_identities,
+                candidate.config,
+                &target_scope_known,
+            );
         }
     }
 
+    return try finishManagedSyncTargets(
+        alloc,
+        &full_text_indexes,
+        &all_indexes,
+        &target_identities,
+        target_scope_known,
+    );
+}
+
+fn collectManagedSyncTargetsForRecord(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+) !ManagedSyncTargets {
+    const generated_source_advanced = replayRecordHasTargetHint(record, .enrichment);
+    const managed_indexes = try collectManagedIndexCandidates(
+        alloc,
+        index_manager,
+        generated_source_advanced,
+    );
+    defer alloc.free(managed_indexes);
+
+    var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (full_text_indexes.items) |name| alloc.free(@constCast(name));
+        full_text_indexes.deinit(alloc);
+    }
+    var all_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (all_indexes.items) |name| alloc.free(@constCast(name));
+        all_indexes.deinit(alloc);
+    }
+    var target_identities = std.ArrayListUnmanaged(IndexTargetVisibility).empty;
+    errdefer {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+    }
+
+    var target_scope_known = true;
+    for (managed_indexes) |candidate| {
+        const applicability = managedIndexRecordApplicability(index_manager, record, candidate.ref);
+        switch (applicability) {
+            .irrelevant, .missing_dependency => {},
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &all_indexes, candidate.ref.name);
+                if (candidate.ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, candidate.ref.name);
+            },
+        }
+        if (applicability != .irrelevant or
+            (generated_source_advanced and candidate.consumes_generated_enrichment))
+        {
+            try appendManagedTargetIdentity(
+                alloc,
+                &target_identities,
+                candidate.config,
+                &target_scope_known,
+            );
+        }
+    }
+
+    return try finishManagedSyncTargets(
+        alloc,
+        &full_text_indexes,
+        &all_indexes,
+        &target_identities,
+        target_scope_known,
+    );
+}
+
+fn finishManagedSyncTargets(
+    alloc: Allocator,
+    full_text_indexes: *std.ArrayListUnmanaged([]const u8),
+    all_indexes: *std.ArrayListUnmanaged([]const u8),
+    target_identities: *std.ArrayListUnmanaged(IndexTargetVisibility),
+    target_scope_known: bool,
+) !ManagedSyncTargets {
+    const owned_full_text = try full_text_indexes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_full_text) |name| alloc.free(@constCast(name));
+        if (owned_full_text.len > 0) alloc.free(owned_full_text);
+    }
+    const owned_all = try all_indexes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_all) |name| alloc.free(@constCast(name));
+        if (owned_all.len > 0) alloc.free(owned_all);
+    }
+    var identities: []IndexTargetVisibility = &.{};
+    if (target_scope_known) {
+        identities = try target_identities.toOwnedSlice(alloc);
+    } else {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+        target_identities.* = .empty;
+    }
+
     return .{
-        .full_text_indexes = try full_text_indexes.toOwnedSlice(alloc),
-        .all_indexes = try all_indexes.toOwnedSlice(alloc),
+        .full_text_indexes = owned_full_text,
+        .all_indexes = owned_all,
+        .target_identities = identities,
+        .target_scope_known = target_scope_known,
     };
 }
 
-fn appendUniqueOwnedName(
+fn appendManagedTargetIdentity(
+    alloc: Allocator,
+    identities: *std.ArrayListUnmanaged(IndexTargetVisibility),
+    cfg: *const types.IndexConfig,
+    scope_known: *bool,
+) !void {
+    if (!scope_known.*) return;
+    const fingerprint = cfg.coverage_config_fingerprint orelse {
+        scope_known.* = false;
+        return;
+    };
+    const owned_name = try alloc.dupe(u8, cfg.name);
+    errdefer alloc.free(owned_name);
+    try identities.append(alloc, .{
+        .index_name = owned_name,
+        .kind = cfg.kind,
+        .incarnation = internal_keys.derivedCoverageGenerationForConfig(
+            cfg.coverage_generation,
+            cfg.config_json,
+        ),
+        .config_hash = fingerprint,
+    });
+}
+
+fn replayRecordHasTargetHint(
+    record: change_journal_mod.Record,
+    hint: change_journal_mod.TargetHint,
+) bool {
+    for (record.target_hints) |candidate| {
+        if (candidate == hint) return true;
+    }
+    return false;
+}
+
+fn batchContainsSourceUpsert(batch: derived_types.DerivedBatch) bool {
+    for (batch.documents) |doc| {
+        if (doc.action == .upsert) return true;
+    }
+    return false;
+}
+
+fn appendOwnedManagedIndexName(
     alloc: Allocator,
     items: *std.ArrayListUnmanaged([]const u8),
     value: []const u8,
 ) !void {
-    for (items.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
-    try items.append(alloc, try alloc.dupe(u8, value));
+    // IndexManager.managedIndexes() returns one entry per index name, so each
+    // filtered projection is already unique. Preserve that invariant here
+    // instead of turning target discovery into an O(indexes^2) duplicate scan.
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try items.append(alloc, owned);
 }
 
 fn waitForManagedIndexesApplied(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -59827,16 +60185,36 @@ test "db source commit publishes exact target observation sequence" {
         .executor = .{ .backend = .manual },
     });
     defer db.close();
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
 
     const HookCtx = struct {
         target_calls: u64 = 0,
         target_sequence: u64 = 0,
+        target_scope_known: bool = false,
+        target_count: usize = 0,
+        target_kind: ?types.IndexKind = null,
+        target_incarnation: u64 = 0,
+        target_config_hash: u64 = 0,
+        target_name_matches: bool = false,
 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.change != .target_advanced) return;
             self.target_calls += 1;
             self.target_sequence = event.target_sequence orelse 0;
+            self.target_scope_known = event.target_scope_known;
+            self.target_count = event.target_indexes.len;
+            if (event.target_indexes.len == 1) {
+                const target = event.target_indexes[0];
+                self.target_kind = target.kind;
+                self.target_incarnation = target.incarnation;
+                self.target_config_hash = target.config_hash;
+                self.target_name_matches = std.mem.eql(u8, target.index_name, "full_text_index_v0");
+            }
         }
     };
     var hook_ctx = HookCtx{};
@@ -59856,6 +60234,117 @@ test "db source commit publishes exact target observation sequence" {
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.target_calls);
     try std.testing.expectEqual(db.core.nextDerivedSequence(), hook_ctx.target_sequence);
     try std.testing.expect(hook_ctx.target_sequence > 0);
+    try std.testing.expect(hook_ctx.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), hook_ctx.target_count);
+    try std.testing.expectEqual(types.IndexKind.full_text, hook_ctx.target_kind.?);
+    try std.testing.expect(hook_ctx.target_name_matches);
+    try std.testing.expect(hook_ctx.target_incarnation > 0);
+    try std.testing.expect(hook_ctx.target_config_hash > 0);
+}
+
+test "db generated downstream indexes are exact convergence targets at source commit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    var replay_targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.enrichment},
+    });
+    defer replay_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), replay_targets.all_indexes.len);
+    try std.testing.expect(replay_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
+
+    var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .documents = &.{.{ .key = "doc:a", .cleaned_value = "{}" }},
+    });
+    defer materialized_targets.deinit(alloc);
+    // Whole-document dense generation can be applied directly by the
+    // materialized path; graph production remains asynchronous. Both still
+    // belong to the commit-time visibility target set.
+    try std.testing.expectEqual(@as(usize, 1), materialized_targets.all_indexes.len);
+    try std.testing.expectEqualStrings("semantic", materialized_targets.all_indexes[0]);
+    try std.testing.expect(materialized_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), materialized_targets.target_identities.len);
+
+    const HookCtx = struct {
+        calls: usize = 0,
+        target_scope_known: bool = false,
+        target_count: usize = 0,
+        saw_dense: bool = false,
+        saw_graph: bool = false,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.calls += 1;
+            self.target_scope_known = event.target_scope_known;
+            self.target_count = event.target_indexes.len;
+            for (event.target_indexes) |target| {
+                if (std.mem.eql(u8, target.index_name, "semantic")) {
+                    self.saw_dense = target.kind == .dense_vector and
+                        target.incarnation != 0 and target.config_hash != 0;
+                }
+                if (std.mem.eql(u8, target.index_name, "relations_graph")) {
+                    self.saw_graph = target.kind == .graph and
+                        target.incarnation != 0 and target.config_hash != 0;
+                }
+            }
+        }
+    };
+    var hook_ctx = HookCtx{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = HookCtx.onChange,
+    });
+
+    // Both indexes are complete for the empty source before this write. The
+    // source commit must fence their exact convergence identities immediately;
+    // waiting for the later generated artifact commit leaves a false-complete
+    // window for status and backup consumers.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha\",\"relations\":[]}",
+        }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), hook_ctx.calls);
+    try std.testing.expect(hook_ctx.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), hook_ctx.target_count);
+    try std.testing.expect(hook_ctx.saw_dense);
+    try std.testing.expect(hook_ctx.saw_graph);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -72945,6 +73434,44 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
 
     try std.testing.expectEqual(@as(usize, 1), sync_targets.all_indexes.len);
     try std.testing.expectEqualStrings("gr_v1", sync_targets.all_indexes[0]);
+    try std.testing.expect(sync_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), sync_targets.target_identities.len);
+    try std.testing.expectEqualStrings("gr_v1", sync_targets.target_identities[0].index_name);
+    try std.testing.expectEqual(types.IndexKind.graph, sync_targets.target_identities[0].kind);
+    try std.testing.expect(sync_targets.target_identities[0].incarnation > 0);
+    try std.testing.expect(sync_targets.target_identities[0].config_hash > 0);
+}
+
+test "visibility targets include graph replay blocked by a missing dependency" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "missing_resolver");
+    defer alloc.free(resolution_key);
+    var targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    });
+    defer targets.deinit(alloc);
+
+    // Missing dependencies are not foreground sync targets, but the graph's
+    // replay target still advanced and completion must be fenced exactly.
+    try std.testing.expectEqual(@as(usize, 0), targets.all_indexes.len);
+    try std.testing.expect(targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), targets.target_identities.len);
+    try std.testing.expectEqualStrings("gr_v1", targets.target_identities[0].index_name);
+    try std.testing.expectEqual(types.IndexKind.graph, targets.target_identities[0].kind);
 }
 
 test "db full_index supports dense parent search for template chunked embeddings" {
@@ -81276,6 +81803,8 @@ test "db encodeThinReplayRecordPayload preserves async write replay contract" {
         &.{true},
         42,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81322,6 +81851,8 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
         &.{true},
         43,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81356,6 +81887,8 @@ test "db thin replay marks artifact-derived target hints" {
         &.{},
         44,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81384,6 +81917,8 @@ test "db thin replay marks document deletes for managed index replay" {
         &.{},
         45,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81416,6 +81951,8 @@ test "db thin replay marks artifact deletes for managed index replay" {
         &.{},
         46,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81454,6 +81991,8 @@ test "db encodeThinReplayRecordPayload marks generated enrichment replay for asy
         &.{true},
         7,
         true,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81486,6 +82025,8 @@ test "db thin replay omits derived work for an unchanged source write" {
         &.{false},
         8,
         true,
+        null,
+        null,
     );
     defer alloc.free(payload);
 

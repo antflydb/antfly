@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
@@ -1853,6 +1854,45 @@ pub const CommittedKeySignal = struct {
     key: []const u8,
 };
 
+/// Stable ownership token for one atomically registered projection/key
+/// listener pair. The token is process-local and deliberately opaque to
+/// callers; teardown uses it to detach exactly the pair it owns while the
+/// apply store is still alive.
+pub const LifecycleListenerRegistration = struct {
+    id: u64,
+};
+
+const RegisteredProjectionListener = struct {
+    registration_id: ?u64 = null,
+    listener: ProjectionListener,
+};
+
+const RegisteredCommittedKeyListener = struct {
+    registration_id: ?u64 = null,
+    listener: CommittedKeyListener,
+};
+
+const TestLifecycleDetachLockBarrier = struct {
+    entered: *std.Io.Event,
+    resume_event: *std.Io.Event,
+    contended: *std.atomic.Value(bool),
+};
+
+var test_lifecycle_detach_lock_barrier: ?TestLifecycleDetachLockBarrier = null;
+
+fn lockLifecycleDetachApplyMutex(mutex: *std.Io.Mutex, io: std.Io) void {
+    if (comptime builtin.is_test) {
+        if (test_lifecycle_detach_lock_barrier) |barrier| {
+            const acquired = mutex.tryLock();
+            barrier.contended.store(!acquired, .release);
+            barrier.entered.set(std.Options.debug_io);
+            barrier.resume_event.waitUncancelable(std.Options.debug_io);
+            if (acquired) return;
+        }
+    }
+    mutex.lockUncancelable(io);
+}
+
 pub const CommittedKeyListener = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -2001,8 +2041,9 @@ pub const RaftApplyStore = struct {
     batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
     projected_placement_intents: std.ArrayListUnmanaged(ProjectedPlacementIntent) = .empty,
     loaded_placement_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    projection_listeners: std.ArrayListUnmanaged(ProjectionListener) = .empty,
-    committed_key_listeners: std.ArrayListUnmanaged(CommittedKeyListener) = .empty,
+    projection_listeners: std.ArrayListUnmanaged(RegisteredProjectionListener) = .empty,
+    committed_key_listeners: std.ArrayListUnmanaged(RegisteredCommittedKeyListener) = .empty,
+    next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     active_outcome: ?*CommittedApplyOutcome = null,
 
@@ -2101,21 +2142,21 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.projection_listeners.append(self.alloc, listener);
+        try self.projection_listeners.append(self.alloc, .{ .listener = listener });
     }
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.committed_key_listeners.append(self.alloc, listener);
+        try self.committed_key_listeners.append(self.alloc, .{ .listener = listener });
     }
 
     pub fn addLifecycleListeners(
         self: *RaftApplyStore,
         projection_listener: ProjectionListener,
         committed_key_listener: CommittedKeyListener,
-    ) !void {
+    ) !LifecycleListenerRegistration {
         try projection_listener.validate();
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -2123,8 +2164,60 @@ pub const RaftApplyStore = struct {
 
         try self.projection_listeners.ensureUnusedCapacity(self.alloc, 1);
         try self.committed_key_listeners.ensureUnusedCapacity(self.alloc, 1);
-        self.projection_listeners.appendAssumeCapacity(projection_listener);
-        self.committed_key_listeners.appendAssumeCapacity(committed_key_listener);
+        const id = self.next_lifecycle_listener_registration_id;
+        if (id == 0 or id == std.math.maxInt(u64))
+            return error.LifecycleListenerRegistrationExhausted;
+        self.next_lifecycle_listener_registration_id = id + 1;
+        self.projection_listeners.appendAssumeCapacity(.{
+            .registration_id = id,
+            .listener = projection_listener,
+        });
+        self.committed_key_listeners.appendAssumeCapacity(.{
+            .registration_id = id,
+            .listener = committed_key_listener,
+        });
+        return .{ .id = id };
+    }
+
+    /// Atomically closes callback admission for one lifecycle listener pair.
+    /// `apply_mutex` also covers synchronous callback dispatch, so returning
+    /// proves that an already-admitted callback has drained. Removal is rare
+    /// teardown work; ordered removal preserves commit-barrier nesting order.
+    pub fn removeLifecycleListeners(
+        self: *RaftApplyStore,
+        registration: LifecycleListenerRegistration,
+    ) bool {
+        const io = self.io_impl.io();
+        // The test path reports actual lock contention before falling back to
+        // the same blocking acquisition used in production. This proves that
+        // detach drains an in-flight callback rather than merely racing it.
+        lockLifecycleDetachApplyMutex(&self.apply_mutex, io);
+        defer self.apply_mutex.unlock(io);
+
+        var projection_index: ?usize = null;
+        for (self.projection_listeners.items, 0..) |registered, index| {
+            if (registered.registration_id == registration.id) {
+                projection_index = index;
+                break;
+            }
+        }
+        var committed_key_index: ?usize = null;
+        for (self.committed_key_listeners.items, 0..) |registered, index| {
+            if (registered.registration_id == registration.id) {
+                committed_key_index = index;
+                break;
+            }
+        }
+        if (projection_index == null or committed_key_index == null) {
+            // Registration and removal are atomic pairs. A half-present pair
+            // is an internal ownership violation, not a state to repair by
+            // silently removing the remaining callback.
+            std.debug.assert(projection_index == null and committed_key_index == null);
+            return false;
+        }
+        _ = self.projection_listeners.orderedRemove(projection_index.?);
+        _ = self.committed_key_listeners.orderedRemove(committed_key_index.?);
+        return true;
     }
 
     pub fn getMetadataIncarnation(
@@ -6491,7 +6584,7 @@ pub const RaftApplyStore = struct {
             outcome.appendProjection(signal) catch |err| outcome.recordFailure(err);
             return;
         }
-        for (self.projection_listeners.items) |listener| listener.onProjectionSignal(signal);
+        for (self.projection_listeners.items) |registered| registered.listener.onProjectionSignal(signal);
     }
 
     fn notifyCommittedKeyListeners(self: *RaftApplyStore, signal: CommittedKeySignal) void {
@@ -6499,7 +6592,7 @@ pub const RaftApplyStore = struct {
             outcome.appendCommittedKey(signal) catch |err| outcome.recordFailure(err);
             return;
         }
-        for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+        for (self.committed_key_listeners.items) |registered| registered.listener.onCommittedKey(signal);
     }
 
     fn notifyCommittedTransition(self: *RaftApplyStore, delta: CommittedTransitionDelta) void {
@@ -6514,14 +6607,14 @@ pub const RaftApplyStore = struct {
     fn dispatchCommittedOutcome(self: *RaftApplyStore, outcome: *const CommittedApplyOutcome) void {
         std.debug.assert(outcome.failure == null);
         for (outcome.projection_signals.items) |owned| {
-            for (self.projection_listeners.items) |listener| listener.onProjectionSignal(owned.signal);
+            for (self.projection_listeners.items) |registered| registered.listener.onProjectionSignal(owned.signal);
         }
         for (outcome.committed_keys.items) |owned| {
             const signal = CommittedKeySignal{
                 .metadata_group_id = owned.metadata_group_id,
                 .key = owned.key,
             };
-            for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+            for (self.committed_key_listeners.items) |registered| registered.listener.onCommittedKey(signal);
         }
     }
 
@@ -6536,7 +6629,8 @@ pub const RaftApplyStore = struct {
         self: *RaftApplyStore,
         outcome: *const CommittedApplyOutcome,
     ) void {
-        for (self.projection_listeners.items) |listener| {
+        for (self.projection_listeners.items) |registered| {
+            const listener = registered.listener;
             const kind = listener.commit_barrier_kind orelse continue;
             if (!outcomeContainsProjectionKind(outcome, kind)) continue;
             listener.beginCommitBarrier();
@@ -6552,7 +6646,7 @@ pub const RaftApplyStore = struct {
         var index = self.projection_listeners.items.len;
         while (index > 0) {
             index -= 1;
-            const listener = self.projection_listeners.items[index];
+            const listener = self.projection_listeners.items[index].listener;
             const kind = listener.commit_barrier_kind orelse continue;
             if (!outcomeContainsProjectionKind(outcome, kind)) continue;
             listener.endCommitBarrier();
@@ -12656,6 +12750,137 @@ test "metadata raft apply store notifies projection listeners for committed tabl
     try std.testing.expectEqual(@as(u64, 1001), capture.last_range_group_id);
 }
 
+test "lifecycle listener detach drains callbacks and preserves unrelated listeners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-lifecycle-listener-detach",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        projection_calls: std.atomic.Value(usize) = .init(0),
+        committed_key_calls: std.atomic.Value(usize) = .init(0),
+        block_projection: std.atomic.Value(bool) = .init(false),
+
+        fn onProjection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.projection_calls.fetchAdd(1, .acq_rel);
+            if (!self.block_projection.load(.acquire)) return;
+            self.entered.set(std.Options.debug_io);
+            self.release.waitUncancelable(std.Options.debug_io);
+        }
+
+        fn matchesCommittedKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onCommittedKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.committed_key_calls.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Dispatch = struct {
+        store: *RaftApplyStore,
+
+        fn run(self: *@This()) void {
+            const io = self.store.io_impl.io();
+            self.store.apply_mutex.lockUncancelable(io);
+            defer self.store.apply_mutex.unlock(io);
+            for (self.store.projection_listeners.items) |registered| {
+                registered.listener.onProjectionSignal(.{
+                    .kind = .table,
+                    .metadata_group_id = 1,
+                });
+            }
+        }
+    };
+    const Detach = struct {
+        store: *RaftApplyStore,
+        registration: LifecycleListenerRegistration,
+        started: std.Io.Event = .unset,
+        finished: std.atomic.Value(bool) = .init(false),
+        removed: bool = false,
+
+        fn run(self: *@This()) void {
+            self.started.set(std.Options.debug_io);
+            self.removed = self.store.removeLifecycleListeners(self.registration);
+            self.finished.store(true, .release);
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var unrelated = Capture{};
+    try store.addProjectionListener(.{
+        .ptr = &unrelated,
+        .vtable = &.{ .on_projection_signal = Capture.onProjection },
+    });
+    try store.addCommittedKeyListener(.{
+        .ptr = &unrelated,
+        .vtable = &.{
+            .matches_key = Capture.matchesCommittedKey,
+            .on_committed_key = Capture.onCommittedKey,
+        },
+    });
+
+    var owned = Capture{};
+    owned.block_projection.store(true, .release);
+    const registration = try store.addLifecycleListeners(
+        .{ .ptr = &owned, .vtable = &.{ .on_projection_signal = Capture.onProjection } },
+        .{ .ptr = &owned, .vtable = &.{
+            .matches_key = Capture.matchesCommittedKey,
+            .on_committed_key = Capture.onCommittedKey,
+        } },
+    );
+
+    var dispatch = Dispatch{ .store = &store };
+    var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});
+    owned.entered.waitUncancelable(std.Options.debug_io);
+
+    var detach = Detach{ .store = &store, .registration = registration };
+    var detach_lock_entered: std.Io.Event = .unset;
+    var detach_lock_resume: std.Io.Event = .unset;
+    var detach_lock_contended: std.atomic.Value(bool) = .init(false);
+    test_lifecycle_detach_lock_barrier = .{
+        .entered = &detach_lock_entered,
+        .resume_event = &detach_lock_resume,
+        .contended = &detach_lock_contended,
+    };
+    defer test_lifecycle_detach_lock_barrier = null;
+    var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});
+    detach.started.waitUncancelable(std.Options.debug_io);
+    detach_lock_entered.waitUncancelable(std.Options.debug_io);
+    // The detach call reached the exact apply-lock boundary while the callback
+    // owns that lock. Resume it, then release the callback; it cannot return
+    // until synchronous dispatch has drained.
+    const blocked_at_lock_boundary = !detach.finished.load(.acquire);
+    const apply_lock_was_contended = detach_lock_contended.load(.acquire);
+    detach_lock_resume.set(std.Options.debug_io);
+    owned.release.set(std.Options.debug_io);
+    dispatch_thread.join();
+    detach_thread.join();
+    try std.testing.expect(blocked_at_lock_boundary);
+    try std.testing.expect(apply_lock_was_contended);
+    try std.testing.expect(detach.removed);
+    try std.testing.expect(detach.finished.load(.acquire));
+
+    owned.block_projection.store(false, .release);
+    store.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = 1 });
+    store.notifyCommittedKeyListeners(.{ .metadata_group_id = 1, .key = "table/1" });
+    try std.testing.expectEqual(@as(usize, 1), owned.projection_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owned.committed_key_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), unrelated.projection_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), unrelated.committed_key_calls.load(.acquire));
+    test_lifecycle_detach_lock_barrier = null;
+    try std.testing.expect(!store.removeLifecycleListeners(registration));
+}
+
 test "placement projection commit barrier brackets durability and notification" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12796,7 +13021,7 @@ test "atomic table topology lifecycle notifications stay constant at the initial
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
     var capture = Capture{};
-    try store.addLifecycleListeners(
+    _ = try store.addLifecycleListeners(
         .{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } },
         .{ .ptr = &capture, .vtable = &.{
             .matches_key = Capture.matchesCommittedKey,

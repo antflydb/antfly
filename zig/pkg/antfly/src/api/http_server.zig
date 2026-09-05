@@ -1278,6 +1278,7 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1295,6 +1296,7 @@ pub const StatusSource = struct {
         mutate_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
+        drop_index_stamped: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!metadata_api.CatalogMutationStamp = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
         delete_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) anyerror!void = null,
         wait_table_lifecycle: ?*const fn (ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) anyerror!void = null,
@@ -1386,6 +1388,18 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
     }
 
+    pub fn replaceTableDefinitionStamped(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+        if (self.vtable.replace_table_definition_stamped) |fn_ptr| {
+            if (try BoundaryAbi.call("replace_table_definition_stamped", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement })) |stamp|
+                return stamp;
+        }
+        // A null optional is a pre-admission capability miss, never a missing
+        // receipt after commit. Preserve the mutation through the v0.2 path;
+        // downstream activation then deliberately uses generic convergence.
+        try self.replaceTableDefinition(expected, replacement);
+        return null;
+    }
+
     pub fn restoreTable(
         self: StatusSource,
         alloc: std.mem.Allocator,
@@ -1473,6 +1487,13 @@ pub const StatusSource = struct {
     pub fn dropIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
+    }
+
+    pub fn dropIndexStamped(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !?metadata_api.CatalogMutationStamp {
+        if (self.vtable.drop_index_stamped) |fn_ptr|
+            return try BoundaryAbi.call("drop_index_stamped", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
+        try self.dropIndex(alloc, table_name, index_name);
+        return null;
     }
 
     pub fn putArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -1609,6 +1630,10 @@ pub const StatusSource = struct {
                 return try replaceTableDefinitionOnService(cast(ptr), expected, replacement);
             }
 
+            fn replaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp {
+                return try replaceTableDefinitionOnServiceStamped(cast(ptr), expected, replacement);
+            }
+
             fn restoreTable(
                 ptr: *anyopaque,
                 alloc: std.mem.Allocator,
@@ -1652,6 +1677,10 @@ pub const StatusSource = struct {
 
             fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void {
                 return try dropIndexOnService(cast(ptr), alloc, table_name, index_name);
+            }
+
+            fn dropIndexStamped(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!metadata_api.CatalogMutationStamp {
+                return try dropIndexOnServiceStamped(cast(ptr), alloc, table_name, index_name);
             }
 
             fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void {
@@ -1738,6 +1767,7 @@ pub const StatusSource = struct {
             .free_routing_snapshot = Gen.freeRoutingSnapshot,
             .create_table = Gen.createTable,
             .replace_table_definition = Gen.replaceTableDefinition,
+            .replace_table_definition_stamped = Gen.replaceTableDefinitionStamped,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
             .drop_table_exact = Gen.dropTableExact,
@@ -1747,6 +1777,7 @@ pub const StatusSource = struct {
             .mutate_schema = Gen.mutateSchema,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
+            .drop_index_stamped = Gen.dropIndexStamped,
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
             .delete_artifact_enrichment = Gen.deleteArtifactEnrichment,
             .wait_table_lifecycle = Gen.waitTableLifecycle,
@@ -2202,6 +2233,16 @@ fn replaceTableDefinitionOnService(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
+    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    try svc.replaceTableDefinition(expected, replacement);
+    try runPostMutationRound(svc);
+}
+
+fn validateTableDefinitionReplacementOnService(
+    svc: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !void {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
@@ -2214,9 +2255,17 @@ fn replaceTableDefinitionOnService(
         expected,
         replacement,
     )) return error.ExtensionOwnedObject;
+}
 
-    try svc.replaceTableDefinition(expected, replacement);
+fn replaceTableDefinitionOnServiceStamped(
+    svc: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !metadata_api.CatalogMutationStamp {
+    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    const stamp = try svc.replaceTableDefinitionStamped(expected, replacement);
     try runPostMutationRound(svc);
+    return stamp;
 }
 
 fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -2285,6 +2334,10 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
 }
 
 fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+    _ = try dropIndexOnServiceStamped(svc, alloc, table_name, index_name);
+}
+
+fn dropIndexOnServiceStamped(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !metadata_api.CatalogMutationStamp {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -2296,8 +2349,9 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
-    try svc.replaceTableDefinition(table.*, updated_record);
+    const stamp = try svc.replaceTableDefinitionStamped(table.*, updated_record);
     try runPostMutationRound(svc);
+    return stamp;
 }
 
 fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -2989,10 +3043,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
-        if (cfg.backend_runtime) |runtime| {
-            if (runtime.apiIoImpl()) |io_impl| return io_impl.io();
-        }
-        return std.Io.Threaded.global_single_threaded.io();
+        const fallback = std.Io.Threaded.global_single_threaded.io();
+        const runtime = cfg.backend_runtime orelse return fallback;
+        return runtime.apiIo() orelse fallback;
     }
 
     fn protocolStoreNowNs() u64 {
@@ -3482,10 +3535,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
-            .io = if (self.cfg.backend_runtime) |runtime|
-                if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
-            else
-                null,
+            .io = if (self.cfg.backend_runtime) |runtime| runtime.apiIo() else null,
         }, &self.connections_cache, .{
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
@@ -3554,8 +3604,7 @@ pub const ApiHttpServer = struct {
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
         const runtime = self.cfg.backend_runtime orelse return null;
-        const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return null;
-        return io_impl.io();
+        return runtime.apiIo();
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -12535,8 +12584,7 @@ pub const ApiHttpServer = struct {
         // generation it inspected. Inline enrichments can depend on producers
         // even when this index is not itself an artifact consumer, so every
         // create-index mutation uses whole-definition compare-and-swap.
-        const mutation_result = self.source.replaceTableDefinition(table_before, replacement);
-        mutation_result catch |err| switch (err) {
+        const mutation_stamp = self.source.replaceTableDefinitionStamped(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -12555,6 +12603,19 @@ pub const ApiHttpServer = struct {
             },
         };
         if (self.table_writes) |table_writes_source| {
+            const committed_activation_accepted = if (mutation_stamp) |stamp|
+                (table_writes_source.acceptCommittedIndexMutation(
+                    alloc,
+                    table_name,
+                    index_name,
+                    stored_index_json,
+                    stamp,
+                ) catch |err| accepted: {
+                    std.log.warn("public create index committed; exact activation admission deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :accepted null;
+                }) != null
+            else
+                false;
             // A prior operation for this key may still be retrying even when
             // this operation needs no new fallback job. Supersede that stale
             // generation before applying the new local state.
@@ -12577,21 +12638,27 @@ pub const ApiHttpServer = struct {
             // sources acknowledge the durable target-fenced activation job and
             // let their dedicated control-plane executor converge it. The HTTP
             // request must never join an in-flight native inference kernel.
-            var local_installation_complete = false;
-            if (projection_ready) {
-                const installed = install: {
-                    if (superseded_existing_installation) platform_sync.lockYielding(&self.index_installation_apply_mutex);
-                    defer if (superseded_existing_installation) self.index_installation_apply_mutex.unlock();
-                    break :install table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
-                        // Consensus already committed the resource. Local
-                        // resource pressure and partial O(groups) installation
-                        // are readiness conditions, not create failures.
-                        std.log.warn("public create index committed; local installation deferred to reconciliation table={s} index={s} err={}", .{ table_name, index_name, err });
-                        break :install null;
-                    };
+            // Always deliver the exact committed definition, even while the
+            // local catalog projection lags. Hosted owners journal that exact
+            // incarnation before consulting projection; collapsing this edge
+            // into a generic `(table,index)` reconcile can lose a rapid
+            // delete/recreate behind an active predecessor. Embedded owners
+            // may reject the early offer and use the fallback below once their
+            // projection catches up.
+            const installed = install: {
+                if (committed_activation_accepted) break :install {};
+                if (superseded_existing_installation) platform_sync.lockYielding(&self.index_installation_apply_mutex);
+                defer if (superseded_existing_installation) self.index_installation_apply_mutex.unlock();
+                break :install table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| {
+                    // Consensus already committed the resource. Local resource
+                    // pressure, projection lag, and partial O(groups)
+                    // installation are readiness conditions, not create
+                    // failures.
+                    std.log.warn("public create index committed; local installation deferred to reconciliation table={s} index={s} projection_ready={} err={}", .{ table_name, index_name, projection_ready, err });
+                    break :install null;
                 };
-                local_installation_complete = installed != null;
-            }
+            };
+            const local_installation_complete = installed != null;
             // A successful create callback is already the activation owner's
             // acknowledgement: embedded sources installed synchronously and
             // provisioned sources durably queued their target. Enqueuing the
@@ -12650,7 +12717,7 @@ pub const ApiHttpServer = struct {
             null;
         defer if (prepared_installation) |*prepared| prepared.deinit(self);
         try ensureTableOperationActive(request);
-        self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
+        const mutation_stamp = self.source.dropIndexStamped(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
             error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
@@ -12671,6 +12738,20 @@ pub const ApiHttpServer = struct {
             },
         };
         if (self.table_writes) |table_writes_source| {
+            const committed_activation_accepted = if (mutation_stamp) |stamp|
+                (table_writes_source.acceptCommittedIndexMutation(
+                    alloc,
+                    table_name,
+                    index_name,
+                    null,
+                    stamp,
+                ) catch |err| accepted: {
+                    std.log.warn("public delete index committed; exact activation admission deferred table={s} index={s} err={}", .{ table_name, index_name, err });
+                    break :accepted null;
+                }) != null
+            else
+                false;
+            if (committed_activation_accepted) return;
             // Fence an older create immediately after the catalog commit. A
             // lagging projection is reconciler input, never an HTTP response
             // dependency after the commit boundary.
@@ -15160,10 +15241,10 @@ pub const ApiHttpServer = struct {
         fn run(ptr: *anyopaque) !void {
             const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
             const runtime = self.server.cfg.backend_runtime orelse return;
-            const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return;
+            const api_io = runtime.apiIo() orelse return;
             var elapsed_ns: u64 = 0;
             while (!self.stop.load(.acquire)) {
-                io_impl.io().sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
+                api_io.sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
                 if (self.stop.load(.acquire)) break;
                 elapsed_ns +|= poll_ns;
                 if (elapsed_ns < interval_ns) continue;
@@ -15221,7 +15302,7 @@ pub const ApiHttpServer = struct {
     fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
         const runtime = self.cfg.backend_runtime orelse return null;
         if (runtime.threaded_jobs == null) return null;
-        if (runtime.apiIoImpl() == null and runtime.io_impl == null) return null;
+        if (runtime.apiIo() == null) return null;
         if (self.repair_job_owner_id == 0) return null;
 
         const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
@@ -16866,6 +16947,8 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
             .indexes_json = "{}",
             .placement_role = "data",
         },
+        replacement_calls: usize = 0,
+        round_calls: usize = 0,
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
@@ -16880,11 +16963,14 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         }
 
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
-        fn replaceTableDefinition(_: *@This(), _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !void {
-            return error.UnexpectedCatalogCommit;
+        fn replaceTableDefinition(self: *@This(), expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            if (!metadata_table_manager.tableDefinitionsEqual(self.table, expected))
+                return error.TableGenerationChanged;
+            self.replacement_calls += 1;
+            self.table = replacement;
         }
-        fn runRound(_: *@This()) !void {
-            return error.UnexpectedCatalogCommit;
+        fn runRound(self: *@This()) !void {
+            self.round_calls += 1;
         }
     };
 
@@ -16916,6 +17002,18 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         error.InvalidEmbeddingArtifactProducer,
         replaceTableDefinitionOnService(&service, service.table, replacement),
     );
+    try std.testing.expectEqual(@as(usize, 0), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 0), service.round_calls);
+
+    // The released, receipt-free service capability remains a complete
+    // mutation boundary of its own. It must not need to implement the newer
+    // stamped method, and the post-commit control round runs exactly once.
+    var valid_replacement = service.table;
+    valid_replacement.description = "updated";
+    try replaceTableDefinitionOnService(&service, service.table, valid_replacement);
+    try std.testing.expectEqual(@as(usize, 1), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 1), service.round_calls);
+    try std.testing.expectEqualStrings("updated", service.table.description);
 }
 
 fn borrowedTestRestoreManifest(backup_id: []const u8, table_name: []const u8) backups_api.TableBackupManifest {
@@ -35153,9 +35251,10 @@ test "api http server create index installs exact visible config and defers lagg
     try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
     try std.testing.expectEqual(@as(usize, 2), writes.enqueue_calls);
 
-    // A committed proposal whose read projection is not visible yet returns
-    // immediately and relies on the targeted reconciler. In particular, it
-    // must not install against stale catalog state or poll for 30 seconds.
+    // A committed proposal whose read projection is not visible yet still
+    // delivers its exact committed definition to the local owner before
+    // falling back to generic reconciliation. The callback must not poll for
+    // projection or hold the request on physical installation.
     source.project_create = false;
     writes.enqueue_error = null;
     const lagging_index_body = try test_contract_helpers.encodeCreateIndexRequest(alloc, "lagging_embed_idx");
@@ -35168,7 +35267,7 @@ test "api http server create index installs exact visible config and defers lagg
     });
     defer lagging_projection_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), lagging_projection_resp.status);
-    try std.testing.expectEqual(@as(usize, 5), writes.create_calls);
+    try std.testing.expectEqual(@as(usize, 6), writes.create_calls);
     try std.testing.expectEqual(@as(usize, 3), writes.enqueue_calls);
 
     // Hosted sources historically exposed create_index without either

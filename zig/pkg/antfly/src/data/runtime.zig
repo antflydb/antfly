@@ -5958,10 +5958,7 @@ pub const DataServer = struct {
             .manager = api_server_cfg.user_manager,
             .auth_enabled = api_server_cfg.auth_enabled,
         });
-        const restore_io = if (self.backend_runtime) |runtime|
-            if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
-        else
-            null;
+        const restore_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null;
         _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
         _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
@@ -8113,6 +8110,7 @@ pub const DataServer = struct {
             .vtable = &.{
                 .fetch_median_key = localFetchMedianKey,
                 .schema_index_ready = localSchemaIndexReady,
+                .activate_index = localAcceptIndexTarget,
             },
         };
     }
@@ -10438,6 +10436,18 @@ pub const DataServer = struct {
         return try fallback.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
     }
 
+    fn localAcceptIndexTarget(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        target: antfly.metadata.IndexActivationTarget,
+    ) !antfly.metadata.IndexActivationProgress {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.group_leadership_source) |leadership| {
+            if (!leadership.isLocalLeader(target.group_id)) return error.GroupLeaderUnavailable;
+        }
+        return try self.liveRuntimeWriteSource().acceptIndexActivationTarget(target);
+    }
+
     fn localObserveSplit(ptr: *anyopaque, _: u64, record: antfly.metadata.SplitTransitionRecord) !antfly.metadata.transition_state.SplitObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try record.table_contract.validateForSplit();
@@ -11903,9 +11913,9 @@ pub const DataServer = struct {
         self.reporter_incarnation_mutex.unlock();
 
         const runtime = try self.ensureBackendRuntime();
-        const io_impl = runtime.apiIoImpl() orelse return error.BackendRuntimeUnavailable;
+        const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         var candidate: u64 = 0;
-        while (candidate == 0) try io_impl.io().randomSecure(std.mem.asBytes(&candidate));
+        while (candidate == 0) try api_io.randomSecure(std.mem.asBytes(&candidate));
         lockAtomic(&self.reporter_incarnation_mutex);
         defer self.reporter_incarnation_mutex.unlock();
         if (self.reporter_incarnation == 0) self.reporter_incarnation = candidate;
@@ -17671,6 +17681,7 @@ const RemoteMetadataSource = struct {
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
+                .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
                 .restore_table = remoteRestoreTable,
                 .drop_table = remoteDropTable,
                 .drop_table_exact = remoteDropTableExact,
@@ -18661,12 +18672,44 @@ const RemoteMetadataSource = struct {
             .definition = replacement,
         }, .{});
         defer self.alloc.free(body);
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+            self.invalidateCache();
+        try self.withMetadataMutationApiClient(void, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                _: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) !void {
                 try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
             }
         }.call, .{ .table_name = replacement.name, .body = body });
         self.invalidateCache();
+    }
+
+    fn remoteReplaceTableDefinitionStamped(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !?antfly.metadata_api.CatalogMutationStamp {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .expected = expected,
+            .definition = replacement,
+        }, .{});
+        defer self.alloc.free(body);
+        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+            self.invalidateCache();
+        const stamp = try self.withMetadataMutationApiClient(?antfly.metadata_api.CatalogMutationStamp, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                _: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) !?antfly.metadata_api.CatalogMutationStamp {
+                return try client.tryReplaceTableDefinitionStamped(base_uri, ctx.table_name, ctx.body);
+            }
+        }.call, .{ .table_name = replacement.name, .body = body });
+        self.invalidateCache();
+        return stamp;
     }
 
     fn remoteDropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
