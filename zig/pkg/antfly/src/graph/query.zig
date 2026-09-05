@@ -964,9 +964,17 @@ pub const GraphQueryEngine = struct {
 
         const metric_names = try self.alloc.alloc([]const u8, metric_dependencies.len);
         defer self.alloc.free(metric_names);
-        for (metric_dependencies, 0..) |metric, i| metric_names[i] = metric.read.name;
+        var read_policy_buffer: [graph_metric_dependency_limit]graph_mod.GraphIndex.GraphMetricColumnReadPolicy = undefined;
+        const read_policies = read_policy_buffer[0..metric_dependencies.len];
+        for (metric_dependencies, 0..) |metric, i| {
+            metric_names[i] = metric.read.name;
+            read_policies[i] = .{
+                .require_published = metric.require_published,
+                .require_fresh = metric.read.freshness == .fresh,
+            };
+        }
 
-        var snapshot = try graph_index.graphMetricColumnsSnapshotAlloc(metric_names, node_keys);
+        var snapshot = try graph_index.graphMetricColumnsSnapshotAlloc(metric_names, node_keys, read_policies);
         var transferred_columns: usize = 0;
         defer {
             for (snapshot.statuses) |*status| status.deinit(graph_index.alloc);
@@ -1016,6 +1024,68 @@ pub const GraphQueryEngine = struct {
         return true;
     }
 
+    /// Returns source row indexes after metric filtering, ordering, and the
+    /// optional response limit. Serverless uses this to compact and reuse
+    /// already-fetched columns between its filter/order/projection stages.
+    pub fn selectLoadedMetricCandidateIndexesAlloc(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        score_columns: []const []?f64,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        node_count: usize,
+    ) ![]usize {
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len) return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, 0..) |column, dependency_name, i| {
+            if (column.len != node_count) return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        var filter_index_buffer: [graph_metric_filter_limit]usize = undefined;
+        const filter_metric_indexes = filter_index_buffer[0..query.where_metric.len];
+        for (query.where_metric, 0..) |filter, i| {
+            filter_metric_indexes[i] = metricColumnNameIndex(dependency_names, filter.name) orelse
+                return error.InvalidQueryRequest;
+        }
+        const candidate_indexes = try alloc.alloc(usize, node_count);
+        defer alloc.free(candidate_indexes);
+        var candidate_count: usize = 0;
+        for (0..node_count) |original_index| {
+            if (!metricCandidatePassesFilters(
+                original_index,
+                query.where_metric,
+                filter_metric_indexes,
+                score_columns,
+            )) continue;
+            candidate_indexes[candidate_count] = original_index;
+            candidate_count += 1;
+        }
+        var selected = candidate_indexes[0..candidate_count];
+        const requested_limit: usize = if (apply_result_limit and query.params.max_results != 0)
+            @intCast(query.params.max_results)
+        else
+            selected.len;
+        if (query.order_by.len > 0 and selected.len > 0) {
+            var order_index_buffer: [graph_metric_order_limit]usize = undefined;
+            const order_metric_indexes = order_index_buffer[0..query.order_by.len];
+            for (query.order_by, 0..) |order, i| {
+                order_metric_indexes[i] = metricColumnNameIndex(dependency_names, order.name) orelse
+                    return error.InvalidQueryRequest;
+            }
+            selected = retainOrderedMetricCandidatePrefix(selected, requested_limit, .{
+                .orders = query.order_by,
+                .metric_indexes = order_metric_indexes,
+                .score_columns = score_columns,
+            });
+        } else if (selected.len > requested_limit) {
+            selected = selected[0..requested_limit];
+        }
+        return try alloc.dupe(usize, selected);
+    }
+
     /// Storage-independent graph-metric post-processing. Callers retain score
     /// columns in their native storage representation until this routine has
     /// filtered and selected the externally visible prefix. Metric objects are
@@ -1040,46 +1110,49 @@ pub const GraphQueryEngine = struct {
             }
         }
 
-        var filter_index_buffer: [graph_metric_filter_limit]usize = undefined;
-        const filter_metric_indexes = filter_index_buffer[0..query.where_metric.len];
-        for (query.where_metric, 0..) |filter, i| {
-            filter_metric_indexes[i] = metricColumnNameIndex(dependency_names, filter.name) orelse
+        const selected = try selectLoadedMetricCandidateIndexesAlloc(
+            alloc,
+            dependency_names,
+            score_columns,
+            query,
+            apply_result_limit,
+            nodes.*.len,
+        );
+        defer alloc.free(selected);
+
+        return try applySelectedMetricColumns(
+            alloc,
+            dependency_names,
+            metric_value_names,
+            score_columns,
+            query,
+            selected,
+            nodes,
+        );
+    }
+
+    /// Materializes a selection previously produced by
+    /// `selectLoadedMetricCandidateIndexesAlloc`. Keeping selection separate
+    /// lets staged backends reuse the exact same indexes for node mutation and
+    /// score-column compaction instead of repeating filtering and top-k work.
+    pub fn applySelectedMetricColumns(
+        alloc: Allocator,
+        dependency_names: []const []const u8,
+        metric_value_names: []const []const u8,
+        score_columns: []const []?f64,
+        query: GraphQuery,
+        selected: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        try validateGraphMetricQueryShape(query);
+        if (dependency_names.len != score_columns.len or metric_value_names.len != score_columns.len)
+            return error.InvalidQueryRequest;
+        for (score_columns, dependency_names, metric_value_names, 0..) |column, dependency_name, metric_value_name, i| {
+            if (column.len != nodes.*.len or !std.mem.eql(u8, dependency_name, metric_value_name))
                 return error.InvalidQueryRequest;
-        }
-
-        const candidate_indexes = try alloc.alloc(usize, nodes.*.len);
-        defer alloc.free(candidate_indexes);
-        var candidate_count: usize = 0;
-        for (nodes.*, 0..) |_, original_index| {
-            if (!metricCandidatePassesFilters(
-                original_index,
-                query.where_metric,
-                filter_metric_indexes,
-                score_columns,
-            )) continue;
-            candidate_indexes[candidate_count] = original_index;
-            candidate_count += 1;
-        }
-        var selected = candidate_indexes[0..candidate_count];
-
-        const requested_limit: usize = if (apply_result_limit and query.params.max_results != 0)
-            @intCast(query.params.max_results)
-        else
-            selected.len;
-        if (query.order_by.len > 0 and selected.len > 0) {
-            var order_index_buffer: [graph_metric_order_limit]usize = undefined;
-            const order_metric_indexes = order_index_buffer[0..query.order_by.len];
-            for (query.order_by, 0..) |order, i| {
-                order_metric_indexes[i] = metricColumnNameIndex(dependency_names, order.name) orelse
-                    return error.InvalidQueryRequest;
+            for (dependency_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, dependency_name)) return error.InvalidQueryRequest;
             }
-            selected = retainOrderedMetricCandidatePrefix(selected, requested_limit, .{
-                .orders = query.order_by,
-                .metric_indexes = order_metric_indexes,
-                .score_columns = score_columns,
-            });
-        } else if (selected.len > requested_limit) {
-            selected = selected[0..requested_limit];
         }
 
         var projection_index_buffer: [graph_metric_projection_limit]usize = undefined;
@@ -1089,8 +1162,15 @@ pub const GraphQueryEngine = struct {
                 return error.InvalidQueryRequest;
         }
 
-        const slab_len = std.math.mul(usize, selected.len, query.metrics.len) catch
-            return error.QueryCandidateBudgetExceeded;
+        const selected_mask = try alloc.alloc(bool, nodes.*.len);
+        defer alloc.free(selected_mask);
+        @memset(selected_mask, false);
+        for (selected) |source_index| {
+            if (source_index >= nodes.*.len or selected_mask[source_index]) return error.InvalidQueryRequest;
+            selected_mask[source_index] = true;
+        }
+
+        const slab_len = std.math.mul(usize, selected.len, query.metrics.len) catch return error.QueryCandidateBudgetExceeded;
         const metric_values_slab = if (slab_len == 0)
             @constCast((&[_]GraphMetricValue{})[0..])
         else
@@ -1106,11 +1186,6 @@ pub const GraphQueryEngine = struct {
                 };
             }
         }
-
-        const selected_mask = try alloc.alloc(bool, nodes.*.len);
-        defer alloc.free(selected_mask);
-        @memset(selected_mask, false);
-        for (selected) |source_index| selected_mask[source_index] = true;
 
         const final_nodes = try alloc.alloc(GraphResultNode, selected.len);
         for (selected, 0..) |source_index, out_index| {

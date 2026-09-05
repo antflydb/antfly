@@ -25,6 +25,7 @@ const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const cache_mod = @import("cache.zig");
 const runtime_mod = @import("runtime.zig");
+const operation = @import("../../api/operation.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 
@@ -104,6 +105,16 @@ pub const PointScoresResult = struct {
     }
 };
 
+pub const PointScoreColumnsResult = struct {
+    columns: []PointScoresResult,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.columns) |*column| column.deinit(alloc);
+        alloc.free(self.columns);
+        self.* = undefined;
+    }
+};
+
 const BorrowedScore = struct { node_id: []const u8, value: f64 };
 const RankedScoreBoundaryValidator = struct {
     previous_node_id: [metric_segment.codec.max_score_node_id_bytes]u8 = undefined,
@@ -135,6 +146,11 @@ const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: 
 const max_score_range_requests: usize = 32;
 const max_top_score_range_requests: usize = 64;
 const max_parallel_score_range_requests: usize = 8;
+const max_point_score_columns: usize = 16;
+// A column may itself hold a 16 MiB routing footer and a 32 MiB range batch.
+// Two columns retain useful overlap without allowing nested fan-out to turn a
+// valid request into an avoidable serverless memory spike.
+const max_parallel_point_score_columns: usize = 2;
 /// Bound aggregate live payload memory as well as request count. Coalescing
 /// deliberately makes ranges variable-sized, so a count-only fanout can turn
 /// eight harmless-looking reads into a large transient allocation spike.
@@ -159,6 +175,162 @@ pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_in
     defer loaded.deinit(alloc);
     const value = loaded.scores[0] orelse return null;
     return .{ .node_id = try alloc.dupe(u8, node_id), .value = value };
+}
+
+fn clonePointScoresResultAlloc(alloc: Allocator, source: PointScoresResult) !PointScoresResult {
+    const scores = try alloc.dupe(?f64, source.scores);
+    errdefer alloc.free(scores);
+    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+    errdefer edge_filter.deinit(alloc);
+    return .{
+        .scores = scores,
+        .config_fingerprint = source.config_fingerprint,
+        .converged = source.converged,
+        .iterations_completed = source.iterations_completed,
+        .delta = source.delta,
+        .edge_filter = edge_filter,
+        .metadata_version = source.metadata_version,
+        .published_generation = source.published_generation,
+        .edge_generation = source.edge_generation,
+        .computed_at_ms = source.computed_at_ms,
+    };
+}
+
+fn scoreColumnWorker(
+    child: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    node_ids: []const []const u8,
+    output: *?PointScoresResult,
+    failure: *?anyerror,
+    cancel_siblings: *std.atomic.Value(bool),
+) void {
+    output.* = scoresAlloc(
+        std.heap.smp_allocator,
+        child,
+        graph_index_name,
+        metric_name,
+        node_ids,
+    ) catch |err| {
+        failure.* = err;
+        cancel_siblings.store(true, .release);
+        return;
+    };
+}
+
+const CombinedColumnCancellation = struct {
+    parent: operation.CancellationToken,
+    sibling_failure: *const std.atomic.Value(bool),
+
+    fn token(self: *const @This()) operation.CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = isCancelled,
+        };
+    }
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.parent.isCancelled() or self.sibling_failure.load(.acquire);
+    }
+};
+
+/// Resolves an entire graph-query metric shape with bounded cross-column
+/// parallelism. Each worker owns its transient decode state while all workers
+/// share the pinned manifest, cancellation token, cache, and atomic read
+/// budget. Returned columns preserve `metric_names` order.
+pub fn scoreColumnsAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_names: []const []const u8,
+    node_ids: []const []const u8,
+) !PointScoreColumnsResult {
+    if (metric_names.len > max_point_score_columns) return error.GraphMetricQueryBudgetExceeded;
+    if (metric_names.len == 0) return .{ .columns = try alloc.alloc(PointScoresResult, 0) };
+    // Parse request-owned configuration before forking: QuerySession's lazy
+    // cache is deliberately not synchronized, while the parsed slice is
+    // immutable and safe for child sessions to borrow.
+    _ = try session.graphMetricSpecs();
+
+    const columns = try alloc.alloc(PointScoresResult, metric_names.len);
+    var initialized_columns: usize = 0;
+    errdefer {
+        for (columns[0..initialized_columns]) |*column| column.deinit(alloc);
+        alloc.free(columns);
+    }
+    if (session.io == null) {
+        for (metric_names, 0..) |metric_name, index| {
+            columns[index] = try scoresAlloc(alloc, session, graph_index_name, metric_name, node_ids);
+            initialized_columns += 1;
+        }
+        return .{ .columns = columns };
+    }
+
+    var start: usize = 0;
+    while (start < metric_names.len) {
+        const end = @min(start + max_parallel_point_score_columns, metric_names.len);
+        const count = end - start;
+        var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
+        var child_diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
+        var temporary: [max_parallel_point_score_columns]?PointScoresResult = @splat(null);
+        var failures: [max_parallel_point_score_columns]?anyerror = @splat(null);
+        var sibling_failure = std.atomic.Value(bool).init(false);
+        var combined_cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
+        defer for (temporary[0..count]) |*maybe_column| {
+            if (maybe_column.*) |*column| column.deinit(std.heap.smp_allocator);
+        };
+
+        const io = session.io.?;
+        var group: std.Io.Group = .init;
+        for (metric_names[start..end], 0..) |metric_name, relative_index| {
+            children[relative_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
+            combined_cancellations[relative_index] = .{
+                .parent = session.cancellation,
+                .sibling_failure = &sibling_failure,
+            };
+            children[relative_index].cancellation = combined_cancellations[relative_index].token();
+            if (session.diagnostics != null) children[relative_index].setDiagnostics(&child_diagnostics[relative_index]);
+            group.async(io, scoreColumnWorker, .{
+                &children[relative_index],
+                graph_index_name,
+                metric_name,
+                node_ids,
+                &temporary[relative_index],
+                &failures[relative_index],
+                &sibling_failure,
+            });
+        }
+        const await_result = group.await(io);
+        for (children[0..count]) |*child| child.deinit();
+        try await_result;
+        for (child_diagnostics[0..count]) |diagnostics| {
+            const rejection = diagnostics.graph_metric_rejection orelse continue;
+            session.recordGraphMetricRejection(
+                rejection.graphIndexName(),
+                rejection.metricName(),
+                rejection.materializer_fingerprint,
+            );
+            break;
+        }
+        // A sibling may observe the local cancellation before the originating
+        // failure is joined. Preserve the actionable root cause instead of
+        // returning that derived cancellation based on array order.
+        for (failures[0..count]) |failure| if (failure) |err| {
+            if (err != error.Canceled) return err;
+        };
+        for (failures[0..count]) |failure| if (failure) |err| return err;
+
+        for (temporary[0..count], 0..) |*maybe_column, relative_index| {
+            var source = maybe_column.* orelse return error.InvalidGraphMetricSegment;
+            columns[start + relative_index] = try clonePointScoresResultAlloc(alloc, source);
+            initialized_columns += 1;
+            source.deinit(std.heap.smp_allocator);
+            maybe_column.* = null;
+        }
+        start = end;
+    }
+    return .{ .columns = columns };
 }
 
 /// Resolves many exact node scores with one control/footer read and at most one
@@ -203,6 +375,26 @@ pub fn scoresAlloc(
     if (control.header.materialization_state == .rejected) {
         recordRejectionDiagnostic(session, control.header);
         return error.GraphMetricMaterializationRejected;
+    }
+
+    // Status/control is still authenticated for an empty result set, but no
+    // score can be observed. Avoid fetching a legacy full artifact or a v4+
+    // routing footer (up to 16 MiB) merely to return an empty column.
+    if (node_ids.len == 0) {
+        var edge_filter = try config.edge_filter.cloneAlloc(alloc);
+        errdefer edge_filter.deinit(alloc);
+        return .{
+            .scores = try alloc.alloc(?f64, 0),
+            .config_fingerprint = control.header.config_fingerprint,
+            .converged = control.header.converged,
+            .iterations_completed = control.header.iterations_completed,
+            .delta = control.header.delta,
+            .edge_filter = edge_filter,
+            .metadata_version = control.header.version,
+            .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
+            .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
+            .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+        };
     }
 
     // Version 1-3 artifacts remain readable during rolling upgrades. New
@@ -553,7 +745,9 @@ fn fetchScoreRangeBatchAlloc(
                 &children[index], metric_index, segment_version, entries, range, &payloads[index], &failures[index],
             });
         }
-        try group.await(io);
+        const await_result = group.await(io);
+        for (children[0..ranges.len]) |*child| child.deinit();
+        try await_result;
     } else {
         for (ranges, 0..) |range, index| {
             children[index] = session.forkGraphMetricRead(std.heap.smp_allocator);
@@ -567,8 +761,8 @@ fn fetchScoreRangeBatchAlloc(
                 &failures[index],
             );
         }
+        for (children[0..ranges.len]) |*child| child.deinit();
     }
-    for (children[0..ranges.len]) |*child| child.deinit();
     for (failures[0..ranges.len]) |failure| if (failure) |err| return err;
     return .{ .payloads = payloads };
 }
@@ -955,6 +1149,20 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     return segment;
 }
 
+test "serverless graph metric column reads bound shape and accept empty dependencies" {
+    const alloc = std.testing.allocator;
+    var unused_session: runtime_mod.QuerySession = undefined;
+    var empty = try scoreColumnsAlloc(alloc, &unused_session, "graph_idx", &.{}, &.{});
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.columns.len);
+
+    const too_many: [max_point_score_columns + 1][]const u8 = @splat("rank");
+    try std.testing.expectError(
+        error.GraphMetricQueryBudgetExceeded,
+        scoreColumnsAlloc(alloc, &unused_session, "graph_idx", &too_many, &.{}),
+    );
+}
+
 test "serverless graph metric range planning caps broad point batches" {
     const alloc = std.testing.allocator;
     var entries: [64]metric_segment.codec.RoutingEntry = undefined;
@@ -1117,8 +1325,8 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
         payload: []const u8,
         control_len: usize,
         footer_offset: usize,
-        range_calls: usize = 0,
-        verify_calls: usize = 0,
+        range_calls: std.atomic.Value(usize) = .init(0),
+        verify_calls: std.atomic.Value(usize) = .init(0),
         corrupt_score_reads: bool = false,
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
@@ -1130,7 +1338,7 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
         }
         fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.range_calls += 1;
+            _ = self.range_calls.fetchAdd(1, .monotonic);
             const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
             if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
             const out = try result_alloc.dupe(u8, self.payload[start..][0..len]);
@@ -1144,7 +1352,7 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
         }
         fn verifyContent(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.verify_calls += 1;
+            _ = self.verify_calls.fetchAdd(1, .monotonic);
             return error.UnexpectedFullVerification;
         }
         fn delete(_: *anyopaque, _: []const u8) !void {
@@ -1204,21 +1412,39 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
     const cached_specs_again = try session.graphMetricSpecs();
     try std.testing.expect(cached_specs.ptr == cached_specs_again.ptr);
     const node_ids = [_][]const u8{"node:1024"};
+
+    var empty_points = try scoresAlloc(alloc, &session, "graph_idx", "rank", &.{});
+    defer empty_points.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_points.scores.len);
+    // Only the authenticated control/status probe is required; routing and
+    // score data remain untouched.
+    try std.testing.expectEqual(@as(usize, 1), state.range_calls.load(.monotonic));
+
+    state.range_calls.store(0, .monotonic);
     var result = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, 1024), result.scores[0]);
-    try std.testing.expectEqual(@as(usize, 0), state.verify_calls);
-    try std.testing.expectEqual(@as(usize, 3), state.range_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.verify_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
 
-    state.range_calls = 0;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    session.setIo(io_impl.io());
+    const column_names = [_][]const u8{ "rank", "rank", "rank" };
+    var columns = try scoreColumnsAlloc(alloc, &session, "graph_idx", &column_names, &node_ids);
+    defer columns.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, column_names.len), columns.columns.len);
+    for (columns.columns) |column| try std.testing.expectEqual(@as(?f64, 1024), column.scores[0]);
+
+    state.range_calls.store(0, .monotonic);
     var top = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", metric_segment.score_block_entries + 1, .{ .max_scores_scanned = 0 });
     defer top.deinit(alloc);
     try std.testing.expectEqual(@as(usize, metric_segment.score_block_entries + 1), top.scores.len);
     try std.testing.expectEqualStrings("node:1024", top.scores[0].node_id);
     try std.testing.expectEqual(@as(f64, 1024), top.scores[0].value);
     try std.testing.expectEqualStrings("node:0000", top.scores[top.scores.len - 1].node_id);
-    try std.testing.expectEqual(@as(usize, 3), state.range_calls);
-    try std.testing.expectEqual(@as(usize, 0), state.verify_calls);
+    try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), state.verify_calls.load(.monotonic));
 
     state.corrupt_score_reads = true;
     try std.testing.expectError(error.InvalidGraphMetricSegment, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
@@ -1230,10 +1456,10 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
         metric_segment.score_block_entries + 1,
         .{ .max_scores_scanned = 0 },
     ));
-    try std.testing.expectEqual(@as(usize, 0), state.verify_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.verify_calls.load(.monotonic));
 
     state.corrupt_score_reads = false;
-    state.range_calls = 0;
+    state.range_calls.store(0, .monotonic);
     session.graph_metric_read_budget = .{ .limits = .{
         .max_range_requests = 2,
         .max_range_bytes = std.math.maxInt(u64),
@@ -1248,7 +1474,7 @@ test "serverless graph metric v6 point and top-1025 reads authenticate bounded r
     // Control and routing are fetched; the score range is rejected before it
     // can reach the backend. The counter is shared by every later metric read
     // performed through this pinned request session.
-    try std.testing.expectEqual(@as(usize, 2), state.range_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
 }
 
 test "serverless graph metric ranked blocks reject cross-boundary inversions and duplicates" {
