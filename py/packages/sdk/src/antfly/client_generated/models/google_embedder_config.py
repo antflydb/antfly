@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.google_embedder_config_provider import GoogleEmbedderConfigProvider
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="GoogleEmbedderConfig")
 
@@ -35,6 +39,11 @@ class GoogleEmbedderConfig:
             dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 recommended). Default: 3072.
             api_key (str | Unset): The Google API key. Can also be set via GEMINI_API_KEY environment variable.
             url (str | Unset): The URL of the Google API endpoint (optional, uses default if not specified).
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
     provider: GoogleEmbedderConfigProvider
@@ -44,6 +53,7 @@ class GoogleEmbedderConfig:
     dimension: int | Unset = 3072
     api_key: str | Unset = UNSET
     url: str | Unset = UNSET
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +70,10 @@ class GoogleEmbedderConfig:
         api_key = self.api_key
 
         url = self.url
+
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -79,11 +93,15 @@ class GoogleEmbedderConfig:
             field_dict["api_key"] = api_key
         if url is not UNSET:
             field_dict["url"] = url
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
         provider = GoogleEmbedderConfigProvider(d.pop("provider"))
 
@@ -99,6 +117,13 @@ class GoogleEmbedderConfig:
 
         url = d.pop("url", UNSET)
 
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         google_embedder_config = cls(
             provider=provider,
             model=model,
@@ -107,6 +132,7 @@ class GoogleEmbedderConfig:
             dimension=dimension,
             api_key=api_key,
             url=url,
+            retrieval=retrieval,
         )
 
         google_embedder_config.additional_properties = d

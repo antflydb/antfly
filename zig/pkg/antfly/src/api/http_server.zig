@@ -1176,6 +1176,7 @@ pub const SemanticStatusResolver = struct {
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     query_embedding_cache: ?*query_embedding_cache.QueryEmbeddingCache = null,
     query_embedding_budget: ?*cache_budget.CacheBudget = null,
     query_embedding_security_domain: managed_embedder.QueryCacheSecurityDomain = .internal,
@@ -1213,6 +1214,7 @@ pub const SemanticStatusResolver = struct {
             .inference_api_url = self.inference_api_url,
             .inference_api_key = self.inference_api_key,
             .secret_store = self.secret_store,
+            .provider_runtime = self.provider_runtime,
             .query_embedding_cache = self.query_embedding_cache,
             .query_embedding_budget = self.query_embedding_budget,
             .query_embedding_security_domain = self.query_embedding_security_domain,
@@ -2825,6 +2827,7 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
 
     pub const RequestStats = struct {
@@ -3022,6 +3025,7 @@ pub const ApiHttpServer = struct {
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
+            .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
             }),
@@ -3420,6 +3424,7 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
         self.* = undefined;
@@ -3504,6 +3509,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
+            .provider_runtime = &self.embedding_provider_runtime,
             .query_embedding_cache = &self.query_embedding_cache,
             .query_embedding_budget = self.inferenceCacheBudget(),
             .query_embedding_security_domain = security_domain,
@@ -6360,6 +6366,7 @@ pub const ApiHttpServer = struct {
             .inference_api_url = self.configuredInferenceAPIURL(),
             .inference_api_key = self.cfg.inference_api_key,
             .secret_store = self.cfg.secret_store,
+            .provider_runtime = &self.embedding_provider_runtime,
             .query_embedding_cache = &self.query_embedding_cache,
             .query_embedding_budget = self.inferenceCacheBudget(),
             .query_embedding_security_domain = .internal,

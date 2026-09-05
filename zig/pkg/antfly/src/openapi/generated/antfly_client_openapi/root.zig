@@ -157,6 +157,7 @@ pub const EmbedderProvider = types.EmbedderProvider;
 pub const Embedding = types.Embedding;
 pub const EmbeddingIndexActivity = types.EmbeddingIndexActivity;
 pub const EmbeddingIndexActivityPhase = types.EmbeddingIndexActivityPhase;
+pub const EmbeddingRetrievalConfig = types.EmbeddingRetrievalConfig;
 pub const EmbeddingSourceCoverageStatus = types.EmbeddingSourceCoverageStatus;
 pub const EmbeddingsIndexConfig = types.EmbeddingsIndexConfig;
 pub const EmbeddingsIndexStats = types.EmbeddingsIndexStats;
