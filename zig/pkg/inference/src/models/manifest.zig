@@ -1030,7 +1030,10 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+        // Keep discovery and compatibility admission aligned with the full
+        // loader. An invalid Antfly manifest must never be advertised as a
+        // loadable model and then fail only when a session is created.
+        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
@@ -2171,6 +2174,26 @@ fn dupeJsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][
     return try items.toOwnedSlice(allocator);
 }
 
+fn dupeManifestStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    if (value != .array) return error.InvalidModelManifest;
+
+    var items = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+    try items.ensureTotalCapacity(allocator, value.array.items.len);
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidModelManifest;
+        items.appendAssumeCapacity(try allocator.dupe(u8, item.string));
+    }
+    if (items.items.len == 0) {
+        items.deinit(allocator);
+        return &.{};
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
 fn replaceOwnedStringArray(
     allocator: std.mem.Allocator,
     target: *[][]const u8,
@@ -2197,6 +2220,21 @@ fn parseEmbeddingStyleJson(value: std.json.Value) !EmbeddingStyle {
         if (std.mem.eql(u8, value.string, name)) return @field(EmbeddingStyle, name);
     }
     return error.InvalidEmbeddingTaskProfile;
+}
+
+fn parseManifestModelTypeJson(value: std.json.Value) !ModelType {
+    if (value != .string) return error.InvalidModelManifest;
+    return std.meta.stringToEnum(ModelType, value.string) orelse error.InvalidModelManifest;
+}
+
+fn parseManifestPoolingJson(value: std.json.Value) !PoolingStrategy {
+    if (value != .string) return error.InvalidModelManifest;
+    return std.meta.stringToEnum(PoolingStrategy, value.string) orelse error.InvalidModelManifest;
+}
+
+fn parseManifestSparse3DOutputLayoutJson(value: std.json.Value) !Sparse3DOutputLayout {
+    if (value != .string) return error.InvalidModelManifest;
+    return parseSparse3DOutputLayout(value.string) orelse error.InvalidModelManifest;
 }
 
 fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !void {
@@ -2273,58 +2311,41 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     };
 
     if (obj.get("type")) |v| {
-        if (v == .string) {
-            const s = v.string;
-            inline for (.{ "embedder", "reranker", "chunker", "generator", "recognizer", "rewriter", "classifier", "reader", "transcriber" }) |name| {
-                if (std.mem.eql(u8, s, name)) {
-                    manifest.model_type = @field(ModelType, name);
-                    manifest.model_type_origin = .manifest;
-                }
-            }
-        }
+        manifest.model_type = try parseManifestModelTypeJson(v);
+        manifest.model_type_origin = .manifest;
     }
 
     if (obj.get("tasks")) |v| {
-        const tasks = try dupeJsonStringArray(allocator, v);
-        if (tasks.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.tasks, tasks);
-        }
+        replaceOwnedStringArray(allocator, &manifest.tasks, try dupeManifestStringArray(allocator, v));
     }
 
     // Parse capabilities array
     if (obj.get("capabilities")) |v| {
-        const capabilities = try dupeJsonStringArray(allocator, v);
-        if (capabilities.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.capabilities, capabilities);
-        }
+        replaceOwnedStringArray(allocator, &manifest.capabilities, try dupeManifestStringArray(allocator, v));
     }
 
     if (obj.get("inputs")) |v| {
-        const inputs = try dupeJsonStringArray(allocator, v);
-        if (inputs.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.inputs, inputs);
-        }
+        replaceOwnedStringArray(allocator, &manifest.inputs, try dupeManifestStringArray(allocator, v));
     }
 
     if (obj.get("sparse_3d_output_layout")) |v| {
-        if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+        manifest.sparse_3d_output_layout = try parseManifestSparse3DOutputLayoutJson(v);
+        if (obj.get("sparse_output_layout")) |legacy| {
+            if (try parseManifestSparse3DOutputLayoutJson(legacy) != manifest.sparse_3d_output_layout.?)
+                return error.InvalidModelManifest;
+        }
     } else if (obj.get("sparse_output_layout")) |v| {
-        if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+        manifest.sparse_3d_output_layout = try parseManifestSparse3DOutputLayoutJson(v);
     }
 
     // Embedding-pipeline overrides. These are the escape hatch for bare GGUF
     // bundles (no sentence-transformers sidecars) and operator overrides.
     if (obj.get("pooling")) |v| {
-        if (v == .string) {
-            inline for (.{ "mean", "cls", "max", "last" }) |name| {
-                if (std.mem.eql(u8, v.string, name)) {
-                    manifest.pooling = @field(PoolingStrategy, name);
-                }
-            }
-        }
+        manifest.pooling = try parseManifestPoolingJson(v);
     }
     if (obj.get("normalize")) |v| {
-        if (v == .bool) manifest.normalize = v.bool;
+        if (v != .bool) return error.InvalidModelManifest;
+        manifest.normalize = v.bool;
     }
     if (obj.get("embedding_task_contract")) |v| {
         manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(v);
@@ -3554,6 +3575,42 @@ test "embedding execution-style declarations reject unknown values and types" {
     }
 }
 
+test "model manifest recognized execution fields reject invalid values" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embeder"}
+        ,
+        \\{"type":42}
+        ,
+        \\{"tasks":["embed",42]}
+        ,
+        \\{"capabilities":{}}
+        ,
+        \\{"inputs":true}
+        ,
+        \\{"sparse_3d_output_layout":"batch_sequnce"}
+        ,
+        \\{"sparse_output_layout":false}
+        ,
+        \\{"sparse_3d_output_layout":"batch_seq","sparse_output_layout":"seq_batch"}
+        ,
+        \\{"pooling":"lasst"}
+        ,
+        \\{"pooling":42}
+        ,
+        \\{"normalize":"true"}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidModelManifest,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+}
+
 test "loadFromDir fails closed on invalid explicit embedding metadata" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3565,10 +3622,13 @@ test "loadFromDir fails closed on invalid explicit embedding metadata" {
         ,
         \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
         ,
+        \\{"type":"embedder","pooling":"lasst"}
+        ,
     }, .{
         error.InvalidEmbeddingTaskProfile,
         error.InvalidEmbeddingTaskProfile,
         error.MissingEmbeddingTaskProfile,
+        error.InvalidModelManifest,
     }) |manifest_json, expected_error| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -3585,6 +3645,43 @@ test "loadFromDir fails closed on invalid explicit embedding metadata" {
         defer allocator.free(model_dir);
 
         try std.testing.expectError(expected_error, loadFromDir(allocator, model_dir));
+    }
+}
+
+test "loadListingFromDir fails closed on invalid explicit model manifests" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","pooling":"lasst"}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+        ,
+    }, .{
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidModelManifest,
+        error.MissingEmbeddingTaskProfile,
+    }) |manifest_json, expected_error| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(expected_error, loadListingFromDir(allocator, model_dir));
     }
 }
 
