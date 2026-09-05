@@ -7650,6 +7650,13 @@ pub const ProvisionedTableWriteSource = struct {
         stamp: metadata_api.CatalogMutationStamp,
     };
 
+    const CommittedMutationWatermark = struct {
+        const State = enum { pending_admission, admitted, completed };
+
+        mutation: LatestCommittedIndexMutation,
+        state: State,
+    };
+
     const StructuralReconcileRequest = struct {
         scheduler_key: IndexActivationKey = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
         enqueue_sequence: u64 = 0,
@@ -7668,6 +7675,7 @@ pub const ProvisionedTableWriteSource = struct {
         not_before_ms: u64 = 0,
         preempted_maintenance_group_ids: []u64 = &.{},
         deferred_repair_group_ids: std.ArrayListUnmanaged(u64) = .empty,
+        deferred_repair_group_set: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
@@ -7676,14 +7684,19 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.plan) |*plan| plan.deinit(alloc);
             alloc.free(self.preempted_maintenance_group_ids);
             self.deferred_repair_group_ids.deinit(alloc);
+            self.deferred_repair_group_set.deinit(alloc);
             self.* = undefined;
         }
 
         fn deferRepairDebt(self: *@This(), alloc: std.mem.Allocator, group_id: u64) !void {
-            for (self.deferred_repair_group_ids.items) |deferred_group_id| {
-                if (deferred_group_id == group_id) return;
-            }
-            try self.deferred_repair_group_ids.append(alloc, group_id);
+            if (self.deferred_repair_group_set.contains(group_id)) return;
+            // Reserve both halves before publishing membership. Once a shard
+            // installs its handoff fence, remembering the ordered wake is an
+            // atomic, allocation-free operation.
+            try self.deferred_repair_group_ids.ensureUnusedCapacity(alloc, 1);
+            try self.deferred_repair_group_set.ensureUnusedCapacity(alloc, 1);
+            self.deferred_repair_group_ids.appendAssumeCapacity(group_id);
+            self.deferred_repair_group_set.putAssumeCapacity(group_id, {});
         }
 
         fn publishDeferredRepairDebt(self: *@This(), owner: *ProvisionedTableWriteSource) void {
@@ -7691,6 +7704,7 @@ pub const ProvisionedTableWriteSource = struct {
                 owner.notifyLocalIndexRepairDebt(self.table_name, group_id, .signal_runnable);
             }
             self.deferred_repair_group_ids.clearRetainingCapacity();
+            self.deferred_repair_group_set.clearRetainingCapacity();
         }
 
         fn handoffDeferredRepairDebt(self: *@This(), owner: *ProvisionedTableWriteSource) void {
@@ -7827,6 +7841,7 @@ pub const ProvisionedTableWriteSource = struct {
     const structural_reconcile_retry_max_ms: u64 = 2_000;
     const structural_reconcile_pending_delay_ms: u64 = 100;
     const structural_reconcile_groups_per_quantum: usize = 4;
+    const structural_reconcile_dispatch_workers: u32 = 4;
     const max_structural_reconcile_requests: usize = 4096;
 
     fn structuralReconcileRetryDelayMs(failure_count: u32) u64 {
@@ -7974,20 +7989,31 @@ pub const ProvisionedTableWriteSource = struct {
     restore_repair_completion_scheduled: std.atomic.Value(bool) = .init(false),
     restore_repair_completions: std.ArrayListUnmanaged([]u8) = .empty,
     structural_reconcile_mutex: Io.Mutex = .init,
+    structural_reconcile_ready: Io.Condition = .init,
     structural_reconcile_scheduled: std.atomic.Value(bool) = .init(false),
+    structural_reconcile_worker_count: std.atomic.Value(u32) = .init(0),
     structural_reconcile_retry_scheduled: std.atomic.Value(bool) = .init(false),
     structural_reconcile_tables: StructuralReconcileQueue = .empty,
     structural_reconcile_keys: std.AutoHashMapUnmanaged(
         IndexActivationKey,
         StructuralReconcileOwnership,
     ) = .empty,
-    // Latest consensus-committed identity for each logical `(table,index)`.
-    // Distinct incarnations remain separately queued, while this O(1) owner
-    // pointer lets a superseded request retire instead of polling forever.
+    // Bounded workers may dispatch unrelated groups concurrently, but a
+    // single route has only one in-flight ownership RPC at a time.
+    structural_reconcile_inflight_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    // Latest observed consensus identity for each active logical
+    // `(table,index)`. It advances before fallible queue admission so a
+    // superseded worker retires even while the successor waits for capacity.
     structural_reconcile_latest_committed: std.AutoHashMapUnmanaged(
         IndexActivationKey,
         LatestCommittedIndexMutation,
     ) = .empty,
+    // Raft log position is globally monotonic inside one metadata namespace.
+    // This compact watermark rejects arbitrarily delayed callbacks after their
+    // per-scope ownership has retired, and distinguishes pending admission
+    // from admitted/completed retries without retaining an unbounded tombstone
+    // for every index name ever observed by the process.
+    structural_reconcile_committed_watermark: ?CommittedMutationWatermark = null,
     // Exact resident RPCs remain private until queue admission commits. A
     // duplicate waits on this short allocation/submission window instead of
     // observing `.accepted` for an owner which may still roll back.
@@ -8811,6 +8837,9 @@ pub const ProvisionedTableWriteSource = struct {
                 runtime.durable_jobs.closeOwner(dropped_table_owner_id);
         }
         const io = self.table_activity_threaded.io();
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        self.structural_reconcile_ready.broadcast(io);
+        self.structural_reconcile_mutex.unlock(io);
         self.structural_reconcile_work_group.cancel(io);
         self.restore_repair_work_group.cancel(io);
         self.structural_reconcile_work_group.await(io) catch {};
@@ -17139,8 +17168,11 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_tables = .empty;
         self.structural_reconcile_keys.deinit(alloc);
         self.structural_reconcile_keys = .empty;
+        self.structural_reconcile_inflight_groups.deinit(alloc);
+        self.structural_reconcile_inflight_groups = .empty;
         self.structural_reconcile_latest_committed.deinit(alloc);
         self.structural_reconcile_latest_committed = .empty;
+        self.structural_reconcile_committed_watermark = null;
         self.index_activation_admitting.deinit(alloc);
         self.index_activation_admitting = .empty;
         self.index_activation_progress.deinit(alloc);
@@ -17154,11 +17186,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn enqueueTableStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8) !void {
-        try self.enqueueTableStructuralReconcileTarget(table_name, null, null, null, null, null);
+        _ = try self.enqueueTableStructuralReconcileTarget(table_name, null, null, null, null, null);
     }
 
     fn enqueueTableIndexStructuralReconcile(self: *ProvisionedTableWriteSource, table_name: []const u8, index_name: []const u8) !void {
-        try self.enqueueTableStructuralReconcileTarget(table_name, index_name, null, null, null, null);
+        _ = try self.enqueueTableStructuralReconcileTarget(table_name, index_name, null, null, null, null);
     }
 
     fn enqueueCommittedTableIndexStructuralReconcile(
@@ -17167,8 +17199,8 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
         committed_target: CommittedIndexTarget,
         committed_stamp: metadata_api.CatalogMutationStamp,
-    ) !void {
-        try self.enqueueTableStructuralReconcileTarget(
+    ) !bool {
+        return try self.enqueueTableStructuralReconcileTarget(
             table_name,
             index_name,
             null,
@@ -17324,6 +17356,26 @@ pub const ProvisionedTableWriteSource = struct {
         const ownership = self.structural_reconcile_keys.get(request.scheduler_key) orelse return;
         std.debug.assert(ownership == .active);
         _ = self.structural_reconcile_keys.remove(request.scheduler_key);
+        if (request.committed_index_scope_key) |scope_key| {
+            if (self.structural_reconcile_latest_committed.get(scope_key)) |latest| {
+                if (std.crypto.timing_safe.eql(IndexActivationKey, latest.scheduler_key, request.scheduler_key) or
+                    // A newer receipt may supersede this worker before its
+                    // own queue admission succeeds. Once the predecessor has
+                    // observed that edge, the global receipt watermark keeps
+                    // every older callback stale, so the temporary per-scope
+                    // pointer can retire instead of becoming a tombstone.
+                    !self.structural_reconcile_keys.contains(latest.scheduler_key))
+                    _ = self.structural_reconcile_latest_committed.remove(scope_key);
+            }
+            if (self.structural_reconcile_committed_watermark) |*watermark| {
+                if (std.crypto.timing_safe.eql(
+                    IndexActivationKey,
+                    watermark.mutation.scheduler_key,
+                    request.scheduler_key,
+                )) watermark.state = .completed;
+            }
+        }
+        self.structural_reconcile_ready.broadcast(io);
     }
 
     pub fn acceptIndexActivationTarget(
@@ -17426,7 +17478,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_mutex.unlock(io);
 
         runTestBeforeIndexActivationEnqueueHook();
-        self.enqueueTableStructuralReconcileTarget(
+        _ = self.enqueueTableStructuralReconcileTarget(
             target.table_name,
             target.index_name,
             target.group_id,
@@ -17474,8 +17526,13 @@ pub const ProvisionedTableWriteSource = struct {
         activation_target: ?metadata_mod.IndexActivationTarget,
         committed_target: ?CommittedIndexTarget,
         committed_stamp: ?metadata_api.CatalogMutationStamp,
-    ) !void {
+    ) !bool {
         if (self.restore_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
+        // Parallel lanes exist only on the hosted, routed index-control owner.
+        // Broad/local structural mutation retains the original single-owner
+        // ordering and can never enter that dispatcher pool.
+        if (self.structural_reconcile_dispatcher != null and index_name == null)
+            return error.InvalidIndexActivationTarget;
         // Enqueue is the publication boundary for an asynchronously activated
         // catalog definition. Install the exact target reservation before any
         // catalog or allocation work: advancing a table epoch first would
@@ -17514,37 +17571,84 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
 
+        var retrying_pending_receipt = false;
         if (committed_scope_key) |scope_key| {
-            if (self.structural_reconcile_latest_committed.get(scope_key)) |latest| {
-                const stamp = committed_stamp.?;
-                // A receipt is ordered only inside its metadata namespace.
-                // The process-lifetime owner never lets an arrival from a
-                // different incarnation replace current authority; startup
-                // constructs a fresh owner for the new namespace.
-                if (!catalogMutationNamespaceEqual(latest.stamp, stamp))
-                    return error.StaleIndexActivationTarget;
+            const stamp = committed_stamp.?;
+            if (self.structural_reconcile_committed_watermark) |watermark| {
+                // Receipt order is meaningful only within the exact metadata
+                // namespace. A mismatched owner or an older callback falls
+                // back to a current-catalog reconcile at the caller.
+                if (!catalogMutationNamespaceEqual(watermark.mutation.stamp, stamp) or stamp.index < watermark.mutation.stamp.index) {
+                    if (targeted_status_reserved) {
+                        self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
+                        targeted_status_reserved = false;
+                    }
+                    return false;
+                }
+                if (stamp.index == watermark.mutation.stamp.index) {
+                    if (stamp.term != watermark.mutation.stamp.term or
+                        !std.crypto.timing_safe.eql(IndexActivationKey, watermark.mutation.scheduler_key, scheduler_key))
+                        return error.ConflictingIndexActivationTarget;
+                    if (watermark.state != .pending_admission) {
+                        // Active ownership is tracked per scope below. Once it
+                        // has retired, the compact completed receipt remains
+                        // authoritative and cannot resurrect structural work.
+                        if (targeted_status_reserved) {
+                            self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
+                            targeted_status_reserved = false;
+                        }
+                        return true;
+                    }
+                    retrying_pending_receipt = true;
+                } else {
+                    // Ordering is admitted before fallible queue allocation.
+                    // If admission fails, this pending watermark still keeps
+                    // an older callback from acquiring exact ownership while
+                    // allowing the same receipt to re-drive the missed job.
+                    self.structural_reconcile_committed_watermark = .{
+                        .mutation = .{ .scheduler_key = scheduler_key, .stamp = stamp },
+                        .state = .pending_admission,
+                    };
+                }
+            } else {
+                self.structural_reconcile_committed_watermark = .{
+                    .mutation = .{ .scheduler_key = scheduler_key, .stamp = stamp },
+                    .state = .pending_admission,
+                };
+            }
+            if (self.structural_reconcile_latest_committed.getPtr(scope_key)) |latest| {
+                if (!catalogMutationNamespaceEqual(latest.stamp, stamp)) {
+                    if (targeted_status_reserved) {
+                        self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
+                        targeted_status_reserved = false;
+                    }
+                    return false;
+                }
                 if (stamp.index < latest.stamp.index) {
                     if (targeted_status_reserved) {
                         self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
                         targeted_status_reserved = false;
                     }
-                    return;
+                    return false;
                 }
                 if (stamp.index == latest.stamp.index) {
                     if (stamp.term != latest.stamp.term or
                         !std.crypto.timing_safe.eql(IndexActivationKey, latest.scheduler_key, scheduler_key))
                         return error.ConflictingIndexActivationTarget;
-                    if (targeted_status_reserved) {
-                        self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
-                        targeted_status_reserved = false;
+                    if (!retrying_pending_receipt) {
+                        if (targeted_status_reserved) {
+                            self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
+                            targeted_status_reserved = false;
+                        }
+                        return true;
                     }
-                    return;
+                } else {
+                    // Supersede an active predecessor before any fallible job
+                    // allocation. The predecessor will observe the new exact
+                    // scope owner and retire even if this admission must be
+                    // retried after capacity becomes available.
+                    latest.* = .{ .scheduler_key = scheduler_key, .stamp = stamp };
                 }
-            } else if (self.structural_reconcile_latest_committed.count() >= max_structural_reconcile_requests) {
-                // Retaining the last receipt is the correctness tombstone for
-                // arbitrarily delayed callbacks. Bound it explicitly rather
-                // than silently evicting authority and resurrecting old work.
-                return error.ResourceBudgetExceeded;
             }
         }
 
@@ -17557,7 +17661,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.releaseTargetedStructuralReconcileStatus(table_name, index_name.?);
                 targeted_status_reserved = false;
             }
-            return;
+            return true;
         }
         if (self.structural_reconcile_keys.count() >= max_structural_reconcile_requests)
             return error.ResourceBudgetExceeded;
@@ -17575,7 +17679,12 @@ pub const ProvisionedTableWriteSource = struct {
         // detection remains expected O(1) and does not scan unrelated work.
         try self.structural_reconcile_tables.ensureUnusedCapacity(alloc, 2);
         try self.structural_reconcile_keys.ensureUnusedCapacity(alloc, 2);
-        if (committed_scope_key != null)
+        try self.structural_reconcile_inflight_groups.ensureTotalCapacity(
+            alloc,
+            structural_reconcile_dispatch_workers,
+        );
+        if (committed_scope_key != null and
+            !self.structural_reconcile_latest_committed.contains(committed_scope_key.?))
             try self.structural_reconcile_latest_committed.ensureUnusedCapacity(alloc, 1);
         self.ensureStructuralReconcileScheduled() catch |err| {
             // Publish queue ownership only after either the worker itself or
@@ -17609,26 +17718,52 @@ pub const ProvisionedTableWriteSource = struct {
                 .scheduler_key = scheduler_key,
                 .stamp = committed_stamp.?,
             });
+        if (committed_stamp != null) {
+            const watermark = &self.structural_reconcile_committed_watermark.?;
+            std.debug.assert(std.crypto.timing_safe.eql(
+                IndexActivationKey,
+                watermark.mutation.scheduler_key,
+                scheduler_key,
+            ));
+            watermark.state = .admitted;
+        }
         if (index_name == null) {
             self.reserveStructuralReconcileStatus(table_name);
         } else {
             targeted_status_reserved = false;
         }
         if (index_name == null) self.reserveStructuralReconcileActivity(table_name);
+        self.structural_reconcile_ready.broadcast(io);
+        return true;
     }
 
     fn ensureStructuralReconcileScheduled(self: *ProvisionedTableWriteSource) !void {
         if (!self.isOpen()) return error.BackgroundOwnerClosing;
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
-        if (consumeTestStructuralReconcileSubmitFailure()) {
-            self.structural_reconcile_scheduled.store(false, .release);
-            return error.TestStructuralReconcileSubmitFailure;
-        }
         const io = self.table_activity_threaded.io();
-        self.structural_reconcile_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
-            self.structural_reconcile_scheduled.store(false, .release);
-            return err;
-        };
+        const worker_target: u32 = if (self.structural_reconcile_dispatcher != null)
+            structural_reconcile_dispatch_workers
+        else
+            1;
+        var started: u32 = 0;
+        while (started < worker_target) : (started += 1) {
+            if (consumeTestStructuralReconcileSubmitFailure()) {
+                if (started == 0) {
+                    self.structural_reconcile_scheduled.store(false, .release);
+                    return error.TestStructuralReconcileSubmitFailure;
+                }
+                break;
+            }
+            _ = self.structural_reconcile_worker_count.fetchAdd(1, .acq_rel);
+            self.structural_reconcile_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
+                _ = self.structural_reconcile_worker_count.fetchSub(1, .acq_rel);
+                if (started == 0) {
+                    self.structural_reconcile_scheduled.store(false, .release);
+                    return err;
+                }
+                break;
+            };
+        }
     }
 
     fn scheduleStructuralReconcileRetry(self: *ProvisionedTableWriteSource) bool {
@@ -17681,13 +17816,62 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
+    fn tryAcquireStructuralDispatchGroup(self: *ProvisionedTableWriteSource, group_id: u64) bool {
+        const io = self.table_activity_threaded.io();
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        defer self.structural_reconcile_mutex.unlock(io);
+        if (self.structural_reconcile_inflight_groups.contains(group_id)) return false;
+        self.structural_reconcile_inflight_groups.putAssumeCapacity(group_id, {});
+        return true;
+    }
+
+    fn releaseStructuralDispatchGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        defer self.structural_reconcile_mutex.unlock(io);
+        std.debug.assert(self.structural_reconcile_inflight_groups.remove(group_id));
+    }
+
     fn drainStructuralReconcileTask(self: *ProvisionedTableWriteSource) Io.Cancelable!void {
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
+        var worker_retired = false;
+        defer {
+            if (!worker_retired) {
+                // Abnormal/cancelled exit happens only after lifecycle
+                // admission closes. Retire it defensively so shutdown never
+                // leaves a phantom scheduled owner.
+                self.structural_reconcile_mutex.lockUncancelable(io);
+                const previous_workers = self.structural_reconcile_worker_count.fetchSub(1, .acq_rel);
+                std.debug.assert(previous_workers != 0);
+                if (previous_workers == 1)
+                    self.structural_reconcile_scheduled.store(false, .release);
+                self.structural_reconcile_mutex.unlock(io);
+            }
+        }
         while (true) {
             self.structural_reconcile_mutex.lockUncancelable(io);
             if (self.structural_reconcile_tables.count() == 0) {
-                self.structural_reconcile_scheduled.store(false, .release);
+                // Keep idle lanes resident while another request is in flight,
+                // so a newly admitted unrelated activation cannot convoy
+                // behind its bounded routing timeout.
+                if (self.structural_reconcile_keys.count() != 0) {
+                    if (self.restore_repair_shutdown.load(.acquire)) {
+                        self.structural_reconcile_mutex.unlock(io);
+                        return;
+                    }
+                    self.structural_reconcile_ready.waitUncancelable(io, &self.structural_reconcile_mutex);
+                    self.structural_reconcile_mutex.unlock(io);
+                    continue;
+                }
+                // Queue observation and last-worker retirement are one mutex
+                // transaction. An enqueue can therefore either see a live
+                // worker or become responsible for admitting a fresh pool.
+                const previous_workers = self.structural_reconcile_worker_count.fetchSub(1, .acq_rel);
+                std.debug.assert(previous_workers != 0);
+                if (previous_workers == 1)
+                    self.structural_reconcile_scheduled.store(false, .release);
+                worker_retired = true;
                 self.structural_reconcile_mutex.unlock(io);
                 return;
             }
@@ -17703,6 +17887,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
 
             var request = self.structural_reconcile_tables.pop().?;
+            std.debug.assert(self.structural_reconcile_dispatcher == null or request.index_name != null);
             const ownership = self.structural_reconcile_keys.getPtr(request.scheduler_key) orelse unreachable;
             std.debug.assert(ownership.* == .queued);
             ownership.* = .active;
@@ -17862,6 +18047,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.structural_reconcile_tables.push(alloc, request.*) catch unreachable;
             ownership.* = .queued;
             requeued = true;
+            self.structural_reconcile_ready.broadcast(io);
         } else {
             _ = self.structural_reconcile_keys.remove(request.scheduler_key);
         }
@@ -17970,6 +18156,11 @@ pub const ProvisionedTableWriteSource = struct {
                 const plan = &request.plan.?;
                 const group = plan.currentGroup() orelse break;
                 const incarnation = plan.metadata_incarnation orelse return error.CatalogPublicationFenceUnavailable;
+                if (!self.tryAcquireStructuralDispatchGroup(group.range.group_id)) {
+                    plan.markCurrentBusy();
+                    waiting_for_acknowledgement = true;
+                    continue;
+                }
                 const progress = dispatcher.activateIndex(alloc, .{
                     .metadata_group_id = plan.metadata_group_id,
                     .metadata_incarnation = incarnation,
@@ -17981,21 +18172,25 @@ pub const ProvisionedTableWriteSource = struct {
                     .index_name = index_name,
                     .indexes_json = plan.indexes_json,
                     .indexes_digest = plan.indexes_digest,
-                }) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable,
-                    error.GroupLeaderNotFound,
-                    error.GroupRouteUnavailable,
-                    error.ConnectionRefused,
-                    error.ConnectionResetByPeer,
-                    error.TimedOut,
-                    error.TopologyChanged,
-                    => {
-                        plan.markCurrentBusy();
-                        waiting_for_acknowledgement = true;
-                        continue;
-                    },
-                    else => return err,
+                }) catch |err| {
+                    self.releaseStructuralDispatchGroup(group.range.group_id);
+                    switch (err) {
+                        error.GroupLeaderUnavailable,
+                        error.GroupLeaderNotFound,
+                        error.GroupRouteUnavailable,
+                        error.ConnectionRefused,
+                        error.ConnectionResetByPeer,
+                        error.TimedOut,
+                        error.TopologyChanged,
+                        => {
+                            plan.markCurrentBusy();
+                            waiting_for_acknowledgement = true;
+                            continue;
+                        },
+                        else => return err,
+                    }
                 };
+                self.releaseStructuralDispatchGroup(group.range.group_id);
                 switch (progress.state) {
                     .observed => {
                         const snapshot_cache = self.runtime_status_cache orelse
@@ -18094,6 +18289,10 @@ pub const ProvisionedTableWriteSource = struct {
         // in the request must be allocation-free. Otherwise OOM between the
         // durable repair edge and request ownership could strand the fence.
         try request.deferred_repair_group_ids.ensureUnusedCapacity(
+            alloc,
+            structural_reconcile_groups_per_quantum,
+        );
+        try request.deferred_repair_group_set.ensureUnusedCapacity(
             alloc,
             structural_reconcile_groups_per_quantum,
         );
@@ -23758,12 +23957,12 @@ pub const HostedProvisionedTableWriteSource = struct {
             try ProvisionedTableWriteSource.committedIndexTargetFromDefinition(alloc, index_name, definition)
         else
             .absent;
-        try control_plane.enqueueCommittedTableIndexStructuralReconcile(
+        if (!try control_plane.enqueueCommittedTableIndexStructuralReconcile(
             table_name,
             index_name,
             committed_target,
             stamp,
-        );
+        )) return null;
         return {};
     }
 
@@ -43014,6 +43213,7 @@ test "structural scheduler capacity includes active ownership" {
         catalog.iface(),
     );
     defer source.deinit();
+    source.structural_reconcile_scheduled.store(true, .release);
     try source.structural_reconcile_keys.ensureTotalCapacity(
         alloc,
         ProvisionedTableWriteSource.max_structural_reconcile_requests,
@@ -43032,6 +43232,99 @@ test "structural scheduler capacity includes active ownership" {
         source.structural_reconcile_keys.count(),
     );
     try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
+
+    const stamp: metadata_api.CatalogMutationStamp = .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .term = 3,
+        .index = 9,
+    };
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        source.enqueueCommittedTableIndexStructuralReconcile(
+            "docs",
+            "committed_after_capacity",
+            .absent,
+            stamp,
+        ),
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.CommittedMutationWatermark.State.pending_admission,
+        source.structural_reconcile_committed_watermark.?.state,
+    );
+
+    var retired_key = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    std.mem.writeInt(u64, retired_key[0..@sizeOf(u64)], 0, .little);
+    try std.testing.expect(source.structural_reconcile_keys.remove(retired_key));
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
+        "docs",
+        "committed_after_capacity",
+        .absent,
+        stamp,
+    ));
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.CommittedMutationWatermark.State.admitted,
+        source.structural_reconcile_committed_watermark.?.state,
+    );
+    const io = source.table_activity_threaded.io();
+    source.structural_reconcile_mutex.lockUncancelable(io);
+    var request = source.structural_reconcile_tables.pop().?;
+    source.structural_reconcile_keys.getPtr(request.scheduler_key).?.* = .active;
+    source.structural_reconcile_mutex.unlock(io);
+    source.finishStructuralReconcileOwnership(request);
+    request.handoffDeferredRepairDebt(&source);
+    request.deinit(alloc);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.CommittedMutationWatermark.State.completed,
+        source.structural_reconcile_committed_watermark.?.state,
+    );
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
+        "docs",
+        "committed_after_capacity",
+        .absent,
+        stamp,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
+
+    const active_stamp = metadata_api.CatalogMutationStamp{
+        .metadata_group_id = stamp.metadata_group_id,
+        .metadata_incarnation = stamp.metadata_incarnation,
+        .term = stamp.term,
+        .index = stamp.index + 1,
+    };
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
+        "docs",
+        "committed_after_capacity",
+        .absent,
+        active_stamp,
+    ));
+    source.structural_reconcile_mutex.lockUncancelable(io);
+    var predecessor = source.structural_reconcile_tables.pop().?;
+    source.structural_reconcile_keys.getPtr(predecessor.scheduler_key).?.* = .active;
+    source.structural_reconcile_mutex.unlock(io);
+    const pending_stamp = metadata_api.CatalogMutationStamp{
+        .metadata_group_id = stamp.metadata_group_id,
+        .metadata_incarnation = stamp.metadata_incarnation,
+        .term = stamp.term,
+        .index = stamp.index + 2,
+    };
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        source.enqueueCommittedTableIndexStructuralReconcile(
+            "docs",
+            "committed_after_capacity",
+            .absent,
+            pending_stamp,
+        ),
+    );
+    source.finishStructuralReconcileOwnership(predecessor);
+    predecessor.handoffDeferredRepairDebt(&source);
+    predecessor.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_latest_committed.count());
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.CommittedMutationWatermark.State.pending_admission,
+        source.structural_reconcile_committed_watermark.?.state,
+    );
 }
 
 test "yielded structural work advances under sustained new admission" {
@@ -43436,7 +43729,7 @@ test "hosted index lifecycle callback hands exact target to persistent control p
             .config_hash = exact.config_hash +% 1,
         } },
     };
-    try control_plane.enqueueCommittedTableIndexStructuralReconcile(
+    try std.testing.expect(try control_plane.enqueueCommittedTableIndexStructuralReconcile(
         "docs",
         "semantic_idx",
         replacement_target,
@@ -43446,7 +43739,7 @@ test "hosted index lifecycle callback hands exact target to persistent control p
             .term = first_stamp.term,
             .index = first_stamp.index + 1,
         },
-    );
+    ));
     const coalesced_token = control_plane.targetedStructuralTransitionToken("docs", "semantic_idx") orelse
         return error.TestExpectedTargetedStatusFence;
     try std.testing.expectEqual(first_token, coalesced_token);
@@ -43474,18 +43767,18 @@ test "committed activation receipt rejects delayed drop after newer create" {
         .incarnation = 42,
         .config_hash = 77,
     } };
-    try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", exact, .{
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", exact, .{
         .metadata_group_id = 1,
         .metadata_incarnation = incarnation,
         .term = 4,
         .index = 102,
-    });
-    try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, .{
+    }));
+    try std.testing.expect(!(try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, .{
         .metadata_group_id = 1,
         .metadata_incarnation = incarnation,
         .term = 4,
         .index = 101,
-    });
+    })));
     try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
     try std.testing.expectEqual(exact, source.structural_reconcile_tables.items[0].committed_index_target.?);
 }
@@ -43502,9 +43795,9 @@ test "committed activation receipt rejects delayed create after newer drop and c
         .term = 5,
         .index = 202,
     };
-    try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, drop_stamp);
-    try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, drop_stamp);
-    try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .{ .exact = .{
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, drop_stamp));
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .absent, drop_stamp));
+    try std.testing.expect(!(try source.enqueueCommittedTableIndexStructuralReconcile("docs", "semantic_idx", .{ .exact = .{
         .kind = .dense_vector,
         .incarnation = 42,
         .config_hash = 77,
@@ -43513,7 +43806,7 @@ test "committed activation receipt rejects delayed create after newer drop and c
         .metadata_incarnation = incarnation,
         .term = 5,
         .index = 201,
-    });
+    })));
     try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
     try std.testing.expectEqual(
         ProvisionedTableWriteSource.CommittedIndexTarget.absent,
@@ -43527,6 +43820,89 @@ test "committed activation receipt rejects delayed create after newer drop and c
             .config_hash = 78,
         } }, drop_stamp),
     );
+}
+
+test "committed activation watermark stays bounded across completed scope churn" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-stamped-churn", catalog.iface());
+    defer source.deinit();
+    source.structural_reconcile_scheduled.store(true, .release);
+    const incarnation = "0123456789abcdef0123456789abcdef".*;
+    const completed_scope_count = ProvisionedTableWriteSource.max_structural_reconcile_requests + 17;
+    var name_buf: [64]u8 = undefined;
+    for (0..completed_scope_count) |ordinal| {
+        const index_name = try std.fmt.bufPrint(&name_buf, "semantic_{d}", .{ordinal});
+        try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
+            "docs",
+            index_name,
+            .absent,
+            .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = incarnation,
+                .term = 7,
+                .index = ordinal + 1,
+            },
+        ));
+        const io = source.table_activity_threaded.io();
+        source.structural_reconcile_mutex.lockUncancelable(io);
+        var request = source.structural_reconcile_tables.pop().?;
+        source.structural_reconcile_keys.getPtr(request.scheduler_key).?.* = .active;
+        source.structural_reconcile_mutex.unlock(io);
+        source.finishStructuralReconcileOwnership(request);
+        request.handoffDeferredRepairDebt(&source);
+        request.deinit(std.heap.page_allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_latest_committed.count());
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_keys.count());
+    try std.testing.expectEqual(
+        @as(u64, completed_scope_count),
+        source.structural_reconcile_committed_watermark.?.mutation.stamp.index,
+    );
+    // The compact global receipt remains after per-scope ownership retires,
+    // so an arbitrarily delayed callback cannot resurrect completed work.
+    try std.testing.expect(!(try source.enqueueCommittedTableIndexStructuralReconcile(
+        "docs",
+        "semantic_0",
+        .absent,
+        .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = incarnation,
+            .term = 7,
+            .index = 1,
+        },
+    )));
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
+    // The completed head receipt is idempotent without retaining a per-scope
+    // tombstone or re-enqueuing work.
+    try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
+        "docs",
+        try std.fmt.bufPrint(&name_buf, "semantic_{d}", .{completed_scope_count - 1}),
+        .absent,
+        .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = incarnation,
+            .term = 7,
+            .index = completed_scope_count,
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
+    // One consensus position identifies exactly one logical activation. A
+    // different target at the same receipt is corruption, not a retry.
+    try std.testing.expectError(
+        error.ConflictingIndexActivationTarget,
+        source.enqueueCommittedTableIndexStructuralReconcile(
+            "docs",
+            "different_index",
+            .absent,
+            .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = incarnation,
+                .term = 7,
+                .index = completed_scope_count,
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), source.structural_reconcile_tables.count());
 }
 
 test "hosted index lifecycle owner retries transient activation failure" {
@@ -43577,6 +43953,81 @@ test "hosted index lifecycle owner retries transient activation failure" {
     control_plane.structural_reconcile_mutex.lockUncancelable(control_plane.table_activity_threaded.io());
     try std.testing.expectEqual(@as(usize, 0), control_plane.structural_reconcile_tables.items.len);
     control_plane.structural_reconcile_mutex.unlock(control_plane.table_activity_threaded.io());
+}
+
+test "structural activation dispatch does not convoy unrelated groups" {
+    const BlockingDispatcher = struct {
+        first_entered: std.atomic.Value(bool) = .init(false),
+        release_first: std.atomic.Value(bool) = .init(false),
+        second_observed: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) metadata_mod.ShardDbAdapter {
+            return .{ .ptr = self, .vtable = &.{
+                .fetch_median_key = fetchMedianKey,
+                .schema_index_ready = schemaIndexReady,
+                .activate_index = activateIndex,
+            } };
+        }
+
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return error.UnsupportedOperation;
+        }
+
+        fn schemaIndexReady(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64, _: u32, _: u32) !bool {
+            return error.UnsupportedOperation;
+        }
+
+        fn activateIndex(ptr: *anyopaque, _: std.mem.Allocator, target: metadata_mod.IndexActivationTarget) !metadata_mod.IndexActivationProgress {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (target.group_id == 7001) {
+                self.first_entered.store(true, .release);
+                while (!self.release_first.load(.acquire))
+                    platform_time.sleepNs(std.time.ns_per_ms);
+            } else if (target.group_id == 7002) {
+                self.second_observed.store(true, .release);
+            } else return error.TestUnexpectedGroup;
+            return .{ .state = .accepted };
+        }
+    };
+
+    var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
+    catalog.expand_now.store(true, .release);
+    catalog.tables[0].indexes_json = structural_reconcile_test_indexes_json;
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-dispatch-convoy", catalog.iface());
+    var dispatcher = BlockingDispatcher{};
+    _ = source.withStructuralReconcileDispatcher(dispatcher.iface());
+    defer {
+        dispatcher.release_first.store(true, .release);
+        source.deinit();
+    }
+    try std.testing.expect(try source.enqueueTableStructuralReconcileTarget(
+        "docs",
+        "semantic_idx",
+        7001,
+        null,
+        null,
+        null,
+    ));
+    for (0..2_000) |_| {
+        if (dispatcher.first_entered.load(.acquire)) break;
+        platform_time.sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(dispatcher.first_entered.load(.acquire));
+
+    try std.testing.expect(try source.enqueueTableStructuralReconcileTarget(
+        "docs",
+        "semantic_idx",
+        7002,
+        null,
+        null,
+        null,
+    ));
+    for (0..2_000) |_| {
+        if (dispatcher.second_observed.load(.acquire)) break;
+        platform_time.sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(dispatcher.second_observed.load(.acquire));
+    try std.testing.expect(!dispatcher.release_first.load(.acquire));
 }
 
 test "hosted index lifecycle backs off repeated stale resident observation" {
@@ -43966,7 +44417,7 @@ test "repair edge after target release retains target authority until handoff" {
             .stats = .{ .index_count = indexes.len, .indexes = &indexes },
         }),
     );
-    const pending_authority = cache.tables.getPtr("docs").?.index_authorities.getPtr("thumbnail").?;
+    const pending_authority = cache.tables.get("docs").?.index_authorities.getPtr("thumbnail").?;
     try std.testing.expect(pending_authority.transition_active);
     try std.testing.expect(!pending_authority.target_authority_handed_off);
 
@@ -44918,6 +45369,33 @@ test "structural reconcile productive quantum yields immediately while blocked w
     );
 }
 
+test "structural reconcile retains ordered constant-time repair wake membership across plan resets" {
+    const alloc = std.testing.allocator;
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-repair-membership", catalog.iface());
+    defer source.deinit();
+    var request = ProvisionedTableWriteSource.StructuralReconcileRequest{
+        .table_name = try alloc.dupe(u8, "docs"),
+    };
+    defer request.deinit(alloc);
+
+    const group_count = 8_192;
+    for (0..group_count) |ordinal| {
+        const group_id: u64 = @intCast(70_000 + ordinal);
+        try request.deferRepairDebt(alloc, group_id);
+        // Repeated plan invalidation must not forget an already acquired wake
+        // or make the next quantum scan the retained ordered list.
+        if (ordinal % 127 == 0) source.resetStructuralReconcilePlan(&request, alloc);
+    }
+    for (0..group_count) |ordinal|
+        try request.deferRepairDebt(alloc, @intCast(70_000 + ordinal));
+
+    try std.testing.expectEqual(@as(usize, group_count), request.deferred_repair_group_ids.items.len);
+    try std.testing.expectEqual(@as(usize, group_count), request.deferred_repair_group_set.count());
+    for (request.deferred_repair_group_ids.items, 0..) |group_id, ordinal|
+        try std.testing.expectEqual(@as(u64, @intCast(70_000 + ordinal)), group_id);
+}
+
 test "structural reconcile retries a transient worker failure" {
     var catalog = StructuralReconcileTestCatalog{ .mode = .fail_once };
     var source = ProvisionedTableWriteSource.init(
@@ -45074,6 +45552,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     try std.testing.expect(capture.notification_count >= 1);
     try std.testing.expectEqual(@as(usize, 0), capture.runnable_signal_count);
     try std.testing.expectEqual(@as(usize, 1), request.deferred_repair_group_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 1), request.deferred_repair_group_set.count());
     const observations_before_handoff = capture.notification_count;
     var rebuilding = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer rebuilding.deinit(alloc);
@@ -45093,6 +45572,8 @@ test "structural reconcile publishes durable index repair debt once per group" {
     reconcile_active = false;
     source.releaseStructuralReconcileStatus("docs");
     request.publishDeferredRepairDebt(&source);
+    try std.testing.expectEqual(@as(usize, 0), request.deferred_repair_group_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), request.deferred_repair_group_set.count());
     try std.testing.expectEqual(observations_before_handoff + 1, capture.notification_count);
     try std.testing.expectEqual(@as(usize, 1), capture.runnable_signal_count);
 

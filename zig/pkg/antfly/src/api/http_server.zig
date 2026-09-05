@@ -1278,7 +1278,7 @@ pub const StatusSource = struct {
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
-        replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
+        replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1389,8 +1389,13 @@ pub const StatusSource = struct {
     }
 
     pub fn replaceTableDefinitionStamped(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
-        if (self.vtable.replace_table_definition_stamped) |fn_ptr|
-            return try BoundaryAbi.call("replace_table_definition_stamped", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
+        if (self.vtable.replace_table_definition_stamped) |fn_ptr| {
+            if (try BoundaryAbi.call("replace_table_definition_stamped", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement })) |stamp|
+                return stamp;
+        }
+        // A null optional is a pre-admission capability miss, never a missing
+        // receipt after commit. Preserve the mutation through the v0.2 path;
+        // downstream activation then deliberately uses generic convergence.
         try self.replaceTableDefinition(expected, replacement);
         return null;
     }
@@ -1625,7 +1630,7 @@ pub const StatusSource = struct {
                 return try replaceTableDefinitionOnService(cast(ptr), expected, replacement);
             }
 
-            fn replaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp {
+            fn replaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp {
                 return try replaceTableDefinitionOnServiceStamped(cast(ptr), expected, replacement);
             }
 

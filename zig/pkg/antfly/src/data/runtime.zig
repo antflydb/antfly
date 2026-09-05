@@ -17684,6 +17684,7 @@ const RemoteMetadataSource = struct {
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
+                .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
                 .restore_table = remoteRestoreTable,
                 .drop_table = remoteDropTable,
                 .drop_table_exact = remoteDropTableExact,
@@ -18674,12 +18675,44 @@ const RemoteMetadataSource = struct {
             .definition = replacement,
         }, .{});
         defer self.alloc.free(body);
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
-                _ = try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
+        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+            self.invalidateCache();
+        try self.withMetadataMutationApiClient(void, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                _: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) !void {
+                try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
             }
         }.call, .{ .table_name = replacement.name, .body = body });
         self.invalidateCache();
+    }
+
+    fn remoteReplaceTableDefinitionStamped(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !?antfly.metadata_api.CatalogMutationStamp {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .expected = expected,
+            .definition = replacement,
+        }, .{});
+        defer self.alloc.free(body);
+        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+            self.invalidateCache();
+        const stamp = try self.withMetadataMutationApiClient(?antfly.metadata_api.CatalogMutationStamp, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                _: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) !?antfly.metadata_api.CatalogMutationStamp {
+                return try client.tryReplaceTableDefinitionStamped(base_uri, ctx.table_name, ctx.body);
+            }
+        }.call, .{ .table_name = replacement.name, .body = body });
+        self.invalidateCache();
+        return stamp;
     }
 
     fn remoteDropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {

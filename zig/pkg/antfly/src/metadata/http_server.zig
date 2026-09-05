@@ -1675,6 +1675,7 @@ pub const MetadataHttpServer = struct {
         try server.postWithBodyLimit(table_path, tables_api.max_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTable));
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
         try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
+        try server.put(table_path ++ routes.Routes.internal_table_definition_stamped_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinitionStamped));
         try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
         try server.postWithBodyLimit(
             table_path ++ routes.Routes.internal_table_schema_mutation_suffix,
@@ -2643,12 +2644,12 @@ pub const MetadataHttpServer = struct {
         return ctx.status(202).text("accepted");
     }
 
-    fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
-        return .{ .source = .{ .ptr = self, .vtable = &.{
+    fn tableOperationsVTable(comptime stamped: bool) *const table_operations.Source.VTable {
+        return &.{
             .create_table = createTableOperation,
             .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
-            .replace_definition_stamped = if (self.source.vtable.replace_table_definition_stamped != null)
+            .replace_definition_stamped = if (stamped)
                 replaceTableDefinitionOperationStamped
             else
                 null,
@@ -2667,7 +2668,19 @@ pub const MetadataHttpServer = struct {
             .validate_merge = validateTableMergeOperation,
             .request_merge = requestTableMergeOperation,
             .reseed_exact_cutover = reseedTableExactCutoverOperation,
-        } } };
+        };
+    }
+
+    fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
+        // Select between two immutable process-lifetime vtables. Building a
+        // runtime-conditional anonymous vtable here would return a pointer to
+        // stack storage and leave every subsequent operation with a dangling
+        // dispatch table.
+        const vtable = if (self.source.vtable.replace_table_definition_stamped != null)
+            tableOperationsVTable(true)
+        else
+            tableOperationsVTable(false);
+        return .{ .source = .{ .ptr = self, .vtable = vtable } };
     }
 
     fn createTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: tables_api.CreateTableRequest) !void {
@@ -2901,6 +2914,28 @@ pub const MetadataHttpServer = struct {
         var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
             return ctx.status(400).text("invalid table definition replacement");
         defer parsed.deinit();
+        self.tableOperations().replaceDefinition(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
+            error.TableNameMismatch => return ctx.status(400).text("table definition name mismatch"),
+            error.ExpectedTableNameMismatch => return ctx.status(400).text("expected table definition name mismatch"),
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
+            else => return metadataMutationError(ctx, err),
+        };
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReplaceTableDefinitionStamped(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        // Capability failure must occur before the legacy mutation is
+        // admitted. A new client can then safely retry the stable v0.2 route
+        // and treat the missing receipt as generic reconciliation ownership.
+        if (self.source.vtable.replace_table_definition_stamped == null)
+            return ctx.status(405).text("method not allowed");
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
+            return ctx.status(400).text("invalid table definition replacement");
+        defer parsed.deinit();
         const stamp = self.tableOperations().replaceDefinitionStamped(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
             error.TableNameMismatch => return ctx.status(400).text("table definition name mismatch"),
             error.ExpectedTableNameMismatch => return ctx.status(400).text("expected table definition name mismatch"),
@@ -2908,12 +2943,10 @@ pub const MetadataHttpServer = struct {
             error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
-        if (stamp) |committed| {
-            return ctx.status(202).json(committed);
-        }
-        return ctx.status(202).text("accepted");
+        const committed = stamp orelse return ctx.status(405).text("method not allowed");
+        return ctx.status(202).json(committed);
     }
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -5110,6 +5143,7 @@ test "metadata http server preserves extension-owned table drop conflicts" {
 test "metadata http server replaces a table definition through compare-and-swap" {
     const FakeSource = struct {
         replaced: bool = false,
+        reject_not_leader: bool = false,
 
         fn iface(self: *@This()) AdminSource {
             return .{
@@ -5119,6 +5153,7 @@ test "metadata http server replaces a table definition through compare-and-swap"
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .replace_table_definition = replaceTableDefinition,
+                    .replace_table_definition_stamped = replaceTableDefinitionStamped,
                 },
             };
         }
@@ -5143,11 +5178,22 @@ test "metadata http server replaces a table definition through compare-and-swap"
 
         fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject_not_leader) return error.NotLeader;
             if (expected.table_id != 42 or !std.mem.eql(u8, expected.description, "original")) return error.TableGenerationChanged;
             try std.testing.expectEqual(@as(u64, 42), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
             try std.testing.expectEqualStrings("restored", replacement.description);
             self.replaced = true;
+        }
+
+        fn replaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+            try replaceTableDefinition(ptr, expected, replacement);
+            return .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                .term = 2,
+                .index = 3,
+            };
         }
     };
 
@@ -5165,7 +5211,48 @@ test "metadata http server replaces a table definition through compare-and-swap"
     defer response.deinit();
 
     try std.testing.expectEqual(@as(u16, 202), response.status.code);
+    try std.testing.expectEqualStrings("accepted", response.body.?);
     try std.testing.expect(source.replaced);
+
+    source.replaced = false;
+    var stamped_response = try server.executeTypedHandlerWithBodyForTest(
+        .PUT,
+        "/internal/v1/tables/docs/definition:stamped",
+        &table_params,
+        \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+    ,
+        MetadataHttpServer.metadataReplaceTableDefinitionStamped,
+    );
+    defer stamped_response.deinit();
+    try std.testing.expectEqual(@as(u16, 202), stamped_response.status.code);
+    var stamp = try std.json.parseFromSlice(
+        metadata_api.CatalogMutationStamp,
+        std.testing.allocator,
+        stamped_response.body.?,
+        .{},
+    );
+    defer stamp.deinit();
+    try std.testing.expectEqual(@as(u64, 1), stamp.value.metadata_group_id);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &stamp.value.metadata_incarnation);
+    try std.testing.expectEqual(@as(u64, 2), stamp.value.term);
+    try std.testing.expectEqual(@as(u64, 3), stamp.value.index);
+    try std.testing.expect(source.replaced);
+
+    source.reject_not_leader = true;
+    var rejected_response = try server.executeTypedHandlerWithBodyForTest(
+        .PUT,
+        "/internal/v1/tables/docs/definition:stamped",
+        &table_params,
+        \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+    ,
+        MetadataHttpServer.metadataReplaceTableDefinitionStamped,
+    );
+    defer rejected_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected_response.status.code);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        rejected_response.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+    );
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {

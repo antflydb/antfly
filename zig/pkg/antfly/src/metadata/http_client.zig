@@ -1005,23 +1005,95 @@ pub const MetadataHttpClient = struct {
         base_uri: []const u8,
         table_name: []const u8,
         body: []const u8,
-    ) !metadata_api.CatalogMutationStamp {
+    ) !void {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.internal_tables_prefix,
             table_name,
             routes.Routes.internal_table_definition_suffix,
         });
         defer self.alloc.free(path);
-        var parsed = try self.requestJsonWithBody(
-            metadata_api.CatalogMutationStamp,
-            base_uri,
-            .PUT,
-            path,
-            body,
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .PUT,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        mapResponseStatus(
+            resp,
             error.InvalidTableDefinitionReplacement,
             error.TableNotFound,
             error.TableGenerationChanged,
-        );
+        ) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+    }
+
+    pub fn replaceTableDefinitionStamped(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?metadata_api.CatalogMutationStamp {
+        if (try self.tryReplaceTableDefinitionStamped(base_uri, table_name, body)) |stamp|
+            return stamp;
+        try self.replaceTableDefinition(base_uri, table_name, body);
+        return null;
+    }
+
+    /// Attempt only the receipt-capable route. A null result proves the peer
+    /// lacks the capability and, critically, that no legacy mutation was
+    /// admitted. Proxies use this form so they can advertise 405 safely.
+    pub fn tryReplaceTableDefinitionStamped(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?metadata_api.CatalogMutationStamp {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_definition_stamped_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .PUT,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) {
+            // Capability handlers reject before mutation admission. The
+            // caller decides whether it owns a safe legacy fallback.
+            return null;
+        }
+        mapResponseStatus(
+            resp,
+            error.InvalidTableDefinitionReplacement,
+            error.TableNotFound,
+            error.TableGenerationChanged,
+        ) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        var parsed = parseJson(metadata_api.CatalogMutationStamp, self.alloc, resp.body) catch
+            // A successful status means the compare-and-swap may already be
+            // committed. A malformed receipt cannot be retried safely.
+            return error.MetadataMutationOutcomeUnknown;
         defer parsed.deinit();
         return parsed.value;
     }
@@ -2206,6 +2278,100 @@ test "metadata http client fetches one bounded linearizable snapshot" {
     try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
     try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "stamped definition replacement falls back to v0.2 text route" {
+    const LegacyExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.PUT, req.method);
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition:stamped"));
+                return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+            }
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition"));
+            return .{ .status = 202, .body = try alloc.dupe(u8, "accepted") };
+        }
+    };
+
+    var probe_executor = LegacyExecutor{};
+    var probe_client = MetadataHttpClient.init(std.testing.allocator, probe_executor.executor());
+    try std.testing.expect((try probe_client.tryReplaceTableDefinitionStamped(
+        "http://127.0.0.1:9000",
+        "docs",
+        "{}",
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), probe_executor.calls);
+
+    var executor = LegacyExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expect((try client.replaceTableDefinitionStamped(
+        "http://127.0.0.1:9000",
+        "docs",
+        "{}",
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "definition replacement does not replay an ambiguous admitted request" {
+    const AmbiguousExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var stamped_executor = AmbiguousExecutor{};
+    var stamped_client = MetadataHttpClient.init(std.testing.allocator, stamped_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        stamped_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), stamped_executor.calls);
+
+    var legacy_executor = AmbiguousExecutor{};
+    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        legacy_client.replaceTableDefinition("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), legacy_executor.calls);
+
+    const MalformedReceiptExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 202, .body = try alloc.dupe(u8, "not-a-receipt") };
+        }
+    };
+
+    var malformed_executor = MalformedReceiptExecutor{};
+    var malformed_client = MetadataHttpClient.init(std.testing.allocator, malformed_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        malformed_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), malformed_executor.calls);
 }
 
 test "metadata http client treats missing linearizable snapshot route as unsupported" {
