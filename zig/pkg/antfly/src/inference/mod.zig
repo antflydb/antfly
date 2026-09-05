@@ -75,6 +75,16 @@ test "bedrock provider request helpers" {
     try managed_embedder.testBedrockRequestFormatConfiguration();
 }
 
+test "embedding provider request helpers" {
+    try vertex.testEmbeddingStatusMapping();
+    try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testCohereBatchLimit();
+    try managed_embedder.testVertexEmbeddingRequestPlanning();
+    try managed_embedder.testManagedVertexCredentialManagerLifetime();
+    try managed_embedder.testCatalogSemanticIdentityRejectsProducerOnlyFields();
+    try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
+}
+
 test "managed embedder resolves file-backed api key rotation at request time" {
     try managed_embedder.testFileBackedApiKeyRotation();
 }
@@ -115,6 +125,10 @@ test "managed embedder sends antfly media parts when local provider is configure
 
 test "managed embedder normalizes local admission overload across embedding modes" {
     try managed_embedder.testLocalAdmissionOverloadNormalization();
+}
+
+test "managed embedder routes query and document embedding tasks" {
+    try managed_embedder.testEmbeddingTaskRouting();
 }
 
 test "query embedding cache owns results and coalesces misses" {

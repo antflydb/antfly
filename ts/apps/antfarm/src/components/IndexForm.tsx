@@ -30,6 +30,9 @@ const staticModelSuggestions: Record<IndexEmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
   openai: ["text-embedding-3-small", "text-embedding-3-large"],
+  gemini: ["gemini-embedding-001"],
+  vertex: ["gemini-embedding-001", "text-embedding-005"],
+  cohere: ["embed-v4.0", "embed-english-v3.0", "embed-multilingual-v3.0"],
   bedrock: [
     "amazon.titan-embed-text-v2:0",
     "amazon.titan-embed-image-v1",

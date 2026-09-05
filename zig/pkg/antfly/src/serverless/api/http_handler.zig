@@ -224,6 +224,7 @@ pub const HttpHandler = struct {
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
+    embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -366,6 +367,13 @@ pub const HttpHandler = struct {
     ) void {
         self.managed_query_embedder = embedder;
         self.published_search_sources = search_sources.withDenseQueryIndexName(self.published_search_sources, index_name);
+    }
+
+    pub fn setEmbeddingProviderRuntime(
+        self: *HttpHandler,
+        runtime: *managed_embedder.ProviderRuntime,
+    ) void {
+        self.embedding_provider_runtime = runtime;
     }
 
     pub fn setRemoteContent(self: *HttpHandler, remote_content: ?*const scraping.RemoteContentConfig) void {
@@ -4069,6 +4077,7 @@ pub const HttpHandler = struct {
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
                 .io = self.io,
                 .remote_content = self.remote_content,
+                .provider_runtime = self.embedding_provider_runtime,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {

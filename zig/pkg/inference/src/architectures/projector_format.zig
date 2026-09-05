@@ -25,6 +25,7 @@ pub const gemma4_spatial_merge_size: u64 = 3;
 pub const Kind = enum {
     unknown,
     antfly_gemma3,
+    clip_qwen3vl_image,
     clip_gemma4_image,
     clip_gemma4_audio,
     clip_gemma4_image_audio,
@@ -36,6 +37,9 @@ pub const Contract = struct {
     tokens_per_image: ?u32 = null,
     supports_image: bool,
     supports_audio: bool,
+    spatial_merge_size: ?u32 = null,
+    vision_block_count: ?u32 = null,
+    deepstack_layer_count: u32 = 0,
 };
 
 pub fn detectPath(allocator: std.mem.Allocator, projector_path: []const u8) !Kind {
@@ -65,6 +69,12 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
 
     if (!std.mem.eql(u8, arch, "clip")) return .unknown;
 
+    if (view.getString("clip.projector_type")) |projector_type| {
+        if (std.mem.eql(u8, projector_type, "qwen3vl_merger")) {
+            return .clip_qwen3vl_image;
+        }
+    }
+
     const has_image = blk: {
         const projector_type = view.getString("clip.vision.projector_type") orelse break :blk false;
         break :blk isGemma4ImageProjectorType(projector_type);
@@ -89,11 +99,131 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
 pub fn inspectFileContract(file: *const gguf_format.File) !Contract {
     return switch (detectFile(file)) {
         .antfly_gemma3 => inspectAntflyGemma3Contract(file),
+        .clip_qwen3vl_image => inspectQwen3VlClipContract(file),
         .clip_gemma4_image => inspectGemma4ClipContract(file, true, false),
         .clip_gemma4_audio => inspectGemma4ClipContract(file, false, true),
         .clip_gemma4_image_audio => inspectGemma4ClipContract(file, true, true),
         .unknown => error.UnsupportedProjectorFormat,
     };
+}
+
+fn inspectQwen3VlClipContract(file: *const gguf_format.File) !Contract {
+    const view = gguf_metadata.View.init(file);
+    if (!(view.getBool("clip.has_vision_encoder") orelse false) or
+        !(view.getBool("clip.use_gelu") orelse false))
+    {
+        return error.InvalidProjectorContract;
+    }
+    const projection_dim = try requiredPositiveU32(view, "clip.vision.projection_dim");
+    const vision_hidden = try requiredPositiveU32(view, "clip.vision.embedding_length");
+    const intermediate = try requiredPositiveU32(view, "clip.vision.feed_forward_length");
+    const block_count = try requiredPositiveU32(view, "clip.vision.block_count");
+    const head_count = try requiredPositiveU32(view, "clip.vision.attention.head_count");
+    const image_size = try requiredPositiveU32(view, "clip.vision.image_size");
+    const patch_size = try requiredPositiveU32(view, "clip.vision.patch_size");
+    const spatial_merge = try requiredPositiveU32(view, "clip.vision.spatial_merge_size");
+    if (vision_hidden % head_count != 0 or image_size % patch_size != 0 or spatial_merge != 2) {
+        return error.InvalidProjectorContract;
+    }
+    const grid = image_size / patch_size;
+    if (grid % spatial_merge != 0) return error.InvalidProjectorContract;
+
+    const deepstack_count = try validateQwen3VlTensorShapes(
+        TensorValidator.init(file),
+        view,
+        projection_dim,
+        vision_hidden,
+        intermediate,
+        block_count,
+        patch_size,
+        grid,
+        spatial_merge,
+    );
+    return .{
+        .kind = .clip_qwen3vl_image,
+        .text_hidden_size = projection_dim,
+        .supports_image = true,
+        .supports_audio = false,
+        .spatial_merge_size = spatial_merge,
+        .vision_block_count = block_count,
+        .deepstack_layer_count = deepstack_count,
+    };
+}
+
+fn validateQwen3VlTensorShapes(
+    validator: TensorValidator,
+    view: gguf_metadata.View,
+    projection_dim: u32,
+    vision_hidden: u32,
+    intermediate: u32,
+    block_count: u32,
+    patch_size: u32,
+    grid: u32,
+    spatial_merge: u32,
+) !u32 {
+    const qkv = try checkedProjectorDimension(vision_hidden, 3);
+    const merge_area = try checkedProjectorDimension(spatial_merge, spatial_merge);
+    const merged_hidden = try checkedProjectorDimension(vision_hidden, merge_area);
+    const position_count = try checkedProjectorDimension(grid, grid);
+    try validator.requireConv2d("v.patch_embd.weight", patch_size, patch_size, 3, vision_hidden, false);
+    // Qwen3-VL's temporal_patch_size=2 Conv3D is serialized as two spatial
+    // kernels. Requiring both prevents silently accepting an older 2-D CLIP.
+    try validator.requireConv2d("v.patch_embd.weight.1", patch_size, patch_size, 3, vision_hidden, false);
+    try validator.requireVector("v.patch_embd.bias", vision_hidden);
+    try validator.requireMatrix("v.position_embd.weight", position_count, vision_hidden);
+    try validator.requireVector("v.post_ln.weight", vision_hidden);
+    try validator.requireVector("v.post_ln.bias", vision_hidden);
+    try validator.requireMatrix("mm.0.weight", merged_hidden, merged_hidden);
+    try validator.requireVector("mm.0.bias", merged_hidden);
+    try validator.requireMatrix("mm.2.weight", merged_hidden, projection_dim);
+    try validator.requireVector("mm.2.bias", projection_dim);
+
+    const deepstack_entry = view.find("clip.vision.is_deepstack_layers") orelse
+        return error.InvalidProjectorContract;
+    const deepstack = switch (deepstack_entry.value) {
+        .array => |array| array,
+        else => return error.InvalidProjectorContract,
+    };
+    if (deepstack.element_type != .bool_ or deepstack.values.len != block_count) {
+        return error.InvalidProjectorContract;
+    }
+
+    var deepstack_count: u32 = 0;
+    var buf: [96]u8 = undefined;
+    for (0..block_count) |layer| {
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ln1.weight"), vision_hidden);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ln1.bias"), vision_hidden);
+        try validator.requireMatrix(try gemma4LayerName(&buf, "v", layer, "attn_qkv.weight"), vision_hidden, qkv);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "attn_qkv.bias"), qkv);
+        try validator.requireMatrix(try gemma4LayerName(&buf, "v", layer, "attn_out.weight"), vision_hidden, vision_hidden);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "attn_out.bias"), vision_hidden);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ln2.weight"), vision_hidden);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ln2.bias"), vision_hidden);
+        try validator.requireMatrix(try gemma4LayerName(&buf, "v", layer, "ffn_up.weight"), vision_hidden, intermediate);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ffn_up.bias"), intermediate);
+        try validator.requireMatrix(try gemma4LayerName(&buf, "v", layer, "ffn_down.weight"), intermediate, vision_hidden);
+        try validator.requireVector(try gemma4LayerName(&buf, "v", layer, "ffn_down.bias"), vision_hidden);
+
+        const enabled = switch (deepstack.values[layer]) {
+            .bool_ => |value| value,
+            else => return error.InvalidProjectorContract,
+        };
+        if (!enabled) continue;
+        deepstack_count += 1;
+        try validator.requireVector(try qwen3VlDeepstackName(&buf, layer, "norm.weight"), merged_hidden);
+        try validator.requireVector(try qwen3VlDeepstackName(&buf, layer, "norm.bias"), merged_hidden);
+        try validator.requireMatrix(try qwen3VlDeepstackName(&buf, layer, "fc1.weight"), merged_hidden, merged_hidden);
+        try validator.requireVector(try qwen3VlDeepstackName(&buf, layer, "fc1.bias"), merged_hidden);
+        try validator.requireMatrix(try qwen3VlDeepstackName(&buf, layer, "fc2.weight"), merged_hidden, projection_dim);
+        try validator.requireVector(try qwen3VlDeepstackName(&buf, layer, "fc2.bias"), projection_dim);
+    }
+    if (deepstack_count == 0) return error.InvalidProjectorContract;
+    return deepstack_count;
+}
+
+fn qwen3VlDeepstackName(buf: *[96]u8, layer: usize, suffix: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "v.deepstack.{d}.{s}", .{ layer, suffix }) catch
+        error.InvalidProjectorContract;
 }
 
 fn inspectAntflyGemma3Contract(file: *const gguf_format.File) !Contract {
@@ -655,7 +785,7 @@ pub fn isAntfly(kind: Kind) bool {
 
 pub fn isClip(kind: Kind) bool {
     return switch (kind) {
-        .clip_gemma4_image, .clip_gemma4_audio, .clip_gemma4_image_audio => true,
+        .clip_qwen3vl_image, .clip_gemma4_image, .clip_gemma4_audio, .clip_gemma4_image_audio => true,
         else => false,
     };
 }
@@ -991,6 +1121,34 @@ test "detect unknown projector metadata" {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
 
     try std.testing.expectEqual(Kind.unknown, try detectPath(allocator, path));
+}
+
+test "detect official Qwen3-VL projector metadata key" {
+    const metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.projector_type", .value = .{ .string = "qwen3vl_merger" } },
+    };
+    var layout = try gguf_mod.writer.buildLayout(std.testing.allocator, &metadata, &.{});
+    defer layout.deinit(std.testing.allocator);
+    var parsed = try gguf_format.parse(std.testing.allocator, layout.header_bytes);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Kind.clip_qwen3vl_image, detectFile(&parsed));
+    try std.testing.expectError(error.InvalidProjectorContract, inspectFileContract(&parsed));
+}
+
+test "published Qwen3-VL projector satisfies the strict header contract when configured" {
+    const path_env = std.c.getenv("ANTFLY_TEST_QWEN3VL_PROJECTOR_GGUF") orelse return error.SkipZigTest;
+    var mapped = try c_file.MmapRegion.init(std.testing.allocator, std.mem.span(path_env));
+    defer mapped.deinit();
+    var file = try gguf_format.parseStructure(std.testing.allocator, mapped.data);
+    defer file.deinit(std.testing.allocator);
+    try gguf_format.validateTensorDataRanges(&file, mapped.data.len);
+    const contract = try inspectFileContract(&file);
+    try std.testing.expectEqual(Kind.clip_qwen3vl_image, contract.kind);
+    try std.testing.expect(contract.supports_image);
+    try std.testing.expect(!contract.supports_audio);
+    try std.testing.expectEqual(@as(?u32, 2), contract.spatial_merge_size);
+    try std.testing.expect(contract.deepstack_layer_count > 0);
 }
 
 test "published Gemma 4 E2B decoder and projector satisfy the paired strict contract when configured" {
