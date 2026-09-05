@@ -11874,7 +11874,7 @@ pub const Node = struct {
 
         // Discover models from filesystem registry
         const ra = self.registry.allocator;
-        const discovered = self.registry.discoverShallow(io) catch &[_]registry_mod.ModelEntry{};
+        const discovered = try self.registry.discoverShallow(io);
         defer {
             for (discovered) |entry| {
                 ra.free(entry.name);
@@ -11890,7 +11890,7 @@ pub const Node = struct {
         }
         try discovered_listings.ensureTotalCapacity(a, discovered.len);
         for (discovered, 0..) |entry, entry_index| {
-            var manifest = manifest_mod.loadFromDir(a, entry.path) catch continue;
+            var manifest = (try manifest_mod.loadListingCandidateFromDir(a, entry.path)) orelse continue;
             if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
                 manifest.deinit();
                 continue;
@@ -11912,7 +11912,7 @@ pub const Node = struct {
             discovered_listings.appendAssumeCapacity(.{
                 .entry_index = entry_index,
                 .manifest = manifest,
-                .reader_supported = reader_candidate and readers_mod.isSupportedModelDir(a, entry.path),
+                .reader_supported = reader_candidate and readers_mod.isSupportedManifest(a, entry.path, manifest),
                 .kind = model_kind,
                 .compatibility_level = @tagName(compatibility_summary.level),
             });
@@ -16818,6 +16818,57 @@ test "failed readiness refresh preserves the last known good inventory" {
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
     try std.testing.expectEqual(@as(usize, 1), snapshot.counts.classifiers);
+}
+
+test "model listing reports registry discovery failures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models-is-a-file",
+        .data = "not a directory",
+    });
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "models-is-a-file",
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+
+    try std.testing.expectError(
+        error.NotDir,
+        node.listModelsJsonAlloc(allocator, std.testing.io),
+    );
+}
+
+test "model listing does not parse GGUF payloads during discovery" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "generators/acme/demo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/acme/demo/model.gguf",
+        // Listing metadata only needs the artifact's presence. This is
+        // intentionally not a parseable GGUF payload.
+        .data = "listing-only fixture",
+    });
+    const models_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(models_path);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_path });
+    defer node.deinit();
+
+    const body = try node.listModelsJsonAlloc(allocator, std.testing.io);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"acme/demo\":") != null);
 }
 
 test "readiness refresh observes an externally published model" {

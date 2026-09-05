@@ -2494,7 +2494,11 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
             const gliner_model_type = try allocator.dupe(u8, v.string);
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
             manifest.gliner_model_type = gliner_model_type;
-            manifest.model_type_origin = .config;
+            // The GLiNER family name is useful even when the operator has
+            // explicitly selected a public model type. Preserve that explicit
+            // type's provenance instead of making a sidecar appear authoritative.
+            if (!manifest.model_manifest_declarations.model_type)
+                manifest.model_type_origin = .config;
         }
     }
     if (obj.get("default_labels")) |v| {
@@ -3202,7 +3206,28 @@ fn markEmbeddingTaskProfileRequired(manifest: *ModelManifest) void {
     if (!manifest.embedding_profile.isResolved()) manifest.embedding_profile.task_contract = .required;
 }
 
+fn hasEmbeddingExecutionContract(manifest: *const ModelManifest) bool {
+    const declarations = manifest.model_manifest_declarations;
+    return declarations.embedding_profile or
+        declarations.embedding_task_contract or
+        declarations.embedding_query_prefix or
+        declarations.embedding_document_prefix or
+        declarations.embedding_style or
+        manifest.embedding_style != .none or
+        manifest.embedding_profile.task_contract != .symmetric or
+        manifest.embedding_profile.query.declared or
+        manifest.embedding_profile.document.declared or
+        manifest.embedding_profile.instruction_template.len > 0;
+}
+
 fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
+    // Embedding transforms are an execution contract, not descriptive metadata.
+    // Validate the final resolved type after all manifests, sidecars, and bundle
+    // hints have been applied so contradictory sources cannot publish a model
+    // whose task-sensitive input rendering would be silently ignored.
+    if (manifest.model_type != .embedder and hasEmbeddingExecutionContract(manifest))
+        return error.InvalidEmbeddingTaskProfile;
+
     // Known execution styles are trusted model-family evidence. Their default
     // rendering contracts fill any sidecar fields the checkpoint omitted.
     switch (if (manifest.model_manifest_declarations.embedding_profile) EmbeddingStyle.none else manifest.embedding_style) {
@@ -3652,6 +3677,24 @@ test "task-required embedding manifests fail without a complete profile" {
     try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
 }
 
+test "embedding execution contracts require an embedder model type" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"generator","embedding_style":"qwen3_embedding"}
+        ,
+        \\{"type":"reranker","embedding_task_contract":"symmetric"}
+        ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try parseModelManifestJson(&manifest, allocator, manifest_json);
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&manifest));
+    }
+}
+
 test "explicit symmetric embedding contracts reject role transforms" {
     const allocator = std.testing.allocator;
 
@@ -3832,11 +3875,14 @@ test "loadFromDir fails closed on invalid explicit embedding metadata" {
         ,
         \\{"type":"embedder","pooling":"lasst"}
         ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
     }, .{
         error.InvalidEmbeddingTaskProfile,
         error.InvalidEmbeddingTaskProfile,
         error.MissingEmbeddingTaskProfile,
         error.InvalidModelManifest,
+        error.InvalidEmbeddingTaskProfile,
     }) |manifest_json, expected_error| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -3869,11 +3915,14 @@ test "loadListingFromDir fails closed on invalid explicit model manifests" {
         ,
         \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
         ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
     }, .{
         error.InvalidEmbeddingTaskProfile,
         error.InvalidEmbeddingTaskProfile,
         error.InvalidModelManifest,
         error.MissingEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
     }) |manifest_json, expected_error| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -4090,6 +4139,37 @@ test "model manifest execution fields override qwen sentence-transformers sideca
         try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
         try std.testing.expectEqualStrings("operator query: ", manifest.embedding_profile.query.prefix);
         try std.testing.expectEqualStrings("operator document: ", manifest.embedding_profile.document.prefix);
+    }
+}
+
+test "GLiNER sidecars preserve explicit model type provenance" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/model_manifest.json",
+        .data = "{\"type\":\"recognizer\"}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/gliner_config.json",
+        .data = "{\"model_type\":\"gliner2\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var full = try loadFromDir(allocator, dir_path);
+    defer full.deinit();
+    var listing = try loadListingFromDir(allocator, dir_path);
+    defer listing.deinit();
+
+    for ([_]*const ModelManifest{ &full, &listing }) |manifest| {
+        try std.testing.expectEqual(ModelType.recognizer, manifest.model_type);
+        try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+        try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
     }
 }
 
