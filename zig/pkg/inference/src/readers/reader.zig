@@ -210,6 +210,7 @@ const GenAiLoadedReader = struct {
             prompt,
             images[0..],
             .{ .max_tokens = @intCast(options.max_tokens orelse 256) },
+            options.execution_control,
         );
         defer raw.deinit();
 

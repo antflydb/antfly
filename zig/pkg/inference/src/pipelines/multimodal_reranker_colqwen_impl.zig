@@ -165,9 +165,9 @@ pub fn encodeQuery(
     for (encoded.ids, 0..) |id, idx| ids_i64[idx] = id;
 
     const hidden = try gpt_arch.hiddenForward(cb, allocator, gpt_cfg, ids_i64, 1, encoded.ids.len, null);
+    defer allocator.free(hidden);
     if (execution_control) |control| try control.check();
     const projected = try applyRetrievalProjection(cb, allocator, hidden, encoded.ids.len, @intCast(gpt_cfg.hidden_size));
-    allocator.free(hidden);
     return .{
         .allocator = allocator,
         .input_ids = encoded.ids,

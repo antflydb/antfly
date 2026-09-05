@@ -3071,7 +3071,15 @@ pub const GenerationPipeline = struct {
                 }
             }
 
-            const result = try ortgenai.generateWithImages(self.allocator, self.model, prompt, all_images.items, gen_opts);
+            var result = try ortgenai.generateWithImages(
+                self.allocator,
+                self.model,
+                prompt,
+                all_images.items,
+                gen_opts,
+                self.execution_control,
+            );
+            errdefer result.deinit();
             if (self.execution_control) |control| try control.check();
             return .{
                 .text = result.text,
@@ -3083,7 +3091,8 @@ pub const GenerationPipeline = struct {
             };
         }
 
-        const result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts);
+        var result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts, self.execution_control);
+        errdefer result.deinit();
         if (self.execution_control) |control| try control.check();
         return .{
             .text = result.text,
@@ -3131,33 +3140,18 @@ pub const GenerationPipeline = struct {
             .top_k = config.top_k,
         };
 
-        const ControlledCallback = struct {
-            control: ?InferenceExecutionControl,
+        const ForwardingCallback = struct {
             downstream_ctx: *anyopaque,
             downstream: TokenCallback,
-            completed: u64 = 0,
-            total: u64,
-            control_error: ?anyerror = null,
 
             fn call(raw: *anyopaque, text: []const u8) bool {
                 const callback: *@This() = @ptrCast(@alignCast(raw));
-                callback.completed +|= 1;
-                if (callback.control) |control| control.update(
-                    .executing,
-                    callback.completed,
-                    callback.total,
-                ) catch |err| {
-                    callback.control_error = err;
-                    return false;
-                };
                 return callback.downstream(callback.downstream_ctx, text);
             }
         };
-        var callback = ControlledCallback{
-            .control = self.execution_control,
+        var callback = ForwardingCallback{
             .downstream_ctx = on_token_ctx,
             .downstream = on_token,
-            .total = @intCast(@max(config.max_tokens, 1)),
         };
         var result = try ortgenai.generateStreaming(
             self.allocator,
@@ -3165,14 +3159,11 @@ pub const GenerationPipeline = struct {
             prompt,
             gen_opts,
             @ptrCast(&callback),
-            ControlledCallback.call,
+            ForwardingCallback.call,
+            self.execution_control,
         );
-        if (callback.control_error) |err| {
-            result.deinit();
-            return err;
-        }
+        errdefer result.deinit();
         if (self.execution_control) |control| control.check() catch |err| {
-            result.deinit();
             return err;
         };
         return .{

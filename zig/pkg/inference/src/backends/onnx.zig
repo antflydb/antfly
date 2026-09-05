@@ -655,6 +655,79 @@ pub fn runWithBoundValues(
     retain_output_names: []const []const u8,
     allocator: std.mem.Allocator,
 ) !BoundRunResult {
+    return runWithBoundValuesImpl(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+        null,
+    );
+}
+
+/// Run an IO-bound ONNX request with the same native termination contract as
+/// Session.runWithControl. This is separate from Session because retained
+/// OrtValues are an ONNX-specific cache optimization, but it must not create a
+/// cancellation blind spot for backend-owned KV runtimes.
+pub fn runWithBoundValuesControl(
+    session: Session,
+    tensor_inputs: []const Tensor,
+    retained_inputs: []const RetainedInput,
+    retain_output_names: []const []const u8,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !BoundRunResult {
+    const active = control orelse return runWithBoundValues(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+    );
+    try active.check();
+
+    const api = getApi();
+    var run_options: ?*c.OrtRunOptions = null;
+    try checkStatus(api, api.CreateRunOptions.?(&run_options));
+    defer api.ReleaseRunOptions.?(run_options.?);
+
+    var watcher = RunCancellationWatcher{
+        .api = api,
+        .run_options = run_options.?,
+        .control = active,
+    };
+    const watcher_thread = try std.Thread.spawn(.{}, RunCancellationWatcher.run, .{&watcher});
+    defer {
+        watcher.finished.store(true, .release);
+        watcher_thread.join();
+    }
+
+    var result = runWithBoundValuesImpl(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+        run_options,
+    ) catch |err| {
+        if (watcher.termination_requested.load(.acquire)) {
+            active.check() catch |control_err| return control_err;
+        }
+        return err;
+    };
+    errdefer result.deinit();
+    try active.check();
+    return result;
+}
+
+fn runWithBoundValuesImpl(
+    session: Session,
+    tensor_inputs: []const Tensor,
+    retained_inputs: []const RetainedInput,
+    retain_output_names: []const []const u8,
+    allocator: std.mem.Allocator,
+    run_options: ?*c.OrtRunOptions,
+) !BoundRunResult {
     const self: *OnnxSession = @ptrCast(@alignCast(session.ptr));
     const api = getApi();
 
@@ -692,7 +765,7 @@ pub fn runWithBoundValues(
         try checkStatus(api, api.BindOutputToDevice.?(binding.?, name.ptr, memory_info.?));
     }
 
-    try checkStatus(api, api.RunWithBinding.?(self.session, null, binding.?));
+    try checkStatus(api, api.RunWithBinding.?(self.session, run_options, binding.?));
 
     const ort_allocator = try getDefaultAllocator(api);
     var output_values: [*c]?*c.OrtValue = null;
