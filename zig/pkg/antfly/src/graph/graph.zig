@@ -1537,6 +1537,23 @@ pub const GraphIndex = struct {
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "phase", @tagName(phase), iteration_text });
     }
 
+    fn graphMetricBuildPhaseProgressKeyAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+    ) ![]u8 {
+        const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
+        defer self.alloc.free(job_id_text);
+        const iteration_text = try std.fmt.allocPrint(self.alloc, "{d}", .{iteration});
+        defer self.alloc.free(iteration_text);
+        // Computational progress belongs to the job artifact namespace, so all
+        // retirement paths remain one bounded cleanup protocol. Cleanup pages
+        // use their existing page/job cursor and never create these records.
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "progress", @tagName(phase), iteration_text });
+    }
+
     fn graphMetricBuildIterationSummaryKeyAlloc(
         self: *GraphIndex,
         metric_name: []const u8,
@@ -2264,6 +2281,23 @@ pub const GraphIndex = struct {
         return decodeGraphMetricBuildPhaseSummary(raw);
     }
 
+    fn metricBuildPhaseProgress(
+        self: *GraphIndex,
+        txn: anytype,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+    ) !?GraphMetricBuildPhaseProgress {
+        const key = try self.graphMetricBuildPhaseProgressKeyAlloc(metric_name, job_id, phase, iteration);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return decodeGraphMetricBuildPhaseProgress(raw);
+    }
+
     fn metricBuildIterationSummary(
         self: *GraphIndex,
         txn: anytype,
@@ -2334,17 +2368,20 @@ pub const GraphIndex = struct {
 
         if (try self.metricBuildJob(&batch, metric_name)) |prior_job| {
             if (prior_job.phase != .complete) {
-                // A missing/expired lease starts a new score epoch. Retire the
-                // prior namespace in the same transaction before replacing
-                // the active-job pointer so crashes and rolling upgrades can
-                // never orphan incompatible page layouts.
-                try self.retireSupersededGraphMetricBuildInBatch(
-                    &batch,
-                    metric_name,
-                    cfg,
-                    prior_job,
-                    "GraphMetricBuildSupersededByLeaseTakeover",
-                );
+                // Explicit failure already recorded diagnostics and enqueued
+                // bounded namespace retirement. Replacing that failed active
+                // pointer must not count the same build a second time as a
+                // lease-takeover failure. Unrecorded abandoned work still goes
+                // through the superseded-build path here.
+                if (prior_job.retry_count == 0 and prior_job.last_error.len == 0) {
+                    try self.retireSupersededGraphMetricBuildInBatch(
+                        &batch,
+                        metric_name,
+                        cfg,
+                        prior_job,
+                        "GraphMetricBuildSupersededByLeaseTakeover",
+                    );
+                }
             }
         }
 
@@ -3459,24 +3496,44 @@ pub const GraphIndex = struct {
             }
         }
         if (candidate_page_id == null) {
+            const progress = try self.metricBuildPhaseProgress(&batch, metric_name, job_id, phase, iteration);
+            if (progress) |current| {
+                if (current.pending_pages == 0 and current.failed_pages == 0 and current.leased_pages == 0) {
+                    try batch.commit();
+                    return null;
+                }
+            }
             const prefix = try self.graphMetricBuildPagePrefixAlloc(metric_name, job_id, phase, iteration);
             defer self.alloc.free(prefix);
+            // Cleanup pages have ordered destructive dependencies and must
+            // retain prefix-order claims. Computational phases are independent
+            // and can safely use the durable round-robin cursor.
+            const cursor_page_id = if (phase != .cleanup_old_generations)
+                if (progress) |current| current.next_claim_page_id else 0
+            else
+                0;
+            const start_key = try self.graphMetricBuildPageKeyAlloc(metric_name, job_id, phase, iteration, cursor_page_id);
+            defer self.alloc.free(start_key);
             var cur = try batch.openCursor();
             defer cur.close();
-            var entry_opt = try cur.seekAtOrAfter(prefix);
-            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-                const page = decodeGraphMetricBuildPage(entry.value) orelse return error.InvalidGraphMetricBuildPage;
-                if (page.job_id != job_id or page.phase != phase or page.iteration != iteration) return error.InvalidGraphMetricBuildPage;
-                const eligible = switch (page.state) {
-                    .pending, .failed => true,
-                    .leased => page.lease_expires_at_ms <= now_ms or std.mem.eql(u8, page.worker_id, worker_id),
-                    .complete => false,
-                };
-                if (!eligible) continue;
-                if (page.attempt >= graph_metric_build_max_page_attempts) continue;
-                candidate_page_id = page.page_id;
-                break;
+            var pass: usize = 0;
+            while (pass < 2 and candidate_page_id == null) : (pass += 1) {
+                if (pass == 1 and cursor_page_id == 0) break;
+                var entry_opt = try cur.seekAtOrAfter(if (pass == 0) start_key else prefix);
+                while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    if (pass == 1 and std.mem.order(u8, entry.key, start_key) != .lt) break;
+                    const page = decodeGraphMetricBuildPage(entry.value) orelse return error.InvalidGraphMetricBuildPage;
+                    if (page.job_id != job_id or page.phase != phase or page.iteration != iteration) return error.InvalidGraphMetricBuildPage;
+                    const eligible = switch (page.state) {
+                        .pending, .failed => true,
+                        .leased => page.lease_expires_at_ms <= now_ms or std.mem.eql(u8, page.worker_id, worker_id),
+                        .complete => false,
+                    };
+                    if (!eligible or page.attempt >= graph_metric_build_max_page_attempts) continue;
+                    candidate_page_id = page.page_id;
+                    break;
+                }
             }
         }
         const page_id = candidate_page_id orelse {
@@ -3484,6 +3541,13 @@ pub const GraphIndex = struct {
             return null;
         };
         const claimed = try self.claimGraphMetricBuildPageInBatch(&batch, metric_name, job_id, phase, iteration, page_id, worker_id, now_ms);
+        if (claimed != null and phase != .cleanup_old_generations) {
+            if (try self.metricBuildPhaseProgress(&batch, metric_name, job_id, phase, iteration)) |current| {
+                var next = current;
+                next.next_claim_page_id = page_id +% 1;
+                try self.putGraphMetricBuildPhaseProgressInBatch(&batch, metric_name, next);
+            }
+        }
         try batch.commit();
         return claimed;
     }
@@ -3520,11 +3584,18 @@ pub const GraphIndex = struct {
         var page = try self.metricBuildPage(batch, metric_name, job_id, phase, iteration, page_id) orelse return error.GraphMetricBuildPageNotFound;
         if (phase == .cleanup_old_generations) {
             const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-            if (graphMetricBuildCleanupPageIsFinal(cfg.kind, page)) {
+            if (graphMetricBuildCleanupPageIsFinal(cfg.kind, page) and page.cursor.len == 0 and page.completed_units == 0) {
                 // The final page removes the whole job namespace. It must not
                 // race a narrower cleanup lease which could otherwise recreate
-                // progress records after completion.
-                for (0..page.page_id) |prior_page_id| {
+                // progress records after completion. Once bounded final-page
+                // cleanup has a cursor, its predecessor records may themselves
+                // have been retired and the durable cursor is the resume fence.
+                // Most metric kinds assign cleanup page IDs from zero, while a
+                // single-page cleanup may retain its phase-manifest page ID.
+                // Dependency cardinality, not that physical ID, defines the
+                // predecessor set.
+                const cleanup_page_count = graphMetricBuildCleanupPageCount(cfg.kind);
+                for (0..cleanup_page_count - 1) |prior_page_id| {
                     const prior = try self.metricBuildPage(
                         batch,
                         metric_name,
@@ -3910,6 +3981,32 @@ pub const GraphIndex = struct {
         phase: GraphMetricBuildPhase,
         iteration: u32,
     ) !GraphMetricBuildPhaseSummary {
+        if (try self.metricBuildPhaseProgress(batch, metric_name, job.job_id, phase, iteration)) |progress| {
+            if (progress.completed_pages != progress.expected_pages) {
+                const state: GraphMetricBuildPhaseState = if (progress.failed_pages != 0) .failed else .pending;
+                const summary = GraphMetricBuildPhaseSummary{
+                    .job_id = job.job_id,
+                    .phase = phase,
+                    .iteration = iteration,
+                    .state = state,
+                    .expected_pages = progress.expected_pages,
+                    .completed_pages = progress.completed_pages,
+                    .failed_pages = progress.failed_pages,
+                    .completed_units = progress.completed_units,
+                    .total_units = progress.total_units,
+                };
+                try self.putGraphMetricBuildPhaseSummaryInBatch(batch, metric_name, summary);
+                return summary;
+            }
+            if (try self.metricBuildPhaseSummary(batch, metric_name, job.job_id, phase, iteration)) |cached| {
+                if (cached.state == .complete and cached.expected_pages == progress.expected_pages and
+                    cached.completed_pages == progress.completed_pages and cached.completed_units == progress.completed_units and
+                    cached.total_units == progress.total_units)
+                {
+                    return cached;
+                }
+            }
+        }
         var expected_pages: u64 = 0;
         var completed_pages: u64 = 0;
         var failed_pages: u64 = 0;
@@ -3984,6 +4081,9 @@ pub const GraphIndex = struct {
     ) !?GraphMetricBuildPageExhaustion {
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
+        if (try self.metricBuildPhaseProgress(&txn, metric_name, job_id, phase, iteration)) |progress| {
+            if (progress.max_attempt_pages == 0) return null;
+        }
         const page_prefix = try self.graphMetricBuildPagePrefixAlloc(metric_name, job_id, phase, iteration);
         defer self.alloc.free(page_prefix);
         var cur = try txn.openCursor();
@@ -4394,12 +4494,83 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         page: GraphMetricBuildPage,
     ) !void {
+        if (page.phase == .cleanup_old_generations) {
+            const page_key = try self.graphMetricBuildPageKeyAlloc(metric_name, page.job_id, page.phase, page.iteration, page.page_id);
+            defer self.alloc.free(page_key);
+            const encoded = try self.alloc.alloc(u8, graphMetricBuildPageEncodedLen(page));
+            defer self.alloc.free(encoded);
+            encodeGraphMetricBuildPage(page, encoded);
+            try batch.put(page_key, encoded);
+            return;
+        }
+        const previous = try self.metricBuildPage(batch, metric_name, page.job_id, page.phase, page.iteration, page.page_id);
+        var progress = try self.metricBuildPhaseProgress(batch, metric_name, page.job_id, page.phase, page.iteration) orelse blk: {
+            var rebuilt = GraphMetricBuildPhaseProgress{
+                .job_id = page.job_id,
+                .phase = page.phase,
+                .iteration = page.iteration,
+            };
+            if (previous != null) {
+                const prefix = try self.graphMetricBuildPagePrefixAlloc(metric_name, page.job_id, page.phase, page.iteration);
+                defer self.alloc.free(prefix);
+                var cur = try batch.openCursor();
+                defer cur.close();
+                var entry_opt = try cur.seekAtOrAfter(prefix);
+                while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    const existing = decodeGraphMetricBuildPage(entry.value) orelse return error.InvalidGraphMetricBuildPage;
+                    try updateGraphMetricBuildPhaseProgress(&rebuilt, existing, true);
+                }
+            }
+            break :blk rebuilt;
+        };
+        if (progress.job_id != page.job_id or progress.phase != page.phase or progress.iteration != page.iteration)
+            return error.InvalidGraphMetricBuildPage;
+        if (previous) |old| try updateGraphMetricBuildPhaseProgress(&progress, old, false);
+        try updateGraphMetricBuildPhaseProgress(&progress, page, true);
+
         const page_key = try self.graphMetricBuildPageKeyAlloc(metric_name, page.job_id, page.phase, page.iteration, page.page_id);
         defer self.alloc.free(page_key);
         const encoded = try self.alloc.alloc(u8, graphMetricBuildPageEncodedLen(page));
         defer self.alloc.free(encoded);
         encodeGraphMetricBuildPage(page, encoded);
         try batch.put(page_key, encoded);
+        try self.putGraphMetricBuildPhaseProgressInBatch(batch, metric_name, progress);
+    }
+
+    fn updateGraphMetricBuildPhaseProgress(progress: *GraphMetricBuildPhaseProgress, page: GraphMetricBuildPage, add: bool) !void {
+        const apply = struct {
+            fn value(target: *u64, amount: u64, should_add: bool) !void {
+                target.* = if (should_add)
+                    std.math.add(u64, target.*, amount) catch return error.InvalidGraphMetricBuildPage
+                else
+                    std.math.sub(u64, target.*, amount) catch return error.InvalidGraphMetricBuildPage;
+            }
+        }.value;
+        try apply(&progress.expected_pages, 1, add);
+        try apply(&progress.completed_units, page.completed_units, add);
+        try apply(&progress.total_units, page.total_units, add);
+        switch (page.state) {
+            .pending => try apply(&progress.pending_pages, 1, add),
+            .leased => try apply(&progress.leased_pages, 1, add),
+            .complete => try apply(&progress.completed_pages, 1, add),
+            .failed => try apply(&progress.failed_pages, 1, add),
+        }
+        if (page.attempt >= graph_metric_build_max_page_attempts and (page.state == .leased or page.state == .failed))
+            try apply(&progress.max_attempt_pages, 1, add);
+    }
+
+    fn putGraphMetricBuildPhaseProgressInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        progress: GraphMetricBuildPhaseProgress,
+    ) !void {
+        const key = try self.graphMetricBuildPhaseProgressKeyAlloc(metric_name, progress.job_id, progress.phase, progress.iteration);
+        defer self.alloc.free(key);
+        var encoded: [graph_metric_build_phase_progress_encoded_len]u8 = undefined;
+        encodeGraphMetricBuildPhaseProgress(progress, &encoded);
+        try batch.put(key, &encoded);
     }
 
     fn putGraphMetricBuildPhaseSummaryInBatch(
@@ -6458,6 +6629,25 @@ pub const GraphIndex = struct {
         output_fingerprint: u64 = 0,
     };
 
+    /// Transactionally maintained, order-independent phase state. Floating
+    /// aggregates intentionally remain in the phase summary: they are reduced
+    /// once in page-key order after this record reports full completion, so
+    /// distributed worker timing cannot change published results.
+    const GraphMetricBuildPhaseProgress = struct {
+        job_id: u64 = 0,
+        phase: GraphMetricBuildPhase = .prepare_generation,
+        iteration: u32 = 0,
+        expected_pages: u64 = 0,
+        pending_pages: u64 = 0,
+        leased_pages: u64 = 0,
+        completed_pages: u64 = 0,
+        failed_pages: u64 = 0,
+        max_attempt_pages: u64 = 0,
+        completed_units: u64 = 0,
+        total_units: u64 = 0,
+        next_claim_page_id: u64 = 0,
+    };
+
     const GraphMetricBuildIterationSummary = struct {
         job_id: u64 = 0,
         iteration: u32 = 0,
@@ -6578,6 +6768,7 @@ pub const GraphIndex = struct {
     const graph_metric_build_page_v2_header_len = graph_metric_build_page_v1_header_len + 8 + 8 + 8 + 8;
     const graph_metric_build_page_header_len = graph_metric_build_page_v2_header_len + 8 + 8 + 8 + 8;
     const graph_metric_build_phase_summary_encoded_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
+    const graph_metric_build_phase_progress_encoded_len = 13 * @sizeOf(u64);
     const graph_metric_build_iteration_summary_encoded_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
     const graph_metric_failure_detail_header_len = 8;
     const graph_metric_failure_record_header_len = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
@@ -7190,6 +7381,54 @@ pub const GraphIndex = struct {
             std.mem.writeInt(u64, out[offset..][0..8], value, .little);
             offset += 8;
         }
+    }
+
+    fn encodeGraphMetricBuildPhaseProgress(progress: GraphMetricBuildPhaseProgress, out: *[graph_metric_build_phase_progress_encoded_len]u8) void {
+        var offset: usize = 0;
+        inline for (.{
+            @as(u64, 1),
+            progress.job_id,
+            @as(u64, @intFromEnum(progress.phase)),
+            @as(u64, progress.iteration),
+            progress.expected_pages,
+            progress.pending_pages,
+            progress.leased_pages,
+            progress.completed_pages,
+            progress.failed_pages,
+            progress.max_attempt_pages,
+            progress.completed_units,
+            progress.total_units,
+            progress.next_claim_page_id,
+        }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+    }
+
+    fn decodeGraphMetricBuildPhaseProgress(raw: []const u8) ?GraphMetricBuildPhaseProgress {
+        if (raw.len != graph_metric_build_phase_progress_encoded_len) return null;
+        var values: [13]u64 = undefined;
+        for (&values, 0..) |*value, i| value.* = std.mem.readInt(u64, raw[i * 8 ..][0..8], .little);
+        if (values[0] != 1 or values[3] > std.math.maxInt(u32)) return null;
+        const phase = graphMetricBuildPhaseFromRaw(values[2]) orelse return null;
+        const state_pages = std.math.add(u64, values[5], values[6]) catch return null;
+        const non_terminal_pages = std.math.add(u64, state_pages, values[8]) catch return null;
+        const all_pages = std.math.add(u64, non_terminal_pages, values[7]) catch return null;
+        if (all_pages != values[4] or values[7] > values[4] or values[9] > values[4] or values[10] > values[11]) return null;
+        return .{
+            .job_id = values[1],
+            .phase = phase,
+            .iteration = @intCast(values[3]),
+            .expected_pages = values[4],
+            .pending_pages = values[5],
+            .leased_pages = values[6],
+            .completed_pages = values[7],
+            .failed_pages = values[8],
+            .max_attempt_pages = values[9],
+            .completed_units = values[10],
+            .total_units = values[11],
+            .next_claim_page_id = values[12],
+        };
     }
 
     fn decodeGraphMetricBuildPhaseSummary(raw: []const u8) ?GraphMetricBuildPhaseSummary {
@@ -13228,7 +13467,12 @@ pub const GraphIndex = struct {
             var job_txn = try self.beginReadReverseTxn();
             defer job_txn.abort();
             const decoded_job = try self.metricBuildJob(&job_txn, metric_name) orelse return error.GraphMetricBuildJobNotFound;
-            if (decoded_job.phase != .complete) {
+            // Cleanup incrementally retires the immutable job namespace, which
+            // includes the manifest. Once publication has advanced the durable
+            // job into cleanup, execution is fenced by that job record and page
+            // leases; requiring a manifest that cleanup is designed to delete
+            // makes multi-batch retirement impossible.
+            if (decoded_job.phase != .complete and decoded_job.phase != .cleanup_old_generations) {
                 const manifest = try self.metricBuildManifest(&job_txn, metric_name, decoded_job.job_id) orelse
                     return error.GraphMetricBuildManifestNotFound;
                 if (manifest.execution_schema_version != graph_metric_build_execution_schema_version or
@@ -23158,11 +23402,17 @@ fn drainGraphMetricBuildToPublishForTest(
     phases: []const GraphIndex.GraphMetricBuildPhase,
 ) !void {
     for (phases) |expected_phase| {
-        const step = try graph.runGraphMetricPlannedWorkerStep(metric_name, cfg, worker_id);
-        try std.testing.expectEqual(expected_phase, step.phase);
-        try std.testing.expect(step.claimed_page);
-        try std.testing.expect(step.completed_page);
-        try std.testing.expect(step.advanced_phase);
+        var page_steps: usize = 0;
+        while (true) {
+            const step = try graph.runGraphMetricPlannedWorkerStep(metric_name, cfg, worker_id);
+            try std.testing.expectEqual(expected_phase, step.phase);
+            try std.testing.expect(step.claimed_page);
+            try std.testing.expect(step.completed_page);
+            page_steps += 1;
+            if (step.advanced_phase) break;
+            if (page_steps > graph_metric_build_max_partition_pages + 1)
+                return error.TestGraphMetricBuildDidNotAdvance;
+        }
     }
 }
 

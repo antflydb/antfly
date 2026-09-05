@@ -105,6 +105,17 @@ pub const PointScoresResult = struct {
     }
 };
 
+const PointScoresMetadata = struct {
+    config_fingerprint: u64,
+    converged: bool,
+    iterations_completed: u32,
+    delta: f64,
+    metadata_version: u16,
+    published_generation: u64,
+    edge_generation: u64,
+    computed_at_ms: u64,
+};
+
 pub const PointScoreColumnsResult = struct {
     columns: []PointScoresResult,
 
@@ -177,22 +188,29 @@ pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_in
     return .{ .node_id = try alloc.dupe(u8, node_id), .value = value };
 }
 
-fn clonePointScoresResultAlloc(alloc: Allocator, source: PointScoresResult) !PointScoresResult {
-    const scores = try alloc.dupe(?f64, source.scores);
-    errdefer alloc.free(scores);
-    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+fn pointScoresResultAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    scores: []?f64,
+    metadata: PointScoresMetadata,
+) !PointScoresResult {
+    const specs = try session.graphMetricSpecs();
+    const config = findConfig(specs, graph_index_name, metric_name) orelse return error.MetricNotConfigured;
+    var edge_filter = try config.edge_filter.cloneAlloc(alloc);
     errdefer edge_filter.deinit(alloc);
     return .{
         .scores = scores,
-        .config_fingerprint = source.config_fingerprint,
-        .converged = source.converged,
-        .iterations_completed = source.iterations_completed,
-        .delta = source.delta,
+        .config_fingerprint = metadata.config_fingerprint,
+        .converged = metadata.converged,
+        .iterations_completed = metadata.iterations_completed,
+        .delta = metadata.delta,
         .edge_filter = edge_filter,
-        .metadata_version = source.metadata_version,
-        .published_generation = source.published_generation,
-        .edge_generation = source.edge_generation,
-        .computed_at_ms = source.computed_at_ms,
+        .metadata_version = metadata.metadata_version,
+        .published_generation = metadata.published_generation,
+        .edge_generation = metadata.edge_generation,
+        .computed_at_ms = metadata.computed_at_ms,
     };
 }
 
@@ -201,16 +219,18 @@ fn scoreColumnWorker(
     graph_index_name: []const u8,
     metric_name: []const u8,
     node_ids: []const []const u8,
-    output: *?PointScoresResult,
+    scores: []?f64,
+    output: *?PointScoresMetadata,
     failure: *?anyerror,
     cancel_siblings: *std.atomic.Value(bool),
 ) void {
-    output.* = scoresAlloc(
+    output.* = scoresInto(
         std.heap.smp_allocator,
         child,
         graph_index_name,
         metric_name,
         node_ids,
+        scores,
     ) catch |err| {
         failure.* = err;
         cancel_siblings.store(true, .release);
@@ -273,17 +293,17 @@ pub fn scoreColumnsAlloc(
         const count = end - start;
         var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
         var child_diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
-        var temporary: [max_parallel_point_score_columns]?PointScoresResult = @splat(null);
+        var score_buffers: [max_parallel_point_score_columns]?[]?f64 = @splat(null);
+        var temporary: [max_parallel_point_score_columns]?PointScoresMetadata = @splat(null);
         var failures: [max_parallel_point_score_columns]?anyerror = @splat(null);
         var sibling_failure = std.atomic.Value(bool).init(false);
         var combined_cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
-        defer for (temporary[0..count]) |*maybe_column| {
-            if (maybe_column.*) |*column| column.deinit(std.heap.smp_allocator);
-        };
+        defer for (score_buffers[0..count]) |maybe_scores| if (maybe_scores) |scores| alloc.free(scores);
 
         const io = session.io.?;
         var group: std.Io.Group = .init;
         for (metric_names[start..end], 0..) |metric_name, relative_index| {
+            score_buffers[relative_index] = try alloc.alloc(?f64, node_ids.len);
             children[relative_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
             combined_cancellations[relative_index] = .{
                 .parent = session.cancellation,
@@ -296,6 +316,7 @@ pub fn scoreColumnsAlloc(
                 graph_index_name,
                 metric_name,
                 node_ids,
+                score_buffers[relative_index].?,
                 &temporary[relative_index],
                 &failures[relative_index],
                 &sibling_failure,
@@ -321,12 +342,18 @@ pub fn scoreColumnsAlloc(
         };
         for (failures[0..count]) |failure| if (failure) |err| return err;
 
-        for (temporary[0..count], 0..) |*maybe_column, relative_index| {
-            var source = maybe_column.* orelse return error.InvalidGraphMetricSegment;
-            columns[start + relative_index] = try clonePointScoresResultAlloc(alloc, source);
+        for (temporary[0..count], 0..) |maybe_metadata, relative_index| {
+            const metadata = maybe_metadata orelse return error.InvalidGraphMetricSegment;
+            columns[start + relative_index] = try pointScoresResultAlloc(
+                alloc,
+                session,
+                graph_index_name,
+                metric_names[start + relative_index],
+                score_buffers[relative_index].?,
+                metadata,
+            );
             initialized_columns += 1;
-            source.deinit(std.heap.smp_allocator);
-            maybe_column.* = null;
+            score_buffers[relative_index] = null;
         }
         start = end;
     }
@@ -342,7 +369,25 @@ pub fn scoresAlloc(
     metric_name: []const u8,
     node_ids: []const []const u8,
 ) !PointScoresResult {
+    const values = try alloc.alloc(?f64, node_ids.len);
+    errdefer alloc.free(values);
+    const metadata = try scoresInto(alloc, session, graph_index_name, metric_name, node_ids, values);
+    return try pointScoresResultAlloc(alloc, session, graph_index_name, metric_name, values, metadata);
+}
+
+/// Resolves scores directly into caller-owned storage. Parallel column reads
+/// allocate their final buffers once on the request allocator while workers
+/// use a thread-safe allocator only for transient I/O and decode state.
+fn scoresInto(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    node_ids: []const []const u8,
+    values: []?f64,
+) !PointScoresMetadata {
     try session.checkCancellation();
+    if (values.len != node_ids.len) return error.InvalidGraphMetricSegment;
     if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     const retained_score_bytes = std.math.mul(usize, node_ids.len, @sizeOf(?f64)) catch return error.GraphMetricQueryBudgetExceeded;
     try session.chargeGraphMetricRetained(retained_score_bytes);
@@ -381,15 +426,11 @@ pub fn scoresAlloc(
     // score can be observed. Avoid fetching a legacy full artifact or a v4+
     // routing footer (up to 16 MiB) merely to return an empty column.
     if (node_ids.len == 0) {
-        var edge_filter = try config.edge_filter.cloneAlloc(alloc);
-        errdefer edge_filter.deinit(alloc);
         return .{
-            .scores = try alloc.alloc(?f64, 0),
             .config_fingerprint = control.header.config_fingerprint,
             .converged = control.header.converged,
             .iterations_completed = control.header.iterations_completed,
             .delta = control.header.delta,
-            .edge_filter = edge_filter,
             .metadata_version = control.header.version,
             .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
             .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
@@ -403,21 +444,15 @@ pub fn scoresAlloc(
     if (control.header.version < 4) {
         var segment = try loadVerifiedAlloc(alloc, session, graph_index_name, metric_name);
         defer segment.deinit(alloc);
-        const values = try alloc.alloc(?f64, node_ids.len);
-        errdefer alloc.free(values);
         for (node_ids, 0..) |node_id, i| {
             if (i % 4096 == 0) try session.checkCancellation();
             values[i] = segment.score(node_id);
         }
-        var edge_filter = try segment.edge_filter.cloneAlloc(alloc);
-        errdefer edge_filter.deinit(alloc);
         return .{
-            .scores = values,
             .config_fingerprint = segment.config_fingerprint,
             .converged = segment.converged,
             .iterations_completed = segment.iterations_completed,
             .delta = segment.delta,
-            .edge_filter = edge_filter,
             .metadata_version = control.header.version,
             .published_generation = segment.published_generation,
             .edge_generation = segment.edge_generation,
@@ -441,8 +476,6 @@ pub fn scoresAlloc(
         return error.InvalidGraphMetricSegment;
     }
 
-    const values = try alloc.alloc(?f64, node_ids.len);
-    errdefer alloc.free(values);
     @memset(values, null);
     const block_counts = try alloc.alloc(usize, routing.entries.len);
     defer alloc.free(block_counts);
@@ -514,15 +547,11 @@ pub fn scoresAlloc(
         }
         fetch_start = fetch_end;
     }
-    var edge_filter = try config.edge_filter.cloneAlloc(alloc);
-    errdefer edge_filter.deinit(alloc);
     return .{
-        .scores = values,
         .config_fingerprint = control.header.config_fingerprint,
         .converged = control.header.converged,
         .iterations_completed = control.header.iterations_completed,
         .delta = control.header.delta,
-        .edge_filter = edge_filter,
         .metadata_version = control.header.version,
         .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
         .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,

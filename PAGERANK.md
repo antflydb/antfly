@@ -517,8 +517,13 @@ top tier. Independent immutable score ranges use bounded eight-way `std.Io`
 fanout, while every child view shares the same synchronized request ledger and
 pinned manifest. Range payloads are decoded and released one fanout batch at a
 time, so peak temporary memory is bounded by concurrency rather than the total
-number of planned ranges. v1-v3 compatibility reads are charged for their full
-artifact before materialization.
+number of planned ranges. Parallel metric workers write into disjoint
+request-owned result columns, avoiding a second full-column clone from the
+thread-safe transient allocator. Public graph shaping carries stable source-row
+ordinals through filter and order stages, fetches later dependencies only for
+surviving rows, and moves nodes once when the final projection is materialized.
+v1-v3 compatibility reads are charged for their full artifact before
+materialization.
 
 Planned native maintenance pins the index catalog with a shared lifetime guard
 for each bounded scheduler unit. It does not hold the database-wide apply fence:
@@ -526,6 +531,17 @@ graph storage transactions, page leases, attempt identities, and publication
 generation fences are the concurrency boundary. A short cooperative pause after
 durable progress protects foreground storage latency without serializing graph
 writes behind a complete maintenance page.
+
+Each computational native phase also maintains an order-independent progress
+record in the same transaction as its page mutation. Claims advance a durable
+round-robin cursor, idle coordinator ticks can decide incomplete/failed state
+without a page scan, and exhausted-page scans are skipped unless a page has
+reached the attempt ceiling. Cleanup instead uses its bounded page/job cursor,
+so every retirement path remains a single job-namespace protocol. Once every
+computational page is complete, the coordinator performs one page-key-ordered
+floating-point reduction and caches the phase summary. This keeps publication
+bit-deterministic without recomputing floating aggregates after every
+completion.
 
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible

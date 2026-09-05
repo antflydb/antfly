@@ -1202,6 +1202,65 @@ pub const GraphQueryEngine = struct {
         return metric_values_slab;
     }
 
+    /// Installs an already-selected row set whose score columns are aligned
+    /// with output order rather than the original candidate array. Staged
+    /// backends use this to carry stable source ordinals through filtering and
+    /// ordering, then move nodes and materialize projected values exactly once.
+    pub fn materializeSelectedMetricColumns(
+        alloc: Allocator,
+        metric_value_names: []const []const u8,
+        aligned_score_columns: []const []?f64,
+        selected_source_indexes: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
+        if (metric_value_names.len != aligned_score_columns.len)
+            return error.InvalidQueryRequest;
+        for (aligned_score_columns, metric_value_names, 0..) |column, name, i| {
+            if (column.len != selected_source_indexes.len or name.len == 0)
+                return error.InvalidQueryRequest;
+            for (metric_value_names[0..i]) |prior_name| {
+                if (std.mem.eql(u8, prior_name, name)) return error.InvalidQueryRequest;
+            }
+        }
+
+        const selected_mask = try alloc.alloc(bool, nodes.*.len);
+        defer alloc.free(selected_mask);
+        @memset(selected_mask, false);
+        for (selected_source_indexes) |source_index| {
+            if (source_index >= nodes.*.len or selected_mask[source_index])
+                return error.InvalidQueryRequest;
+            selected_mask[source_index] = true;
+        }
+
+        const slab_len = std.math.mul(usize, selected_source_indexes.len, metric_value_names.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        const metric_values_slab = if (slab_len == 0)
+            @constCast((&[_]GraphMetricValue{})[0..])
+        else
+            try alloc.alloc(GraphMetricValue, slab_len);
+        errdefer if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+        for (selected_source_indexes, 0..) |_, row_index| {
+            const row = metric_values_slab[row_index * metric_value_names.len ..][0..metric_value_names.len];
+            for (row, metric_value_names, aligned_score_columns) |*value, name, column| {
+                value.* = .{ .name = name, .score = column[row_index], .name_owned = false };
+            }
+        }
+
+        const final_nodes = try alloc.alloc(GraphResultNode, selected_source_indexes.len);
+        for (selected_source_indexes, 0..) |source_index, out_index| {
+            var node = nodes.*[source_index];
+            for (node.metrics) |*metric| metric.deinit(alloc);
+            if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
+            node.metrics = metric_values_slab[out_index * metric_value_names.len ..][0..metric_value_names.len];
+            node.metrics_owned = false;
+            final_nodes[out_index] = node;
+        }
+        for (nodes.*, selected_mask) |*node, keep| if (!keep) node.deinit(alloc);
+        alloc.free(nodes.*);
+        nodes.* = final_nodes;
+        return metric_values_slab;
+    }
+
     /// Keep metric scores columnar through filtering, ordering, and limiting.
     /// Per-node public metric objects are created only for the surviving result
     /// page, avoiding candidate-count heap fragmentation and needless copies.
@@ -3732,6 +3791,43 @@ test "graph metric shared column application is allocation-failure safe" {
             try std.testing.expectEqual(@as(usize, 2), nodes.len);
             try std.testing.expectEqualStrings("b", nodes[0].key);
             try std.testing.expectEqual(@as(?f64, 0.9), nodes[0].metrics[0].score);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric stable row materialization moves nodes once and is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metric_values_slab: []GraphMetricValue = &.{};
+            var nodes = try alloc.alloc(GraphResultNode, 3);
+            var initialized: usize = 0;
+            defer {
+                for (nodes[0..initialized]) |*node| node.deinit(alloc);
+                alloc.free(nodes);
+                if (metric_values_slab.len > 0) alloc.free(metric_values_slab);
+            }
+            for (&[_][]const u8{ "a", "b", "c" }, 0..) |key, i| {
+                nodes[i] = .{ .key = try alloc.dupe(u8, key), .depth = 1, .distance = 1 };
+                initialized += 1;
+            }
+
+            var aligned_scores = [_]?f64{ 0.8, 0.2 };
+            const columns = [_][]?f64{&aligned_scores};
+            const names = [_][]const u8{"rank"};
+            metric_values_slab = try GraphQueryEngine.materializeSelectedMetricColumns(
+                alloc,
+                &names,
+                &columns,
+                &.{ 2, 0 },
+                &nodes,
+            );
+            initialized = nodes.len;
+            try std.testing.expectEqual(@as(usize, 2), nodes.len);
+            try std.testing.expectEqualStrings("c", nodes[0].key);
+            try std.testing.expectEqual(@as(?f64, 0.8), nodes[0].metrics[0].score);
+            try std.testing.expectEqualStrings("a", nodes[1].key);
+            try std.testing.expectEqual(@as(?f64, 0.2), nodes[1].metrics[0].score);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

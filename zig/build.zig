@@ -8221,6 +8221,7 @@ pub fn build(b: *std.Build) void {
         "borrowed graph metric names do not allocate per node",
         "graph metric column selection retains deterministic bounded top k",
         "graph metric shared column application is allocation-failure safe",
+        "graph metric stable row materialization moves nodes once and is allocation-failure safe",
         "graph metric order and filter dependencies attach status without projection",
         "graph metric order and filter apply max results after metric processing",
         "shortest path metric filtering evaluates the complete bounded candidate set",

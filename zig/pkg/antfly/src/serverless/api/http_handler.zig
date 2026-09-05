@@ -3188,6 +3188,13 @@ pub const HttpHandler = struct {
         }
     };
 
+    const CachedPublicGraphMetricColumn = struct {
+        scores: []?f64,
+        /// Stable indexes into the original graph result. This slice is owned
+        /// by the request workspace and shared by columns loaded together.
+        source_rows: []const usize,
+    };
+
     fn metricDependencyIndex(names: []const []const u8, name: []const u8) ?usize {
         for (names, 0..) |candidate, i| if (std.mem.eql(u8, candidate, name)) return i;
         return null;
@@ -3199,6 +3206,7 @@ pub const HttpHandler = struct {
         graph_index_name: []const u8,
         metric_names: []const []const u8,
         nodes: []const graph_query_mod.GraphResultNode,
+        source_rows: []const usize,
         dependency_names: []const []const u8,
         statuses: []db_types.GraphMetricStatus,
         status_initialized: []bool,
@@ -3216,13 +3224,17 @@ pub const HttpHandler = struct {
         // table-qualified identities out of the lookup entirely; flattening
         // them to `key` could alias an unrelated local node with the same key.
         var local_node_count: usize = 0;
-        for (nodes) |node| local_node_count += @intFromBool(graphMetricLocalNodeId(node) != null);
+        for (source_rows) |source_row| {
+            if (source_row >= nodes.len) return error.InvalidQueryRequest;
+            local_node_count += @intFromBool(graphMetricLocalNodeId(nodes[source_row]) != null);
+        }
         const node_ids = try self.alloc.alloc([]const u8, local_node_count);
         defer self.alloc.free(node_ids);
         const local_node_indexes = try self.alloc.alloc(usize, local_node_count);
         defer self.alloc.free(local_node_indexes);
         var local_node_index: usize = 0;
-        for (nodes, 0..) |node, result_index| {
+        for (source_rows, 0..) |source_row, result_index| {
+            const node = nodes[source_row];
             const node_id = graphMetricLocalNodeId(node) orelse continue;
             node_ids[local_node_index] = node_id;
             local_node_indexes[local_node_index] = result_index;
@@ -3246,8 +3258,8 @@ pub const HttpHandler = struct {
             }
             const local_scores = try point_scores.takeScores();
             errdefer self.alloc.free(local_scores);
-            if (local_node_count != nodes.len) {
-                const aligned_bytes = std.math.mul(usize, nodes.len, @sizeOf(?f64)) catch
+            if (local_node_count != source_rows.len) {
+                const aligned_bytes = std.math.mul(usize, source_rows.len, @sizeOf(?f64)) catch
                     return error.GraphMetricQueryBudgetExceeded;
                 // The local result remains live while the aligned column is
                 // allocated, so charge the peak expansion rather than only
@@ -3256,7 +3268,7 @@ pub const HttpHandler = struct {
             }
             columns[i] = try scatterLocalGraphMetricScoresAlloc(
                 self.alloc,
-                nodes.len,
+                source_rows.len,
                 local_node_indexes,
                 local_scores,
             );
@@ -3271,10 +3283,11 @@ pub const HttpHandler = struct {
         graph_index_name: []const u8,
         requested_names: []const []const u8,
         nodes: []const graph_query_mod.GraphResultNode,
+        source_rows: []const usize,
         dependency_names: []const []const u8,
         statuses: []db_types.GraphMetricStatus,
         status_initialized: []bool,
-        cached_columns: []?[]?f64,
+        cached_columns: []?CachedPublicGraphMetricColumn,
     ) !void {
         var missing_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
         var missing_count: usize = 0;
@@ -3291,6 +3304,7 @@ pub const HttpHandler = struct {
             graph_index_name,
             missing_names[0..missing_count],
             nodes,
+            source_rows,
             dependency_names,
             statuses,
             status_initialized,
@@ -3298,54 +3312,50 @@ pub const HttpHandler = struct {
         defer loaded.deinit(self.alloc);
         for (missing_names[0..missing_count], loaded.columns) |name, *column| {
             const dependency_index = metricDependencyIndex(dependency_names, name).?;
-            cached_columns[dependency_index] = column.*;
+            cached_columns[dependency_index] = .{ .scores = column.*, .source_rows = source_rows };
             column.* = @constCast((&[_]?f64{})[0..]);
         }
     }
 
     fn publicGraphMetricStageColumns(
-        dependency_names: []const []const u8,
-        stage_names: []const []const u8,
-        cached_columns: []const ?[]?f64,
-        out: [][]?f64,
-    ) !void {
-        if (out.len != stage_names.len) return error.InvalidQueryRequest;
-        for (stage_names, out) |name, *column| {
-            const dependency_index = metricDependencyIndex(dependency_names, name) orelse
-                return error.InvalidQueryRequest;
-            column.* = cached_columns[dependency_index] orelse return error.InvalidQueryRequest;
-        }
-    }
-
-    fn compactPublicGraphMetricColumns(
         self: *HttpHandler,
         session: *query_mod.QuerySession,
-        cached_columns: []?[]?f64,
-        source_indexes: []const usize,
+        dependency_names: []const []const u8,
+        stage_names: []const []const u8,
+        cached_columns: []const ?CachedPublicGraphMetricColumn,
+        active_rows: []const usize,
+        out: [][]?f64,
+        owned: []bool,
     ) !void {
-        var loaded_count: usize = 0;
-        for (cached_columns) |column| loaded_count += @intFromBool(column != null);
-        const compacted_values = std.math.mul(usize, loaded_count, source_indexes.len) catch
-            return error.GraphMetricQueryBudgetExceeded;
-        const compacted_bytes = std.math.mul(usize, compacted_values, @sizeOf(?f64)) catch
-            return error.GraphMetricQueryBudgetExceeded;
-        try session.chargeGraphMetricRetained(compacted_bytes);
-        var replacements: [graph_query_mod.graph_metric_dependency_limit]?[]?f64 = @splat(null);
-        errdefer for (replacements[0..cached_columns.len]) |replacement| if (replacement) |column| self.alloc.free(column);
-        for (cached_columns, 0..) |maybe_column, column_index| {
-            const column = maybe_column orelse continue;
-            const compacted = try self.alloc.alloc(?f64, source_indexes.len);
-            errdefer self.alloc.free(compacted);
-            for (source_indexes, compacted) |source_index, *score| {
-                if (source_index >= column.len) return error.InvalidQueryRequest;
-                score.* = column[source_index];
+        if (out.len != stage_names.len or owned.len != stage_names.len)
+            return error.InvalidQueryRequest;
+        @memset(owned, false);
+        errdefer for (out, owned) |column, is_owned| if (is_owned) self.alloc.free(column);
+        for (stage_names, out, owned) |name, *column, *is_owned| {
+            const dependency_index = metricDependencyIndex(dependency_names, name) orelse
+                return error.InvalidQueryRequest;
+            const cached = cached_columns[dependency_index] orelse return error.InvalidQueryRequest;
+            if (std.mem.eql(usize, cached.source_rows, active_rows)) {
+                column.* = cached.scores;
+                continue;
             }
-            replacements[column_index] = compacted;
-        }
-        for (cached_columns, replacements[0..cached_columns.len]) |*maybe_column, replacement| {
-            const compacted = replacement orelse continue;
-            self.alloc.free(maybe_column.*.?);
-            maybe_column.* = compacted;
+            const gathered_bytes = std.math.mul(usize, active_rows.len, @sizeOf(?f64)) catch
+                return error.GraphMetricQueryBudgetExceeded;
+            try session.chargeGraphMetricRetained(gathered_bytes);
+            const gathered = try self.alloc.alloc(?f64, active_rows.len);
+            column.* = gathered;
+            is_owned.* = true;
+            for (active_rows, gathered) |source_row, *score| {
+                var low: usize = 0;
+                var high: usize = cached.source_rows.len;
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    if (cached.source_rows[mid] < source_row) low = mid + 1 else high = mid;
+                }
+                if (low >= cached.source_rows.len or cached.source_rows[low] != source_row)
+                    return error.InvalidQueryRequest;
+                score.* = cached.scores[low];
+            }
         }
     }
 
@@ -3383,33 +3393,56 @@ pub const HttpHandler = struct {
         var projection_name_count: usize = 0;
         for (query.metrics) |metric| appendUniqueMetricDependency(&projection_names_buffer, &projection_name_count, metric.name);
 
-        var cached_columns: [graph_query_mod.graph_metric_dependency_limit]?[]?f64 = @splat(null);
+        var row_sets = std.ArrayListUnmanaged([]usize).empty;
+        defer {
+            for (row_sets.items) |rows| self.alloc.free(rows);
+            row_sets.deinit(self.alloc);
+        }
+        const initial_row_bytes = std.math.mul(usize, result.nodes.len, @sizeOf(usize)) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        try session.chargeGraphMetricRetained(initial_row_bytes);
+        const initial_rows = try self.alloc.alloc(usize, result.nodes.len);
+        for (initial_rows, 0..) |*row, i| row.* = i;
+        row_sets.append(self.alloc, initial_rows) catch |err| {
+            self.alloc.free(initial_rows);
+            return err;
+        };
+        var active_rows: []const usize = initial_rows;
+
+        var cached_columns: [graph_query_mod.graph_metric_dependency_limit]?CachedPublicGraphMetricColumn = @splat(null);
         defer for (cached_columns[0..dependency_count]) |maybe_column| if (maybe_column) |column| {
-            if (column.len > 0) self.alloc.free(column);
+            if (column.scores.len > 0) self.alloc.free(column.scores);
         };
         var stage_column_buffer: [graph_query_mod.graph_metric_dependency_limit][]?f64 = undefined;
+        var stage_column_owned: [graph_query_mod.graph_metric_dependency_limit]bool = undefined;
 
-        // Resolve selective filters first and compact the candidate set before
-        // any ordering/projection I/O. Cached dependency columns are compacted
-        // with the same selected indexes and reused by every later stage.
+        // Resolve selective filters first so later I/O only covers survivors.
+        // Stable original-row ordinals compose across stages; cached columns
+        // remain immutable and nodes are materialized once after selection.
         if (filter_name_count > 0) {
             try self.ensurePublicGraphMetricColumns(
                 session,
                 query.index_name,
                 filter_names_buffer[0..filter_name_count],
                 result.nodes,
+                active_rows,
                 dependency_names[0..dependency_count],
                 statuses,
                 status_initialized[0..dependency_count],
                 cached_columns[0..dependency_count],
             );
             const filter_columns = stage_column_buffer[0..filter_name_count];
-            try publicGraphMetricStageColumns(
+            const filter_owned = stage_column_owned[0..filter_name_count];
+            try self.publicGraphMetricStageColumns(
+                session,
                 dependency_names[0..dependency_count],
                 filter_names_buffer[0..filter_name_count],
                 cached_columns[0..dependency_count],
+                active_rows,
                 filter_columns,
+                filter_owned,
             );
+            defer for (filter_columns, filter_owned) |column, owned| if (owned) self.alloc.free(column);
             var filter_query = query;
             filter_query.metrics = &.{};
             filter_query.order_by = &.{};
@@ -3419,22 +3452,29 @@ pub const HttpHandler = struct {
                 filter_columns,
                 filter_query,
                 order_name_count == 0,
-                result.nodes.len,
+                active_rows.len,
             );
             defer self.alloc.free(selected);
-            const previous_slab = result.metric_values_slab;
-            const filtered_slab = try graph_query_mod.GraphQueryEngine.applySelectedMetricColumns(
-                self.alloc,
-                filter_names_buffer[0..filter_name_count],
-                filter_names_buffer[0..filter_name_count],
-                filter_columns,
-                filter_query,
-                selected,
-                &result.nodes,
-            );
-            result.metric_values_slab = filtered_slab;
-            if (previous_slab.len > 0) self.alloc.free(previous_slab);
-            try self.compactPublicGraphMetricColumns(session, cached_columns[0..dependency_count], selected);
+            const filtered_rows = try self.alloc.alloc(usize, selected.len);
+            for (selected, filtered_rows) |source_index, *row| {
+                if (source_index >= active_rows.len) {
+                    self.alloc.free(filtered_rows);
+                    return error.InvalidQueryRequest;
+                }
+                row.* = active_rows[source_index];
+            }
+            session.chargeGraphMetricRetained(std.math.mul(usize, filtered_rows.len, @sizeOf(usize)) catch {
+                self.alloc.free(filtered_rows);
+                return error.GraphMetricQueryBudgetExceeded;
+            }) catch |err| {
+                self.alloc.free(filtered_rows);
+                return err;
+            };
+            row_sets.append(self.alloc, filtered_rows) catch |err| {
+                self.alloc.free(filtered_rows);
+                return err;
+            };
+            active_rows = filtered_rows;
         }
 
         if (order_name_count > 0) {
@@ -3443,18 +3483,24 @@ pub const HttpHandler = struct {
                 query.index_name,
                 order_names_buffer[0..order_name_count],
                 result.nodes,
+                active_rows,
                 dependency_names[0..dependency_count],
                 statuses,
                 status_initialized[0..dependency_count],
                 cached_columns[0..dependency_count],
             );
             const order_columns = stage_column_buffer[0..order_name_count];
-            try publicGraphMetricStageColumns(
+            const order_owned = stage_column_owned[0..order_name_count];
+            try self.publicGraphMetricStageColumns(
+                session,
                 dependency_names[0..dependency_count],
                 order_names_buffer[0..order_name_count],
                 cached_columns[0..dependency_count],
+                active_rows,
                 order_columns,
+                order_owned,
             );
+            defer for (order_columns, order_owned) |column, owned| if (owned) self.alloc.free(column);
             var order_query = query;
             order_query.metrics = &.{};
             order_query.where_metric = &.{};
@@ -3464,22 +3510,29 @@ pub const HttpHandler = struct {
                 order_columns,
                 order_query,
                 true,
-                result.nodes.len,
+                active_rows.len,
             );
             defer self.alloc.free(selected);
-            const previous_slab = result.metric_values_slab;
-            const ordered_slab = try graph_query_mod.GraphQueryEngine.applySelectedMetricColumns(
-                self.alloc,
-                order_names_buffer[0..order_name_count],
-                order_names_buffer[0..order_name_count],
-                order_columns,
-                order_query,
-                selected,
-                &result.nodes,
-            );
-            result.metric_values_slab = ordered_slab;
-            if (previous_slab.len > 0) self.alloc.free(previous_slab);
-            try self.compactPublicGraphMetricColumns(session, cached_columns[0..dependency_count], selected);
+            const ordered_rows = try self.alloc.alloc(usize, selected.len);
+            for (selected, ordered_rows) |source_index, *row| {
+                if (source_index >= active_rows.len) {
+                    self.alloc.free(ordered_rows);
+                    return error.InvalidQueryRequest;
+                }
+                row.* = active_rows[source_index];
+            }
+            session.chargeGraphMetricRetained(std.math.mul(usize, ordered_rows.len, @sizeOf(usize)) catch {
+                self.alloc.free(ordered_rows);
+                return error.GraphMetricQueryBudgetExceeded;
+            }) catch |err| {
+                self.alloc.free(ordered_rows);
+                return err;
+            };
+            row_sets.append(self.alloc, ordered_rows) catch |err| {
+                self.alloc.free(ordered_rows);
+                return err;
+            };
+            active_rows = ordered_rows;
         }
 
         try self.ensurePublicGraphMetricColumns(
@@ -3487,6 +3540,7 @@ pub const HttpHandler = struct {
             query.index_name,
             projection_names_buffer[0..projection_name_count],
             result.nodes,
+            active_rows,
             dependency_names[0..dependency_count],
             statuses,
             status_initialized[0..dependency_count],
@@ -3495,7 +3549,7 @@ pub const HttpHandler = struct {
         for (status_initialized[0..dependency_count]) |initialized| if (!initialized)
             return error.InvalidQueryRequest;
 
-        const projected_value_count = std.math.mul(usize, result.nodes.len, query.metrics.len) catch
+        const projected_value_count = std.math.mul(usize, active_rows.len, query.metrics.len) catch
             return error.GraphMetricQueryBudgetExceeded;
         var projected_retained_bytes = std.math.mul(usize, projected_value_count, @sizeOf(graph_query_mod.GraphMetricValue)) catch
             return error.GraphMetricQueryBudgetExceeded;
@@ -3530,41 +3584,39 @@ pub const HttpHandler = struct {
             metric_value_names[i] = try self.alloc.dupe(u8, status.name);
             initialized_metric_names += 1;
         }
-        // Keep the old slab alive until post-processing has successfully
-        // allocated and installed every replacement node view. Besides making
-        // allocation failure transactional, this preserves the backing memory
-        // while applyLoadedMetricColumns retires each node's prior metrics.
-        if (projection_name_count > 0) {
-            const projection_columns = stage_column_buffer[0..projection_name_count];
-            try publicGraphMetricStageColumns(
-                dependency_names[0..dependency_count],
-                projection_names_buffer[0..projection_name_count],
-                cached_columns[0..dependency_count],
-                projection_columns,
-            );
-            var projection_query = query;
-            projection_query.where_metric = &.{};
-            projection_query.order_by = &.{};
-            const projection_metric_value_names = try self.alloc.alloc([]const u8, projection_name_count);
-            defer self.alloc.free(projection_metric_value_names);
-            for (projection_names_buffer[0..projection_name_count], 0..) |name, i| {
-                const dependency_index = metricDependencyIndex(dependency_names[0..dependency_count], name) orelse
-                    return error.InvalidQueryRequest;
-                projection_metric_value_names[i] = metric_value_names[dependency_index];
-            }
-            const previous_metric_values_slab = result.metric_values_slab;
-            const replacement_metric_values_slab = try graph_query_mod.GraphQueryEngine.applyLoadedMetricColumns(
-                self.alloc,
-                projection_names_buffer[0..projection_name_count],
-                projection_metric_value_names,
-                projection_columns,
-                projection_query,
-                false,
-                &result.nodes,
-            );
-            result.metric_values_slab = replacement_metric_values_slab;
-            if (previous_metric_values_slab.len > 0) self.alloc.free(previous_metric_values_slab);
+        // Keep the old slab alive until the single final node move has
+        // installed every replacement view. Filtering and ordering above only
+        // changed stable ordinals, so no intermediate node or metric copies
+        // are required.
+        const projection_columns = stage_column_buffer[0..projection_name_count];
+        const projection_owned = stage_column_owned[0..projection_name_count];
+        try self.publicGraphMetricStageColumns(
+            session,
+            dependency_names[0..dependency_count],
+            projection_names_buffer[0..projection_name_count],
+            cached_columns[0..dependency_count],
+            active_rows,
+            projection_columns,
+            projection_owned,
+        );
+        defer for (projection_columns, projection_owned) |column, owned| if (owned) self.alloc.free(column);
+        const projection_metric_value_names = try self.alloc.alloc([]const u8, projection_name_count);
+        defer self.alloc.free(projection_metric_value_names);
+        for (projection_names_buffer[0..projection_name_count], 0..) |name, i| {
+            const dependency_index = metricDependencyIndex(dependency_names[0..dependency_count], name) orelse
+                return error.InvalidQueryRequest;
+            projection_metric_value_names[i] = metric_value_names[dependency_index];
         }
+        const previous_metric_values_slab = result.metric_values_slab;
+        const replacement_metric_values_slab = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumns(
+            self.alloc,
+            projection_metric_value_names,
+            projection_columns,
+            active_rows,
+            &result.nodes,
+        );
+        result.metric_values_slab = replacement_metric_values_slab;
+        if (previous_metric_values_slab.len > 0) self.alloc.free(previous_metric_values_slab);
         for (result.metric_value_names) |name| self.alloc.free(name);
         if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
         result.metric_value_names = metric_value_names;
