@@ -750,6 +750,7 @@ const AntflyRootImports = struct {
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    credentials: *std.Build.Module,
     google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
@@ -820,6 +821,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_credentials", .field = "credentials" },
         .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
@@ -1649,12 +1651,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const google_mod = b.createModule(.{
         .root_source_file = b.path("lib/google/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_credentials", credentials_mod);
     google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
@@ -1670,6 +1683,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
     wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -2086,6 +2100,7 @@ pub fn build(b: *std.Build) void {
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .credentials = credentials_mod,
         .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,

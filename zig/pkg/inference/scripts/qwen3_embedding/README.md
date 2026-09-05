@@ -62,9 +62,10 @@ antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1   # GGUF F
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1  # safetensors
 ```
 
-The Q8_0 bundle is qualified on Metal and native CPU. The F16 GGUF and BF16
-safetensors bundles are currently admitted on Metal only; each variant still
-requires its exact managed receipt and live artifact hashes.
+The Q8_0 bundle is qualified on Metal, CUDA, and native CPU. The F16 GGUF is
+admitted on Metal, while the BF16 safetensors bundle is admitted on Metal and
+CUDA; each variant still requires its exact managed receipt and live artifact
+hashes.
 
 Then run the gate against the running server:
 
@@ -79,6 +80,38 @@ python3 qualify_qwen3_embedding_metal.py \
 
 Exit code 0 means every gate passed; 1 prints a failure table; 2 is an
 infrastructure/usage error.
+
+### CUDA qualification
+
+Run the server with CUDA as a required backend so qualification fails closed
+instead of silently falling back to CPU. Use an absolute models path so preload
+and request-time discovery resolve to the same cache key:
+
+```bash
+ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda antfly-inference run \
+  --models-dir /absolute/path/to/models \
+  --preload-model embedder:cuda:MODEL_ID
+```
+
+After the server reports `selected backend cuda` and `listening`, run:
+
+```bash
+python3 qualify_qwen3_embedding_cuda.py \
+  --oracle /tmp/qwen3_embedding_oracle.json \
+  --model MODEL_ID \
+  --tier q8_0
+# Use --tier bf16 for the safetensors bundle.
+```
+
+For CUDA throughput measurements, run the pretokenized E2E benchmark (model
+loading and tokenization remain outside the timed region):
+
+```bash
+zig build -Dcuda=true -Doptimize=ReleaseFast bench-qwen3-embedding-e2e -- \
+  --backend cuda --model-dir /path/to/qwen3-embedding-q8 --batch 8 --seq-len 256
+zig build -Dcuda=true -Doptimize=ReleaseFast bench-qwen3-embedding-e2e -- \
+  --backend cuda --model-dir /path/to/qwen3-embedding-q8 --lengths 32,64,128,256
+```
 
 ## Gates per tier
 

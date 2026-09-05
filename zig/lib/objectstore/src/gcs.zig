@@ -23,6 +23,16 @@ const s3 = @import("s3.zig");
 const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
+
+test "standalone objectstore wires Google credential identity dependencies" {
+    var manager = google_auth.CredentialManager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try std.testing.expectError(
+        error.MissingGoogleCredentials,
+        manager.tokenSource("__antfly_missing_google_credentials__.json", google_auth.default_scope),
+    );
+}
+
 const resumable_upload_threshold: u64 = 64 * 1024 * 1024;
 const resumable_upload_min_chunk_bytes: u64 = 16 * 1024 * 1024;
 const resumable_upload_max_chunk_bytes: u64 = 512 * 1024 * 1024;

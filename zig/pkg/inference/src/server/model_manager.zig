@@ -533,14 +533,16 @@ pub fn compatibilitySummaryForBackend(
 ) !?CompatibilitySummary {
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
-    // Exact Qwen3-VL promotions are Metal-only. Reject other routes before
-    // inspectAlloc re-hashes the multi-gigabyte promoted bundle; hashing is
-    // still mandatory once for the only backend that can consume it.
-    if (man.isQwen3VlBundle() and backend != .metal) {
+    // Split GGUF Qwen3-VL promotions are Metal-only. The official integrated
+    // BF16 generation bundle has a separate CUDA-qualified resident route.
+    // Reject other routes before inspectAlloc re-hashes multi-gigabyte files.
+    const cuda_qwen3vl_generation = backend == .cuda and
+        man.isQwen3VlGenerationSafetensorsBundle();
+    if (man.isQwen3VlBundle() and backend != .metal and !cuda_qwen3vl_generation) {
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-VL bundles require the Metal backend",
+            .message = "production-qualified Qwen3-VL bundles require Metal, except the integrated BF16 generation bundle which also supports CUDA",
         };
     }
     if (man.embedding_style == .qwen3_embedding and
@@ -550,7 +552,7 @@ pub fn compatibilitySummaryForBackend(
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-Embedding GGUF bundles require the Metal or native CPU backend",
+            .message = "production-qualified Qwen3-Embedding GGUF bundles require Metal, native CPU, or CUDA",
         };
     }
 
@@ -574,7 +576,7 @@ pub fn compatibilitySummaryForBackend(
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "this production-qualified Qwen3-Embedding bundle requires the Metal backend; native CPU is qualified for Q8_0",
+            .message = "this production-qualified Qwen3-Embedding variant is not qualified on the selected backend",
         };
     }
 
@@ -705,13 +707,13 @@ pub fn compatibilitySummaryForBackend(
 }
 
 fn qwen3EmbeddingSupportsBackend(backend: backends.BackendType) bool {
-    return backend == .metal or backend == .native;
+    return backend == .metal or backend == .native or backend == .cuda;
 }
 
-test "Qwen3 embedding production backends include native CPU" {
+test "Qwen3 embedding production backends include native CPU and CUDA" {
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
-    try std.testing.expect(!qwen3EmbeddingSupportsBackend(.cuda));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.cuda));
 }
 
 fn qwen3EmbeddingPromotionSupportsBackend(
@@ -720,19 +722,21 @@ fn qwen3EmbeddingPromotionSupportsBackend(
 ) bool {
     return switch (promotion) {
         .none => true,
-        .q8_0 => backend == .metal or backend == .native,
-        .f16, .bf16_safetensors => backend == .metal,
+        .q8_0 => backend == .metal or backend == .native or backend == .cuda,
+        .f16 => backend == .metal,
+        .bf16_safetensors => backend == .metal or backend == .cuda,
     };
 }
 
 test "Qwen3 embedding promotion backend qualification is variant-specific" {
     try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .native));
     try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .metal));
-    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.q8_0, .cuda));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .cuda));
     try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.f16, .native));
     try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.f16, .metal));
     try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .native));
     try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .metal));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .cuda));
 }
 
 fn qwen3VlPromotionSupportsBackend(

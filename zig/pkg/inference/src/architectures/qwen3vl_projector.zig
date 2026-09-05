@@ -15,6 +15,7 @@
 //! accidentally discard DeepStack or treat its concatenated payload as tokens.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const image = @import("../pipelines/image.zig");
 const ops = @import("../ops/ops.zig");
@@ -27,6 +28,7 @@ const projector_common = @import("gemma4_projector.zig");
 const qwen3vl_plan = @import("qwen3vl_plan.zig");
 const gpt_arch = @import("gpt.zig");
 const gpt_config = @import("../models/gpt.zig");
+const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
@@ -298,28 +300,47 @@ const Config = struct {
 /// tensor for the whole multi-image request makes those identities unique,
 /// then explicitly releases their dynamic slots before the wrappers die.
 const WeightCache = struct {
+    const Source = union(enum) {
+        gguf: *tensor_store_mod.GgufStore,
+        resident: Config,
+    };
+
     allocator: std.mem.Allocator,
     cb: *const ComputeBackend,
-    store: *tensor_store_mod.GgufStore,
+    source: Source,
     tensors: std.StringHashMapUnmanaged(CT) = .empty,
+    resident_patch_f32: ?[]f32 = null,
+    position_f32: ?[]f32 = null,
 
-    fn init(
+    fn initGguf(
         allocator: std.mem.Allocator,
         cb: *const ComputeBackend,
         store: *tensor_store_mod.GgufStore,
     ) WeightCache {
-        return .{ .allocator = allocator, .cb = cb, .store = store };
+        return .{ .allocator = allocator, .cb = cb, .source = .{ .gguf = store } };
+    }
+
+    fn initResident(
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        config: Config,
+    ) WeightCache {
+        return .{ .allocator = allocator, .cb = cb, .source = .{ .resident = config } };
     }
 
     fn deinit(self: *WeightCache) void {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
-            metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, tensor.*);
+            if (self.cb.kind() == .metal) {
+                metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, tensor.*);
+            }
             self.cb.free(tensor.*);
         }
         var key_it = self.tensors.keyIterator();
         while (key_it.next()) |key| self.allocator.free(key.*);
         self.tensors.deinit(self.allocator);
+        if (self.resident_patch_f32) |values| self.allocator.free(values);
+        if (self.position_f32) |values| self.allocator.free(values);
     }
 
     fn insert(self: *WeightCache, key: []const u8, tensor: CT) !CT {
@@ -333,7 +354,14 @@ const WeightCache = struct {
         const key = try std.fmt.allocPrint(self.allocator, "weight:{s}", .{name});
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
-        const tensor = try projector_common.loadWeightCt(self.cb, self.allocator, self.store, name);
+        const tensor = switch (self.source) {
+            .gguf => |store| try projector_common.loadWeightCt(self.cb, self.allocator, store, name),
+            .resident => |cfg| blk: {
+                const resident_name = try residentWeightNameAlloc(self.allocator, cfg, name);
+                defer self.allocator.free(resident_name);
+                break :blk try self.cb.getWeight(resident_name);
+            },
+        };
         errdefer self.cb.free(tensor);
         return self.insert(key, tensor);
     }
@@ -342,11 +370,25 @@ const WeightCache = struct {
         const key = try std.fmt.allocPrint(self.allocator, "linear:{d}:{d}:{s}", .{ in_dim, out_dim, name });
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
+        switch (self.source) {
+            .resident => |cfg| {
+                const resident_name = try residentWeightNameAlloc(self.allocator, cfg, name);
+                defer self.allocator.free(resident_name);
+                const tensor = try self.cb.getWeight(resident_name);
+                errdefer self.cb.free(tensor);
+                return self.insert(key, tensor);
+            },
+            .gguf => {},
+        }
+        const store = switch (self.source) {
+            .gguf => |value| value,
+            .resident => unreachable,
+        };
         if (self.cb.kind() == .metal) {
-            var tensor_ref = try self.store.tensorStore().describeTensor(self.allocator, name);
+            var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
             defer tensor_ref.deinit(self.allocator);
             if (tensor_ref.quantized) {
-                if (try self.store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
+                if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
                     var storage = storage_value;
                     const shape_matches = storage.shape.len == 2 and
                         storage.shape[0] == @as(i64, @intCast(out_dim)) and
@@ -369,10 +411,38 @@ const WeightCache = struct {
                 }
             }
         }
+        if (comptime build_options.enable_cuda) {
+            if (self.cb.kind() == .cuda) {
+                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
+                defer tensor_ref.deinit(self.allocator);
+                if (tensor_ref.quantized) {
+                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
+                        var storage = storage_value;
+                        if (storage.shape.len == 2 and
+                            storage.shape[0] == @as(i64, @intCast(out_dim)) and
+                            storage.shape[1] == @as(i64, @intCast(in_dim)))
+                        {
+                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
+                            defer self.allocator.free(cache_key);
+                            const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
+                                self.cb,
+                                cache_key,
+                                storage,
+                                &shape,
+                            );
+                            errdefer self.cb.free(tensor);
+                            return self.insert(key, tensor);
+                        }
+                        storage.deinit();
+                    }
+                }
+            }
+        }
         const tensor = try projector_common.loadLinearWeightCt(
             self.cb,
             self.allocator,
-            self.store,
+            store,
             name,
             in_dim,
             out_dim,
@@ -385,11 +455,194 @@ const WeightCache = struct {
         const key = try std.fmt.allocPrint(self.allocator, "patch:{s}", .{name});
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
-        const tensor = try loadPatchWeight(self.cb, self.store, name, cfg);
+        switch (self.source) {
+            .resident => {
+                const full = if (self.resident_patch_f32) |values|
+                    values
+                else blk: {
+                    const source = try self.cb.getWeight("model.visual.patch_embed.proj.weight");
+                    defer self.cb.free(source);
+                    const values = try self.cb.toFloat32(source, self.allocator);
+                    self.resident_patch_f32 = values;
+                    break :blk values;
+                };
+                const patch_area = try std.math.mul(usize, cfg.patch_size, cfg.patch_size);
+                const patch_dim = try std.math.mul(usize, 3, patch_area);
+                const expected = try std.math.mul(usize, try std.math.mul(usize, cfg.vision_hidden, patch_dim), 2);
+                if (full.len != expected) return error.InvalidTensorShape;
+                const temporal_index: usize = if (std.mem.endsWith(u8, name, ".weight.1")) 1 else 0;
+                const values = try self.allocator.alloc(f32, cfg.vision_hidden * patch_dim);
+                defer self.allocator.free(values);
+                for (0..cfg.vision_hidden) |out| {
+                    for (0..3) |channel| {
+                        for (0..patch_area) |pixel| {
+                            const dst = out * patch_dim + channel * patch_area + pixel;
+                            const src = ((((out * 3 + channel) * 2 + temporal_index) * patch_area) + pixel);
+                            values[dst] = full[src];
+                        }
+                    }
+                }
+                const shape = [_]i32{ @intCast(cfg.vision_hidden), @intCast(patch_dim) };
+                const tensor = try self.cb.fromFloat32Shape(values, &shape);
+                errdefer self.cb.free(tensor);
+                return self.insert(key, tensor);
+            },
+            .gguf => {},
+        }
+        const store = switch (self.source) {
+            .gguf => |value| value,
+            .resident => unreachable,
+        };
+        if (comptime build_options.enable_cuda) {
+            if (self.cb.kind() == .cuda) {
+                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
+                defer tensor_ref.deinit(self.allocator);
+                if (tensor_ref.quantized) {
+                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
+                        var storage = storage_value;
+                        if (storage.shape.len == 4 and
+                            storage.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
+                            storage.shape[1] == 3 and
+                            storage.shape[2] == @as(i64, @intCast(cfg.patch_size)) and
+                            storage.shape[3] == @as(i64, @intCast(cfg.patch_size)))
+                        {
+                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
+                            defer self.allocator.free(cache_key);
+                            const shape = [_]i64{
+                                @intCast(cfg.vision_hidden),
+                                @intCast(cfg.patch_size * cfg.patch_size * 3),
+                            };
+                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
+                                self.cb,
+                                cache_key,
+                                storage,
+                                &shape,
+                            );
+                            errdefer self.cb.free(tensor);
+                            return self.insert(key, tensor);
+                        }
+                        storage.deinit();
+                    }
+                }
+            }
+        }
+        const tensor = try loadPatchWeight(self.cb, store, name, cfg);
         errdefer self.cb.free(tensor);
         return self.insert(key, tensor);
     }
+
+    /// The integrated safetensors checkpoint stores Conv3D patch weights as
+    /// native BF16 [O, C, T=2, H, W].  CUDA can consume that flattened tensor
+    /// directly with cuBLASLt when the still-image patch row is duplicated in
+    /// the same C,T,H,W order.  Keeping this wrapper resident avoids the old
+    /// per-request BF16->host-F32 download, two F32 uploads, and two scalar
+    /// dense projections.
+    fn fullResidentPatch(self: *WeightCache) !?CT {
+        switch (self.source) {
+            .gguf => return null,
+            .resident => {},
+        }
+        const key = "patch:resident-full-bf16";
+        if (self.tensors.get(key)) |tensor| return tensor;
+        const tensor = try self.cb.getWeight("model.visual.patch_embed.proj.weight");
+        errdefer self.cb.free(tensor);
+        return try self.insert(key, tensor);
+    }
+
+    fn positionValues(self: *WeightCache, cfg: Config) ![]const f32 {
+        if (self.position_f32) |values| return values;
+        const values = switch (self.source) {
+            .gguf => |store| blk: {
+                var loaded = try projector_common.loadTensorF32(store, "v.position_embd.weight");
+                defer loaded.deinit();
+                break :blk try self.allocator.dupe(f32, loaded.data);
+            },
+            .resident => blk: {
+                const tensor = try self.weight("v.position_embd.weight");
+                break :blk try self.cb.toFloat32(tensor, self.allocator);
+            },
+        };
+        const side = cfg.image_size / cfg.patch_size;
+        const expected = try std.math.mul(usize, try std.math.mul(usize, side, side), cfg.vision_hidden);
+        if (values.len != expected) {
+            self.allocator.free(values);
+            return error.InvalidPositionEmbeddingShape;
+        }
+        self.position_f32 = values;
+        return values;
+    }
 };
+
+fn residentWeightNameAlloc(allocator: std.mem.Allocator, cfg: Config, name: []const u8) ![]u8 {
+    if (std.mem.eql(u8, name, "v.patch_embd.bias"))
+        return allocator.dupe(u8, "model.visual.patch_embed.proj.bias");
+    if (std.mem.eql(u8, name, "v.position_embd.weight"))
+        return allocator.dupe(u8, "model.visual.pos_embed.weight");
+    if (std.mem.startsWith(u8, name, "v.post_ln."))
+        return std.fmt.allocPrint(allocator, "model.visual.merger.norm.{s}", .{name["v.post_ln.".len..]});
+    if (std.mem.startsWith(u8, name, "mm.0."))
+        return std.fmt.allocPrint(allocator, "model.visual.merger.linear_fc1.{s}", .{name["mm.0.".len..]});
+    if (std.mem.startsWith(u8, name, "mm.2."))
+        return std.fmt.allocPrint(allocator, "model.visual.merger.linear_fc2.{s}", .{name["mm.2.".len..]});
+
+    const block_prefix = "v.blk.";
+    if (std.mem.startsWith(u8, name, block_prefix)) {
+        const rest = name[block_prefix.len..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.WeightNotFound;
+        const layer = try std.fmt.parseInt(usize, rest[0..dot], 10);
+        if (layer >= cfg.block_count) return error.WeightNotFound;
+        const component = rest[dot + 1 ..];
+        const mappings = [_]struct { logical: []const u8, resident: []const u8 }{
+            .{ .logical = "ln1.", .resident = "norm1." },
+            .{ .logical = "ln2.", .resident = "norm2." },
+            .{ .logical = "attn_qkv.", .resident = "attn.qkv." },
+            .{ .logical = "attn_out.", .resident = "attn.proj." },
+            .{ .logical = "ffn_up.", .resident = "mlp.linear_fc1." },
+            .{ .logical = "ffn_down.", .resident = "mlp.linear_fc2." },
+        };
+        for (mappings) |mapping| {
+            if (std.mem.startsWith(u8, component, mapping.logical)) {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "model.visual.blocks.{d}.{s}{s}",
+                    .{ layer, mapping.resident, component[mapping.logical.len..] },
+                );
+            }
+        }
+        return error.WeightNotFound;
+    }
+
+    const deepstack_prefix = "v.deepstack.";
+    if (std.mem.startsWith(u8, name, deepstack_prefix)) {
+        const rest = name[deepstack_prefix.len..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.WeightNotFound;
+        const layer = try std.fmt.parseInt(usize, rest[0..dot], 10);
+        var tap: ?usize = null;
+        for (cfg.deepstack_layers[0..cfg.deepstack_len], 0..) |candidate, index| {
+            if (candidate == layer) {
+                tap = index;
+                break;
+            }
+        }
+        const tap_index = tap orelse return error.WeightNotFound;
+        const component = rest[dot + 1 ..];
+        const mappings = [_]struct { logical: []const u8, resident: []const u8 }{
+            .{ .logical = "norm.", .resident = "norm." },
+            .{ .logical = "fc1.", .resident = "linear_fc1." },
+            .{ .logical = "fc2.", .resident = "linear_fc2." },
+        };
+        for (mappings) |mapping| {
+            if (std.mem.startsWith(u8, component, mapping.logical)) {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "model.visual.deepstack_merger_list.{d}.{s}{s}",
+                    .{ tap_index, mapping.resident, component[mapping.logical.len..] },
+                );
+            }
+        }
+    }
+    return error.WeightNotFound;
+}
 
 pub const Geometry = struct {
     width: usize,
@@ -459,11 +712,61 @@ fn encodeProjectedImagesFromStoreQualified(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !ProjectedImages {
+    const cfg = try parseConfig(&store.parsed);
+    var weights = WeightCache.initGguf(allocator, cb, store);
+    defer weights.deinit();
+    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence);
+}
+
+/// Run the upstream integrated safetensors vision tower whose weights already
+/// reside on the model compute backend. This is the BF16 counterpart of the
+/// split GGUF projector path and deliberately shares the exact preprocessing,
+/// M-RoPE, DeepStack, and decoder-injection graph.
+pub fn encodeProjectedImagesResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    images: []const []const u8,
+    limits: Limits,
+) !ProjectedImages {
+    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, false);
+}
+
+pub fn encodeProjectedImagesResidentForQualification(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    images: []const []const u8,
+    limits: Limits,
+) !ProjectedImages {
+    return encodeProjectedImagesResidentQualified(cb, allocator, config, images, limits, true);
+}
+
+fn encodeProjectedImagesResidentQualified(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    images: []const []const u8,
+    limits: Limits,
+    collect_preprocess_evidence: bool,
+) !ProjectedImages {
+    const cfg = try configFromResidentModel(config);
+    var weights = WeightCache.initResident(allocator, cb, cfg);
+    defer weights.deinit();
+    return encodeProjectedImagesFromWeightsQualified(cb, allocator, &weights, cfg, images, limits, collect_preprocess_evidence);
+}
+
+fn encodeProjectedImagesFromWeightsQualified(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    weights: *WeightCache,
+    cfg: Config,
+    images: []const []const u8,
+    limits: Limits,
+    collect_preprocess_evidence: bool,
+) !ProjectedImages {
     try limits.validate();
     if (images.len == 0 or images.len > limits.max_images) return error.ImageLimitExceeded;
-    const cfg = try parseConfig(&store.parsed);
-    var weights = WeightCache.init(allocator, cb, store);
-    defer weights.deinit();
     var embeddings = std.ArrayListUnmanaged(f32).empty;
     errdefer embeddings.deinit(allocator);
     var per_image_deepstack = std.ArrayListUnmanaged([]f32).empty;
@@ -481,7 +784,7 @@ fn encodeProjectedImagesFromStoreQualified(
     errdefer preprocess_spatial_patches.deinit(allocator);
 
     for (images) |bytes| {
-        var encoded = try encodeSingleImage(cb, allocator, store, &weights, cfg, bytes, limits, collect_preprocess_evidence);
+        var encoded = try encodeSingleImage(cb, allocator, weights, cfg, bytes, limits, collect_preprocess_evidence);
         defer encoded.deinit(allocator);
         try embeddings.appendSlice(allocator, encoded.embeddings);
         // Reserve the list slot before duplicating the feature payload so a
@@ -650,7 +953,6 @@ const EncodedImage = struct {
 fn encodeSingleImage(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
-    store: *tensor_store_mod.GgufStore,
     weights: *WeightCache,
     cfg: Config,
     bytes: []const u8,
@@ -659,12 +961,22 @@ fn encodeSingleImage(
 ) !EncodedImage {
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
+    var failed_stage: []const u8 = "admission";
+    var failed_layer: ?usize = null;
+    errdefer |err| if (profile) {
+        if (failed_layer) |layer|
+            std.debug.print("qwen3vl-projector-error: stage={s} layer={d} error={s}\n", .{ failed_stage, layer, @errorName(err) })
+        else
+            std.debug.print("qwen3vl-projector-error: stage={s} error={s}\n", .{ failed_stage, @errorName(err) });
+    };
     if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
+    failed_stage = "decode";
     const decoded = try image.decode(allocator, bytes);
     defer decoded.deinit(allocator);
     const decode_ns = profileLap(profile, &stage_started_at);
     const decoded_pixels = std.math.mul(usize, decoded.width, decoded.height) catch return error.VisionAdmissionExceeded;
     if (decoded_pixels == 0 or decoded_pixels > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+    failed_stage = "preprocess";
     const geometry = try targetGeometry(cfg, decoded.width, decoded.height, limits);
     const pixels = try image.preprocessDecodedRectScaledWithResample(
         allocator,
@@ -679,6 +991,7 @@ fn encodeSingleImage(
     defer allocator.free(pixels);
     const preprocess_ns = profileLap(profile, &stage_started_at);
 
+    failed_stage = "patchify";
     const patch_rows = try extractPatchesMergeMajor(allocator, pixels, cfg, geometry);
     defer allocator.free(patch_rows);
     const patchify_ns = profileLap(profile, &stage_started_at);
@@ -700,27 +1013,62 @@ fn encodeSingleImage(
     else
         null;
     errdefer if (preprocess_spatial_patches) |patches| allocator.free(patches);
-    const patch_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(cfg.patch_size * cfg.patch_size * 3) };
-    const patch_input = try cb.fromFloat32Shape(patch_rows, &patch_shape);
-    defer cb.free(patch_input);
-    const patch0 = try weights.patch("v.patch_embd.weight", cfg);
-    const patch1 = try weights.patch("v.patch_embd.weight.1", cfg);
+    failed_stage = "patch_weights";
     const patch_bias = try weights.weight("v.patch_embd.bias");
     const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-    const first_temporal = try cb.linear(patch_input, patch0, patch_bias, geometry.patchCount(), patch_dim, cfg.vision_hidden);
-    defer cb.free(first_temporal);
-    const second_temporal = try cb.linearNoBias(patch_input, patch1, geometry.patchCount(), patch_dim, cfg.vision_hidden);
-    defer cb.free(second_temporal);
-    const embedded = try cb.add(first_temporal, second_temporal);
+    const full_resident_patch = if (comptime build_options.enable_cuda)
+        if (cb.kind() == .cuda) try weights.fullResidentPatch() else null
+    else
+        null;
+    const embedded = if (full_resident_patch) |full_patch| blk: {
+        failed_stage = "patch_temporal_expand";
+        const temporal_rows = try duplicateStillImageTemporalPatches(
+            allocator,
+            patch_rows,
+            geometry.patchCount(),
+            cfg.patch_size,
+        );
+        defer allocator.free(temporal_rows);
+        const temporal_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim * 2) };
+        const temporal_input = try cb.fromFloat32Shape(temporal_rows, &temporal_shape);
+        defer cb.free(temporal_input);
+        failed_stage = "patch_linear_bf16";
+        break :blk try cb.linear(
+            temporal_input,
+            full_patch,
+            patch_bias,
+            geometry.patchCount(),
+            patch_dim * 2,
+            cfg.vision_hidden,
+        );
+    } else blk: {
+        const patch_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim) };
+        failed_stage = "patch_upload";
+        const patch_input = try cb.fromFloat32Shape(patch_rows, &patch_shape);
+        defer cb.free(patch_input);
+        const patch0 = try weights.patch("v.patch_embd.weight", cfg);
+        const patch1 = try weights.patch("v.patch_embd.weight.1", cfg);
+        failed_stage = "patch_linear_first";
+        const first_temporal = try cb.linear(patch_input, patch0, patch_bias, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+        defer cb.free(first_temporal);
+        failed_stage = "patch_linear_second";
+        const second_temporal = try cb.linearNoBias(patch_input, patch1, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+        defer cb.free(second_temporal);
+        failed_stage = "patch_add";
+        break :blk try cb.add(first_temporal, second_temporal);
+    };
     defer cb.free(embedded);
+    failed_stage = "patch_download";
     const embedded_host = try cb.toFloat32(embedded, allocator);
     defer allocator.free(embedded_host);
-    try addInterpolatedPositions(store, embedded_host, cfg, geometry);
+    failed_stage = "position_embedding";
+    try addInterpolatedPositions(weights, embedded_host, cfg, geometry);
     var completed_preprocess_evidence = preprocess_evidence;
     if (completed_preprocess_evidence) |*evidence| {
         evidence.positioned_embedding_f32le_sha256 = sha256F32LeHex(embedded_host);
     }
     const hidden_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(cfg.vision_hidden) };
+    failed_stage = "positioned_upload";
     var hidden = try cb.fromFloat32Shape(embedded_host, &hidden_shape);
     // Keep exactly one owner for the current vision tensor. Every successful
     // stage replaces that owner only after freeing its predecessor, so all
@@ -729,6 +1077,7 @@ fn encodeSingleImage(
     defer cb.free(hidden);
     const patch_embed_ns = profileLap(profile, &stage_started_at);
 
+    failed_stage = "rope_positions";
     const positions = try visionPositions(allocator, geometry, cfg.spatial_merge);
     defer allocator.free(positions);
     const positions_ns = profileLap(profile, &stage_started_at);
@@ -746,6 +1095,8 @@ fn encodeSingleImage(
     var blocks_ns: u64 = 0;
     var deepstack_ns: u64 = 0;
     for (0..cfg.block_count) |layer| {
+        failed_stage = "vision_block";
+        failed_layer = layer;
         const block_started_at = if (profile) monotonicNowNs() else 0;
         const next = try encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer);
         if (profile) blocks_ns +|= monotonicNowNs() -| block_started_at;
@@ -768,18 +1119,22 @@ fn encodeSingleImage(
         }
     }
     stage_started_at = if (profile) monotonicNowNs() else 0;
+    failed_layer = null;
     if (next_tap != cfg.deepstack_len) return error.InvalidGgufProjector;
     if (completed_preprocess_evidence) |*evidence| {
         evidence.vision_trace_layer = vision_trace_layer;
         evidence.vision_trace_f32le_sha256 = vision_trace_digest;
     }
 
+    failed_stage = "post_norm";
     const post_norm = try layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
     cb.free(hidden);
     hidden = post_norm;
+    failed_stage = "final_merge";
     const projected = try mergeProjectedNamed(cb, allocator, weights, cfg, post_norm, geometry, "mm.0", "mm.2");
     cb.free(hidden);
     hidden = projected;
+    failed_stage = "final_download";
     const embeddings = try cb.toFloat32(projected, allocator);
     const final_merge_ns = profileLap(profile, &stage_started_at);
     errdefer allocator.free(embeddings);
@@ -840,33 +1195,45 @@ fn encoderBlock(
 ) !CT {
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
+    var failed_stage: []const u8 = "ln1";
+    errdefer |err| if (profile) std.debug.print(
+        "qwen3vl-vision-block-error: layer={d} stage={s} error={s}\n",
+        .{ layer, failed_stage, @errorName(err) },
+    );
     var prefix_buf: [96]u8 = undefined;
     const ln1_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln1", .{layer});
     const normed1 = try layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed1);
     const ln1_ns = profileLap(profile, &stage_started_at);
+    failed_stage = "attention";
     const attn = try visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer);
     defer cb.free(attn);
     const attention_ns = profileLap(profile, &stage_started_at);
+    failed_stage = "attention_residual";
     const residual1 = try cb.add(input, attn);
     errdefer cb.free(residual1);
     const attention_residual_ns = profileLap(profile, &stage_started_at);
 
     const ln2_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln2", .{layer});
+    failed_stage = "ln2";
     const normed2 = try layerNormNamed(cb, allocator, weights, residual1, ln2_prefix, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed2);
     const ln2_ns = profileLap(profile, &stage_started_at);
     const fc1_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_up", .{layer});
+    failed_stage = "fc1";
     const fc1 = try linearNamed(cb, allocator, weights, normed2, fc1_prefix, token_count, cfg.vision_hidden, cfg.intermediate);
     defer cb.free(fc1);
     const fc1_ns = profileLap(profile, &stage_started_at);
+    failed_stage = "gelu";
     const activated = try cb.geluExact(fc1) orelse try cb.gelu(fc1);
     defer cb.free(activated);
     const activation_ns = profileLap(profile, &stage_started_at);
     const fc2_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_down", .{layer});
+    failed_stage = "fc2";
     const fc2 = try linearNamed(cb, allocator, weights, activated, fc2_prefix, token_count, cfg.intermediate, cfg.vision_hidden);
     defer cb.free(fc2);
     const fc2_ns = profileLap(profile, &stage_started_at);
+    failed_stage = "ffn_residual";
     const output = try cb.add(residual1, fc2);
     cb.free(residual1);
     const ffn_residual_ns = profileLap(profile, &stage_started_at);
@@ -901,20 +1268,30 @@ fn visionAttention(
 ) !CT {
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
+    var failed_stage: []const u8 = "qkv";
+    errdefer |err| if (profile) std.debug.print(
+        "qwen3vl-vision-attention-error: layer={d} stage={s} error={s}\n",
+        .{ layer, failed_stage, @errorName(err) },
+    );
     var buf: [96]u8 = undefined;
     const qkv_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_qkv", .{layer});
     const qkv = try linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3);
     defer cb.free(qkv);
     const qkv_ns = profileLap(profile, &stage_started_at);
+    failed_stage = "split_q";
     const q_unrotated = try cb.sliceLastDim(qkv, 0, cfg.vision_hidden);
     defer cb.free(q_unrotated);
+    failed_stage = "split_k";
     const k_unrotated = try cb.sliceLastDim(qkv, cfg.vision_hidden, cfg.vision_hidden * 2);
     defer cb.free(k_unrotated);
+    failed_stage = "split_v";
     const v = try cb.sliceLastDim(qkv, cfg.vision_hidden * 2, cfg.vision_hidden * 3);
     defer cb.free(v);
+    failed_stage = "rope_q";
     const q = (try cb.visionRope(q_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions)) orelse
         return error.UnsupportedVisionRopeBackend;
     defer cb.free(q);
+    failed_stage = "rope_k";
     const k = (try cb.visionRope(k_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions)) orelse
         return error.UnsupportedVisionRopeBackend;
     defer cb.free(k);
@@ -922,10 +1299,12 @@ fn visionAttention(
     // Every patch is active in the single-image vision tower. An explicit
     // all-ones mask only adds a device upload and blocks specialized unmasked
     // SDPA routes without changing the mathematical result.
+    failed_stage = "sdpa";
     const attended = try cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, token_count, cfg.head_count, cfg.headDim());
     defer cb.free(attended);
     const sdpa_ns = profileLap(profile, &stage_started_at);
     const out_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer});
+    failed_stage = "output_projection";
     const output = try linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden);
     const out_ns = profileLap(profile, &stage_started_at);
     if (profile) {
@@ -1030,12 +1409,20 @@ fn linearNamed(
     in_dim: usize,
     out_dim: usize,
 ) !CT {
+    const profile = qwen3VlProfileEnabled();
+    var failed_stage: []const u8 = "weight";
+    errdefer |err| if (profile) std.debug.print(
+        "qwen3vl-linear-error: prefix={s} stage={s} error={s}\n",
+        .{ prefix, failed_stage, @errorName(err) },
+    );
     const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{prefix});
     defer allocator.free(weight_name);
     const bias_name = try std.fmt.allocPrint(allocator, "{s}.bias", .{prefix});
     defer allocator.free(bias_name);
     const weight = try weights.linear(weight_name, in_dim, out_dim);
+    failed_stage = "bias";
     const bias = try weights.weight(bias_name);
+    failed_stage = "linear";
     return cb.linear(input, weight, bias, rows, in_dim, out_dim);
 }
 
@@ -1090,6 +1477,30 @@ fn extractPatchesMergeMajor(
     return out;
 }
 
+fn duplicateStillImageTemporalPatches(
+    allocator: std.mem.Allocator,
+    patches: []const f32,
+    patch_count: usize,
+    patch_size: usize,
+) ![]f32 {
+    const patch_area = try std.math.mul(usize, patch_size, patch_size);
+    const spatial_dim = try std.math.mul(usize, 3, patch_area);
+    if (patches.len != try std.math.mul(usize, patch_count, spatial_dim)) return error.InvalidPatchEmbeddingShape;
+    const temporal_dim = try std.math.mul(usize, spatial_dim, 2);
+    const out = try allocator.alloc(f32, try std.math.mul(usize, patch_count, temporal_dim));
+    for (0..patch_count) |token| {
+        const src_row = patches[token * spatial_dim ..][0..spatial_dim];
+        const dst_row = out[token * temporal_dim ..][0..temporal_dim];
+        for (0..3) |channel| {
+            const source = src_row[channel * patch_area ..][0..patch_area];
+            const channel_base = channel * 2 * patch_area;
+            @memcpy(dst_row[channel_base..][0..patch_area], source);
+            @memcpy(dst_row[channel_base + patch_area ..][0..patch_area], source);
+        }
+    }
+    return out;
+}
+
 fn visionPositions(allocator: std.mem.Allocator, geometry: Geometry, merge: usize) ![]u32 {
     const count = geometry.patchCount();
     const position_count = std.math.mul(usize, count, 2) catch return error.InvalidPositionEmbeddingShape;
@@ -1110,15 +1521,13 @@ fn visionPositions(allocator: std.mem.Allocator, geometry: Geometry, merge: usiz
 }
 
 fn addInterpolatedPositions(
-    store: *tensor_store_mod.GgufStore,
+    weights: *WeightCache,
     hidden: []f32,
     cfg: Config,
     geometry: Geometry,
 ) !void {
-    var table = try projector_common.loadTensorF32(store, "v.position_embd.weight");
-    defer table.deinit();
-    if (table.shape.len != 2 or table.shape[1] != cfg.vision_hidden or table.shape[0] <= 0) return error.InvalidPositionEmbeddingShape;
-    const position_count: usize = @intCast(table.shape[0]);
+    const table = try weights.positionValues(cfg);
+    const position_count = table.len / cfg.vision_hidden;
     const side = exactSquareRoot(position_count) orelse return error.InvalidPositionEmbeddingShape;
     if (hidden.len != geometry.patchCount() * cfg.vision_hidden) return error.InvalidPositionEmbeddingShape;
     var token: usize = 0;
@@ -1138,10 +1547,10 @@ fn addInterpolatedPositions(
                     const wx = fx - @as(f32, @floatFromInt(x0));
                     const dst = token * cfg.vision_hidden;
                     for (0..cfg.vision_hidden) |h| {
-                        const p00 = table.data[(y0 * side + x0) * cfg.vision_hidden + h];
-                        const p01 = table.data[(y0 * side + x1) * cfg.vision_hidden + h];
-                        const p10 = table.data[(y1 * side + x0) * cfg.vision_hidden + h];
-                        const p11 = table.data[(y1 * side + x1) * cfg.vision_hidden + h];
+                        const p00 = table[(y0 * side + x0) * cfg.vision_hidden + h];
+                        const p01 = table[(y0 * side + x1) * cfg.vision_hidden + h];
+                        const p10 = table[(y1 * side + x0) * cfg.vision_hidden + h];
+                        const p11 = table[(y1 * side + x1) * cfg.vision_hidden + h];
                         hidden[dst + h] += (p00 * (1.0 - wx) + p01 * wx) * (1.0 - wy) +
                             (p10 * (1.0 - wx) + p11 * wx) * wy;
                     }
@@ -1280,6 +1689,50 @@ fn parseConfig(file: *const gguf_format.File) !Config {
     return cfg;
 }
 
+fn configFromResidentModel(config: gpt_config.Config) !Config {
+    if (config.family != .qwen3_vl or !config.hasQwen3VlArchitectureContract() or
+        config.vision_temporal_patch_size != 2 or config.vision_num_position_embeddings == 0 or
+        config.vision_deepstack_visual_indexes_len == 0)
+    {
+        return error.InvalidMultimodalConfig;
+    }
+    const position_count: usize = @intCast(config.vision_num_position_embeddings);
+    const position_side = exactSquareRoot(position_count) orelse
+        return error.InvalidPositionEmbeddingShape;
+    const patch_size: usize = @intCast(config.vision_patch_size);
+    var cfg = Config{
+        .text_hidden = @intCast(config.hidden_size),
+        .vision_hidden = @intCast(config.vision_hidden_size),
+        .intermediate = @intCast(config.vision_intermediate_size),
+        .block_count = @intCast(config.vision_num_hidden_layers),
+        .head_count = @intCast(config.vision_num_attention_heads),
+        .image_size = try std.math.mul(usize, position_side, patch_size),
+        .patch_size = patch_size,
+        .spatial_merge = @intCast(config.vision_spatial_merge_size),
+        .layer_norm_eps = 1e-6,
+        // Qwen3-VL's vision tower retains the Qwen2-VL 10K rotary base; the
+        // multi-million text RoPE base belongs only to the language model.
+        .rope_theta = 10_000.0,
+        .image_mean = .{ 0.5, 0.5, 0.5 },
+        .image_std = .{ 0.5, 0.5, 0.5 },
+    };
+    const deepstack = config.visionDeepstackVisualIndexes();
+    if (deepstack.len > cfg.deepstack_layers.len) return error.InvalidMultimodalConfig;
+    for (deepstack, 0..) |layer, index| {
+        const layer_index: usize = @intCast(layer);
+        if (layer_index >= cfg.block_count) return error.InvalidMultimodalConfig;
+        cfg.deepstack_layers[index] = layer_index;
+    }
+    cfg.deepstack_len = deepstack.len;
+    if (cfg.text_hidden == 0 or cfg.vision_hidden == 0 or cfg.intermediate == 0 or
+        cfg.block_count == 0 or cfg.head_count == 0 or cfg.vision_hidden % cfg.head_count != 0 or
+        cfg.patch_size == 0 or cfg.spatial_merge == 0)
+    {
+        return error.InvalidMultimodalConfig;
+    }
+    return cfg;
+}
+
 fn metadataF32x3(view: gguf_metadata.View, key: []const u8) ![3]f32 {
     const entry = view.find(key) orelse return error.InvalidGgufProjector;
     const array = switch (entry.value) {
@@ -1301,6 +1754,79 @@ fn metadataF32x3(view: gguf_metadata.View, key: []const u8) ![3]f32 {
 fn exactSquareRoot(value: usize) ?usize {
     const root: usize = @intFromFloat(@sqrt(@as(f64, @floatFromInt(value))));
     return if (root * root == value) root else null;
+}
+
+test "Qwen3-VL resident projector maps integrated safetensors weights" {
+    var cfg = Config{
+        .text_hidden = 2048,
+        .vision_hidden = 1024,
+        .intermediate = 4096,
+        .block_count = 24,
+        .head_count = 16,
+        .image_size = 768,
+        .patch_size = 16,
+        .spatial_merge = 2,
+        .layer_norm_eps = 1e-6,
+        .image_mean = .{ 0.5, 0.5, 0.5 },
+        .image_std = .{ 0.5, 0.5, 0.5 },
+        .deepstack_len = 3,
+    };
+    cfg.deepstack_layers[0] = 5;
+    cfg.deepstack_layers[1] = 11;
+    cfg.deepstack_layers[2] = 17;
+
+    const cases = [_]struct { logical: []const u8, resident: []const u8 }{
+        .{ .logical = "v.patch_embd.bias", .resident = "model.visual.patch_embed.proj.bias" },
+        .{ .logical = "v.position_embd.weight", .resident = "model.visual.pos_embed.weight" },
+        .{ .logical = "v.blk.7.attn_qkv.weight", .resident = "model.visual.blocks.7.attn.qkv.weight" },
+        .{ .logical = "v.blk.23.ffn_down.bias", .resident = "model.visual.blocks.23.mlp.linear_fc2.bias" },
+        .{ .logical = "v.post_ln.weight", .resident = "model.visual.merger.norm.weight" },
+        .{ .logical = "mm.0.bias", .resident = "model.visual.merger.linear_fc1.bias" },
+        .{ .logical = "v.deepstack.11.fc2.weight", .resident = "model.visual.deepstack_merger_list.1.linear_fc2.weight" },
+    };
+    for (cases) |case| {
+        const actual = try residentWeightNameAlloc(std.testing.allocator, cfg, case.logical);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.resident, actual);
+    }
+    try std.testing.expectError(
+        error.WeightNotFound,
+        residentWeightNameAlloc(std.testing.allocator, cfg, "v.deepstack.6.fc1.weight"),
+    );
+}
+
+test "Qwen3-VL resident projector derives the official BF16 vision contract" {
+    var model = gpt_config.Config{
+        .family = .qwen3_vl,
+        .hidden_size = 2048,
+        .num_attention_heads = 16,
+        .image_token_index = 151655,
+        .video_token_index = 151656,
+        .boi_token_index = 151652,
+        .eoi_token_index = 151653,
+        .vision_hidden_size = 1024,
+        .vision_num_hidden_layers = 24,
+        .vision_num_attention_heads = 16,
+        .vision_intermediate_size = 4096,
+        .vision_num_position_embeddings = 2304,
+        .vision_out_hidden_size = 2048,
+        .vision_patch_size = 16,
+        .vision_spatial_merge_size = 2,
+        .vision_temporal_patch_size = 2,
+        .vision_deepstack_visual_indexes_len = 3,
+        .mrope_interleaved = true,
+        .mrope_section = .{ 24, 20, 20 },
+    };
+    model.vision_deepstack_visual_indexes[0] = 5;
+    model.vision_deepstack_visual_indexes[1] = 11;
+    model.vision_deepstack_visual_indexes[2] = 17;
+
+    const cfg = try configFromResidentModel(model);
+    try std.testing.expectEqual(@as(usize, 768), cfg.image_size);
+    try std.testing.expectEqual(@as(usize, 24), cfg.block_count);
+    try std.testing.expectEqual(@as(usize, 3), cfg.deepstack_len);
+    try std.testing.expectEqualSlices(usize, &.{ 5, 11, 17 }, cfg.deepstack_layers[0..cfg.deepstack_len]);
+    try std.testing.expectEqual(@as(f32, 10_000.0), cfg.rope_theta);
 }
 
 test "Qwen3-VL image geometry is merge aligned and admission bounded" {
@@ -1398,6 +1924,13 @@ test "Qwen3-VL vision positions preserve 2x2 merge-major order" {
     defer std.testing.allocator.free(positions);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1, 0, 0, 1, 1 }, positions[0..8]);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1, 2, 3, 2, 3 }, positions[8..16]);
+}
+
+test "Qwen3-VL still-image temporal patch expansion matches Conv3D CTHW order" {
+    const spatial = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const actual = try duplicateStillImageTemporalPatches(std.testing.allocator, &spatial, 2, 1);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6 }, actual);
 }
 
 test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {

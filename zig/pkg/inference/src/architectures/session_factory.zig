@@ -82,6 +82,8 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gliner2,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
@@ -1392,7 +1394,11 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
             model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
         );
     }
-    const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
+    const cuda_profile = cudaProfileForArch(
+        native_impl.arch_config,
+        native_impl.task,
+        &model_manifest,
+    ) orelse return error.UnsupportedCudaArchitecture;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
         &native_impl.backend_data.native.resident_weights,
@@ -1571,38 +1577,69 @@ pub fn verifyCudaA4bPreparedPack(
     );
 }
 
-fn cudaSupportsArch(arch_config: ArchConfig) bool {
-    return cudaProfileForArch(arch_config) != null;
+fn cudaSupportsArch(arch_config: ArchConfig, model_manifest: *const manifest_mod.ModelManifest) bool {
+    return cudaProfileForArch(arch_config, .generic, model_manifest) != null;
 }
 
-fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
+fn cudaProfileForArch(
+    arch_config: ArchConfig,
+    task: SessionTask,
+    model_manifest: *const manifest_mod.ModelManifest,
+) ?CudaCapabilityProfile {
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
-        .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
+        .gpt => |cfg| switch (cfg.family) {
+            .gemma => .gemma4,
+            .qwen3 => if (task == .generic and model_manifest.isLastTokenDecoderEmbedder()) .qwen3_embedding else null,
+            .qwen3_vl => if (task == .generic and
+                model_manifest.model_type == .generator and
+                model_manifest.isQwen3VlGenerationSafetensorsBundle())
+                .qwen3_vl_generation
+            else
+                null,
+            else => null,
+        },
         else => null,
     };
 }
 
-test "cuda support gate admits only supported encoder architectures" {
-    try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
-    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
-    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
+test "cuda support gate admits only supported model roles" {
+    const generic_manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    const qwen3_embedder = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .pooling = .last,
+        .embedding_style = .qwen3_embedding,
+    };
+    const qwen3_vl_generator = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_safetensors_bundle_family,
+    };
+    try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
     if (comptime build_options.enable_cuda) {
-        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }, .classifier, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }, .recognizer, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.qwen3_embedding, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3 } }, .generic, &qwen3_embedder).?);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3 } }, .generic, &generic_manifest) == null);
+        try std.testing.expectEqual(CudaCapabilityProfile.qwen3_vl_generation, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .generic, &qwen3_vl_generator).?);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .generic, &generic_manifest) == null);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .classifier, &qwen3_vl_generator) == null);
     }
 }
 
@@ -4392,7 +4429,7 @@ fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.me
     // those source views alive while preparing reusable F16 projection slots
     // (or the explicit F32 rollback), so the host cache must be able to account
     // for the complete artifact. The ordinary GPU defaults already cover the
-    // prepared projections and the persistent embedding table on supported
+    // prepared projections and persistent embedding table on supported
     // machines; these are minimums, not an override of an explicit limit.
     const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(4));
     const backend_floor = clampBytes((total_bytes *| 3) / 4 +| gib(1), gib(3), gib(6));
@@ -4683,11 +4720,11 @@ fn sharedGpuHostedBudgetPolicy(
     else
         runtime.tier.cache.Budget{};
     const budget_floor = widenLimits(
+        widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
         widenLimits(
-            widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
             widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
+            bge_m3_budget_floor,
         ),
-        bge_m3_budget_floor,
     );
     const shared_cache_floor = runtime.tier.cache.Budget{
         .host_limit_bytes = @max(

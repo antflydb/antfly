@@ -23,6 +23,7 @@ const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
 const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
 const credential_safety = @import("../common/credential_safety.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -626,9 +627,20 @@ fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) vo
     alloc.free(scope_key);
 }
 
-fn managedEmbeddingApiKeyIdentityHash(entry: *const ManagedEmbeddingEntry) u64 {
-    if (entry.api_key) |api_key| return api_key.identityHash();
-    return 0;
+fn managedEmbeddingCredentialSourceIdentity(
+    entry: *const ManagedEmbeddingEntry,
+) credential_source_identity.CredentialSourceIdentity {
+    const Identity = credential_source_identity.CredentialSourceIdentity;
+    return switch (entry.provider) {
+        .openai, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
+        // Managed Bedrock currently exposes the process-wide AWS default
+        // chain. Profile and web-identity constructors live in the shared
+        // identity type so future per-index sources cannot bypass these
+        // execution/cache boundaries.
+        .bedrock => Identity.awsDefaultChain(),
+        .ollama => Identity.none(),
+    };
 }
 
 fn managedEmbeddingEntriesEquivalentForLookup(
@@ -642,7 +654,7 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         lhs.requests_per_minute == rhs.requests_per_minute and
         lhs.burst == rhs.burst and
         (lhs.antfly_provider != null) == (rhs.antfly_provider != null) and
-        managedEmbeddingApiKeyIdentityHash(lhs) == managedEmbeddingApiKeyIdentityHash(rhs) and
+        managedEmbeddingCredentialSourceIdentity(lhs).eql(managedEmbeddingCredentialSourceIdentity(rhs)) and
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
@@ -808,17 +820,86 @@ fn validateManagedEmbeddingLookupNames(
 }
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
-    const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
-        @tagName(entry.provider),
-        entry.base_url,
-        entry.model,
-        entry.project_id,
-        api_key_hash,
-        @intFromBool(entry.sparse),
-        entry.requests_per_minute,
-        entry.burst,
-    });
+    // The global pacer registry is an execution boundary. Hash the complete,
+    // length-framed scope instead of interpolating user-controlled fields or
+    // reducing the credential identity to a lossy machine-sized hash.
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    credential_source_identity.updateField(&hasher, "antfly-managed-embedding-pacer-v1");
+    credential_source_identity.updateField(&hasher, @tagName(entry.provider));
+    credential_source_identity.updateField(&hasher, entry.base_url);
+    credential_source_identity.updateField(&hasher, entry.model);
+    credential_source_identity.updateField(&hasher, entry.project_id);
+    managedEmbeddingCredentialSourceIdentity(entry).updateHash(&hasher);
+    hashQueryCacheU64(&hasher, @intFromBool(entry.sparse));
+    hashQueryCacheU64(&hasher, entry.requests_per_minute);
+    hashQueryCacheU64(&hasher, entry.burst);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
+}
+
+pub fn testManagedEmbeddingCredentialSourceIdentities() !void {
+    const alloc = std.testing.allocator;
+    const base = ManagedEmbeddingEntry{
+        .alloc = alloc,
+        .index_name = @constCast("dense"),
+        .provider = .vertex,
+        .model = @constCast("gemini-embedding-001"),
+        .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
+        .project_id = @constCast("project-a"),
+        .location = @constCast("us-central1"),
+        .dimensions = 3072,
+    };
+
+    var vertex_default = base;
+    var vertex_file_a = base;
+    vertex_file_a.credentials_path = @constCast("credentials-a.json");
+    var vertex_file_b = base;
+    vertex_file_b.credentials_path = @constCast("credentials-b.json");
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&vertex_default, &vertex_file_a));
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&vertex_file_a, &vertex_file_b));
+
+    var cohere_a = base;
+    cohere_a.provider = .cohere;
+    cohere_a.api_key = .{ .secret_ref = @constCast("cohere-a") };
+    var cohere_b = cohere_a;
+    cohere_b.api_key = .{ .secret_ref = @constCast("cohere-b") };
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&cohere_a, &cohere_b));
+
+    var bedrock_a = base;
+    bedrock_a.provider = .bedrock;
+    bedrock_a.region = @constCast("us-east-1");
+    var bedrock_b = bedrock_a;
+    try std.testing.expect(managedEmbeddingEntriesEquivalentForLookup(&bedrock_a, &bedrock_b));
+    try std.testing.expectEqual(
+        credential_source_identity.CredentialSourceIdentity.Kind.aws_default_chain,
+        managedEmbeddingCredentialSourceIdentity(&bedrock_a).kind,
+    );
+
+    const default_scope = try requestPacerScopeKeyAlloc(alloc, &vertex_default);
+    defer alloc.free(default_scope);
+    const file_scope = try requestPacerScopeKeyAlloc(alloc, &vertex_file_a);
+    defer alloc.free(file_scope);
+    try std.testing.expect(!std.mem.eql(u8, default_scope, file_scope));
+
+    // These two scopes collided under delimiter-based concatenation because
+    // the separator could be moved between adjacent user-controlled fields.
+    var framed_a = base;
+    framed_a.model = @constCast("alpha\x1fbeta");
+    framed_a.project_id = @constCast("gamma");
+    var framed_b = base;
+    framed_b.model = @constCast("alpha");
+    framed_b.project_id = @constCast("beta\x1fgamma");
+    const framed_scope_a = try requestPacerScopeKeyAlloc(alloc, &framed_a);
+    defer alloc.free(framed_scope_a);
+    const framed_scope_b = try requestPacerScopeKeyAlloc(alloc, &framed_b);
+    defer alloc.free(framed_scope_b);
+    try std.testing.expect(!std.mem.eql(u8, framed_scope_a, framed_scope_b));
+}
+
+test "managed embedding execution identities include every credential source" {
+    try testManagedEmbeddingCredentialSourceIdentities();
 }
 
 fn attachManagedGoogleCredentialManager(
@@ -1140,12 +1221,9 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.region);
         hashQueryCacheField(&hasher, entry.project_id);
         hashQueryCacheField(&hasher, entry.location);
-        // Keep cache authorization boundaries aligned with CredentialManager.
-        // The explicit tag prevents a valid file path from aliasing default
-        // ADC. Token refreshes retain the same vector identity, while distinct
-        // credential sources must never coalesce.
-        hashQueryCacheU64(&hasher, @intFromBool(entry.credentials_path.len > 0));
-        hashQueryCacheField(&hasher, entry.credentials_path);
+        // Token refreshes retain the same vector identity, while provider,
+        // source-kind, and source-locator boundaries must never coalesce.
+        managedEmbeddingCredentialSourceIdentity(entry).updateHash(&hasher);
         hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
@@ -1154,7 +1232,6 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_query.canonical());
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
-        hashQueryCacheSecretIdentity(&hasher, entry.api_key);
         hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
@@ -1340,27 +1417,6 @@ fn hashQueryCacheField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) 
 fn hashQueryCacheU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     var encoded = std.mem.nativeToLittle(u64, @intCast(value));
     hasher.update(std.mem.asBytes(&encoded));
-}
-
-fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secret: ?common_secrets.SecretValue) void {
-    const secret = maybe_secret orelse {
-        hashQueryCacheField(hasher, "none");
-        return;
-    };
-    switch (secret) {
-        .literal => |value| {
-            hashQueryCacheField(hasher, "literal");
-            hashQueryCacheField(hasher, value);
-        },
-        .secret_ref => |value| {
-            hashQueryCacheField(hasher, "secret_ref");
-            hashQueryCacheField(hasher, value);
-        },
-        .env_var => |value| {
-            hashQueryCacheField(hasher, "env_var");
-            hashQueryCacheField(hasher, value);
-        },
-    }
 }
 
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {

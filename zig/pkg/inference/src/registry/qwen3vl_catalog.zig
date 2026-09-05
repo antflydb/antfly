@@ -76,6 +76,36 @@ pub const GenerationBundle = struct {
     }
 };
 
+pub const GenerationSafetensorsBundle = struct {
+    id: []const u8,
+    size: ModelSize,
+    model: Artifact,
+    config: Artifact,
+    preprocessor: Artifact,
+    video_preprocessor: Artifact,
+    chat_template: Artifact,
+    tokenizer: Artifact,
+    tokenizer_config: Artifact,
+
+    pub fn artifacts(self: *const GenerationSafetensorsBundle) [7]Artifact {
+        return .{
+            self.model,
+            self.config,
+            self.preprocessor,
+            self.video_preprocessor,
+            self.chat_template,
+            self.tokenizer,
+            self.tokenizer_config,
+        };
+    }
+
+    pub fn installedBytes(self: *const GenerationSafetensorsBundle) u64 {
+        var total: u64 = generation_safetensors_bundle_manifest.len;
+        for (self.artifacts()) |artifact| total += artifact.size;
+        return total;
+    }
+};
+
 const preprocessor_sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516";
 const video_preprocessor_sha256 = "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13";
 const tokenizer_sha256 = "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7";
@@ -264,8 +294,30 @@ pub const generation_bundles = [_]GenerationBundle{
     },
 };
 
+pub const generation_safetensors_bundles = [_]GenerationSafetensorsBundle{
+    .{
+        .id = "qwen3-vl-2b-instruct-bf16",
+        .size = .vl_2b,
+        .model = .{
+            .repo = "Qwen/Qwen3-VL-2B-Instruct",
+            .revision = "89644892e4d85e24eaac8bacfd4f463576704203",
+            .path = "model.safetensors",
+            .size = 4_255_140_312,
+            .sha256 = "7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0",
+        },
+        .config = generation_bundles[0].config,
+        .preprocessor = generation_bundles[0].preprocessor,
+        .video_preprocessor = generation_bundles[0].video_preprocessor,
+        .chat_template = generation_bundles[0].chat_template,
+        .tokenizer = generation_bundles[0].tokenizer,
+        .tokenizer_config = generation_bundles[0].tokenizer_config,
+    },
+};
+
 pub const generation_bundle_variant = "q4-k-m-bundle-v1";
 pub const generation_bundle_family = "qwen3_vl_gguf_bundle/v1";
+pub const generation_safetensors_bundle_variant = "bf16-safetensors-bundle-v1";
+pub const generation_safetensors_bundle_family = "qwen3_vl_safetensors_bundle/v1";
 pub const reranker_bundle_variant = "bf16-safetensors-bundle-v1";
 pub const reranker_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
 
@@ -328,6 +380,8 @@ pub const promoted_reranker_artifacts = [_]PromotedArtifact{
 };
 pub const reranker_bundle_manifest =
     "{\"family\":\"" ++ reranker_bundle_family ++ "\",\"model\":\"model.safetensors\"}\n";
+pub const generation_safetensors_bundle_manifest =
+    "{\"family\":\"" ++ generation_safetensors_bundle_family ++ "\",\"model\":\"model.safetensors\"}\n";
 
 const generation_manifest_prefix = "{\"family\":\"" ++ generation_bundle_family ++ "\",\"decoder\":\"";
 const generation_manifest_projector = "\",\"projector\":\"";
@@ -490,6 +544,20 @@ pub fn findGenerationBundleForHubRef(owner: []const u8, name: []const u8, varian
     return null;
 }
 
+pub fn findGenerationSafetensorsBundleForHubRef(
+    owner: []const u8,
+    name: []const u8,
+    variant: []const u8,
+) ?*const GenerationSafetensorsBundle {
+    if (!std.mem.eql(u8, variant, generation_safetensors_bundle_variant)) return null;
+    for (&generation_safetensors_bundles) |*bundle| {
+        const slash = std.mem.indexOfScalar(u8, bundle.model.repo, '/') orelse continue;
+        if (std.mem.eql(u8, owner, bundle.model.repo[0..slash]) and
+            std.mem.eql(u8, name, bundle.model.repo[slash + 1 ..])) return bundle;
+    }
+    return null;
+}
+
 fn validLowerHex(value: []const u8, len: usize) bool {
     if (value.len != len) return false;
     for (value) |char| {
@@ -534,6 +602,19 @@ pub fn validate() !void {
             !std.mem.eql(u8, bundle.config.revision, bundle.tokenizer.revision) or
             !std.mem.eql(u8, bundle.config.revision, bundle.tokenizer_config.revision)) return error.MixedSidecarSource;
     }
+    for (generation_safetensors_bundles, 0..) |bundle, i| {
+        if (bundle.id.len == 0) return error.InvalidCatalogBundle;
+        for (generation_safetensors_bundles[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier.id, bundle.id) or earlier.size == bundle.size)
+                return error.DuplicateCatalogBundle;
+        }
+        for (bundle.artifacts()) |artifact| try validateArtifact(artifact);
+        for (bundle.artifacts()[1..]) |sidecar| {
+            if (!std.mem.eql(u8, bundle.model.repo, sidecar.repo) or
+                !std.mem.eql(u8, bundle.model.revision, sidecar.revision))
+                return error.MixedSidecarSource;
+        }
+    }
     for (rerankerArtifacts()) |artifact| try validateArtifact(artifact);
     for (promoted_generation_2b_metadata_artifacts) |artifact| try validatePromotedArtifact(artifact);
     for (promoted_reranker_artifacts) |artifact| try validatePromotedArtifact(artifact);
@@ -549,6 +630,13 @@ test "Qwen3-VL artifact catalog is immutable and internally consistent" {
         "Qwen3-VL-4B-Instruct-GGUF",
         generation_bundle_variant,
     ) == &generation_bundles[1]);
+    try std.testing.expect(findGenerationSafetensorsBundleForHubRef(
+        "Qwen",
+        "Qwen3-VL-2B-Instruct",
+        generation_safetensors_bundle_variant,
+    ) == &generation_safetensors_bundles[0]);
+    try std.testing.expectEqual(@as(usize, 1), generation_safetensors_bundles.len);
+    try std.testing.expect(generation_safetensors_bundles[0].installedBytes() > generation_bundles[0].installedBytes());
     try std.testing.expect(generation_bundles[0].installedBytes() < generation_bundles[1].installedBytes());
     try std.testing.expect(generation_bundles[1].installedBytes() < generation_bundles[2].installedBytes());
     const manifest = try generationBundleManifestAlloc(std.testing.allocator, &generation_bundles[1]);
