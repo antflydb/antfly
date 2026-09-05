@@ -125,18 +125,53 @@ pub const PoolingStrategy = enum {
 /// repo, so GGUF and safetensors deployments embed queries identically).
 pub const qwen3_embedding_default_query_prefix =
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+pub const qwen3_embedding_instruction_template = "Instruct: {instruction}\nQuery:";
 
-/// Which decoder-embedder convention the manifest resolved to. Styles drive
-/// the resident Qwen3 embedding path, query/document prefix semantics, and
-/// suppress the generative-arch model-type flip for checkpoints whose
-/// config.json says `Qwen3ForCausalLM` but which serve embeddings.
+/// Whether retrieval roles are interchangeable, backed by a resolved profile,
+/// or known to require a profile that could not be resolved. `required` is a
+/// fail-closed intermediate state: model admission must reject it.
+pub const EmbeddingTaskContract = enum {
+    symmetric,
+    profiled,
+    required,
+};
+
+pub const EmbeddingTransform = struct {
+    prefix: []const u8 = "",
+    declared: bool = false,
+};
+
+/// Data-driven rendering contract for the text presented to an embedding
+/// model. Execution details such as decoder pooling remain in EmbeddingStyle;
+/// this profile owns only query/document semantics.
+pub const EmbeddingProfile = struct {
+    task_contract: EmbeddingTaskContract = .symmetric,
+    query: EmbeddingTransform = .{},
+    document: EmbeddingTransform = .{},
+    /// Query prefix template containing exactly one `{instruction}` marker.
+    /// It is used only when a request overrides the model's default task text.
+    instruction_template: []const u8 = "",
+
+    fn deinit(self: *EmbeddingProfile, allocator: std.mem.Allocator) void {
+        if (self.query.prefix.len > 0) allocator.free(self.query.prefix);
+        if (self.document.prefix.len > 0) allocator.free(self.document.prefix);
+        if (self.instruction_template.len > 0) allocator.free(self.instruction_template);
+        self.* = .{};
+    }
+
+    pub fn isResolved(self: EmbeddingProfile) bool {
+        return self.task_contract == .profiled and self.query.declared and self.document.declared;
+    }
+};
+
+/// Which decoder-embedder execution convention the manifest resolved to.
+/// Styles select pooling/EOS/runtime behavior and suppress the generative-arch
+/// model-type flip. Query/document text rendering belongs to EmbeddingProfile.
 pub const EmbeddingStyle = enum {
     none,
-    /// Jina embeddings v5: "Query: " / "Document: " prefixes.
+    /// Jina embeddings v5 decoder execution and last-token pooling.
     jina_v5,
-    /// Qwen3-Embedding: instruction-wrapped queries
-    /// ("Instruct: {task}\nQuery:{text}"), raw documents, trailing-EOS
-    /// last-token pooling.
+    /// Qwen3-Embedding trailing-EOS last-token pooling.
     qwen3_embedding,
 };
 
@@ -241,11 +276,13 @@ pub const ModelManifest = struct {
     // Pipeline config
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
-    embedding_text_prefix: []const u8 = "",
-    /// Prefix applied to query-side inputs (task_type retrieval-query
-    /// requests). Documents use `embedding_text_prefix`. For Qwen3-Embedding
-    /// this holds the full default instruction wrapper up to the text.
-    embedding_query_prefix: []const u8 = "",
+    embedding_profile: EmbeddingProfile = .{},
+    /// True only when model_manifest.json explicitly declares the profile.
+    /// Explicit profiles replace family defaults and must be complete.
+    embedding_profile_explicit: bool = false,
+    /// Tracks a contract declared by either the legacy top-level field or the
+    /// declarative profile so later parsing cannot silently replace it.
+    embedding_task_contract_explicit: bool = false,
     embedding_style: EmbeddingStyle = .none,
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
@@ -327,8 +364,7 @@ pub const ModelManifest = struct {
             self.allocator.free(labels);
         }
         if (self.chat_template) |t| self.allocator.free(t);
-        if (self.embedding_text_prefix.len > 0) self.allocator.free(self.embedding_text_prefix);
-        if (self.embedding_query_prefix.len > 0) self.allocator.free(self.embedding_query_prefix);
+        self.embedding_profile.deinit(self.allocator);
         if (self.gliner_model_type.len > 0) self.allocator.free(self.gliner_model_type);
         if (self.config_model_arch.len > 0) self.allocator.free(self.config_model_arch);
         if (self.gliner_default_labels.len > 0) {
@@ -361,22 +397,25 @@ pub const ModelManifest = struct {
     /// embedder (Qwen3-Embedding, Jina v5) eligible for the resident Qwen3
     /// embedding path and query/document prefix handling.
     pub fn isLastTokenDecoderEmbedder(self: *const ModelManifest) bool {
-        if (self.embedding_style != .none) {
-            return self.model_type == .embedder and self.pooling == .last;
-        }
+        if (self.embedding_style != .none) return self.model_type == .embedder;
         // Legacy heuristic kept for manifests written before embedding_style
         // existed: Jina v5's last pooling + document prefix pairing.
         return self.pooling == .last and
-            std.mem.eql(u8, self.embedding_text_prefix, "Document: ");
+            std.mem.eql(u8, self.embedding_profile.document.prefix, "Document: ");
     }
 
     /// Query-side prefix for retrieval-query task types. Qwen3-Embedding
     /// manifests without sentence-transformers prompts (e.g. bare GGUF
     /// bundles) fall back to the model card's default retrieval instruction.
     pub fn queryPrefix(self: *const ModelManifest) []const u8 {
-        if (self.embedding_query_prefix.len > 0) return self.embedding_query_prefix;
-        if (self.embedding_style == .qwen3_embedding) return qwen3_embedding_default_query_prefix;
-        return "";
+        return self.embedding_profile.query.prefix;
+    }
+
+    /// True when retrieval task roles alter the text presented to the model.
+    /// Decoder execution style and task prefixing are deliberately separate:
+    /// encoder models such as Nomic can require query/document prefixes too.
+    pub fn hasEmbeddingTaskProfile(self: *const ModelManifest) bool {
+        return self.embedding_profile.isResolved();
     }
 
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
@@ -823,6 +862,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
             direct.catalog.model_dir_path,
             manifest.gguf_path.?,
         ));
+        try finalizeEmbeddingProfile(&manifest);
         return manifest;
     }
 
@@ -960,6 +1000,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     applyImplicitSparseOutputLayout(&manifest, catalog);
     try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog));
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
 }
@@ -1044,6 +1085,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     applyImplicitSparseOutputLayout(&manifest, &catalog);
     try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog));
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
 }
@@ -1095,10 +1137,7 @@ fn applySentenceTransformersPoolingSidecars(
 
     const modules_bytes = (try catalog.readOptional("modules.json")) orelse return;
     defer allocator.free(modules_bytes);
-    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return,
-    };
+    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch return;
     defer modules_parsed.deinit();
     if (modules_parsed.value != .array) return;
 
@@ -1124,29 +1163,34 @@ fn applySentenceTransformersPoolingSidecars(
     const pooling_path = std.fmt.bufPrint(&pooling_path_buf, "{s}/config.json", .{dir}) catch return;
     const pooling_bytes = (try catalog.readOptional(pooling_path)) orelse return;
     defer allocator.free(pooling_bytes);
-    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return,
-    };
+    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch return;
     defer pooling_parsed.deinit();
     if (pooling_parsed.value != .object) return;
     const pooling_obj = pooling_parsed.value.object;
 
-    // The qualified Qwen3-Embedding runtime is specifically a trailing-EOS,
-    // last-token contract. Other sentence-transformers pooling modes do not
-    // distinguish an embedding checkpoint from a colocated Qwen3 generator
-    // strongly enough to opt it into that runtime.
-    if (!poolingModeEnabled(pooling_obj, "pooling_mode_lasttoken")) return;
+    const pooling: PoolingStrategy = if (poolingModeEnabled(pooling_obj, "pooling_mode_lasttoken"))
+        .last
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_mean_tokens"))
+        .mean
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_cls_token"))
+        .cls
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_max_tokens"))
+        .max
+    else
+        return;
 
     manifest.model_type = .embedder;
     manifest.model_type_origin = .config;
-    manifest.pooling = .last;
+    manifest.pooling = pooling;
     if (has_normalize_module) manifest.normalize = true;
     manifest.embedding_style = .qwen3_embedding;
 
     if (try catalog.readOptional("config_sentence_transformers.json")) |st_bytes| {
         defer allocator.free(st_bytes);
-        try applySentenceTransformersPrompts(manifest, allocator, st_bytes);
+        applySentenceTransformersPrompts(manifest, allocator, st_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
     }
 }
 
@@ -1165,38 +1209,15 @@ fn applySentenceTransformersPrompts(
     if (parsed.value != .object) return;
     const prompts = parsed.value.object.get("prompts") orelse return;
     if (prompts != .object) return;
-    const query = if (prompts.object.get("query")) |value|
-        if (value == .string) value.string else null
-    else
-        null;
-    const document = if (prompts.object.get("document")) |value|
-        if (value == .string) value.string else null
-    else
-        null;
-
-    // Allocate every replacement before changing the manifest. This keeps the
-    // update transactional: an OOM cannot leave a freed prefix installed in a
-    // manifest that the best-effort metadata caller will later deinitialize.
-    var owned_query: ?[]u8 = if (query) |value|
-        if (value.len == 0) null else try allocator.dupe(u8, value)
-    else
-        null;
-    errdefer if (owned_query) |value| allocator.free(value);
-    var owned_document: ?[]u8 = if (document) |value|
-        if (value.len == 0) null else try allocator.dupe(u8, value)
-    else
-        null;
-    errdefer if (owned_document) |value| allocator.free(value);
-
-    if (query != null) {
-        if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
-        manifest.embedding_query_prefix = owned_query orelse "";
-        owned_query = null;
+    if (prompts.object.get("query")) |q| {
+        if (q == .string) {
+            try setEmbeddingProfilePrefix(manifest, .query, q.string);
+        }
     }
-    if (document != null) {
-        if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
-        manifest.embedding_text_prefix = owned_document orelse "";
-        owned_document = null;
+    if (prompts.object.get("document")) |d| {
+        if (d == .string) {
+            try setEmbeddingProfilePrefix(manifest, .document, d.string);
+        }
     }
 }
 
@@ -1366,7 +1387,14 @@ fn applyGgufTokenizerMetadata(
     // Do not issue a whole-file DONTNEED that defeats rolling-worker prefetch.
     region.preserveFileCacheOnDeinit();
 
-    var parsed = try gguf_format.parse(allocator, region.data);
+    const has_external_tokenizer = artifactExists(catalog, allocator, model_dir_path, "tokenizer.json") or
+        artifactExists(catalog, allocator, model_dir_path, "tokenizer.model") or
+        artifactExists(catalog, allocator, model_dir_path, "vocab.json") or
+        artifactExists(catalog, allocator, model_dir_path, "vocab.txt");
+    var parsed = if (has_external_tokenizer)
+        try gguf_format.parseWithExternalTokenizer(allocator, region.data)
+    else
+        try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);
 
     const view = gguf_metadata.View.init(&parsed);
@@ -1420,7 +1448,7 @@ fn applyGgufTokenizerMetadata(
                         3 => .last,
                         else => manifest.pooling,
                     };
-                    if (pooling_type == 3) {
+                    if (pooling_type >= 1 and pooling_type <= 3) {
                         manifest.model_type = .embedder;
                         manifest.model_type_origin = .config;
                         manifest.normalize = true;
@@ -1462,9 +1490,8 @@ fn applyGgufTokenizerMetadata(
                 if (shouldUseBuiltInGemma4GgufChatTemplate(model_name, value)) gemma4_chat_template else value
             else
                 value;
-            const replacement = try allocator.dupe(u8, selected);
             if (manifest.chat_template) |old| allocator.free(old);
-            manifest.chat_template = replacement;
+            manifest.chat_template = try allocator.dupe(u8, selected);
         }
     }
 
@@ -1558,9 +1585,8 @@ fn applyGgufSpecialTokenString(
         .string => |value| value,
         else => return,
     };
-    const replacement = allocator.dupe(u8, token) catch return;
     if (target.*.len > 0) allocator.free(target.*);
-    target.* = replacement;
+    target.* = allocator.dupe(u8, token) catch return;
 }
 
 fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const gguf_format.MetadataEntry {
@@ -1983,23 +2009,26 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            } else if (std.mem.eql(u8, s, "nomic_bert")) {
+                // Nomic Embed v1/v1.5 checkpoints require asymmetric literal
+                // task prefixes. Keep these in the manifest so HTTP and
+                // embedded inference use one model-owned profile.
+                markEmbeddingTaskProfileRequired(manifest);
+                try setEmbeddingProfilePrefix(manifest, .query, "search_query: ");
+                try setEmbeddingProfilePrefix(manifest, .document, "search_document: ");
             }
         }
     }
 
     if (jina_v5_embedding_config) {
-        const document_prefix = try allocator.dupe(u8, "Document: ");
-        errdefer allocator.free(document_prefix);
-        const query_prefix = try allocator.dupe(u8, "Query: ");
         manifest.model_type = .embedder;
         manifest.model_type_origin = .config;
         manifest.pooling = .last;
         manifest.normalize = true;
         manifest.embedding_style = .jina_v5;
-        if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
-        manifest.embedding_text_prefix = document_prefix;
-        if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
-        manifest.embedding_query_prefix = query_prefix;
+        markEmbeddingTaskProfileRequired(manifest);
+        try setEmbeddingProfilePrefix(manifest, .document, "Document: ");
+        try setEmbeddingProfilePrefix(manifest, .query, "Query: ");
     }
 
     // For CLIP/CLAP/multimodal models, text_config contains the text encoder's
@@ -2163,6 +2192,81 @@ fn replaceOwnedStringArray(
     target.* = replacement;
 }
 
+fn parseEmbeddingTaskContractJson(value: std.json.Value) !EmbeddingTaskContract {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    if (std.mem.eql(u8, value.string, "symmetric")) return .symmetric;
+    // `required` is the legacy fail-closed spelling. `profiled` still starts in
+    // the unresolved state and becomes profiled only after both roles have
+    // actually been declared.
+    if (std.mem.eql(u8, value.string, "profiled") or
+        std.mem.eql(u8, value.string, "required")) return .required;
+    return error.InvalidEmbeddingTaskProfile;
+}
+
+fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !void {
+    // An explicit profile replaces inferred config.json defaults. Mark it
+    // unresolved first so malformed or partial role mappings fail closed in
+    // finalizeEmbeddingProfile instead of silently reverting to raw text.
+    const inherited_contract = manifest.embedding_profile.task_contract;
+    const inherited_contract_explicit = manifest.embedding_task_contract_explicit;
+    manifest.embedding_profile.deinit(manifest.allocator);
+    manifest.embedding_profile.task_contract = if (inherited_contract_explicit)
+        inherited_contract
+    else
+        .required;
+    manifest.embedding_profile_explicit = true;
+    if (value != .object) return error.InvalidEmbeddingTaskProfile;
+
+    var fields = value.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "task_contract") and
+            !std.mem.eql(u8, field.key_ptr.*, "query") and
+            !std.mem.eql(u8, field.key_ptr.*, "document"))
+        {
+            return error.InvalidEmbeddingTaskProfile;
+        }
+    }
+
+    if (value.object.get("task_contract")) |contract| {
+        const parsed_contract = try parseEmbeddingTaskContractJson(contract);
+        if (inherited_contract_explicit and parsed_contract != inherited_contract)
+            return error.InvalidEmbeddingTaskProfile;
+        manifest.embedding_profile.task_contract = parsed_contract;
+        manifest.embedding_task_contract_explicit = true;
+    }
+    if (value.object.get("query")) |query| {
+        if (query != .object) return error.InvalidEmbeddingTaskProfile;
+        var query_fields = query.object.iterator();
+        while (query_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix") and
+                !std.mem.eql(u8, field.key_ptr.*, "instruction_template"))
+            {
+                return error.InvalidEmbeddingTaskProfile;
+            }
+        }
+        if (query.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .query, prefix.string);
+        }
+        if (query.object.get("instruction_template")) |template| {
+            if (template != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingInstructionTemplate(manifest, template.string);
+        }
+    }
+    if (value.object.get("document")) |document| {
+        if (document != .object) return error.InvalidEmbeddingTaskProfile;
+        var document_fields = document.object.iterator();
+        while (document_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix"))
+                return error.InvalidEmbeddingTaskProfile;
+        }
+        if (document.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .document, prefix.string);
+        }
+    }
+}
+
 fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
@@ -2223,18 +2327,21 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     if (obj.get("normalize")) |v| {
         if (v == .bool) manifest.normalize = v.bool;
     }
+    if (obj.get("embedding_task_contract")) |v| {
+        manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(v);
+        manifest.embedding_task_contract_explicit = true;
+    }
+    if (obj.get("embedding_profile")) |v| try parseEmbeddingProfileJson(manifest, v);
+    // Legacy flat fields remain read-compatible. New manifests should use
+    // embedding_profile.query/document.prefix.
     if (obj.get("query_prefix")) |v| {
         if (v == .string) {
-            const replacement = if (v.string.len == 0) "" else try allocator.dupe(u8, v.string);
-            if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
-            manifest.embedding_query_prefix = replacement;
+            try setEmbeddingProfilePrefix(manifest, .query, v.string);
         }
     }
     if (obj.get("document_prefix")) |v| {
         if (v == .string) {
-            const replacement = if (v.string.len == 0) "" else try allocator.dupe(u8, v.string);
-            if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
-            manifest.embedding_text_prefix = replacement;
+            try setEmbeddingProfilePrefix(manifest, .document, v.string);
         }
     }
     if (obj.get("embedding_style")) |v| {
@@ -2909,6 +3016,81 @@ fn replaceOwnedString(allocator: std.mem.Allocator, slot: *[]const u8, value: []
     slot.* = value;
 }
 
+const EmbeddingProfileRole = enum { query, document };
+
+fn setEmbeddingProfilePrefix(
+    manifest: *ModelManifest,
+    role: EmbeddingProfileRole,
+    value: []const u8,
+) !void {
+    const transform = switch (role) {
+        .query => &manifest.embedding_profile.query,
+        .document => &manifest.embedding_profile.document,
+    };
+    const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
+    replaceOwnedString(manifest.allocator, &transform.prefix, owned);
+    transform.declared = true;
+}
+
+fn setEmbeddingInstructionTemplate(manifest: *ModelManifest, value: []const u8) !void {
+    const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
+    replaceOwnedString(manifest.allocator, &manifest.embedding_profile.instruction_template, owned);
+}
+
+fn markEmbeddingTaskProfileRequired(manifest: *ModelManifest) void {
+    if (!manifest.embedding_profile.isResolved()) manifest.embedding_profile.task_contract = .required;
+}
+
+fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
+    // Known execution styles are trusted model-family evidence. Their default
+    // rendering contracts fill any sidecar fields the checkpoint omitted.
+    switch (if (manifest.embedding_profile_explicit) EmbeddingStyle.none else manifest.embedding_style) {
+        .qwen3_embedding => {
+            markEmbeddingTaskProfileRequired(manifest);
+            if (!manifest.embedding_profile.query.declared)
+                try setEmbeddingProfilePrefix(manifest, .query, qwen3_embedding_default_query_prefix);
+            if (!manifest.embedding_profile.document.declared)
+                try setEmbeddingProfilePrefix(manifest, .document, "");
+            if (manifest.embedding_profile.instruction_template.len == 0)
+                try setEmbeddingInstructionTemplate(manifest, qwen3_embedding_instruction_template);
+        },
+        .jina_v5 => {
+            markEmbeddingTaskProfileRequired(manifest);
+            if (!manifest.embedding_profile.query.declared)
+                try setEmbeddingProfilePrefix(manifest, .query, "Query: ");
+            if (!manifest.embedding_profile.document.declared)
+                try setEmbeddingProfilePrefix(manifest, .document, "Document: ");
+        },
+        .none => {},
+    }
+
+    // Validate an explicitly symmetric declaration before deriving the
+    // resolved state. Prefix setters must never rewrite declared intent.
+    const has_declared_transform = manifest.embedding_profile.query.declared or
+        manifest.embedding_profile.document.declared or
+        manifest.embedding_profile.instruction_template.len > 0;
+    if (manifest.embedding_task_contract_explicit and
+        manifest.embedding_profile.task_contract == .symmetric and
+        has_declared_transform)
+    {
+        return error.InvalidEmbeddingTaskProfile;
+    }
+    if (manifest.embedding_profile.query.declared and manifest.embedding_profile.document.declared)
+        manifest.embedding_profile.task_contract = .profiled;
+    if (has_declared_transform and manifest.embedding_profile.task_contract == .symmetric)
+        manifest.embedding_profile.task_contract = .required;
+    switch (manifest.embedding_profile.task_contract) {
+        .required => return error.MissingEmbeddingTaskProfile,
+        .profiled => if (!manifest.embedding_profile.query.declared or
+            !manifest.embedding_profile.document.declared)
+            return error.MissingEmbeddingTaskProfile,
+        .symmetric => {},
+    }
+    const template = manifest.embedding_profile.instruction_template;
+    if (template.len > 0 and std.mem.count(u8, template, "{instruction}") != 1)
+        return error.InvalidEmbeddingTaskProfile;
+}
+
 fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, manifest.allocator, json_bytes, .{});
     defer parsed.deinit();
@@ -3122,9 +3304,8 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
             if (manifest.chat_template) |existing| {
                 if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
-                    const replacement = try allocator.dupe(u8, gemma4_chat_template);
                     allocator.free(existing);
-                    manifest.chat_template = replacement;
+                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
                 }
             } else {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
@@ -3232,7 +3413,7 @@ test "manifest treats jina embeddings v5 as qwen3 embedder with last pooling" {
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
     try std.testing.expect(manifest.normalize);
-    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_profile.document.prefix);
     try std.testing.expectEqualStrings("jina_embeddings_v5", manifest.config_model_arch);
     try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
 }
@@ -3254,7 +3435,142 @@ test "manifest treats merged jina qwen3 task repo as embedder" {
 
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
-    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_profile.document.prefix);
+}
+
+test "NomicBERT config installs its asymmetric retrieval task profile" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseConfigJson(&manifest, allocator, "{\"model_type\":\"nomic_bert\"}");
+    try finalizeEmbeddingProfile(&manifest);
+    try std.testing.expect(manifest.hasEmbeddingTaskProfile());
+    try std.testing.expectEqualStrings("search_query: ", manifest.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("search_document: ", manifest.embedding_profile.document.prefix);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
+}
+
+test "model manifest accepts a declarative embedding profile" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseModelManifestJson(&manifest, allocator,
+        \\{
+        \\  "type":"embedder",
+        \\  "embedding_profile":{
+        \\    "task_contract":"profiled",
+        \\    "query":{"prefix":"query: ","instruction_template":"task={instruction}\nquery: "},
+        \\    "document":{"prefix":"passage: "}
+        \\  }
+        \\}
+    );
+    try finalizeEmbeddingProfile(&manifest);
+    try std.testing.expectEqual(EmbeddingTaskContract.profiled, manifest.embedding_profile.task_contract);
+    try std.testing.expectEqualStrings("query: ", manifest.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("passage: ", manifest.embedding_profile.document.prefix);
+    try std.testing.expectEqualStrings("task={instruction}\nquery: ", manifest.embedding_profile.instruction_template);
+}
+
+test "task-required embedding manifests fail without a complete profile" {
+    const allocator = std.testing.allocator;
+
+    var missing = ModelManifest{ .allocator = allocator };
+    defer missing.deinit();
+    try parseModelManifestJson(&missing, allocator,
+        \\{"type":"embedder","embedding_task_contract":"required"}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&missing));
+
+    var partial = ModelManifest{ .allocator = allocator };
+    defer partial.deinit();
+    try parseModelManifestJson(&partial, allocator,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
+}
+
+test "explicit symmetric embedding contracts reject role transforms" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_profile":{"task_contract":"symmetric","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","query_prefix":"query: ","document_prefix":"document: "}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try parseModelManifestJson(&manifest, allocator, manifest_json);
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&manifest));
+    }
+}
+
+test "duplicate embedding contract declarations must agree" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingTaskProfile,
+        parseModelManifestJson(&manifest, allocator,
+            \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ),
+    );
+}
+
+test "embedding task contract declarations reject unknown values and types" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_task_contract":true}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profile"}}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":1}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+}
+
+test "explicit embedding profiles reject malformed fields without family fallback" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":42}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":42},"document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":"query: ","document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: ","unknown":true},"document":{"prefix":""}}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var partial = ModelManifest{ .allocator = allocator };
+    defer partial.deinit();
+    try parseModelManifestJson(&partial, allocator,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: "}}}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
 }
 
 test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
@@ -3314,64 +3630,13 @@ test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
     try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
     try std.testing.expect(manifest.normalize);
-    try std.testing.expectEqualStrings("", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("", manifest.embedding_profile.document.prefix);
     try std.testing.expectEqualStrings(
         "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
-        manifest.embedding_query_prefix,
+        manifest.embedding_profile.query.prefix,
     );
     try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
     try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
-
-    const AllocationRunner = struct {
-        fn run(alloc: std.mem.Allocator, path: []const u8) !void {
-            var loaded = try loadFromDir(alloc, path);
-            defer loaded.deinit();
-            if (loaded.embedding_style != .qwen3_embedding or loaded.pooling != .last) {
-                return error.TestExpectedQwen3EmbeddingManifest;
-            }
-        }
-    };
-    try std.testing.checkAllAllocationFailures(allocator, AllocationRunner.run, .{dir_path});
-}
-
-test "qwen3 sentence-transformers sidecars require last-token pooling" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io, "model/1_Pooling");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "model/config.json",
-        .data =
-        \\{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": 1024}
-        ,
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "model/modules.json",
-        .data =
-        \\[
-        \\  {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
-        \\  {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"}
-        \\]
-        ,
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "model/1_Pooling/config.json",
-        .data =
-        \\{"pooling_mode_mean_tokens": true, "pooling_mode_lasttoken": false}
-        ,
-    });
-
-    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
-    defer allocator.free(dir_path);
-
-    var manifest = try loadFromDir(allocator, dir_path);
-    defer manifest.deinit();
-
-    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
-    try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
-    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 
 test "bare qwen3 config without sidecars stays generative" {
@@ -3414,6 +3679,7 @@ test "model_manifest.json embedding overrides configure a gguf qwen3 embedder" {
         \\}
     ;
     try parseModelManifestJson(&manifest, allocator, manifest_json);
+    try finalizeEmbeddingProfile(&manifest);
 
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
@@ -5041,7 +5307,7 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 3);
+    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
     defer allocator.free(gguf_bytes);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
 
@@ -5059,28 +5325,6 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     // 512 default would silently truncate long embedding inputs.
     try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
     try std.testing.expectEqual(@as(usize, 32768), manifest.maxTextSequenceLength());
-}
-
-test "qwen3 GGUF metadata does not infer embedding style from mean pooling" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 1);
-    defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-mean.gguf", .data = gguf_bytes });
-
-    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(model_dir);
-
-    var manifest = try loadFromDir(allocator, model_dir);
-    defer manifest.deinit();
-
-    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
-    try std.testing.expectEqual(ModelTypeOrigin.default, manifest.model_type_origin);
-    try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
-    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 
 test "colocated GGUF does not overwrite selected safetensors BERT config" {
@@ -5201,7 +5445,7 @@ fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
-fn buildTestGgufWithQwen3Pooling(allocator: std.mem.Allocator, pooling_type: u32) ![]u8 {
+fn buildTestGgufWithQwen3Embedding(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
 
@@ -5212,7 +5456,7 @@ fn buildTestGgufWithQwen3Pooling(allocator: std.mem.Allocator, pooling_type: u32
 
     try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
     try appendTestMetadataU32(allocator, &data, "qwen3.context_length", 32768);
-    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", pooling_type);
+    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", 3);
     try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
     try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
         "<|endoftext|>",

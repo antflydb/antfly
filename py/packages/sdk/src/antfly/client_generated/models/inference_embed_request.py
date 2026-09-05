@@ -40,12 +40,12 @@ class InferenceEmbedRequest:
             semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
         task_type (InferenceEmbedRequestTaskType | Unset): Optional embedding task type using Google embedding task-type
             names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the
-            document prefix. For Qwen3-Embedding models, all task types except RETRIEVAL_DOCUMENT wrap the input with the
-            model's instruction format ("Instruct: {task}\nQuery:{input}"); documents are embedded raw.
-        instruction (str | Unset): Optional task description for instruction-aware embedding models (Qwen3-Embedding).
-            Replaces the model's default task description inside the query instruction wrapper ("Instruct:
-            {instruction}\nQuery:{input}"). Requires a query-side task_type; rejected for models without instruction
-            support.
+            document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval
+            instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+        instruction (str | Unset): Task description for instruction-aware embedding models (Qwen3-Embedding), rendered
+            inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY,
+            which has a model-owned default; required for other non-document task types; rejected for document tasks and
+            models without instruction support.
         input_type (InferenceEmbedRequestInputType | Unset): Deprecated compatibility alias for task_type.
             search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification
             and clustering map to their Google task_type equivalents.

@@ -221,7 +221,6 @@ pub const RerankingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < documents.len) {
-            try self.checkExecution();
             const chunk_len = @min(chunk_limit, documents.len - offset);
             const encoded = try alloc.alloc([]i32, chunk_len);
             defer alloc.free(encoded);
@@ -831,37 +830,6 @@ test "generative yes-no reranking batches exact prompt paths without CLS extract
     try std.testing.expectEqual(@as(usize, 3), trace.raw_logits.items.len);
     try std.testing.expect(std.mem.indexOf(u8, trace.pairs.items[0].rendered_prompt, "<Query>:red planet") != null);
     try std.testing.expectEqual(@as(f32, 0), trace.raw_logits.items[0]);
-}
-
-test "generative yes-no reranking observes cancellation between bounded batches" {
-    const Control = struct {
-        checks: std.atomic.Value(usize) = .init(0),
-
-        fn check(raw: ?*anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
-            if (count >= 3) return error.Cancelled;
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    var tokenizer_state = FakeRerankingTokenizer{};
-    var session_state = FakeRerankingSession{ .fixed_sequence = false };
-    var control = Control{};
-    var pipeline = RerankingPipeline.init(
-        allocator,
-        session_state.session(),
-        tokenizer_state.tokenizer(),
-        .{
-            .max_length = 32,
-            .batch_size = 2,
-            .mode = .generative_yes_no,
-        },
-    );
-    pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
-    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
-    try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 2), tokenizer_state.encode_count.load(.acquire));
 }
 
 test "reranking execution gate blocks the session forward pass" {

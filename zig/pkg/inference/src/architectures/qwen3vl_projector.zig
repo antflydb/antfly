@@ -19,6 +19,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const image = @import("../pipelines/image.zig");
 const ops = @import("../ops/ops.zig");
+const metal_compute_mod = @import("../ops/metal_compute.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_format = @import("../gguf/format.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
@@ -330,6 +331,9 @@ const WeightCache = struct {
     fn deinit(self: *WeightCache) void {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
+            if (self.cb.kind() == .metal) {
+                metal_compute_mod.MetalCompute.releaseDynamicSlotsForTensor(self.cb, tensor.*);
+            }
             self.cb.free(tensor.*);
         }
         var key_it = self.tensors.keyIterator();
@@ -380,6 +384,33 @@ const WeightCache = struct {
             .gguf => |value| value,
             .resident => unreachable,
         };
+        if (self.cb.kind() == .metal) {
+            var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
+            defer tensor_ref.deinit(self.allocator);
+            if (tensor_ref.quantized) {
+                if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
+                    var storage = storage_value;
+                    const shape_matches = storage.shape.len == 2 and
+                        storage.shape[0] == @as(i64, @intCast(out_dim)) and
+                        storage.shape[1] == @as(i64, @intCast(in_dim));
+                    if (shape_matches) {
+                        // takeQuantizedStorage consumes storage on every
+                        // outcome. Unsupported IQ-family formats still have a
+                        // valid host-dequantized path below, so only propagate
+                        // genuine upload/allocation failures.
+                        const maybe_tensor: ?CT = metal_compute_mod.MetalCompute.takeQuantizedStorage(self.cb, storage) catch |err| fallback: {
+                            if (@as(anyerror, err) == error.UnsupportedTensorType) break :fallback null;
+                            return err;
+                        };
+                        if (maybe_tensor) |tensor| {
+                            errdefer self.cb.free(tensor);
+                            return self.insert(key, tensor);
+                        }
+                    }
+                    if (!shape_matches) storage.deinit();
+                }
+            }
+        }
         if (comptime build_options.enable_cuda) {
             if (self.cb.kind() == .cuda) {
                 var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
@@ -955,7 +986,7 @@ fn encodeSingleImage(
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        .bicubic,
+        .pillow_bicubic,
     );
     defer allocator.free(pixels);
     const preprocess_ns = profileLap(profile, &stage_started_at);

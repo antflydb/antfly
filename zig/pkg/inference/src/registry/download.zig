@@ -1400,6 +1400,9 @@ pub fn writeManagedArtifactAndUpdatePlan(
 
     var artifacts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
     defer artifacts.deinit(allocator);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
     try artifacts.ensureTotalCapacity(allocator, validated.artifacts.len + 1);
     var replaced = false;
     for (validated.artifacts) |artifact| {
@@ -1407,6 +1410,7 @@ pub fn writeManagedArtifactAndUpdatePlan(
             try artifacts.append(allocator, .{
                 .path = relative_path,
                 .size = data.len,
+                .sha256 = &digest_hex,
             });
             replaced = true;
         } else {
@@ -1424,6 +1428,7 @@ pub fn writeManagedArtifactAndUpdatePlan(
         try artifacts.append(allocator, .{
             .path = relative_path,
             .size = data.len,
+            .sha256 = &digest_hex,
         });
     }
 
@@ -2582,7 +2587,7 @@ fn downloadFile(
         io,
         owner,
         name,
-        config.revision,
+        "main",
         filename,
         dest_dir,
         config,
@@ -2644,9 +2649,7 @@ fn downloadFileAtRevision(
         n_headers += 1;
     }
 
-    var url_config = config;
-    url_config.revision = revision;
-    const url = try modelFileUrlAlloc(allocator, url_config, owner, name, filename);
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/{s}/{s}", .{ config.base_url, owner, name, revision, filename });
     defer allocator.free(url);
 
     // Create parent dirs if filename has slashes (e.g., "onnx/model.onnx")

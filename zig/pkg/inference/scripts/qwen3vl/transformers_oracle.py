@@ -72,7 +72,9 @@ def verify_environment() -> dict[str, str]:
         if actual[name] != expected
     }
     if mismatches:
-        raise OracleError(f"oracle dependency mismatch: {json.dumps(mismatches, sort_keys=True)}")
+        raise OracleError(
+            f"oracle dependency mismatch: {json.dumps(mismatches, sort_keys=True)}"
+        )
     return actual
 
 
@@ -80,7 +82,9 @@ def tensor_f32le_bytes(tensor: Any) -> bytes:
     import numpy as np
     import torch
 
-    canonical = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    canonical = (
+        tensor.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    )
     canonical = np.asarray(canonical, dtype="<f4", order="C")
     return canonical.tobytes(order="C")
 
@@ -152,20 +156,28 @@ def image_evidence(
     # still image the temporal frames are exact duplicates. Antfly applies the
     # two Conv3D temporal weight slices to one canonical spatial row, so this
     # digest is the direct cross-runtime input contract.
-    shaped = pixel_values.detach().to(device="cpu", dtype=torch.float32).reshape(
-        pixel_values.shape[0], channels, temporal_patch_size, patch_size, patch_size
+    shaped = (
+        pixel_values.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .reshape(
+            pixel_values.shape[0], channels, temporal_patch_size, patch_size, patch_size
+        )
     )
     spatial = shaped[:, :, 0, :, :].contiguous()
     temporal_delta = float((shaped - shaped[:, :, :1, :, :]).abs().max().item())
     if temporal_delta != 0.0:
-        raise OracleError(f"static-image temporal patches differ: max_abs={temporal_delta}")
+        raise OracleError(
+            f"static-image temporal patches differ: max_abs={temporal_delta}"
+        )
     if patch_output is not None:
         with patch_output.open("wb") as stream:
             stream.write(tensor_f32le_bytes(spatial))
     grid = [[int(item) for item in row] for row in grid_thw.detach().cpu().tolist()]
     expected_rows = sum(t * h * w for t, h, w in grid)
     if expected_rows != pixel_values.shape[0]:
-        raise OracleError(f"grid rows {expected_rows} != pixel rows {pixel_values.shape[0]}")
+        raise OracleError(
+            f"grid rows {expected_rows} != pixel rows {pixel_values.shape[0]}"
+        )
     return {
         "grid_thw": grid,
         "resized_sizes": [[w * patch_size, h * patch_size] for _, h, w in grid],
@@ -173,7 +185,9 @@ def image_evidence(
         "pixel_values_f32le_sha256": tensor_f32le_sha256(pixel_values),
         "spatial_patch_shape": [int(dim) for dim in spatial.shape],
         "spatial_patch_f32le_sha256": tensor_f32le_sha256(spatial),
-        "spatial_patch_f32le_path": str(patch_output) if patch_output is not None else None,
+        "spatial_patch_f32le_path": str(patch_output)
+        if patch_output is not None
+        else None,
         "temporal_duplicate_max_abs": temporal_delta,
         "pixel_values_stats": {
             "min": float(pixel_values.min().item()),
@@ -256,7 +270,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     input_ids = flat_ints(inputs["input_ids"])
     image_token_id = int(config.image_token_id)
     visual_token_count = sum(token_id == image_token_id for token_id in input_ids)
-    deepstack_indexes = [int(item) for item in config.vision_config.deepstack_visual_indexes]
+    deepstack_indexes = [
+        int(item) for item in config.vision_config.deepstack_visual_indexes
+    ]
     payload: dict[str, Any] = {
         "schema": "antfly.qwen3vl.transformers_oracle.v1",
         "runtime": {
@@ -268,7 +284,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "config": type(config).__name__,
         },
         "model_dir": str(model_dir),
-        "sidecar_sha256": {name: sha256_file(model_dir / name) for name in REQUIRED_SIDECARS},
+        "sidecar_sha256": {
+            name: sha256_file(model_dir / name) for name in REQUIRED_SIDECARS
+        },
         "prompt": args.prompt,
         "rendered_prompt": rendered,
         "placeholder_token_ids": [int(item) for item in placeholder_ids],

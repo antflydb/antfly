@@ -533,6 +533,29 @@ pub fn compatibilitySummaryForBackend(
 ) !?CompatibilitySummary {
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
+    // Split GGUF Qwen3-VL promotions are Metal-only. The official integrated
+    // BF16 generation bundle has a separate CUDA-qualified resident route.
+    // Reject other routes before inspectAlloc re-hashes multi-gigabyte files.
+    const cuda_qwen3vl_generation = backend == .cuda and
+        man.isQwen3VlGenerationSafetensorsBundle();
+    if (man.isQwen3VlBundle() and backend != .metal and !cuda_qwen3vl_generation) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "production-qualified Qwen3-VL bundles require Metal, except the integrated BF16 generation bundle which also supports CUDA",
+        };
+    }
+    if (man.embedding_style == .qwen3_embedding and
+        man.usesGgufWeights() and
+        !qwen3EmbeddingSupportsBackend(backend))
+    {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "production-qualified Qwen3-Embedding GGUF bundles require Metal, native CPU, or CUDA",
+        };
+    }
+
     // GGUF metadata is authoritative only when this route will consume GGUF.
     // ONNX/safetensors routes use the manifest architecture rather than
     // accidentally inheriting an unrelated optional GGUF's classification.
@@ -547,6 +570,13 @@ pub fn compatibilitySummaryForBackend(
             .level = .incompatible,
             .code = .unsupported_backend,
             .message = "production-qualified Qwen3-VL bundles require the Metal backend",
+        };
+    }
+    if (!qwen3EmbeddingPromotionSupportsBackend(inspection.qwen3_embedding_promotion, backend)) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "this production-qualified Qwen3-Embedding variant is not qualified on the selected backend",
         };
     }
 
@@ -674,6 +704,39 @@ pub fn compatibilitySummaryForBackend(
         }
     }
     return summaryFromAssessment(assessment);
+}
+
+fn qwen3EmbeddingSupportsBackend(backend: backends.BackendType) bool {
+    return backend == .metal or backend == .native or backend == .cuda;
+}
+
+test "Qwen3 embedding production backends include native CPU and CUDA" {
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.cuda));
+}
+
+fn qwen3EmbeddingPromotionSupportsBackend(
+    promotion: model_compatibility.Qwen3EmbeddingPromotion,
+    backend: backends.BackendType,
+) bool {
+    return switch (promotion) {
+        .none => true,
+        .q8_0 => backend == .metal or backend == .native or backend == .cuda,
+        .f16 => backend == .metal,
+        .bf16_safetensors => backend == .metal or backend == .cuda,
+    };
+}
+
+test "Qwen3 embedding promotion backend qualification is variant-specific" {
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .metal));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .cuda));
+    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.f16, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.f16, .metal));
+    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .metal));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .cuda));
 }
 
 fn qwen3VlPromotionSupportsBackend(
@@ -2664,7 +2727,7 @@ pub const LoadedModel = struct {
                 .max => .max,
                 .last => .last,
             },
-            .text_prefix = self.manifest.embedding_text_prefix,
+            .text_prefix = self.manifest.embedding_profile.document.prefix,
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),

@@ -491,7 +491,8 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const ref = try parseModelRefOrAlias(ref_str);
+        const resolved_ref = resolveFriendlyRef(ref_str) orelse ref_str;
+        const ref = try ModelRef.parse(resolved_ref);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -1771,9 +1772,25 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
-/// Resolve a model name by variant suffix.
+fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8) bool {
+    const marker = "--antfly-";
+    if (!std.mem.startsWith(u8, candidate, requested_name) or
+        candidate.len != requested_name.len + marker.len + 16 or
+        !std.mem.eql(u8, candidate[requested_name.len..][0..marker.len], marker))
+    {
+        return false;
+    }
+    for (candidate[candidate.len - 16 ..]) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return false;
+    }
+    return true;
+}
+
+/// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
 /// prefixed with "requested-" and returns the shortest deterministic match.
+/// Managed variant directories are deliberately excluded: their suffix is an
+/// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
 /// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
@@ -1806,7 +1823,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
             else => return err,
         };
         if (entry_kind != .directory) continue;
-        if (std.mem.startsWith(u8, entry.name, prefix)) {
+        if (std.mem.startsWith(u8, entry.name, prefix) and
+            !isManagedVariantInstallLeaf(requested_name, entry.name))
+        {
             if (best_name == null or entry.name.len < best_name.?.len or
                 (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
             {
@@ -1894,7 +1913,7 @@ test "explicit model variants use distinct stable install directories" {
     try std.testing.expectEqualStrings("/models/owner/model", auto);
 }
 
-test "resolveVariant finds nested explicit variant install" {
+test "resolveVariant ignores opaque managed variant install hashes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1904,11 +1923,24 @@ test "resolveVariant finds nested explicit variant install" {
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
+    try std.testing.expect(try resolveVariant(allocator, io, models_dir, "owner/model") == null);
+}
+
+test "resolveVariant retains legacy suffix resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
     const resolved = (try resolveVariant(allocator, io, models_dir, "owner/model")) orelse
         return error.ExpectedVariantResolution;
     defer allocator.free(resolved);
 
-    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model-q4_0" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }

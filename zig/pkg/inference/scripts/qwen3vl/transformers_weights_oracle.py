@@ -44,8 +44,6 @@ def synchronize(device: str) -> None:
 
     if device == "mps":
         torch.mps.synchronize()
-    elif device == "cuda":
-        torch.cuda.synchronize()
 
 
 def percentile(samples: list[float], percentile_value: float) -> float:
@@ -76,7 +74,7 @@ def summarize_stage_samples(
 
 
 class SynchronizedStageProfiler:
-    """Measure coarse model stages while accounting for asynchronous device work."""
+    """Measure coarse model stages while accounting for asynchronous MPS work."""
 
     def __init__(self, device: str, clock: Any = time.monotonic) -> None:
         self.device = device
@@ -150,29 +148,19 @@ class SynchronizedStageProfiler:
         self.handles.clear()
 
 
-def device_memory_snapshot(device: str, torch: Any) -> dict[str, int] | None:
-    if device == "cuda":
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        return {
-            "allocated_bytes": int(torch.cuda.memory_allocated()),
-            "reserved_bytes": int(torch.cuda.memory_reserved()),
-            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-            "device_free_bytes": int(free_bytes),
-            "device_total_bytes": int(total_bytes),
-        }
-    if device == "mps":
-        snapshot: dict[str, int] = {}
-        for function_name, field_name in (
-            ("current_allocated_memory", "current_allocated_bytes"),
-            ("driver_allocated_memory", "driver_allocated_bytes"),
-            ("recommended_max_memory", "recommended_max_bytes"),
-        ):
-            function = getattr(torch.mps, function_name, None)
-            if callable(function):
-                snapshot[field_name] = int(function())
-        return snapshot
-    return None
+def mps_memory_snapshot(device: str, torch: Any) -> dict[str, int] | None:
+    if device != "mps":
+        return None
+    snapshot: dict[str, int] = {}
+    for function_name, field_name in (
+        ("current_allocated_memory", "current_allocated_bytes"),
+        ("driver_allocated_memory", "driver_allocated_bytes"),
+        ("recommended_max_memory", "recommended_max_bytes"),
+    ):
+        function = getattr(torch.mps, function_name, None)
+        if callable(function):
+            snapshot[field_name] = int(function())
+    return snapshot
 
 
 def torch_dtype(name: str, torch: Any) -> Any:
@@ -226,8 +214,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.device == "mps" and not torch.backends.mps.is_available():
         raise OracleError("MPS is not available")
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise OracleError("CUDA is not available")
     if args.device == "cpu" and args.dtype != "bfloat16":
         raise OracleError("the canonical CPU oracle requires bfloat16")
     if args.warmup_runs < 0:
@@ -288,13 +274,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         model.to(args.device)
     model.eval()
     synchronize(args.device)
-    if args.device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
     loaded_at = time.monotonic()
     memory_snapshots: list[dict[str, Any]] = []
 
     def capture_memory(stage: str, run_index: int | None = None) -> None:
-        snapshot = device_memory_snapshot(args.device, torch)
+        snapshot = mps_memory_snapshot(args.device, torch)
         if snapshot is not None:
             memory_snapshots.append({"stage": stage, "run": run_index, **snapshot})
 
@@ -437,23 +421,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "packages": versions,
             "device": args.device,
             "torch_mps_available": bool(torch.backends.mps.is_available()),
-            "torch_cuda_available": bool(torch.cuda.is_available()),
-            "cuda_device_name": torch.cuda.get_device_name()
-            if args.device == "cuda"
-            else None,
-            "cuda_compute_capability": list(torch.cuda.get_device_capability())
-            if args.device == "cuda"
-            else None,
             "attention_implementation": args.attn_implementation,
             "load_strategy": args.load_strategy,
             "logit_transfer": args.logit_transfer,
             "logits_to_keep": args.logits_to_keep,
-            "accelerator_environment": {
+            "mps_environment": {
                 name: os.environ.get(name)
                 for name in (
-                    "CUDA_VISIBLE_DEVICES",
-                    "CUBLAS_WORKSPACE_CONFIG",
-                    "NVIDIA_TF32_OVERRIDE",
                     "PYTORCH_ENABLE_MPS_FALLBACK",
                     "PYTORCH_MPS_FAST_MATH",
                     "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
@@ -461,7 +435,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "PYTORCH_MPS_PREFER_METAL",
                 )
             }
-            if args.device in ("cuda", "mps")
+            if args.device == "mps"
             else None,
         },
         "request": {
@@ -506,9 +480,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "timed_model_forward_median": statistics.median(
                 timed_model_forward_samples
             ),
-            "timed_model_forward_p95": percentile(
-                timed_model_forward_samples, 0.95
-            ),
+            "timed_model_forward_p95": percentile(timed_model_forward_samples, 0.95),
             "warmup_logit_postprocess_samples": warmup_logit_postprocess_samples,
             "timed_logit_postprocess_samples": timed_logit_postprocess_samples,
         },
@@ -517,7 +489,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "timed_runs": args.timed_runs,
             "timed_logit_sha256": timed_logit_sha256,
             "timed_logits_bitwise_deterministic": len(set(timed_logit_sha256)) == 1,
-            "device_memory_snapshots": memory_snapshots,
+            "mps_memory_snapshots": memory_snapshots,
             "device_logit_diagnostics": device_logit_diagnostics,
             "stage_profile": summarize_stage_samples(timed_stage_samples)
             if timed_stage_samples
@@ -532,7 +504,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--processor-dir", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--prompt", default="Describe the image briefly.")
-    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
+    parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument(
         "--attn-implementation",

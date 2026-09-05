@@ -80,34 +80,6 @@ class TransformersWeightsOracleContractTests(unittest.TestCase):
         self.assertEqual(1, args.logits_to_keep)
         self.assertTrue(args.profile_stages)
 
-    def test_cuda_device_is_supported_explicitly(self) -> None:
-        args = oracle.parse_args(
-            [
-                "--weights-dir",
-                "/weights",
-                "--processor-dir",
-                "/processor",
-                "--image",
-                "/image.jpg",
-                "--device",
-                "cuda",
-                "--dtype",
-                "bfloat16",
-                "--attn-implementation",
-                "sdpa",
-                "--logits-to-keep",
-                "1",
-                "--logits-output",
-                "/logits.f32le",
-                "--output",
-                "/oracle.json",
-            ]
-        )
-        self.assertEqual("cuda", args.device)
-        self.assertEqual("bfloat16", args.dtype)
-        self.assertEqual("sdpa", args.attn_implementation)
-        self.assertEqual(1, args.logits_to_keep)
-
     def test_percentile_uses_nearest_rank(self) -> None:
         self.assertEqual(1.0, oracle.percentile([3.0, 1.0, 2.0], 0.01))
         self.assertEqual(2.0, oracle.percentile([3.0, 1.0, 2.0], 0.50))

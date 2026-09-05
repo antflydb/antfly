@@ -28,18 +28,96 @@ import urllib.request
 DEFAULT_SEED = 20260901
 COSINE_WARN_THRESHOLD = 0.98
 FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v2"
+LEGACY_FIXTURE_SCHEMA = "antfly.qwen3_embedding.benchmark_fixture.v1"
 REPORT_SCHEMA = "antfly.qwen3_embedding.endpoint_benchmark.v2"
 
+
+def portable_report(report: Any, *, workdir: Path, home: Path) -> Any:
+    """Replace machine-specific paths before persisting a benchmark report."""
+    replacements = sorted(
+        ((str(workdir.resolve()), "<workdir>"), (str(home.resolve()), "~")),
+        key=lambda replacement: len(replacement[0]),
+        reverse=True,
+    )
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, str):
+            for local_path, portable_path in replacements:
+                value = value.replace(local_path, portable_path)
+            return value
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, dict):
+            return {key: sanitize(item) for key, item in value.items()}
+        return value
+
+    return sanitize(report)
+
+
 VOCABULARY = [
-    "ant", "colony", "vector", "search", "index", "shard", "raft", "quorum",
-    "metal", "kernel", "tensor", "batch", "token", "embed", "cosine", "norm",
-    "query", "passage", "corpus", "latency", "throughput", "cache", "buffer",
-    "graph", "layer", "attention", "pooling", "resident", "pipeline", "frame",
-    "quantized", "matrix", "stream", "socket", "server", "client", "replica",
-    "storage", "segment", "manifest", "schema", "field", "document", "score",
-    "ranker", "encoder", "decoder", "hidden", "weight", "bias", "softmax",
-    "gpu", "cpu", "memory", "bandwidth", "profile", "trace", "warmup", "bench",
-    "distill", "sparse", "dense", "hybrid",
+    "ant",
+    "colony",
+    "vector",
+    "search",
+    "index",
+    "shard",
+    "raft",
+    "quorum",
+    "metal",
+    "kernel",
+    "tensor",
+    "batch",
+    "token",
+    "embed",
+    "cosine",
+    "norm",
+    "query",
+    "passage",
+    "corpus",
+    "latency",
+    "throughput",
+    "cache",
+    "buffer",
+    "graph",
+    "layer",
+    "attention",
+    "pooling",
+    "resident",
+    "pipeline",
+    "frame",
+    "quantized",
+    "matrix",
+    "stream",
+    "socket",
+    "server",
+    "client",
+    "replica",
+    "storage",
+    "segment",
+    "manifest",
+    "schema",
+    "field",
+    "document",
+    "score",
+    "ranker",
+    "encoder",
+    "decoder",
+    "hidden",
+    "weight",
+    "bias",
+    "softmax",
+    "gpu",
+    "cpu",
+    "memory",
+    "bandwidth",
+    "profile",
+    "trace",
+    "warmup",
+    "bench",
+    "distill",
+    "sparse",
+    "dense",
+    "hybrid",
 ]
 
 CORPUS_PROFILES = {
@@ -54,12 +132,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18099/v1/embeddings")
     parser.add_argument("--reference-url", help="llama.cpp /v1/embeddings endpoint")
-    parser.add_argument("--model", default="qwen3-embedding")
+    parser.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B-GGUF")
     parser.add_argument("--reference-model")
     parser.add_argument("--corpus", choices=sorted(CORPUS_PROFILES), default="mixed")
-    parser.add_argument("--fixture", type=Path, help=f"exact-token {FIXTURE_SCHEMA} JSON")
+    parser.add_argument(
+        "--fixture", type=Path, help=f"exact-token {FIXTURE_SCHEMA} JSON"
+    )
     parser.add_argument("--fixture-cases", help="comma-separated fixture case IDs")
-    parser.add_argument("--fixture-token-count", type=int, help="select exact-length fixture cases")
+    parser.add_argument(
+        "--fixture-token-count", type=int, help="select exact-length fixture cases"
+    )
     parser.add_argument(
         "--antfly-reported-token-offset",
         type=int,
@@ -75,6 +157,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-sizes", default="1,8,32,128")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--precondition-iters",
+        type=int,
+        default=0,
+        help="unmeasured alternating iterations on two reserved fixture batches",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
@@ -98,12 +186,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="shell-quoted live argv after the reference executable; strict mode matches it exactly",
     )
     parser.add_argument("--output", type=Path, help="write results JSON to this path")
+    parser.add_argument(
+        "--include-local-paths",
+        action="store_true",
+        help="preserve absolute local paths in the persisted report",
+    )
     args = parser.parse_args(argv)
-    args.batch_sizes = [int(value) for value in args.batch_sizes.split(",") if value.strip()]
+    args.batch_sizes = [
+        int(value) for value in args.batch_sizes.split(",") if value.strip()
+    ]
     if not args.batch_sizes or any(value < 1 for value in args.batch_sizes):
         parser.error("batch sizes must be positive")
-    if args.warmup < 0 or args.iters < 1:
-        parser.error("warmup must be non-negative and iters must be positive")
+    if args.warmup < 0 or args.precondition_iters < 0 or args.iters < 1:
+        parser.error(
+            "warmup and precondition-iters must be non-negative and iters must be positive"
+        )
+    if args.precondition_iters and args.fixture is None:
+        parser.error("precondition-iters requires an exact-token fixture")
     if args.timeout <= 0 or args.bootstrap_samples < 1:
         parser.error("timeout and bootstrap samples must be positive")
     if args.fixture_token_count is not None and args.fixture_token_count < 1:
@@ -115,10 +214,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.require_comparable:
         missing = []
         for name in (
-            "reference_url", "fixture", "antfly_model_file", "reference_model_file",
-            "antfly_build_id", "reference_build_id", "antfly_build_file",
-            "reference_build_file", "antfly_server_pid", "reference_server_pid",
-            "antfly_server_args", "reference_server_args",
+            "reference_url",
+            "fixture",
+            "antfly_model_file",
+            "reference_model_file",
+            "antfly_build_id",
+            "reference_build_id",
+            "antfly_build_file",
+            "reference_build_file",
+            "antfly_server_pid",
+            "reference_server_pid",
+            "antfly_server_args",
+            "reference_server_args",
         ):
             if not getattr(args, name):
                 missing.append("--" + name.replace("_", "-"))
@@ -156,6 +263,109 @@ def build_corpus(corpus: str, count: int, seed: int = DEFAULT_SEED) -> list[str]
     ]
 
 
+def fixture_cases_sha256(cases: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        cases, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def expand_fixture_recipe(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    recipe = payload.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError("compact fixture recipe is missing or invalid")
+
+    lengths = recipe.get("token_counts")
+    if (
+        not isinstance(lengths, list)
+        or not lengths
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 2
+            for value in lengths
+        )
+        or len(set(lengths)) != len(lengths)
+    ):
+        raise ValueError("compact fixture token_counts must be distinct integers >= 2")
+
+    continuation = recipe.get("continuation")
+    if not isinstance(continuation, dict):
+        raise ValueError("compact fixture continuation is missing or invalid")
+    continuation_text = continuation.get("text")
+    continuation_token_id = continuation.get("token_id")
+    if not isinstance(continuation_text, str) or not continuation_text:
+        raise ValueError("compact fixture continuation text is empty")
+    if not isinstance(continuation_token_id, int) or isinstance(
+        continuation_token_id, bool
+    ):
+        raise ValueError("compact fixture continuation token_id is invalid")
+
+    eos_token_id = recipe.get("eos_token_id")
+    if not isinstance(eos_token_id, int) or isinstance(eos_token_id, bool):
+        raise ValueError("compact fixture eos_token_id is invalid")
+
+    raw_prefixes = recipe.get("prefixes")
+    if not isinstance(raw_prefixes, list) or not raw_prefixes:
+        raise ValueError("compact fixture has no prefixes")
+    prefixes = []
+    seen_ids: set[str] = set()
+    seen_texts: set[str] = set()
+    seen_token_ids: set[int] = set()
+    for raw in raw_prefixes:
+        if not isinstance(raw, dict):
+            raise ValueError("compact fixture prefix is not an object")
+        prefix_id = raw.get("id")
+        prefix_text = raw.get("text")
+        prefix_token_id = raw.get("token_id")
+        if not isinstance(prefix_id, str) or not prefix_id or prefix_id in seen_ids:
+            raise ValueError(
+                f"invalid or duplicate compact fixture prefix id: {prefix_id!r}"
+            )
+        if (
+            not isinstance(prefix_text, str)
+            or not prefix_text
+            or prefix_text in seen_texts
+        ):
+            raise ValueError(
+                f"invalid or duplicate compact fixture prefix text: {prefix_text!r}"
+            )
+        if (
+            not isinstance(prefix_token_id, int)
+            or isinstance(prefix_token_id, bool)
+            or prefix_token_id in seen_token_ids
+        ):
+            raise ValueError(
+                "invalid or duplicate compact fixture prefix token_id: "
+                f"{prefix_token_id!r}"
+            )
+        seen_ids.add(prefix_id)
+        seen_texts.add(prefix_text)
+        seen_token_ids.add(prefix_token_id)
+        prefixes.append((prefix_id, prefix_text, prefix_token_id))
+
+    cases = []
+    for token_count in lengths:
+        continuation_count = token_count - 2
+        for prefix_id, prefix_text, prefix_token_id in prefixes:
+            cases.append(
+                {
+                    "id": f"tokens_{token_count}_{prefix_id}",
+                    "text": prefix_text + continuation_text * continuation_count,
+                    "token_ids": [prefix_token_id]
+                    + [continuation_token_id] * continuation_count
+                    + [eos_token_id],
+                }
+            )
+
+    expected_sha256 = payload.get("expanded_cases_sha256")
+    actual_sha256 = fixture_cases_sha256(cases)
+    if not isinstance(expected_sha256, str) or expected_sha256.lower() != actual_sha256:
+        raise ValueError(
+            "compact fixture expanded case SHA-256 "
+            f"{actual_sha256} does not match {expected_sha256!r}"
+        )
+    return cases
+
+
 def load_fixture(
     path: Path, expected_model_sha256: str | None = None
 ) -> list[dict[str, Any]]:
@@ -163,8 +373,13 @@ def load_fixture(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid fixture {path}: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != FIXTURE_SCHEMA:
-        raise ValueError(f"fixture must use schema {FIXTURE_SCHEMA}")
+    if not isinstance(payload, dict) or payload.get("schema") not in {
+        FIXTURE_SCHEMA,
+        LEGACY_FIXTURE_SCHEMA,
+    }:
+        raise ValueError(
+            f"fixture must use schema {FIXTURE_SCHEMA} or {LEGACY_FIXTURE_SCHEMA}"
+        )
     if expected_model_sha256 is not None:
         fixture_sha256 = payload.get("model_sha256")
         if (
@@ -175,82 +390,44 @@ def load_fixture(
                 f"fixture model SHA-256 {fixture_sha256!r} does not match "
                 f"benchmark model {expected_model_sha256}"
             )
-    recipe = payload.get("recipe")
-    if not isinstance(recipe, dict):
-        raise ValueError("fixture has no recipe")
-    token_counts = recipe.get("token_counts")
-    fill = recipe.get("fill")
-    eos_token_id = recipe.get("eos_token_id")
-    prefixes = recipe.get("prefixes")
-
-    def is_int(value: object) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool)
-
-    if (
-        not isinstance(token_counts, list)
-        or not token_counts
-        or not all(is_int(value) and value >= 2 for value in token_counts)
-        or len(set(token_counts)) != len(token_counts)
-    ):
-        raise ValueError("fixture recipe token_counts are invalid")
-    if (
-        not isinstance(fill, dict)
-        or not isinstance(fill.get("text"), str)
-        or not fill["text"]
-        or not is_int(fill.get("token_id"))
-    ):
-        raise ValueError("fixture recipe fill is invalid")
-    if not is_int(eos_token_id):
-        raise ValueError("fixture recipe eos_token_id is invalid")
-    if not isinstance(prefixes, list) or not prefixes:
-        raise ValueError("fixture recipe has no prefixes")
-
-    normalized_prefixes = []
-    seen_prefix_ids = set()
-    seen_prefix_token_ids = set()
-    for prefix in prefixes:
-        if not isinstance(prefix, dict):
-            raise ValueError("fixture recipe prefix is not an object")
-        prefix_id, text, token_id = (
-            prefix.get("id"), prefix.get("text"), prefix.get("token_id")
-        )
+    cases = (
+        expand_fixture_recipe(payload)
+        if payload["schema"] == FIXTURE_SCHEMA
+        else payload.get("cases")
+    )
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("fixture has no cases")
+    validated = []
+    seen = set()
+    for raw in cases:
+        if not isinstance(raw, dict):
+            raise ValueError("fixture case is not an object")
+        case_id, text, token_ids = raw.get("id"), raw.get("text"), raw.get("token_ids")
+        if not isinstance(case_id, str) or not case_id or case_id in seen:
+            raise ValueError(f"invalid or duplicate fixture id: {case_id!r}")
+        if not isinstance(text, str) or not text:
+            raise ValueError(f"fixture case {case_id}: text is empty")
         if (
-            not isinstance(prefix_id, str)
-            or not prefix_id
-            or prefix_id in seen_prefix_ids
-            or not isinstance(text, str)
-            or not text
-            or not is_int(token_id)
-            or token_id in seen_prefix_token_ids
-        ):
-            raise ValueError(f"invalid or duplicate fixture prefix: {prefix!r}")
-        seen_prefix_ids.add(prefix_id)
-        seen_prefix_token_ids.add(token_id)
-        normalized_prefixes.append((prefix_id, text, token_id))
-
-    cases = []
-    for token_count in token_counts:
-        fill_count = token_count - 2
-        for prefix_id, prefix_text, prefix_token_id in normalized_prefixes:
-            cases.append(
-                {
-                    "id": f"tokens_{token_count}_{prefix_id}",
-                    "text": prefix_text + (" " + fill["text"]) * fill_count,
-                    "token_ids": (
-                        [prefix_token_id]
-                        + [fill["token_id"]] * fill_count
-                        + [eos_token_id]
-                    ),
-                }
+            not isinstance(token_ids, list)
+            or not token_ids
+            or not all(
+                isinstance(token, int) and not isinstance(token, bool)
+                for token in token_ids
             )
-    return cases
+        ):
+            raise ValueError(f"fixture case {case_id}: token_ids are invalid")
+        seen.add(case_id)
+        validated.append({"id": case_id, "text": text, "token_ids": token_ids})
+    return validated
 
 
 def fixture_batch(
     cases: list[dict[str, Any]], count: int, offset: int = 0
 ) -> tuple[list[str], list[int]]:
     selected = [cases[(offset + index) % len(cases)] for index in range(count)]
-    return [case["text"] for case in selected], [len(case["token_ids"]) for case in selected]
+    return [case["text"] for case in selected], [
+        len(case["token_ids"]) for case in selected
+    ]
 
 
 def select_fixture_cases(
@@ -299,9 +476,7 @@ def validate_cache_neutral_cases(
         label for label, values in identities.items() if len(set(values)) != len(values)
     ]
     if duplicates:
-        raise ValueError(
-            "strict cache-neutral fixture reuses " + ", ".join(duplicates)
-        )
+        raise ValueError("strict cache-neutral fixture reuses " + ", ".join(duplicates))
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -329,11 +504,15 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     dot = sum(a * b for a, b in zip(left, right))
     left_norm = math.sqrt(sum(value * value for value in left))
     right_norm = math.sqrt(sum(value * value for value in right))
-    return 0.0 if left_norm == 0.0 or right_norm == 0.0 else dot / (left_norm * right_norm)
+    return (
+        0.0 if left_norm == 0.0 or right_norm == 0.0 else dot / (left_norm * right_norm)
+    )
 
 
 def cross_check(
-    actual: list[list[float]], reference: list[list[float]], threshold: float = COSINE_WARN_THRESHOLD
+    actual: list[list[float]],
+    reference: list[list[float]],
+    threshold: float = COSINE_WARN_THRESHOLD,
 ) -> dict[str, Any]:
     if len(actual) != len(reference):
         raise ValueError("embedding counts differ between servers")
@@ -354,7 +533,9 @@ def cross_check(
 def interleaved_schedule(iterations: int) -> list[str]:
     schedule = []
     for index in range(iterations):
-        schedule.extend(("antfly", "reference") if index % 2 == 0 else ("reference", "antfly"))
+        schedule.extend(
+            ("antfly", "reference") if index % 2 == 0 else ("reference", "antfly")
+        )
     return schedule
 
 
@@ -388,11 +569,14 @@ def sha256_file(path: Path) -> str:
 def model_provenance(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for label, path in (
-        ("antfly", args.antfly_model_file), ("reference", args.reference_model_file)
+        ("antfly", args.antfly_model_file),
+        ("reference", args.reference_model_file),
     ):
         if path is not None:
             result[label] = {"path": str(path), "sha256": sha256_file(path)}
-    hashes = [entry["sha256"] for label, entry in result.items() if label != "identical"]
+    hashes = [
+        entry["sha256"] for label, entry in result.items() if label != "identical"
+    ]
     result["identical"] = len(hashes) == 2 and hashes[0] == hashes[1]
     if args.require_comparable and not result["identical"]:
         raise ValueError("strict comparison requires byte-identical model files")
@@ -427,7 +611,9 @@ def process_provenance(
         observed_argv = shlex.split(command)
         argv0 = observed_argv[0]
     except (ValueError, IndexError) as exc:
-        raise ValueError(f"cannot parse command for server PID {pid}: {command!r}") from exc
+        raise ValueError(
+            f"cannot parse command for server PID {pid}: {command!r}"
+        ) from exc
     observed_executable = _resolve_executable(argv0)
     if observed_executable != declared_executable:
         comm_result = subprocess.run(
@@ -477,7 +663,9 @@ def request_embeddings(
         raise RuntimeError(
             f"expected {len(texts)} embeddings, got {len(data) if isinstance(data, list) else 'none'}"
         )
-    embeddings = [item.get("embedding") if isinstance(item, dict) else None for item in data]
+    embeddings = [
+        item.get("embedding") if isinstance(item, dict) else None for item in data
+    ]
     if any(not isinstance(vector, list) or not vector for vector in embeddings):
         raise RuntimeError("response contains an empty embedding vector")
     dimensions = {len(vector) for vector in embeddings}
@@ -485,7 +673,11 @@ def request_embeddings(
         raise RuntimeError(f"inconsistent embedding dimensions: {sorted(dimensions)}")
     usage = payload.get("usage") if isinstance(payload, dict) else None
     prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
-    if not isinstance(prompt_tokens, int) or isinstance(prompt_tokens, bool) or prompt_tokens < 0:
+    if (
+        not isinstance(prompt_tokens, int)
+        or isinstance(prompt_tokens, bool)
+        or prompt_tokens < 0
+    ):
         prompt_tokens = None
     return elapsed_ms, embeddings, str(payload.get("model", "")), prompt_tokens
 
@@ -521,25 +713,46 @@ def run_cell(
     args: argparse.Namespace,
     request_batches: list[tuple[list[str], list[int]]],
     token_source: str,
+    precondition_batches: list[tuple[list[str], list[int]]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, str]]:
     targets = {"antfly": (args.url, args.model)}
     if args.reference_url:
         targets["reference"] = (args.reference_url, args.reference_model or args.model)
     last_embeddings: dict[str, list[list[float]]] = {}
     last_prompt_tokens: dict[str, int | None] = {}
-    observed_prompt_tokens: dict[str, list[int | None]] = {label: [] for label in targets}
+    observed_prompt_tokens: dict[str, list[int | None]] = {
+        label: [] for label in targets
+    }
     observed_models: dict[str, list[str]] = {label: [] for label in targets}
     reported: dict[str, str] = {}
     samples: dict[str, list[float]] = {label: [] for label in targets}
-    for iteration in range(args.warmup):
-        texts, _ = request_batches[iteration]
-        order = ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
+    for iteration, (texts, _) in enumerate(precondition_batches or []):
+        order = (
+            ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
+        )
         if not args.reference_url:
             order = ("antfly",)
         for label in order:
-            (
-                _, last_embeddings[label], reported[label], last_prompt_tokens[label]
-            ) = request_embeddings(targets[label][0], targets[label][1], texts, args.timeout)
+            (_, last_embeddings[label], reported[label], last_prompt_tokens[label]) = (
+                request_embeddings(
+                    targets[label][0], targets[label][1], texts, args.timeout
+                )
+            )
+            observed_prompt_tokens[label].append(last_prompt_tokens[label])
+            observed_models[label].append(reported[label])
+    for iteration in range(args.warmup):
+        texts, _ = request_batches[iteration]
+        order = (
+            ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
+        )
+        if not args.reference_url:
+            order = ("antfly",)
+        for label in order:
+            (_, last_embeddings[label], reported[label], last_prompt_tokens[label]) = (
+                request_embeddings(
+                    targets[label][0], targets[label][1], texts, args.timeout
+                )
+            )
             observed_prompt_tokens[label].append(last_prompt_tokens[label])
             observed_models[label].append(reported[label])
     measured_token_counts: list[list[int]] = []
@@ -547,26 +760,36 @@ def run_cell(
     for iteration in range(args.iters):
         texts, token_counts = request_batches[args.warmup + iteration]
         measured_token_counts.append(token_counts)
-        order = ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
+        order = (
+            ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
+        )
         if not args.reference_url:
             order = ("antfly",)
         for label in order:
             (
-                elapsed, last_embeddings[label], reported[label], last_prompt_tokens[label]
-            ) = request_embeddings(targets[label][0], targets[label][1], texts, args.timeout)
+                elapsed,
+                last_embeddings[label],
+                reported[label],
+                last_prompt_tokens[label],
+            ) = request_embeddings(
+                targets[label][0], targets[label][1], texts, args.timeout
+            )
             observed_prompt_tokens[label].append(last_prompt_tokens[label])
             observed_models[label].append(reported[label])
             samples[label].append(elapsed)
         if args.reference_url:
             parity_checks.append(
                 cross_check(
-                    last_embeddings["antfly"], last_embeddings["reference"],
+                    last_embeddings["antfly"],
+                    last_embeddings["reference"],
                     args.cosine_threshold,
                 )
             )
     expected_totals = {sum(counts) for counts in measured_token_counts}
     if len(expected_totals) != 1:
-        raise ValueError("all measured fixture batches must have the same total token count")
+        raise ValueError(
+            "all measured fixture batches must have the same total token count"
+        )
     token_counts = measured_token_counts[0]
     if args.require_comparable:
         expected_tokens = sum(token_counts)
@@ -576,7 +799,8 @@ def run_cell(
         }
         mismatches = {
             label: {
-                "expected": expected_tokens + reported_offsets[label] * len(token_counts),
+                "expected": expected_tokens
+                + reported_offsets[label] * len(token_counts),
                 "observed": sorted(
                     set(observed_prompt_tokens[label]),
                     key=lambda value: -1 if value is None else value,
@@ -618,13 +842,17 @@ def run_cell(
             raise ValueError("reference comparison has no measured parity checks")
         comparison = {
             "min_cosine": min(check["min_cosine"] for check in parity_checks),
-            "mean_cosine": statistics.fmean(check["mean_cosine"] for check in parity_checks),
+            "mean_cosine": statistics.fmean(
+                check["mean_cosine"] for check in parity_checks
+            ),
             "max_abs_error": max(check["max_abs_error"] for check in parity_checks),
             "threshold": args.cosine_threshold,
             "pass": all(check["pass"] for check in parity_checks),
             "parity_iterations": len(parity_checks),
             "throughput_ratio_antfly_over_reference": bootstrap_ratio_ci(
-                samples["antfly"], samples["reference"], args.bootstrap_samples,
+                samples["antfly"],
+                samples["reference"],
+                args.bootstrap_samples,
                 args.seed + len(texts),
             ),
             "order": "alternating AB/BA",
@@ -633,7 +861,8 @@ def run_cell(
         comparison["ratio_gate"] = {
             "threshold": threshold,
             "pass": threshold is None
-            or comparison["throughput_ratio_antfly_over_reference"]["lower_95"] >= threshold,
+            or comparison["throughput_ratio_antfly_over_reference"]["lower_95"]
+            >= threshold,
         }
     return results, comparison, reported
 
@@ -669,7 +898,9 @@ def main(argv: list[str] | None = None) -> int:
             else {}
         )
         fixture_model_sha256 = (
-            provenance.get("antfly", {}).get("sha256") if args.require_comparable else None
+            provenance.get("antfly", {}).get("sha256")
+            if args.require_comparable
+            else None
         )
         fixture = (
             select_fixture_cases(
@@ -692,9 +923,19 @@ def main(argv: list[str] | None = None) -> int:
         },
         "comparison_contract": {
             "strict": args.require_comparable,
-            "sample_order": "alternating AB/BA" if args.reference_url else "single target",
+            "sample_order": "alternating AB/BA"
+            if args.reference_url
+            else "single target",
+            "thermal_preconditioning": {
+                "iterations": args.precondition_iters,
+                "measured": False,
+                "fixture_batches_reserved": 2 if args.precondition_iters else 0,
+            },
             "model_files": provenance,
-            "build_ids": {"antfly": args.antfly_build_id, "reference": args.reference_build_id},
+            "build_ids": {
+                "antfly": args.antfly_build_id,
+                "reference": args.reference_build_id,
+            },
             "live_processes": process_attestations,
             "server_args": {
                 "antfly": args.antfly_server_args,
@@ -706,16 +947,22 @@ def main(argv: list[str] | None = None) -> int:
         "comparisons": [],
     }
     if args.reference_url:
-        report["servers"]["reference"] = {"url": args.reference_url, "model_reported": ""}
-    print("target,corpus,batch,input_tokens,mean_ms,p50_ms,p95_ms,embeddings_s,tokens_s,token_source,dims")
+        report["servers"]["reference"] = {
+            "url": args.reference_url,
+            "model_reported": "",
+        }
+    print(
+        "target,corpus,batch,input_tokens,mean_ms,p50_ms,p95_ms,embeddings_s,tokens_s,token_source,dims"
+    )
     failed = False
     for batch in args.batch_sizes:
         if fixture:
             request_count = args.warmup + args.iters
             needed_cases = request_count * batch
+            reserve_cases = 2 * batch if args.precondition_iters else 0
             if args.require_comparable:
                 try:
-                    validate_cache_neutral_cases(fixture, needed_cases)
+                    validate_cache_neutral_cases(fixture, needed_cases + reserve_cases)
                 except ValueError as exc:
                     print(f"benchmark configuration failed: {exc}", file=sys.stderr)
                     return 2
@@ -723,20 +970,33 @@ def main(argv: list[str] | None = None) -> int:
                 fixture_batch(fixture, batch, offset=index * batch)
                 for index in range(request_count)
             ]
+            precondition_batches = [
+                fixture_batch(
+                    fixture,
+                    batch,
+                    offset=needed_cases + (index % 2) * batch,
+                )
+                for index in range(args.precondition_iters)
+            ]
             token_source = f"exact:{args.fixture}"
         else:
             texts = build_corpus(args.corpus, batch, args.seed)
             token_counts = [approx_token_count(text) for text in texts]
             request_batches = [(texts, token_counts)] * (args.warmup + args.iters)
+            precondition_batches = []
             token_source = "approximate:whitespace_words"
         try:
-            results, comparison, reported = run_cell(args, request_batches, token_source)
+            results, comparison, reported = run_cell(
+                args, request_batches, token_source, precondition_batches
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"benchmark request failed: {exc}", file=sys.stderr)
             return 2
         for result in results:
             report["results"].append(result)
-            report["servers"][result["target"]]["model_reported"] = reported[result["target"]]
+            report["servers"][result["target"]]["model_reported"] = reported[
+                result["target"]
+            ]
             print_row(result)
         if comparison is not None:
             comparison["batch"] = batch
@@ -745,7 +1005,15 @@ def main(argv: list[str] | None = None) -> int:
                 failed = True
     report["pass"] = not failed
     if args.output:
-        args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        persisted_report = (
+            report
+            if args.include_local_paths
+            else portable_report(report, workdir=Path.cwd(), home=Path.home())
+        )
+        args.output.write_text(
+            json.dumps(persisted_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         print(f"wrote {args.output}")
     return 1 if failed else 0
 

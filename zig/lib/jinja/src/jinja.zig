@@ -105,18 +105,25 @@ fn normalizeEnvironmentWhitespace(
         try result.appendSlice(allocator, source[cursor..relative_open]);
 
         if (options.lstrip_blocks) {
-            var line_start = result.items.len;
-            while (line_start > 0 and result.items[line_start - 1] != '\n' and result.items[line_start - 1] != '\r') {
+            // Determine line boundaries from the source. trim_blocks may have
+            // consumed a newline without copying it to result, so walking the
+            // output can incorrectly treat the preceding tag as part of this
+            // source line and retain the next tag's indentation.
+            var line_start = relative_open;
+            while (line_start > 0 and source[line_start - 1] != '\n' and source[line_start - 1] != '\r') {
                 line_start -= 1;
             }
             var whitespace_only = true;
-            for (result.items[line_start..]) |byte| {
+            for (source[line_start..relative_open]) |byte| {
                 if (byte != ' ' and byte != '\t') {
                     whitespace_only = false;
                     break;
                 }
             }
-            if (whitespace_only) result.items.len = line_start;
+            if (whitespace_only) {
+                const copied_line_start = @max(line_start, cursor);
+                result.items.len -= relative_open - copied_line_start;
+            }
         }
 
         const relative_close = findStatementClose(source, relative_open + 2) orelse {
@@ -287,6 +294,22 @@ test "Hugging Face template environment trims block lines" {
     try ctx.put(arena, "enabled", Value.bln(true));
     const result = try tpl.render(arena, &ctx);
     try std.testing.expectEqualStrings("assistant\n", result);
+}
+
+test "Hugging Face lstrip uses source line after a trimmed newline" {
+    var tpl = try Template.initHuggingFace(
+        std.testing.allocator,
+        "{% if enabled %}\n    {% set marker = 'ok' %}\n{{ marker }}\n{% endif %}\n",
+    );
+    defer tpl.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = ValueMap{};
+    try ctx.put(arena, "enabled", Value.bln(true));
+    const result = try tpl.render(arena, &ctx);
+    try std.testing.expectEqualStrings("ok\n", result);
 }
 
 test "Hugging Face whitespace scan ignores quoted statement terminators" {

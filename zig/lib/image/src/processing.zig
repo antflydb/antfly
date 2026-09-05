@@ -19,6 +19,10 @@ pub const Resample = enum(u32) {
     lanczos = 1,
     bilinear = 2,
     bicubic = 3,
+    /// Pillow's antialiased, quantized two-pass BICUBIC implementation. This
+    /// is distinct from the legacy bicubic sampler used by existing model
+    /// configurations so parity-sensitive callers must opt in explicitly.
+    pillow_bicubic = 4,
 };
 
 pub const PixelFormat = enum(u8) {
@@ -132,7 +136,7 @@ pub fn preprocessDecodedRectScaledWithResample(
         return result;
     }
 
-    if (resample == .bicubic) {
+    if (resample == .pillow_bicubic) {
         try preprocessDecodedRectPillowBicubic(
             allocator,
             img,
@@ -841,7 +845,7 @@ test "bicubic downsampling matches Pillow RGB pixels" {
         .{ 0.0, 0.0, 0.0 },
         .{ 1.0, 1.0, 1.0 },
         1.0,
-        .bicubic,
+        .pillow_bicubic,
     );
     defer alloc.free(out);
 
@@ -852,4 +856,22 @@ test "bicubic downsampling matches Pillow RGB pixels" {
         45, 45,  45,  155, 155, 155,
     };
     try std.testing.expectEqualSlices(f32, &expected, out);
+
+    const legacy = try preprocessDecodedRectScaledWithResample(
+        alloc,
+        .{
+            .data = &rgb,
+            .width = 8,
+            .height = 6,
+            .format = .rgb8,
+        },
+        3,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        1.0,
+        .bicubic,
+    );
+    defer alloc.free(legacy);
+    try std.testing.expect(!std.mem.eql(f32, legacy, out));
 }
