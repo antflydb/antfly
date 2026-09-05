@@ -198,6 +198,24 @@ pub const AntflyProvider = struct {
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
+/// Long-lived provider resources shared by independently constructed managed
+/// embedders. API runtimes should own one of these for their full service
+/// lifetime so request-scoped embedders reuse credentials and refresh work.
+pub const ProviderRuntime = struct {
+    google_credentials: google_auth.CredentialManager,
+
+    pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
+        return .{
+            .google_credentials = google_auth.CredentialManager.init(alloc, io),
+        };
+    }
+
+    pub fn deinit(self: *ProviderRuntime) void {
+        self.google_credentials.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
@@ -212,6 +230,10 @@ pub const InitOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    /// Borrowed for the lifetime of the constructed ManagedEmbedder. Services
+    /// should supply their runtime; standalone embedders retain an owned
+    /// fallback for compatibility.
+    provider_runtime: ?*ProviderRuntime = null,
 };
 
 const DimensionProbeValidation = enum {
@@ -457,9 +479,9 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     truncate: []u8 = "",
-    /// Borrowed from the owning ManagedEmbedder. Keeping the credential
-    /// manager alive across requests preserves ADC tokens and serializes
-    /// refreshes instead of reminting a token for every embedding operation.
+    /// Borrowed from the service ProviderRuntime, or from the owning
+    /// ManagedEmbedder's standalone fallback. A service-scoped manager keeps
+    /// ADC tokens across request embedders and serializes refreshes.
     google_credentials: ?*google_auth.CredentialManager = null,
     bedrock_credentials: bedrock_provider.CredentialCache = .{},
     api_key: ?common_secrets.SecretValue = null,
@@ -754,10 +776,11 @@ fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbe
     });
 }
 
-fn createManagedGoogleCredentialManager(
+fn attachManagedGoogleCredentialManager(
     alloc: std.mem.Allocator,
     io: ?std.Io,
     entries: []ManagedEmbeddingEntry,
+    provider_runtime: ?*ProviderRuntime,
 ) !?*google_auth.CredentialManager {
     var has_vertex = false;
     for (entries) |entry| {
@@ -768,22 +791,32 @@ fn createManagedGoogleCredentialManager(
     }
     if (!has_vertex) return null;
 
-    const manager = try alloc.create(google_auth.CredentialManager);
-    manager.* = google_auth.CredentialManager.init(
-        alloc,
-        io orelse std.Io.Threaded.global_single_threaded.io(),
-    );
+    const owned_manager = if (provider_runtime == null)
+        try alloc.create(google_auth.CredentialManager)
+    else
+        null;
+    errdefer if (owned_manager) |manager| alloc.destroy(manager);
+    if (owned_manager) |manager| {
+        manager.* = google_auth.CredentialManager.init(
+            alloc,
+            io orelse std.Io.Threaded.global_single_threaded.io(),
+        );
+    }
+    const manager = if (provider_runtime) |runtime|
+        &runtime.google_credentials
+    else
+        owned_manager.?;
     for (entries) |*entry| {
         if (entry.provider == .vertex) entry.google_credentials = manager;
     }
-    return manager;
+    return owned_manager;
 }
 
 pub const ManagedEmbedder = struct {
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
     pacer_scope_keys: [][]u8 = &.{},
-    google_credentials: ?*google_auth.CredentialManager = null,
+    owned_google_credentials: ?*google_auth.CredentialManager = null,
 
     pub fn initFromIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !ManagedEmbedder {
         return try initFromIndexesJsonWithOptions(alloc, indexes_json, .{});
@@ -843,12 +876,13 @@ pub const ManagedEmbedder = struct {
         }
         try attachRequestPacers(alloc, entries.items, &pacer_scope_keys);
 
-        const google_credentials = try createManagedGoogleCredentialManager(
+        const owned_google_credentials = try attachManagedGoogleCredentialManager(
             alloc,
             options.io,
             entries.items,
+            options.provider_runtime,
         );
-        errdefer if (google_credentials) |manager| {
+        errdefer if (owned_google_credentials) |manager| {
             manager.deinit();
             alloc.destroy(manager);
         };
@@ -857,7 +891,7 @@ pub const ManagedEmbedder = struct {
             .alloc = alloc,
             .entries = try entries.toOwnedSlice(alloc),
             .pacer_scope_keys = try pacer_scope_keys.toOwnedSlice(alloc),
-            .google_credentials = google_credentials,
+            .owned_google_credentials = owned_google_credentials,
         };
     }
 
@@ -869,7 +903,7 @@ pub const ManagedEmbedder = struct {
             self.alloc.free(scope_key);
         }
         if (self.pacer_scope_keys.len > 0) self.alloc.free(self.pacer_scope_keys);
-        if (self.google_credentials) |manager| {
+        if (self.owned_google_credentials) |manager| {
             manager.deinit();
             self.alloc.destroy(manager);
         }
@@ -1512,7 +1546,10 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .object => |object| object.get("embedder") orelse return error.InvalidCreateTableRequest,
         else => return error.InvalidCreateTableRequest,
     };
-    var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder_value);
+    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder_value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
     defer embedder_cfg.deinit(alloc);
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidCreateTableRequest;
@@ -3446,7 +3483,10 @@ fn buildManagedEmbeddingEntry(
     semantic_binding: ?CatalogSemanticExecutionBinding,
 ) !ManagedEmbeddingEntry {
     const sparse = cfg.sparse orelse false;
-    var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder);
+    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidManagedEmbeddingIndex,
+    };
     defer embedder_cfg.deinit(alloc);
 
     const provider = try parseEmbedderProvider(embedder_cfg);
@@ -5086,39 +5126,35 @@ test "Vertex embedding request planning matches model-specific wire limits" {
 }
 
 pub fn testManagedVertexCredentialManagerLifetime() !void {
-    var entries = [_]ManagedEmbeddingEntry{
-        .{
-            .alloc = std.testing.allocator,
-            .index_name = @constCast("first"),
-            .provider = .vertex,
-            .model = @constCast("gemini-embedding-001"),
-            .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
-            .dimensions = 3072,
-        },
-        .{
-            .alloc = std.testing.allocator,
-            .index_name = @constCast("second"),
-            .provider = .vertex,
-            .model = @constCast("text-embedding-005"),
-            .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
-            .dimensions = 768,
-        },
-    };
-    const manager = (try createManagedGoogleCredentialManager(
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"test-project","location":"us-central1"}}}
+    ;
+    var provider_runtime = ProviderRuntime.init(
         std.testing.allocator,
-        null,
-        &entries,
-    )).?;
-    defer {
-        manager.deinit();
-        std.testing.allocator.destroy(manager);
-    }
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    defer provider_runtime.deinit();
 
-    try std.testing.expect(entries[0].google_credentials == manager);
-    try std.testing.expect(entries[1].google_credentials == manager);
+    var first_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer first_request.deinit();
+    var second_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer second_request.deinit();
+
+    try std.testing.expect(first_request.owned_google_credentials == null);
+    try std.testing.expect(second_request.owned_google_credentials == null);
+    try std.testing.expect(first_request.entries[0].google_credentials == &provider_runtime.google_credentials);
+    try std.testing.expect(second_request.entries[0].google_credentials == &provider_runtime.google_credentials);
 }
 
-test "managed Vertex entries share a lifetime-scoped Google credential manager" {
+test "request-scoped managed Vertex embedders borrow the service credential manager" {
     try testManagedVertexCredentialManagerLifetime();
 }
 

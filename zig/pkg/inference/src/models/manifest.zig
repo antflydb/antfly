@@ -276,6 +276,9 @@ pub const ModelManifest = struct {
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
     embedding_profile: EmbeddingProfile = .{},
+    /// True only when model_manifest.json explicitly declares the profile.
+    /// Explicit profiles replace family defaults and must be complete.
+    embedding_profile_explicit: bool = false,
     embedding_style: EmbeddingStyle = .none,
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
@@ -2189,25 +2192,50 @@ fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !v
     // finalizeEmbeddingProfile instead of silently reverting to raw text.
     manifest.embedding_profile.deinit(manifest.allocator);
     manifest.embedding_profile.task_contract = .required;
-    if (value != .object) return;
+    manifest.embedding_profile_explicit = true;
+    if (value != .object) return error.InvalidEmbeddingTaskProfile;
+
+    var fields = value.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "task_contract") and
+            !std.mem.eql(u8, field.key_ptr.*, "query") and
+            !std.mem.eql(u8, field.key_ptr.*, "document"))
+        {
+            return error.InvalidEmbeddingTaskProfile;
+        }
+    }
 
     if (value.object.get("task_contract")) |contract|
         manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(contract);
     if (value.object.get("query")) |query| {
-        if (query == .object) {
-            if (query.object.get("prefix")) |prefix| {
-                if (prefix == .string) try setEmbeddingProfilePrefix(manifest, .query, prefix.string);
+        if (query != .object) return error.InvalidEmbeddingTaskProfile;
+        var query_fields = query.object.iterator();
+        while (query_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix") and
+                !std.mem.eql(u8, field.key_ptr.*, "instruction_template"))
+            {
+                return error.InvalidEmbeddingTaskProfile;
             }
-            if (query.object.get("instruction_template")) |template| {
-                if (template == .string) try setEmbeddingInstructionTemplate(manifest, template.string);
-            }
+        }
+        if (query.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .query, prefix.string);
+        }
+        if (query.object.get("instruction_template")) |template| {
+            if (template != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingInstructionTemplate(manifest, template.string);
         }
     }
     if (value.object.get("document")) |document| {
-        if (document == .object) {
-            if (document.object.get("prefix")) |prefix| {
-                if (prefix == .string) try setEmbeddingProfilePrefix(manifest, .document, prefix.string);
-            }
+        if (document != .object) return error.InvalidEmbeddingTaskProfile;
+        var document_fields = document.object.iterator();
+        while (document_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix"))
+                return error.InvalidEmbeddingTaskProfile;
+        }
+        if (document.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .document, prefix.string);
         }
     }
 }
@@ -2990,7 +3018,7 @@ fn markEmbeddingTaskProfileRequired(manifest: *ModelManifest) void {
 fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
     // Known execution styles are trusted model-family evidence. Their default
     // rendering contracts fill any sidecar fields the checkpoint omitted.
-    switch (manifest.embedding_style) {
+    switch (if (manifest.embedding_profile_explicit) EmbeddingStyle.none else manifest.embedding_style) {
         .qwen3_embedding => {
             markEmbeddingTaskProfileRequired(manifest);
             if (!manifest.embedding_profile.query.declared)
@@ -3447,6 +3475,35 @@ test "embedding task contract declarations reject unknown values and types" {
             parseModelManifestJson(&manifest, allocator, manifest_json),
         );
     }
+}
+
+test "explicit embedding profiles reject malformed fields without family fallback" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":42}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":42},"document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":"query: ","document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: ","unknown":true},"document":{"prefix":""}}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var partial = ModelManifest{ .allocator = allocator };
+    defer partial.deinit();
+    try parseModelManifestJson(&partial, allocator,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: "}}}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
 }
 
 test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {

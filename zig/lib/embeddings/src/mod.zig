@@ -21,6 +21,28 @@ const Allocator = std.mem.Allocator;
 pub const Provider = openapi.EmbedderProvider;
 pub const OpenApiConfig = openapi.EmbedderConfig;
 
+const RetrievalCapabilities = struct {
+    legacy_input_type: bool = false,
+    role_input_types: bool = false,
+    query_instruction: bool = false,
+};
+
+fn retrievalCapabilities(provider: Provider, model: []const u8, request_format: []const u8) RetrievalCapabilities {
+    return switch (provider) {
+        .cohere => .{ .legacy_input_type = true, .role_input_types = true },
+        .gemini, .vertex => .{ .role_input_types = true },
+        .bedrock => if (std.mem.eql(u8, request_format, "cohere_v3") or
+            std.mem.eql(u8, request_format, "cohere_v4") or
+            ((request_format.len == 0 or std.mem.eql(u8, request_format, "auto")) and
+                std.mem.indexOf(u8, model, "cohere.embed-") != null))
+            .{ .legacy_input_type = true, .role_input_types = true }
+        else
+            .{},
+        .antfly => .{ .query_instruction = true },
+        .openai, .openrouter, .ollama => .{},
+    };
+}
+
 pub const Config = struct {
     provider: Provider,
     model: []const u8 = "",
@@ -101,23 +123,14 @@ pub const Config = struct {
         if (self.batch_size) |batch_size| {
             if (batch_size == 0) return error.InvalidEmbedderConfig;
         }
-        const has_role_overrides = self.query_input_type.len > 0 or self.document_input_type.len > 0;
-        const has_instruction = self.query_instruction.len > 0;
-        switch (self.provider) {
-            .cohere, .gemini, .vertex => if (has_instruction) return error.UnsupportedEmbeddingRetrievalConfig,
-            .bedrock => {
-                if (has_instruction) return error.UnsupportedEmbeddingRetrievalConfig;
-                const cohere_format = std.mem.eql(u8, self.request_format, "cohere_v3") or
-                    std.mem.eql(u8, self.request_format, "cohere_v4") or
-                    (self.request_format.len == 0 or std.mem.eql(u8, self.request_format, "auto")) and
-                        (std.mem.indexOf(u8, self.model, "cohere.embed-") != null);
-                if ((has_role_overrides or self.input_type.len > 0) and !cohere_format)
-                    return error.UnsupportedEmbeddingRetrievalConfig;
-            },
-            .antfly => if (has_role_overrides) return error.UnsupportedEmbeddingRetrievalConfig,
-            .openai, .openrouter, .ollama => if (has_role_overrides or has_instruction)
-                return error.UnsupportedEmbeddingRetrievalConfig,
-        }
+        const capabilities = retrievalCapabilities(self.provider, self.model, self.request_format);
+        if (!capabilities.legacy_input_type and self.input_type.len > 0)
+            return error.UnsupportedEmbeddingRetrievalConfig;
+        if (!capabilities.role_input_types and
+            (self.query_input_type.len > 0 or self.document_input_type.len > 0))
+            return error.UnsupportedEmbeddingRetrievalConfig;
+        if (!capabilities.query_instruction and self.query_instruction.len > 0)
+            return error.UnsupportedEmbeddingRetrievalConfig;
     }
 
     pub fn defaultedUrl(self: Config) []const u8 {
@@ -312,18 +325,32 @@ test "embedder config accepts matching legacy retrieval fields and rejects confl
 
 test "embedder config rejects retrieval controls a provider would ignore" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(
-        error.UnsupportedEmbeddingRetrievalConfig,
-        parseConfigFromSlice(alloc,
-            \\{"provider":"openai","model":"text-embedding-3-small","retrieval":{"query_input_type":"search_query"}}
-        ),
-    );
-    try std.testing.expectError(
-        error.UnsupportedEmbeddingRetrievalConfig,
-        parseConfigFromSlice(alloc,
-            \\{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","retrieval":{"query_input_type":"search_query"}}
-        ),
-    );
+    const Case = struct { raw: []const u8, supported: bool };
+    const cases = [_]Case{
+        .{ .raw = "{\"provider\":\"cohere\",\"model\":\"embed-v4.0\",\"input_type\":\"search_document\",\"retrieval\":{\"query_input_type\":\"search_query\"}}", .supported = true },
+        .{ .raw = "{\"provider\":\"gemini\",\"model\":\"gemini-embedding-001\",\"retrieval\":{\"query_input_type\":\"RETRIEVAL_QUERY\"}}", .supported = true },
+        .{ .raw = "{\"provider\":\"vertex\",\"model\":\"gemini-embedding-001\",\"retrieval\":{\"document_input_type\":\"RETRIEVAL_DOCUMENT\"}}", .supported = true },
+        .{ .raw = "{\"provider\":\"bedrock\",\"model\":\"cohere.embed-v4:0\",\"retrieval\":{\"query_input_type\":\"search_query\"}}", .supported = true },
+        .{ .raw = "{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\",\"retrieval\":{\"query_instruction\":\"retrieve passages\"}}", .supported = true },
+        .{ .raw = "{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"retrieval\":{\"query_input_type\":\"search_query\"}}", .supported = false },
+        .{ .raw = "{\"provider\":\"openrouter\",\"model\":\"openai/text-embedding-3-small\",\"input_type\":\"search_query\"}", .supported = false },
+        .{ .raw = "{\"provider\":\"ollama\",\"model\":\"nomic-embed-text\",\"retrieval\":{\"query_instruction\":\"retrieve passages\"}}", .supported = false },
+        .{ .raw = "{\"provider\":\"gemini\",\"model\":\"gemini-embedding-001\",\"input_type\":\"RETRIEVAL_QUERY\"}", .supported = false },
+        .{ .raw = "{\"provider\":\"vertex\",\"model\":\"gemini-embedding-001\",\"retrieval\":{\"query_instruction\":\"retrieve passages\"}}", .supported = false },
+        .{ .raw = "{\"provider\":\"bedrock\",\"model\":\"amazon.titan-embed-text-v2:0\",\"retrieval\":{\"query_input_type\":\"search_query\"}}", .supported = false },
+        .{ .raw = "{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\",\"input_type\":\"search_query\"}", .supported = false },
+    };
+    for (cases) |case| {
+        if (case.supported) {
+            var cfg = try parseConfigFromSlice(alloc, case.raw);
+            cfg.deinit(alloc);
+        } else {
+            try std.testing.expectError(
+                error.UnsupportedEmbeddingRetrievalConfig,
+                parseConfigFromSlice(alloc, case.raw),
+            );
+        }
+    }
 }
 
 test "embedder config supports antfly api_url normalization" {
