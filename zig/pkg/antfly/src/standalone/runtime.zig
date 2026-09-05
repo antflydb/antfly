@@ -5354,7 +5354,9 @@ fn inferenceProviderEmbedDenseTextsWithContext(
     return try invokeInferenceProviderControlled([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
         .model = model,
         .texts = texts,
-    }, context.deadline_ns, context.cancellation orelse .none);
+        .task_type = context.task_type.canonical(),
+        .instruction = context.instruction,
+    }, context.request.deadline_ns, context.request.cancellation orelse .none);
 }
 
 fn inferenceProviderEmbedSparseTexts(
@@ -5375,7 +5377,17 @@ fn inferenceProviderEmbedDenseParts(
     model: []const u8,
     parts: []const antfly.template.ContentPart,
 ) anyerror![][]f32 {
-    return try inferenceProviderEmbedDensePartsBorrowed(handle, alloc, model, parts, .embed_dense_parts, null, .none);
+    return try inferenceProviderEmbedDensePartsBorrowed(
+        handle,
+        alloc,
+        model,
+        parts,
+        .embed_dense_parts,
+        null,
+        null,
+        null,
+        .none,
+    );
 }
 
 fn inferenceProviderEmbedDensePartsWithContext(
@@ -5386,7 +5398,17 @@ fn inferenceProviderEmbedDensePartsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     try context.check();
-    return try inferenceProviderEmbedDensePartsBorrowed(handle, alloc, model, parts, .embed_dense_parts_with_context, context.deadline_ns, context.cancellation orelse .none);
+    return try inferenceProviderEmbedDensePartsBorrowed(
+        handle,
+        alloc,
+        model,
+        parts,
+        .embed_dense_parts_with_context,
+        context.task_type.canonical(),
+        context.instruction,
+        context.request.deadline_ns,
+        context.request.cancellation orelse .none,
+    );
 }
 
 fn inferenceProviderEmbedDensePartsBorrowed(
@@ -5395,6 +5417,8 @@ fn inferenceProviderEmbedDensePartsBorrowed(
     model: []const u8,
     parts: []const antfly.template.ContentPart,
     operation: inference_bridge.ProviderOperation,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
@@ -5422,7 +5446,13 @@ fn inferenceProviderEmbedDensePartsBorrowed(
         alloc,
         handle,
         operation,
-        .{ .model = model, .parts = wire_parts, .attachment_count = payload_count },
+        .{
+            .model = model,
+            .parts = wire_parts,
+            .attachment_count = payload_count,
+            .task_type = task_type,
+            .instruction = instruction,
+        },
         deadline_ns,
         payload_storage[0..payload_count],
         ref_storage[0..payload_count],

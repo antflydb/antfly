@@ -9,13 +9,14 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
 const inference_work = @import("work.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
     @import("../template.zig");
 
 const HeaderPair = [2][]const u8;
-pub const cohere_max_batch_size: usize = 96;
+pub const cohere_max_batch_size = provider_defaults.cohere_max_embedding_batch_size;
 const single_input_batch_size: usize = 1;
 const imds_default_endpoint = "http://169.254.169.254";
 const ecs_credentials_endpoint = "http://169.254.170.2";
@@ -1635,7 +1636,7 @@ pub fn testCredentialUrlEncoding() !void {
 }
 
 pub fn testRequestShapeBatchesByProviderRequest() !void {
-    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-v4"));
+    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-v4:0"));
     try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-english-v3"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-text-v2:0"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-image-v1"));

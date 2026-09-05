@@ -33,6 +33,8 @@ const EmbedWireRequest = struct {
     model: []const u8,
     input: std.json.Value,
     encoding_format: []const u8 = "float",
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 const DenseJsonEmbeddingObject = struct {
@@ -83,7 +85,12 @@ fn addRequestSize(total: *usize, amount: usize) !void {
     total.* = std.math.add(usize, total.*, amount) catch return error.OutOfMemory;
 }
 
-fn embedPartsRequestSize(model: []const u8, parts: []const template_mod.ContentPart) !usize {
+fn embedPartsRequestSize(
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+) !usize {
     var total: usize = "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len;
     try addRequestSize(&total, try jsonStringEncodedSize(model));
     for (parts, 0..) |part, index| {
@@ -104,6 +111,14 @@ fn embedPartsRequestSize(model: []const u8, parts: []const template_mod.ContentP
             },
         }
     }
+    if (task_type) |value| {
+        try addRequestSize(&total, ",\"task_type\":".len);
+        try addRequestSize(&total, try jsonStringEncodedSize(value));
+    }
+    if (instruction) |value| {
+        try addRequestSize(&total, ",\"instruction\":".len);
+        try addRequestSize(&total, try jsonStringEncodedSize(value));
+    }
     return total;
 }
 
@@ -115,10 +130,12 @@ fn embedPartsRequestJsonAlloc(
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = try .initCapacity(
         alloc,
-        try embedPartsRequestSize(model, parts),
+        try embedPartsRequestSize(model, parts, task_type, instruction),
     );
     defer output.deinit();
     var stringify: std.json.Stringify = .{ .writer = &output.writer };
@@ -165,6 +182,14 @@ fn embedPartsRequestJsonAlloc(
     try stringify.endArray();
     try stringify.objectField("encoding_format");
     try stringify.write("float");
+    if (task_type) |value| {
+        try stringify.objectField("task_type");
+        try stringify.write(value);
+    }
+    if (instruction) |value| {
+        try stringify.objectField("instruction");
+        try stringify.write(value);
+    }
     try stringify.endObject();
     if (output.writer.end != output.writer.buffer.len) return error.InvalidEmbedRequestSize;
     const body = output.writer.buffer;
@@ -441,9 +466,34 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts);
+        return self.embedPartsWithTask(alloc, model, parts, null, null);
+    }
+
+    pub fn embedPartsWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);
         defer alloc.free(json_body);
         return try self.embedJsonBody(alloc, json_body);
+    }
+
+    pub fn embedWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        inputs: []const []const u8,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        var input_array = std.json.Array.init(alloc);
+        defer input_array.deinit();
+        for (inputs) |input| try input_array.append(.{ .string = input });
+        return try self.embedJsonInputWithTask(alloc, model, .{ .array = input_array }, task_type, instruction);
     }
 
     fn embedImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, inputs: []const []const u8) anyerror!inference.EmbedResult {
@@ -455,9 +505,22 @@ pub const Provider = struct {
     }
 
     fn embedJsonInput(self: *Provider, alloc: std.mem.Allocator, model: []const u8, input: std.json.Value) !inference.EmbedResult {
+        return self.embedJsonInputWithTask(alloc, model, input, null, null);
+    }
+
+    fn embedJsonInputWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: std.json.Value,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
         const json_body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
             .model = model,
             .input = input,
+            .task_type = task_type,
+            .instruction = instruction,
         });
         defer alloc.free(json_body);
         return try self.embedJsonBody(alloc, json_body);
@@ -719,9 +782,18 @@ test "antfly embed parts request sizing is exact for escaped strings" {
         .{ .media_url = "https://example.invalid/a\\b.png" },
         .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
     };
-    const body = try embedPartsRequestJsonAlloc(std.testing.allocator, "clip\"clap", &parts);
+    const body = try embedPartsRequestJsonAlloc(
+        std.testing.allocator,
+        "clip\"clap",
+        &parts,
+        "RETRIEVAL_DOCUMENT",
+        "find diagrams",
+    );
     defer std.testing.allocator.free(body);
-    try std.testing.expectEqual(try embedPartsRequestSize("clip\"clap", &parts), body.len);
+    try std.testing.expectEqual(
+        try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams"),
+        body.len,
+    );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
@@ -741,6 +813,32 @@ test "antfly dense JSON response cleanup is allocation-failure safe" {
 }
 
 test "antfly embed parts streams binary base64 into one request body" {
+    return testEmbedPartsRequestRoundTrip();
+}
+
+test "antfly embed request carries retrieval task and instruction" {
+    const alloc = std.testing.allocator;
+    var input = std.json.Array.init(alloc);
+    defer input.deinit();
+    try input.append(.{ .string = "history of Korea" });
+
+    const body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+        .model = "nomic-ai/nomic-embed-text-v1.5",
+        .input = .{ .array = input },
+        .task_type = "RETRIEVAL_QUERY",
+        .instruction = "retrieve relevant encyclopedia passages",
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"task_type\":\"RETRIEVAL_QUERY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\":\"retrieve relevant encyclopedia passages\"") != null);
+}
+
+test "antfly embed parts preserves binary base64 until request serialization" {
+    return testEmbedPartsRequestRoundTrip();
+}
+
+fn testEmbedPartsRequestRoundTrip() !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

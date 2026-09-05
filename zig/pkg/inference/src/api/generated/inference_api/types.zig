@@ -998,10 +998,12 @@ pub const EmbedRequest = struct {
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
     encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
     task_type: ?[]const u8 = null,
+    /// Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support.
+    instruction: ?[]const u8 = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
     /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
@@ -1014,6 +1016,7 @@ pub const EmbedRequest = struct {
         .{ "encoding_format", "encoding_format", true },
         .{ "dimensions", "dimensions", true },
         .{ "task_type", "task_type", true },
+        .{ "instruction", "instruction", true },
         .{ "input_type", "input_type", true },
         .{ "error_policy", "error_policy", true },
     };
@@ -1042,6 +1045,10 @@ pub const EmbedRequest = struct {
         }
         if (self.task_type) |value| {
             try jw.objectField("task_type");
+            try jw.write(value);
+        }
+        if (self.instruction) |value| {
+            try jw.objectField("instruction");
             try jw.write(value);
         }
         if (self.input_type) |value| {

@@ -1712,12 +1712,14 @@ pub const AntflyEmbedderConfig = struct {
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_url", "api_url", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1736,6 +1738,10 @@ pub const AntflyEmbedderConfig = struct {
         try jw.write(self.model);
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2538,10 +2544,10 @@ pub const BatchResponse = struct {
     }
 };
 
-/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 pub const BedrockEmbedderConfig = struct {
     provider: []const u8,
-    /// The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
+    /// The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
     model: []const u8,
     /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
     request_format: ?[]const u8 = null,
@@ -2559,6 +2565,7 @@ pub const BedrockEmbedderConfig = struct {
     strip_new_lines: ?bool = null,
     /// The batch size for embedding requests to optimize throughput.
     batch_size: ?i64 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2572,6 +2579,7 @@ pub const BedrockEmbedderConfig = struct {
         .{ "truncate", "truncate", true },
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2618,6 +2626,10 @@ pub const BedrockEmbedderConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4344,10 +4356,11 @@ pub const CohereEmbedderConfig = struct {
     model: []const u8,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Specifies the type of input for optimized embeddings.
+    /// Legacy fixed input type applied to every embedding operation. When omitted, Antfly derives `search_query` for semantic searches and `search_document` for indexed documents. Prefer the role-specific fields under `retrieval`.
     input_type: ?[]const u8 = null,
     /// How to handle inputs longer than the max token length.
     truncate: ?[]const u8 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -4356,6 +4369,7 @@ pub const CohereEmbedderConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "input_type", "input_type", true },
         .{ "truncate", "truncate", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4382,6 +4396,10 @@ pub const CohereEmbedderConfig = struct {
         }
         if (self.truncate) |value| {
             try jw.objectField("truncate");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8384,6 +8402,7 @@ pub const EmbedderConfig = struct {
     api_key: ?[]const u8 = null,
     /// The URL of the Google API endpoint (optional, uses default if not specified).
     url: ?[]const u8 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
@@ -8402,8 +8421,14 @@ pub const EmbedderConfig = struct {
     batch_size: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
+    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
+    /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
+    query_input_type: ?[]const u8 = null,
+    /// Deprecated compatibility form of `retrieval.document_input_type`. New configurations should use the nested `retrieval` object.
+    document_input_type: ?[]const u8 = null,
+    /// Deprecated compatibility form of `retrieval.query_instruction`. New configurations should use the nested `retrieval` object.
+    query_instruction: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -8414,6 +8439,7 @@ pub const EmbedderConfig = struct {
         .{ "dimension", "dimension", true },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
+        .{ "retrieval", "retrieval", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "dimensions", "dimensions", true },
         .{ "request_format", "request_format", true },
@@ -8424,6 +8450,9 @@ pub const EmbedderConfig = struct {
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
         .{ "multimodal", "multimodal", true },
+        .{ "query_input_type", "query_input_type", true },
+        .{ "document_input_type", "document_input_type", true },
+        .{ "query_instruction", "query_instruction", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8464,6 +8493,10 @@ pub const EmbedderConfig = struct {
             try jw.objectField("url");
             try jw.write(value);
         }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
+            try jw.write(value);
+        }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
             try jw.write(value);
@@ -8502,6 +8535,18 @@ pub const EmbedderConfig = struct {
         }
         if (self.multimodal) |value| {
             try jw.objectField("multimodal");
+            try jw.write(value);
+        }
+        if (self.query_input_type) |value| {
+            try jw.objectField("query_input_type");
+            try jw.write(value);
+        }
+        if (self.document_input_type) |value| {
+            try jw.objectField("document_input_type");
+            try jw.write(value);
+        }
+        if (self.query_instruction) |value| {
+            try jw.objectField("query_instruction");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8639,6 +8684,48 @@ pub const EmbeddingIndexActivityPhase = enum {
             .{ "idle", .idle },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Advanced retrieval-role overrides. Antfly assigns canonical task intent automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override how a provider or instruction-aware model represents that intent.
+pub const EmbeddingRetrievalConfig = struct {
+    /// Provider-specific query role, such as `search_query` for Cohere. When omitted, the provider adapter derives it from `RETRIEVAL_QUERY`.
+    query_input_type: ?[]const u8 = null,
+    /// Provider-specific document role, such as `search_document` for Cohere. When omitted, the provider adapter derives it from `RETRIEVAL_DOCUMENT`.
+    document_input_type: ?[]const u8 = null,
+    /// Optional instruction sent only with retrieval-query embeddings by instruction-aware Antfly inference models. Provider adapters that do not support free-form instructions reject this field.
+    query_instruction: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query_input_type", "query_input_type", true },
+        .{ "document_input_type", "document_input_type", true },
+        .{ "query_instruction", "query_instruction", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.query_input_type) |value| {
+            try jw.objectField("query_input_type");
+            try jw.write(value);
+        }
+        if (self.document_input_type) |value| {
+            try jw.objectField("document_input_type");
+            try jw.write(value);
+        }
+        if (self.query_instruction) |value| {
+            try jw.objectField("query_instruction");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -12949,6 +13036,7 @@ pub const GoogleEmbedderConfig = struct {
     api_key: ?[]const u8 = null,
     /// The URL of the Google API endpoint (optional, uses default if not specified).
     url: ?[]const u8 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12959,6 +13047,7 @@ pub const GoogleEmbedderConfig = struct {
         .{ "dimension", "dimension", true },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12993,6 +13082,10 @@ pub const GoogleEmbedderConfig = struct {
         }
         if (self.url) |value| {
             try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();
@@ -16911,6 +17004,9 @@ pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
+    cohere_embedder_config: CohereEmbedderConfig,
+    google_embedder_config: GoogleEmbedderConfig,
+    vertex_embedder_config: VertexEmbedderConfig,
     antfly_embedder_config: AntflyEmbedderConfig,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
@@ -16939,6 +17035,15 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "cohere")) {
+            return .{ .cohere_embedder_config = try std.json.parseFromSliceLeaky(CohereEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "gemini")) {
+            return .{ .google_embedder_config = try std.json.parseFromSliceLeaky(GoogleEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_embedder_config = try std.json.parseFromSliceLeaky(VertexEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "antfly")) {
             return .{ .antfly_embedder_config = try std.json.parseFromSliceLeaky(AntflyEmbedderConfig, allocator, input, options) };
@@ -16969,6 +17074,15 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "cohere")) {
+            return .{ .cohere_embedder_config = try std.json.parseFromValueLeaky(CohereEmbedderConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "gemini")) {
+            return .{ .google_embedder_config = try std.json.parseFromValueLeaky(GoogleEmbedderConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_embedder_config = try std.json.parseFromValueLeaky(VertexEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "antfly")) {
             return .{ .antfly_embedder_config = try std.json.parseFromValueLeaky(AntflyEmbedderConfig, allocator, source, options) };
         }
@@ -16980,6 +17094,9 @@ pub const IndexEmbedderConfig = union(enum) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
+            .cohere_embedder_config => |v| try jw.write(v),
+            .google_embedder_config => |v| try jw.write(v),
+            .vertex_embedder_config => |v| try jw.write(v),
             .antfly_embedder_config => |v| try jw.write(v),
         }
     }
@@ -18494,10 +18611,12 @@ pub const InferenceEmbedRequest = struct {
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
     encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
     task_type: ?[]const u8 = null,
+    /// Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support.
+    instruction: ?[]const u8 = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
     /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
@@ -18510,6 +18629,7 @@ pub const InferenceEmbedRequest = struct {
         .{ "encoding_format", "encoding_format", true },
         .{ "dimensions", "dimensions", true },
         .{ "task_type", "task_type", true },
+        .{ "instruction", "instruction", true },
         .{ "input_type", "input_type", true },
         .{ "error_policy", "error_policy", true },
     };
@@ -18538,6 +18658,10 @@ pub const InferenceEmbedRequest = struct {
         }
         if (self.task_type) |value| {
             try jw.objectField("task_type");
+            try jw.write(value);
+        }
+        if (self.instruction) |value| {
+            try jw.objectField("instruction");
             try jw.write(value);
         }
         if (self.input_type) |value| {
@@ -32098,7 +32222,7 @@ pub const VADOptions = struct {
     }
 };
 
-/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Model:** gemini-embedding-001 (default, 3072 dims) Antfly's Vertex embedder currently supports text inputs. Binary media is rejected instead of being flattened or silently discarded. **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 pub const VertexEmbedderConfig = struct {
     provider: []const u8,
     /// The name of the Vertex AI embedding model to use.
@@ -32109,8 +32233,9 @@ pub const VertexEmbedderConfig = struct {
     location: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
     dimension: ?i64 = null,
+    retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32120,6 +32245,7 @@ pub const VertexEmbedderConfig = struct {
         .{ "location", "location", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "dimension", "dimension", true },
+        .{ "retrieval", "retrieval", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32150,6 +32276,10 @@ pub const VertexEmbedderConfig = struct {
         }
         if (self.dimension) |value| {
             try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
             try jw.write(value);
         }
         try jw.endObject();

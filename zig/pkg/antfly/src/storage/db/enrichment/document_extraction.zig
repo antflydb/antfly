@@ -32,6 +32,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             pub const CancellationProbe = struct {
                 context: ?*const anyopaque = null,
                 is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+
+                pub fn check(self: CancellationProbe) !void {
+                    if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
+                }
             };
 
             pub const RenderForkTemplate = struct {

@@ -83,6 +83,13 @@ pub const EmbeddingConfig = struct {
     /// Enable the direct resident Qwen3/Jina embedding encoder. This is set
     /// from Jina/Qwen3 embedding manifests, not merely from the backbone family.
     resident_qwen3_embedding: bool = false,
+    /// Guarantee exactly one trailing EOS token on every encoded sequence.
+    /// Last-token-pooling embedders (Qwen3-Embedding, Jina v5) read the EOS
+    /// position; a missing EOS silently corrupts the embedding. The guard is
+    /// idempotent: sequences already ending in EOS (tokenizers with a
+    /// TemplateProcessing post-processor) are left untouched, so old and new
+    /// tokenizer.json snapshots produce identical ids.
+    ensure_trailing_eos_id: ?i32 = null,
     /// Keep a supported text encoder, pooling, and normalization on the GPU.
     resident_text_encoder: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
@@ -363,6 +370,9 @@ pub const EmbeddingPipeline = struct {
 
             encoded[i] = try self.tok.encodeForModel(alloc, token_text, max_len);
             encoded_count += 1;
+            if (self.config.ensure_trailing_eos_id) |eos_id| {
+                ensureTrailingEos(&encoded[i], eos_id);
+            }
             if (self.config.trim_padding_to_batch_max and !fixed_len) {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
             }
@@ -611,6 +621,33 @@ pub const EmbeddingPipeline = struct {
             }
         }
         return if (found) last_active + 1 else 1;
+    }
+
+    /// Guarantee the encoded sequence's last active token is `eos_id`.
+    /// Appends into padding when room exists; when the sequence fills its
+    /// buffer, the final token is overwritten (HF truncates the sequence
+    /// before the post-processor appends EOS, so EOS always survives).
+    /// Idempotent when the tokenizer already appended EOS.
+    fn ensureTrailingEos(encoded: *EncodeResult, eos_id: i32) void {
+        const mask = encoded.attention_mask;
+        if (mask.len == 0) return;
+        var last_active: ?usize = null;
+        for (mask, 0..) |value, idx| {
+            if (value > 0) last_active = idx;
+        }
+        if (last_active) |last| {
+            if (encoded.ids[last] == eos_id) return;
+            if (last + 1 < mask.len) {
+                encoded.ids[last + 1] = eos_id;
+                encoded.attention_mask[last + 1] = 1;
+            } else {
+                encoded.ids[last] = eos_id;
+            }
+        } else {
+            // Empty input: the embedding of an empty string is the EOS row.
+            encoded.ids[0] = eos_id;
+            encoded.attention_mask[0] = 1;
+        }
     }
 
     /// Pool 3D output [batch, seq, hidden] -> [batch][hidden]
@@ -910,6 +947,7 @@ pub const EmbeddingPipeline = struct {
         const preprocess_start = embedTimingStart(self.print_timing);
         switch (self.config.image_preprocess_profile) {
             .default => try image.preprocessBorrowedRasterBatchIntoWithOptions(
+                alloc,
                 pixel_values,
                 rasters,
                 img_size,
@@ -919,6 +957,7 @@ pub const EmbeddingPipeline = struct {
                 .{ .io = self.config.preprocess_io },
             ),
             .clip => try image.preprocessClipBorrowedRasterBatchIntoWithOptions(
+                alloc,
                 pixel_values,
                 rasters,
                 img_size,
@@ -1500,8 +1539,9 @@ pub const EmbeddingPipeline = struct {
         );
         logEmbedTiming("text.encoder.qwen3.resident", batch, encoder_start);
 
+        // encoder_outputs.deinit() owns and frees output_storage; a defer
+        // free here would double-free the slice (heap corruption).
         const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        defer self.allocator.free(output_storage);
         output_storage[0] = hidden;
         var encoder_outputs = session_mod.ResidentOutputs{
             .outputs = output_storage,
@@ -1627,8 +1667,9 @@ pub const EmbeddingPipeline = struct {
         logEmbedTiming("text.encoder.qwen3.graph", batch, encoder_start);
 
         const output = graph_hidden orelse return error.NoOutputTensors;
+        // encoder_outputs.deinit() owns and frees output_storage; a defer
+        // free here would double-free the slice (heap corruption).
         const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        defer self.allocator.free(output_storage);
         output_storage[0] = output;
         var encoder_outputs = session_mod.ResidentOutputs{
             .outputs = output_storage,

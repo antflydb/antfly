@@ -602,6 +602,7 @@ test "borrowed raster batch preprocesses strided RGBA without decode copy or ret
 
     var actual: [12]f32 = undefined;
     try preprocessBorrowedRasterBatchInto(
+        std.testing.allocator,
         &actual,
         &.{raster},
         2,
@@ -617,6 +618,58 @@ test "borrowed raster batch preprocesses strided RGBA without decode copy or ret
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[10], 1e-6);
 }
 
+test "borrowed raster Pillow bicubic scratch is bounded and caller-owned" {
+    var rgba = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &rgba,
+        .width = 2,
+        .height = 2,
+        .stride_bytes = 8,
+    };
+    const decoded = Image{ .data = &rgba, .width = 2, .height = 2, .channels = 4 };
+    const expected = try preprocessDecodedWithResample(
+        std.testing.allocator,
+        decoded,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .pillow_bicubic,
+    );
+    defer std.testing.allocator.free(expected);
+
+    var actual: [27]f32 = undefined;
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
+        &actual,
+        &.{raster},
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .pillow_bicubic,
+        .{ .max_inflight_decoded_bytes = 64 * 1024 },
+    );
+    try std.testing.expectEqualSlices(f32, expected, &actual);
+
+    try std.testing.expectError(
+        error.ImagePreprocessDecodedBytesExceeded,
+        preprocessBorrowedRasterBatchIntoWithOptions(
+            std.testing.allocator,
+            &actual,
+            &.{raster},
+            3,
+            .{ 0.5, 0.5, 0.5 },
+            .{ 0.5, 0.5, 0.5 },
+            .pillow_bicubic,
+            .{ .max_inflight_decoded_bytes = 64 },
+        ),
+    );
+}
+
 test "borrowed raster CLIP preprocessing preserves strided center crop semantics" {
     var padded = [_]u8{
         0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 91, 92, 93, 94,
@@ -630,6 +683,7 @@ test "borrowed raster CLIP preprocessing preserves strided center crop semantics
     };
     var actual: [12]f32 = undefined;
     try preprocessClipBorrowedRasterBatchInto(
+        std.testing.allocator,
         &actual,
         &.{raster},
         2,
@@ -657,6 +711,7 @@ test "borrowed raster preprocessing uses caller executor without reordering" {
     var serial: [24]f32 = undefined;
     var parallel: [24]f32 = undefined;
     try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
         &serial,
         &rasters,
         2,
@@ -666,6 +721,7 @@ test "borrowed raster preprocessing uses caller executor without reordering" {
         .{ .max_workers = 1 },
     );
     try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
         &parallel,
         &rasters,
         2,
@@ -1084,6 +1140,7 @@ pub fn preprocessDecodedWithResample(
 }
 
 pub fn preprocessDecodedWithResampleInto(
+    allocator: std.mem.Allocator,
     img: Image,
     output: []f32,
     target_size: u32,
@@ -1091,7 +1148,7 @@ pub fn preprocessDecodedWithResampleInto(
     std_dev: [3]f32,
     resample: Resample,
 ) !void {
-    return shared.preprocessDecodedWithResampleInto(toSharedImage(img), output, target_size, mean, std_dev, resample);
+    return shared.preprocessDecodedWithResampleInto(allocator, toSharedImage(img), output, target_size, mean, std_dev, resample);
 }
 
 /// Preprocess an already-decoded image to an explicit width/height target.
@@ -1438,10 +1495,12 @@ pub fn preprocessBatchIntoBounded(
 }
 
 /// Preprocess renderer-owned rasters directly into caller-owned model storage.
-/// This synchronous path has no allocator and therefore cannot decode, copy,
-/// or retain the borrowed source buffers. Arbitrary validated row stride is
+/// Source buffers are never decoded, copied, or retained. The allocator is
+/// used only to provision bounded, thread-safe resampler scratch for modes
+/// such as Pillow-compatible bicubic. Arbitrary validated row stride is
 /// preserved all the way into the sampler.
 pub fn preprocessBorrowedRasterBatchInto(
+    allocator: std.mem.Allocator,
     result: []f32,
     rasters: []const antfly_image.BorrowedRasterAttachment,
     target_size: u32,
@@ -1450,6 +1509,7 @@ pub fn preprocessBorrowedRasterBatchInto(
     resample: Resample,
 ) !void {
     return preprocessBorrowedRasterBatchIntoWithOptions(
+        allocator,
         result,
         rasters,
         target_size,
@@ -1461,6 +1521,7 @@ pub fn preprocessBorrowedRasterBatchInto(
 }
 
 pub fn preprocessBorrowedRasterBatchIntoWithOptions(
+    allocator: std.mem.Allocator,
     result: []f32,
     rasters: []const antfly_image.BorrowedRasterAttachment,
     target_size: u32,
@@ -1475,7 +1536,7 @@ pub fn preprocessBorrowedRasterBatchIntoWithOptions(
     const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
     if (result.len != expected_len) return error.InvalidInputShape;
 
-    try runBorrowedRasterPreprocessBatch(rasters, result, per_image, .{ .square = .{
+    try runBorrowedRasterPreprocessBatch(allocator, rasters, result, per_image, .{ .square = .{
         .target_size = target_size,
         .mean = mean,
         .std_dev = std_dev,
@@ -1487,6 +1548,7 @@ pub fn preprocessBorrowedRasterBatchIntoWithOptions(
 /// encoded implementation's short-edge resize and center-crop semantics while
 /// honoring renderer row stride and retaining no source memory.
 pub fn preprocessClipBorrowedRasterBatchInto(
+    allocator: std.mem.Allocator,
     result: []f32,
     rasters: []const antfly_image.BorrowedRasterAttachment,
     target_size: u32,
@@ -1494,6 +1556,7 @@ pub fn preprocessClipBorrowedRasterBatchInto(
     std_dev: [3]f32,
 ) !void {
     return preprocessClipBorrowedRasterBatchIntoWithOptions(
+        allocator,
         result,
         rasters,
         target_size,
@@ -1504,6 +1567,7 @@ pub fn preprocessClipBorrowedRasterBatchInto(
 }
 
 pub fn preprocessClipBorrowedRasterBatchIntoWithOptions(
+    allocator: std.mem.Allocator,
     result: []f32,
     rasters: []const antfly_image.BorrowedRasterAttachment,
     target_size: u32,
@@ -1517,7 +1581,7 @@ pub fn preprocessClipBorrowedRasterBatchIntoWithOptions(
     const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
     if (result.len != expected_len) return error.InvalidInputShape;
 
-    try runBorrowedRasterPreprocessBatch(rasters, result, per_image, .{ .clip = .{
+    try runBorrowedRasterPreprocessBatch(allocator, rasters, result, per_image, .{ .clip = .{
         .target_size = target_size,
         .mean = mean,
         .std_dev = std_dev,
@@ -1831,6 +1895,7 @@ const BatchPreprocessTask = struct {
                 };
                 defer decoded.deinit(self.allocator);
                 preprocessDecodedWithResampleInto(
+                    self.allocator,
                     decoded,
                     self.output,
                     square.target_size,
@@ -1861,6 +1926,7 @@ const BatchPreprocessTask = struct {
 };
 
 const BorrowedRasterPreprocessTask = struct {
+    allocator: std.mem.Allocator,
     raster: antfly_image.BorrowedRasterAttachment,
     output: []f32,
     operation: BatchPreprocessOperation,
@@ -1873,6 +1939,7 @@ const BorrowedRasterPreprocessTask = struct {
         };
         switch (self.operation) {
             .square => |square| shared.preprocessDecodedWithResampleInto(
+                self.allocator,
                 view,
                 self.output,
                 square.target_size,
@@ -1905,27 +1972,39 @@ const BorrowedRasterPreprocessTask = struct {
 };
 
 fn runBorrowedRasterPreprocessBatch(
+    backing_allocator: std.mem.Allocator,
     rasters: []const antfly_image.BorrowedRasterAttachment,
     result: []f32,
     per_image: usize,
     operation: BatchPreprocessOperation,
     options: BatchPreprocessOptions,
 ) !void {
-    if (options.max_workers == 0) return error.InvalidBatchPreprocessOptions;
+    if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0)
+        return error.InvalidBatchPreprocessOptions;
     if (rasters.len == 0) return;
     const cpu_count = linalg.pool.cachedCpuCount();
-    const worker_limit = @max(@as(usize, 1), @min(
+    const worker_limit: usize = @max(@as(usize, 1), @min(
         rasters.len,
         @min(cpu_count, @min(options.max_workers, maximum_preprocess_workers)),
     ));
     var tasks: [maximum_preprocess_workers]BorrowedRasterPreprocessTask = undefined;
     var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
+    var scratch_budget = try SharedPreprocessBudget.initResizableWithBacking(
+        backing_allocator,
+        preprocessSlabBytesForWave(0, worker_limit, options.max_inflight_decoded_bytes),
+        options.max_inflight_decoded_bytes,
+    );
+    defer scratch_budget.deinit();
+    const scratch_allocator = scratch_budget.allocator();
     var first: usize = 0;
+    var adaptive_worker_limit: usize = worker_limit;
     while (first < rasters.len) {
-        const wave_len = @min(worker_limit, rasters.len - first);
+        const wave_len = @min(adaptive_worker_limit, rasters.len - first);
+        scratch_budget.limit_exceeded.store(false, .release);
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
             task.* = .{
+                .allocator = scratch_allocator,
                 .raster = rasters[index],
                 .output = result[index * per_image ..][0..per_image],
                 .operation = operation,
@@ -1937,8 +2016,27 @@ fn runBorrowedRasterPreprocessBatch(
             try linalg.pool.dispatchJobsIo(io, jobs[0..wave_len])
         else for (jobs[0..wave_len]) |job|
             job.fn_ptr(job.ctx);
-        for (tasks[0..wave_len]) |task| if (task.err) |err| return err;
+        var first_error: ?anyerror = null;
+        for (tasks[0..wave_len]) |task| {
+            if (task.err) |err| {
+                first_error = err;
+                break;
+            }
+        }
+        std.debug.assert(scratch_budget.live_bytes.load(.acquire) == 0);
+        if (first_error) |err| {
+            if (err == error.OutOfMemory and scratch_budget.limit_exceeded.load(.acquire)) {
+                if (try scratch_budget.growAfterExhaustion()) continue;
+                if (wave_len > 1) {
+                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
+                    continue;
+                }
+                return error.ImagePreprocessDecodedBytesExceeded;
+            }
+            return err;
+        }
         first += wave_len;
+        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
     }
 }
 

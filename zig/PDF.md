@@ -3656,6 +3656,13 @@ component-plane-to-CHW writes for encoded CLIP input. The borrowed raster ABI
 carries validated RGBA8 dimensions and stride through the standalone bridge;
 capability negotiation retains encoded-image fallback everywhere else.
 
+Resamplers that require temporary storage, including Pillow-compatible
+bicubic, allocate from a caller-backed, synchronized wave budget. That budget
+grows only between joined waves, reduces worker width before rejecting valid
+input, and maps terminal exhaustion to the same explicit preprocessing byte
+limit as encoded-image decoding. Borrowed-page preprocessing therefore has no
+unadmitted per-worker scratch allocator escape.
+
 - Measure the realized encode/decode reduction and copy cost on the production
   corpus.
 - Keep the decoded pixel format and ownership/admission contract narrow and

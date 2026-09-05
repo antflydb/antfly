@@ -23,6 +23,7 @@ const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("../inference/execution_context.zig");
 const platform_time = @import("antfly_platform").time;
+const provider_defaults = @import("../common/provider_defaults.zig");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
 
@@ -161,7 +162,7 @@ const BackendState = struct {
                 const api_key = (try api_key_ref.resolveOwned(alloc, secret_store)) orelse return error.MissingGeneratorCredentials;
                 defer alloc.free(api_key);
                 break :blk .{ .gemini = try vertex_provider.GeminiProvider.init(alloc, http, .{
-                    .base_url = if (cfg.url.len > 0) cfg.url else "https://generativelanguage.googleapis.com/v1beta",
+                    .base_url = provider_defaults.normalizedBase(cfg.url, provider_defaults.gemini_v1beta_base),
                     .api_key = api_key,
                 }) };
             },
@@ -169,9 +170,9 @@ const BackendState = struct {
                 const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
                 defer if (bearer_token) |value| alloc.free(value);
                 break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
-                    .base_url = if (cfg.url.len > 0) cfg.url else "https://aiplatform.googleapis.com/v1",
+                    .base_url = provider_defaults.normalizedBase(cfg.url, provider_defaults.vertex_v1_base),
                     .project_id = cfg.project_id,
-                    .location = cfg.location orelse "us-central1",
+                    .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
                 }) };

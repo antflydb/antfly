@@ -323,6 +323,7 @@ pub const ReadingPipeline = struct {
         const pixel_values = try self.allocator.alloc(f32, 3 * per_image_side);
         defer self.allocator.free(pixel_values);
         try image.preprocessBorrowedRasterBatchInto(
+            self.allocator,
             pixel_values,
             &.{raster},
             img_size,
@@ -386,6 +387,7 @@ pub const ReadingPipeline = struct {
         defer self.allocator.free(pixel_values);
         resetLastReadTelemetry();
         try image.preprocessBorrowedRasterBatchIntoWithOptions(
+            self.allocator,
             pixel_values,
             rasters,
             img_size,
