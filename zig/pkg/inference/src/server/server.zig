@@ -3916,6 +3916,23 @@ pub const Node = struct {
         self.model_manager.attachIo(io);
     }
 
+    /// Completes a caller-supplied request contract with Node-owned execution
+    /// capabilities. Direct callers should not need access to the private
+    /// watchdog merely to get the same cancellation guarantees as HTTP.
+    fn bindExecutionControl(
+        self: *Node,
+        io: ?std.Io,
+        supplied: InferenceExecutionControl,
+    ) InferenceExecutionControl {
+        var control = supplied;
+        if (control.io == null) control.io = io orelse self.session_manager.io;
+        if (control.hard_cancellation == null) {
+            if (self.hard_cancellation_watchdog) |watchdog|
+                control.hard_cancellation = watchdog.boundary();
+        }
+        return control;
+    }
+
     fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
         const counts = try collectDiscoveredModelCounts(
             self.config.models_dir,
@@ -4031,12 +4048,13 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
         model_name: []const u8,
         texts: []const []const u8,
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        const control = self.bindExecutionControl(io, supplied_control);
         try control.check();
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
@@ -4067,12 +4085,13 @@ pub const Node = struct {
     pub fn embedDenseTextsFromPathWithExecutionControlAndTask(
         self: *Node,
         allocator: std.mem.Allocator,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
         model_path: []const u8,
         texts: []const []const u8,
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        const control = self.bindExecutionControl(null, supplied_control);
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         const task_type = if (task_type_name) |name|
             parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
@@ -4169,8 +4188,9 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         texts: []const []const u8,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
+        const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
         try self.acquireAdmissionUnits(1);
@@ -4255,12 +4275,12 @@ pub const Node = struct {
             }
         };
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
-        const execution_control = InferenceExecutionControl{
+        const execution_control = self.bindExecutionControl(request_io, .{
             .io = if (upstream_control) |control| control.io else null,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
-        };
+        });
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
         const model = model_handle.get();
@@ -4323,9 +4343,10 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         messages: []const generation.Message,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
+        const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         const preflight = try directGeneratePreflightForMessages(messages);
         var admission = try self.beginDirectGenerateAdmission(preflight, 256);
@@ -4528,7 +4549,10 @@ pub const Node = struct {
         if (admitted_node != self) return error.InvalidGenerationAdmission;
         try admission.prepareMessages(messages);
         const max_tokens = admission.max_tokens;
-        const execution_control = admission.execution_control;
+        const execution_control = if (admission.execution_control) |control|
+            self.bindExecutionControl(null, control)
+        else
+            null;
         if (execution_control) |control| try control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
@@ -5203,12 +5227,13 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
         task_type_raw: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        const control = self.bindExecutionControl(io, supplied_control);
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try control.check();
 
@@ -5375,8 +5400,9 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         request: readers_api.Request,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
     ) ![]readers_api.Result {
+        const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
@@ -5492,8 +5518,9 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         request: transcribing_api.Request,
-        control: InferenceExecutionControl,
+        supplied_control: InferenceExecutionControl,
     ) !transcribing_api.Response {
+        const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         var media_shape: RequestMediaAdmissionShape = .{};
         if (std.mem.startsWith(u8, request.url, "data:"))
@@ -5615,8 +5642,12 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
-        execution_control: ?InferenceExecutionControl,
+        supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        const execution_control = if (supplied_control) |control|
+            self.bindExecutionControl(null, control)
+        else
+            null;
         if (execution_control) |control| try control.check();
         switch (admission_owner) {
             .direct => try self.acquireAdmissionUnits(1),
@@ -16817,10 +16848,10 @@ test "supervised node owns and joins the hard cancellation watchdog" {
     );
     try node.attachIo(std.testing.io);
 
-    const boundary = node.hard_cancellation_watchdog.?.boundary();
-    var guard = try (InferenceExecutionControl{
-        .hard_cancellation = boundary,
-    }).enterUninterruptible(.process_required);
+    const control = node.bindExecutionControl(null, .{});
+    try std.testing.expect(control.io != null);
+    try std.testing.expect(control.hard_cancellation != null);
+    var guard = try control.enterUninterruptible(.process_required);
     guard.deinit();
 }
 
