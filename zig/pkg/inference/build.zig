@@ -1683,6 +1683,16 @@ pub fn build(b: *std.Build) void {
     cli_tests.root_module.addImport("antfly_platform", platform_mod);
     cli_tests.root_module.link_libc = link_libc;
 
+    const bge_m3_e2e_bench_tests = b.addTest(.{
+        .root_module = bge_m3_e2e_bench_exe.root_module,
+    });
+    const run_bge_m3_e2e_bench_tests = b.addRunArtifact(bge_m3_e2e_bench_tests);
+    const bge_m3_e2e_bench_test_step = b.step(
+        "test-bge-m3-e2e-benchmark",
+        "Run BGE-M3 benchmark contract tests",
+    );
+    bge_m3_e2e_bench_test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
+
     const run_cli_tests = b.addRunArtifact(cli_tests);
     for (selected_test_filters) |filter| {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
@@ -1766,9 +1776,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
     // A focused server/library filter need not match an executable-root test.
-    // The default aggregate still owns the complete CLI suite.
+    // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {
         test_step.dependOn(&run_cli_tests.step);
+        test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
     }
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
