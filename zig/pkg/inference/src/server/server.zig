@@ -51,6 +51,9 @@ const generation = @import("../pipelines/generation.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
 const reranking_pipeline = @import("../pipelines/reranking.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
+const qwen3vl_multimodal_reranker = @import("../pipelines/qwen3vl_multimodal_reranker.zig");
+const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
+const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
 const document_token_classification = @import("../pipelines/document_token_classification.zig");
 const graph_mod = @import("../graph/root.zig");
@@ -1969,10 +1972,21 @@ fn countParsedDenseEmbedTextTokens(
     io: ?std.Io,
     tokenizer: anytype,
     inputs: *const ParsedDenseEmbedInputs,
+    text_prefix: []const u8,
 ) usize {
     var total: usize = 0;
     for (inputs.texts.items) |item| {
-        total += countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
+        if (text_prefix.len == 0) {
+            total +|= countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
+            continue;
+        }
+
+        const rendered = std.fmt.allocPrint(allocator, "{s}{s}", .{ text_prefix, item.text }) catch {
+            total +|= estimateTextTokens(text_prefix) +| estimateTextTokens(item.text);
+            continue;
+        };
+        defer allocator.free(rendered);
+        total +|= countTokenizerTokens(allocator, io, tokenizer, rendered) catch estimateTextTokens(rendered);
     }
     return total;
 }
@@ -2032,6 +2046,46 @@ test "token counting uses the attached std.Io tokenizer path" {
     );
     try std.testing.expectEqual(@as(usize, 1), parallel_calls);
     try std.testing.expectEqual(@as(usize, 1), serial_calls);
+}
+
+test "dense embedding token usage includes the applied text prefix" {
+    const ByteTokenizer = struct {
+        pub fn encodeInto(
+            _: @This(),
+            allocator: std.mem.Allocator,
+            text: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+        ) !void {
+            try ids.appendNTimes(allocator, 1, text.len);
+        }
+
+        pub fn encodeIntoParallel(
+            self: @This(),
+            _: std.Io,
+            allocator: std.mem.Allocator,
+            text: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+            _: usize,
+        ) !void {
+            try self.encodeInto(allocator, text, ids);
+        }
+    };
+
+    var inputs: ParsedDenseEmbedInputs = .{};
+    defer inputs.deinit(std.testing.allocator);
+    try inputs.texts.append(std.testing.allocator, .{ .index = 0, .text = "body" });
+    inputs.total_count = 1;
+
+    try std.testing.expectEqual(
+        @as(usize, "query: body".len),
+        countParsedDenseEmbedTextTokens(
+            std.testing.allocator,
+            null,
+            ByteTokenizer{},
+            &inputs,
+            "query: ",
+        ),
+    );
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -3088,7 +3142,11 @@ test "loaded model listing preserves managed variant identity without exposing c
     try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", identifier);
 }
 
-const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
+const RequestModelResolutionErrorKind = enum { invalid, missing, ambiguous, internal };
+
+const ambiguous_model_error_code = "AMBIGUOUS_MODEL";
+const ambiguous_model_error_message = "model identifier matches multiple installed variants";
+const ambiguous_model_error_hint = "Run `antfly inference list` and specify an exact owner/name:variant";
 
 const RequestWorkTestCounters = struct {
     model_resolution_attempts: usize = 0,
@@ -3107,7 +3165,33 @@ fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKin
     return switch (err) {
         error.InvalidModelIdentifier, error.ModelOutsideModelsDir => .invalid,
         error.ModelNotFound, error.ModelNotSpecified, error.FileNotFound, error.NotDir => .missing,
+        error.AmbiguousModelIdentifier => .ambiguous,
         else => .internal,
+    };
+}
+
+fn batchModelResolutionError(err: anyerror) api.GenerateBatchError {
+    return switch (requestModelResolutionErrorKind(err)) {
+        .invalid => .{
+            .code = "INVALID_REQUEST",
+            .message = "model must be a relative identifier within models_dir",
+            .retryable = false,
+        },
+        .missing => .{
+            .code = "MODEL_NOT_FOUND",
+            .message = "model not found",
+            .retryable = false,
+        },
+        .ambiguous => .{
+            .code = ambiguous_model_error_code,
+            .message = ambiguous_model_error_message,
+            .retryable = false,
+        },
+        .internal => .{
+            .code = "MODEL_RESOLUTION_FAILED",
+            .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err),
+            .retryable = true,
+        },
     };
 }
 
@@ -3631,7 +3715,32 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
+        return self.embedDenseTextsDirectWithContextAndTask(
+            allocator,
+            io,
+            deadline_ns,
+            model_name,
+            texts,
+            null,
+            null,
+        );
+    }
+
+    pub fn embedDenseTextsDirectWithContextAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
+        const task_type = if (task_type_name) |name|
+            parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
+        else
+            EmbeddingTaskType.RETRIEVAL_DOCUMENT;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
@@ -3649,6 +3758,8 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             deadline_ns: ?u64,
             texts: []const []const u8,
+            task_type: EmbeddingTaskType,
+            instruction: ?[]const u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -3661,6 +3772,8 @@ pub const Node = struct {
                     attempt.deadline_ns,
                     model,
                     attempt.texts,
+                    attempt.task_type,
+                    attempt.instruction,
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
@@ -3672,6 +3785,8 @@ pub const Node = struct {
             .allocator = allocator,
             .deadline_ns = deadline_ns,
             .texts = texts,
+            .task_type = task_type,
+            .instruction = instruction,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -3682,10 +3797,21 @@ pub const Node = struct {
         deadline_ns: ?u64,
         model: *model_manager_mod.LoadedModel,
         texts: []const []const u8,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
     ) ![][]f32 {
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
+        const owned_prefix = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{
+            .model = "",
+            .input = .null,
+            .encoding_format = null,
+            .dimensions = null,
+            .task_type = task_type,
+            .instruction = instruction,
+        });
+        defer if (owned_prefix) |prefix| allocator.free(prefix);
         return pipeline.embed(texts);
     }
 
@@ -3906,26 +4032,38 @@ pub const Node = struct {
         total_ms: u64 = 0,
     };
 
+    const NativePromptTokenCount = struct {
+        token_count: usize,
+        media_admission: generation.NativeGenerationMediaAdmission,
+    };
+
     fn countPromptTokens(
         allocator: std.mem.Allocator,
+        model_dir: []const u8,
         model: *model_manager_mod.LoadedModel,
         gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
         max_tokens: i32,
-    ) !usize {
+    ) !NativePromptTokenCount {
         const prompt = if (model.chat_tmpl) |ct|
             try ct.apply(allocator, messages, true)
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
 
-        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const media_admission = try generation.nativeGenerationMediaAdmission(
+            allocator,
+            model_dir,
+            messages,
+            gpt_config,
+        );
+        const preliminary_media_allowance = generation.nativeGenerationPreliminaryMediaTokenAllowance(messages, gpt_config);
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
             gpt_config,
             null,
             @intCast(@max(max_tokens, 1)),
             0,
-            media_allowance,
+            preliminary_media_allowance,
         );
         var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
@@ -3940,7 +4078,11 @@ pub const Node = struct {
         var prompt_tokens: usize = 0;
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
-        return std.math.add(usize, prompt_tokens, media_allowance) catch error.PromptTooLong;
+        return .{
+            .token_count = std.math.add(usize, prompt_tokens, media_admission.token_allowance) catch
+                return error.PromptTooLong,
+            .media_admission = media_admission,
+        };
     }
 
     fn generateMessagesDirectMaxTokens(
@@ -4053,7 +4195,8 @@ pub const Node = struct {
             self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
+        const prompt_estimate = try countPromptTokens(allocator, model_path, model, gpt_config, messages, max_tokens);
+        const prompt_tokens = prompt_estimate.token_count;
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
                 .backend = backend_kind,
@@ -4099,7 +4242,11 @@ pub const Node = struct {
         var admission_amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
         if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
             admission_amounts = try admission_amounts.merge(
-                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+                try model_manager_mod.projectorRunAdmissionAmounts(
+                    model.manifest,
+                    backend_kind,
+                    prompt_estimate.media_admission,
+                ),
             );
         }
         var admission_lease = try self.model_manager.acquireRunResourceAmounts(
@@ -4566,6 +4713,8 @@ pub const Node = struct {
             &parsed,
             &reserved_units,
             deadline_ns,
+            .RETRIEVAL_DOCUMENT,
+            null,
         );
     }
 
@@ -4588,8 +4737,34 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
+        return self.embedDensePartsDirectWithContextAndTask(
+            allocator,
+            io,
+            deadline_ns,
+            model_name,
+            parts,
+            null,
+            null,
+        );
+    }
+
+    pub fn embedDensePartsDirectWithContextAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+        task_type_raw: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
+
+        const task_type = if (task_type_raw) |raw|
+            parseEmbeddingTaskType(raw) orelse return error.UnsupportedEmbeddingTaskType
+        else
+            EmbeddingTaskType.RETRIEVAL_DOCUMENT;
 
         const preflight = try directDenseEmbedPreflight(parts);
         const media_admission = requestMediaAdmission(self, preflight.shape);
@@ -4640,6 +4815,8 @@ pub const Node = struct {
             &parsed,
             &reserved_units,
             deadline_ns,
+            task_type,
+            instruction,
         );
     }
 
@@ -4651,6 +4828,8 @@ pub const Node = struct {
         parsed: *ParsedDenseEmbedInputs,
         reserved_units: *usize,
         deadline_ns: ?u64,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -4678,6 +4857,8 @@ pub const Node = struct {
             parsed: *ParsedDenseEmbedInputs,
             audio_decode_working_bytes: usize,
             deadline_ns: ?u64,
+            task_type: EmbeddingTaskType,
+            instruction: ?[]const u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -4688,6 +4869,15 @@ pub const Node = struct {
                 try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
                 var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                const owned_prefix = try applyDenseEmbeddingRequestOptions(attempt.allocator, &pipeline, &model.manifest, .{
+                    .model = "",
+                    .input = .null,
+                    .encoding_format = null,
+                    .dimensions = null,
+                    .task_type = attempt.task_type,
+                    .instruction = attempt.instruction,
+                });
+                defer if (owned_prefix) |prefix| attempt.allocator.free(prefix);
                 var audio_asset_guard = AudioEmbeddingAssetGuard.init(
                     model,
                     attempt.parsed.audio.items.len > 0,
@@ -4712,6 +4902,8 @@ pub const Node = struct {
             .parsed = parsed,
             .audio_decode_working_bytes = audio_decode_working_bytes,
             .deadline_ns = deadline_ns,
+            .task_type = task_type,
+            .instruction = instruction,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -5282,6 +5474,11 @@ pub const Node = struct {
                 .message = "model not found",
                 .hint = "Run `antfly inference list`; pull the requested model or restart with --models-dir <path>",
             }),
+            .ambiguous => ctx.status(409).json(.{
+                .@"error" = ambiguous_model_error_code,
+                .message = ambiguous_model_error_message,
+                .hint = ambiguous_model_error_hint,
+            }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",
                 .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err),
@@ -5342,7 +5539,17 @@ pub const Node = struct {
                 } else {
                     self.allocator.free(task_path);
                 }
+            }
 
+            // Discovery publishes validated managed-receipt identities instead
+            // of cache leaf names. Only scan after cheap legacy exact matches:
+            // those paths do not depend on receipt metadata and must not become
+            // O(models x artifacts) or fail because an unrelated receipt is
+            // unreadable/ambiguous.
+            if (try self.resolveDiscoveredRequestName(io, n)) |managed_path|
+                return managed_path;
+
+            if (task_type) |tt| {
                 // Variant resolution within task-type dir
                 const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
                 defer self.allocator.free(task_dir);
@@ -5394,6 +5601,54 @@ pub const Node = struct {
             self.allocator.free(task_dir);
         }
         return self.findFirstModelDir() orelse error.ModelNotSpecified;
+    }
+
+    fn resolveDiscoveredRequestName(
+        self: *Node,
+        io: std.Io,
+        request_name: []const u8,
+    ) !?[]u8 {
+        // Model-path resolution is also used by narrow unit and direct-runtime
+        // construction paths that initialize only Node's request fields. Build
+        // this read-only discovery view from the authoritative configured root
+        // instead of relying on the long-lived listing registry to be present.
+        // It also keeps a request resolution race from sharing mutable listing
+        // state with a concurrent inventory refresh.
+        var registry = registry_mod.ModelRegistry.init(self.allocator, self.config.models_dir);
+        const discovered = try registry.discoverShallow(io);
+        defer {
+            for (discovered) |entry| {
+                registry.allocator.free(entry.name);
+                registry.allocator.free(entry.path);
+            }
+            if (discovered.len > 0) registry.allocator.free(discovered);
+        }
+
+        var match: ?[]const u8 = null;
+        for (discovered) |entry| {
+            if (!std.mem.eql(u8, entry.name, request_name)) continue;
+            if (match != null and !std.mem.eql(u8, match.?, entry.path))
+                return error.AmbiguousModelIdentifier;
+            match = entry.path;
+        }
+        if (match) |path| return try self.allocator.dupe(u8, path);
+
+        // A variant-less owner/name remains convenient while exactly one
+        // validated managed variant is installed. Once variants coexist there
+        // is no implicit default: choosing by the opaque install-directory hash
+        // can select a different precision or even a backend-incompatible
+        // artifact after an unrelated pull.
+        const requested_ref = registry_mod.ModelRef.parse(request_name) catch return null;
+        if (!std.mem.eql(u8, requested_ref.variant, "auto")) return null;
+        for (discovered) |entry| {
+            const entry_ref = registry_mod.ModelRef.parse(entry.name) catch continue;
+            if (!std.mem.eql(u8, entry_ref.owner, requested_ref.owner) or
+                !std.mem.eql(u8, entry_ref.name, requested_ref.name)) continue;
+            if (match != null and !std.mem.eql(u8, match.?, entry.path))
+                return error.AmbiguousModelIdentifier;
+            match = entry.path;
+        }
+        return if (match) |path| try self.allocator.dupe(u8, path) else null;
     }
 
     fn findFirstModelInDir(self: *Node, dir_path: []const u8) ?[]const u8 {
@@ -5785,6 +6040,7 @@ pub const Node = struct {
         prompt: []const u8,
         encoded: @import("inference_tokenizer").EncodeResult,
         prompt_token_limit: usize,
+        media_admission: generation.NativeGenerationMediaAdmission,
 
         fn deinit(self: *NativePromptEstimate) void {
             self.allocator.free(self.prompt);
@@ -5811,7 +6067,7 @@ pub const Node = struct {
             try generation.formatMessages(allocator, messages);
         var prompt_owned = true;
         defer if (prompt_owned) allocator.free(prompt);
-        const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
+        const media_admission = try generation.nativeGenerationMediaAdmission(
             allocator,
             model_dir,
             messages,
@@ -5837,13 +6093,14 @@ pub const Node = struct {
         defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        const total = std.math.add(usize, count, media_allowance) catch return error.PromptTooLong;
+        const total = std.math.add(usize, count, media_admission.token_allowance) catch return error.PromptTooLong;
         if (out_estimate) |out| {
             out.* = .{
                 .allocator = allocator,
                 .prompt = prompt,
                 .encoded = encoded,
                 .prompt_token_limit = prompt_token_limit,
+                .media_admission = media_admission,
             };
             prompt_owned = false;
             encoded_owned = false;
@@ -5899,6 +6156,12 @@ pub const Node = struct {
         defer admission_manifest.deinit();
 
         if (admission_manifest.hasCapability("sparse")) {
+            validateSparseEmbeddingRequestOptions(request) catch |err| {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = embedRequestOptionErrorMessage(err),
+                });
+            };
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -6026,9 +6289,21 @@ pub const Node = struct {
                 );
                 defer audio_asset_guard.deinit();
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
-                try applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, attempt.request);
+                const owned_request_prefix = try applyDenseEmbeddingRequestOptions(
+                    attempt.allocator,
+                    &pipeline,
+                    &model.manifest,
+                    attempt.request,
+                );
+                defer if (owned_request_prefix) |prefix| attempt.allocator.free(prefix);
                 attempt.prompt_tokens = if (attempt.inputs.texts.items.len > 0)
-                    countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs)
+                    countParsedDenseEmbedTextTokens(
+                        attempt.allocator,
+                        attempt.io,
+                        model.getTokenizer(),
+                        attempt.inputs,
+                        pipeline.config.text_prefix,
+                    )
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
 
@@ -6065,7 +6340,7 @@ pub const Node = struct {
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .failure_stage = &failure_stage,
         }, &attempt, Attempt.run) catch |err| {
-            if (err == error.UnsupportedEmbeddingTaskType) {
+            if (isEmbedRequestOptionError(err)) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = embedRequestOptionErrorMessage(err),
@@ -6087,7 +6362,7 @@ pub const Node = struct {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 }
-                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, admission_manifest.normalize, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -6105,7 +6380,7 @@ pub const Node = struct {
             .per_item => |partial_value| {
                 var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
-                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, admission_manifest.normalize, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -6269,10 +6544,12 @@ pub const Node = struct {
             var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer admission_manifest.deinit();
-            if (!(admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
+            const supports_qwen3vl_pointwise = admission_manifest.isQwen3VlRerankerGgufBundle() and
+                admission_manifest.gguf_projector_path != null;
+            if (!(supports_qwen3vl_pointwise or admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
                 return ctx.status(400).json(.{
                     .@"error" = "MODEL_NOT_SUPPORTED",
-                    .message = "model does not advertise multimodal late-interaction reranking capability",
+                    .message = "model does not advertise a supported multimodal reranking capability",
                 });
             }
         }
@@ -6328,6 +6605,131 @@ pub const Node = struct {
             const prompt_tokens =
                 (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
                 (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
+            return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
+        }
+
+        if (model.manifest.isQwen3VlReranker()) {
+            if (!model.manifest.isQwen3VlRerankerGgufBundle()) {
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_NOT_SUPPORTED",
+                    .message = "Qwen3-VL safetensors rerankers are text-only; multimodal reranking requires a qualified GGUF projector bundle",
+                });
+            }
+            const projector_path = model.manifest.gguf_projector_path orelse
+                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "Qwen3-VL reranker bundle is missing its GGUF projector" });
+            const gpt_cfg = session_factory.getGptConfig(model.session) orelse
+                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "Qwen3-VL multimodal reranking requires a native GPT decoder session" });
+            const projector_media = qwen3VlRerankerMediaAdmission(
+                parsed_docs.items,
+                gpt_cfg,
+                @min(model.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length),
+            ) catch return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "Qwen3-VL reranker image geometry exceeds the supported admission envelope",
+            });
+            const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+                .native => .native,
+                .metal => .metal,
+                .cuda => .cuda,
+                else => return ctx.status(400).json(.{
+                    .@"error" = "MODEL_NOT_SUPPORTED",
+                    .message = "Qwen3-VL multimodal reranking requires a native, Metal, or CUDA decoder session",
+                }),
+            };
+            const backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
+                .native => .cpu,
+                .metal, .cuda => .gpu,
+            };
+            const admission_limits = self.config.generation_budget_overrides.apply(
+                session_factory.widenBudgetLimitsForSession(
+                    model.session,
+                    self.defaultGenerationLimits(backend_class),
+                ),
+            );
+            const admission_amounts = model_manager_mod.projectorRunAdmissionAmounts(
+                model.manifest,
+                backend_kind,
+                projector_media,
+            ) catch |err| return inferenceFailureResponse(ctx, err);
+            var resource_lease = self.model_manager.acquireRunResourceAmounts(
+                backend_class,
+                admission_limits,
+                admission_amounts,
+            ) catch |err| return inferenceFailureResponse(ctx, err);
+            defer resource_lease.release();
+
+            // Projector and decoder calls share the loaded model's stateful
+            // accelerator runtime. Serialize their complete lifetime while
+            // leaving request parsing and media admission outside the lane.
+            const execution_mutex = model.targetInferenceExecutionMutex();
+            if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+            defer if (execution_mutex) |mutex| mutex.unlock();
+
+            var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
+                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+            defer cb.deinit();
+            var qwen_pipeline = qwen3vl_multimodal_reranker.Pipeline.init(
+                ctx.allocator,
+                &cb,
+                model.getTokenizer(),
+                gpt_cfg,
+                projector_path,
+                .{
+                    .max_length = @min(model.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length),
+                },
+            ) catch |err|
+                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+
+            const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
+            defer ctx.allocator.free(scores);
+            var prompt_tokens: usize = 0;
+            for (parsed_docs.items, 0..) |doc, idx| {
+                if (doc.images.len == 0) {
+                    var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                    text_pipeline.execution_lock = null;
+                    const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                        return inferenceFailureResponse(ctx, err);
+                    defer ctx.allocator.free(text_scores);
+                    scores[idx] = text_scores[0];
+                    const text_tokens =
+                        (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) +
+                        (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc.text) catch estimateTextTokens(doc.text));
+                    prompt_tokens = std.math.add(usize, prompt_tokens, text_tokens) catch
+                        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "rerank token accounting overflow" });
+                    continue;
+                }
+
+                const result = qwen_pipeline.scoreDocument(
+                    body.query,
+                    doc.qwen_content,
+                    doc.images,
+                ) catch |err| switch (err) {
+                    error.InvalidRerankerImageCount,
+                    error.ImageLimitExceeded,
+                    error.InputTokenLimitExceeded,
+                    error.RerankerPromptTooLarge,
+                    error.InvalidRerankerPromptLimit,
+                    error.InvalidRerankerSequence,
+                    error.InvalidRerankerTokenId,
+                    error.ImagePlaceholderCountMismatch,
+                    error.SpecialTokenBudgetExceeded,
+                    error.InvalidRerankerMaxLength,
+                    => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+                    error.InvalidMultimodalConfig,
+                    error.ImageProjectionSizeMismatch,
+                    error.ImageTokenLengthMismatch,
+                    error.InvalidPreparedPrompt,
+                    error.InvalidDeepstackContext,
+                    error.InvalidRerankerInputShape,
+                    error.InvalidRerankerScoreShape,
+                    error.UnsupportedRerankerArchitecture,
+                    => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
+                    else => return inferenceFailureResponse(ctx, err),
+                };
+                scores[idx] = result.score;
+                prompt_tokens = std.math.add(usize, prompt_tokens, result.prompt_tokens) catch
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "rerank token accounting overflow" });
+            }
             return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
         }
 
@@ -7558,7 +7960,11 @@ pub const Node = struct {
         };
         if (generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items)) {
             admission_requests[0].amounts = try admission_requests[0].amounts.merge(
-                try model_manager_mod.projectorRunAdmissionAmounts(model.manifest),
+                try model_manager_mod.projectorRunAdmissionAmounts(
+                    model.manifest,
+                    backend_kind,
+                    prompt_estimate.?.media_admission,
+                ),
             );
         }
         const admission_request_count: usize = if (draft_resource_estimate) |estimate| blk: {
@@ -8545,11 +8951,7 @@ pub const Node = struct {
             } orelse break;
             const first_body = body.requests[first_idx].body;
             const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, first_body.model, "generators") catch |err| {
-                results[first_idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
-                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
-                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
-                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
-                };
+                results[first_idx].@"error" = batchModelResolutionError(err);
                 pending[first_idx] = false;
                 continue;
             };
@@ -8666,7 +9068,7 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
-                    prompt_tokens[pos] = self.estimateNativePromptTokens(
+                    const item_prompt_estimate = self.estimateNativePromptTokens(
                         ctx.allocator,
                         model_path,
                         model,
@@ -8688,6 +9090,7 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
+                    prompt_tokens[pos] = item_prompt_estimate;
                     prompt_bytes[pos] = self.estimateGeneratePromptBytes(owned_messages[idx].messages);
                     valid_count += 1;
                 }
@@ -9266,14 +9669,52 @@ pub const Node = struct {
     const ParsedMultimodalRerankDocument = struct {
         allocator: std.mem.Allocator,
         text: []u8,
+        /// Text plus one canonical Qwen vision marker at each image's exact
+        /// content-part position. ColQwen continues to consume `text`.
+        qwen_content: []u8,
         images: [][]const u8,
 
         fn deinit(self: *ParsedMultimodalRerankDocument) void {
             self.allocator.free(self.text);
+            self.allocator.free(self.qwen_content);
             for (self.images) |img| self.allocator.free(img);
             self.allocator.free(self.images);
         }
     };
+
+    fn qwen3VlRerankerMediaAdmission(
+        documents: []const ParsedMultimodalRerankDocument,
+        config: gpt_model_mod.Config,
+        max_length: usize,
+    ) !generation.NativeGenerationMediaAdmission {
+        if (config.family != .qwen3_vl or max_length == 0) {
+            return error.InvalidRerankerConfiguration;
+        }
+        var result = generation.NativeGenerationMediaAdmission{};
+        for (documents) |document| {
+            if (document.images.len == 0) continue;
+            const context_limit = max_length / document.images.len;
+            if (context_limit < 4) return error.InputTokenLimitExceeded;
+            const estimate = try qwen3vl_projector.estimateAdmission(
+                document.images,
+                config,
+                .{
+                    .max_images = 8,
+                    .min_merged_tokens = 4,
+                    .max_merged_tokens = @min(@as(usize, 576), context_limit),
+                },
+            );
+            result.token_allowance = @max(
+                result.token_allowance,
+                std.math.add(usize, estimate.visual_tokens, document.images.len) catch
+                    return error.InputTokenLimitExceeded,
+            );
+            result.host_scratch_bytes = @max(result.host_scratch_bytes, estimate.host_scratch_bytes);
+            result.backend_scratch_bytes = @max(result.backend_scratch_bytes, estimate.backend_scratch_bytes);
+        }
+        if (result.token_allowance == 0) return error.InvalidRerankerImageCount;
+        return result;
+    }
 
     fn writeRerankScoresResponse(
         ctx: *httpx.Context,
@@ -9311,6 +9752,8 @@ pub const Node = struct {
     ) !ParsedMultimodalRerankDocument {
         var text_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer text_buf.deinit(allocator);
+        var qwen_content_buf = std.ArrayListUnmanaged(u8).empty;
+        errdefer qwen_content_buf.deinit(allocator);
         var images = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (images.items) |img| allocator.free(img);
@@ -9318,7 +9761,10 @@ pub const Node = struct {
         }
 
         switch (content) {
-            .string => |s| try text_buf.appendSlice(allocator, s),
+            .string => |s| {
+                try text_buf.appendSlice(allocator, s);
+                try qwen_content_buf.appendSlice(allocator, s);
+            },
             .array => |arr| {
                 for (arr.items) |part| {
                     if (part != .object) return error.UnsupportedContentPartType;
@@ -9331,6 +9777,7 @@ pub const Node = struct {
                         const text_val = obj.get("text") orelse return error.UnsupportedContentPartType;
                         if (text_val != .string) return error.UnsupportedContentPartType;
                         try text_buf.appendSlice(allocator, text_val.string);
+                        try qwen_content_buf.appendSlice(allocator, text_val.string);
                     } else if (std.mem.eql(u8, ptype, "image_url")) {
                         const iu = obj.get("image_url") orelse return error.UnsupportedContentPartType;
                         const url_str = if (iu == .object)
@@ -9346,11 +9793,13 @@ pub const Node = struct {
                                 else => return error.InvalidImageDataUri,
                             };
                             errdefer decoded.deinit(allocator);
+                            try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
                             try images.append(allocator, decoded.data);
                         } else {
                             const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
                             defer allocator.free(downloaded.content_type);
                             errdefer allocator.free(downloaded.data);
+                            try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
                             try images.append(allocator, downloaded.data);
                         }
                     } else if (std.mem.eql(u8, ptype, "media")) {
@@ -9365,6 +9814,7 @@ pub const Node = struct {
                         const decoded = decoded_payload.data;
                         errdefer allocator.free(decoded);
                         if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.UnsupportedContentPartType;
+                        try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
                         try images.append(allocator, decoded);
                     } else {
                         return error.UnsupportedContentPartType;
@@ -9376,10 +9826,13 @@ pub const Node = struct {
 
         const owned_text = try text_buf.toOwnedSlice(allocator);
         errdefer allocator.free(owned_text);
+        const owned_qwen_content = try qwen_content_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_qwen_content);
         const owned_images = try images.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
             .text = owned_text,
+            .qwen_content = owned_qwen_content,
             .images = owned_images,
         };
     }
@@ -10404,7 +10857,7 @@ pub const Node = struct {
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
+            .invalid, .ambiguous, .internal => return requestModelResolutionError(ctx, err),
         }
 
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
@@ -10437,7 +10890,7 @@ pub const Node = struct {
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
-            .invalid, .internal => return requestModelResolutionError(ctx, err),
+            .invalid, .ambiguous, .internal => return requestModelResolutionError(ctx, err),
         }
 
         return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
@@ -11256,7 +11709,7 @@ pub const Node = struct {
                 return path;
             } else |err| switch (requestModelResolutionErrorKind(err)) {
                 .missing => continue,
-                .invalid, .internal => return err,
+                .invalid, .ambiguous, .internal => return err,
             }
         }
         return error.ModelNotFound;
@@ -16753,6 +17206,29 @@ test "HTTP model identifiers reject path and malformed variant syntax" {
 
     try std.testing.expectEqual(RequestModelResolutionErrorKind.invalid, requestModelResolutionErrorKind(error.InvalidModelIdentifier));
     try std.testing.expectEqual(RequestModelResolutionErrorKind.missing, requestModelResolutionErrorKind(error.ModelNotFound));
+    try std.testing.expectEqual(RequestModelResolutionErrorKind.ambiguous, requestModelResolutionErrorKind(error.AmbiguousModelIdentifier));
+
+    const batch_error = batchModelResolutionError(error.AmbiguousModelIdentifier);
+    try std.testing.expectEqualStrings(ambiguous_model_error_code, batch_error.code);
+    try std.testing.expectEqualStrings(ambiguous_model_error_message, batch_error.message);
+    try std.testing.expect(!batch_error.retryable);
+}
+
+test "ambiguous model resolution returns an actionable conflict response" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try Node.requestModelResolutionError(&ctx, error.AmbiguousModelIdentifier);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"AMBIGUOUS_MODEL\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, ambiguous_model_error_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "owner/name:variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOLUTION_FAILED") == null);
 }
 
 test "HTTP model resolution is canonical and contained while trusted resolution accepts absolute paths" {
@@ -16808,6 +17284,144 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
         try tmp.dir.symLink(std.testing.io, "../outside", "models/link", .{});
         try std.testing.expectError(error.ModelOutsideModelsDir, node.resolveRequestModelPath(request_allocator, std.testing.io, "link", "generators"));
     }
+}
+
+test "trusted model resolution prefers an exact legacy path before receipt discovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    inline for (.{ "duplicate-a", "duplicate-b" }) |leaf| {
+        try tmp.dir.createDirPath(io, "models/" ++ leaf);
+        try tmp.dir.writeFile(io, .{ .sub_path = "models/" ++ leaf ++ "/config.json", .data = "{}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "models/" ++ leaf ++ "/model.gguf", .data = "decoder" });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/" ++ leaf ++ "/.antfly-download-complete.json",
+            .data =
+            \\{"version":2,"source":{"owner":"owner","name":"model","variant":"q4_0"},"artifacts":[{"path":"config.json","size":2},{"path":"model.gguf","size":7}]}
+            ,
+        });
+    }
+
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(io, "models/owner/model", allocator);
+    defer allocator.free(model_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    const resolved = try node.resolveModelPath(io, "owner/model:q4_0", "generators");
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(model_root, resolved);
+}
+
+test "HTTP model resolution accepts the managed identity advertised by discovery" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/provisioned/arbitrary-leaf");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/provisioned/arbitrary-leaf/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/provisioned/arbitrary-leaf/model.gguf",
+        .data = "decoder",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/provisioned/arbitrary-leaf/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"owner","name":"model","variant":"q8-bundle-v1"},"artifacts":[{"path":"config.json","size":2},{"path":"model.gguf","size":7}]}
+        ,
+    });
+
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(
+        io,
+        "models/provisioned/arbitrary-leaf",
+        allocator,
+    );
+    defer allocator.free(model_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+    node.registry = registry_mod.ModelRegistry.init(allocator, models_root);
+
+    const resolved = try node.resolveRequestModelPath(
+        allocator,
+        io,
+        "owner/model:q8-bundle-v1",
+        "rerankers",
+    );
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(model_root, resolved);
+}
+
+test "managed model resolution fails closed when explicit variants coexist" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    inline for (.{
+        .{ "q8", "q8-0-bundle-v1" },
+        .{ "f16", "f16-bundle-v1" },
+    }) |fixture| {
+        try tmp.dir.createDirPath(io, "models/provisioned/" ++ fixture[0]);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/provisioned/" ++ fixture[0] ++ "/model.gguf",
+            .data = "decoder",
+        });
+        const receipt = try std.fmt.allocPrint(
+            allocator,
+            "{{\"version\":2,\"source\":{{\"owner\":\"Qwen\",\"name\":\"Qwen3-Embedding-0.6B-GGUF\",\"variant\":\"{s}\"}},\"artifacts\":[{{\"path\":\"model.gguf\",\"size\":7}}]}}",
+            .{fixture[1]},
+        );
+        defer allocator.free(receipt);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/provisioned/" ++ fixture[0] ++ "/.antfly-download-complete.json",
+            .data = receipt,
+        });
+    }
+
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const q8_root = try tmp.dir.realPathFileAlloc(io, "models/provisioned/q8", allocator);
+    defer allocator.free(q8_root);
+    const f16_root = try tmp.dir.realPathFileAlloc(io, "models/provisioned/f16", allocator);
+    defer allocator.free(f16_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    try std.testing.expectError(
+        error.AmbiguousModelIdentifier,
+        node.resolveModelPath(io, "Qwen/Qwen3-Embedding-0.6B-GGUF", "embedders"),
+    );
+    const q8_resolved = try node.resolveModelPath(
+        io,
+        "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+        "embedders",
+    );
+    defer allocator.free(q8_resolved);
+    try std.testing.expectEqualStrings(q8_root, q8_resolved);
+    const f16_resolved = try node.resolveModelPath(
+        io,
+        "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1",
+        "embedders",
+    );
+    defer allocator.free(f16_resolved);
+    try std.testing.expectEqualStrings(f16_root, f16_resolved);
 }
 
 test "HTTP model resolution caller ownership stays flat across repeated requests" {
@@ -17405,6 +18019,10 @@ const ParsedEmbedRequest = struct {
     encoding_format: ?[]const u8,
     dimensions: ?i64,
     task_type: ?EmbeddingTaskType,
+    /// Optional task description overriding the model's default query
+    /// instruction. Instruction-aware embedders (Qwen3-Embedding) wrap
+    /// query-side inputs as "Instruct: {instruction}\nQuery:{text}".
+    instruction: ?[]const u8 = null,
     error_policy: EmbedErrorPolicy = .fail_fast,
 };
 
@@ -17535,12 +18153,18 @@ fn parseEmbedRequest(body: std.json.Value) !ParsedEmbedRequest {
         break :blk parseEmbedErrorPolicy(value.string) orelse return error.UnsupportedEmbeddingErrorPolicy;
     } else .fail_fast;
 
+    const instruction: ?[]const u8 = if (obj.get("instruction")) |value| blk: {
+        if (value != .string) return error.InstructionMustBeString;
+        break :blk if (value.string.len > 0) value.string else null;
+    } else null;
+
     return .{
         .model = model_value.string,
         .input = input_value,
         .encoding_format = encoding_format,
         .dimensions = dimensions,
         .task_type = task_type orelse legacy_task_type,
+        .instruction = instruction,
         .error_policy = error_policy,
     };
 }
@@ -17559,38 +18183,109 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
         error.ConflictingEmbeddingTaskTypes => "task_type and input_type specify different embedding task types",
         error.ErrorPolicyMustBeString => "error_policy must be a string",
         error.UnsupportedEmbeddingErrorPolicy => "error_policy must be one of fail_fast or per_item",
+        error.InstructionMustBeString => "instruction must be a string",
         else => "invalid embedding request",
     };
 }
 
-fn isJinaV5EmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
-    return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
-        (manifest.pooling == .last and
-            std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
-}
-
+/// Configure query/document prefixes from the model-owned embedding task
+/// profile (including Jina, Qwen3-Embedding, and Nomic). Returns an
+/// owned prefix buffer when a per-request instruction was rendered; the
+/// caller must keep it alive for the pipeline run and free it afterwards.
 fn applyDenseEmbeddingRequestOptions(
+    allocator: std.mem.Allocator,
     pipeline: *embedding_mod.EmbeddingPipeline,
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
-) !void {
-    if (!isJinaV5EmbeddingManifest(manifest)) return;
+) !?[]u8 {
+    if (!manifest.hasEmbeddingTaskProfile()) {
+        if (request.instruction != null) return error.InstructionNotSupportedForModel;
+        return null;
+    }
+
+    // Manifests written before embedding_style existed can still match the
+    // legacy Jina heuristic. Prefix-only encoder profiles keep style .none.
+    const style: manifest_mod.EmbeddingStyle = if (manifest.embedding_style == .none)
+        if (manifest.isLastTokenDecoderEmbedder()) .jina_v5 else .none
+    else
+        manifest.embedding_style;
 
     const task_type = request.task_type orelse EmbeddingTaskType.RETRIEVAL_DOCUMENT;
-    if (task_type.usesQueryPrefix()) {
-        pipeline.config.text_prefix = "Query: ";
-    } else if (task_type.usesDocumentPrefix()) {
-        pipeline.config.text_prefix = "Document: ";
-    } else {
-        return error.UnsupportedEmbeddingTaskType;
+    const query_side = switch (style) {
+        // Qwen3-Embedding supports every non-document task through its
+        // instruction wrapper, but only retrieval queries have a model-owned
+        // default instruction.
+        .qwen3_embedding => !task_type.usesDocumentPrefix(),
+        else => task_type.usesQueryPrefix(),
+    };
+
+    if (query_side) {
+        if (request.instruction) |instr| {
+            const template = manifest.embedding_profile.instruction_template;
+            if (template.len == 0) return error.InstructionNotSupportedForModel;
+            const marker = "{instruction}";
+            const marker_at = std.mem.indexOf(u8, template, marker) orelse
+                return error.InstructionNotSupportedForModel;
+            const owned = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}{s}",
+                .{ template[0..marker_at], instr, template[marker_at + marker.len ..] },
+            );
+            pipeline.config.text_prefix = owned;
+            return owned;
+        }
+        if (style == .qwen3_embedding and task_type != .RETRIEVAL_QUERY) {
+            return error.InstructionRequiredForEmbeddingTask;
+        }
+        pipeline.config.text_prefix = manifest.embedding_profile.query.prefix;
+        return null;
     }
+    if (task_type.usesDocumentPrefix()) {
+        if (request.instruction != null) return error.InstructionRequiresQueryTask;
+        pipeline.config.text_prefix = manifest.embedding_profile.document.prefix;
+        return null;
+    }
+    return error.UnsupportedEmbeddingTaskType;
+}
+
+fn isEmbedRequestOptionError(err: anyerror) bool {
+    return switch (err) {
+        error.UnsupportedEmbeddingTaskType,
+        error.InstructionNotSupportedForModel,
+        error.InstructionRequiredForEmbeddingTask,
+        error.InstructionRequiresQueryTask,
+        => true,
+        else => false,
+    };
 }
 
 fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.UnsupportedEmbeddingTaskType => "task_type must be a query/document retrieval task for this embedding model",
+        error.InstructionNotSupportedForModel => "instruction is only supported for instruction-aware embedding models",
+        error.InstructionRequiredForEmbeddingTask => "instruction is required for this embedding task_type because the model has no task-specific default",
+        error.InstructionRequiresQueryTask => "instruction requires a query-side task_type (documents are embedded without instructions)",
         else => "invalid embedding options",
     };
+}
+
+fn validateSparseEmbeddingRequestOptions(request: ParsedEmbedRequest) !void {
+    if (request.instruction != null) return error.InstructionNotSupportedForModel;
+}
+
+test "sparse embedding request options reject instructions" {
+    const request = ParsedEmbedRequest{
+        .model = "sparse-model",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+        .instruction = "Retrieve relevant passages",
+    };
+    try std.testing.expectError(
+        error.InstructionNotSupportedForModel,
+        validateSparseEmbeddingRequestOptions(request),
+    );
 }
 
 fn parseSparseEmbedInputs(
@@ -18555,11 +19250,23 @@ fn embedAudioInputsIndividually(
     }
 }
 
+/// Scale factor restoring unit L2 norm after Matryoshka truncation. MRL
+/// embeddings must be re-normalized after truncating to `dimensions`;
+/// serving raw truncated vectors silently breaks cosine/dot equivalence.
+fn truncatedEmbeddingScale(emb: []const f32, dimensions: usize, renormalize: bool) f64 {
+    if (!renormalize or dimensions >= emb.len) return 1.0;
+    var norm_sq: f64 = 0;
+    for (emb[0..dimensions]) |val| norm_sq += @as(f64, val) * @as(f64, val);
+    if (norm_sq <= 0) return 1.0;
+    return 1.0 / @sqrt(norm_sq);
+}
+
 fn buildEmbedDenseResponse(
     arena: std.mem.Allocator,
     model_name: []const u8,
     embeddings: []const []const f32,
     requested_dimensions: ?usize,
+    renormalize_truncated: bool,
     prompt_tokens: usize,
 ) !EmbedResponseStrict {
     const data = try arena.alloc(api.EmbeddingObject, embeddings.len);
@@ -18568,7 +19275,8 @@ fn buildEmbedDenseResponse(
         if (dimensions > emb.len) return error.InvalidEmbeddingDimensions;
         var arr: std.json.Array = .init(arena);
         try arr.ensureTotalCapacity(dimensions);
-        for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = val });
+        const scale = truncatedEmbeddingScale(emb, dimensions, renormalize_truncated);
+        for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = @as(f64, val) * scale });
         data[i] = .{
             .object = "embedding",
             .index = @intCast(i),
@@ -18591,6 +19299,7 @@ fn buildEmbedDensePartialResponse(
     model_name: []const u8,
     result: *const DenseEmbedPartialResult,
     requested_dimensions: ?usize,
+    renormalize_truncated: bool,
     prompt_tokens: usize,
 ) !EmbedDensePartialResponse {
     const succeeded = result.successCount();
@@ -18602,7 +19311,8 @@ fn buildEmbedDensePartialResponse(
         if (dimensions > emb.len) return error.InvalidEmbeddingDimensions;
         var arr: std.json.Array = .init(arena);
         try arr.ensureTotalCapacity(dimensions);
-        for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = val });
+        const scale = truncatedEmbeddingScale(emb, dimensions, renormalize_truncated);
+        for (emb[0..dimensions]) |val| arr.appendAssumeCapacity(.{ .float = @as(f64, val) * scale });
         data[out_index] = .{
             .object = "embedding",
             .index = @intCast(input_index),
@@ -18676,6 +19386,189 @@ test "Antfly inference embeddings validates encoding format and dimensions" {
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(-1));
 }
 
+/// Test shim: applies request options and asserts no owned prefix escaped
+/// (owned prefixes are only produced by per-request instructions).
+fn applyDenseEmbeddingRequestOptionsForTest(
+    pipeline: *embedding_mod.EmbeddingPipeline,
+    manifest: *const manifest_mod.ModelManifest,
+    request: ParsedEmbedRequest,
+) !void {
+    const owned = try applyDenseEmbeddingRequestOptions(std.testing.allocator, pipeline, manifest, request);
+    try std.testing.expectEqual(@as(?[]u8, null), owned);
+}
+
+test "qwen3 embedding request options wrap queries with instructions" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .pooling = .last,
+        .embedding_style = .qwen3_embedding,
+        .embedding_profile = .{
+            .task_contract = .profiled,
+            .query = .{ .declared = true },
+            .document = .{ .declared = true },
+        },
+        .model_type = .embedder,
+    };
+    defer manifest.deinit();
+    manifest.embedding_profile.query.prefix = try allocator.dupe(u8, manifest_mod.qwen3_embedding_default_query_prefix);
+    manifest.embedding_profile.instruction_template = try allocator.dupe(u8, manifest_mod.qwen3_embedding_instruction_template);
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    // Queries get the model-card default instruction when none is supplied.
+    const query_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+    };
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, query_request);
+    try std.testing.expectEqualStrings(
+        manifest_mod.qwen3_embedding_default_query_prefix,
+        pipeline.config.text_prefix,
+    );
+
+    // Documents are embedded raw — no prefix at all.
+    const document_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = null,
+    };
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, document_request);
+    try std.testing.expectEqualStrings("", pipeline.config.text_prefix);
+
+    // Non-retrieval task types require an explicit task instruction. Reusing
+    // the web-retrieval default would silently produce the wrong embeddings.
+    const clustering_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .CLUSTERING,
+    };
+    try std.testing.expectError(
+        error.InstructionRequiredForEmbeddingTask,
+        applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, clustering_request),
+    );
+
+    const instructed_clustering_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .CLUSTERING,
+        .instruction = "Group texts by their primary topic",
+    };
+    const clustering_prefix = try applyDenseEmbeddingRequestOptions(
+        allocator,
+        &pipeline,
+        &manifest,
+        instructed_clustering_request,
+    );
+    defer if (clustering_prefix) |prefix| allocator.free(prefix);
+    try std.testing.expectEqualStrings(
+        "Instruct: Group texts by their primary topic\nQuery:",
+        pipeline.config.text_prefix,
+    );
+
+    // A custom instruction renders into the Instruct/Query wrapper.
+    const custom_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+        .instruction = "Given a legal question, retrieve statutes that answer it",
+    };
+    const owned = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &manifest, custom_request);
+    defer if (owned) |p| allocator.free(p);
+    try std.testing.expectEqualStrings(
+        "Instruct: Given a legal question, retrieve statutes that answer it\nQuery:",
+        pipeline.config.text_prefix,
+    );
+
+    // Instructions on document-side requests are rejected loudly.
+    const doc_instruction_request = ParsedEmbedRequest{
+        .model = "qwen3-embedding",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_DOCUMENT,
+        .instruction = "some task",
+    };
+    try std.testing.expectError(
+        error.InstructionRequiresQueryTask,
+        applyDenseEmbeddingRequestOptions(allocator, &pipeline, &manifest, doc_instruction_request),
+    );
+}
+
+test "instruction is rejected for non-instruction models" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+
+    const request = ParsedEmbedRequest{
+        .model = "bge-m3",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = null,
+        .instruction = "some task",
+    };
+    try std.testing.expectError(
+        error.InstructionNotSupportedForModel,
+        applyDenseEmbeddingRequestOptions(allocator, &pipeline, &manifest, request),
+    );
+}
+
+test "prefix-only encoder embedding profiles switch query and document roles" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "search_query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "search_document: "), .declared = true },
+    };
+
+    var pipeline = embedding_mod.EmbeddingPipeline{
+        .allocator = allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+    };
+    const base_request = ParsedEmbedRequest{
+        .model = "nomic-embed-text-v1.5",
+        .input = .{ .string = "hello" },
+        .encoding_format = null,
+        .dimensions = null,
+        .task_type = .RETRIEVAL_QUERY,
+    };
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, base_request);
+    try std.testing.expectEqualStrings("search_query: ", pipeline.config.text_prefix);
+
+    var document_request = base_request;
+    document_request.task_type = .RETRIEVAL_DOCUMENT;
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, document_request);
+    try std.testing.expectEqualStrings("search_document: ", pipeline.config.text_prefix);
+}
+
 test "jina embedding request options switch query and document prefixes" {
     const allocator = std.testing.allocator;
     var manifest = manifest_mod.ModelManifest{
@@ -18683,7 +19576,11 @@ test "jina embedding request options switch query and document prefixes" {
         .pooling = .last,
     };
     defer manifest.deinit();
-    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "Query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "Document: "), .declared = true },
+    };
     manifest.tasks = try allocator.alloc([]const u8, 1);
     manifest.tasks[0] = try allocator.dupe(u8, "retrieval");
 
@@ -18701,7 +19598,7 @@ test "jina embedding request options switch query and document prefixes" {
         .dimensions = null,
         .task_type = .RETRIEVAL_QUERY,
     };
-    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, query_request);
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, query_request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 
     const qa_request = ParsedEmbedRequest{
@@ -18711,7 +19608,7 @@ test "jina embedding request options switch query and document prefixes" {
         .dimensions = null,
         .task_type = .QUESTION_ANSWERING,
     };
-    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, qa_request);
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, qa_request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 
     const document_request = ParsedEmbedRequest{
@@ -18721,7 +19618,7 @@ test "jina embedding request options switch query and document prefixes" {
         .dimensions = null,
         .task_type = .RETRIEVAL_DOCUMENT,
     };
-    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, document_request);
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, document_request);
     try std.testing.expectEqualStrings("Document: ", pipeline.config.text_prefix);
 
     const bad_task_type = ParsedEmbedRequest{
@@ -18731,7 +19628,7 @@ test "jina embedding request options switch query and document prefixes" {
         .dimensions = null,
         .task_type = .CLASSIFICATION,
     };
-    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, applyDenseEmbeddingRequestOptions(&pipeline, &manifest, bad_task_type));
+    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, bad_task_type));
 }
 
 test "jina embedding request options support legacy input_type aliases" {
@@ -18741,7 +19638,11 @@ test "jina embedding request options support legacy input_type aliases" {
         .pooling = .last,
     };
     defer manifest.deinit();
-    manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+    manifest.embedding_profile = .{
+        .task_contract = .profiled,
+        .query = .{ .prefix = try allocator.dupe(u8, "Query: "), .declared = true },
+        .document = .{ .prefix = try allocator.dupe(u8, "Document: "), .declared = true },
+    };
 
     var pipeline = embedding_mod.EmbeddingPipeline{
         .allocator = allocator,
@@ -18762,7 +19663,7 @@ test "jina embedding request options support legacy input_type aliases" {
 
     const request = try parseEmbedRequest(parsed.value);
     try std.testing.expectEqual(EmbeddingTaskType.RETRIEVAL_QUERY, request.task_type.?);
-    try applyDenseEmbeddingRequestOptions(&pipeline, &manifest, request);
+    try applyDenseEmbeddingRequestOptionsForTest(&pipeline, &manifest, request);
     try std.testing.expectEqualStrings("Query: ", pipeline.config.text_prefix);
 }
 
@@ -19017,7 +19918,7 @@ test "Antfly inference embeddings dense response supports truncation" {
     defer arena.deinit();
     const embedding = [_]f32{ 1.0, 2.0, 3.0 };
     const embeddings = [_][]const f32{embedding[0..]};
-    const response = try buildEmbedDenseResponse(arena.allocator(), "dense-model", &embeddings, 2, 7);
+    const response = try buildEmbedDenseResponse(arena.allocator(), "dense-model", &embeddings, 2, false, 7);
     const body = try std.json.Stringify.valueAlloc(alloc, response, .{});
     defer alloc.free(body);
 
@@ -19031,6 +19932,36 @@ test "Antfly inference embeddings dense response supports truncation" {
     try expectJsonNumber(2.0, embedding_json[1]);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
+}
+
+test "Antfly inference embeddings truncation renormalizes for MRL models" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    // Unit-norm 3-vector; truncating to the first two components must
+    // rescale them back onto the unit sphere (Matryoshka contract).
+    const embedding = [_]f32{ 0.6, 0.8, 0.0 };
+    const full_norm = [_]f32{ 0.48, 0.64, 0.6 };
+    const embeddings = [_][]const f32{ embedding[0..], full_norm[0..] };
+    const response = try buildEmbedDenseResponse(arena.allocator(), "dense-model", &embeddings, 2, true, 7);
+    const body = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), data.len);
+    for (data) |item| {
+        const embedding_json = item.object.get("embedding").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), embedding_json.len);
+        var norm_sq: f64 = 0;
+        for (embedding_json) |component| norm_sq += component.float * component.float;
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), norm_sq, 1e-9);
+    }
+    // Full-dimension responses stay untouched even with renormalize on.
+    const full_response = try buildEmbedDenseResponse(arena.allocator(), "dense-model", &embeddings, null, true, 7);
+    const full_first = full_response.data[0].embedding.?.array.items;
+    try expectJsonNumber(@as(f64, @floatCast(@as(f32, 0.6))), full_first[0]);
 }
 
 test "Antfly inference embeddings per-item response includes successes and indexed errors" {
@@ -19051,7 +19982,7 @@ test "Antfly inference embeddings per-item response includes successes and index
         .errors = errors[0..],
     };
 
-    const response = try buildEmbedDensePartialResponse(arena.allocator(), "dense-model", &partial, 2, 7);
+    const response = try buildEmbedDensePartialResponse(arena.allocator(), "dense-model", &partial, 2, false, 7);
     const body = try std.json.Stringify.valueAlloc(alloc, response, .{});
     defer alloc.free(body);
 
@@ -19365,11 +20296,49 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
     defer doc.deinit();
 
     try std.testing.expectEqualStrings("invoice page appendix", doc.text);
+    try std.testing.expectEqualStrings(
+        "invoice page" ++ qwen3vl_reranker.image_marker ++ qwen3vl_reranker.image_marker ++ " appendix",
+        doc.qwen_content,
+    );
     try std.testing.expectEqual(@as(usize, 2), doc.images.len);
     try std.testing.expectEqual(@as(usize, 1), doc.images[0].len);
     try std.testing.expectEqual(@as(usize, 1), doc.images[1].len);
     try std.testing.expectEqual(@as(u8, 0), doc.images[0][0]);
     try std.testing.expectEqual(@as(u8, 1), doc.images[1][0]);
+}
+
+test "Qwen3-VL multimodal reranker reserves projector scratch before execution" {
+    var png = [_]u8{0} ** 24;
+    png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    std.mem.writeInt(u32, png[16..20], 227, .big);
+    std.mem.writeInt(u32, png[20..24], 149, .big);
+    var images = [_][]const u8{png[0..]};
+    const documents = [_]Node.ParsedMultimodalRerankDocument{.{
+        .allocator = std.testing.allocator,
+        .text = &.{},
+        .qwen_content = &.{},
+        .images = images[0..],
+    }};
+    const config = gpt_model_mod.Config{
+        .family = .qwen3_vl,
+        .hidden_size = 2048,
+        .vision_hidden_size = 1024,
+        .vision_intermediate_size = 4096,
+        .vision_num_attention_heads = 16,
+        .vision_patch_size = 16,
+        .vision_spatial_merge_size = 2,
+        .vision_deepstack_visual_indexes_len = 3,
+    };
+
+    const estimate = try Node.qwen3VlRerankerMediaAdmission(&documents, config, 8192);
+    try std.testing.expect(estimate.token_allowance >= 5);
+    try std.testing.expect(estimate.host_scratch_bytes > 0);
+    try std.testing.expect(estimate.backend_scratch_bytes > 0);
+    try std.testing.expectError(
+        error.InputTokenLimitExceeded,
+        Node.qwen3VlRerankerMediaAdmission(&documents, config, 3),
+    );
 }
 
 test "multimodal rerank parser releases both owned slices on every allocation failure" {

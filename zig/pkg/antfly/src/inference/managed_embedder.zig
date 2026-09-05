@@ -21,14 +21,17 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
+const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
 const credential_safety = @import("../common/credential_safety.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const embeddings_openapi = @import("antfly_embeddings_openapi");
 const embeddings_types = @import("antfly_embeddings");
 const scraping = @import("antfly_scraping");
 const inference_types = @import("types.zig");
 const bedrock_provider = @import("bedrock.zig");
+const vertex_provider = @import("vertex.zig");
 const openai_provider = @import("openai.zig");
 const antfly_provider_mod = @import("local.zig");
 const chunking_types = @import("../chunking/types.zig");
@@ -60,10 +63,43 @@ pub const ProviderKind = enum {
     openai,
     ollama,
     bedrock,
+    cohere,
+    gemini,
+    vertex,
     antfly,
 };
 
-pub const EmbeddingRequestContext = RequestContext;
+/// Antfly assigns retrieval roles from the operation: artifact/index writes
+/// are documents and semantic-search inputs are queries. Provider adapters
+/// translate these canonical roles to their wire-specific spelling.
+pub const EmbeddingTaskType = enum {
+    retrieval_query,
+    retrieval_document,
+
+    pub fn canonical(self: EmbeddingTaskType) []const u8 {
+        return switch (self) {
+            .retrieval_query => "RETRIEVAL_QUERY",
+            .retrieval_document => "RETRIEVAL_DOCUMENT",
+        };
+    }
+
+    pub fn cohereInputType(self: EmbeddingTaskType) []const u8 {
+        return switch (self) {
+            .retrieval_query => "search_query",
+            .retrieval_document => "search_document",
+        };
+    }
+};
+
+pub const EmbeddingRequestContext = struct {
+    request: RequestContext,
+    task_type: EmbeddingTaskType = .retrieval_document,
+    instruction: ?[]const u8 = null,
+
+    pub fn check(self: EmbeddingRequestContext) !void {
+        return self.request.check();
+    }
+};
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
@@ -162,6 +198,64 @@ pub const AntflyProvider = struct {
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
+const BedrockCredentialPool = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    by_region: std.StringHashMapUnmanaged(*bedrock_provider.CredentialCache) = .empty,
+
+    fn init(alloc: std.mem.Allocator, io: std.Io) BedrockCredentialPool {
+        return .{ .alloc = alloc, .io = io };
+    }
+
+    fn cacheForRegion(self: *BedrockCredentialPool, region: []const u8) !*bedrock_provider.CredentialCache {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.by_region.get(region)) |cache| return cache;
+
+        const owned_region = try self.alloc.dupe(u8, region);
+        errdefer self.alloc.free(owned_region);
+        const cache = try self.alloc.create(bedrock_provider.CredentialCache);
+        errdefer self.alloc.destroy(cache);
+        cache.* = .{};
+        try self.by_region.put(self.alloc, owned_region, cache);
+        return cache;
+    }
+
+    fn deinit(self: *BedrockCredentialPool) void {
+        var iterator = self.by_region.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.*.deinit(self.alloc);
+            self.alloc.destroy(entry.value_ptr.*);
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.by_region.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+/// Long-lived provider resources shared by independently constructed managed
+/// embedders. API runtimes should own one of these for their full service
+/// lifetime so request-scoped embedders reuse credentials and refresh work.
+pub const ProviderRuntime = struct {
+    google_credentials: google_auth.CredentialManager,
+    bedrock_credentials: BedrockCredentialPool,
+
+    pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
+        return .{
+            .google_credentials = google_auth.CredentialManager.init(alloc, io),
+            .bedrock_credentials = BedrockCredentialPool.init(alloc, io),
+        };
+    }
+
+    pub fn deinit(self: *ProviderRuntime) void {
+        self.bedrock_credentials.deinit();
+        self.google_credentials.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     io: ?std.Io = null,
@@ -176,6 +270,10 @@ pub const InitOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
+    /// Borrowed for the lifetime of the constructed ManagedEmbedder. Services
+    /// should supply their runtime; standalone embedders retain an owned
+    /// fallback for compatibility.
+    provider_runtime: ?*ProviderRuntime = null,
 };
 
 const DimensionProbeValidation = enum {
@@ -410,10 +508,23 @@ pub const ManagedEmbeddingEntry = struct {
     model: []u8,
     base_url: []u8,
     region: []u8 = "",
+    project_id: []u8 = "",
+    location: []u8 = "",
+    credentials_path: []u8 = "",
     bedrock_request_format: bedrock_provider.RequestFormat = .auto,
     input_type: []u8 = "",
+    /// Advanced provider overrides. When omitted, Antfly derives these from
+    /// whether it is embedding an indexed document or a search query.
+    query_input_type: []u8 = "",
+    document_input_type: []u8 = "",
+    query_instruction: []u8 = "",
     truncate: []u8 = "",
-    bedrock_credentials: bedrock_provider.CredentialCache = .{},
+    /// Borrowed from the service ProviderRuntime, or from the owning
+    /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
+    /// cloud credentials across request embedders and serialize refreshes.
+    google_credentials: ?*google_auth.CredentialManager = null,
+    bedrock_credentials: ?*bedrock_provider.CredentialCache = null,
+    owns_bedrock_credentials: bool = false,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
@@ -437,9 +548,19 @@ pub const ManagedEmbeddingEntry = struct {
         alloc.free(self.model);
         alloc.free(self.base_url);
         if (self.region.len > 0) alloc.free(self.region);
+        if (self.project_id.len > 0) alloc.free(self.project_id);
+        if (self.location.len > 0) alloc.free(self.location);
+        if (self.credentials_path.len > 0) alloc.free(self.credentials_path);
         if (self.input_type.len > 0) alloc.free(self.input_type);
+        if (self.query_input_type.len > 0) alloc.free(self.query_input_type);
+        if (self.document_input_type.len > 0) alloc.free(self.document_input_type);
+        if (self.query_instruction.len > 0) alloc.free(self.query_instruction);
         if (self.truncate.len > 0) alloc.free(self.truncate);
-        self.bedrock_credentials.deinit(alloc);
+        if (self.owns_bedrock_credentials) {
+            const cache = self.bedrock_credentials.?;
+            cache.deinit(alloc);
+            alloc.destroy(cache);
+        }
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
         self.* = undefined;
@@ -525,8 +646,13 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
+        std.mem.eql(u8, lhs.project_id, rhs.project_id) and
+        std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
+        std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
+        std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
+        std.mem.eql(u8, lhs.query_instruction, rhs.query_instruction) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
 
@@ -544,8 +670,13 @@ fn managedEmbeddingEntriesSemanticallyEquivalent(
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
+        std.mem.eql(u8, lhs.project_id, rhs.project_id) and
+        std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
+        std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
+        std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
+        std.mem.eql(u8, lhs.query_instruction, rhs.query_instruction) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
 
@@ -678,10 +809,11 @@ fn validateManagedEmbeddingLookupNames(
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
     const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
+    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
         @tagName(entry.provider),
         entry.base_url,
         entry.model,
+        entry.project_id,
         api_key_hash,
         @intFromBool(entry.sparse),
         entry.requests_per_minute,
@@ -689,10 +821,66 @@ fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbe
     });
 }
 
+fn attachManagedGoogleCredentialManager(
+    alloc: std.mem.Allocator,
+    io: ?std.Io,
+    entries: []ManagedEmbeddingEntry,
+    provider_runtime: ?*ProviderRuntime,
+) !?*google_auth.CredentialManager {
+    var has_vertex = false;
+    for (entries) |entry| {
+        if (entry.provider == .vertex) {
+            has_vertex = true;
+            break;
+        }
+    }
+    if (!has_vertex) return null;
+
+    const owned_manager = if (provider_runtime == null)
+        try alloc.create(google_auth.CredentialManager)
+    else
+        null;
+    errdefer if (owned_manager) |manager| alloc.destroy(manager);
+    if (owned_manager) |manager| {
+        manager.* = google_auth.CredentialManager.init(
+            alloc,
+            io orelse std.Io.Threaded.global_single_threaded.io(),
+        );
+    }
+    const manager = if (provider_runtime) |runtime|
+        &runtime.google_credentials
+    else
+        owned_manager.?;
+    for (entries) |*entry| {
+        if (entry.provider == .vertex) entry.google_credentials = manager;
+    }
+    return owned_manager;
+}
+
+fn attachManagedBedrockCredentialCaches(
+    alloc: std.mem.Allocator,
+    entries: []ManagedEmbeddingEntry,
+    provider_runtime: ?*ProviderRuntime,
+) !void {
+    for (entries) |*entry| {
+        if (entry.provider != .bedrock) continue;
+        if (provider_runtime) |runtime| {
+            entry.bedrock_credentials = try runtime.bedrock_credentials.cacheForRegion(entry.region);
+            continue;
+        }
+
+        const cache = try alloc.create(bedrock_provider.CredentialCache);
+        cache.* = .{};
+        entry.bedrock_credentials = cache;
+        entry.owns_bedrock_credentials = true;
+    }
+}
+
 pub const ManagedEmbedder = struct {
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
     pacer_scope_keys: [][]u8 = &.{},
+    owned_google_credentials: ?*google_auth.CredentialManager = null,
 
     pub fn initFromIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !ManagedEmbedder {
         return try initFromIndexesJsonWithOptions(alloc, indexes_json, .{});
@@ -752,10 +940,27 @@ pub const ManagedEmbedder = struct {
         }
         try attachRequestPacers(alloc, entries.items, &pacer_scope_keys);
 
+        const owned_google_credentials = try attachManagedGoogleCredentialManager(
+            alloc,
+            options.io,
+            entries.items,
+            options.provider_runtime,
+        );
+        errdefer if (owned_google_credentials) |manager| {
+            manager.deinit();
+            alloc.destroy(manager);
+        };
+        try attachManagedBedrockCredentialCaches(
+            alloc,
+            entries.items,
+            options.provider_runtime,
+        );
+
         return .{
             .alloc = alloc,
             .entries = try entries.toOwnedSlice(alloc),
             .pacer_scope_keys = try pacer_scope_keys.toOwnedSlice(alloc),
+            .owned_google_credentials = owned_google_credentials,
         };
     }
 
@@ -767,6 +972,10 @@ pub const ManagedEmbedder = struct {
             self.alloc.free(scope_key);
         }
         if (self.pacer_scope_keys.len > 0) self.alloc.free(self.pacer_scope_keys);
+        if (self.owned_google_credentials) |manager| {
+            manager.deinit();
+            self.alloc.destroy(manager);
+        }
         self.* = undefined;
     }
 
@@ -886,7 +1095,7 @@ pub const ManagedEmbedder = struct {
 
     pub fn embedQuery(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, text: []const u8) ![]f32 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        return try embedWithEntry(alloc, entry, text, entry.dimensions);
+        return try embedWithEntryForTask(alloc, entry, text, entry.dimensions, .retrieval_query);
     }
 
     pub fn embedQueryWithCancellation(
@@ -898,12 +1107,11 @@ pub const ManagedEmbedder = struct {
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var request_entry = configured_entry.*;
-        request_entry.bedrock_credentials = .{};
-        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.owns_bedrock_credentials = false;
         request_entry.auth_header_cache = .{};
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
-        return try embedWithEntry(alloc, &request_entry, text, request_entry.dimensions);
+        return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
     }
 
     /// Digest the effective dense-text embedding operation. Table and index
@@ -923,14 +1131,27 @@ pub const ManagedEmbedder = struct {
         }
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
+        hashQueryCacheField(&hasher, "antfly-query-embedding-v2");
         hashQueryCacheField(&hasher, @tagName(security_domain));
         hashQueryCacheField(&hasher, security_scope);
         hashQueryCacheField(&hasher, @tagName(entry.provider));
         hashQueryCacheField(&hasher, entry.base_url);
         hashQueryCacheField(&hasher, entry.model);
         hashQueryCacheField(&hasher, entry.region);
+        hashQueryCacheField(&hasher, entry.project_id);
+        hashQueryCacheField(&hasher, entry.location);
+        // Keep cache authorization boundaries aligned with CredentialManager.
+        // The explicit tag prevents a valid file path from aliasing default
+        // ADC. Token refreshes retain the same vector identity, while distinct
+        // credential sources must never coalesce.
+        hashQueryCacheU64(&hasher, @intFromBool(entry.credentials_path.len > 0));
+        hashQueryCacheField(&hasher, entry.credentials_path);
+        hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
         hashQueryCacheField(&hasher, entry.input_type);
+        hashQueryCacheField(&hasher, entry.query_input_type);
+        hashQueryCacheField(&hasher, entry.document_input_type);
+        hashQueryCacheField(&hasher, entry.query_instruction);
+        hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_query.canonical());
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
@@ -955,7 +1176,7 @@ pub const ManagedEmbedder = struct {
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
-        return embedWithEntryParts(alloc, entry, parts, entry.dimensions) catch |err| return err;
+        return embedWithEntryPartsForTask(alloc, entry, parts, entry.dimensions, .retrieval_query) catch |err| return err;
     }
 
     pub fn embedQueryWithTemplateAndCancellation(
@@ -968,8 +1189,7 @@ pub const ManagedEmbedder = struct {
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var request_entry = configured_entry.*;
-        request_entry.bedrock_credentials = .{};
-        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.owns_bedrock_credentials = false;
         request_entry.auth_header_cache = .{};
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
@@ -979,7 +1199,7 @@ pub const ManagedEmbedder = struct {
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
-        return embedWithEntryParts(alloc, &request_entry, parts, request_entry.dimensions) catch |err| return err;
+        return embedWithEntryPartsForTask(alloc, &request_entry, parts, request_entry.dimensions, .retrieval_query) catch |err| return err;
     }
 
     fn findQueryEntry(self: *const ManagedEmbedder, index_name: []const u8) ?*const ManagedEmbeddingEntry {
@@ -1154,8 +1374,16 @@ fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
     return entry.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
-    return .{ .io = embeddingIo(entry), .deadline_ns = embeddingOperationDeadline(entry), .cancellation = entry.cancellation };
+fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) EmbeddingRequestContext {
+    return .{
+        .request = .{
+            .io = embeddingIo(entry),
+            .deadline_ns = embeddingOperationDeadline(entry),
+            .cancellation = entry.cancellation,
+        },
+        .task_type = task_type,
+        .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
+    };
 }
 
 fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
@@ -1173,14 +1401,7 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         .keep_alive = false,
         .max_response_size = 4 << 20,
     };
-    const deadline = embeddingOperationDeadline(entry);
-    const now_ns = monotonicNowNs();
-    if (now_ns >= deadline) return error.Timeout;
-    const remaining_ns = deadline - now_ns;
-    const timeout_ms = @min(
-        max_embedding_request_timeout_ms,
-        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
-    );
+    const timeout_ms = try embeddingRemainingTimeoutMs(entry);
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
     // Both the whole-request and connect watchdogs need Io.concurrent.
     // Manual/embedded owners deliberately use the single-threaded fallback
@@ -1195,6 +1416,18 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         config.timeouts.connect_ms = 0;
     }
     return config;
+}
+
+fn embeddingRemainingTimeoutMs(entry: *const ManagedEmbeddingEntry) !u64 {
+    try ensureEntryDeadline(entry);
+    const deadline = embeddingOperationDeadline(entry);
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    return @min(
+        max_embedding_request_timeout_ms,
+        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+    );
 }
 
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
@@ -1286,7 +1519,7 @@ pub fn testEmbeddingProviderDeadlines() !void {
         fn denseWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.check();
-            try std.testing.expect(context.deadline_ns != null);
+            try std.testing.expect(context.request.deadline_ns != null);
             self.context_calls += 1;
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
@@ -1389,16 +1622,38 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .object => |object| object.get("embedder") orelse return error.InvalidCreateTableRequest,
         else => return error.InvalidCreateTableRequest,
     };
-    var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder_value);
+    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder_value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
     defer embedder_cfg.deinit(alloc);
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidCreateTableRequest;
-    const region = if (provider == .bedrock) try resolveBedrockRegion(alloc, embedder_cfg) else try alloc.dupe(u8, "");
+    const region = if (provider == .bedrock)
+        try resolveBedrockRegion(alloc, embedder_cfg)
+    else if (provider == .vertex)
+        try resolveVertexLocation(alloc, embedder_cfg)
+    else
+        try alloc.dupe(u8, "");
     defer alloc.free(region);
+    const project_id = if (provider == .vertex)
+        if (embedder_cfg.project_id.len > 0)
+            try alloc.dupe(u8, embedder_cfg.project_id)
+        else
+            (try vertex_provider.vertexProjectIdFromConfigAlloc(
+                alloc,
+                if (embedder_cfg.credentials_path.len > 0) embedder_cfg.credentials_path else null,
+            )) orelse return error.InvalidCreateTableRequest
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(project_id);
     const endpoint = switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
         .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, region),
+        .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
+        .gemini => try resolveGeminiBaseUrl(alloc, embedder_cfg),
+        .vertex => try resolveVertexBaseUrl(alloc, embedder_cfg, region),
         .antfly => if (shouldUseAntflyProvider(embedder_cfg, options))
             try alloc.dupe(u8, "antfly:embedded")
         else
@@ -1413,23 +1668,31 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         model: []const u8,
         endpoint: []const u8,
         region: []const u8,
+        project_id: ?[]const u8 = null,
         request_format: []const u8,
         sparse: bool,
         multimodal: bool,
         input_type: []const u8,
         truncate: []const u8,
+        query_input_type: ?[]const u8 = null,
+        document_input_type: ?[]const u8 = null,
+        query_instruction: ?[]const u8 = null,
     };
     return try std.json.Stringify.valueAlloc(alloc, SemanticProducer{
         .provider = @tagName(provider),
         .model = embedder_cfg.model,
         .endpoint = endpoint,
         .region = region,
+        .project_id = if (project_id.len > 0) project_id else null,
         .request_format = embedder_cfg.request_format,
         .sparse = cfg.sparse orelse false,
         .multimodal = embedder_cfg.multimodal,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
-    }, .{});
+        .query_input_type = if (embedder_cfg.query_input_type.len > 0) embedder_cfg.query_input_type else null,
+        .document_input_type = if (embedder_cfg.document_input_type.len > 0) embedder_cfg.document_input_type else null,
+        .query_instruction = if (embedder_cfg.query_instruction.len > 0) embedder_cfg.query_instruction else null,
+    }, .{ .emit_null_optional_fields = false });
 }
 
 /// Returns the durable, credential-free identity of the producer configured
@@ -2175,11 +2438,15 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "model") or
             std.mem.eql(u8, field.key_ptr.*, "endpoint") or
             std.mem.eql(u8, field.key_ptr.*, "region") or
+            std.mem.eql(u8, field.key_ptr.*, "project_id") or
             std.mem.eql(u8, field.key_ptr.*, "request_format") or
             std.mem.eql(u8, field.key_ptr.*, "sparse") or
             std.mem.eql(u8, field.key_ptr.*, "multimodal") or
             std.mem.eql(u8, field.key_ptr.*, "input_type") or
-            std.mem.eql(u8, field.key_ptr.*, "truncate");
+            std.mem.eql(u8, field.key_ptr.*, "truncate") or
+            std.mem.eql(u8, field.key_ptr.*, "query_input_type") or
+            std.mem.eql(u8, field.key_ptr.*, "document_input_type") or
+            std.mem.eql(u8, field.key_ptr.*, "query_instruction");
         if (!allowed) return error.InvalidEmbeddingArtifactProducer;
     }
     if (object.get("url") != null or object.get("api_url") != null or object.get("base_url") != null)
@@ -2205,9 +2472,13 @@ fn semanticProducerComparisonConfigJsonAlloc(
         model: []const u8,
         url: ?[]const u8,
         region: ?[]const u8 = null,
+        project_id: ?[]const u8 = null,
         request_format: ?[]const u8 = null,
         input_type: ?[]const u8 = null,
         truncate: ?[]const u8 = null,
+        query_input_type: ?[]const u8 = null,
+        document_input_type: ?[]const u8 = null,
+        query_instruction: ?[]const u8 = null,
         multimodal: ?bool = null,
     };
     const optionalString = struct {
@@ -2226,9 +2497,13 @@ fn semanticProducerComparisonConfigJsonAlloc(
         .model = model.string,
         .url = if (embedded) null else endpoint.string,
         .region = try optionalString(object, "region"),
+        .project_id = try optionalString(object, "project_id"),
         .request_format = try optionalString(object, "request_format"),
         .input_type = try optionalString(object, "input_type"),
         .truncate = try optionalString(object, "truncate"),
+        .query_input_type = try optionalString(object, "query_input_type"),
+        .document_input_type = try optionalString(object, "document_input_type"),
+        .query_instruction = try optionalString(object, "query_instruction"),
         .multimodal = multimodal,
     }, .{ .emit_null_optional_fields = false });
 }
@@ -2498,6 +2773,13 @@ fn semanticIdentityStringField(identity: std.json.Value, name: []const u8) ![]co
     return field.string;
 }
 
+fn semanticIdentityOptionalStringField(identity: std.json.Value, name: []const u8) ![]const u8 {
+    if (identity != .object) return error.InvalidEmbeddingArtifactProducer;
+    const field = identity.object.get(name) orelse return "";
+    if (field != .string) return error.InvalidEmbeddingArtifactProducer;
+    return field.string;
+}
+
 fn validateCatalogOwnerSemanticIdentity(
     alloc: std.mem.Allocator,
     owner: CatalogProducerOwner,
@@ -2524,11 +2806,24 @@ fn validateCatalogOwnerSemanticIdentity(
     defer embedder_cfg.deinit(alloc);
     const provider = parseEmbedderProvider(embedder_cfg) catch
         return error.InvalidEmbeddingArtifactProducer;
+    const configured_query_input_type = embedder_cfg.query_input_type;
+    const configured_document_input_type = embedder_cfg.document_input_type;
+    const configured_query_instruction = embedder_cfg.query_instruction;
     if (!std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "provider"), @tagName(provider)) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "model"), embedder_cfg.model) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "request_format"), embedder_cfg.request_format) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "input_type"), embedder_cfg.input_type) or
-        !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate))
+        !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_input_type"), configured_query_input_type) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "document_input_type"), configured_document_input_type) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_instruction"), configured_query_instruction))
+    {
+        return error.InvalidEmbeddingArtifactProducer;
+    }
+    const semantic_project_id = try semanticIdentityOptionalStringField(parsed_identity.value, "project_id");
+    if ((provider == .vertex and semantic_project_id.len == 0) or
+        (provider != .vertex and semantic_project_id.len != 0) or
+        (embedder_cfg.project_id.len > 0 and !std.mem.eql(u8, semantic_project_id, embedder_cfg.project_id)))
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
@@ -2540,9 +2835,10 @@ fn validateCatalogOwnerSemanticIdentity(
     // is empty. Runtime binding must not discover that an extension-installed
     // owner omitted the field only after the catalog has committed.
     const semantic_region = try semanticIdentityStringField(parsed_identity.value, "region");
-    if ((provider == .bedrock and semantic_region.len == 0) or
-        (provider != .bedrock and semantic_region.len != 0) or
-        (embedder_cfg.region.len > 0 and !std.mem.eql(u8, semantic_region, embedder_cfg.region)))
+    if (((provider == .bedrock or provider == .vertex) and semantic_region.len == 0) or
+        (provider != .bedrock and provider != .vertex and semantic_region.len != 0) or
+        (provider == .bedrock and embedder_cfg.region.len > 0 and !std.mem.eql(u8, semantic_region, embedder_cfg.region)) or
+        (provider == .vertex and embedder_cfg.location.len > 0 and !std.mem.eql(u8, semantic_region, embedder_cfg.location)))
     {
         return error.InvalidEmbeddingArtifactProducer;
     }
@@ -2553,6 +2849,8 @@ fn validateCatalogOwnerSemanticIdentity(
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
+            .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
+            .gemini, .vertex => try alloc.dupe(u8, std.mem.trimEnd(u8, embedder_cfg.url, "/")),
             .bedrock => try alloc.dupe(u8, embedder_cfg.url),
             .antfly => normalizeAntflyInferenceBaseUrl(alloc, embedder_cfg.url) catch
                 return error.InvalidEmbeddingArtifactProducer,
@@ -2687,9 +2985,13 @@ fn semanticIdentityFieldsEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
 fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
     if (std.mem.eql(u8, name, "multimodal")) return .{ .bool = false };
     if (std.mem.eql(u8, name, "region") or
+        std.mem.eql(u8, name, "project_id") or
         std.mem.eql(u8, name, "request_format") or
         std.mem.eql(u8, name, "input_type") or
-        std.mem.eql(u8, name, "truncate"))
+        std.mem.eql(u8, name, "truncate") or
+        std.mem.eql(u8, name, "query_input_type") or
+        std.mem.eql(u8, name, "document_input_type") or
+        std.mem.eql(u8, name, "query_instruction"))
     {
         return .{ .string = "" };
     }
@@ -2725,6 +3027,62 @@ fn validateCatalogSemanticProducerOwner(
         if (!semanticIdentityFieldsEqual(field.value_ptr.*, producer_field))
             return error.InvalidEmbeddingArtifactProducer;
     }
+
+    // The owner-to-producer pass above accepts omitted fields at their
+    // canonical defaults. Compare in the other direction as well so a
+    // producer cannot add a non-default retrieval role or deployment field
+    // that was absent from the admitted owner identity.
+    var producer_fields = producer.object.iterator();
+    while (producer_fields.next()) |field| {
+        const owner_field = owner_identity.value.object.get(field.key_ptr.*) orelse
+            semanticIdentityDefaultField(field.key_ptr.*) orelse
+            return error.InvalidEmbeddingArtifactProducer;
+        if (!semanticIdentityFieldsEqual(field.value_ptr.*, owner_field))
+            return error.InvalidEmbeddingArtifactProducer;
+    }
+}
+
+pub fn testCatalogSemanticIdentityRejectsProducerOnlyFields() !void {
+    const owner_identity =
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":""}
+    ;
+    var producer = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":"","query_input_type":"custom_query"}
+    ,
+        .{},
+    );
+    defer producer.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingArtifactProducer,
+        validateCatalogSemanticProducerOwner(std.testing.allocator, producer.value, .{
+            .sparse = false,
+            .dimensions = 1024,
+            .semantic_producer_json = owner_identity,
+            .index_value = .null,
+        }),
+    );
+
+    var canonical_default = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"version":2,"provider":"cohere","model":"embed-v4.0","endpoint":"https://api.cohere.com/v2","region":"","request_format":"","sparse":false,"multimodal":false,"input_type":"","truncate":"","query_input_type":""}
+    ,
+        .{},
+    );
+    defer canonical_default.deinit();
+    try validateCatalogSemanticProducerOwner(std.testing.allocator, canonical_default.value, .{
+        .sparse = false,
+        .dimensions = 1024,
+        .semantic_producer_json = owner_identity,
+        .index_value = .null,
+    });
+}
+
+test "catalog semantic identity rejects producer-only retrieval fields" {
+    try testCatalogSemanticIdentityRejectsProducerOnlyFields();
 }
 
 fn validateCatalogEmbeddingProducerOwnership(
@@ -3116,11 +3474,13 @@ fn parseManagedEmbeddingEntry(
 const CatalogSemanticExecutionBinding = struct {
     endpoint: []u8,
     region: []u8,
+    project_id: []u8,
     embedded: bool,
 
     fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.endpoint);
         if (self.region.len > 0) alloc.free(self.region);
+        if (self.project_id.len > 0) alloc.free(self.project_id);
         self.* = undefined;
     }
 };
@@ -3158,6 +3518,7 @@ fn catalogSemanticExecutionBindingAlloc(
         return error.InvalidEmbeddingArtifactProducer;
     const endpoint = try semanticIdentityStringField(identity.value, "endpoint");
     const region = try semanticIdentityStringField(identity.value, "region");
+    const project_id = try semanticIdentityOptionalStringField(identity.value, "project_id");
     const embedded = std.mem.eql(u8, endpoint, "antfly:embedded");
     if (embedded and options.antfly_provider == null)
         return error.InvalidEmbeddingArtifactProducer;
@@ -3166,9 +3527,12 @@ fn catalogSemanticExecutionBindingAlloc(
     errdefer alloc.free(owned_endpoint);
     const owned_region: []u8 = if (region.len > 0) try alloc.dupe(u8, region) else @constCast("");
     errdefer if (owned_region.len > 0) alloc.free(owned_region);
+    const owned_project_id: []u8 = if (project_id.len > 0) try alloc.dupe(u8, project_id) else @constCast("");
+    errdefer if (owned_project_id.len > 0) alloc.free(owned_project_id);
     return .{
         .endpoint = owned_endpoint,
         .region = owned_region,
+        .project_id = owned_project_id,
         .embedded = embedded,
     };
 }
@@ -3195,7 +3559,10 @@ fn buildManagedEmbeddingEntry(
     semantic_binding: ?CatalogSemanticExecutionBinding,
 ) !ManagedEmbeddingEntry {
     const sparse = cfg.sparse orelse false;
-    var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder);
+    var embedder_cfg = parseEmbedderConfigFromValue(alloc, embedder) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidManagedEmbeddingIndex,
+    };
     defer embedder_cfg.deinit(alloc);
 
     const provider = try parseEmbedderProvider(embedder_cfg);
@@ -3236,19 +3603,41 @@ fn buildManagedEmbeddingEntry(
     const owned_model = try alloc.dupe(u8, embedder_cfg.model);
     errdefer alloc.free(owned_model);
 
-    const bedrock_region: []u8 = if (semantic_binding) |binding|
+    const provider_region: []u8 = if (semantic_binding) |binding|
         if (binding.region.len > 0) try alloc.dupe(u8, binding.region) else @constCast("")
     else if (provider == .bedrock)
         try resolveBedrockRegion(alloc, embedder_cfg)
+    else if (provider == .vertex)
+        try resolveVertexLocation(alloc, embedder_cfg)
     else
         @constCast("");
-    errdefer if (bedrock_region.len > 0) alloc.free(bedrock_region);
+    errdefer if (provider_region.len > 0) alloc.free(provider_region);
+    const project_id: []u8 = if (provider == .vertex and semantic_binding != null)
+        try alloc.dupe(u8, semantic_binding.?.project_id)
+    else if (provider == .vertex and embedder_cfg.project_id.len > 0)
+        try alloc.dupe(u8, embedder_cfg.project_id)
+    else
+        @constCast("");
+    errdefer if (project_id.len > 0) alloc.free(project_id);
+    const credentials_path: []u8 = if (provider == .vertex and embedder_cfg.credentials_path.len > 0)
+        try alloc.dupe(u8, embedder_cfg.credentials_path)
+    else
+        @constCast("");
+    errdefer if (credentials_path.len > 0) alloc.free(credentials_path);
+    const location: []u8 = if (provider == .vertex)
+        try alloc.dupe(u8, provider_region)
+    else
+        @constCast("");
+    errdefer if (location.len > 0) alloc.free(location);
     const base_url = if (semantic_binding) |binding|
         try alloc.dupe(u8, if (binding.embedded) "" else binding.endpoint)
     else switch (provider) {
         .openai => try resolveOpenAiBaseUrl(alloc, embedder_cfg),
         .ollama => try resolveOllamaBaseUrl(alloc, embedder_cfg),
-        .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, bedrock_region),
+        .bedrock => try resolveBedrockEndpoint(alloc, embedder_cfg, provider_region),
+        .cohere => try resolveCohereBaseUrl(alloc, embedder_cfg),
+        .gemini => try resolveGeminiBaseUrl(alloc, embedder_cfg),
+        .vertex => try resolveVertexBaseUrl(alloc, embedder_cfg, provider_region),
         .antfly => if (antfly_provider != null)
             try alloc.dupe(u8, "")
         else
@@ -3257,16 +3646,24 @@ fn buildManagedEmbeddingEntry(
     errdefer alloc.free(base_url);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
     errdefer if (input_type.len > 0) alloc.free(input_type);
+    const query_input_type = if (embedder_cfg.query_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.query_input_type) else @constCast("");
+    errdefer if (query_input_type.len > 0) alloc.free(query_input_type);
+    const document_input_type = if (embedder_cfg.document_input_type.len > 0) try alloc.dupe(u8, embedder_cfg.document_input_type) else @constCast("");
+    errdefer if (document_input_type.len > 0) alloc.free(document_input_type);
+    const query_instruction = if (embedder_cfg.query_instruction.len > 0) try alloc.dupe(u8, embedder_cfg.query_instruction) else @constCast("");
+    errdefer if (query_instruction.len > 0) alloc.free(query_instruction);
     const truncate = if (embedder_cfg.truncate.len > 0) try alloc.dupe(u8, embedder_cfg.truncate) else @constCast("");
     errdefer if (truncate.len > 0) alloc.free(truncate);
     const api_key = switch (provider) {
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
+        .cohere => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
+        .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
         .antfly => try common_secrets.SecretValue.initConfigOrEnv(
             alloc,
             embedder_cfg.api_key orelse options.inference_api_key,
             "ANTFLY_INFERENCE_API_KEY",
         ),
-        .ollama, .bedrock => null,
+        .ollama, .bedrock, .vertex => null,
     };
     errdefer if (api_key) |*owned_api_key| owned_api_key.deinit(alloc);
 
@@ -3282,9 +3679,15 @@ fn buildManagedEmbeddingEntry(
         .provider = provider,
         .model = owned_model,
         .base_url = base_url,
-        .region = bedrock_region,
+        .region = provider_region,
+        .project_id = project_id,
+        .location = location,
+        .credentials_path = credentials_path,
         .bedrock_request_format = bedrock_request_format,
         .input_type = input_type,
+        .query_input_type = query_input_type,
+        .document_input_type = document_input_type,
+        .query_instruction = query_instruction,
         .truncate = truncate,
         .api_key = api_key,
         .secret_store = options.secret_store,
@@ -3311,6 +3714,9 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
             .bedrock_embedder_config => |value| value.dimension orelse value.dimensions,
+            .cohere_embedder_config => null,
+            .google_embedder_config => |value| value.dimension,
+            .vertex_embedder_config => |value| value.dimension,
             .antfly_embedder_config => null,
         };
         if (declared) |dimension| {
@@ -3515,6 +3921,9 @@ fn parseEmbedderProvider(embedder: embeddings_types.Config) !ProviderKind {
         .openai => .openai,
         .ollama => .ollama,
         .bedrock => .bedrock,
+        .cohere => .cohere,
+        .gemini => .gemini,
+        .vertex => .vertex,
         .antfly => .antfly,
         else => error.UnsupportedEmbeddingProvider,
     };
@@ -3569,6 +3978,9 @@ fn providerRequestsPerMinuteEnv(provider: ProviderKind) [:0]const u8 {
         .openai => "ANTFLY_OPENAI_EMBED_REQUESTS_PER_MINUTE",
         .ollama => "ANTFLY_OLLAMA_EMBED_REQUESTS_PER_MINUTE",
         .bedrock => "ANTFLY_BEDROCK_EMBED_REQUESTS_PER_MINUTE",
+        .cohere => "ANTFLY_COHERE_EMBED_REQUESTS_PER_MINUTE",
+        .gemini => "ANTFLY_GEMINI_EMBED_REQUESTS_PER_MINUTE",
+        .vertex => "ANTFLY_VERTEX_EMBED_REQUESTS_PER_MINUTE",
         .antfly => "ANTFLY_INFERENCE_EMBED_REQUESTS_PER_MINUTE",
     };
 }
@@ -3578,6 +3990,9 @@ fn providerBurstEnv(provider: ProviderKind) [:0]const u8 {
         .openai => "ANTFLY_OPENAI_EMBED_BURST",
         .ollama => "ANTFLY_OLLAMA_EMBED_BURST",
         .bedrock => "ANTFLY_BEDROCK_EMBED_BURST",
+        .cohere => "ANTFLY_COHERE_EMBED_BURST",
+        .gemini => "ANTFLY_GEMINI_EMBED_BURST",
+        .vertex => "ANTFLY_VERTEX_EMBED_BURST",
         .antfly => "ANTFLY_INFERENCE_EMBED_BURST",
     };
 }
@@ -3866,6 +4281,16 @@ fn embedWithEntryParts(
     parts: []const template_mod.ContentPart,
     dims: u32,
 ) ![]f32 {
+    return embedWithEntryPartsForTask(alloc, entry, parts, dims, .retrieval_document);
+}
+
+fn embedWithEntryPartsForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    parts: []const template_mod.ContentPart,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         try waitForEntryPacer(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -3875,11 +4300,11 @@ fn embedWithEntryParts(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
-            .input_type = entry.input_type,
+            .input_type = effectiveInputType(entry, task_type),
             .truncate = entry.truncate,
             .dimension = dims,
             .cancellation = entry.cancellation,
-        }, &@constCast(entry).bedrock_credentials);
+        }, entry.bedrock_credentials orelse return error.MissingBedrockCredentialCache);
         defer provider.deinit();
 
         var result = try provider.embedParts(alloc, entry.model, parts);
@@ -3895,7 +4320,7 @@ fn embedWithEntryParts(
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
                 try waitForEntryPacer(entry);
-                const context = embeddingRequestContext(entry);
+                const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_parts_with_context) |embed_parts_with_context|
                     AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
@@ -3925,7 +4350,13 @@ fn embedWithEntryParts(
             }
         }
 
-        var result = provider.embedParts(alloc, entry.model, parts) catch |err| switch (err) {
+        var result = provider.embedPartsWithTask(
+            alloc,
+            entry.model,
+            parts,
+            task_type.canonical(),
+            effectiveInstruction(entry, task_type),
+        ) catch |err| switch (err) {
             error.EmptyResponse => return error.EmptyEmbeddingResponse,
             else => return err,
         };
@@ -3936,9 +4367,15 @@ fn embedWithEntryParts(
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
+    // Text-only provider adapters must never turn media into an empty string
+    // or URL-shaped text. Bedrock and Antfly return above through adapters
+    // that preserve binary parts; the remaining providers currently expose
+    // only their text embedding contract through Antfly.
+    if (partsContainMedia(parts)) return error.UnsupportedEmbeddingProvider;
+
     const flattened = try flattenContentPartsToText(alloc, parts);
     defer alloc.free(flattened);
-    return try embedWithEntry(alloc, entry, flattened, dims);
+    return try embedWithEntryForTask(alloc, entry, flattened, dims, task_type);
 }
 
 fn embedSparseWithEntry(
@@ -4019,7 +4456,7 @@ fn embedSparseBatchWithEntry(
             try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
-        .openai, .ollama, .bedrock => return error.UnsupportedEmbeddingProvider,
+        .openai, .ollama, .bedrock, .cohere, .gemini, .vertex => return error.UnsupportedEmbeddingProvider,
     }
 }
 
@@ -4033,12 +4470,28 @@ fn partsContainMedia(parts: []const template_mod.ContentPart) bool {
     return false;
 }
 
+pub fn testTextOnlyManagedProvidersRejectMedia() !void {
+    var managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"vertex_idx":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"test-project","location":"us-central1"}}}
+    );
+    defer managed.deinit();
+
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedEmbeddingProvider,
+        embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3072),
+    );
+}
+
 fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
     const raw = try resolveConfigString(
         alloc,
         if (embedder.url.len > 0) embedder.url else null,
         "OPENAI_BASE_URL",
-        "https://api.openai.com",
+        provider_defaults.openai_origin,
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/v1");
@@ -4049,10 +4502,45 @@ fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Con
         alloc,
         if (embedder.url.len > 0) embedder.url else null,
         "OLLAMA_HOST",
-        "http://localhost:11434",
+        provider_defaults.ollama_origin,
     );
     defer alloc.free(raw);
     return try appendPathIfMissing(alloc, raw, "/v1");
+}
+
+fn resolveCohereBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    const raw = try resolveConfigString(
+        alloc,
+        if (embedder.url.len > 0) embedder.url else null,
+        "COHERE_BASE_URL",
+        provider_defaults.cohere_origin,
+    );
+    defer alloc.free(raw);
+    return try appendPathIfMissing(alloc, raw, "/v2");
+}
+
+fn resolveGeminiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    const raw = try resolveConfigString(
+        alloc,
+        if (embedder.url.len > 0) embedder.url else null,
+        "GEMINI_BASE_URL",
+        provider_defaults.gemini_v1beta_base,
+    );
+    defer alloc.free(raw);
+    return try alloc.dupe(u8, std.mem.trimEnd(u8, raw, "/"));
+}
+
+fn resolveVertexLocation(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
+    return try resolveConfigString(
+        alloc,
+        if (embedder.location.len > 0) embedder.location else null,
+        "GOOGLE_CLOUD_LOCATION",
+        provider_defaults.default_google_location,
+    );
+}
+
+fn resolveVertexBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config, location: []const u8) ![]u8 {
+    return try provider_defaults.vertexRegionalV1BaseAlloc(alloc, embedder.url, location);
 }
 
 fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config, options: InitOptions) ![]u8 {
@@ -4091,12 +4579,11 @@ fn resolveBedrockRegion(alloc: std.mem.Allocator, embedder: embeddings_types.Con
     if (embedder.region.len > 0) return try alloc.dupe(u8, embedder.region);
     if (resolveOptionalEnv(alloc, "AWS_REGION")) |value| return value;
     if (resolveOptionalEnv(alloc, "AWS_DEFAULT_REGION")) |value| return value;
-    return try alloc.dupe(u8, "us-east-1");
+    return try alloc.dupe(u8, provider_defaults.default_aws_region);
 }
 
 fn resolveBedrockEndpoint(alloc: std.mem.Allocator, embedder: embeddings_types.Config, region: []const u8) ![]u8 {
-    if (embedder.url.len > 0) return try alloc.dupe(u8, embedder.url);
-    return try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{region});
+    return try provider_defaults.bedrockRuntimeEndpointAlloc(alloc, embedder.url, region);
 }
 
 fn resolveConfigString(
@@ -4145,7 +4632,17 @@ fn embedWithEntry(
     text: []const u8,
     dims: u32,
 ) ![]f32 {
-    const vectors = try embedBatchWithEntry(alloc, entry, &.{text}, dims);
+    return embedWithEntryForTask(alloc, entry, text, dims, .retrieval_document);
+}
+
+fn embedWithEntryForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    text: []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
+    const vectors = try embedBatchWithEntryForTask(alloc, entry, &.{text}, dims, task_type);
     errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
     if (vectors.len == 0) return error.EmptyEmbeddingResponse;
 
@@ -4160,20 +4657,95 @@ fn embedBatchWithEntry(
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
+    return embedBatchWithEntryForTask(alloc, entry, texts, dims, .retrieval_document);
+}
+
+fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    const role_override = switch (task_type) {
+        .retrieval_query => entry.query_input_type,
+        .retrieval_document => entry.document_input_type,
+    };
+    if (role_override.len > 0) return role_override;
+    // Backward-compatible expert override: the legacy field applies to both
+    // roles. New configurations should prefer the role-specific fields.
+    if (entry.input_type.len > 0) return entry.input_type;
+    return task_type.cohereInputType();
+}
+
+fn effectiveInstruction(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) ?[]const u8 {
+    if (task_type != .retrieval_query or entry.query_instruction.len == 0) return null;
+    return entry.query_instruction;
+}
+
+pub fn testEmbeddingTaskRouting() !void {
+    const entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .index_name = @constCast("semantic"),
+        .provider = .bedrock,
+        .model = @constCast("cohere.embed-v4:0"),
+        .base_url = @constCast("https://bedrock.example"),
+        .dimensions = 1024,
+        .query_input_type = @constCast("custom_query"),
+    };
+    try std.testing.expectEqualStrings("custom_query", effectiveInputType(&entry, .retrieval_query));
+    try std.testing.expectEqualStrings("search_document", effectiveInputType(&entry, .retrieval_document));
+    try std.testing.expect(effectiveInstruction(&entry, .retrieval_query) == null);
+    try std.testing.expect(effectiveInstruction(&entry, .retrieval_document) == null);
+
+    const query_context = embeddingRequestContext(&entry, .retrieval_query);
+    try std.testing.expectEqual(EmbeddingTaskType.retrieval_query, query_context.task_type);
+    try std.testing.expect(query_context.instruction == null);
+    const document_context = embeddingRequestContext(&entry, .retrieval_document);
+    try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, document_context.task_type);
+    try std.testing.expect(document_context.instruction == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"provider":"bedrock","model":"cohere.embed-v4:0","region":"us-east-1","retrieval":{"query_input_type":"search_query","document_input_type":"search_document"}}
+    , .{});
+    defer parsed.deinit();
+    var config = try parseEmbedderConfigFromValue(std.testing.allocator, parsed.value);
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("search_query", config.query_input_type);
+    try std.testing.expectEqualStrings("search_document", config.document_input_type);
+    try std.testing.expectEqualStrings("", config.query_instruction);
+
+    var antfly_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF","retrieval":{"query_instruction":"retrieve passages"}}
+    , .{});
+    defer antfly_parsed.deinit();
+    var antfly_config = try parseEmbedderConfigFromValue(std.testing.allocator, antfly_parsed.value);
+    defer antfly_config.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("retrieve passages", antfly_config.query_instruction);
+}
+
+test "managed embeddings derive provider task types from query and document operations" {
+    try testEmbeddingTaskRouting();
+}
+
+fn embedBatchWithEntryForTask(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
     switch (entry.provider) {
         .openai, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
-                return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims);
+                return try embedBatchWithOpenAiCompatiblePacedChunks(alloc, entry, texts, dims, task_type);
             }
-            return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims);
+            return try embedBatchWithOpenAiCompatible(alloc, entry, texts, dims, task_type);
         },
         .bedrock => {
-            return try embedBatchWithBedrock(alloc, entry, texts, dims);
+            return try embedBatchWithBedrock(alloc, entry, texts, dims, task_type);
         },
+        .cohere => return try embedBatchWithCohere(alloc, entry, texts, dims, task_type),
+        .gemini => return try embedBatchWithGemini(alloc, entry, texts, dims, task_type),
+        .vertex => return try embedBatchWithVertex(alloc, entry, texts, dims, task_type),
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const context = embeddingRequestContext(entry);
+                const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
@@ -4203,7 +4775,13 @@ fn embedBatchWithEntry(
                 }
             }
 
-            var result = try provider.embedder().embed(alloc, entry.model, texts);
+            var result = try provider.embedWithTask(
+                alloc,
+                entry.model,
+                texts,
+                task_type.canonical(),
+                effectiveInstruction(entry, task_type),
+            );
             errdefer result.deinit();
             try validateDenseBatch(result.vectors, texts.len, dims);
             return try adoptDenseBatchResult(alloc, &result);
@@ -4211,11 +4789,204 @@ fn embedBatchWithEntry(
     }
 }
 
+fn embeddingHttpCancellation(entry: *const ManagedEmbeddingEntry) ?httpx.CancellationToken {
+    return if (entry.cancellation) |token|
+        httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+    else
+        null;
+}
+
+fn effectiveProviderTaskType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    const role_override = switch (task_type) {
+        .retrieval_query => entry.query_input_type,
+        .retrieval_document => entry.document_input_type,
+    };
+    return if (role_override.len > 0) role_override else task_type.canonical();
+}
+
+fn embedBatchWithGemini(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    try waitForEntryPacer(entry);
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer http.deinit();
+    const api_key_ref = if (entry.api_key) |*value| value else return error.MissingEmbeddingApiKey;
+    const api_key = (try api_key_ref.resolveOwned(alloc, entry.secret_store)) orelse return error.MissingEmbeddingApiKey;
+    defer alloc.free(api_key);
+    var provider = try vertex_provider.GeminiProvider.init(alloc, &http, .{
+        .base_url = entry.base_url,
+        .api_key = api_key,
+    });
+    defer provider.deinit();
+    var result = try provider.embedText(alloc, entry.model, texts, .{
+        .task_type = effectiveProviderTaskType(entry, task_type),
+        .dimensions = if (dims > 0) dims else null,
+        .cancellation = embeddingHttpCancellation(entry),
+    });
+    errdefer result.deinit();
+    try validateDenseBatch(result.vectors, texts.len, dims);
+    return try adoptDenseBatchResult(alloc, &result);
+}
+
+fn embedBatchWithVertex(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    if (texts.len == 0) return error.EmptyEmbeddingResponse;
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer http.deinit();
+    const token_source = if (entry.google_credentials) |manager|
+        manager.tokenSource(
+            if (entry.credentials_path.len > 0) entry.credentials_path else null,
+            vertex_provider.vertex_auth_scope,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.MissingVertexCredentials,
+        }
+    else
+        null;
+    var provider = try vertex_provider.Provider.init(alloc, &http, .{
+        .base_url = entry.base_url,
+        .project_id = if (entry.project_id.len > 0) entry.project_id else null,
+        .location = entry.location,
+        .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
+        .token_source = token_source,
+    });
+    defer provider.deinit();
+
+    var out = std.ArrayListUnmanaged([]const f32).empty;
+    errdefer {
+        for (out.items) |vector| alloc.free(vector);
+        out.deinit(alloc);
+    }
+
+    const max_batch = provider_defaults.vertexMaxEmbeddingBatchSize(entry.model);
+    var offset: usize = 0;
+    while (offset < texts.len) {
+        const end = cappedEmbeddingBatchEnd(offset, texts.len, max_batch);
+        try waitForEntryPacer(entry);
+        var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
+            .task_type = effectiveProviderTaskType(entry, task_type),
+            .dimensions = if (dims > 0) dims else null,
+            .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(entry) else null,
+            .cancellation = embeddingHttpCancellation(entry),
+        });
+        errdefer result.deinit();
+        try validateDenseBatch(result.vectors, end - offset, dims);
+        try out.ensureUnusedCapacity(alloc, result.vectors.len);
+        const vectors = try adoptDenseBatchResult(alloc, &result);
+        for (vectors) |vector| out.appendAssumeCapacity(vector);
+        alloc.free(vectors);
+        offset = end;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn embedBatchWithCohere(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    var out = std.ArrayListUnmanaged([]const f32).empty;
+    errdefer {
+        for (out.items) |vector| alloc.free(vector);
+        out.deinit(alloc);
+    }
+
+    var offset: usize = 0;
+    while (offset < texts.len) {
+        const end = cappedEmbeddingBatchEnd(
+            offset,
+            texts.len,
+            provider_defaults.cohere_max_embedding_batch_size,
+        );
+        const vectors = try embedBatchWithCohereRequest(alloc, entry, texts[offset..end], dims, task_type);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try out.ensureUnusedCapacity(alloc, vectors.len);
+        for (vectors) |vector| out.appendAssumeCapacity(vector);
+        alloc.free(vectors);
+        offset = end;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn embedBatchWithCohereRequest(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    const Request = struct {
+        model: []const u8,
+        texts: []const []const u8,
+        input_type: []const u8,
+        embedding_types: []const []const u8 = &.{"float"},
+        output_dimension: ?u32 = null,
+        truncate: ?[]const u8 = null,
+    };
+    const Response = struct {
+        embeddings: struct { float: []const []const f32 = &.{} },
+    };
+    const body = try std.json.Stringify.valueAlloc(alloc, Request{
+        .model = entry.model,
+        .texts = texts,
+        .input_type = effectiveInputType(entry, task_type),
+        .output_dimension = if (dims > 0 and std.mem.indexOf(u8, entry.model, "v4") != null) dims else null,
+        .truncate = if (entry.truncate.len > 0) entry.truncate else null,
+    }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(body);
+    const url = try std.fmt.allocPrint(alloc, "{s}/embed", .{entry.base_url});
+    defer alloc.free(url);
+    const api_key_ref = if (entry.api_key) |*value| value else return error.MissingEmbeddingApiKey;
+    const auth_header = (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) orelse
+        return error.MissingEmbeddingApiKey;
+    defer alloc.free(auth_header);
+    const headers = [_][2][]const u8{
+        .{ "content-type", "application/json" },
+        .{ "authorization", auth_header },
+    };
+    try waitForEntryPacer(entry);
+    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer client.deinit();
+    var response = try client.post(url, .{
+        .json = body,
+        .headers = &headers,
+        .cancellation = embeddingHttpCancellation(entry),
+    });
+    defer response.deinit();
+    if (!response.ok()) return mapEmbedStatus(response.status.code);
+    var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyEmbeddingResponse, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try validateDenseBatch(parsed.value.embeddings.float, texts.len, dims);
+    const vectors = try alloc.alloc([]const f32, texts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    for (parsed.value.embeddings.float, 0..) |vector, i| {
+        vectors[i] = try alloc.dupe(f32, vector);
+        initialized += 1;
+    }
+    return vectors;
+}
+
 fn embedBatchWithBedrock(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     const max_batch = bedrock_provider.maxBatchSizeForFormat(entry.bedrock_request_format);
     var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -4227,7 +4998,7 @@ fn embedBatchWithBedrock(
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + max_batch);
-        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims);
+        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims, task_type);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -4242,6 +5013,7 @@ fn embedBatchWithBedrockRequest(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     try waitForEntryPacer(entry);
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -4250,11 +5022,11 @@ fn embedBatchWithBedrockRequest(
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
-        .input_type = entry.input_type,
+        .input_type = effectiveInputType(entry, task_type),
         .truncate = entry.truncate,
         .dimension = dims,
         .cancellation = entry.cancellation,
-    }, &@constCast(entry).bedrock_credentials);
+    }, entry.bedrock_credentials orelse return error.MissingBedrockCredentialCache);
     defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
@@ -4267,6 +5039,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     const chunk_size = @max(@as(usize, 1), @as(usize, @intCast(entry.burst)));
     var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -4278,7 +5051,7 @@ fn embedBatchWithOpenAiCompatiblePacedChunks(
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + chunk_size);
-        const vectors = try embedBatchWithOpenAiCompatible(alloc, entry, texts[offset..end], dims);
+        const vectors = try embedBatchWithOpenAiCompatible(alloc, entry, texts[offset..end], dims, task_type);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -4293,7 +5066,9 @@ fn embedBatchWithOpenAiCompatible(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
     dims: u32,
+    task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    _ = task_type;
     const Request = openai_api.types.CreateEmbeddingRequest;
     const Response = struct {
         data: []const struct {
@@ -4388,6 +5163,123 @@ fn mapEmbedStatus(status: u16) anyerror {
         => error.EmbedTransientFailure,
         else => if (status >= 500 and status < 600) error.EmbedTransientFailure else error.EmbedRequestFailed,
     };
+}
+
+fn cappedEmbeddingBatchEnd(offset: usize, total: usize, maximum: usize) usize {
+    std.debug.assert(offset <= total);
+    std.debug.assert(maximum > 0);
+    return offset + @min(total - offset, maximum);
+}
+
+pub fn testCohereBatchLimit() !void {
+    const maximum = provider_defaults.cohere_max_embedding_batch_size;
+    try std.testing.expectEqual(@as(usize, 96), cappedEmbeddingBatchEnd(0, 97, maximum));
+    try std.testing.expectEqual(@as(usize, 97), cappedEmbeddingBatchEnd(96, 97, maximum));
+    try std.testing.expectEqual(@as(usize, 12), cappedEmbeddingBatchEnd(0, 12, maximum));
+}
+
+test "Cohere embedding batches respect the provider request limit" {
+    try testCohereBatchLimit();
+}
+
+pub fn testVertexEmbeddingRequestPlanning() !void {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        vertexEmbeddingRequestCount("gemini-embedding-001", 2),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        vertexEmbeddingRequestCount("text-embedding-005", 251),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        vertexEmbeddingRequestCount("gemini-embedding-001", 0),
+    );
+}
+
+test "Vertex embedding request planning matches model-specific wire limits" {
+    try testVertexEmbeddingRequestPlanning();
+}
+
+pub fn testManagedVertexCredentialManagerLifetime() !void {
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"test-project","location":"us-central1"}}}
+    ;
+    var provider_runtime = ProviderRuntime.init(
+        std.testing.allocator,
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    defer provider_runtime.deinit();
+
+    var first_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer first_request.deinit();
+    var second_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer second_request.deinit();
+
+    try std.testing.expect(first_request.owned_google_credentials == null);
+    try std.testing.expect(second_request.owned_google_credentials == null);
+    try std.testing.expect(first_request.entries[0].google_credentials == &provider_runtime.google_credentials);
+    try std.testing.expect(second_request.entries[0].google_credentials == &provider_runtime.google_credentials);
+}
+
+test "request-scoped managed Vertex embedders borrow the service credential manager" {
+    try testManagedVertexCredentialManagerLifetime();
+}
+
+test "request-scoped managed Bedrock embedders borrow region-scoped credential caches" {
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"cohere.embed-v4:0","request_format":"cohere_v4","region":"us-east-1"}}}
+    ;
+    var provider_runtime = ProviderRuntime.init(
+        std.testing.allocator,
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    defer provider_runtime.deinit();
+
+    var first_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer first_request.deinit();
+    var second_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer second_request.deinit();
+
+    const east_cache = first_request.entries[0].bedrock_credentials.?;
+    try std.testing.expect(east_cache == second_request.entries[0].bedrock_credentials.?);
+    try std.testing.expect(!first_request.entries[0].owns_bedrock_credentials);
+    try std.testing.expect(!second_request.entries[0].owns_bedrock_credentials);
+    const west_cache = try provider_runtime.bedrock_credentials.cacheForRegion("us-west-2");
+    try std.testing.expect(east_cache != west_cache);
+}
+
+test "standalone managed Bedrock embedders own their credential cache" {
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"cohere.embed-v4:0","request_format":"cohere_v4","region":"us-east-1"}}}
+    ;
+    var embedder = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, indexes_json);
+    defer embedder.deinit();
+
+    try std.testing.expect(embedder.entries[0].bedrock_credentials != null);
+    try std.testing.expect(embedder.entries[0].owns_bedrock_credentials);
+}
+
+fn vertexEmbeddingRequestCount(model: []const u8, input_count: usize) usize {
+    if (input_count == 0) return 0;
+    const maximum = provider_defaults.vertexMaxEmbeddingBatchSize(model);
+    return input_count / maximum + @intFromBool(input_count % maximum != 0);
 }
 
 fn adoptDenseBatchResult(
@@ -4792,11 +5684,61 @@ pub fn testQueryEmbeddingCacheKeys() !void {
     const credential_a = try first_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
     const credential_b = try second_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
 
+    var vertex_project_a = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1","credentials_path":"credentials-a.json"}}}
+    );
+    defer vertex_project_a.deinit();
+    var vertex_project_b = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-b","location":"us-central1","credentials_path":"credentials-a.json"}}}
+    );
+    defer vertex_project_b.deinit();
+    var vertex_credentials_b = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1","credentials_path":"credentials-b.json"}}}
+    );
+    defer vertex_credentials_b.deinit();
+    var vertex_default_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1"}}}
+    );
+    defer vertex_default_credentials.deinit();
+    var vertex_sentinel_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1","credentials_path":"<default-adc>"}}}
+    );
+    defer vertex_sentinel_credentials.deinit();
+    const vertex_a = try vertex_project_a.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_b = try vertex_project_b.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_credential_b = try vertex_credentials_b.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_default = try vertex_default_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_sentinel = try vertex_sentinel_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+
+    const bedrock_profile = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings";
+    const bedrock_v3_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"dense\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1024,\"embedder\":{{\"provider\":\"bedrock\",\"model\":\"{s}\",\"request_format\":\"cohere_v3\",\"region\":\"us-east-1\"}}}}}}",
+        .{bedrock_profile},
+    );
+    defer std.testing.allocator.free(bedrock_v3_json);
+    const bedrock_v4_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"dense\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1024,\"embedder\":{{\"provider\":\"bedrock\",\"model\":\"{s}\",\"request_format\":\"cohere_v4\",\"region\":\"us-east-1\"}}}}}}",
+        .{bedrock_profile},
+    );
+    defer std.testing.allocator.free(bedrock_v4_json);
+    var bedrock_v3 = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, bedrock_v3_json);
+    defer bedrock_v3.deinit();
+    var bedrock_v4 = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, bedrock_v4_json);
+    defer bedrock_v4.deinit();
+    const bedrock_format_v3 = try bedrock_v3.queryCacheKey("dense", .principal, "alice", "exact input");
+    const bedrock_format_v4 = try bedrock_v4.queryCacheKey("dense", .principal, "alice", "exact input");
+
     try std.testing.expectEqual(first, equivalent);
     try std.testing.expect(!std.mem.eql(u8, &first, &other_principal));
     try std.testing.expect(!std.mem.eql(u8, &first, &anonymous));
     try std.testing.expect(!std.mem.eql(u8, &first, &changed_text));
     try std.testing.expect(!std.mem.eql(u8, &credential_a, &credential_b));
+    try std.testing.expect(!std.mem.eql(u8, &vertex_a, &vertex_b));
+    try std.testing.expect(!std.mem.eql(u8, &vertex_a, &vertex_credential_b));
+    try std.testing.expect(!std.mem.eql(u8, &vertex_default, &vertex_sentinel));
+    try std.testing.expect(!std.mem.eql(u8, &bedrock_format_v3, &bedrock_format_v4));
 }
 
 test "query embedding cache keys share equivalent indexes and isolate security domains" {

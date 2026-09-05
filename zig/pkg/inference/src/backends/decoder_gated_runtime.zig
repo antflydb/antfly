@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const contracts = @import("../graph/backend_contracts.zig");
@@ -1427,6 +1428,14 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
         // the retained KV. The remaining unsupported cases are the extra
         // decoder-side sublayers that still branch the block structure.
         .llama, .mistral, .qwen2, .qwen3 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
+        // Qwen3-VL shares the dense Qwen3 decoder block. Keep its prepared
+        // slots unavailable unless the paired per-layer frame is explicitly
+        // enabled: using the slots through the generic synchronous path has
+        // not passed the model-token gate independently.
+        .qwen3_vl => platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_SLOTS", false) and
+            platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_QWEN3VL_PREFILL_FRAME", false) and
+            !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_FAST_PATH", false) and
+            !gpt_config.usesMoe() and !gpt_config.hasPle(),
         .gemma => gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config),
         else => false,
     };
@@ -4878,28 +4887,12 @@ fn prepareLinearNoBiasSlotForConfigTagged(
     tags: PrepareSlotTags,
 ) !bool {
     const dense_fallback_max_bytes = gemma4E4bDenseFallbackMaxBytes(gpt_config);
-    if (gpt_config.family != .qwen3) {
-        return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
-            .disable_mapped_quant_weight = disable_mapped_quant_weight,
-            .dense_fallback_max_bytes = dense_fallback_max_bytes,
-            .lm_head = tags.lm_head,
-            .lm_head_refine_slot = tags.lm_head_refine_slot,
-            .prefer_q8_over_dense_bf16 = tags.prefer_q8_over_dense_bf16,
-        });
-    }
-
-    // Jina v5 applies a LoRA retrieval adapter into the loaded f32 tensor.
-    // Preparing from raw bf16 bytes would bypass that merge for resident slots.
-    const shape = try cb.tensorShape(weight, allocator);
-    defer allocator.free(shape);
-    const shape_i32 = try allocator.alloc(i32, shape.len);
-    defer allocator.free(shape_i32);
-    for (shape, 0..) |dim, i| shape_i32[i] = @intCast(dim);
-    const values = try cb.toFloat32(weight, allocator);
-    defer allocator.free(values);
-    const dense = try cb.fromFloat32Shape(values, shape_i32);
-    defer cb.free(dense);
-    return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, dense, in_dim, out_dim, .{
+    // Preserve the backend's loaded representation. Jina v5 adapter merges
+    // replace matching base weights with owned f32 tensors before they reach
+    // this path, while unmodified safetensors weights may remain zero-copy
+    // bf16. Forcing every Qwen3 weight through toFloat32 would mistake those
+    // native bf16 buffers for empty host tensors and fail shape validation.
+    return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
         .disable_mapped_quant_weight = disable_mapped_quant_weight,
         .dense_fallback_max_bytes = dense_fallback_max_bytes,
         .lm_head = tags.lm_head,
@@ -5135,7 +5128,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-        if (gpt_config.family == .gemma or gpt_config.family == .qwen3) {
+        if (gpt_config.family == .gemma or gpt_config.family == .qwen3 or gpt_config.family == .qwen3_vl) {
             var primary_buf: [256]u8 = undefined;
 
             if (gpt_config.family == .gemma) {
