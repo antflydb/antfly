@@ -5596,6 +5596,23 @@ pub const Node = struct {
                 return error.AmbiguousModelIdentifier;
             match = entry.path;
         }
+        if (match) |path| return try self.allocator.dupe(u8, path);
+
+        // A variant-less owner/name remains convenient while exactly one
+        // validated managed variant is installed. Once variants coexist there
+        // is no implicit default: choosing by the opaque install-directory hash
+        // can select a different precision or even a backend-incompatible
+        // artifact after an unrelated pull.
+        const requested_ref = registry_mod.ModelRef.parse(request_name) catch return null;
+        if (!std.mem.eql(u8, requested_ref.variant, "auto")) return null;
+        for (discovered) |entry| {
+            const entry_ref = registry_mod.ModelRef.parse(entry.name) catch continue;
+            if (!std.mem.eql(u8, entry_ref.owner, requested_ref.owner) or
+                !std.mem.eql(u8, entry_ref.name, requested_ref.name)) continue;
+            if (match != null and !std.mem.eql(u8, match.?, entry.path))
+                return error.AmbiguousModelIdentifier;
+            match = entry.path;
+        }
         return if (match) |path| try self.allocator.dupe(u8, path) else null;
     }
 
@@ -17293,6 +17310,64 @@ test "HTTP model resolution accepts the managed identity advertised by discovery
     );
     defer allocator.free(resolved);
     try std.testing.expectEqualStrings(model_root, resolved);
+}
+
+test "managed model resolution fails closed when explicit variants coexist" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    inline for (.{
+        .{ "q8", "q8-0-bundle-v1" },
+        .{ "f16", "f16-bundle-v1" },
+    }) |fixture| {
+        try tmp.dir.createDirPath(io, "models/provisioned/" ++ fixture[0]);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/provisioned/" ++ fixture[0] ++ "/model.gguf",
+            .data = "decoder",
+        });
+        const receipt = try std.fmt.allocPrint(
+            allocator,
+            "{{\"version\":2,\"source\":{{\"owner\":\"Qwen\",\"name\":\"Qwen3-Embedding-0.6B-GGUF\",\"variant\":\"{s}\"}},\"artifacts\":[{{\"path\":\"model.gguf\",\"size\":7}}]}}",
+            .{fixture[1]},
+        );
+        defer allocator.free(receipt);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "models/provisioned/" ++ fixture[0] ++ "/.antfly-download-complete.json",
+            .data = receipt,
+        });
+    }
+
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const q8_root = try tmp.dir.realPathFileAlloc(io, "models/provisioned/q8", allocator);
+    defer allocator.free(q8_root);
+    const f16_root = try tmp.dir.realPathFileAlloc(io, "models/provisioned/f16", allocator);
+    defer allocator.free(f16_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    try std.testing.expectError(
+        error.AmbiguousModelIdentifier,
+        node.resolveModelPath(io, "Qwen/Qwen3-Embedding-0.6B-GGUF", "embedders"),
+    );
+    const q8_resolved = try node.resolveModelPath(
+        io,
+        "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+        "embedders",
+    );
+    defer allocator.free(q8_resolved);
+    try std.testing.expectEqualStrings(q8_root, q8_resolved);
+    const f16_resolved = try node.resolveModelPath(
+        io,
+        "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1",
+        "embedders",
+    );
+    defer allocator.free(f16_resolved);
+    try std.testing.expectEqualStrings(f16_root, f16_resolved);
 }
 
 test "HTTP model resolution caller ownership stays flat across repeated requests" {

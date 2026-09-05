@@ -1245,14 +1245,7 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         .keep_alive = false,
         .max_response_size = 4 << 20,
     };
-    const deadline = embeddingOperationDeadline(entry);
-    const now_ns = monotonicNowNs();
-    if (now_ns >= deadline) return error.Timeout;
-    const remaining_ns = deadline - now_ns;
-    const timeout_ms = @min(
-        max_embedding_request_timeout_ms,
-        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
-    );
+    const timeout_ms = try embeddingRemainingTimeoutMs(entry);
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
     // Both the whole-request and connect watchdogs need Io.concurrent.
     // Manual/embedded owners deliberately use the single-threaded fallback
@@ -1267,6 +1260,18 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         config.timeouts.connect_ms = 0;
     }
     return config;
+}
+
+fn embeddingRemainingTimeoutMs(entry: *const ManagedEmbeddingEntry) !u64 {
+    try ensureEntryDeadline(entry);
+    const deadline = embeddingOperationDeadline(entry);
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    return @min(
+        max_embedding_request_timeout_ms,
+        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+    );
 }
 
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
@@ -4612,7 +4617,7 @@ fn embedBatchWithVertex(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    try waitForEntryPacer(entry);
+    if (texts.len == 0) return error.EmptyEmbeddingResponse;
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
     var provider = try vertex_provider.Provider.init(alloc, &http, .{
@@ -4622,14 +4627,33 @@ fn embedBatchWithVertex(
         .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
     });
     defer provider.deinit();
-    var result = try provider.embedText(alloc, entry.model, texts, .{
-        .task_type = effectiveProviderTaskType(entry, task_type),
-        .dimensions = if (dims > 0) dims else null,
-        .cancellation = embeddingHttpCancellation(entry),
-    });
-    errdefer result.deinit();
-    try validateDenseBatch(result.vectors, texts.len, dims);
-    return try adoptDenseBatchResult(alloc, &result);
+
+    var out = std.ArrayListUnmanaged([]const f32).empty;
+    errdefer {
+        for (out.items) |vector| alloc.free(vector);
+        out.deinit(alloc);
+    }
+
+    const max_batch = provider_defaults.vertexMaxEmbeddingBatchSize(entry.model);
+    var offset: usize = 0;
+    while (offset < texts.len) {
+        const end = cappedEmbeddingBatchEnd(offset, texts.len, max_batch);
+        try waitForEntryPacer(entry);
+        var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
+            .task_type = effectiveProviderTaskType(entry, task_type),
+            .dimensions = if (dims > 0) dims else null,
+            .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(entry) else null,
+            .cancellation = embeddingHttpCancellation(entry),
+        });
+        errdefer result.deinit();
+        try validateDenseBatch(result.vectors, end - offset, dims);
+        try out.ensureUnusedCapacity(alloc, result.vectors.len);
+        const vectors = try adoptDenseBatchResult(alloc, &result);
+        for (vectors) |vector| out.appendAssumeCapacity(vector);
+        alloc.free(vectors);
+        offset = end;
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn embedBatchWithCohere(
@@ -4923,6 +4947,31 @@ pub fn testCohereBatchLimit() !void {
 
 test "Cohere embedding batches respect the provider request limit" {
     try testCohereBatchLimit();
+}
+
+pub fn testVertexEmbeddingRequestPlanning() !void {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        vertexEmbeddingRequestCount("gemini-embedding-001", 2),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        vertexEmbeddingRequestCount("text-embedding-005", 251),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        vertexEmbeddingRequestCount("gemini-embedding-001", 0),
+    );
+}
+
+test "Vertex embedding request planning matches model-specific wire limits" {
+    try testVertexEmbeddingRequestPlanning();
+}
+
+fn vertexEmbeddingRequestCount(model: []const u8, input_count: usize) usize {
+    if (input_count == 0) return 0;
+    const maximum = provider_defaults.vertexMaxEmbeddingBatchSize(model);
+    return input_count / maximum + @intFromBool(input_count % maximum != 0);
 }
 
 fn adoptDenseBatchResult(

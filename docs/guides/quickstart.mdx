@@ -147,7 +147,7 @@ antfly table create --table wikipedia \
     "template": "{{title}} {{body}}",
     "embedder": {
       "provider": "antfly",
-      "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
+      "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
     },
     "chunker": {
       "provider": "antfly",
@@ -171,7 +171,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
         "template": "{{title}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -201,7 +201,7 @@ await client.tables.create('wikipedia', {
       template: '{{title}} {{body}}',
       embedder: {
         provider: 'antfly',
-        model: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
+        model: 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
       },
       chunker: {
         provider: 'antfly',
@@ -227,7 +227,7 @@ client.create_table(
             'template': '{{title}} {{body}}',
             'embedder': {
                 'provider': 'antfly',
-                'model': 'Qwen/Qwen3-Embedding-0.6B-GGUF',
+                'model': 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
             },
             'chunker': {
                 'provider': 'antfly',
@@ -258,7 +258,7 @@ if err != nil {
 }
 
 embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "Qwen/Qwen3-Embedding-0.6B-GGUF",
+	Model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
 })
 if err != nil { log.Fatal(err) }
 
@@ -296,7 +296,7 @@ client.create_table("wikipedia", &json!({
             "template": "{{title}} {{body}}",
             "embedder": {
                 "provider": "antfly",
-                "model": "Qwen/Qwen3-Embedding-0.6B-GGUF"
+                "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
             },
             "chunker": {
                 "provider": "antfly",

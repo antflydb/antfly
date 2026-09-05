@@ -21,7 +21,7 @@ func main() {
 	}
 
 	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
-		Model: "Qwen/Qwen3-Embedding-0.6B-GGUF",
+		Model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
 	})
 	if err != nil {
 		log.Fatal(err)

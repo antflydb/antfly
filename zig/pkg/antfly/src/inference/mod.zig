@@ -79,6 +79,7 @@ test "embedding provider request helpers" {
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
     try managed_embedder.testCohereBatchLimit();
+    try managed_embedder.testVertexEmbeddingRequestPlanning();
     try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
 }
 

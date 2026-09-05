@@ -16,6 +16,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference = @import("types.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
@@ -319,7 +320,7 @@ pub const Provider = struct {
         }
         var dimension: usize = 0;
         var offset: usize = 0;
-        const max_inputs = vertexEmbeddingMaxInputs(model);
+        const max_inputs = provider_defaults.vertexMaxEmbeddingBatchSize(model);
         while (offset < texts.len) {
             const batch_len = @min(max_inputs, texts.len - offset);
             var batch = try self.embedTextRequest(
@@ -346,13 +347,15 @@ pub const Provider = struct {
         };
     }
 
-    fn embedTextRequest(
+    pub fn embedTextRequest(
         self: *Provider,
         alloc: Allocator,
         model: []const u8,
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
+        if (texts.len == 0 or texts.len > provider_defaults.vertexMaxEmbeddingBatchSize(model))
+            return error.InvalidEmbeddingBatchSize;
         const Instance = struct {
             content: []const u8,
             task_type: []const u8,
@@ -474,13 +477,6 @@ pub const Provider = struct {
         .generate = &generateImpl,
     };
 };
-
-/// Vertex text-embedding endpoints accept at most 250 instances generally,
-/// while gemini-embedding-001 accepts exactly one input per request.
-fn vertexEmbeddingMaxInputs(model: []const u8) usize {
-    const basename = std.fs.path.basename(model);
-    return if (std.mem.eql(u8, basename, "gemini-embedding-001")) 1 else 250;
-}
 
 fn copyEmbeddingValues(alloc: Allocator, items: anytype) !inference.EmbedResult {
     if (items.len == 0) return error.EmptyResponse;
@@ -769,12 +765,12 @@ test "google embedding status mapping preserves retryability" {
 
 pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 1), vertexEmbeddingMaxInputs("gemini-embedding-001"));
+    try std.testing.expectEqual(@as(usize, 1), provider_defaults.vertexMaxEmbeddingBatchSize("gemini-embedding-001"));
     try std.testing.expectEqual(
         @as(usize, 1),
-        vertexEmbeddingMaxInputs("publishers/google/models/gemini-embedding-001"),
+        provider_defaults.vertexMaxEmbeddingBatchSize("publishers/google/models/gemini-embedding-001"),
     );
-    try std.testing.expectEqual(@as(usize, 250), vertexEmbeddingMaxInputs("text-embedding-005"));
+    try std.testing.expectEqual(@as(usize, 250), provider_defaults.vertexMaxEmbeddingBatchSize("text-embedding-005"));
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

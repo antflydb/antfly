@@ -17,6 +17,19 @@ pub const default_aws_region = "us-east-1";
 /// Cohere Embed v2 accepts at most 96 texts per request. This applies to both
 /// the direct Cohere API and Cohere models invoked through Bedrock.
 pub const cohere_max_embedding_batch_size: usize = 96;
+pub const vertex_default_max_embedding_batch_size: usize = 250;
+
+/// Vertex generally accepts 250 embedding instances per prediction request,
+/// but gemini-embedding-001 is restricted to one input. Keep this model-aware
+/// wire limit shared by provider and managed batching so one managed chunk is
+/// always exactly one upstream request.
+pub fn vertexMaxEmbeddingBatchSize(model: []const u8) usize {
+    const basename = std.fs.path.basename(model);
+    return if (std.mem.eql(u8, basename, "gemini-embedding-001"))
+        1
+    else
+        vertex_default_max_embedding_batch_size;
+}
 
 pub fn normalizedBase(configured: []const u8, default_value: []const u8) []const u8 {
     return std.mem.trimEnd(u8, if (configured.len > 0) configured else default_value, "/");
@@ -67,4 +80,13 @@ test "provider endpoint defaults preserve explicit deployment endpoints" {
 
 test "shared provider limits match upstream APIs" {
     try std.testing.expectEqual(@as(usize, 96), cohere_max_embedding_batch_size);
+    try std.testing.expectEqual(@as(usize, 1), vertexMaxEmbeddingBatchSize("gemini-embedding-001"));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        vertexMaxEmbeddingBatchSize("publishers/google/models/gemini-embedding-001"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 250),
+        vertexMaxEmbeddingBatchSize("text-embedding-005"),
+    );
 }

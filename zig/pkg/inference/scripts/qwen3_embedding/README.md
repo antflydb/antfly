@@ -28,6 +28,13 @@ Matryoshka truncation to 32-1024 dims).
   benchmark expands it in memory and verifies the canonical expanded-case
   SHA-256 before making a request. Production serving does not read it.
 
+## Checked-in qualification reports
+
+The JSON files under `reports/` are intentionally versioned qualification
+evidence referenced by `BASELINE.md`; they are not runtime inputs or disposable
+test output. Replace them only when rerunning the documented protocol against
+the pinned model artifacts, and update `BASELINE.md` in the same change.
+
 ## Produce the oracle
 
 ```bash
