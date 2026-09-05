@@ -732,7 +732,7 @@ fn discoverReaderModelPathFromRegistry(
     for (discovered) |entry| {
         if (excluded_paths.contains(entry.path)) continue;
 
-        var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, entry.path);
+        var manifest = (try manifest_mod.loadListingCandidateFromDir(ctx.allocator, entry.path)) orelse continue;
         defer manifest.deinit();
         if (manifest.model_type != .reader and entry.kind != .reader) continue;
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) continue;
@@ -1013,6 +1013,33 @@ test "image extraction caches a supported fallback reader selection" {
     try std.testing.expectEqual(@as(?[]u8, null), failed_entry.path);
     try std.testing.expectEqual(@as(usize, 1), resolver.failed_candidates.count());
     try std.testing.expect(resolver.failed_candidates.contains(first));
+}
+
+test "image extraction reader discovery skips invalid unrelated models" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(
+        tmp.dir,
+        "embedders/acme/broken",
+        "{\"type\":\"embedder\",\"pooling\":\"lasst\"}",
+    );
+    try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+    const no_failed_paths = FailedReaderPathSet.empty;
+
+    const selected = try discoverReaderModelPathFromRegistry(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "fastino/gliner2-base-v1", &no_failed_paths);
+    defer allocator.free(selected);
+
+    try std.testing.expect(std.mem.endsWith(u8, selected, "readers/antflydb/florence-2-base"));
 }
 
 test "image extraction caches unavailable reader discovery for a bounded ttl" {
