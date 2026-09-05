@@ -1270,6 +1270,33 @@ fn graphResultNodeRetainedBytes(node: graph_query_mod.GraphResultNode) usize {
         retainedPathEdgeSliceBytes(graph_query_mod.PathEdgeInfo, edges),
     );
     if (node.provenance) |provenance| retainedAdd(&total, retainedStringSliceBytes(provenance));
+    if (node.metrics_owned) {
+        retainedAdd(&total, retainedBytesForSlice(graph_query_mod.GraphMetricValue, node.metrics.len));
+        for (node.metrics) |metric| if (metric.name_owned) retainedAdd(&total, metric.name.len);
+    }
+    return total;
+}
+
+fn graphMetricStatusRetainedBytes(status: db_mod.types.GraphMetricStatus) usize {
+    var total: usize = 0;
+    retainedAdd(&total, status.name.len);
+    retainedAdd(&total, retainedStringSliceBytes(status.edge_filter.types));
+    retainedAdd(&total, status.build_worker_id.len);
+    retainedAdd(&total, status.build_cursor.len);
+    retainedAdd(
+        &total,
+        retainedBytesForSlice(db_mod.types.GraphMetricBuildPageStatus, status.build_pages.len),
+    );
+    for (status.build_pages) |page| {
+        retainedAdd(&total, page.worker_id.len);
+        retainedAdd(&total, page.cursor.len);
+        retainedAdd(&total, page.last_error.len);
+    }
+    retainedAdd(&total, status.last_error.len);
+    retainedAdd(
+        &total,
+        retainedBytesForSlice(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events.len),
+    );
     return total;
 }
 
@@ -1379,6 +1406,19 @@ pub fn graphResultsRetainedUsage(
         );
         for (result.nodes) |node| {
             retainedAdd(&usage.state_bytes, graphResultNodeRetainedBytes(node));
+        }
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(graph_query_mod.GraphMetricValue, result.metric_values_slab.len),
+        );
+        retainedAdd(&usage.state_bytes, retainedBytesForSlice([]u8, result.metric_value_names.len));
+        for (result.metric_value_names) |name| retainedAdd(&usage.state_bytes, name.len);
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(db_mod.types.GraphMetricStatus, result.metric_status.len),
+        );
+        for (result.metric_status) |status| {
+            retainedAdd(&usage.state_bytes, graphMetricStatusRetainedBytes(status));
         }
 
         retainedAdd(
@@ -1562,6 +1602,52 @@ test "distributed graph result admission is cumulative across shard payloads" {
         graph_work_budget.Dimension.retained_state_bytes,
         diagnostic.diagnostic.?.dimension,
     );
+}
+
+test "distributed graph result accounting includes shared metric storage and status details" {
+    var metric_values = [_]graph_query_mod.GraphMetricValue{.{
+        .name = "pagerank",
+        .score = 0.75,
+        .name_owned = false,
+    }};
+    var metric_names = [_][]u8{@constCast("pagerank")};
+    const edge_types = [_][]const u8{"links_to"};
+    var events = [_]graph_mod.GraphIndex.GraphMetricEvent{.{ .kind = .publish }};
+    var pages = [_]db_mod.types.GraphMetricBuildPageStatus{.{
+        .worker_id = "worker",
+        .cursor = "cursor",
+        .last_error = "page-error",
+    }};
+    var statuses = [_]db_mod.types.GraphMetricStatus{.{
+        .name = @constCast("pagerank"),
+        .edge_filter = .{ .mode = .types, .types = &edge_types },
+        .build_worker_id = "worker",
+        .build_cursor = "cursor",
+        .build_pages = &pages,
+        .last_error = "metric-error",
+        .recent_events = &events,
+    }};
+    var graph_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("walk"),
+        .nodes = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const baseline = graphResultsRetainedUsage(&graph_results).state_bytes;
+
+    graph_results[0].metric_values_slab = &metric_values;
+    graph_results[0].metric_value_names = &metric_names;
+    graph_results[0].metric_status = &statuses;
+    const usage = graphResultsRetainedUsage(&graph_results).state_bytes;
+    const expected_extra = @sizeOf(graph_query_mod.GraphMetricValue) +
+        @sizeOf([]u8) + "pagerank".len +
+        @sizeOf(db_mod.types.GraphMetricStatus) + "pagerank".len +
+        @sizeOf([]const u8) + "links_to".len +
+        "worker".len + "cursor".len +
+        @sizeOf(db_mod.types.GraphMetricBuildPageStatus) +
+        "worker".len + "cursor".len + "page-error".len +
+        "metric-error".len + @sizeOf(graph_mod.GraphIndex.GraphMetricEvent);
+    try std.testing.expectEqual(baseline + expected_extra, usage);
 }
 
 const GraphMetricResultBuilder = struct {

@@ -508,15 +508,17 @@ score reads and latency predictable for operators.
 Serverless point, projection, rerank, and direct top-k reads share one budget
 ledger on the pinned request session. The ledger composes authenticated range
 operations, transferred bytes, decoded blocks/work, and retained result-column
-memory across every named operation and metric dependency. This closes the
+and status memory across every named operation and metric dependency. This closes the
 per-metric-limit loophole where a valid request could multiply the allowed I/O
 by its dependency count. Exhaustion fails before the next backend range read
 and is returned as an actionable, non-retryable HTTP 422. Current v5/v6
 artifacts continue to use authenticated routed blocks and the persisted bounded
 top tier. Independent immutable score ranges use bounded eight-way `std.Io`
 fanout, while every child view shares the same synchronized request ledger and
-pinned manifest. v1-v3 compatibility reads are charged for their full artifact
-before materialization.
+pinned manifest. Range payloads are decoded and released one fanout batch at a
+time, so peak temporary memory is bounded by concurrency rather than the total
+number of planned ranges. v1-v3 compatibility reads are charged for their full
+artifact before materialization.
 
 Planned native maintenance pins the index catalog with a shared lifetime guard
 for each bounded scheduler unit. It does not hold the database-wide apply fence:

@@ -266,10 +266,6 @@ fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const 
     }
 }
 
-fn expectExactErrorLogs(run: *std.Build.Step.Run, test_filter: []const u8, count: []const u8) void {
-    run.addArgs(&.{ "--expect-error-logs", test_filter, count });
-}
-
 fn configureUnitStorageTestRun(
     b: *std.Build,
     run: *std.Build.Step.Run,
@@ -5701,16 +5697,6 @@ pub fn build(b: *std.Build) void {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
-    expectExactErrorLogs(
-        run_public_api_parity_tests,
-        "cluster backup retains its fenced attempt after an ambiguous table outcome",
-        "2",
-    );
-    expectExactErrorLogs(
-        run_public_api_parity_aggregate_tests,
-        "cluster backup retains its fenced attempt after an ambiguous table outcome",
-        "2",
-    );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
@@ -5802,11 +5788,6 @@ pub fn build(b: *std.Build) void {
         b,
         lib_api_auth_tests,
         lib_api_auth_runtime_filters,
-    );
-    expectExactErrorLogs(
-        run_lib_api_auth_tests,
-        "cluster backup retains its fenced attempt after an ambiguous table outcome",
-        "2",
     );
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
@@ -6023,11 +6004,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_api_storage_authority_tests = addFilteredTestRunArtifact(b, lib_api_storage_authority_tests);
-    expectExactErrorLogs(
-        run_lib_api_storage_authority_tests,
-        "cluster backup retains its fenced attempt after an ambiguous table outcome",
-        "2",
-    );
     const lib_api_storage_authority_test_step = b.step("lib-api-storage-authority-test", "Run remote backup credential-boundary tests");
     lib_api_storage_authority_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
 
@@ -8331,6 +8307,7 @@ pub fn build(b: *std.Build) void {
         "query merge requires comparable graph metric rerank generations across shards",
         "query merge rejects malformed graph metric rerank score details",
         "query merge rejects missing or unpublished graph metric rerank shard status",
+        "distributed graph result accounting includes shared metric storage and status details",
         "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",

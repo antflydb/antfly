@@ -3207,6 +3207,30 @@ pub const HttpHandler = struct {
             initialized_columns += 1;
         }
 
+        const projected_value_count = std.math.mul(usize, result.nodes.len, query.metrics.len) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        var projected_retained_bytes = std.math.mul(usize, projected_value_count, @sizeOf(graph_query_mod.GraphMetricValue)) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf([]u8)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf(db_types.GraphMetricStatus)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        for (statuses[0..dependency_count]) |status| {
+            // The status and the projection dictionary intentionally own
+            // independent copies: status may be omitted from the response
+            // while projected metric names must remain valid.
+            projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, status.name.len, 2) catch
+                return error.GraphMetricQueryBudgetExceeded) catch
+                return error.GraphMetricQueryBudgetExceeded;
+            projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, status.edge_filter.types.len, @sizeOf([]const u8)) catch
+                return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+            for (status.edge_filter.types) |edge_type| {
+                projected_retained_bytes = std.math.add(usize, projected_retained_bytes, edge_type.len) catch
+                    return error.GraphMetricQueryBudgetExceeded;
+            }
+        }
+        try session.chargeGraphMetricRetained(projected_retained_bytes);
+
         const metric_value_names = try self.alloc.alloc([]u8, dependency_count);
         var initialized_metric_names: usize = 0;
         var metric_names_owned = true;
