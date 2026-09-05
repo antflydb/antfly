@@ -3469,18 +3469,17 @@ export interface components {
              * @description Declare that this model supports non-text content (images, audio, video, PDFs),
              *     even if the model isn't in Antfly's built-in model registry yet.
              *
-             *     When `true`, Antfly treats the model as multimodal and will send binary content
-             *     (images, audio, etc.) to the provider instead of extracting text. The provider's
-             *     API is still responsible for accepting the content — this flag just tells Antfly
-             *     not to strip it.
+             *     When `true`, Antfly treats the model as multimodal and sends binary content
+             *     (images, audio, etc.) through an embedding adapter that supports content parts.
+             *     Antfly currently provides that contract for local Antfly inference and Bedrock;
+             *     text-only provider adapters reject media rather than silently discarding it.
              *
-             *     Not needed for models already in the registry (e.g., `multimodalembedding`,
-             *     `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+             *     Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
              *
              *     **Example:**
              *     ```json
              *     {
-             *       "provider": "vertex",
+             *       "provider": "antfly",
              *       "model": "some-future-multimodal-model",
              *       "multimodal": true
              *     }
@@ -8952,7 +8951,10 @@ export interface components {
          *
          *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
          *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+         *     **Example Model:** gemini-embedding-001 (default, 3072 dims)
+         *
+         *     Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+         *     instead of being flattened or silently discarded.
          *
          *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
          * @example {
@@ -8985,7 +8987,7 @@ export interface components {
             /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain. */
             credentials_path?: string;
             /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
              * @default 3072
              */
             dimension?: number;

@@ -310,6 +310,49 @@ pub const Provider = struct {
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
+        if (texts.len == 0) return error.EmptyResponse;
+
+        var vectors = std.ArrayListUnmanaged([]const f32).empty;
+        errdefer {
+            for (vectors.items) |vector| alloc.free(vector);
+            vectors.deinit(alloc);
+        }
+        var dimension: usize = 0;
+        var offset: usize = 0;
+        const max_inputs = vertexEmbeddingMaxInputs(model);
+        while (offset < texts.len) {
+            const batch_len = @min(max_inputs, texts.len - offset);
+            var batch = try self.embedTextRequest(
+                alloc,
+                model,
+                texts[offset .. offset + batch_len],
+                options,
+            );
+            defer batch.deinit();
+            if (batch.vectors.len != batch_len) return error.InvalidEmbeddingResponse;
+            if (dimension == 0) dimension = batch.dimension;
+            if (batch.dimension != dimension) return error.InvalidEmbeddingResponse;
+            try vectors.ensureUnusedCapacity(alloc, batch.vectors.len);
+            for (batch.vectors) |vector| {
+                try vectors.append(alloc, try alloc.dupe(f32, vector));
+            }
+            offset += batch_len;
+        }
+
+        return .{
+            .vectors = try vectors.toOwnedSlice(alloc),
+            .dimension = dimension,
+            .allocator = alloc,
+        };
+    }
+
+    fn embedTextRequest(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        options: EmbedOptions,
+    ) !inference.EmbedResult {
         const Instance = struct {
             content: []const u8,
             task_type: []const u8,
@@ -431,6 +474,13 @@ pub const Provider = struct {
         .generate = &generateImpl,
     };
 };
+
+/// Vertex text-embedding endpoints accept at most 250 instances generally,
+/// while gemini-embedding-001 accepts exactly one input per request.
+fn vertexEmbeddingMaxInputs(model: []const u8) usize {
+    const basename = std.fs.path.basename(model);
+    return if (std.mem.eql(u8, basename, "gemini-embedding-001")) 1 else 250;
+}
 
 fn copyEmbeddingValues(alloc: Allocator, items: anytype) !inference.EmbedResult {
     if (items.len == 0) return error.EmptyResponse;
@@ -717,6 +767,68 @@ test "google embedding status mapping preserves retryability" {
     try testEmbeddingStatusMapping();
 }
 
+pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 1), vertexEmbeddingMaxInputs("gemini-embedding-001"));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        vertexEmbeddingMaxInputs("publishers/google/models/gemini-embedding-001"),
+    );
+    try std.testing.expectEqual(@as(usize, 250), vertexEmbeddingMaxInputs("text-embedding-005"));
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const path = "/projects/proj/locations/us-central1/publishers/google/models/gemini-embedding-001:predict";
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = path, .assert_request = expectVertexEmbeddingRequest, .respond = .{
+            .body = "{\"predictions\":[{\"embeddings\":{\"values\":[1,2]}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var provider = try Provider.init(alloc, &client, .{
+        .base_url = server.baseUrl(),
+        .project_id = "proj",
+        .bearer_token = "test-token",
+    });
+    defer provider.deinit();
+
+    const texts = [_][]const u8{ "first", "second" };
+    var result: ?inference.EmbedResult = null;
+    defer if (result) |*value| value.deinit();
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: *Provider,
+            out: *?inference.EmbedResult,
+            err_out: *?anyerror,
+            inputs: []const []const u8,
+        ) std.Io.Cancelable!void {
+            out.* = p.embedText(a, "gemini-embedding-001", inputs, .{
+                .task_type = "RETRIEVAL_DOCUMENT",
+                .dimensions = 2,
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &provider, &result, &run_err, &texts }) catch return;
+    try server.handleOne();
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 2), result.?.vectors.len);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[1]);
+}
+
 test "vertex provider exchanges service account credentials and generates content" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -847,6 +959,24 @@ fn expectVertexGenerateRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"systemInstruction\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"text\":\"describe this\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"YWJj\"}") != null);
+}
+
+fn expectVertexEmbeddingRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse return error.MissingHeader);
+    const Parsed = struct {
+        instances: []const struct {
+            content: []const u8,
+            task_type: []const u8,
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, req.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.instances.len);
+    try std.testing.expect(
+        std.mem.eql(u8, parsed.value.instances[0].content, "first") or
+            std.mem.eql(u8, parsed.value.instances[0].content, "second"),
+    );
+    try std.testing.expectEqualStrings("RETRIEVAL_DOCUMENT", parsed.value.instances[0].task_type);
 }
 
 fn expectGeminiGenerateRequest(req: httpx.testing_mod.RequestInfo) !void {

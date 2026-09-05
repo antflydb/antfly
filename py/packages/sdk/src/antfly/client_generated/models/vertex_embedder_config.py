@@ -22,7 +22,10 @@ class VertexEmbedderConfig:
 
     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
 
-    **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+    **Example Model:** gemini-embedding-001 (default, 3072 dims)
+
+    Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+    instead of being flattened or silently discarded.
 
     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 
@@ -40,8 +43,8 @@ class VertexEmbedderConfig:
                 set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'. Default: 'us-central1'.
             credentials_path (str | Unset): Path to an ADC credential JSON file (service-account, authorized-user, or
                 external-account). Alternative to the default ADC chain.
-            dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001;
-                128-1408 for multimodalembedding). Default: 3072.
+            dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+                Default: 3072.
             retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
                 intent
                 automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index

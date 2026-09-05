@@ -4140,6 +4140,12 @@ fn embedWithEntryPartsForTask(
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
+    // Text-only provider adapters must never turn media into an empty string
+    // or URL-shaped text. Bedrock and Antfly return above through adapters
+    // that preserve binary parts; the remaining providers currently expose
+    // only their text embedding contract through Antfly.
+    if (partsContainMedia(parts)) return error.UnsupportedEmbeddingProvider;
+
     const flattened = try flattenContentPartsToText(alloc, parts);
     defer alloc.free(flattened);
     return try embedWithEntryForTask(alloc, entry, flattened, dims, task_type);
@@ -4235,6 +4241,22 @@ fn partsContainMedia(parts: []const template_mod.ContentPart) bool {
         }
     }
     return false;
+}
+
+pub fn testTextOnlyManagedProvidersRejectMedia() !void {
+    var managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"vertex_idx":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"test-project","location":"us-central1"}}}
+    );
+    defer managed.deinit();
+
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "caption" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedEmbeddingProvider,
+        embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3072),
+    );
 }
 
 fn resolveOpenAiBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {

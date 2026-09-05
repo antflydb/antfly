@@ -200,18 +200,17 @@ class EmbedderConfig:
             multimodal (bool | Unset): Declare that this model supports non-text content (images, audio, video, PDFs),
                 even if the model isn't in Antfly's built-in model registry yet.
 
-                When `true`, Antfly treats the model as multimodal and will send binary content
-                (images, audio, etc.) to the provider instead of extracting text. The provider's
-                API is still responsible for accepting the content — this flag just tells Antfly
-                not to strip it.
+                When `true`, Antfly treats the model as multimodal and sends binary content
+                (images, audio, etc.) through an embedding adapter that supports content parts.
+                Antfly currently provides that contract for local Antfly inference and Bedrock;
+                text-only provider adapters reject media rather than silently discarding it.
 
-                Not needed for models already in the registry (e.g., `multimodalembedding`,
-                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
 
                 **Example:**
                 ```json
                 {
-                  "provider": "vertex",
+                  "provider": "antfly",
                   "model": "some-future-multimodal-model",
                   "multimodal": true
                 }

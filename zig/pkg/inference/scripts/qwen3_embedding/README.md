@@ -55,6 +55,10 @@ antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1   # GGUF F
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1  # safetensors
 ```
 
+The Q8_0 bundle is qualified on Metal and native CPU. The F16 GGUF and BF16
+safetensors bundles are currently admitted on Metal only; each variant still
+requires its exact managed receipt and live artifact hashes.
+
 Then run the gate against the running server:
 
 ```bash

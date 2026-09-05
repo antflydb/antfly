@@ -570,6 +570,13 @@ pub fn compatibilitySummaryForBackend(
             .message = "production-qualified Qwen3-VL bundles require the Metal backend",
         };
     }
+    if (!qwen3EmbeddingPromotionSupportsBackend(inspection.qwen3_embedding_promotion, backend)) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "this production-qualified Qwen3-Embedding bundle requires the Metal backend; native CPU is qualified for Q8_0",
+        };
+    }
 
     var projector_decoder = ProjectorDecoderContract{
         .family = projectorDecoderFamilyForArchitecture(man.config_model_arch),
@@ -705,6 +712,27 @@ test "Qwen3 embedding production backends include native CPU" {
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
     try std.testing.expect(!qwen3EmbeddingSupportsBackend(.cuda));
+}
+
+fn qwen3EmbeddingPromotionSupportsBackend(
+    promotion: model_compatibility.Qwen3EmbeddingPromotion,
+    backend: backends.BackendType,
+) bool {
+    return switch (promotion) {
+        .none => true,
+        .q8_0 => backend == .metal or backend == .native,
+        .f16, .bf16_safetensors => backend == .metal,
+    };
+}
+
+test "Qwen3 embedding promotion backend qualification is variant-specific" {
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .metal));
+    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.q8_0, .cuda));
+    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.f16, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.f16, .metal));
+    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .native));
+    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .metal));
 }
 
 fn qwen3VlPromotionSupportsBackend(

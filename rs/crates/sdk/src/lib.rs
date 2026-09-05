@@ -601,12 +601,8 @@ include!(concat!(env!("OUT_DIR"), "/client.rs"));
 pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
     types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
-        document_input_type: None,
         model: model.into(),
-        multimodal: None,
         provider: types::AntflyEmbedderConfigProvider::Antfly,
-        query_input_type: None,
-        query_instruction: None,
         retrieval: None,
     })
 }
