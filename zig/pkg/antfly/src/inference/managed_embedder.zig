@@ -53,6 +53,7 @@ const inference_work = @import("work.zig");
 const remote_capabilities = @import("remote_capabilities.zig");
 const execution_context = @import("execution_context.zig");
 const shared_vector = @import("antfly_vector").vector;
+const antfly_image = @import("antfly_image");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -304,6 +305,13 @@ pub const AntflyProvider = struct {
         request: readers.RasterRequest,
         context: execution_context.RequestContext,
     ) anyerror!readers.BatchResult = null,
+    embed_dense_rasters: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        context: EmbeddingRequestContext,
+    ) anyerror![][]f32 = null,
 };
 
 pub const ClassificationRequest = struct {
@@ -1100,6 +1108,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
             .dense_embed_part_items_fn = embedDensePartItems,
+            .dense_embed_raster_items_fn = embedDenseRasterItems,
             .media_part_limit_fn = denseMediaPartLimit,
             .capabilities_fn = denseCapabilities,
             .part_invocation_memory_fn = densePartInvocationMemory,
@@ -1407,6 +1416,34 @@ pub const ManagedEmbedder = struct {
             }
             offset = end;
         }
+        return vectors;
+    }
+
+    fn embedDenseRasterItems(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const antfly_image.BorrowedRasterAttachment,
+        dims: u32,
+    ) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
+        const local = entry.antfly_provider orelse return error.UnsupportedEmbeddingProvider;
+        const embed_rasters = local.embed_dense_rasters orelse return error.UnsupportedEmbeddingProvider;
+        if (items.len == 0) return try alloc.alloc([]const f32, 0);
+        try waitForEntryPacer(entry);
+        const context = embeddingRequestContext(entry);
+        try context.check();
+        const vectors = AntflyProviderBoundary.call(
+            "embed_dense_rasters",
+            local.boundary_dispatch,
+            embed_rasters,
+            .{ local.ptr, alloc, entry.model, items, context },
+        ) catch |err| return normalizeLocalEmbeddingError(err);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try context.check();
+        try validateDenseBatch(vectors, items.len, dims);
         return vectors;
     }
 

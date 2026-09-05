@@ -166,6 +166,7 @@ pub const ProviderOperation = enum(c_int) {
     rewrite_texts = 18,
     classify_texts = 19,
     read_raster_images_reported = 20,
+    embed_dense_rasters = 21,
 };
 
 pub const ProviderBinaryPayload = extern struct {

@@ -374,6 +374,26 @@ pub const Cache = struct {
                     self.mutex.unlock(self.io);
                     continue;
                 }
+                // A legacy endpoint that has no catalog is a successfully
+                // discovered conservative route, not a failed flight. Cache the
+                // absence so rolling upgrades and explicit compatibility
+                // endpoints do not pay one catalog probe per invocation.
+                if (err == error.RemoteCapabilityDiscoveryUnsupported) {
+                    self.admitLocked(key, null, null, null, monotonicNowNs(self.io)) catch |admit_err| {
+                        flight.err = admit_err;
+                        flight.done = true;
+                        flight.ready.set(self.io);
+                        self.releaseFlightLocked(flight);
+                        self.mutex.unlock(self.io);
+                        return admit_err;
+                    };
+                    flight.value = null;
+                    flight.done = true;
+                    flight.ready.set(self.io);
+                    self.releaseFlightLocked(flight);
+                    self.mutex.unlock(self.io);
+                    return .{ .capabilities = null };
+                }
                 // Authoritative rejection, routing-stale responses, and invalid
                 // contracts revoke the cached plan. Only explicitly transient
                 // discovery failures are eligible for stale-if-error behavior.
@@ -1019,6 +1039,8 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
 
 fn discoveryStatusError(status: u16, capability_stale: bool) anyerror {
     if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
+    if (status == 404 or status == 405 or status == 501)
+        return error.RemoteCapabilityDiscoveryUnsupported;
     if (status == 408 or status == 425 or status == 429 or (status >= 500 and status <= 599))
         return error.RemoteCapabilityDiscoveryTransient;
     return error.RemoteCapabilityDiscoveryRejected;
@@ -1425,6 +1447,9 @@ test "capability discovery HTTP failures retain authoritative status semantics" 
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(409, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(401, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(403, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(404, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(405, false));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(501, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(408, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(429, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, discoveryStatusError(503, false));

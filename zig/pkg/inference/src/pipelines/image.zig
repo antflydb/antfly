@@ -617,6 +617,30 @@ test "borrowed raster batch preprocesses strided RGBA without decode copy or ret
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[10], 1e-6);
 }
 
+test "borrowed raster CLIP preprocessing preserves strided center crop semantics" {
+    var padded = [_]u8{
+        0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 91, 92, 93, 94,
+        0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 81, 82, 83, 84,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &padded,
+        .width = 4,
+        .height = 2,
+        .stride_bytes = 20,
+    };
+    var actual: [12]f32 = undefined;
+    try preprocessClipBorrowedRasterBatchInto(
+        &actual,
+        &.{raster},
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0 / 255.0), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), actual[1], 1e-6);
+    for (actual[4..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-6);
+}
+
 test "bounded batch preprocessing uses a caller-owned executor without changing output" {
     const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
     var serial: [24]f32 = undefined;
@@ -1406,6 +1430,35 @@ pub fn preprocessBorrowedRasterBatchInto(
     }
 }
 
+/// CLIP/SigLIP variant of the borrowed-raster fast path. It preserves the
+/// encoded implementation's short-edge resize and center-crop semantics while
+/// honoring renderer row stride and retaining no source memory.
+pub fn preprocessClipBorrowedRasterBatchInto(
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    for (rasters, 0..) |raster, index| {
+        const view = try raster.imageView();
+        try view.validate();
+        preprocessImageViewClip(
+            view,
+            result[index * per_image ..][0..per_image],
+            target_size,
+            mean,
+            std_dev,
+        );
+    }
+}
+
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,
 /// center crop target_size x target_size, and normalize to CHW f32.
 pub fn preprocessClipBatch(
@@ -1923,6 +1976,16 @@ fn preprocessDecodedClip(
     mean: [3]f32,
     std_dev: [3]f32,
 ) void {
+    preprocessImageViewClip(toSharedImage(img), result, target_size, mean, std_dev);
+}
+
+fn preprocessImageViewClip(
+    img: ImageU8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
     std.debug.assert(target_size > 0);
     std.debug.assert(img.width > 0 and img.height > 0);
 
@@ -1936,7 +1999,7 @@ fn preprocessDecodedClip(
     const scale_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(resized_h));
 
     if (img.width == target_size and img.height == target_size) {
-        preprocessClipCenterCropNoResize(img, result, ts, 0, 0, mean, std_dev);
+        preprocessClipCenterCropNoResizeView(img, result, ts, 0, 0, mean, std_dev);
         return;
     }
 
@@ -1953,10 +2016,10 @@ fn preprocessDecodedClip(
             const fx = src_x - @as(f32, @floatFromInt(x0));
 
             for (0..3) |ch| {
-                const p00 = pixelAt(img, x0, y0, ch);
-                const p10 = pixelAt(img, x1, y0, ch);
-                const p01 = pixelAt(img, x0, y1, ch);
-                const p11 = pixelAt(img, x1, y1, ch);
+                const p00 = pixelAtView(img, x0, y0, ch);
+                const p10 = pixelAtView(img, x1, y0, ch);
+                const p01 = pixelAtView(img, x0, y1, ch);
+                const p11 = pixelAtView(img, x1, y1, ch);
                 const top = p00 * (1.0 - fx) + p10 * fx;
                 const bottom = p01 * (1.0 - fx) + p11 * fx;
                 const value = top * (1.0 - fy) + bottom * fy;
@@ -1964,6 +2027,15 @@ fn preprocessDecodedClip(
             }
         }
     }
+}
+
+fn pixelAtView(img: ImageU8, x: u32, y: u32, ch: usize) f32 {
+    const channels = img.channels();
+    const stride = img.rowStride() catch unreachable;
+    const xi: usize = @intCast(@min(x, img.width - 1));
+    const yi: usize = @intCast(@min(y, img.height - 1));
+    const ci = @min(ch, channels - 1);
+    return @floatFromInt(img.data[yi * stride + xi * channels + ci]);
 }
 
 const ClipResizeDims = struct {
@@ -1992,8 +2064,20 @@ fn preprocessClipCenterCropNoResize(
     mean: [3]f32,
     std_dev: [3]f32,
 ) void {
-    const width: usize = @intCast(img.width);
-    const channels: usize = @intCast(img.channels);
+    preprocessClipCenterCropNoResizeView(toSharedImage(img), result, target_size, crop_left, crop_top, mean, std_dev);
+}
+
+fn preprocessClipCenterCropNoResizeView(
+    img: ImageU8,
+    result: []f32,
+    target_size: usize,
+    crop_left: u32,
+    crop_top: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
+    const channels = img.channels();
+    const stride = img.rowStride() catch unreachable;
     const left: usize = @intCast(crop_left);
     const top: usize = @intCast(crop_top);
     const plane_stride = target_size * target_size;
@@ -2006,7 +2090,7 @@ fn preprocessClipCenterCropNoResize(
     const inv_255 = 1.0 / 255.0;
 
     for (0..target_size) |y| {
-        const row_base = ((top + y) * width + left) * channels;
+        const row_base = (top + y) * stride + left * channels;
         const dst_row = y * target_size;
         for (0..target_size) |x| {
             const src = row_base + x * channels;

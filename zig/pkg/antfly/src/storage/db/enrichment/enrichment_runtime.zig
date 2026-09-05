@@ -299,6 +299,8 @@ const generated_ocr_default_render_parallel_pages: usize = 1;
 const generated_ocr_max_render_parallel_pages: usize = 8;
 const generated_ocr_default_render_inflight_pixels: u64 = 50_000_000;
 const generated_ocr_default_render_inflight_bytes: usize = 256 * 1024 * 1024;
+const generated_pdf_default_render_prefetch_batches: usize = 1;
+const generated_pdf_max_render_prefetch_batches: usize = 1;
 const generated_pdf_default_max_document_pages: usize = 2048;
 const generated_pdf_absolute_max_document_pages: usize = 16_384;
 const generated_pdf_artifact_scan_work_max_keys: usize = generated_pdf_absolute_max_document_pages * 8;
@@ -603,6 +605,26 @@ fn generatedOcrRenderInflightBytes() usize {
     const raw = getenv("ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES") orelse return generated_ocr_default_render_inflight_bytes;
     if (raw.len == 0) return generated_ocr_default_render_inflight_bytes;
     return std.fmt.parseUnsigned(usize, raw, 10) catch generated_ocr_default_render_inflight_bytes;
+}
+
+fn generatedPdfRenderPrefetchBatches() usize {
+    if (comptime builtin.os.tag == .freestanding) return 0;
+    const raw = getenv("ANTFLY_ENRICHMENT_PDF_RENDER_PREFETCH_BATCHES") orelse
+        return generated_pdf_default_render_prefetch_batches;
+    if (raw.len == 0) return generated_pdf_default_render_prefetch_batches;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch
+        return generated_pdf_default_render_prefetch_batches;
+    return effectivePdfRenderPrefetchBatches(parsed);
+}
+
+fn effectivePdfRenderPrefetchBatches(configured: usize) usize {
+    return @min(configured, generated_pdf_max_render_prefetch_batches);
+}
+
+test "PDF render prefetch is capped at one window" {
+    try std.testing.expectEqual(@as(usize, 0), effectivePdfRenderPrefetchBatches(0));
+    try std.testing.expectEqual(@as(usize, 1), effectivePdfRenderPrefetchBatches(1));
+    try std.testing.expectEqual(@as(usize, 1), effectivePdfRenderPrefetchBatches(std.math.maxInt(usize)));
 }
 
 /// Apply node-owned render controls after document configuration parsing.
@@ -5544,22 +5566,35 @@ const PreparedDocumentSourceCache = struct {
         http_error: scraping.HttpError,
     };
 
+    const PendingSource = struct {
+        source_identity: SourceIdentity,
+        credential_name: ?[]u8,
+    };
+
+    const PendingPdf = struct {
+        entry: *Entry,
+        decode_limits: document_extraction_mod.PdfDecodeLimits,
+    };
+
     backing_alloc: Allocator,
     budgeted: ?resource_manager_mod.BudgetedAllocator,
     // Entries are individually allocated so a borrowed preparation remains
     // stable when the pointer array grows. This matters once compatible task
     // executors overlap or append another credential/transform variant.
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
-    /// Preparation is intentionally globally single-flight. Besides avoiding
-    /// duplicate parses for an identical source/limit pair, serializing cache
-    /// allocation keeps the cache-owned BudgetedAllocator thread-confined and
-    /// bounds simultaneous prepared-document growth. Task-local render and
-    /// inference windows remain independently concurrent after preparation.
+    /// Source and transform work is single-flight by key. The map mutex only
+    /// protects lookup/publication; unrelated downloads and parses execute in
+    /// parallel. The cache allocator has its own narrow serialization boundary
+    /// because ResourceManager BudgetedAllocator is task-confined.
+    pending_sources: std.ArrayListUnmanaged(PendingSource) = .empty,
+    pending_pdfs: std.ArrayListUnmanaged(PendingPdf) = .empty,
     io: Io,
     mutex: Io.Mutex = .init,
     drained: Io.Condition = .init,
+    allocator_mutex: std.atomic.Mutex = .unlocked,
     shutting_down: bool = false,
     active_borrows: usize = 0,
+    active_preparations: usize = 0,
     content_digest_computations: usize = 0,
     pdf_preparation_computations: usize = 0,
     prepare_pdf_session_fn: *const fn (
@@ -5586,15 +5621,59 @@ const PreparedDocumentSourceCache = struct {
         };
     }
 
-    fn allocator(self: *@This()) Allocator {
+    fn rawAllocator(self: *@This()) Allocator {
         return if (self.budgeted) |*budgeted| budgeted.allocator() else self.backing_alloc;
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = cacheAlloc,
+            .resize = cacheResize,
+            .remap = cacheRemap,
+            .free = cacheFree,
+        } };
+    }
+
+    fn lockAllocator(self: *@This()) void {
+        while (!self.allocator_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn cacheAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lockAllocator();
+        defer self.allocator_mutex.unlock();
+        return self.rawAllocator().rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn cacheResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lockAllocator();
+        defer self.allocator_mutex.unlock();
+        return self.rawAllocator().rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn cacheRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lockAllocator();
+        defer self.allocator_mutex.unlock();
+        return self.rawAllocator().rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn cacheFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lockAllocator();
+        self.rawAllocator().rawFree(memory, alignment, ret_addr);
+        self.allocator_mutex.unlock();
     }
 
     fn deinit(self: *@This()) void {
         self.mutex.lockUncancelable(self.io);
         self.shutting_down = true;
-        while (self.active_borrows != 0) self.drained.waitUncancelable(self.io, &self.mutex);
+        while (self.active_borrows != 0 or self.active_preparations != 0)
+            self.drained.waitUncancelable(self.io, &self.mutex);
         const alloc = self.allocator();
+        std.debug.assert(self.pending_sources.items.len == 0);
+        std.debug.assert(self.pending_pdfs.items.len == 0);
         for (self.entries.items) |entry| {
             for (entry.prepared_pdfs.items) |variant| {
                 if (variant.session) |*session| session.deinit();
@@ -5606,6 +5685,8 @@ const PreparedDocumentSourceCache = struct {
             alloc.destroy(entry);
         }
         self.entries.deinit(alloc);
+        self.pending_sources.deinit(std.heap.smp_allocator);
+        self.pending_pdfs.deinit(std.heap.smp_allocator);
         if (self.budgeted) |*budgeted| budgeted.deinit();
         self.mutex.unlock(self.io);
         self.* = undefined;
@@ -5617,26 +5698,137 @@ const PreparedDocumentSourceCache = struct {
         credential_name: ?[]const u8,
         config: template_remote.RenderConfig,
     ) !FetchOutcome {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.shutting_down) return error.PreparedDocumentCacheShuttingDown;
-        if (self.lookupAssumeLocked(source_url, credential_name)) |entry|
-            return .{ .ok = try self.borrowSourceAssumeLocked(entry) };
+        const identity = sourceIdentity(source_url);
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.shutting_down) {
+                self.mutex.unlock(self.io);
+                return error.PreparedDocumentCacheShuttingDown;
+            }
+            if (self.lookupAssumeLocked(source_url, credential_name)) |entry| {
+                const lease = self.borrowSourceAssumeLocked(entry) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.unlock(self.io);
+                return .{ .ok = lease };
+            }
+            if (self.sourcePendingAssumeLocked(identity, credential_name)) {
+                self.drained.waitUncancelable(self.io, &self.mutex);
+                self.mutex.unlock(self.io);
+                continue;
+            }
+            const owned_credential = if (credential_name) |value|
+                std.heap.smp_allocator.dupe(u8, value) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                }
+            else
+                null;
+            self.pending_sources.append(std.heap.smp_allocator, .{
+                .source_identity = identity,
+                .credential_name = owned_credential,
+            }) catch |err| {
+                if (owned_credential) |value| std.heap.smp_allocator.free(value);
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.active_preparations = std.math.add(usize, self.active_preparations, 1) catch {
+                const removed = self.pending_sources.pop().?;
+                if (removed.credential_name) |value| std.heap.smp_allocator.free(value);
+                self.mutex.unlock(self.io);
+                return error.PreparedDocumentCacheReferenceOverflow;
+            };
+            self.mutex.unlock(self.io);
+            break;
+        }
 
         const alloc = self.allocator();
-        const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
+        const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
             alloc,
             config,
             source_url,
             credential_name,
         );
-        switch (fetched) {
-            .http_error => |http_error| return .{ .http_error = http_error },
-            .ok => |content| {
-                const entry = try self.adoptOwnedAssumeLocked(source_url, credential_name, content);
-                return .{ .ok = try self.borrowSourceAssumeLocked(entry) };
+        if (fetched) |outcome| switch (outcome) {
+            .http_error => |http_error| {
+                self.mutex.lockUncancelable(self.io);
+                self.finishPendingSourceAssumeLocked(identity, credential_name);
+                const shutting_down = self.shutting_down;
+                self.mutex.unlock(self.io);
+                if (shutting_down) return error.PreparedDocumentCacheShuttingDown;
+                return .{ .http_error = http_error };
             },
+            .ok => |content| {
+                // Content hashing is proportional to source size and therefore
+                // belongs to preparation, not cache publication. Computing it
+                // here keeps unrelated cache keys independent.
+                var content_sha256: ContentDigest = undefined;
+                std.crypto.hash.sha2.Sha256.hash(content.data, &content_sha256, .{});
+
+                self.mutex.lockUncancelable(self.io);
+                if (self.shutting_down) {
+                    var owned_content = content;
+                    owned_content.deinit(alloc);
+                    self.finishPendingSourceAssumeLocked(identity, credential_name);
+                    self.mutex.unlock(self.io);
+                    return error.PreparedDocumentCacheShuttingDown;
+                }
+                const entry = self.adoptOwnedWithDigestAssumeLocked(
+                    source_url,
+                    credential_name,
+                    content,
+                    content_sha256,
+                ) catch |err| {
+                    self.finishPendingSourceAssumeLocked(identity, credential_name);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                const lease = self.borrowSourceAssumeLocked(entry) catch |err| {
+                    self.finishPendingSourceAssumeLocked(identity, credential_name);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.finishPendingSourceAssumeLocked(identity, credential_name);
+                self.mutex.unlock(self.io);
+                return .{ .ok = lease };
+            },
+        } else |err| {
+            self.mutex.lockUncancelable(self.io);
+            self.finishPendingSourceAssumeLocked(identity, credential_name);
+            self.mutex.unlock(self.io);
+            return err;
         }
+    }
+
+    fn sourcePendingAssumeLocked(
+        self: *@This(),
+        identity: SourceIdentity,
+        credential_name: ?[]const u8,
+    ) bool {
+        for (self.pending_sources.items) |pending| {
+            if (std.mem.eql(u8, pending.source_identity[0..], identity[0..]) and
+                optionalStringsEqual(pending.credential_name, credential_name)) return true;
+        }
+        return false;
+    }
+
+    fn finishPendingSourceAssumeLocked(
+        self: *@This(),
+        identity: SourceIdentity,
+        credential_name: ?[]const u8,
+    ) void {
+        for (self.pending_sources.items, 0..) |pending, index| {
+            if (!std.mem.eql(u8, pending.source_identity[0..], identity[0..]) or
+                !optionalStringsEqual(pending.credential_name, credential_name)) continue;
+            const removed = self.pending_sources.swapRemove(index);
+            if (removed.credential_name) |value| std.heap.smp_allocator.free(value);
+            std.debug.assert(self.active_preparations > 0);
+            self.active_preparations -= 1;
+            self.drained.broadcast(self.io);
+            return;
+        }
+        unreachable;
     }
 
     fn lookup(
@@ -5671,18 +5863,26 @@ const PreparedDocumentSourceCache = struct {
         credential_name: ?[]const u8,
         content: scraping.DownloadedContent,
     ) !PreparedSourceLease {
+        var content_sha256: ContentDigest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(content.data, &content_sha256, .{});
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.shutting_down) return error.PreparedDocumentCacheShuttingDown;
-        const entry = try self.adoptOwnedAssumeLocked(source_url, credential_name, content);
+        const entry = try self.adoptOwnedWithDigestAssumeLocked(
+            source_url,
+            credential_name,
+            content,
+            content_sha256,
+        );
         return try self.borrowSourceAssumeLocked(entry);
     }
 
-    fn adoptOwnedAssumeLocked(
+    fn adoptOwnedWithDigestAssumeLocked(
         self: *@This(),
         source_url: []const u8,
         credential_name: ?[]const u8,
         content: scraping.DownloadedContent,
+        content_sha256: ContentDigest,
     ) !*Entry {
         const alloc = self.allocator();
         var owned_content = content;
@@ -5691,8 +5891,6 @@ const PreparedDocumentSourceCache = struct {
         errdefer if (owned_credential) |value| alloc.free(value);
         const entry = try alloc.create(Entry);
         errdefer alloc.destroy(entry);
-        var content_sha256: ContentDigest = undefined;
-        std.crypto.hash.sha2.Sha256.hash(owned_content.data, &content_sha256, .{});
         entry.* = .{
             .source_identity = sourceIdentity(source_url),
             .credential_name = owned_credential,
@@ -5711,36 +5909,131 @@ const PreparedDocumentSourceCache = struct {
         decode_limits: document_extraction_mod.PdfDecodeLimits,
         timeout_ms: u64,
     ) !PreparedPdfLease {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.shutting_down) return error.PreparedDocumentCacheShuttingDown;
         if (source.cache != self or source.entry_ptr == null)
             return error.InvalidPreparedDocumentSourceLease;
         const entry = source.entry();
-        if (self.lookupPreparedPdfVariantAssumeLocked(entry, decode_limits)) |variant|
-            return try self.borrowPdfAssumeLocked(variant);
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.shutting_down) {
+                self.mutex.unlock(self.io);
+                return error.PreparedDocumentCacheShuttingDown;
+            }
+            if (source.cache != self or source.entry_ptr == null) {
+                self.mutex.unlock(self.io);
+                return error.InvalidPreparedDocumentSourceLease;
+            }
+            if (self.lookupPreparedPdfVariantAssumeLocked(entry, decode_limits)) |variant| {
+                const lease = self.borrowPdfAssumeLocked(variant) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.unlock(self.io);
+                return lease;
+            }
+            if (self.pdfPendingAssumeLocked(entry, decode_limits)) {
+                self.drained.waitUncancelable(self.io, &self.mutex);
+                self.mutex.unlock(self.io);
+                continue;
+            }
+            self.pending_pdfs.append(std.heap.smp_allocator, .{
+                .entry = entry,
+                .decode_limits = decode_limits,
+            }) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.active_preparations = std.math.add(usize, self.active_preparations, 1) catch {
+                _ = self.pending_pdfs.pop();
+                self.mutex.unlock(self.io);
+                return error.PreparedDocumentCacheReferenceOverflow;
+            };
+            self.pdf_preparation_computations += 1;
+            self.mutex.unlock(self.io);
+            break;
+        }
 
         const alloc = self.allocator();
-        const variant = try alloc.create(PreparedPdfVariant);
-        errdefer alloc.destroy(variant);
+        const variant = alloc.create(PreparedPdfVariant) catch |err| {
+            self.mutex.lockUncancelable(self.io);
+            self.finishPendingPdfAssumeLocked(entry, decode_limits);
+            self.mutex.unlock(self.io);
+            return err;
+        };
         variant.* = .{ .decode_limits = decode_limits };
         variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
-        self.pdf_preparation_computations += 1;
-        variant.session = self.prepare_pdf_session_fn(
+        const prepared = self.prepare_pdf_session_fn(
             alloc,
             entry.content.data,
             decode_limits,
             &variant.deadline,
-        ) catch |err| return self.classifyPreparationError(err);
-        errdefer {
-            variant.session.?.deinit();
-            variant.session = null;
+        );
+        if (prepared) |session| {
+            variant.session = session;
+            self.mutex.lockUncancelable(self.io);
+            if (self.shutting_down) {
+                variant.session.?.deinit();
+                alloc.destroy(variant);
+                self.finishPendingPdfAssumeLocked(entry, decode_limits);
+                self.mutex.unlock(self.io);
+                return error.PreparedDocumentCacheShuttingDown;
+            }
+            // Publish only a completely prepared immutable source. The keyed
+            // flight serializes this source/limit pair through publication.
+            entry.prepared_pdfs.append(alloc, variant) catch |err| {
+                variant.session.?.deinit();
+                alloc.destroy(variant);
+                const classified = self.classifyPreparationError(err);
+                self.finishPendingPdfAssumeLocked(entry, decode_limits);
+                self.mutex.unlock(self.io);
+                return classified;
+            };
+            const lease = self.borrowPdfAssumeLocked(variant) catch |err| {
+                self.finishPendingPdfAssumeLocked(entry, decode_limits);
+                self.mutex.unlock(self.io);
+                return err;
+            };
+            self.finishPendingPdfAssumeLocked(entry, decode_limits);
+            self.mutex.unlock(self.io);
+            return lease;
+        } else |err| {
+            const classified = self.classifyPreparationError(err);
+            alloc.destroy(variant);
+            self.mutex.lockUncancelable(self.io);
+            self.finishPendingPdfAssumeLocked(entry, decode_limits);
+            self.mutex.unlock(self.io);
+            return classified;
         }
-        // Publish only a completely prepared immutable source. The cache lock
-        // serializes lookup through publication, so an identical concurrent
-        // request observes this variant instead of starting a duplicate parse.
-        try entry.prepared_pdfs.append(alloc, variant);
-        return try self.borrowPdfAssumeLocked(variant);
+    }
+
+    fn pdfPendingAssumeLocked(
+        self: *@This(),
+        entry: *Entry,
+        decode_limits: document_extraction_mod.PdfDecodeLimits,
+    ) bool {
+        for (self.pending_pdfs.items) |pending| {
+            if (pending.entry == entry and
+                pending.decode_limits.max_decoded_stream_bytes == decode_limits.max_decoded_stream_bytes and
+                pending.decode_limits.max_working_set_bytes == decode_limits.max_working_set_bytes) return true;
+        }
+        return false;
+    }
+
+    fn finishPendingPdfAssumeLocked(
+        self: *@This(),
+        entry: *Entry,
+        decode_limits: document_extraction_mod.PdfDecodeLimits,
+    ) void {
+        for (self.pending_pdfs.items, 0..) |pending, index| {
+            if (pending.entry != entry or
+                pending.decode_limits.max_decoded_stream_bytes != decode_limits.max_decoded_stream_bytes or
+                pending.decode_limits.max_working_set_bytes != decode_limits.max_working_set_bytes) continue;
+            _ = self.pending_pdfs.swapRemove(index);
+            std.debug.assert(self.active_preparations > 0);
+            self.active_preparations -= 1;
+            self.drained.broadcast(self.io);
+            return;
+        }
+        unreachable;
     }
 
     fn lookupPreparedPdfVariantAssumeLocked(
@@ -5797,6 +6090,8 @@ const PreparedDocumentSourceCache = struct {
     }
 
     fn classifyPreparationError(self: *@This(), err: anyerror) anyerror {
+        self.lockAllocator();
+        defer self.allocator_mutex.unlock();
         if (err == error.OutOfMemory and self.budgeted != null and self.budgeted.?.denied())
             return error.DocumentExtractionWorkingSetTooLarge;
         return err;
@@ -5975,6 +6270,94 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
     deinit_thread.join();
     try std.testing.expect(workers.errors[0] == null);
     try std.testing.expect(workers.errors[1] == null);
+}
+
+test "prepared document cache prepares unrelated PDF keys concurrently" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const FakePreparation = struct {
+        var calls = std.atomic.Value(usize).init(0);
+        var active = std.atomic.Value(usize).init(0);
+        var peak = std.atomic.Value(usize).init(0);
+        var release = std.atomic.Value(bool).init(false);
+
+        fn prepare(
+            _: Allocator,
+            _: []const u8,
+            _: document_extraction_mod.PdfDecodeLimits,
+            _: *const document_extraction_mod.PdfRenderDeadline,
+        ) !document_extraction_mod.PdfRenderSession {
+            _ = calls.fetchAdd(1, .acq_rel);
+            const now_active = active.fetchAdd(1, .acq_rel) + 1;
+            var observed = peak.load(.acquire);
+            while (now_active > observed) {
+                observed = peak.cmpxchgWeak(observed, now_active, .acq_rel, .acquire) orelse break;
+            }
+            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            _ = active.fetchSub(1, .acq_rel);
+            return .{ .parsed = .{} };
+        }
+    };
+    const Worker = struct {
+        cache: *PreparedDocumentSourceCache,
+        source_url: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var source = (self.cache.lookup(self.source_url, null) catch |err| {
+                self.err = err;
+                return;
+            }) orelse {
+                self.err = error.TestExpectedEqual;
+                return;
+            };
+            defer source.deinit();
+            var prepared = self.cache.preparePdf(&source, .{
+                .max_decoded_stream_bytes = 1024,
+                .max_working_set_bytes = 2048,
+            }, 1_000) catch |err| {
+                self.err = err;
+                return;
+            };
+            defer prepared.deinit();
+        }
+    };
+
+    FakePreparation.calls.store(0, .release);
+    FakePreparation.active.store(0, .release);
+    FakePreparation.peak.store(0, .release);
+    FakePreparation.release.store(false, .release);
+    var cache = PreparedDocumentSourceCache{
+        .backing_alloc = std.testing.allocator,
+        .budgeted = null,
+        .io = std.testing.io,
+        .prepare_pdf_session_fn = FakePreparation.prepare,
+    };
+    defer cache.deinit();
+    inline for (.{ "https://example.test/a.pdf", "https://example.test/b.pdf" }) |source_url| {
+        var source = try cache.adoptOwned(source_url, null, .{
+            .content_type = try std.testing.allocator.dupe(u8, "application/pdf"),
+            .data = try std.testing.allocator.dupe(u8, "%PDF-concurrent-key"),
+        });
+        source.deinit();
+    }
+
+    var first = Worker{ .cache = &cache, .source_url = "https://example.test/a.pdf" };
+    var second = Worker{ .cache = &cache, .source_url = "https://example.test/b.pdf" };
+    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    for (0..100_000) |_| {
+        if (FakePreparation.calls.load(.acquire) == 2) break;
+        std.Thread.yield() catch {};
+    }
+    FakePreparation.release.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(first.err == null);
+    try std.testing.expect(second.err == null);
+    try std.testing.expectEqual(@as(usize, 2), FakePreparation.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), FakePreparation.peak.load(.acquire));
 }
 
 fn processPendingDocumentGroup(
@@ -7565,6 +7948,77 @@ pub fn embedRenderedPdfPageBatch(
     return .{ .results = results };
 }
 
+pub fn embedRenderedPdfPageRasterBatch(
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    rendered: document_extraction_mod.RenderedPdfPageRasterBatch,
+    dims: u32,
+) !PdfPageEmbeddingBatch {
+    if (!dense_embedder.supportsRasterItems()) return error.UnsupportedEmbeddingProvider;
+    const results = try alloc.alloc(PdfPageEmbeddingResult, rendered.results.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |*result| result.deinit(alloc);
+        alloc.free(results);
+    }
+    var success_count: usize = 0;
+    for (rendered.results) |page| {
+        if (page.rendered != null and page.failure != null) return error.InvalidPdfRenderBatch;
+        results[initialized] = .{
+            .page_number = page.page_number,
+            .failure = page.failure orelse if (page.rendered == null) error.MissingRenderedPdfPage else null,
+        };
+        initialized += 1;
+        if (page.rendered != null) success_count += 1;
+    }
+    if (success_count == 0) return .{ .results = results };
+
+    const rasters = try alloc.alloc(antfly_image.BorrowedRasterAttachment, success_count);
+    defer alloc.free(rasters);
+    var raster_index: usize = 0;
+    for (rendered.results) |page| if (page.rendered) |raster| {
+        rasters[raster_index] = .{
+            .bytes = raster.bytes,
+            .width = raster.width,
+            .height = raster.height,
+            .stride_bytes = raster.stride,
+            .format = .rgba8,
+            .mime_type = antfly_image.rgba8_raster_mime_type,
+            .page_number = @intCast(page.page_number),
+        };
+        raster_index += 1;
+    };
+    const vectors = try dense_embedder.embedDenseRasterItems(alloc, embedding_name, rasters, dims);
+    defer alloc.free(vectors);
+    raster_index = 0;
+    for (rendered.results, results) |page, *result| {
+        if (page.rendered == null) continue;
+        result.vector = vectors[raster_index];
+        raster_index += 1;
+    }
+    return .{ .results = results };
+}
+
+const PdfEmbeddingRenderedWindow = union(enum) {
+    encoded: document_extraction_mod.RenderedPdfPageBatch,
+    raster: document_extraction_mod.RenderedPdfPageRasterBatch,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        switch (self.*) {
+            inline else => |*batch| batch.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+
+    fn sourceBytes(self: *const @This(), index: usize) []const u8 {
+        return switch (self.*) {
+            .encoded => |batch| batch.results[index].rendered.?.png,
+            .raster => |batch| batch.results[index].rendered.?.bytes,
+        };
+    }
+};
+
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -7862,8 +8316,10 @@ const ConcurrentPdfWindowOutputAllocator = struct {
 /// One fair, window-scoped admission owner for native render scratch and the
 /// allocator-backed media/provider peak. The two credits are acquired in one
 /// ResourceManager operation, so neither side can be stolen between planning
-/// and execution. `window_slots` is one today; accepting a multiplier makes
-/// future render/inference overlap require atomic admission for both windows.
+/// and execution. A slot multiplier supports statically planned windows; the
+/// streaming prefetch path instead acquires a second independent lease while
+/// the active lease is live, so the ResourceManager admits their combined peak
+/// before speculative rendering begins.
 const PdfWindowCompositeLease = struct {
     owner_alloc: Allocator,
     backing_alloc: Allocator,
@@ -14477,6 +14933,240 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
     stale.artifact_delete_keys = &.{};
 }
 
+const PdfEmbeddingPreparedWindow = struct {
+    first_page: usize,
+    count: usize,
+    lease: *PdfWindowCompositeLease,
+    rendered: PdfEmbeddingRenderedWindow,
+
+    fn deinit(self: *@This()) void {
+        self.rendered.deinit(self.lease.allocator());
+        self.lease.destroy();
+        self.* = undefined;
+    }
+};
+
+const PdfEmbeddingWindowPreparer = struct {
+    runtime: *EnrichmentRuntime,
+    coordinator: *RuntimePdfOcrCoordinator,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    expected_dims: u32,
+    render_config: document_extraction_mod.Config,
+    capabilities: inference_work.InferenceCapabilities,
+    batch_items: usize,
+    batch_bytes: usize,
+    page_count: usize,
+    use_borrowed_rasters: bool,
+    cancel_requested: *const std.atomic.Value(bool),
+
+    fn isCancelled(raw: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw orelse return true));
+        return self.cancel_requested.load(.acquire) or
+            platform_time.monotonicNs() >= self.coordinator.deadline.deadline_ns;
+    }
+
+    fn cancellationProbe(self: *const @This()) document_extraction_mod.PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn prepare(self: *const @This(), first_page: usize) !PdfEmbeddingPreparedWindow {
+        // A speculative window is prepared on an Io worker while the
+        // enrichment worker consumes and stages the current window. Keep all
+        // allocations reachable from that task on a thread-safe allocator;
+        // the composite lease and ResourceManager still enforce the large
+        // scratch/output ceilings independently of the backing allocator.
+        const concurrent_alloc = std.heap.smp_allocator;
+        self.coordinator.beginOperation(self.runtime.config.sync_wait_timeout_ms);
+        self.coordinator.session.setCancellationProbe(self.cancellationProbe());
+        var count = @min(self.batch_items, self.page_count - first_page + 1);
+        const available_bytes = @min(
+            try self.coordinator.availableRenderBytes(),
+            self.render_config.pdf_render_max_inflight_bytes,
+        );
+        const model_pixel_cap = self.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const requests = try concurrent_alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
+        defer concurrent_alloc.free(requests);
+        const minimum_dimension = @min(
+            self.render_config.ocr_max_rendered_dimension,
+            minimum_pdf_page_render_dimension,
+        );
+        for (requests, 0..) |*page_request, i| page_request.* = .{
+            .page_number = first_page + i,
+            .requested_dpi = self.render_config.ocr_render_dpi,
+            .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
+            .max_dimension = self.render_config.ocr_max_rendered_dimension,
+            .max_output_bytes = null,
+            .min_output_dimension = minimum_dimension,
+            .max_output_attempts = maximum_pdf_page_render_attempts,
+        };
+        const prepared_plans = try concurrent_alloc.alloc(
+            document_extraction_mod.PreparedPdfPageRenderPlan,
+            count,
+        );
+        defer concurrent_alloc.free(prepared_plans);
+        count = try preparePdfPixelPrefix(
+            &self.coordinator.session,
+            requests[0..count],
+            prepared_plans,
+            model_pixel_cap,
+        );
+        const singleton_memory = try self.dense_embedder.partInvocationMemoryForMime(
+            self.embedding_name,
+            1,
+            "image/png",
+            self.expected_dims,
+        );
+        const per_page_bytes = if (self.use_borrowed_rasters)
+            1
+        else
+            @min(
+                maximum_pdf_page_inline_png_bytes,
+                try singleton_memory.attachment_transport.maxRawBytesForLimits(
+                    "image/png".len,
+                    1,
+                    self.batch_bytes,
+                    std.math.maxInt(usize),
+                ),
+            );
+        if (per_page_bytes == 0) return error.DocumentExtractionWorkingSetTooLarge;
+
+        var window_lease: ?*PdfWindowCompositeLease = null;
+        errdefer if (window_lease) |lease| lease.destroy();
+        var memory_budget: ?PdfRenderMemoryBudget = null;
+        var candidate_count = count;
+        while (candidate_count > 0) : (candidate_count -= 1) {
+            const invocation_memory = try self.dense_embedder.partInvocationMemoryForMime(
+                self.embedding_name,
+                candidate_count,
+                "image/png",
+                self.expected_dims,
+            );
+            var retained_raw_bytes: usize = 0;
+            if (self.use_borrowed_rasters) {
+                for (prepared_plans[0..candidate_count]) |plan| {
+                    retained_raw_bytes = std.math.add(
+                        usize,
+                        retained_raw_bytes,
+                        try pdfRgbaBytesForPixels(plan.geometry().pixels),
+                    ) catch return error.DocumentExtractionWorkingSetTooLarge;
+                }
+            } else {
+                retained_raw_bytes = std.math.mul(usize, per_page_bytes, candidate_count) catch
+                    return error.DocumentExtractionWorkingSetTooLarge;
+            }
+            const required_output_bytes = if (self.use_borrowed_rasters)
+                try pdfRasterInvocationOutputReservationBytes(invocation_memory, retained_raw_bytes)
+            else
+                try pdfInvocationOutputReservationBytes(
+                    self.batch_bytes,
+                    invocation_memory,
+                    "image/png".len,
+                    candidate_count,
+                    retained_raw_bytes,
+                );
+            const lease = PdfWindowCompositeLease.create(
+                concurrent_alloc,
+                concurrent_alloc,
+                self.resource_manager,
+                available_bytes,
+                required_output_bytes,
+                1,
+            ) catch |err| {
+                if (err == error.DocumentExtractionWorkingSetTooLarge and candidate_count > 1)
+                    continue;
+                return err;
+            };
+            var lease_owned = true;
+            defer if (lease_owned) lease.destroy();
+            const candidate_budget = (if (self.use_borrowed_rasters)
+                splitOwnedPdfRasterInvocationMemoryBudget(
+                    lease.scratchBytesPerWindow(),
+                    lease.outputBytesPerWindow(),
+                    invocation_memory,
+                )
+            else
+                splitOwnedPdfInvocationMemoryBudget(
+                    lease.scratchBytesPerWindow(),
+                    lease.outputBytesPerWindow(),
+                    self.batch_bytes,
+                    invocation_memory,
+                    "image/png".len,
+                    candidate_count,
+                )) catch |err| {
+                if (err == error.DocumentExtractionWorkingSetTooLarge and candidate_count > 1)
+                    continue;
+                return err;
+            };
+            if (retained_raw_bytes <= candidate_budget.retained_bytes) {
+                count = candidate_count;
+                memory_budget = candidate_budget;
+                window_lease = lease;
+                lease_owned = false;
+                break;
+            }
+            if (candidate_count == 1) return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
+        window_lease = null;
+        errdefer lease.destroy();
+        const admitted_memory = memory_budget orelse return error.DocumentExtractionWorkingSetTooLarge;
+        for (requests[0..count], 0..) |*page_request, i| {
+            page_request.max_output_bytes = if (self.use_borrowed_rasters) null else per_page_bytes;
+            prepared_plans[i] = prepared_plans[i].withMaxOutputBytes(page_request.max_output_bytes);
+        }
+        const render_options = document_extraction_mod.PdfPageRenderBatchOptions{
+            .max_batch_pages = count,
+            .max_parallel_pages = @min(self.render_config.pdf_render_max_parallel_pages, count),
+            .max_inflight_pixels = @min(self.render_config.pdf_render_max_inflight_pixels, model_pixel_cap),
+            .max_inflight_bytes = admitted_memory.scratch_bytes,
+            .max_retained_png_bytes = admitted_memory.retained_bytes,
+            .max_retained_raster_bytes = admitted_memory.retained_bytes,
+            .profile = .ocr,
+            .cancellation = self.cancellationProbe(),
+            .executor_io = self.runtime.config.io,
+        };
+        var rendered: PdfEmbeddingRenderedWindow = if (self.use_borrowed_rasters)
+            .{ .raster = try renderPreparedPdfRasterWindowBatchAlloc(
+                self.runtime,
+                &self.coordinator.session,
+                lease.allocator(),
+                prepared_plans[0..count],
+                render_options,
+            ) }
+        else
+            .{ .encoded = try renderPreparedPdfWindowBatchAlloc(
+                self.runtime,
+                &self.coordinator.session,
+                lease.allocator(),
+                prepared_plans[0..count],
+                render_options,
+            ) };
+        errdefer rendered.deinit(lease.allocator());
+        return .{
+            .first_page = first_page,
+            .count = count,
+            .lease = lease,
+            .rendered = rendered,
+        };
+    }
+};
+
+const PdfEmbeddingWindowPrefetch = struct {
+    preparer: *const PdfEmbeddingWindowPreparer,
+    first_page: usize,
+    window: ?PdfEmbeddingPreparedWindow = null,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.window = self.preparer.prepare(self.first_page) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
 fn processChunkText(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -14654,7 +15344,8 @@ fn processPdfPageImageEmbedding(
     window: *GeneratedReplayWindow,
 ) !void {
     if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
-    if (!dense_embedder.supportsPartItems()) return error.UnsupportedEmbeddingProvider;
+    if (!dense_embedder.supportsPartItems() and !dense_embedder.supportsRasterItems())
+        return error.UnsupportedEmbeddingProvider;
     // Rendering and a remote/local multimodal invocation can each exceed the
     // ordinary enrichment lease TTL. Renew the exact tenure concurrently for
     // the complete operation; transaction fences remain the publication
@@ -14665,7 +15356,9 @@ fn processPdfPageImageEmbedding(
     try embedding_lease_guard.check();
     const embedding_name = requestEmbeddingName(request);
     const capabilities = try dense_embedder.capabilities(runtime.alloc, embedding_name);
-    if (!capabilities.supports(.{ .image = true }) or !capabilities.acceptsMimeType("image/png") or
+    const use_borrowed_rasters = dense_embedder.supportsRasterItems() and capabilities.borrowed_rasters;
+    if (!capabilities.supports(.{ .image = true }) or
+        (!use_borrowed_rasters and !capabilities.acceptsMimeType("image/png")) or
         capabilities.result_cardinality != .one_per_item)
     {
         return error.UnsupportedEmbeddingProvider;
@@ -14674,12 +15367,13 @@ fn processPdfPageImageEmbedding(
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
     const batch_items = @min(policy.batch_items orelse default_items, capability_items);
-    // Page-image planning requires an exact encoded-media ceiling. Treat a
-    // temporarily unavailable remote catalog as retryable capability
-    // discovery; inventing the 256 MiB renderer ceiling here makes the output
-    // reservation impossible under the default 256 MiB extraction budget.
+    // Encoded routes require an exact wire ceiling. A local raw-raster route
+    // is bounded by decoded pixels and its composite retained-byte lease, so
+    // an encoded-media ceiling is neither required nor applied.
     const capability_bytes = capabilities.batch.max_encoded_media_bytes;
-    const batch_bytes = if (capability_bytes) |model_limit|
+    const batch_bytes = if (use_borrowed_rasters)
+        policy.batch_bytes orelse 1
+    else if (capability_bytes) |model_limit|
         pdfImageEmbeddingBatchBytes(policy.batch_bytes, model_limit)
     else
         policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
@@ -14736,9 +15430,12 @@ fn processPdfPageImageEmbedding(
     defer prepared_pdf_source_lease.deinit();
     const prepared_pdf_source = prepared_pdf_source_lease.session();
     try embedding_lease_guard.check();
+    // The next page window may render concurrently with result staging for
+    // the current window, so the cloned render session must not share the
+    // enrichment worker's task-confined allocator.
     const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(
-        runtime.alloc,
-        runtime.alloc,
+        std.heap.smp_allocator,
+        std.heap.smp_allocator,
         runtime.config.sync_wait_timeout_ms,
         render_config,
         prepared_pdf_source,
@@ -14758,7 +15455,7 @@ fn processPdfPageImageEmbedding(
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     try heartbeatEnrichmentLease(runtime);
     const fence_epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
-    const source_hash = std.hash.Wyhash.hash(0x7064665f73746167, downloaded.data);
+    const source_hash = std.mem.readInt(u64, prepared_source.content_sha256[0..@sizeOf(u64)], .little);
     const stage_attempt_id = try std.fmt.allocPrint(
         runtime.alloc,
         "epoch-{d}:sequence-{d}:attempt-{d}:source-{x}",
@@ -14784,130 +15481,61 @@ fn processPdfPageImageEmbedding(
         base_embeddings.deinit(runtime.alloc);
     }
 
-    var first_page: usize = 1;
-    while (first_page <= page_count) {
+    var prefetch_cancel_requested: std.atomic.Value(bool) = .init(false);
+    const window_preparer = PdfEmbeddingWindowPreparer{
+        .runtime = runtime,
+        .coordinator = coordinator,
+        .resource_manager = resource_tracker.manager,
+        .dense_embedder = dense_embedder,
+        .embedding_name = embedding_name,
+        .expected_dims = request.expected_dims,
+        .render_config = render_config,
+        .capabilities = capabilities,
+        .batch_items = batch_items,
+        .batch_bytes = batch_bytes,
+        .page_count = page_count,
+        .use_borrowed_rasters = use_borrowed_rasters,
+        .cancel_requested = &prefetch_cancel_requested,
+    };
+    const prefetch_io = runtime.config.io;
+    const prefetch_batches = generatedPdfRenderPrefetchBatches();
+    var prefetch_job = PdfEmbeddingWindowPrefetch{
+        .preparer = &window_preparer,
+        .first_page = 0,
+    };
+    var prefetch_future: ?Io.Future(void) = null;
+    defer {
+        prefetch_cancel_requested.store(true, .release);
+        if (prefetch_future) |*future| {
+            if (prefetch_io) |io| future.await(io);
+        }
+        if (prefetch_job.window) |*prepared| prepared.deinit();
+    }
+    var current_window: ?PdfEmbeddingPreparedWindow = try window_preparer.prepare(1);
+    defer if (current_window) |*prepared| prepared.deinit();
+
+    while (current_window) |*current| {
         try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
-        coordinator.beginOperation(runtime.config.sync_wait_timeout_ms);
-        var count = @min(batch_items, page_count - first_page + 1);
-        const available_bytes = @min(try coordinator.availableRenderBytes(), render_config.pdf_render_max_inflight_bytes);
-        const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
-        const requests = try runtime.alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
-        defer runtime.alloc.free(requests);
-        const minimum_dimension = @min(render_config.ocr_max_rendered_dimension, minimum_pdf_page_render_dimension);
-        for (requests, 0..) |*page_request, i| page_request.* = .{
-            .page_number = first_page + i,
-            .requested_dpi = render_config.ocr_render_dpi,
-            .max_pixels = @min(render_config.ocr_max_rendered_pixels, model_pixel_cap),
-            .max_dimension = render_config.ocr_max_rendered_dimension,
-            .max_output_bytes = null,
-            .min_output_dimension = minimum_dimension,
-            .max_output_attempts = maximum_pdf_page_render_attempts,
+        const next_first_page = current.first_page + current.count;
+        if (next_first_page <= page_count and prefetch_batches != 0) if (prefetch_io) |io| {
+            std.debug.assert(prefetch_future == null);
+            std.debug.assert(prefetch_job.window == null);
+            prefetch_job = .{
+                .preparer = &window_preparer,
+                .first_page = next_first_page,
+            };
+            // Prefetch is an optimization. Executor saturation or a temporary
+            // task-spawn failure must preserve the synchronous baseline.
+            prefetch_future = io.concurrent(PdfEmbeddingWindowPrefetch.run, .{&prefetch_job}) catch null;
         };
-        const prepared_plans = try runtime.alloc.alloc(
-            document_extraction_mod.PreparedPdfPageRenderPlan,
-            count,
-        );
-        defer runtime.alloc.free(prepared_plans);
-        count = try preparePdfPixelPrefix(
-            &coordinator.session,
-            requests[0..count],
-            prepared_plans,
-            model_pixel_cap,
-        );
-        const singleton_memory = try dense_embedder.partInvocationMemoryForMime(
-            embedding_name,
-            1,
-            "image/png",
-            request.expected_dims,
-        );
-        const per_page_bytes = @min(
-            maximum_pdf_page_inline_png_bytes,
-            try singleton_memory.attachment_transport.maxRawBytesForLimits(
-                "image/png".len,
-                1,
-                batch_bytes,
-                std.math.maxInt(usize),
-            ),
-        );
-        if (per_page_bytes == 0) return error.DocumentExtractionWorkingSetTooLarge;
-        var window_lease: ?*PdfWindowCompositeLease = null;
-        errdefer if (window_lease) |lease| lease.destroy();
-        var memory_budget: ?PdfRenderMemoryBudget = null;
-        var candidate_count = count;
-        while (candidate_count > 0) : (candidate_count -= 1) {
-            const invocation_memory = try dense_embedder.partInvocationMemoryForMime(
-                embedding_name,
-                candidate_count,
-                "image/png",
-                request.expected_dims,
-            );
-            const retained_raw_bytes = std.math.mul(usize, per_page_bytes, candidate_count) catch
-                return error.DocumentExtractionWorkingSetTooLarge;
-            const required_output_bytes = try pdfInvocationOutputReservationBytes(
-                batch_bytes,
-                invocation_memory,
-                "image/png".len,
-                candidate_count,
-                retained_raw_bytes,
-            );
-            const lease = PdfWindowCompositeLease.create(
-                runtime.alloc,
-                runtime.alloc,
-                resource_tracker.manager,
-                available_bytes,
-                required_output_bytes,
-                1,
-            ) catch |err| {
-                if (err == error.DocumentExtractionWorkingSetTooLarge and candidate_count > 1)
-                    continue;
-                return err;
-            };
-            var lease_owned = true;
-            defer if (lease_owned) lease.destroy();
-            const candidate_budget = splitOwnedPdfInvocationMemoryBudget(
-                lease.scratchBytesPerWindow(),
-                lease.outputBytesPerWindow(),
-                batch_bytes,
-                invocation_memory,
-                "image/png".len,
-                candidate_count,
-            ) catch |err| {
-                if (err == error.DocumentExtractionWorkingSetTooLarge and candidate_count > 1)
-                    continue;
-                return err;
-            };
-            if (per_page_bytes <= candidate_budget.retained_bytes / candidate_count) {
-                count = candidate_count;
-                memory_budget = candidate_budget;
-                window_lease = lease;
-                lease_owned = false;
-                break;
-            }
-            if (candidate_count == 1) return error.DocumentExtractionWorkingSetTooLarge;
-        }
-        const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
-        defer lease.destroy();
-        window_lease = null;
-        const admitted_memory = memory_budget orelse return error.DocumentExtractionWorkingSetTooLarge;
-        for (requests[0..count], 0..) |*page_request, i| {
-            page_request.max_output_bytes = per_page_bytes;
-            prepared_plans[i] = prepared_plans[i].withMaxOutputBytes(page_request.max_output_bytes);
-        }
-        try embedding_lease_guard.check();
-        var rendered = try renderPreparedPdfWindowBatchAlloc(runtime, &coordinator.session, lease.allocator(), prepared_plans[0..count], .{
-            .max_batch_pages = count,
-            .max_parallel_pages = @min(render_config.pdf_render_max_parallel_pages, count),
-            .max_inflight_pixels = @min(render_config.pdf_render_max_inflight_pixels, model_pixel_cap),
-            .max_inflight_bytes = admitted_memory.scratch_bytes,
-            .max_retained_png_bytes = admitted_memory.retained_bytes,
-            .profile = .ocr,
-            .cancellation = coordinator.deadline.probe(),
-            .executor_io = runtime.config.io,
-        });
-        defer rendered.deinit(lease.allocator());
-        try embedding_lease_guard.check();
-        var embedded = try embedRenderedPdfPageBatch(lease.allocator(), dense_embedder, embedding_name, rendered, request.expected_dims);
+
+        const lease = current.lease;
+        const rendered = &current.rendered;
+        var embedded = switch (rendered.*) {
+            .encoded => |batch| try embedRenderedPdfPageBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
+            .raster => |batch| try embedRenderedPdfPageRasterBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
+        };
         defer embedded.deinit(lease.allocator());
         try embedding_lease_guard.check();
         try heartbeatEnrichmentLease(runtime);
@@ -14951,7 +15579,7 @@ fn processPdfPageImageEmbedding(
             try staged_page_keys.append(runtime.alloc, stage_key);
             stage_key_owned = false;
             const page_source_hash = enrichment_artifact_codec.hashEmbeddingSource(
-                rendered.results[result_index].rendered.?.png,
+                rendered.sourceBytes(result_index),
                 request.producer_json,
             );
             const staged_payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(
@@ -14988,7 +15616,32 @@ fn processPdfPageImageEmbedding(
         try embedding_lease_guard.check();
         try storePutBatchWithRetry(runtime, stage_writes.items, &.{});
         try embedding_lease_guard.check();
-        first_page += count;
+        current.deinit();
+        current_window = null;
+        if (next_first_page > page_count) break;
+
+        if (prefetch_future) |*future| {
+            future.await(prefetch_io.?);
+            prefetch_future = null;
+            if (prefetch_job.err) |err| {
+                prefetch_job.err = null;
+                // A speculative second window may not fit while the current
+                // window is admitted, or its operation-local deadline may
+                // expire behind slow inference. Once the current lease is
+                // released, retry synchronously instead of turning safe
+                // backpressure into durable enrichment failure.
+                if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
+                    return err;
+                try embedding_lease_guard.check();
+                try checkProviderFailureGuard(runtime);
+                current_window = try window_preparer.prepare(next_first_page);
+            } else {
+                current_window = prefetch_job.window orelse return error.MissingPdfRenderWindow;
+                prefetch_job.window = null;
+            }
+        } else {
+            current_window = try window_preparer.prepare(next_first_page);
+        }
     }
 
     try embedding_lease_guard.check();

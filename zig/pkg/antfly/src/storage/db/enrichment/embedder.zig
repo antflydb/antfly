@@ -23,6 +23,7 @@ const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or b
 else
     @import("../../../template.zig");
 const inference_work = @import("../../../inference/work.zig");
+const antfly_image = @import("antfly_image");
 
 pub const DenseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32;
 pub const DenseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32) anyerror![]const []const f32;
@@ -31,6 +32,7 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 /// the document-page path: a window of page images produces one vector per
 /// page rather than an implicit document-level pool.
 pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
+pub const DenseEmbedRasterItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const antfly_image.BorrowedRasterAttachment, dims: u32) anyerror![]const []const f32;
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
 pub const DensePartInvocationMemory = inference_work.InvocationMemoryPlan;
@@ -79,6 +81,7 @@ pub const DenseEmbedder = struct {
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
+    dense_embed_raster_items_fn: ?DenseEmbedRasterItemsFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     capabilities_fn: ?DenseCapabilitiesFn = null,
     part_invocation_memory_fn: ?DensePartInvocationMemoryFn = null,
@@ -116,6 +119,10 @@ pub const DenseEmbedder = struct {
 
     pub fn supportsPartItems(self: DenseEmbedder) bool {
         return self.dense_embed_part_items_fn != null;
+    }
+
+    pub fn supportsRasterItems(self: DenseEmbedder) bool {
+        return self.dense_embed_raster_items_fn != null;
     }
 
     pub fn mediaPartLimit(self: DenseEmbedder, embedding_name: []const u8) ?usize {
@@ -262,6 +269,27 @@ pub const DenseEmbedder = struct {
         if (result_bytes > invocation_plan.max_result_bytes) {
             freeDenseEmbeddingBatch(alloc, vectors);
             return error.InferenceResultTooLarge;
+        }
+        return vectors;
+    }
+
+    pub fn embedDenseRasterItems(
+        self: DenseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        items: []const antfly_image.BorrowedRasterAttachment,
+        dims: u32,
+    ) ![]const []const f32 {
+        const embed_items = self.dense_embed_raster_items_fn orelse
+            return error.UnsupportedEmbeddingProvider;
+        for (items) |item| try item.validate();
+        const vectors = try embed_items(self.ptr, alloc, embedding_name, items, dims);
+        errdefer freeDenseEmbeddingBatch(alloc, vectors);
+        if (vectors.len != items.len) return error.InvalidEmbeddingResponse;
+        for (vectors) |vector| {
+            if (vector.len != dims) return error.InvalidEmbeddingDimensions;
+            for (vector) |value| if (!std.math.isFinite(value))
+                return error.InvalidEmbeddingResponse;
         }
         return vectors;
     }

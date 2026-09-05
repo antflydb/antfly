@@ -19,6 +19,7 @@
 // backend Session (ONNX, native).
 
 const std = @import("std");
+const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const linalg = @import("inference_linalg");
@@ -834,6 +835,120 @@ pub const EmbeddingPipeline = struct {
             return err;
         };
         return embeddings;
+    }
+
+    /// Embed renderer-owned decoded rasters without an encode/decode round
+    /// trip. Buffers remain borrowed for this synchronous call and are copied
+    /// only into the model's normalized f32 input tensor.
+    pub fn embedBorrowedRasters(
+        self: *EmbeddingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) anyerror![][]f32 {
+        if (rasters.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
+        return self.embedBorrowedRastersBatch(rasters) catch |err| {
+            if (rasters.len > 1 and shouldFallbackBatchedImageError(err)) {
+                const embeddings = try self.allocator.alloc([]f32, rasters.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
+                    self.allocator.free(embeddings);
+                }
+                for (rasters, 0..) |_, index| {
+                    const single = try self.embedBorrowedRastersBatch(rasters[index .. index + 1]);
+                    defer self.allocator.free(single);
+                    embeddings[index] = single[0];
+                    initialized += 1;
+                }
+                return embeddings;
+            }
+            return err;
+        };
+    }
+
+    fn embedBorrowedRastersBatch(
+        self: *EmbeddingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) anyerror![][]f32 {
+        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
+        const alloc = self.allocator;
+        const img_size = self.config.image_size;
+        const batch = rasters.len;
+        const pixel_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, 3) catch return error.ResourceLimitExceeded,
+                img_size,
+            ) catch return error.ResourceLimitExceeded,
+            img_size,
+        ) catch return error.ResourceLimitExceeded;
+        const pixel_bytes = std.math.mul(usize, pixel_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var raster_bytes: usize = 0;
+        for (rasters) |raster| {
+            try raster.validate();
+            raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
+                return error.ResourceLimitExceeded;
+        }
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
+
+        const pixel_values = try alloc.alloc(f32, pixel_elements);
+        defer alloc.free(pixel_values);
+        const preprocess_start = embedTimingStart(self.print_timing);
+        switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBorrowedRasterBatchInto(
+                pixel_values,
+                rasters,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+                .bilinear,
+            ),
+            .clip => try image.preprocessClipBorrowedRasterBatchInto(
+                pixel_values,
+                rasters,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+            ),
+        }
+        logEmbedTiming("image.preprocess.raster", batch, preprocess_start);
+
+        const sz: i64 = @intCast(img_size);
+        const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
+        var pv_tensor = try Tensor.initFloat32(alloc, "pixel_values", &pv_shape, pixel_values);
+        defer pv_tensor.deinit();
+
+        if (self.visual_projection) |proj| {
+            const resident = try self.tryEmbedResidentProjection(
+                &.{pv_tensor},
+                proj,
+                .image,
+                batch,
+                "image.encoder.resident",
+                "image.projection.resident",
+                &run_permit,
+            );
+            if (resident) |embeddings| return embeddings;
+        }
+
+        const encoder_start = embedTimingStart(self.print_timing);
+        const outputs = try run_permit.run(&.{pv_tensor}, alloc);
+        logEmbedTiming("image.encoder", batch, encoder_start);
+        defer {
+            for (outputs) |*output| output.deinit();
+            alloc.free(outputs);
+        }
+        return try self.imageEmbeddingsFromOutputs(outputs, batch);
     }
 
     fn imageEmbeddingsFromOutputs(self: *EmbeddingPipeline, outputs: []Tensor, batch: usize) ![][]f32 {

@@ -4972,6 +4972,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
         .embed_dense_parts = inferenceProviderEmbedDenseParts,
         .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
+        .embed_dense_rasters = inferenceProviderEmbedDenseRasters,
         .rerank_texts = inferenceProviderRerankTexts,
         .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
         .generate_text = inferenceProviderGenerateText,
@@ -5995,6 +5996,40 @@ fn inferenceProviderReadRasterImagesReportedControlled(
         borrowed.refs,
         cancellation,
     );
+}
+
+fn inferenceProviderEmbedDenseRasters(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    rasters: []const antfly.readers.RasterImage,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    try context.check();
+    if (rasters.len == 0) return try alloc.alloc([]f32, 0);
+    var borrowed = try rasterProviderPayloadsAlloc(alloc, rasters);
+    defer borrowed.deinit(alloc);
+    const vectors = try invokeInferenceProviderWithBinaryControlled(
+        [][]f32,
+        alloc,
+        handle,
+        .embed_dense_rasters,
+        inference_bridge.ReadRasterImagesRequest{
+            .model = model,
+            .raster_count = rasters.len,
+            .rasters = borrowed.metadata,
+        },
+        context.deadline_ns,
+        borrowed.payloads,
+        borrowed.refs,
+        context.cancellation orelse .none,
+    );
+    errdefer {
+        for (vectors) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    try context.check();
+    return vectors;
 }
 
 const RasterProviderPayloads = struct {

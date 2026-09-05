@@ -84,6 +84,7 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
 const executor_microbatch = @import("executor_microbatch.zig");
+pub const ExecutorCancellation = executor_microbatch.Cancellation;
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1554,6 +1555,17 @@ fn denseEmbedDownloadContext(context: DenseEmbedRequestContext) !scraping.Downlo
 
 fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
     _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
+}
+
+fn directExecutorDeadline(io: std.Io, deadline_ns: ?u64) !?std.Io.Clock.Timestamp {
+    const deadline = deadline_ns orelse return null;
+    const now_ns = embedTimingNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns: i96 = @intCast(@as(u128, deadline) - now_ns);
+    return std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+        .raw = std.Io.Duration.fromNanoseconds(remaining_ns),
+        .clock = .awake,
+    });
 }
 
 fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
@@ -5046,6 +5058,88 @@ pub const Node = struct {
         );
     }
 
+    /// Local renderer-to-embedder fast path. Raw raster storage and identity
+    /// remain borrowed; only the returned vectors escape this call.
+    pub fn embedDenseRastersDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        rasters: []const readers_api.RasterImage,
+    ) ![][]f32 {
+        if (rasters.len == 0) return try allocator.alloc([]f32, 0);
+        if (rasters.len > executorMaxImages("embed")) return error.EmbeddingBatchTooLarge;
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        const security = effectiveRequestContentSecurity(self);
+        var raster_bytes: usize = 0;
+        var decoded_pixels: u64 = 0;
+        for (rasters) |raster| {
+            try raster.validate();
+            try image_pipeline.DecodeLimits.inference_default.validate(raster.width, raster.height);
+            if (security.max_image_dimension) |limit| {
+                if (raster.width > limit or raster.height > limit) return error.ImageTooLarge;
+            }
+            raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
+                return error.EmbeddingBatchTooLarge;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try raster.pixels()) catch
+                return error.EmbeddingBatchTooLarge;
+        }
+
+        const admission = readResidentEncodedAdmissionForLimits(
+            rasters.len,
+            raster_bytes,
+            self.inference_admission.capacity,
+            security.max_image_dimension,
+        );
+        try self.acquireAdmissionUnits(admission.units);
+        defer self.releaseAdmissionUnits(admission.units);
+        self.metrics.incRequest("embed.local.raster");
+        defer self.metrics.decActive();
+
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
+        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer manifest.deinit();
+        if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &manifest);
+        if (!executor_contract.accepts_borrowed_rasters) return error.BorrowedRasterUnsupported;
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = rasters.len,
+            .decoded_pixels = decoded_pixels,
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            deadline_ns: ?u64,
+            rasters: []const readers_api.RasterImage,
+            vectors: ?[][]f32 = null,
+
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                var asset_lease = model.acquireEmbeddingAssetLease(false);
+                defer asset_lease.release();
+                try model.ensureEmbeddingAssets(false, true, false);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                var pipeline = model.embeddingPipeline(attempt.allocator);
+                const vectors = try pipeline.embedBorrowedRasters(attempt.rasters);
+                asset_lease.release();
+                errdefer freeDirectDenseVectors(attempt.allocator, vectors);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                attempt.vectors = vectors;
+            }
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .deadline_ns = deadline_ns,
+            .rasters = rasters,
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
+    }
+
     fn embedParsedDenseInputsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -5225,6 +5319,25 @@ pub const Node = struct {
         model_name: []const u8,
         request: readers_api.EncodedRequest,
     ) !readers_api.BatchResult {
+        return self.readEncodedImagesReportedDirectWithContext(
+            allocator,
+            model_name,
+            request,
+            null,
+            .{},
+        );
+    }
+
+    pub fn readEncodedImagesReportedDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+        deadline_ns: ?u64,
+        cancellation: ExecutorCancellation,
+    ) !readers_api.BatchResult {
+        if (cancellation.isCancelled()) return error.Canceled;
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (request.images.len == 0) return error.ReadBatchTooLarge;
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try readers_api.validateEncodedRequest(request);
@@ -5264,6 +5377,7 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
+        const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
@@ -5318,7 +5432,7 @@ pub const Node = struct {
                         std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
                     else
                         std.math.maxInt(usize);
-                    const broker_result = try self.executorMicrobatchBroker().submit(
+                    const broker_result = try self.executorMicrobatchBroker().submitControlled(
                         ReadMicrobatchPayload,
                         readers_api.Result,
                         io,
@@ -5354,8 +5468,8 @@ pub const Node = struct {
                             .source_fingerprint = request.images[0].source_fingerprint,
                             .page_number = request.images[0].page_number,
                         },
-                        null,
-                        null,
+                        broker_deadline,
+                        cancellation,
                         &broker_payload,
                         self,
                         executeReadMicrobatch,
@@ -5404,6 +5518,7 @@ pub const Node = struct {
             request.prompt,
             max_tokens,
             request.source_fingerprint,
+            null,
             null,
         );
     }
@@ -5494,17 +5609,6 @@ pub const Node = struct {
         };
     }
 
-    fn cloneReadResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
-        var result = readers_api.Result{ .text = try allocator.dupe(u8, source.text) };
-        errdefer readers_api.deinitResult(allocator, &result);
-        result.fields_json = if (source.fields_json) |value| try allocator.dupe(u8, value) else null;
-        result.regions_json = if (source.regions_json) |value| try allocator.dupe(u8, value) else null;
-        result.item_id = if (source.item_id.len > 0) try allocator.dupe(u8, source.item_id) else "";
-        result.source_fingerprint = if (source.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
-        result.page_number = source.page_number;
-        return result;
-    }
-
     fn executeReadMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
         const self: *Node = @ptrCast(@alignCast(raw));
         if (items.len == 0) return;
@@ -5519,17 +5623,23 @@ pub const Node = struct {
             return;
         };
         defer allocator.free(image_datas);
+        const result_allocators = allocator.alloc(std.mem.Allocator, items.len) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(result_allocators);
         const first = items[0].payloadAs(ReadMicrobatchPayload);
         var common_profile_source = first.profile_source_fingerprint;
         for (items, 0..) |item, index| {
             const payload = item.payloadAs(ReadMicrobatchPayload);
             images[index] = payload.image;
             image_datas[index] = payload.image.bytes;
+            result_allocators[index] = item.allocator;
             if (!optionalBytesEql(common_profile_source, payload.profile_source_fingerprint))
                 common_profile_source = null;
         }
 
-        var batch = self.runReadImageBatchReportedDirect(
+        const batch = self.runReadImageBatchReportedDirect(
             allocator,
             first.model_path,
             image_datas,
@@ -5540,12 +5650,23 @@ pub const Node = struct {
             // attribute a cross-document fused batch to its first item.
             common_profile_source,
             first.fence,
+            result_allocators,
         ) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer batch.deinit(allocator);
+        // Each item was materialized directly into its ticket allocator. The
+        // broker array alone belongs to the node allocator; item ownership is
+        // transferred into the corresponding result slot below.
+        defer allocator.free(batch.items);
         if (batch.items.len != items.len) {
+            for (batch.items, 0..) |*result, index| {
+                const result_allocator = if (index < result_allocators.len)
+                    result_allocators[index]
+                else
+                    allocator;
+                readers_api.deinitResult(result_allocator, result);
+            }
             for (items) |item| item.slot.fail(error.InvalidReadResultCount);
             return;
         }
@@ -5555,13 +5676,8 @@ pub const Node = struct {
             .native_batch
         else
             .serial;
-        for (items, batch.items) |item, source| {
-            const result = cloneReadResult(item.allocator, source) catch |err| {
-                item.slot.fail(err);
-                continue;
-            };
+        for (items, batch.items) |item, result|
             item.slot.setValue(readers_api.Result, result, execution);
-        }
     }
 
     fn runReadImageBatchDirect(
@@ -5581,6 +5697,7 @@ pub const Node = struct {
             prompt,
             max_tokens,
             source_fingerprint,
+            null,
             null,
         )).items;
     }
@@ -5704,7 +5821,11 @@ pub const Node = struct {
         max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
+        result_allocators: ?[]const std.mem.Allocator,
     ) !readers_api.BatchResult {
+        if (result_allocators) |allocators| {
+            if (allocators.len != image_datas.len) return error.InvalidReadResultCount;
+        }
         var owned_admission_manifest: ?manifest_mod.ModelManifest = null;
         defer if (owned_admission_manifest) |*manifest| manifest.deinit();
         const admission_manifest: *const manifest_mod.ModelManifest = if (execution_fence) |fence|
@@ -5761,7 +5882,10 @@ pub const Node = struct {
         const out = try allocator.alloc(readers_api.Result, image_datas.len);
         var initialized: usize = 0;
         errdefer {
-            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+            for (out[0..initialized], 0..) |*result, index| {
+                const result_allocator = if (result_allocators) |allocators| allocators[index] else allocator;
+                readers_api.deinitResult(result_allocator, result);
+            }
             allocator.free(out);
         }
 
@@ -5781,15 +5905,16 @@ pub const Node = struct {
         if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
         for (results, 0..) |result, i| {
+            const result_allocator = if (result_allocators) |allocators| allocators[i] else allocator;
             var item: readers_api.Result = .{
-                .text = try allocator.dupe(u8, result.text),
+                .text = try result_allocator.dupe(u8, result.text),
             };
-            errdefer readers_api.deinitResult(allocator, &item);
-            item.fields_json = try readerFieldsJsonAlloc(allocator, result.fields);
-            item.regions_json = try readerRegionsJsonAlloc(allocator, result.regions);
+            errdefer readers_api.deinitResult(result_allocator, &item);
+            item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
+            item.regions_json = try readerRegionsJsonAlloc(result_allocator, result.regions);
             if (encoded_images) |images| {
-                item.item_id = if (images[i].item_id.len > 0) try allocator.dupe(u8, images[i].item_id) else "";
-                item.source_fingerprint = if (images[i].source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+                item.item_id = if (images[i].item_id.len > 0) try result_allocator.dupe(u8, images[i].item_id) else "";
+                item.source_fingerprint = if (images[i].source_fingerprint) |value| try result_allocator.dupe(u8, value) else null;
                 item.page_number = images[i].page_number;
             }
             out[i] = item;
@@ -16080,8 +16205,9 @@ fn resolvedInferenceExecutorContract(
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
         .accepts_document = modalities.document,
-        .accepts_borrowed_rasters = std.mem.eql(u8, resolved_task, "read") and
-            manifest.native_arch_hint == .florence,
+        .accepts_borrowed_rasters = (std.mem.eql(u8, resolved_task, "read") and
+            manifest.native_arch_hint == .florence) or
+            (std.mem.eql(u8, resolved_task, "embed") and modalities.image),
     };
 }
 

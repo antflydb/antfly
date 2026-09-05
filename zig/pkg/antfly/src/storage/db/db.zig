@@ -5084,7 +5084,7 @@ pub const DB = struct {
         }
     };
 
-    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
 
         // Producer ownership moves through reconfiguration, but execution and
@@ -5092,7 +5092,7 @@ pub const DB = struct {
         // replacement at this single construction boundary so live index DDL
         // cannot silently fall back to default remote-content policy or an
         // unrelated executor when it supplies only a new producer set.
-        var runtime_cfg = enrichment_cfg;
+        var runtime_cfg = enrichment_cfg.*;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
         if (runtime_cfg.resource_manager == null) runtime_cfg.resource_manager = self.core.index_manager.resource_manager;
@@ -5150,6 +5150,13 @@ pub const DB = struct {
             self.backend_runtime,
             runtime_cfg,
         );
+        // Runtime.init has now adopted every move-only provider. Clear the
+        // source owner before any later fallible initialization so exactly one
+        // side destroys the providers on both success and error paths.
+        enrichment_cfg.dense_embedder = null;
+        enrichment_cfg.sparse_embedder = null;
+        enrichment_cfg.asset_producer = null;
+        enrichment_cfg.chunk_provider = null;
         errdefer runtime.deinit();
         // The repair ledger and its sequence marker are committed before the
         // enrichment runtime status. A crash in that narrow interval must not
@@ -5176,7 +5183,7 @@ pub const DB = struct {
         }
     }
 
-    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
+    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !void {
         var detached = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
         const owned = detached.take();
         self.enrichment_append_context = owned.append_ctx;
@@ -5213,12 +5220,10 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
         var owned_cfg = cfg;
-        var cfg_owned = true;
-        errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
+        defer self.deinitEnrichmentConfig(&owned_cfg);
 
         const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
-        var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
-        cfg_owned = false;
+        var detached = try self.createDetachedEnrichmentRuntime(&owned_cfg);
         errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
         if (builtin.is_test) {
             if (test_enrichment_reconfigure_after_detached_hook) |hook| try hook(self);
@@ -5486,14 +5491,15 @@ pub const DB = struct {
         // Created after the resolution runtime so it can patch the resolution
         // append context to wake the promoter when resolution artifacts land.
         try self.initPromotionRuntime();
-        if (opts.enrichment) |raw_enrichment_cfg| {
-            var enrichment_cfg = raw_enrichment_cfg;
+        if (opts.enrichment) |*enrichment_cfg| {
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
             if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
             if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
             try self.initOptionalEnrichmentRuntime(enrichment_cfg);
-            // A successful initialization transfers every provider into the
-            // runtime; later open failures are then cleaned up with the DB.
+            // Providers adopted by a runtime were cleared by the move boundary;
+            // provider-only configurations that do not require a runtime remain
+            // here and must be released before clearing the open option.
+            deinitOwnedEnrichmentConfig(self.alloc, enrichment_cfg);
             opts.enrichment = null;
         }
         if (opts.ttl_cleanup.enabled) {

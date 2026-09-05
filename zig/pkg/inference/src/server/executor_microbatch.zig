@@ -101,6 +101,32 @@ pub const Shape = struct {
     tokens: usize = 0,
 };
 
+/// Transport-neutral cancellation probe. The broker may retain this borrowed
+/// context only for the synchronous duration of submitControlled.
+pub const Cancellation = struct {
+    ptr: ?*const anyopaque = null,
+    is_cancelled_fn: ?*const fn (*const anyopaque) bool = null,
+
+    pub fn fromAtomic(signal: ?*const std.atomic.Value(bool)) Cancellation {
+        const value = signal orelse return .{};
+        return .{
+            .ptr = value,
+            .is_cancelled_fn = struct {
+                fn call(ptr: *const anyopaque) bool {
+                    const atomic: *const std.atomic.Value(bool) = @ptrCast(@alignCast(ptr));
+                    return atomic.load(.acquire);
+                }
+            }.call,
+        };
+    }
+
+    pub fn isCancelled(self: Cancellation) bool {
+        const ptr = self.ptr orelse return false;
+        const callback = self.is_cancelled_fn orelse return false;
+        return callback(ptr);
+    }
+};
+
 pub const ItemError = struct {
     cause: anyerror,
 };
@@ -156,7 +182,7 @@ const Ticket = struct {
     done: std.Io.Event = .unset,
     state: TicketState = .queued,
     cancel_requested: std.atomic.Value(bool) = .init(false),
-    cancellation: ?*const std.atomic.Value(bool),
+    cancellation: Cancellation,
     deadline: ?std.Io.Clock.Timestamp,
 };
 
@@ -169,6 +195,9 @@ const Group = struct {
     bytes: usize = 0,
     pixels: u64 = 0,
     tokens: usize = 0,
+    created_at: std.Io.Clock.Timestamp,
+    earliest_deadline: ?std.Io.Clock.Timestamp = null,
+    flush_requested: bool = false,
     wake: std.Io.Event = .unset,
 
     fn fits(self: *const Group, shape: Shape) bool {
@@ -181,11 +210,18 @@ const Group = struct {
             tokens <= self.limits.max_tokens;
     }
 
-    fn append(self: *Group, allocator: std.mem.Allocator, ticket: *Ticket, shape: Shape) !void {
+    fn append(self: *Group, allocator: std.mem.Allocator, ticket: *Ticket, shape: Shape) !bool {
         try self.tickets.append(allocator, ticket);
         self.bytes += shape.bytes;
         self.pixels += shape.pixels;
         self.tokens += shape.tokens;
+        const deadline = ticket.deadline orelse return false;
+        const previous = self.earliest_deadline;
+        if (previous == null or deadline.raw.nanoseconds < previous.?.raw.nanoseconds) {
+            self.earliest_deadline = deadline;
+            return true;
+        }
+        return false;
     }
 };
 
@@ -230,6 +266,39 @@ pub const Broker = struct {
         identity: Identity,
         deadline: ?std.Io.Clock.Timestamp,
         cancellation: ?*const std.atomic.Value(bool),
+        payload: *const Payload,
+        execute_ctx: *anyopaque,
+        execute_fn: ExecuteFn,
+    ) !ItemResult(Output) {
+        return self.submitControlled(
+            Payload,
+            Output,
+            io,
+            result_allocator,
+            key,
+            limits,
+            shape,
+            identity,
+            deadline,
+            Cancellation.fromAtomic(cancellation),
+            payload,
+            execute_ctx,
+            execute_fn,
+        );
+    }
+
+    pub fn submitControlled(
+        self: *Broker,
+        comptime Payload: type,
+        comptime Output: type,
+        io: std.Io,
+        result_allocator: std.mem.Allocator,
+        key: Key,
+        limits: Limits,
+        shape: Shape,
+        identity: Identity,
+        deadline: ?std.Io.Clock.Timestamp,
+        cancellation: Cancellation,
         payload: *const Payload,
         execute_ctx: *anyopaque,
         execute_fn: ExecuteFn,
@@ -287,6 +356,7 @@ pub const Broker = struct {
                 .limits = limits,
                 .execute_ctx = execute_ctx,
                 .execute_fn = execute_fn,
+                .created_at = std.Io.Clock.Timestamp.now(io, .awake),
             };
             self.groups.append(self.allocator, group) catch |err| {
                 self.allocator.destroy(group);
@@ -295,7 +365,7 @@ pub const Broker = struct {
             };
             leader = true;
         }
-        group.append(self.allocator, &ticket, shape) catch |err| {
+        const deadline_shortened = group.append(self.allocator, &ticket, shape) catch |err| {
             if (leader) {
                 _ = self.groups.pop();
                 self.allocator.destroy(group);
@@ -306,28 +376,18 @@ pub const Broker = struct {
         if (group.tickets.items.len >= group.limits.preferred_items or
             group.tickets.items.len == group.limits.max_items)
         {
+            group.flush_requested = true;
             group.wake.set(io);
-        } else if (deadline != null and group.tickets.items.len > 1) {
-            // A newly arrived deadline may precede the leader's original wait.
-            // Flushing now is conservative and never violates max-wait.
+        } else if (deadline_shortened and !leader) {
+            // Wake the leader to recompute the bounded window. An earlier
+            // follower deadline shortens the wait; it does not force a tiny
+            // batch when there is still time to admit compatible work.
             group.wake.set(io);
         }
         self.mutex.unlock(io);
 
         if (leader) {
-            if (!group.wake.isSet() and limits.max_wait_us > 0) {
-                const timeout: std.Io.Timeout = .{ .deadline = boundedLeaderWaitDeadline(
-                    std.Io.Clock.Timestamp.now(io, .awake),
-                    limits.max_wait_us,
-                    deadline,
-                ) };
-                group.wake.waitTimeout(io, timeout) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => {
-                        ticket.cancel_requested.store(true, .release);
-                    },
-                };
-            }
+            self.waitForGroupWindow(io, group, &ticket);
             self.executeGroup(io, group);
         } else {
             ticket.done.wait(io) catch |err| switch (err) {
@@ -346,6 +406,41 @@ pub const Broker = struct {
         // The canceling caller already waited above for the borrowed stack
         // ticket to complete, so returning that result is lifetime-safe.
         return takeResult(Output, identity, &output, slot);
+    }
+
+    fn waitForGroupWindow(self: *Broker, io: std.Io, group: *Group, leader: *Ticket) void {
+        if (group.limits.max_wait_us == 0) return;
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            if (group.flush_requested) {
+                self.mutex.unlock(io);
+                return;
+            }
+            const wait_deadline = boundedLeaderWaitDeadline(
+                group.created_at,
+                group.limits.max_wait_us,
+                group.earliest_deadline,
+            );
+            const now = std.Io.Clock.Timestamp.now(io, .awake);
+            if (wait_deadline.raw.nanoseconds <= now.raw.nanoseconds) {
+                self.mutex.unlock(io);
+                return;
+            }
+            // Reset while holding the group lock. A follower either published
+            // its deadline before this recomputation, or will set the event
+            // after acquiring the same lock; no update can be lost.
+            group.wake.reset();
+            self.mutex.unlock(io);
+
+            const timeout: std.Io.Timeout = .{ .deadline = wait_deadline };
+            group.wake.waitTimeout(io, timeout) catch |err| switch (err) {
+                error.Timeout => return,
+                error.Canceled => {
+                    leader.cancel_requested.store(true, .release);
+                    return;
+                },
+            };
+        }
     }
 
     fn executeGroup(self: *Broker, io: std.Io, group: *Group) void {
@@ -405,8 +500,8 @@ pub const Broker = struct {
     }
 };
 
-fn isCanceled(cancellation: ?*const std.atomic.Value(bool)) bool {
-    return if (cancellation) |signal| signal.load(.acquire) else false;
+fn isCanceled(cancellation: Cancellation) bool {
+    return cancellation.isCancelled();
 }
 
 fn deadlineExpired(io: std.Io, deadline: ?std.Io.Clock.Timestamp) bool {
@@ -578,6 +673,72 @@ test "microbatch broker groups native work and preserves provenance" {
     const stats = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), stats.native_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.native_items);
+}
+
+test "microbatch follower deadline shortens window without forcing an immediate flush" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    var executor = TestExecutor{};
+    const limits = Limits{
+        .mode = .native,
+        .preferred_items = 3,
+        .max_items = 3,
+        .max_wait_us = 500_000,
+    };
+    const Submit = struct {
+        broker: *Broker,
+        executor: *TestExecutor,
+        limits: Limits,
+        input: usize,
+        deadline: ?std.Io.Clock.Timestamp = null,
+        result: ?ItemResult(usize) = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            self.result = self.broker.submit(
+                usize,
+                usize,
+                std.testing.io,
+                std.testing.allocator,
+                .{ .model = "reader", .task = .read, .resource_class = .gpu },
+                self.limits,
+                .{},
+                .{},
+                self.deadline,
+                null,
+                &self.input,
+                self.executor,
+                TestExecutor.run,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    const now = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const follower_deadline = now.addDuration(.{
+        .raw = std.Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    });
+    var first = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 1 };
+    var second = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 2, .deadline = follower_deadline };
+    var third = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 3 };
+    var first_future = try std.testing.io.concurrent(Submit.run, .{&first});
+    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
+    var second_future = try std.testing.io.concurrent(Submit.run, .{&second});
+    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
+    try std.testing.expectEqual(@as(usize, 0), executor.calls.load(.monotonic));
+    var third_future = try std.testing.io.concurrent(Submit.run, .{&third});
+    try first_future.await(std.testing.io);
+    try second_future.await(std.testing.io);
+    try third_future.await(std.testing.io);
+
+    try std.testing.expect(first.err == null);
+    try std.testing.expect(second.err == null);
+    try std.testing.expect(third.err == null);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), executor.largest_batch.load(.monotonic));
 }
 
 test "microbatch broker never coalesces republished model generations" {

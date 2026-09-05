@@ -276,9 +276,12 @@ compatible. Each window is bounded simultaneously by:
 - model admission and provider request limits; and
 - cancellation and deadline.
 
-One render window is the default. Optional render/inference overlap uses one
-prefetch window and is enabled only after admission reserves the combined peak
-of both windows. Estimates guide scheduling; hard bounded allocators, decoder
+One render window is the baseline. Durable visual embedding can keep exactly
+one speculative render window ahead. The active window retains its composite
+lease; the next window must acquire a second composite lease against that live
+usage before any rendering begins. If the combined peak does not fit, the
+speculative attempt stops and is retried synchronously after the active lease
+is released. Estimates guide scheduling; hard bounded allocators, decoder
 limits, and model admission remain the enforcement boundary for memory visible
 to Antfly allocators. Framework-private renderer memory is handled separately
 under the compatibility-backend contract below.
@@ -1974,9 +1977,11 @@ The hardening above follows these long-term rules:
    Remote Antfly execution discovers resolved inputs, normalized native-batch
    support, and model-owned limits from `/ai/v1/models`; discovery failure uses
    conservative serial/single-item behavior instead of guessing.
-9. **Deliberately deferred:** fused inspection/render preparation and a single
-   prefetched window require profiling and combined admission. One-window
-   execution remains the safe default.
+9. **Implemented for durable visual embedding:** fused preparation reuses the
+   cached immutable PDF session, and a single controlled prefetch overlaps
+   rendering window N+1 with inference and staging for window N. Both live
+   windows are independently admitted against the same process budget; an
+   admission miss falls back to sequential execution after releasing N.
 10. **Implemented for deterministic CI:** the production-mode two-page PDF
     fixture traverses reader, generator, and embedder contracts and verifies
     native reader batching, honest serial generator reporting, and one visual
@@ -2600,6 +2605,56 @@ The hardening above follows these long-term rules:
     before model acquisition, but only the fenced manifest supplies
     authoritative limits. The leader waits until the earlier of its bounded
     coalescing delay and caller deadline.
+96. **Implemented after enrichment ownership review:** enrichment configuration
+    is transferred through one explicit move boundary. A detached runtime
+    clears each provider field from the source only after successful runtime
+    construction; every failure and disabled-runtime path deinitializes the
+    still-owned dense, sparse, asset, and chunk providers exactly once.
+97. **Implemented after rolling-upgrade review:** an upstream catalog response
+    of 404, 405, or 501 is a negatively cached `discovery unsupported` result,
+    not an inference outage. Explicitly configured legacy endpoints continue
+    with conservative singleton/serial execution, while authoritative catalog
+    rejections, stale route tokens, invalid descriptors, and transient failures
+    retain their distinct fail-closed semantics.
+98. **Implemented after preparation-lock review:** prepared-document fetch and
+    PDF parsing are keyed single-flight operations. The cache mutex now covers
+    lookup and atomic publication only; unrelated source downloads, source
+    hashing, and PDF parses run concurrently. A separately serialized budgeted
+    allocator preserves its accounting contract, and teardown drains both
+    leases and unpublished preparations before freeing cache memory.
+99. **Implemented after coalescing-window review:** a follower deadline updates
+    a native microbatch's earliest deadline without immediately flushing the
+    group. The leader recomputes the fixed creation-time window after each
+    update, preserving batching opportunity without exceeding any request's
+    deadline. The standalone provider passes its absolute deadline and semantic
+    cancellation callback into the node broker across the independently
+    compiled linked-runtime boundary. Distributed inference keeps the same
+    controls at its bounded HTTP request boundary and submits already-formed
+    page batches to the remote node.
+100. **Implemented after visual-embedding performance review:** linked image
+    embedders advertise a concrete borrowed-raster executor. PDF page embedding
+    can render directly to bounded RGBA8 windows and feed row-stride-aware
+    default or CLIP preprocessing without PNG encode/decode. Vectors remain
+    one-per-page and raw buffers remain invocation-borrowed. Remote inference
+    deliberately retains encoded page transport because sending full RGBA over
+    the network is usually a bandwidth regression.
+101. **Implemented after render-overlap review:** durable visual embedding
+    defaults to a single speculative render window and never queues more than
+    one. The render session, planning arrays, composite lease, and retained
+    output use thread-safe allocation because rendering overlaps enrichment
+    staging. The next window acquires its own scratch/output reservation while
+    the current reservation is live; insufficient combined capacity becomes
+    sequential backpressure, not durable request failure. Task-spawn pressure
+    and an operation-local prefetch timeout also return to the synchronous
+    baseline. Cancellation and all error paths join the prefetch task before
+    either session or page storage is destroyed. Operators can disable overlap
+    with `ANTFLY_ENRICHMENT_PDF_RENDER_PREFETCH_BATCHES=0`; values above one
+    are hard-clamped to one.
+102. **Implemented after OCR result-copy review:** a fused reader microbatch
+    materializes each public result directly into that ticket's allocator.
+    The leader owns only the result pointer array and transfers every item into
+    its matching slot, removing the second text/fields/regions/provenance copy
+    without weakening independent ticket lifetimes.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -2777,12 +2832,13 @@ Antfly now has a bounded document-scoped render and OCR pipeline:
   and full-decoder paths and has a regression test proving that finished rows
   remain padded while active rows retain independent lengths.
 
-The implementation intentionally does not prefetch a second render window.
-That keeps memory and backpressure simple: acquire, render, infer, merge,
-release, then advance. The composite lease accepts an explicit window count so
-future one-window overlap must admit both live windows atomically; enabling it
-remains a benchmark-driven policy choice rather than an accidental queueing
-effect.
+Durable page-image embedding can prefetch exactly one second render window.
+The current window remains admitted while the speculative window acquires its
+own composite lease, so the resource manager observes and bounds their combined
+peak before the second render starts. If that reservation cannot be acquired,
+the current window completes and releases first, then the same page range is
+prepared synchronously. OCR and every executor without an explicit overlap
+policy retain acquire-render-infer-release sequencing.
 
 ## Required invariants
 
@@ -3138,22 +3194,26 @@ failure provenance before generating the final unit and chunk artifacts.
 Rendered buffers are released immediately after their OCR result is applied.
 The pipeline must not retain completed PNGs through later artifact writes.
 
-## Backpressure and optional overlap
+## Backpressure and controlled overlap
 
-The initial implementation should render one window, OCR it, release it, and
-then render the next. This is simple and has a clear peak-memory bound.
+The baseline renders one window, consumes it, releases it, and then renders the
+next. This remains the fallback whenever no concurrent runtime is attached,
+overlap is disabled, or a second reservation does not fit.
 
 An optional double-buffered mode can overlap CPU rendering of window N+1 with
-GPU OCR of window N:
+model inference for window N:
 
 ```text
 CPU render:  [ window N ] [ window N+1 ] [ window N+2 ]
-GPU OCR:                  [ window N   ] [ window N+1 ]
+model:                    [ window N   ] [ window N+1 ]
 ```
 
-Enable this only with `prefetch_batches = 1`, and admit the combined memory of
-the active OCR window and the prefetched render window. Values greater than one
-are unnecessary initially and risk recreating whole-document buffering.
+Durable visual embedding enables this with `prefetch_batches = 1`. The active
+window and prefetched window each own a composite scratch/output reservation;
+the second reservation is acquired while the first remains live, which admits
+their combined peak before rendering. Values greater than one are hard-clamped
+because they recreate whole-document buffering without a useful pipeline
+stage. `prefetch_batches = 0` restores strictly sequential execution.
 
 If the inference queue is saturated, rendering must stop at the admitted
 window. Likewise, a render scheduler with no permits must not reserve an
@@ -3186,7 +3246,7 @@ ocr:
     max_inflight_pages: 8
     max_inflight_pixels: 50000000
     max_inflight_bytes: 268435456
-    prefetch_batches: 0
+    prefetch_batches: 1
 ```
 
 Suggested operator controls:
@@ -3198,6 +3258,7 @@ ANTFLY_ENRICHMENT_OCR_BATCH_BYTES
 ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_PIXELS
 ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES
+ANTFLY_ENRICHMENT_PDF_RENDER_PREFETCH_BATCHES
 ANTFLY_ENRICHMENT_PDF_MAX_DOCUMENT_PAGES
 ```
 
@@ -3205,8 +3266,9 @@ Empty, zero, overflowing, and malformed values need explicit semantics. In
 general, requested values are clamped to at least one where zero would disable
 progress. Parallel pages are hard-clamped to eight. Parallel rendering defaults
 to one; operators can opt into higher CPU concurrency only after assigning an
-aggregate byte budget that admits it. Prefetch is not implemented and is
-therefore effectively zero.
+aggregate byte budget that admits it. Visual-embedding prefetch defaults to one
+window, accepts only zero or one effectively, and falls back to sequential work
+when the second composite lease is unavailable.
 
 Status output should report requested and effective values so operators can
 tell when admission or a hard cap reduced concurrency or batch size.
@@ -3515,26 +3577,26 @@ fallback at unsupported provider boundaries.
 
 ### Phase 5: Render/OCR pipeline overlap
 
-Status: optional follow-up. The implemented pipeline intentionally keeps
-prefetch at zero. Fair window-scoped composite admission is complete: the active
-window releases its scratch and output credit as soon as its consumer finishes,
-and the lease API can reserve two windows atomically. Overlap should be enabled
-only after benchmarks justify it and only by acquiring the two-window lease
-before either window begins.
+Status: complete for durable visual embedding; OCR retains the sequential
+baseline. The active window releases its scratch and output credit as soon as
+its consumer finishes. At most one speculative window may acquire a second
+composite lease against the still-live first lease; inability to admit the
+combined peak falls back to synchronous preparation after release.
 
-- Add optional one-window prefetch.
-- Admit active OCR and prefetched render memory together.
-- Stop rendering when inference backpressure prevents the current window from
-  advancing.
+- Keep prefetch operator-controlled and hard-cap it at one window.
+- Keep every live render and invocation byte under a composite reservation.
+- Join speculative rendering before tearing down its document session or
+  buffers.
 - Compare end-to-end throughput and peak memory against the non-overlapped
   implementation.
 
 ### Phase 6: Optional decoded-image handoff
 
-Status: complete for linked native Florence reads. Bounded direct-to-batch-
-tensor preprocessing uses the backend runtime's lazy inference lane,
-deterministic output slices, direct RGBA consumption for Florence, and direct
-baseline-JPEG component-plane-to-CHW writes for CLIP. The borrowed raster ABI
+Status: complete for linked native Florence reads and linked visual embedders.
+Bounded direct-to-batch-tensor preprocessing uses the backend runtime's lazy
+inference lane, deterministic output slices, direct RGBA consumption for
+Florence and ClipClap-class embedders, and direct baseline-JPEG
+component-plane-to-CHW writes for encoded CLIP input. The borrowed raster ABI
 carries validated RGBA8 dimensions and stride through the standalone bridge;
 capability negotiation retains encoded-image fallback everywhere else.
 

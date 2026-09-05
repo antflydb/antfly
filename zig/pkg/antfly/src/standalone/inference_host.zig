@@ -985,6 +985,16 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .max_tokens = decoded.metadata.value.max_tokens,
                 .source_fingerprint = decoded.metadata.value.source_fingerprint,
             };
+            const ReadCancellation = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
+                    return view.requested();
+                }
+            };
+            const executor_cancellation = inference.server.ExecutorCancellation{
+                .ptr = &context.cancellation,
+                .is_cancelled_fn = ReadCancellation.requested,
+            };
             // The override is an injected test executor with no model catalog.
             // Every production path resolves and enforces the concrete model
             // contract inside this ABI boundary.
@@ -998,14 +1008,28 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 try validateEncodedReadCapabilities(read_capabilities, encoded_request);
             }
             if (operation == .read_encoded_images_reported and state.read_encoded_images_override == null) {
-                var batch = try state.node.readEncodedImagesReportedDirect(alloc, decoded.metadata.value.model, encoded_request);
+                var batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                    alloc,
+                    decoded.metadata.value.model,
+                    encoded_request,
+                    deadline_ns,
+                    executor_cancellation,
+                );
                 defer batch.deinit(alloc);
                 break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
             }
             const result = if (state.read_encoded_images_override) |handler|
                 try handler.read(alloc, decoded.metadata.value.model, encoded_request)
-            else
-                try state.node.readEncodedImagesDirect(alloc, decoded.metadata.value.model, encoded_request);
+            else result: {
+                const batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                    alloc,
+                    decoded.metadata.value.model,
+                    encoded_request,
+                    deadline_ns,
+                    executor_cancellation,
+                );
+                break :result batch.items;
+            };
             if (operation == .read_encoded_images_reported) {
                 var batch = antfly.readers.BatchResult{
                     .items = result,
@@ -1075,6 +1099,48 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 return error.InvalidReaderResponse;
             try batch.execution.validate(batch.items.len);
             break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
+        },
+        .embed_dense_rasters => blk: {
+            var decoded = try decodeReadRasterImagesProviderRequest(
+                alloc,
+                request_json,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer decoded.deinit(alloc);
+            const capabilities = try localModelCapabilities(
+                &state.node,
+                state.io,
+                decoded.metadata.value.model,
+                .embed,
+            );
+            if (!capabilities.borrowed_rasters or !capabilities.supports(.{ .image = true }))
+                return error.BorrowedRasterUnsupported;
+            var pixels: u64 = 0;
+            for (decoded.images) |raster| {
+                pixels = std.math.add(u64, pixels, try raster.pixels()) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
+            try capabilities.validateInvocation(.embed, .{
+                .item_count = decoded.images.len,
+                .modalities = .{ .image = true },
+                .decoded_pixels = pixels,
+                .max_media_parts_per_item = 1,
+            });
+            const vectors = try state.node.embedDenseRastersDirectWithContext(
+                alloc,
+                state.io,
+                deadline_ns,
+                decoded.metadata.value.model,
+                decoded.images,
+            );
+            defer {
+                for (vectors) |vector| alloc.free(vector);
+                alloc.free(vectors);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, vectors, .{});
         },
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
@@ -2283,9 +2349,8 @@ fn localModelCapabilitiesInScope(
             inference.server.resolvedTaskPromptPolicy(@tagName(task)),
         ).?,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
-        // Only the native vision-reader path below consumes decoded raster
-        // views today. Other image-capable task families remain encoded-only.
-        .borrowed_rasters = task == .read and manifest.native_arch_hint == .florence,
+        .borrowed_rasters = (task == .read and manifest.native_arch_hint == .florence) or
+            (task == .embed and modalities.image),
     };
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
