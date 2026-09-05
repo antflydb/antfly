@@ -616,10 +616,21 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
         // ceiling prevents any lane from converting a transient fan-out spike
         // into an unbounded kernel-thread/stack reservation ratchet.
         io_impl.* = Io.Threaded.init(alloc, .{
+            .async_limit = boundedIoAsyncLimit(concurrent_limit),
             .concurrent_limit = .limited(concurrent_limit),
         });
         return io_impl;
     }
+}
+
+/// `std.Io.Threaded` controls `async` and `concurrent` fan-out independently.
+/// CPU stages use `Group.async`, so leaving the async side at its default would
+/// bypass the runtime lane's configured backstop. Keep at most one async worker
+/// per additional detected CPU; the caller always runs one task inline.
+fn boundedIoAsyncLimit(concurrent_limit: u32) Io.Limit {
+    if (comptime builtin.single_threaded) return .nothing;
+    const cpu_count = std.Thread.getCpuCount() catch return .limited(concurrent_limit);
+    return .limited(@min(@as(usize, concurrent_limit), cpu_count -| 1));
 }
 
 fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
@@ -2125,6 +2136,9 @@ test "backend runtime inference lane has an isolated bounded executor" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    // The executor object is runtime-owned, but its worker team is staffed
+    // only after asynchronous work is submitted.
+    try std.testing.expect(handle.ptr().inference_io_impl.?.worker_threads.load(.acquire) == null);
     var inference = try handle.ptr().acquireInferenceLane();
     defer inference.release();
     _ = inference.io();
@@ -2137,6 +2151,21 @@ test "backend runtime inference lane has an isolated bounded executor" {
         std.Io.Limit.limited(threaded_io_limits.inference),
         handle.ptr().inference_io_impl.?.concurrent_limit,
     );
+    try std.testing.expect(
+        @intFromEnum(handle.ptr().inference_io_impl.?.async_limit) <= threaded_io_limits.inference,
+    );
+}
+
+test "backend runtime async lane limit is CPU aware" {
+    if (builtin.single_threaded) {
+        try std.testing.expectEqual(std.Io.Limit.nothing, boundedIoAsyncLimit(8));
+        return;
+    }
+    const expected = if (std.Thread.getCpuCount()) |cpu_count|
+        std.Io.Limit.limited(@min(@as(usize, 8), cpu_count -| 1))
+    else |_|
+        std.Io.Limit.limited(8);
+    try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
 }
 
 test "backend runtime rejects control lane leases after shutdown begins" {

@@ -171,6 +171,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             bytes_per_pixel_reserve: usize = 12,
             profile: RenderProfile = .ocr,
             cancellation: reader.CancellationProbe = .{},
+            executor_io: ?std.Io = null,
         };
         pub const PageRenderResult = struct {
             page_number: usize,

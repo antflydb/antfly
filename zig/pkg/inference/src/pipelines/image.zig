@@ -584,6 +584,37 @@ test "bounded batch preprocessing preserves input-indexed tensor order" {
     try std.testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(serial[0..12]), std.mem.sliceAsBytes(serial[12..24])));
 }
 
+test "bounded batch preprocessing uses a caller-owned executor without changing output" {
+    const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
+    var serial: [24]f32 = undefined;
+    var runtime_owned: [24]f32 = undefined;
+
+    try preprocessBatchIntoBounded(
+        &serial,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{ .max_workers = 1, .max_inflight_decoded_bytes = 16 * 1024 },
+    );
+    try preprocessBatchIntoBounded(
+        &runtime_owned,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{
+            .max_workers = 2,
+            .max_inflight_decoded_bytes = 16 * 1024,
+            .io = std.testing.io,
+        },
+    );
+
+    try std.testing.expectEqualSlices(f32, &serial, &runtime_owned);
+}
+
 test "bounded batch preprocessing rejects a decoded image above its wave budget" {
     var output: [12]f32 = undefined;
     try std.testing.expectError(
@@ -1252,13 +1283,24 @@ pub fn preprocessBatch(
     mean: [3]f32,
     std_dev: [3]f32,
 ) ![]f32 {
+    return preprocessBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{});
+}
+
+pub fn preprocessBatchWithOptions(
+    allocator: std.mem.Allocator,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) ![]f32 {
     const ts: usize = target_size;
     const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
     const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
     const output_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
     const result = try allocator.alloc(f32, output_len);
     errdefer allocator.free(result);
-    try preprocessBatchIntoBounded(result, image_list, target_size, mean, std_dev, .bilinear, .{});
+    try preprocessBatchIntoBounded(result, image_list, target_size, mean, std_dev, .bilinear, options);
     return result;
 }
 
@@ -1269,6 +1311,9 @@ pub fn preprocessBatch(
 pub const BatchPreprocessOptions = struct {
     max_workers: usize = 8,
     max_inflight_decoded_bytes: usize = 128 * 1024 * 1024,
+    /// Production runtimes pass their leased inference executor here. Offline
+    /// and test callers may omit it and use the synchronous linalg fallback.
+    io: ?std.Io = null,
 };
 
 /// Decode and preprocess directly into a caller-owned batch tensor. Output
@@ -1306,6 +1351,17 @@ pub fn preprocessClipBatch(
     mean: [3]f32,
     std_dev: [3]f32,
 ) ![]f32 {
+    return preprocessClipBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{});
+}
+
+pub fn preprocessClipBatchWithOptions(
+    allocator: std.mem.Allocator,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) ![]f32 {
     const ts: usize = target_size;
     const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
     const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
@@ -1317,7 +1373,7 @@ pub fn preprocessClipBatch(
         .target_size = target_size,
         .mean = mean,
         .std_dev = std_dev,
-    } }, .{});
+    } }, options);
     return result;
 }
 
@@ -1693,11 +1749,13 @@ fn runBoundedPreprocessBatch(
         for (jobs[0..wave_len], tasks[0..wave_len]) |*job, *task| {
             job.* = .{ .fn_ptr = BatchPreprocessTask.runOpaque, .ctx = task };
         }
-        // Reuse the process-wide inference worker pool. Its submission gate
-        // prevents concurrent requests from multiplying CPU threads, while
-        // the final job runs inline so progress does not depend on pool
-        // availability. Non-Linux builds use the pool's serial fallback.
-        linalg.pool.dispatchJobs(jobs[0..wave_len]);
+        // Production calls schedule through the BackendRuntime-owned
+        // inference executor, which supplies the aggregate CPU/thread bound
+        // and lifecycle. Offline callers retain the synchronous fallback.
+        if (options.io) |io|
+            try linalg.pool.dispatchJobsIo(io, jobs[0..wave_len])
+        else for (jobs[0..wave_len]) |job|
+            job.fn_ptr(job.ctx);
         // Error selection is input-index deterministic rather than completion
         // order dependent.
         var first_error: ?anyerror = null;

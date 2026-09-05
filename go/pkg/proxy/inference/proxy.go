@@ -1755,6 +1755,13 @@ const defaultMaxProxyRetainedBodyBytes int64 = 768 << 20
 const defaultMaxProxyBatchResponseBytes int64 = 256 << 20
 const defaultMaxProxyRetainedBatchResponseBytes int64 = 1 << 30
 const defaultMaxProxySpooledBatchResponseBytes int64 = 2 << 30
+
+// Keep ordinary mixed-batch partition responses off the filesystem. The
+// retained-response admission already covers these bytes, while the small
+// fixed threshold keeps aggregate memory bounded independently of the number
+// of items in a partition. Larger responses transparently migrate to the
+// existing process-admitted spill path.
+const proxyBatchResponseMemorySpoolBytes int64 = 1 << 20
 const defaultMaxProxyRetainedCatalogBytes int64 = 256 << 20
 const defaultMaxProxyUpstreamResponseHeaderBytes int64 = 64 << 10
 const proxyBodyAdmissionMultiplier int64 = 3
@@ -4723,8 +4730,9 @@ func newBoundedProxyResponseWriterWithSpool(maxBytes int64, directory string) *b
 		header:     make(http.Header),
 		statusCode: http.StatusOK,
 		body: proxyResponseSpool{
-			directory: directory,
-			maxBytes:  maxBytes,
+			directory:   directory,
+			maxBytes:    maxBytes,
+			memoryLimit: min(maxBytes, proxyBatchResponseMemorySpoolBytes),
 		},
 	}
 }
@@ -4784,12 +4792,14 @@ func (w *boundedProxyResponseWriter) releaseBody() error {
 }
 
 type proxyResponseSpool struct {
-	directory string
-	file      *os.File
-	path      string
-	size      int64
-	maxBytes  int64
-	err       error
+	directory   string
+	file        *os.File
+	path        string
+	memory      []byte
+	memoryLimit int64
+	size        int64
+	maxBytes    int64
+	err         error
 }
 
 func (s *proxyResponseSpool) Write(body []byte) (int, error) {
@@ -4802,6 +4812,11 @@ func (s *proxyResponseSpool) Write(body []byte) (int, error) {
 	}
 	if len(body) == 0 {
 		return 0, nil
+	}
+	if s.file == nil && int64(len(body)) <= s.memoryLimit-s.size {
+		s.memory = append(s.memory, body...)
+		s.size += int64(len(body))
+		return len(body), nil
 	}
 	if s.file == nil {
 		file, err := os.CreateTemp(s.directory, "antfly-proxy-batch-response-*")
@@ -4817,6 +4832,17 @@ func (s *proxyResponseSpool) Write(body []byte) (int, error) {
 		// CloseAndRemove cleanup instead.
 		if err := os.Remove(s.path); err == nil {
 			s.path = ""
+		}
+		if len(s.memory) > 0 {
+			written, err := s.file.Write(s.memory)
+			if err == nil && written != len(s.memory) {
+				err = io.ErrShortWrite
+			}
+			if err != nil {
+				s.err = err
+				return 0, err
+			}
+			s.memory = nil
 		}
 	}
 	written, err := s.file.Write(body)
@@ -4837,10 +4863,13 @@ func (s *proxyResponseSpool) ReadAll() ([]byte, error) {
 	if s.size < 0 || uint64(s.size) > uint64(^uint(0)>>1) {
 		return nil, errProxyResponseTooLarge
 	}
-	body := make([]byte, int(s.size))
 	if s.file == nil {
-		return body, nil
+		if len(s.memory) != int(s.size) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return s.memory, nil
 	}
+	body := make([]byte, int(s.size))
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -4865,6 +4894,7 @@ func (s *proxyResponseSpool) CloseAndRemove() error {
 		s.path = ""
 	}
 	s.size = 0
+	s.memory = nil
 	return result
 }
 

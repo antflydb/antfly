@@ -88,6 +88,10 @@ pub const PageRenderBatchOptions = struct {
     bytes_per_pixel_reserve: usize = 12,
     profile: RenderProfile = .ocr,
     cancellation: reader.CancellationProbe = .{},
+    /// Production callers borrow this from BackendRuntime. When present,
+    /// render jobs use that runtime's bounded executor instead of creating a
+    /// batch-local thread team.
+    executor_io: ?std.Io = null,
 };
 
 pub const PageRenderResult = struct {
@@ -107,9 +111,8 @@ pub const PageRenderResult = struct {
 pub const RenderedPageBatch = struct {
     results: []PageRenderResult,
     requested_parallelism: usize,
-    /// Maximum number of successfully launched worker threads in a wave.
-    /// This is distinct from peak_parallelism: launched workers may still be
-    /// waiting at the coordinated start gate.
+    /// Maximum number of worker tasks launched in a wave. This is distinct
+    /// from peak_parallelism: launched work may still be queued by the runtime.
     peak_launched_workers: usize,
     /// Maximum number of workers executing their render operation at once.
     peak_parallelism: usize,
@@ -762,6 +765,10 @@ const PageRenderWorker = struct {
         }
     }
 
+    fn runAsync(self: *PageRenderWorker) std.Io.Cancelable!void {
+        self.runPrepared();
+    }
+
     fn runPrepared(self: *PageRenderWorker) void {
         self.wave_control.probe().check() catch {
             self.failure = error.Canceled;
@@ -972,7 +979,7 @@ pub fn renderParsedPagesBatchAlloc(
     for (workers, 0..) |*worker, i| worker.initBase(&thread_control, i);
     var thread_spawn_fallbacks: usize = 0;
     var spawned_workers: usize = 0;
-    if (worker_capacity > 1) {
+    if (worker_capacity > 1 and options.executor_io == null) {
         for (workers) |*worker| {
             worker.thread = std.Thread.spawn(.{}, PageRenderWorker.threadMain, .{worker}) catch blk: {
                 thread_spawn_fallbacks += 1;
@@ -1035,7 +1042,15 @@ pub fn renderParsedPagesBatchAlloc(
             initialized_workers += 1;
         }
 
-        if (wave_len == 1 and spawned_workers == 0) {
+        if (options.executor_io) |io| {
+            var group: std.Io.Group = .init;
+            errdefer group.cancel(io);
+            for (workers[0 .. wave_len - 1]) |*worker|
+                group.async(io, PageRenderWorker.runAsync, .{worker});
+            workers[wave_len - 1].runPrepared();
+            try group.await(io);
+            peak_launched_workers = @max(peak_launched_workers, wave_len);
+        } else if (wave_len == 1 and spawned_workers == 0) {
             // The conservative default does not need a helper thread. Keeping
             // the serial case inline avoids thread setup cost while exercising
             // the exact same batch ownership and admission path.
@@ -3749,6 +3764,30 @@ test "bounded render batch is byte stable across concurrency levels" {
         try std.testing.expect(serial_result.failure == null);
         try std.testing.expect(parallel_result.failure == null);
         try std.testing.expectEqualSlices(u8, serial_result.rendered.?.png, parallel_result.rendered.?.png);
+    }
+}
+
+test "bounded render batch uses a caller-owned executor without local threads" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const requests = [_]PageRenderRequest{
+        .{ .page_number = 1 },
+        .{ .page_number = 2 },
+    };
+
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &requests, .{
+        .max_parallel_pages = 2,
+        .executor_io = std.testing.io,
+    });
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), batch.peak_launched_workers);
+    try std.testing.expectEqual(@as(usize, 0), batch.thread_spawn_fallbacks);
+    for (batch.results) |result| {
+        try std.testing.expect(result.failure == null);
+        try std.testing.expect(result.rendered != null);
     }
 }
 

@@ -80,6 +80,7 @@ pub const ReadConfig = struct {
     pix2struct_do_normalize: bool = false,
     prompt: ?[]const u8 = null,
     source_fingerprint: ?[]const u8 = null,
+    preprocess_io: ?std.Io = null,
 };
 
 pub const ReadResult = struct {
@@ -317,7 +318,7 @@ pub const ReadingPipeline = struct {
             self.config.image_mean,
             self.config.image_std,
             self.config.resample,
-            .{},
+            .{ .io = self.config.preprocess_io },
         );
 
         const prompt_text = self.config.prompt orelse "<OCR>";

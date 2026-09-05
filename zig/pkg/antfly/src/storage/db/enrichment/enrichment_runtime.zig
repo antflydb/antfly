@@ -7592,6 +7592,7 @@ fn renderRuntimePdfWindow(
         .max_retained_png_bytes = memory_budget.retained_bytes,
         .profile = .ocr,
         .cancellation = deadline.probe(),
+        .executor_io = runtime.config.io,
     });
     errdefer batch.deinit(alloc);
     return .{
@@ -13549,6 +13550,7 @@ fn processPdfPageImageEmbedding(
             .max_retained_png_bytes = memory_budget.retained_bytes,
             .profile = .ocr,
             .cancellation = coordinator.deadline.probe(),
+            .executor_io = runtime.config.io,
         });
         defer rendered.deinit(pdf_output_alloc);
         var embedded = try embedRenderedPdfPageBatch(pdf_output_alloc, dense_embedder, embedding_name, rendered, request.expected_dims);

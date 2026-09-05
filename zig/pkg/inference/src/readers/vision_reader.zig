@@ -246,6 +246,7 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
                 .source_fingerprint = options.source_fingerprint,
+                .preprocess_io = if (self.loaded_model) |model| model.executor_io else null,
             },
             &self.florence_final_logits_bias_zero,
         );

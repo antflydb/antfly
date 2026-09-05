@@ -88,6 +88,8 @@ pub const EmbeddingConfig = struct {
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
     image_preprocess_profile: ImagePreprocessProfile = .default,
+    /// BackendRuntime-owned executor used for bounded image decode work.
+    preprocess_io: ?std.Io = null,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
     /// Aggregate audio working-set budget shared by retained decoded PCM,
@@ -775,19 +777,21 @@ pub const EmbeddingPipeline = struct {
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
         const pixel_values = switch (self.config.image_preprocess_profile) {
-            .default => try image.preprocessBatch(
+            .default => try image.preprocessBatchWithOptions(
                 alloc,
                 images,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
+                .{ .io = self.config.preprocess_io },
             ),
-            .clip => try image.preprocessClipBatch(
+            .clip => try image.preprocessClipBatchWithOptions(
                 alloc,
                 images,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
+                .{ .io = self.config.preprocess_io },
             ),
         };
         defer alloc.free(pixel_values);

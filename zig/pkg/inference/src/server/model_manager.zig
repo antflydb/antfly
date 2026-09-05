@@ -2234,6 +2234,9 @@ pub const LoadedModel = struct {
     model_manager: *ModelManager,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
+    /// Borrowed from the serving BackendRuntime and valid for the model's
+    /// loaded lifetime. Offline model owners leave this null.
+    executor_io: ?std.Io = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
@@ -2298,6 +2301,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        self.executor_io = io;
         session_factory.attachIo(self.session, io);
         if (self.vision_session) |session| session_factory.attachIo(session, io);
         if (self.audio_session) |session| session_factory.attachIo(session, io);
@@ -2617,6 +2621,7 @@ pub const LoadedModel = struct {
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            .preprocess_io = self.executor_io,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -6143,6 +6148,7 @@ pub const ModelManager = struct {
             .model_manager = self,
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
+            .executor_io = self.session_manager.io,
             .chat_tmpl = chat_tmpl,
             .whisper_prompt_cache = whisper_prompt_cache,
             .chat_template_failed = chat_template_failed,

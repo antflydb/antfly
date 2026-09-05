@@ -5001,6 +5001,64 @@ func TestBoundedProxyResponseWriterRetainsOnlyRequiredMetadata(t *testing.T) {
 	}
 }
 
+func TestProxyResponseSpoolKeepsSmallBodiesInMemoryAndSpillsLargeBodies(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	small := newBoundedProxyResponseWriterWithSpool(2<<20, directory)
+	if _, err := small.Write([]byte("small response")); err != nil {
+		t.Fatal(err)
+	}
+	if small.body.file != nil {
+		t.Fatal("small response unexpectedly opened a spill file")
+	}
+	body, err := small.readBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "small response" {
+		t.Fatalf("small response = %q", body)
+	}
+	if err := small.releaseBody(); err != nil {
+		t.Fatal(err)
+	}
+
+	large := newBoundedProxyResponseWriterWithSpool(2<<20, directory)
+	prefix := bytes.Repeat([]byte{'a'}, int(proxyBatchResponseMemorySpoolBytes))
+	if _, err := large.Write(prefix); err != nil {
+		t.Fatal(err)
+	}
+	if large.body.file != nil {
+		t.Fatal("threshold-sized response unexpectedly spilled")
+	}
+	if _, err := large.Write([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if large.body.file == nil {
+		t.Fatal("response above the memory threshold did not spill")
+	}
+	if len(large.body.memory) != 0 {
+		t.Fatalf("spilled response retained %d in-memory bytes", len(large.body.memory))
+	}
+	body, err = large.readBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != len(prefix)+1 || body[len(body)-1] != 'b' {
+		t.Fatalf("spilled response length/tail = %d/%q", len(body), body[len(body)-1:])
+	}
+	if err := large.releaseBody(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spill files leaked: %v", entries)
+	}
+}
+
 func TestScopedCatalogRequiresProcessWideByteAdmission(t *testing.T) {
 	t.Parallel()
 

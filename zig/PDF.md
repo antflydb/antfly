@@ -4,8 +4,8 @@ Status: bounded document preparation, indexed reader execution, multimodal
 generation transport, distributed model-aware routing, lease-fenced durable
 page-image embedding, observed remote execution, and post-review batching
 hardening, single-pass PDF preparation, bounded unit replay, and hot-path
-allocation reductions implemented. Document-scoped render lanes, dynamically
-bounded parallel preprocessing on a reusable process-wide worker pool, direct
+allocation reductions implemented. Backend-runtime-owned rendering and
+preprocessing tasks, dynamically bounded parallel preprocessing, direct
 JPEG-to-CHW writes, prepared tokenizer inputs, lease-renewed and
 transaction-fenced attempt storage, and bounded concurrent proxy partitions
 are also implemented.
@@ -78,6 +78,25 @@ multiple consumers have compatible requirements, and releases rendered bytes
 after all consumers of that window finish. A future transform cache is keyed by
 source fingerprint, page, renderer version, DPI, pixel/dimension limits, and
 render profile; it must never be keyed by URL alone.
+
+### Runtime-owned execution lanes
+
+Worker lifecycle belongs to `BackendRuntime`, not to a renderer, codec, model,
+or request. The runtime constructs bounded executor objects, while
+`std.Io.Threaded` staffs their worker teams lazily on the first asynchronous
+submission and retains those workers until coordinated runtime shutdown.
+Production document rendering and image preprocessing borrow the inference
+executor through a lifetime-safe owner; they do not create process-global or
+per-request pools. Their per-window item, pixel, and byte limits remain local
+admission controls layered below the aggregate runtime thread ceiling.
+
+Low-level libraries accept a generic borrowed `std.Io` rather than importing
+Antfly storage/runtime types. This preserves layering and lets tests or embedded
+hosts supply their own executor. A missing executor is an explicit compatibility
+mode: image preprocessing runs serially, while the PDF library retains its
+bounded call-scoped worker fallback. If profiling eventually justifies isolated
+render and model-compute queues, `BackendRuntime` should expose additional lazy
+leased lanes while retaining one aggregate process admission budget.
 
 ### Task-specific executors
 
@@ -2307,15 +2326,18 @@ The hardening above follows these long-term rules:
     so sharing does not weaken thread isolation. Admission charges a bounded
     fork-control allowance instead of charging the source document once per
     worker.
-73. **Implemented after render scheduling review:** a render call creates its
-    worker team once and reuses those threads across every admitted wave. A
-    generation counter coordinates workers and joins all active work before
-    buffers are released. The immutable prepared document survives across
-    waves, while each wave creates and destroys private render forks and their
-    mutable caches; worker-thread reuse does not turn those caches into shared
-    or cross-wave state. Planned adaptive geometry is passed into the first
-    render attempt, avoiding duplicate page-box/rotation work; geometry is
-    recomputed only for a quality/size retry.
+73. **Implemented after render scheduling review:** production render calls
+    submit each admitted wave to the backend runtime's bounded inference
+    executor. `std.Io.Threaded` creates workers only when asynchronous work is
+    submitted and retains them under the runtime's lifecycle, so windows do not
+    create independent thread teams and concurrent documents cannot multiply
+    pools. The final task runs inline for progress on a one-worker runtime.
+    Standalone library callers without a runtime retain the prior call-scoped
+    bounded worker team as a compatibility fallback. The immutable prepared
+    document survives across waves, while each wave creates and destroys
+    private render forks and mutable caches. Planned adaptive geometry is
+    passed into the first render attempt, avoiding duplicate page-box/rotation
+    work; geometry is recomputed only for a quality/size retry.
 74. **Implemented after output-credit and storage review:** page-image
     embedding pins its complete pre-admitted output credit for the whole
     operation instead of releasing and reacquiring capacity between windows.
@@ -2400,10 +2422,11 @@ The hardening above follows these long-term rules:
     reviving a parallel `/classify` surface.
 81. **Implemented after preprocessing review:** generic image, CLIP, and
     Florence batches preprocess in deterministic input-indexed waves on the
-    reusable process-wide inference worker pool. Worker count is CPU-aware and
-    capped at eight; the pool's submission gate prevents concurrent requests
-    from multiplying thread teams, its final job runs inline to guarantee
-    progress, and unsupported platforms use its serial fallback. Every codec
+    caller's backend-runtime-owned inference executor. Worker count is capped
+    at eight, the runtime caps both `async` and `concurrent` fan-out (with the
+    async ceiling also limited by detected CPU count), and the final job runs
+    inline to guarantee progress. Offline callers with no runtime use a serial
+    fallback and never activate a hidden process-global pool. Every codec
     allocation in a wave (decoded pixels, PNG scan buffers, progressive-JPEG
     coefficient state, and other scratch) is suballocated from one reusable,
     thread-safe request slab. The slab starts from the current admitted wave's
@@ -2421,9 +2444,12 @@ The hardening above follows these long-term rules:
     use a bounded eight-worker pool. Routing, inference, and independently
     bounded body draining overlap; reconstruction alone remains in stable model
     and item order. Each active partition drains into its own request-bounded
-    temporary spill file under one process-wide, pre-acquired disk admission,
-    so an uneven, oversized, or malformed response cannot steal a sibling's
-    allowance or hold its upstream connection behind reconstruction order.
+    hybrid response spool under one process-wide retained-memory and disk
+    admission. Ordinary responses remain in memory; only a response crossing
+    the fixed one-MiB threshold migrates its prefix and subsequent bytes to an
+    unlinked temporary file. Thus small batches avoid filesystem setup while an
+    uneven, oversized, or malformed response cannot steal a sibling's allowance
+    or hold its upstream connection behind reconstruction order.
     The coordinator consumes each completion immediately, removes its spill,
     and refills that worker slot; indexed results and per-partition execution
     reports are merged only in stable order. On POSIX, spill files are unlinked
@@ -2781,8 +2807,10 @@ Parallel rendering uses two levels of admission in the current runtime:
 
 - Global resource-manager byte admission and bounded enrichment execution lanes
   prevent concurrent PDFs from multiplying memory without limit.
-- A per-document worker cap prevents one large PDF from creating an unbounded
-  thread group.
+- Backend-runtime-owned inference execution supplies one aggregate thread
+  ceiling across documents; a per-document worker cap prevents one large PDF
+  from monopolizing it. The underlying workers are created lazily on submitted
+  asynchronous work and are destroyed with the runtime.
 
 The resource-manager admission is one owned split reservation. With the
 defaults, an OCR operation must own the physical peak implied by its 64 MiB
@@ -2796,8 +2824,10 @@ either operation's already-owned scratch or output side. An unusable native
 partition or unavailable required output credit fails before coordinator
 parsing or worker creation.
 
-A separate process-wide CPU permit pool remains an optional follow-up if
-operational measurements show that the bounded enrichment lanes are too coarse.
+PDF and model modules must not own process-global worker pools. If operational
+measurements require separate render and model-compute concurrency classes,
+they should become lazily activated lanes behind `BackendRuntime`, with the
+same lease, shutdown, and metrics contract as its current inference lane.
 
 Page count is not a sufficient weight. Before scheduling a page, derive its
 target dimensions after DPI and dimension clamping, then estimate:
@@ -3364,10 +3394,10 @@ prefetch at zero.
 ### Phase 6: Optional decoded-image handoff
 
 Status: bounded direct-to-batch-tensor preprocessing is complete. It uses the
-process-wide inference worker pool, deterministic output slices, direct RGBA
-consumption for Florence, and direct baseline-JPEG component-plane-to-CHW
-writes for CLIP. Passing decoded PDF rasters across the local model boundary
-remains a measurement-driven future optimization.
+backend runtime's lazily staffed inference executor, deterministic output
+slices, direct RGBA consumption for Florence, and direct baseline-JPEG
+component-plane-to-CHW writes for CLIP. Passing decoded PDF rasters across the
+local model boundary remains a measurement-driven future optimization.
 
 - Measure whether PNG encode/decode remains material after Phase 4.
 - If justified, define a stable decoded pixel format and ownership/admission
@@ -3430,11 +3460,10 @@ The following remain qualification work rather than architectural blockers:
   shared. The safe implementation keeps font and image caches task-local.
 - Whether the conservative source-size, decode-working-set, and
   bytes-per-pixel reservation can be tightened with measured high-water data.
-- Whether a process-wide CPU permit pool materially improves control beyond
-  the existing reusable per-render worker team, per-document cap, bounded
-  enrichment execution lanes, and global resource-manager byte reservation.
-  This is specifically a renderer decision: image preprocessing already uses
-  the reusable process-wide inference worker pool.
+- Whether profiling justifies distinct lazily activated render and model CPU
+  lanes inside `BackendRuntime`. The default deliberately shares its bounded
+  inference executor so separate subsystems cannot multiply process threads;
+  a split must preserve aggregate admission and runtime-owned shutdown.
 - Whether the long-term pipeline should retain PNG as the local interchange
   format or move directly to RGB pixels after measuring Phase 4.
 - Whether the attempt spool should eventually use a compact versioned binary
