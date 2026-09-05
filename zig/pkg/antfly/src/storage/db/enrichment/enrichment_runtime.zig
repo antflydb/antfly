@@ -1567,6 +1567,7 @@ fn inferenceControlFailure(err: anyerror) bool {
 
 const InferenceControlFailurePolicy = struct {
     next_batch_cap: ?usize = null,
+    failed_capacity_batch: ?usize = null,
     open_circuit: bool = false,
 };
 
@@ -1574,7 +1575,7 @@ const InferenceRecoveryState = struct {
     adaptive_batch_max: usize = std.math.maxInt(usize),
     circuit_open_until_ns: u64 = 0,
     successful_batches_at_cap: u16 = 0,
-    smallest_failed_batch: usize = std.math.maxInt(usize),
+    smallest_failed_capacity_batch: usize = std.math.maxInt(usize),
 };
 
 const adaptive_growth_successes: u16 = 8;
@@ -1628,7 +1629,10 @@ fn assetRequestRecoveryKey(alloc: Allocator, request: enrichment_types.Generated
 fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceControlFailurePolicy {
     if (!inferenceControlFailure(err)) return null;
     if (err == error.Cancelled or err == error.Canceled or err == error.EnrichmentWaitCanceled) return .{};
-    if (batch_items > 1) return .{ .next_batch_cap = @max(@as(usize, 1), batch_items / 2) };
+    if (batch_items > 1) return .{
+        .next_batch_cap = @max(@as(usize, 1), batch_items / 2),
+        .failed_capacity_batch = batch_items,
+    };
     return .{ .open_circuit = true };
 }
 
@@ -1641,7 +1645,12 @@ fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: Infere
         const entry = runtime.inference_recovery.getOrPut(runtime.alloc, recovery_key) catch return;
         if (!entry.found_existing) entry.value_ptr.* = .{};
         entry.value_ptr.successful_batches_at_cap = 0;
-        entry.value_ptr.smallest_failed_batch = @min(entry.value_ptr.smallest_failed_batch, batch_items);
+        if (policy.failed_capacity_batch) |failed_batch| {
+            entry.value_ptr.smallest_failed_capacity_batch = @min(
+                entry.value_ptr.smallest_failed_capacity_batch,
+                failed_batch,
+            );
+        }
         if (policy.next_batch_cap) |reduced| {
             entry.value_ptr.adaptive_batch_max = @min(entry.value_ptr.adaptive_batch_max, reduced);
         } else if (policy.open_circuit) {
@@ -1656,14 +1665,17 @@ fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: Infere
 test "inference timeout policy avoids inline retry storms" {
     const reduced = inferenceControlFailurePolicy(error.Timeout, 8).?;
     try std.testing.expectEqual(@as(?usize, 4), reduced.next_batch_cap);
+    try std.testing.expectEqual(@as(?usize, 8), reduced.failed_capacity_batch);
     try std.testing.expect(!reduced.open_circuit);
 
     const singleton = inferenceControlFailurePolicy(error.Timeout, 1).?;
     try std.testing.expect(singleton.next_batch_cap == null);
+    try std.testing.expect(singleton.failed_capacity_batch == null);
     try std.testing.expect(singleton.open_circuit);
 
     const cancelled = inferenceControlFailurePolicy(error.Cancelled, 8).?;
     try std.testing.expect(cancelled.next_batch_cap == null);
+    try std.testing.expect(cancelled.failed_capacity_batch == null);
     try std.testing.expect(!cancelled.open_circuit);
     try std.testing.expect(inferenceControlFailurePolicy(error.ConnectionResetByPeer, 8) == null);
 }
@@ -1687,10 +1699,10 @@ fn noteInferenceControlSuccess(runtime: *EnrichmentRuntime, recovery_key: Infere
     // Only a successful batch at the active cap is evidence that the cap can
     // grow. Grow gradually after sustained success, and probe a previously
     // failing boundary much less often to avoid timeout/success oscillation.
-    if (state.smallest_failed_batch != std.math.maxInt(usize) and
-        batch_items >= state.smallest_failed_batch)
+    if (state.smallest_failed_capacity_batch != std.math.maxInt(usize) and
+        batch_items >= state.smallest_failed_capacity_batch)
     {
-        state.smallest_failed_batch = std.math.maxInt(usize);
+        state.smallest_failed_capacity_batch = std.math.maxInt(usize);
     }
     state.successful_batches_at_cap +|= 1;
     const next = std.math.add(
@@ -1698,8 +1710,8 @@ fn noteInferenceControlSuccess(runtime: *EnrichmentRuntime, recovery_key: Infere
         state.adaptive_batch_max,
         @max(@as(usize, 1), state.adaptive_batch_max / 4),
     ) catch std.math.maxInt(usize);
-    const probing_failed_boundary = state.smallest_failed_batch != std.math.maxInt(usize) and
-        next >= state.smallest_failed_batch;
+    const probing_failed_boundary = state.smallest_failed_capacity_batch != std.math.maxInt(usize) and
+        next >= state.smallest_failed_capacity_batch;
     const required = if (probing_failed_boundary) adaptive_probe_successes else adaptive_growth_successes;
     if (state.successful_batches_at_cap < required) return;
     state.adaptive_batch_max = next;
@@ -4778,6 +4790,10 @@ test "inference recovery is scoped by model and backend" {
     const cpu_key = inferenceRecoveryKey(.{ .model = "bge-m3", .backend = "cpu" });
     noteInferenceControlFailure(&runtime, metal_key, error.Timeout, 8);
     try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, metal_key));
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        runtime.inference_recovery.get(metal_key).?.smallest_failed_capacity_batch,
+    );
     try std.testing.expectEqual(std.math.maxInt(usize), recoveryBatchCap(&runtime, cpu_key));
 
     noteInferenceControlSuccess(&runtime, metal_key, 4);
@@ -4787,10 +4803,18 @@ test "inference recovery is scoped by model and backend" {
 
     noteInferenceControlFailure(&runtime, metal_key, error.Timeout, 1);
     try std.testing.expectError(error.InferenceCircuitOpen, checkProviderInvocation(&runtime, metal_key, true));
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        runtime.inference_recovery.get(metal_key).?.smallest_failed_capacity_batch,
+    );
     try checkProviderInvocation(&runtime, cpu_key, true);
     noteInferenceControlSuccess(&runtime, metal_key, 1);
     try checkProviderInvocation(&runtime, metal_key, true);
     try std.testing.expectEqual(@as(usize, 5), recoveryBatchCap(&runtime, metal_key));
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        runtime.inference_recovery.get(metal_key).?.smallest_failed_capacity_batch,
+    );
 
     noteInferenceControlFailure(&runtime, cpu_key, error.Timeout, 8);
     for (0..adaptive_growth_successes) |_| noteInferenceControlSuccess(&runtime, cpu_key, 4);

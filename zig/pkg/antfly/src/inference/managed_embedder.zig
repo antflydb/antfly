@@ -1567,6 +1567,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
             .io = embeddingIo(entry),
             .deadline_ns = embeddingOperationDeadline(entry),
             .cancellation = entry.cancellation,
+            .progress = entry.progress,
         },
         .task_type = task_type,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
@@ -1620,7 +1621,7 @@ fn embeddingRemainingTimeoutMs(entry: *const ManagedEmbeddingEntry) !u64 {
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
     if (isAntflyProvider(entry.provider)) {
         if (entry.antfly_provider) |local| {
-            if (sparse) return false;
+            if (sparse) return local.embed_sparse_texts_with_context != null;
             if (local.embed_dense_texts_with_context == null) return false;
             if (entry.multimodal and local.embed_dense_parts_with_context == null)
                 return false;
@@ -1631,6 +1632,87 @@ fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) boo
     // supplied an executor capable of running the request and watchdog
     // concurrently.
     return entry.bounded_http_request;
+}
+
+pub fn testLocalForegroundEmbeddingAdmissionCapabilities() !void {
+    const Stub = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparseWithContext(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: EmbeddingRequestContext,
+        ) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var provider_context: u8 = 0;
+    var entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .index_name = @constCast("sparse_idx"),
+        .provider = .antfly,
+        .model = @constCast("bge-m3"),
+        .base_url = @constCast(""),
+        .dimensions = 1,
+        .sparse = true,
+        .antfly_provider = .{
+            .ptr = &provider_context,
+            .embed_dense_texts = Stub.dense,
+            .embed_sparse_texts = Stub.sparse,
+        },
+    };
+    try std.testing.expect(!entryForegroundBounded(&entry, true));
+
+    entry.antfly_provider = .{
+        .ptr = &provider_context,
+        .embed_dense_texts = Stub.dense,
+        .embed_sparse_texts = Stub.sparse,
+        .embed_sparse_texts_with_context = Stub.sparseWithContext,
+    };
+    try std.testing.expect(entryForegroundBounded(&entry, true));
+}
+
+pub fn testManagedEmbeddingRequestContextProgress() !void {
+    const Capture = struct {
+        last: ?request_context.Progress = null,
+
+        fn update(raw: ?*anyopaque, progress: request_context.Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.last = progress;
+        }
+    };
+
+    var capture = Capture{};
+    const entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .deadline_ns = std.math.maxInt(u64),
+        .progress = .{ .ptr = &capture, .update_fn = Capture.update },
+        .index_name = @constCast("semantic_idx"),
+        .provider = .antfly,
+        .model = @constCast("bge-m3"),
+        .base_url = @constCast(""),
+        .dimensions = 1,
+    };
+
+    const context = embeddingRequestContext(&entry, .retrieval_document);
+    try std.testing.expect(context.request.progress != null);
+    try context.request.updateDetail(.executing, 2, 3, entry.model, "metal");
+    const progress = capture.last.?;
+    try std.testing.expectEqual(request_context.Phase.executing, progress.phase);
+    try std.testing.expectEqual(@as(u64, 2), progress.completed);
+    try std.testing.expectEqual(@as(u64, 3), progress.total);
+    try std.testing.expectEqualStrings("bge-m3", progress.model);
+    try std.testing.expectEqualStrings("metal", progress.backend);
+    try std.testing.expectEqual(entry.deadline_ns, progress.deadline_ns);
 }
 
 pub fn testEmbeddingProviderDeadlines() !void {
