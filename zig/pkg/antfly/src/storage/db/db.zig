@@ -1018,6 +1018,10 @@ const IndexRepairScheduleRecord = struct {
     durable_next_retry_at_ms: u64,
     next_retry_at_ms: u64,
     progress_wait_until_sequence: ?u64 = null,
+    // Process-local grace period for an already-queryable initial build.
+    // Once its deadline is selected, the repair owner receives one explicit
+    // audit authority instead of blindly rearming the same grace period.
+    audit_wait_armed: bool = false,
     heap_position: ?usize = null,
 };
 
@@ -1155,6 +1159,7 @@ const IndexRepairSchedulerDirectory = struct {
         if (record.revision != expected_revision or record.class != .runnable) return false;
         if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
         record.progress_wait_until_sequence = wake_at_sequence;
+        record.audit_wait_armed = false;
         record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
         self.rescheduleRunnable(repair_id);
         return true;
@@ -1179,6 +1184,7 @@ const IndexRepairSchedulerDirectory = struct {
             record.progress_wait_until_sequence = null;
             self.progress_waiters -= 1;
         }
+        record.audit_wait_armed = true;
         record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
         self.rescheduleRunnable(repair_id);
         return true;
@@ -1202,6 +1208,7 @@ const IndexRepairSchedulerDirectory = struct {
         const wake_at = record.progress_wait_until_sequence orelse return null;
         if (applied_sequence < wake_at) return null;
         record.progress_wait_until_sequence = null;
+        record.audit_wait_armed = false;
         self.progress_waiters -= 1;
         record.next_retry_at_ms = record.durable_next_retry_at_ms;
         self.rescheduleRunnable(record.repair_id);
@@ -1298,6 +1305,7 @@ const IndexRepairSchedulerDirectory = struct {
             record.root_generation = intent.root_generation;
             if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
             record.progress_wait_until_sequence = null;
+            record.audit_wait_armed = false;
             record.phase_terminal = intent.phase == .terminal;
             record.revision = persisted_revision;
             if (schedule_changed and class == .runnable) {
@@ -15391,6 +15399,16 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
     ) anyerror!IndexRepairAdvanceResult {
+        return try self.advanceScheduledIndexRepairIntent(alloc, repair_id, options, false);
+    }
+
+    fn advanceScheduledIndexRepairIntent(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        options: types.ArtifactRepairRunOptions,
+        audit_due: bool,
+    ) anyerror!IndexRepairAdvanceResult {
         // Resolve the durable name before taking the process-local lease, then
         // reload after acquisition. A pause or terminal transition which wins
         // between those operations must be observed by this owner; using the
@@ -15434,6 +15452,7 @@ pub const DB = struct {
             repair_id,
             owned_options,
             &entry,
+            audit_due,
         );
     }
 
@@ -15446,6 +15465,7 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
         entry: *index_repair_state.Entry,
+        audit_due: bool,
     ) anyerror!IndexRepairAdvanceResult {
         var result = IndexRepairAdvanceResult{ .repair_id = repair_id };
         var effective_options = options;
@@ -15572,7 +15592,7 @@ pub const DB = struct {
             // to this durable bounded owner. Append one primary-store page,
             // then publish its cursor. A crash before the cursor repeats an
             // idempotent page; a crash after it can never skip source rows.
-            const artifact_names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(
+            const artifact_names = try self.core.index_manager.artifactProducerNamesForIndexAlloc(
                 alloc,
                 entry.intent.index_name,
             );
@@ -15703,22 +15723,24 @@ pub const DB = struct {
         // it once coverage and replay converge.
         if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
             const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-            if (!try self.deferIndexRepairUntilTargetOrAudit(
-                alloc,
-                repair_id,
-                entry.intent.revision,
-                entry.intent.index_name,
-                observed_sequence,
-                entry.intent.target_sequence,
-            )) {
-                // A concurrent durable transition invalidated this observation.
-                // Consume one bounded slot and let its newer schedule decide
-                // the next wake instead of publishing a stale progress wait.
-                result.busy = true;
+            if (!audit_due or observed_sequence < entry.intent.target_sequence) {
+                if (!try self.deferIndexRepairUntilTargetOrAudit(
+                    alloc,
+                    repair_id,
+                    entry.intent.revision,
+                    entry.intent.index_name,
+                    observed_sequence,
+                    entry.intent.target_sequence,
+                )) {
+                    // A concurrent durable transition invalidated this observation.
+                    // Consume one bounded slot and let its newer schedule decide
+                    // the next wake instead of publishing a stale progress wait.
+                    result.busy = true;
+                    return result;
+                }
+                result.deferred = true;
                 return result;
             }
-            result.deferred = true;
-            return result;
         }
 
         if (entry.intent.phase == .detected and entry.intent.source_replay_state == .complete) {
@@ -16120,7 +16142,12 @@ pub const DB = struct {
     }
 
     const IndexRepairSchedulerSelection = struct {
-        repair_ids: std.ArrayListUnmanaged(u128) = .empty,
+        const Repair = struct {
+            repair_id: u128,
+            audit_due: bool,
+        };
+
+        repairs: std.ArrayListUnmanaged(Repair) = .empty,
         inspected: usize = 0,
         deferred: usize = 0,
         terminal: usize = 0,
@@ -16128,7 +16155,7 @@ pub const DB = struct {
         next_retry_at_ms: u64 = 0,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
-            self.repair_ids.deinit(alloc);
+            self.repairs.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -16153,7 +16180,7 @@ pub const DB = struct {
             execution_limit,
             @intCast(directory.cursor),
         );
-        try selection.repair_ids.ensureTotalCapacity(alloc, inspection.budget);
+        try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
@@ -16180,7 +16207,10 @@ pub const DB = struct {
                     self.async_context.index_repair_progress_wait_pending.store(false, .release);
                 }
             }
-            selection.repair_ids.appendAssumeCapacity(record.repair_id);
+            selection.repairs.appendAssumeCapacity(.{
+                .repair_id = record.repair_id,
+                .audit_due = record.audit_wait_armed,
+            });
         }
         return selection;
     }
@@ -16211,9 +16241,14 @@ pub const DB = struct {
         result.inspected = selection.inspected;
         result.remaining = selection.remaining;
         var consumed_slots: usize = 0;
-        for (selection.repair_ids.items) |repair_id| {
+        for (selection.repairs.items) |scheduled| {
             if (consumed_slots >= limit) break;
-            const advanced = try self.advanceIndexRepairIntent(alloc, repair_id, options);
+            const advanced = try self.advanceScheduledIndexRepairIntent(
+                alloc,
+                scheduled.repair_id,
+                options,
+                scheduled.audit_due,
+            );
             result.attempted += @intFromBool(advanced.attempted);
             result.repaired += @intFromBool(advanced.repaired);
             result.degraded += @intFromBool(advanced.indexes_degraded_after != 0);
@@ -85544,6 +85579,101 @@ test "db managed vector admission captures writes while durable repair is pendin
     try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
 }
 
+test "db managed full text admission replays transitive artifact producers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    // Model the catalog-to-resident handoff: the source write commits through
+    // the old schema immediately before the new generated index is admitted.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+
+    const cfg = types.IndexConfig{
+        .name = "document_text",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}",
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+
+    const direct_sources = try db.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, cfg.name);
+    defer {
+        for (direct_sources) |name| alloc.free(name);
+        if (direct_sources.len > 0) alloc.free(direct_sources);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_sources.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", direct_sources[0]);
+
+    const producer_path = try db.core.index_manager.artifactProducerNamesForIndexAlloc(alloc, cfg.name);
+    defer {
+        for (producer_path) |name| alloc.free(name);
+        if (producer_path.len > 0) alloc.free(producer_path);
+    }
+    try std.testing.expectEqual(@as(usize, 2), producer_path.len);
+    try std.testing.expect(containsName(producer_path, "document_chunks_v1"));
+    try std.testing.expect(containsName(producer_path, "document_units_v1"));
+
+    var admitted = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer admitted.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, admitted.intent.source_replay_state);
+
+    const replay = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(replay.attempted);
+    try std.testing.expect(replay.deferred);
+    try std.testing.expectEqual(@as(u64, 1), replay.documents_reprocessed);
+    try db.runUntilIdle();
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+        try db.runUntilIdle();
+    }
+    try std.testing.expect(repaired);
+
+    var result = try db.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].artifact_ref.?.document_id);
+}
+
 test "db managed vector admission discovers artifacts committed before resident activation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -85892,17 +86022,19 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
     var first = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), first.inspected);
-    try std.testing.expectEqual(@as(usize, 0), first.repair_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.repairs.items.len);
 
     var second = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer second.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), second.inspected);
-    try std.testing.expectEqual(@as(usize, 0), second.repair_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), second.repairs.items.len);
 
     var third = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer third.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), third.inspected);
-    try std.testing.expectEqualSlices(u128, &.{18}, third.repair_ids.items);
+    try std.testing.expectEqual(@as(usize, 1), third.repairs.items.len);
+    try std.testing.expectEqual(@as(u128, 18), third.repairs.items[0].repair_id);
+    try std.testing.expect(!third.repairs.items[0].audit_due);
 }
 
 test "resident index repair scheduler maintains exact aggregate wake precedence" {
@@ -86431,7 +86563,30 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // target continues moving as normal embeddings arrive, but that must
         // not arm a next-sequence repair wake for each batch.
         try std.testing.expectEqual(@as(?u64, null), partial_record.progress_wait_until_sequence);
+        try std.testing.expect(partial_record.audit_wait_armed);
         try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
+    }
+    {
+        // Model the bounded audit deadline expiring. Selection must carry
+        // that authority into the one scheduled execution; otherwise the
+        // queryable shortcut simply rearms another deadline forever.
+        {
+            lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+            defer db.async_context.index_repair_scheduler_mutex.unlock();
+            const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+                return error.TestUnexpectedResult;
+            const partial_record = &db.async_context.index_repair_scheduler.records.items[partial_record_index];
+            partial_record.next_retry_at_ms = 0;
+            db.async_context.index_repair_scheduler.rescheduleRunnable(repair_id);
+        }
+
+        var audit_selection = try db.selectIndexRepairSchedulerQuantum(alloc, 2);
+        defer audit_selection.deinit(alloc);
+        var selected_due_audit = false;
+        for (audit_selection.repairs.items) |scheduled| {
+            if (scheduled.repair_id == repair_id) selected_due_audit = scheduled.audit_due;
+        }
+        try std.testing.expect(selected_due_audit);
     }
     if (try db.indexRepairIdForIndex(alloc, "damaged_idx")) |remaining_repair_id| {
         try std.testing.expectEqual(damaged_repair_id, remaining_repair_id);
