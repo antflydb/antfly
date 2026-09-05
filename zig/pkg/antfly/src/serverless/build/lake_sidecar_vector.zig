@@ -31,7 +31,7 @@ const lake_build_limits = @import("lake_build_limits.zig");
 pub const VectorSidecarBuildOptions = struct {
     name: []const u8,
     vector_column: []const u8,
-    metric: shared_vector.DistanceMetric = .cosine,
+    metric: shared_vector.DistanceMetric = shared_vector.default_distance_metric,
     policy: vector_index.BuildPolicy = .{},
     embedding_name: ?[]const u8 = null,
     artifact_id: []const u8 = &.{},

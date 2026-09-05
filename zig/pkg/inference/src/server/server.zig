@@ -49,6 +49,7 @@ const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
+const reranking_pipeline = @import("../pipelines/reranking.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
 const document_token_classification = @import("../pipelines/document_token_classification.zig");
@@ -3735,21 +3736,58 @@ pub const Node = struct {
         query: []const u8,
         documents: []const []const u8,
     ) ![]f32 {
+        return self.rerankTextsDirectWithContext(allocator, null, null, null, model_name, query, documents);
+    }
+
+    pub fn rerankTextsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: ?std.Io,
+        deadline_ns: ?u64,
+        upstream_control: ?reranking_pipeline.ExecutionControl,
+        model_name: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+    ) ![]f32 {
+        if (upstream_control) |control| try control.check();
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (documents.len == 0) return try allocator.alloc(f32, 0);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        if (upstream_control) |control| try control.check();
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
+        var owned_io: ?std.Io.Threaded = if (io == null) std.Io.Threaded.init(allocator, .{}) else null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const request_io = io orelse owned_io.?.io();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
-        return try pipeline.rerank(query, documents);
+        const DeadlineControl = struct {
+            deadline_ns: ?u64,
+            upstream: ?reranking_pipeline.ExecutionControl,
+
+            fn check(raw: ?*anyopaque) !void {
+                const control: *const @This() = @ptrCast(@alignCast(raw.?));
+                if (control.upstream) |upstream| try upstream.check();
+                return ensureDirectEmbeddingDeadline(control.deadline_ns);
+            }
+        };
+        var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
+        pipeline.execution_control = .{
+            .ptr = &deadline_control,
+            .check_fn = DeadlineControl.check,
+        };
+        const scores = try pipeline.rerank(query, documents);
+        errdefer allocator.free(scores);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return scores;
     }
 
     pub fn generateTextDirect(

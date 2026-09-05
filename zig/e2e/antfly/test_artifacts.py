@@ -1275,14 +1275,26 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
 
     def text_projection_intact() -> dict | None:
         detail = stateful_api.get_index(table_name, "document_text")
-        result = stateful_api.query_table(
-            table_name,
-            {
-                "full_text_index": "document_text",
-                "full_text_search": {"field": "text", "match": canary},
-                "limit": 5,
-            },
-        )
+        try:
+            result = stateful_api.query_table(
+                table_name,
+                {
+                    "full_text_index": "document_text",
+                    "full_text_search": {"field": "text", "match": canary},
+                    "limit": 5,
+                },
+            )
+        except requests.HTTPError as err:
+            response = err.response
+            if response is None or response.status_code != 503:
+                raise
+            try:
+                unavailable = response.json()
+            except ValueError:
+                unavailable = {}
+            if unavailable.get("code") != "index_rebuilding":
+                raise
+            return None
         if detail.get("status", {}).get("doc_count") != 1:
             return None
         if doc_key not in _query_hit_ids(result):

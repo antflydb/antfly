@@ -19,7 +19,7 @@ class GeneratorConfig:
         {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}
 
     Attributes:
-        provider (GeneratorProvider): The generative AI provider to use.
+        provider (GeneratorProvider): Generator providers implemented by Antfly's generation runtime.
     """
 
     provider: GeneratorProvider

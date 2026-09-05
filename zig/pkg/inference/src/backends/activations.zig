@@ -591,8 +591,8 @@ test "gelu" {
 test "exact gelu matches erf reference values" {
     var data = [_]f32{ 0.0, 1.0, -1.0, 2.0 };
     geluExact(&data);
-    // libm exp rounding differs by a few f32 ULPs across supported targets.
-    const tolerance: f32 = 5e-7;
+    // erfApproxF32 is bounded to a few f32 ULPs after composition with GELU.
+    const tolerance = 4 * std.math.floatEps(f32);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], tolerance);

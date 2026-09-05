@@ -34,10 +34,12 @@ from .answer_agent_result import AnswerAgentResult
 from .answer_agent_steps import AnswerAgentSteps
 from .antfly_chunker_config import AntflyChunkerConfig
 from .antfly_embedder_config import AntflyEmbedderConfig
+from .antfly_embedder_config_provider import AntflyEmbedderConfigProvider
 from .antfly_generator_config import AntflyGeneratorConfig
+from .antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from .antfly_reranker_config import AntflyRerankerConfig
+from .antfly_reranker_config_provider import AntflyRerankerConfigProvider
 from .antfly_type import AntflyType
-from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
@@ -64,8 +66,8 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
+from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
-from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
@@ -106,9 +108,10 @@ from .cluster_topology import ClusterTopology
 from .cluster_topology_deployment_mode import ClusterTopologyDeploymentMode
 from .cohere_embedder_config import CohereEmbedderConfig
 from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
+from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
-from .cohere_generator_config import CohereGeneratorConfig
 from .cohere_reranker_config import CohereRerankerConfig
+from .cohere_reranker_config_provider import CohereRerankerConfigProvider
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -311,8 +314,11 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .google_embedder_config import GoogleEmbedderConfig
+from .google_embedder_config_provider import GoogleEmbedderConfigProvider
 from .google_generator_config import GoogleGeneratorConfig
+from .google_generator_config_provider import GoogleGeneratorConfigProvider
 from .graph_aggregate_value import GraphAggregateValue
 from .graph_aggregates_result import GraphAggregatesResult
 from .graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
@@ -721,12 +727,15 @@ from .multi_phrase_query import MultiPhraseQuery
 from .node_filter import NodeFilter
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
+from .ollama_embedder_config_provider import OllamaEmbedderConfigProvider
 from .ollama_generator_config import OllamaGeneratorConfig
-from .ollama_reranker_config import OllamaRerankerConfig
+from .ollama_generator_config_provider import OllamaGeneratorConfigProvider
 from .open_ai_embedder_config import OpenAIEmbedderConfig
+from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
+from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_router_embedder_config import OpenRouterEmbedderConfig
-from .open_router_generator_config import OpenRouterGeneratorConfig
+from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -760,6 +769,8 @@ from .query_builder_result_query import QueryBuilderResultQuery
 from .query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExceededErrorError
 from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
+from .query_dependency_error import QueryDependencyError
+from .query_dependency_error_code import QueryDependencyErrorCode
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -802,6 +813,9 @@ from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_source_type import ReplicationSourceType
 from .replication_transform_op import ReplicationTransformOp
+from .reranker_candidate_limit_exceeded_error import RerankerCandidateLimitExceededError
+from .reranker_candidate_limit_exceeded_error_error import RerankerCandidateLimitExceededErrorError
+from .reranker_candidate_limit_exceeded_error_status import RerankerCandidateLimitExceededErrorStatus
 from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
@@ -895,6 +909,7 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_patch import TableSchemaPatch
 from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
@@ -953,6 +968,7 @@ from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
+from .ttl_config import TtlConfig
 from .unsupported_hierarchy_grouping_error import UnsupportedHierarchyGroupingError
 from .unsupported_hierarchy_grouping_error_action import UnsupportedHierarchyGroupingErrorAction
 from .unsupported_hierarchy_grouping_error_error import UnsupportedHierarchyGroupingErrorError
@@ -972,8 +988,11 @@ from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
 from .vertex_embedder_config import VertexEmbedderConfig
+from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from .vertex_generator_config import VertexGeneratorConfig
+from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
+from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_service import VertexSearchConfigService
 from .web_search_config import WebSearchConfig
@@ -1017,10 +1036,12 @@ __all__ = (
     "AnswerAgentSteps",
     "AntflyChunkerConfig",
     "AntflyEmbedderConfig",
+    "AntflyEmbedderConfigProvider",
     "AntflyGeneratorConfig",
+    "AntflyGeneratorConfigProvider",
     "AntflyRerankerConfig",
+    "AntflyRerankerConfigProvider",
     "AntflyType",
-    "AnthropicGeneratorConfig",
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
@@ -1047,8 +1068,8 @@ __all__ = (
     "BatchResponse",
     "BatchResponseStatus",
     "BedrockEmbedderConfig",
+    "BedrockEmbedderConfigProvider",
     "BedrockEmbedderConfigRequestFormat",
-    "BedrockGeneratorConfig",
     "BooleanQuery",
     "BoolFieldQuery",
     "BraveSearchConfig",
@@ -1089,9 +1110,10 @@ __all__ = (
     "ClusterTopologyDeploymentMode",
     "CohereEmbedderConfig",
     "CohereEmbedderConfigInputType",
+    "CohereEmbedderConfigProvider",
     "CohereEmbedderConfigTruncate",
-    "CohereGeneratorConfig",
     "CohereRerankerConfig",
+    "CohereRerankerConfigProvider",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
@@ -1292,8 +1314,11 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GlobalStatefulQueryRequest",
     "GoogleEmbedderConfig",
+    "GoogleEmbedderConfigProvider",
     "GoogleGeneratorConfig",
+    "GoogleGeneratorConfigProvider",
     "GraphAggregatesResult",
     "GraphAggregatesResultAggregates",
     "GraphAggregatesResultKind",
@@ -1698,12 +1723,15 @@ __all__ = (
     "NodeFilter",
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
+    "OllamaEmbedderConfigProvider",
     "OllamaGeneratorConfig",
-    "OllamaRerankerConfig",
+    "OllamaGeneratorConfigProvider",
     "OpenAIEmbedderConfig",
+    "OpenAIEmbedderConfigProvider",
     "OpenAIGeneratorConfig",
+    "OpenAIGeneratorConfigProvider",
     "OpenRouterEmbedderConfig",
-    "OpenRouterGeneratorConfig",
+    "OpenRouterEmbedderConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",
@@ -1737,6 +1765,8 @@ __all__ = (
     "QueryCandidateBudgetExceededError",
     "QueryCandidateBudgetExceededErrorError",
     "QueryCandidateBudgetExceededErrorStatus",
+    "QueryDependencyError",
+    "QueryDependencyErrorCode",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
@@ -1779,6 +1809,9 @@ __all__ = (
     "ReplicationSourceStatus",
     "ReplicationSourceType",
     "ReplicationTransformOp",
+    "RerankerCandidateLimitExceededError",
+    "RerankerCandidateLimitExceededErrorError",
+    "RerankerCandidateLimitExceededErrorStatus",
     "RerankerConfig",
     "RerankerProfile",
     "RerankerProvider",
@@ -1872,6 +1905,7 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaPatch",
     "TableShards",
     "TableStatistics",
     "TableStatisticsFieldStats",
@@ -1930,6 +1964,7 @@ __all__ = (
     "TraversalRules",
     "TraverseResponse",
     "TreeSearchConfig",
+    "TtlConfig",
     "UnsupportedHierarchyGroupingError",
     "UnsupportedHierarchyGroupingErrorAction",
     "UnsupportedHierarchyGroupingErrorError",
@@ -1949,8 +1984,11 @@ __all__ = (
     "UserMetadataType0",
     "VADOptions",
     "VertexEmbedderConfig",
+    "VertexEmbedderConfigProvider",
     "VertexGeneratorConfig",
+    "VertexGeneratorConfigProvider",
     "VertexRerankerConfig",
+    "VertexRerankerConfigProvider",
     "VertexSearchConfig",
     "VertexSearchConfigService",
     "WebSearchConfig",

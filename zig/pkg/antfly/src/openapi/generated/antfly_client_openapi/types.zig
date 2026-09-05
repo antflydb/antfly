@@ -313,7 +313,7 @@ pub const AgentStepStatus = enum {
 };
 
 pub const AggregationBucket = struct {
-    /// Bucket key (term, range name, date, etc.)
+    /// Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array.
     key: []const u8,
     /// Formatted key for display (e.g., formatted dates)
     key_as_string: ?[]const u8 = null,
@@ -482,7 +482,7 @@ pub const AggregationRequest = struct {
     field: ?[]const u8 = null,
     /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
     mode: ?std.json.Value = null,
-    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+    /// Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
     size: ?i64 = null,
@@ -1707,6 +1707,7 @@ pub const AntflyChunkerConfig = struct {
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
+    provider: []const u8,
     /// The embedding model name (maps to models/embedders/{name}/ directory).
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -1714,6 +1715,7 @@ pub const AntflyEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_url", "api_url", true },
     };
@@ -1728,6 +1730,8 @@ pub const AntflyEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_url) |value| {
@@ -1740,6 +1744,7 @@ pub const AntflyEmbedderConfig = struct {
 
 /// Configuration for the Antfly inference generative AI provider.
 pub const AntflyGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the generator model.
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -1757,6 +1762,7 @@ pub const AntflyGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_url", "api_url", true },
         .{ "temperature", "temperature", true },
@@ -1776,6 +1782,8 @@ pub const AntflyGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_url) |value| {
@@ -1808,14 +1816,16 @@ pub const AntflyGeneratorConfig = struct {
 
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
-    /// The name of the reranking model (e.g., cross-encoder model name).
-    model: []const u8,
+    provider: []const u8,
+    /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
+    model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
         .{ "url", "url", true },
     };
 
@@ -1829,8 +1839,12 @@ pub const AntflyRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.url) |value| {
             try jw.objectField("url");
             try jw.write(value);
@@ -1891,74 +1905,6 @@ pub const AntflyType = enum {
             .{ "blob", .blob },
         });
         return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Configuration for the Anthropic generative AI provider.
-pub const AnthropicGeneratorConfig = struct {
-    /// The full model ID of the Anthropic model to use.
-    model: []const u8,
-    /// The Anthropic API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Anthropic API endpoint.
-    url: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "api_key", "api_key", true },
-        .{ "url", "url", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
-            try jw.write(value);
-        }
-        try jw.endObject();
     }
 };
 
@@ -2500,7 +2446,7 @@ pub const BackupRequest = struct {
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
     inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions take precedence over inserts for the same key in one batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
@@ -2594,6 +2540,7 @@ pub const BatchResponse = struct {
 
 /// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 pub const BedrockEmbedderConfig = struct {
+    provider: []const u8,
     /// The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
     model: []const u8,
     /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
@@ -2615,6 +2562,7 @@ pub const BedrockEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "request_format", "request_format", true },
         .{ "region", "region", true },
@@ -2636,6 +2584,8 @@ pub const BedrockEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.request_format) |value| {
@@ -2668,67 +2618,6 @@ pub const BedrockEmbedderConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for the AWS Bedrock generative AI provider.
-pub const BedrockGeneratorConfig = struct {
-    /// The Bedrock model ID to use.
-    model: []const u8,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "region", "region", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.region) |value| {
-            try jw.objectField("region");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
             try jw.write(value);
         }
         try jw.endObject();
@@ -3602,30 +3491,21 @@ pub const ChunkerProvider = enum {
 
 /// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
 pub const ClassificationStepConfig = struct {
-    /// Enable query classification and strategy selection
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Include pre-retrieval reasoning explaining query analysis and strategy selection
     with_reasoning: ?bool = null,
     /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
     force_strategy: ?QueryStrategy = null,
     /// Override semantic query mode selection.
     force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
         .{ "with_reasoning", "with_reasoning", true },
         .{ "force_strategy", "force_strategy", true },
         .{ "force_semantic_mode", "force_semantic_mode", true },
-        .{ "multi_phrase_count", "multi_phrase_count", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3642,14 +3522,6 @@ pub const ClassificationStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.with_reasoning) |value| {
             try jw.objectField("with_reasoning");
             try jw.write(value);
@@ -3660,10 +3532,6 @@ pub const ClassificationStepConfig = struct {
         }
         if (self.force_semantic_mode) |value| {
             try jw.objectField("force_semantic_mode");
-            try jw.write(value);
-        }
-        if (self.multi_phrase_count) |value| {
-            try jw.objectField("multi_phrase_count");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4471,6 +4339,7 @@ pub const ClusterTopology = struct {
 
 /// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
 pub const CohereEmbedderConfig = struct {
+    provider: []const u8,
     /// The name of the Cohere embedding model to use.
     model: []const u8,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
@@ -4482,6 +4351,7 @@ pub const CohereEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
         .{ "input_type", "input_type", true },
@@ -4498,6 +4368,8 @@ pub const CohereEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
@@ -4516,98 +4388,19 @@ pub const CohereEmbedderConfig = struct {
     }
 };
 
-/// Configuration for the Cohere generative AI provider.
-pub const CohereGeneratorConfig = struct {
-    /// The name of the Cohere model to use.
-    model: []const u8,
-    /// The Cohere API key.
-    api_key: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-1.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// Penalty for token frequency (0.0-1.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (0.0-1.0).
-    presence_penalty: ?f32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "api_key", "api_key", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "top_k", "top_k", true },
-        .{ "frequency_penalty", "frequency_penalty", true },
-        .{ "presence_penalty", "presence_penalty", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
-            try jw.write(value);
-        }
-        if (self.frequency_penalty) |value| {
-            try jw.objectField("frequency_penalty");
-            try jw.write(value);
-        }
-        if (self.presence_penalty) |value| {
-            try jw.objectField("presence_penalty");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
 pub const CohereRerankerConfig = struct {
+    provider: []const u8,
     /// The name of the Cohere reranking model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4620,18 +4413,14 @@ pub const CohereRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
-            try jw.write(value);
-        }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
             try jw.write(value);
         }
         try jw.endObject();
@@ -4640,21 +4429,12 @@ pub const CohereRerankerConfig = struct {
 
 /// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
 pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4669,18 +4449,6 @@ pub const ConfidenceStepConfig = struct {
         try jw.beginObject();
         if (self.enabled) |value| {
             try jw.objectField("enabled");
-            try jw.write(value);
-        }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5193,7 +4961,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -5211,10 +4979,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?IndexEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -5244,7 +5010,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -5325,10 +5090,6 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -5666,7 +5427,7 @@ pub const CreateTableRequest = struct {
     description: ?[]const u8 = null,
     /// Map of index name to create-index configuration. The map key owns the index name; do not repeat `name` inside the configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
     indexes: ?std.json.ArrayHashMap(CreateIndexRequest) = null,
-    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
+    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration with a `ttl` policy - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl": {"duration": "7d", "field": "_timestamp"}, "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
@@ -5857,7 +5618,6 @@ pub const CreatedEmbeddingsIndex = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -5884,7 +5644,6 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -5969,10 +5728,6 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -6017,7 +5772,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
-    summarizer: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
     top_k: ?i64 = null,
     min_weight: ?f32 = null,
@@ -6039,7 +5793,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -6107,10 +5860,6 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -7380,7 +7129,7 @@ pub const DisjunctionQuery = struct {
     }
 };
 
-/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
 pub const DistanceMetric = enum {
     l2_squared,
     inner_product,
@@ -8555,24 +8304,12 @@ pub const EdgeTypeConfig = struct {
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
     topology: ?[]const u8 = null,
-    /// Maximum allowed edge weight
-    max_weight: ?f64 = null,
-    /// Minimum allowed edge weight
-    min_weight: ?f64 = null,
-    /// Whether to allow edges from a node to itself
-    allow_self_loops: ?bool = null,
-    /// Required metadata fields for this edge type
-    required_metadata: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "field", "field", true },
         .{ "topology", "topology", true },
-        .{ "max_weight", "max_weight", true },
-        .{ "min_weight", "min_weight", true },
-        .{ "allow_self_loops", "allow_self_loops", true },
-        .{ "required_metadata", "required_metadata", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8593,22 +8330,6 @@ pub const EdgeTypeConfig = struct {
         }
         if (self.topology) |value| {
             try jw.objectField("topology");
-            try jw.write(value);
-        }
-        if (self.max_weight) |value| {
-            try jw.objectField("max_weight");
-            try jw.write(value);
-        }
-        if (self.min_weight) |value| {
-            try jw.objectField("min_weight");
-            try jw.write(value);
-        }
-        if (self.allow_self_loops) |value| {
-            try jw.objectField("allow_self_loops");
-            try jw.write(value);
-        }
-        if (self.required_metadata) |value| {
-            try jw.objectField("required_metadata");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8650,6 +8371,7 @@ pub const EdgesResponse = struct {
 
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
+    provider: ?[]const u8 = null,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
@@ -8662,7 +8384,7 @@ pub const EmbedderConfig = struct {
     api_key: ?[]const u8 = null,
     /// The URL of the Google API endpoint (optional, uses default if not specified).
     url: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
     dimensions: ?i64 = null,
@@ -8680,12 +8402,12 @@ pub const EmbedderConfig = struct {
     batch_size: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    provider: EmbedderProvider,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", true },
@@ -8701,7 +8423,6 @@ pub const EmbedderConfig = struct {
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
-        .{ "provider", "provider", false },
         .{ "multimodal", "multimodal", true },
     };
 
@@ -8715,6 +8436,10 @@ pub const EmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -8775,8 +8500,6 @@ pub const EmbedderConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
         if (self.multimodal) |value| {
             try jw.objectField("multimodal");
             try jw.write(value);
@@ -8794,7 +8517,6 @@ pub const EmbedderProvider = enum {
     openrouter,
     bedrock,
     cohere,
-    mock,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -8806,7 +8528,6 @@ pub const EmbedderProvider = enum {
             .openrouter => "openrouter",
             .bedrock => "bedrock",
             .cohere => "cohere",
-            .mock => "mock",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -8825,7 +8546,6 @@ pub const EmbedderProvider = enum {
             .{ "openrouter", .openrouter },
             .{ "bedrock", .bedrock },
             .{ "cohere", .cohere },
-            .{ "mock", .mock },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -8998,14 +8718,14 @@ pub const EmbeddingSourceCoverageStatus = struct {
     }
 };
 
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -9023,10 +8743,8 @@ pub const EmbeddingsIndexConfig = struct {
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?IndexEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -9052,7 +8770,6 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "distance_metric", "distance_metric", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
@@ -9120,10 +8837,6 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.chunker) |value| {
@@ -11898,26 +11611,17 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+/// Configuration for deterministic follow-up suggestions derived from the original query and the standard Antfly follow-up templates.
 pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
     /// Number of follow-up questions to generate
     count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
-        .{ "generator", "generator", true },
-        .{ "chain", "chain", true },
         .{ "count", "count", true },
-        .{ "context", "context", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11934,20 +11638,8 @@ pub const FollowupStepConfig = struct {
             try jw.objectField("enabled");
             try jw.write(value);
         }
-        if (self.generator) |value| {
-            try jw.objectField("generator");
-            try jw.write(value);
-        }
-        if (self.chain) |value| {
-            try jw.objectField("chain");
-            try jw.write(value);
-        }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12158,7 +11850,7 @@ pub const FullTextIndexStats = struct {
     repair: ?IndexRepairStatus = null,
     /// Whether the index is actively rebuilding, replaying, or catching up.
     backfill_active: ?bool = null,
-    /// Progress of ongoing rebuild as fraction [0.0, 1.0]
+    /// Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
     backfill_items_processed: ?i64 = null,
@@ -12541,9 +12233,9 @@ pub const FuzzyQuery = struct {
 
 /// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
 pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
+    /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
     enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
+    /// Canonical generator configuration for this step. When omitted, the top-level request generator is used.
     generator: ?GeneratorConfig = null,
     /// Chain of generators to try in order. Mutually exclusive with 'generator'.
     chain: ?[]const ChainLink = null,
@@ -12597,6 +12289,7 @@ pub const GenerationStepConfig = struct {
 
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
+    provider: ?[]const u8 = null,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
@@ -12625,14 +12318,10 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    provider: GeneratorProvider,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", true },
@@ -12647,9 +12336,6 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
-        .{ "models", "models", true },
-        .{ "region", "region", true },
-        .{ "provider", "provider", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12662,6 +12348,10 @@ pub const GeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -12718,32 +12408,17 @@ pub const GeneratorConfig = struct {
             try jw.objectField("presence_penalty");
             try jw.write(value);
         }
-        if (self.models) |value| {
-            try jw.objectField("models");
-            try jw.write(value);
-        }
-        if (self.region) |value| {
-            try jw.objectField("region");
-            try jw.write(value);
-        }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
         try jw.endObject();
     }
 };
 
-/// The generative AI provider to use.
+/// Generator providers implemented by Antfly's generation runtime.
 pub const GeneratorProvider = enum {
     gemini,
     vertex,
     ollama,
     openai,
-    openrouter,
-    bedrock,
-    anthropic,
-    cohere,
     antfly,
-    mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -12751,12 +12426,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
-            .openrouter => "openrouter",
-            .bedrock => "bedrock",
-            .anthropic => "anthropic",
-            .cohere => "cohere",
             .antfly => "antfly",
-            .mock => "mock",
         };
         try jw.write(s);
     }
@@ -12771,12 +12441,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
-            .{ "openrouter", .openrouter },
-            .{ "bedrock", .bedrock },
-            .{ "anthropic", .anthropic },
-            .{ "cohere", .cohere },
             .{ "antfly", .antfly },
-            .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -13000,8 +12665,271 @@ pub const GeoShapeQuery = struct {
     }
 };
 
+/// A stateful global query. The target table is required on this route.
+pub const GlobalStatefulQueryRequest = struct {
+    /// Name of the table to query. Required for global-query requests.
+    table: ?[]const u8 = null,
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
+    query: ?std.json.Value = null,
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
+    semantic_search: ?[]const u8 = null,
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    embedding_template: ?[]const u8 = null,
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
+    indexes: ?[]const []const u8 = null,
+    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
+    filter_prefix: ?[]const u8 = null,
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"` - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}` For structured `geo_bbox`, `min_lon > max_lon` intentionally represents a bounding box that crosses the antimeridian.
+    filter_query: ?RawQuery = null,
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    exclusion_query: ?RawQuery = null,
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    search_effort: ?f32 = null,
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
+    fields: ?[]const []const u8 = null,
+    hierarchy: ?QueryHierarchy = null,
+    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
+    limit: ?i64 = null,
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
+    offset: ?i64 = null,
+    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
+    timeout_ms: ?i64 = null,
+    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
+    order_by: ?[]const SortField = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
+    search_after: ?[]const std.json.Value = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    search_before: ?[]const std.json.Value = null,
+    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
+    distance_under: ?f32 = null,
+    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
+    distance_over: ?f32 = null,
+    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    merge_config: ?MergeConfig = null,
+    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
+    count: ?bool = null,
+    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
+    profile: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    reranker: ?RerankerConfig = null,
+    analyses: ?Analyses = null,
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    graph_queries: ?GraphQueries = null,
+    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    document_renderer: ?[]const u8 = null,
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    pruner: ?Pruner = null,
+    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
+    join: ?JoinClause = null,
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
+    graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
+    /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+    expand_strategy: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "query", "query", true },
+        .{ "full_text_search", "full_text_search", true },
+        .{ "full_text_index", "full_text_index", true },
+        .{ "semantic_search", "semantic_search", true },
+        .{ "embedding_template", "embedding_template", true },
+        .{ "indexes", "indexes", true },
+        .{ "filter_prefix", "filter_prefix", true },
+        .{ "filter_query", "filter_query", true },
+        .{ "exclusion_query", "exclusion_query", true },
+        .{ "aggregations", "aggregations", true },
+        .{ "embeddings", "embeddings", true },
+        .{ "search_effort", "search_effort", true },
+        .{ "fields", "fields", true },
+        .{ "hierarchy", "hierarchy", true },
+        .{ "limit", "limit", true },
+        .{ "offset", "offset", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "order_by", "order_by", true },
+        .{ "search_after", "search_after", true },
+        .{ "search_before", "search_before", true },
+        .{ "distance_under", "distance_under", true },
+        .{ "distance_over", "distance_over", true },
+        .{ "merge_config", "merge_config", true },
+        .{ "count", "count", true },
+        .{ "profile", "profile", true },
+        .{ "reranker", "reranker", true },
+        .{ "analyses", "analyses", true },
+        .{ "graph_queries", "graph_queries", true },
+        .{ "document_renderer", "document_renderer", true },
+        .{ "pruner", "pruner", true },
+        .{ "join", "join", true },
+        .{ "foreign_sources", "foreign_sources", true },
+        .{ "graph_searches", "graph_searches", true },
+        .{ "expand_strategy", "expand_strategy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.full_text_search) |value| {
+            try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
+            try jw.write(value);
+        }
+        if (self.semantic_search) |value| {
+            try jw.objectField("semantic_search");
+            try jw.write(value);
+        }
+        if (self.embedding_template) |value| {
+            try jw.objectField("embedding_template");
+            try jw.write(value);
+        }
+        if (self.indexes) |value| {
+            try jw.objectField("indexes");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.exclusion_query) |value| {
+            try jw.objectField("exclusion_query");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        if (self.embeddings) |value| {
+            try jw.objectField("embeddings");
+            try jw.write(value);
+        }
+        if (self.search_effort) |value| {
+            try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.offset) |value| {
+            try jw.objectField("offset");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.search_after) |value| {
+            try jw.objectField("search_after");
+            try jw.write(value);
+        }
+        if (self.search_before) |value| {
+            try jw.objectField("search_before");
+            try jw.write(value);
+        }
+        if (self.distance_under) |value| {
+            try jw.objectField("distance_under");
+            try jw.write(value);
+        }
+        if (self.distance_over) |value| {
+            try jw.objectField("distance_over");
+            try jw.write(value);
+        }
+        if (self.merge_config) |value| {
+            try jw.objectField("merge_config");
+            try jw.write(value);
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.reranker) |value| {
+            try jw.objectField("reranker");
+            try jw.write(value);
+        }
+        if (self.analyses) |value| {
+            try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_queries) |value| {
+            try jw.objectField("graph_queries");
+            try jw.write(value);
+        }
+        if (self.document_renderer) |value| {
+            try jw.objectField("document_renderer");
+            try jw.write(value);
+        }
+        if (self.pruner) |value| {
+            try jw.objectField("pruner");
+            try jw.write(value);
+        }
+        if (self.join) |value| {
+            try jw.objectField("join");
+            try jw.write(value);
+        }
+        if (self.foreign_sources) |value| {
+            try jw.objectField("foreign_sources");
+            try jw.write(value);
+        }
+        if (self.graph_searches) |value| {
+            try jw.objectField("graph_searches");
+            try jw.write(value);
+        }
+        if (self.expand_strategy) |value| {
+            try jw.objectField("expand_strategy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
 pub const GoogleEmbedderConfig = struct {
+    provider: []const u8,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
@@ -13017,6 +12945,7 @@ pub const GoogleEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", false },
@@ -13035,6 +12964,8 @@ pub const GoogleEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -13063,6 +12994,7 @@ pub const GoogleEmbedderConfig = struct {
 
 /// Configuration for the Google generative AI provider (Gemini).
 pub const GoogleGeneratorConfig = struct {
+    provider: []const u8,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
@@ -13084,6 +13016,7 @@ pub const GoogleGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", false },
@@ -13105,6 +13038,8 @@ pub const GoogleGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -16752,7 +16687,7 @@ pub const IndexConfig = struct {
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
     external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
@@ -16764,10 +16699,8 @@ pub const IndexConfig = struct {
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    embedder: ?IndexEmbedderConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
     chunker: ?ChunkerConfig = null,
     /// Default number of results to return from search (sparse only)
     top_k: ?i64 = null,
@@ -16777,6 +16710,8 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?GeneratorConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
@@ -16811,12 +16746,12 @@ pub const IndexConfig = struct {
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
         .{ "embedder", "embedder", true },
-        .{ "summarizer", "summarizer", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
         .{ "min_weight", "min_weight", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "execution", "execution", true },
+        .{ "summarizer", "summarizer", true },
         .{ "edge_types", "edge_types", true },
         .{ "max_edges_per_document", "max_edges_per_document", true },
         .{ "source", "source", true },
@@ -16908,10 +16843,6 @@ pub const IndexConfig = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
         if (self.chunker) |value| {
             try jw.objectField("chunker");
             try jw.write(value);
@@ -16930,6 +16861,10 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
             try jw.write(value);
         }
         if (self.edge_types) |value| {
@@ -16961,6 +16896,85 @@ pub const IndexConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Embedding provider configuration accepted when Antfly creates and maintains an embeddings index. This purpose-specific subset reuses the canonical provider configurations; it does not define a second provider namespace.
+pub const IndexEmbedderConfig = union(enum) {
+    ollama_embedder_config: OllamaEmbedderConfig,
+    open_ai_embedder_config: OpenAIEmbedderConfig,
+    bedrock_embedder_config: BedrockEmbedderConfig,
+    antfly_embedder_config: AntflyEmbedderConfig,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { provider: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.provider) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "ollama")) {
+            return .{ .ollama_embedder_config = try std.json.parseFromSliceLeaky(OllamaEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openai")) {
+            return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "bedrock")) {
+            return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "antfly")) {
+            return .{ .antfly_embedder_config = try std.json.parseFromSliceLeaky(AntflyEmbedderConfig, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("provider") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "ollama")) {
+            return .{ .ollama_embedder_config = try std.json.parseFromValueLeaky(OllamaEmbedderConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openai")) {
+            return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "bedrock")) {
+            return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "antfly")) {
+            return .{ .antfly_embedder_config = try std.json.parseFromValueLeaky(AntflyEmbedderConfig, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .ollama_embedder_config => |v| try jw.write(v),
+            .open_ai_embedder_config => |v| try jw.write(v),
+            .bedrock_embedder_config => |v| try jw.write(v),
+            .antfly_embedder_config => |v| try jw.write(v),
+        }
     }
 };
 
@@ -21683,17 +21697,13 @@ pub const LegacyGraphSearchResult = struct {
     }
 };
 
-/// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
+/// Status of a completed linear merge page. Successful responses are atomic and use "success"; failures are returned as non-2xx HTTP responses.
 pub const LinearMergePageStatus = enum {
     success,
-    partial,
-    @"error",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .success => "success",
-            .partial => "partial",
-            .@"error" => "error",
         };
         try jw.write(s);
     }
@@ -21705,14 +21715,12 @@ pub const LinearMergePageStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "success", .success },
-            .{ "partial", .partial },
-            .{ "error", .@"error" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. Expanded bytes count toward the server-wide request-body memory budget; temporary saturation returns HTTP 503 with `Retry-After` instead of allocating outside that budget. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. Use next_cursor as last_merged_id for the next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
     records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
@@ -21768,7 +21776,7 @@ pub const LinearMergeResult = struct {
     deleted: i64,
     /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
     deleted_ids: ?[]const []const u8 = null,
-    failed: ?[]const FailedOperation = null,
+    failed: []const FailedOperation,
     /// ID of last record in this batch (use for next request)
     next_cursor: []const u8,
     key_range: ?KeyRange = null,
@@ -21776,7 +21784,7 @@ pub const LinearMergeResult = struct {
     keys_scanned: ?i64 = null,
     /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
     message: ?[]const u8 = null,
-    took: ?i64 = null,
+    took: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -21785,12 +21793,12 @@ pub const LinearMergeResult = struct {
         .{ "skipped", "skipped", false },
         .{ "deleted", "deleted", false },
         .{ "deleted_ids", "deleted_ids", true },
-        .{ "failed", "failed", true },
+        .{ "failed", "failed", false },
         .{ "next_cursor", "next_cursor", false },
         .{ "key_range", "key_range", true },
         .{ "keys_scanned", "keys_scanned", true },
         .{ "message", "message", true },
-        .{ "took", "took", true },
+        .{ "took", "took", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -21815,10 +21823,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("deleted_ids");
             try jw.write(value);
         }
-        if (self.failed) |value| {
-            try jw.objectField("failed");
-            try jw.write(value);
-        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
         try jw.objectField("next_cursor");
         try jw.write(self.next_cursor);
         if (self.key_range) |value| {
@@ -21833,10 +21839,8 @@ pub const LinearMergeResult = struct {
             try jw.objectField("message");
             try jw.write(value);
         }
-        if (self.took) |value| {
-            try jw.objectField("took");
-            try jw.write(value);
-        }
+        try jw.objectField("took");
+        try jw.write(self.took);
         try jw.endObject();
     }
 };
@@ -22827,17 +22831,15 @@ pub const MergeProfile = struct {
     }
 };
 
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
 pub const MergeStrategy = enum {
     rrf,
     rsf,
-    failover,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .rrf => "rrf",
             .rsf => "rsf",
-            .failover => "failover",
         };
         try jw.write(s);
     }
@@ -22850,7 +22852,6 @@ pub const MergeStrategy = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "rrf", .rrf },
             .{ "rsf", .rsf },
-            .{ "failover", .failover },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -23154,6 +23155,7 @@ pub const NumericRangeQuery = struct {
 
 /// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
 pub const OllamaEmbedderConfig = struct {
+    provider: []const u8,
     /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
     model: []const u8,
     /// The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
@@ -23161,6 +23163,7 @@ pub const OllamaEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
     };
@@ -23175,6 +23178,8 @@ pub const OllamaEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -23187,6 +23192,7 @@ pub const OllamaEmbedderConfig = struct {
 
 /// Configuration for the Ollama generative AI provider.
 pub const OllamaGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the Ollama model to use.
     model: []const u8,
     /// The URL of the Ollama API endpoint.
@@ -23204,6 +23210,7 @@ pub const OllamaGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
         .{ "temperature", "temperature", true },
@@ -23223,6 +23230,8 @@ pub const OllamaGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -23253,41 +23262,9 @@ pub const OllamaGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the Ollama reranking provider.
-pub const OllamaRerankerConfig = struct {
-    /// The name of the Ollama model to use for reranking.
-    model: []const u8,
-    /// The URL of the Ollama API endpoint.
-    url: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "url", "url", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Configuration for the OpenAI embedding provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. Supports OpenAI-compatible APIs via `url` field. **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims) **Docs:** https://platform.openai.com/docs/guides/embeddings
 pub const OpenAIEmbedderConfig = struct {
+    provider: []const u8,
     /// The name of the OpenAI model to use.
     model: []const u8,
     /// The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
@@ -23299,6 +23276,7 @@ pub const OpenAIEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -23315,6 +23293,8 @@ pub const OpenAIEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -23335,6 +23315,7 @@ pub const OpenAIEmbedderConfig = struct {
 
 /// Configuration for the OpenAI generative AI provider.
 pub const OpenAIGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the OpenAI model to use.
     model: []const u8,
     /// The URL of the OpenAI API endpoint.
@@ -23354,6 +23335,7 @@ pub const OpenAIGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -23374,6 +23356,8 @@ pub const OpenAIGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -23410,6 +23394,7 @@ pub const OpenAIGeneratorConfig = struct {
 
 /// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
+    provider: []const u8,
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
     model: []const u8,
     /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
@@ -23419,6 +23404,7 @@ pub const OpenRouterEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
         .{ "dimensions", "dimensions", true },
@@ -23434,6 +23420,8 @@ pub const OpenRouterEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
@@ -23442,83 +23430,6 @@ pub const OpenRouterEmbedderConfig = struct {
         }
         if (self.dimensions) |value| {
             try jw.objectField("dimensions");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for the OpenRouter generative AI provider.
-pub const OpenRouterGeneratorConfig = struct {
-    /// Single model identifier. Either model or models must be provided.
-    model: ?[]const u8 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The OpenRouter API key.
-    api_key: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
-        .{ "models", "models", true },
-        .{ "api_key", "api_key", true },
-        .{ "temperature", "temperature", true },
-        .{ "max_tokens", "max_tokens", true },
-        .{ "top_p", "top_p", true },
-        .{ "frequency_penalty", "frequency_penalty", true },
-        .{ "presence_penalty", "presence_penalty", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.models) |value| {
-            try jw.objectField("models");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.temperature) |value| {
-            try jw.objectField("temperature");
-            try jw.write(value);
-        }
-        if (self.max_tokens) |value| {
-            try jw.objectField("max_tokens");
-            try jw.write(value);
-        }
-        if (self.top_p) |value| {
-            try jw.objectField("top_p");
-            try jw.write(value);
-        }
-        if (self.frequency_penalty) |value| {
-            try jw.objectField("frequency_penalty");
-            try jw.write(value);
-        }
-        if (self.presence_penalty) |value| {
-            try jw.objectField("presence_penalty");
             try jw.write(value);
         }
         try jw.endObject();
@@ -24305,9 +24216,9 @@ pub const PruneStats = struct {
     }
 };
 
-/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
+/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results. Pruning runs once on the globally merged score domain, after reranking when a reranker is configured and before offset/limit paging.
 pub const Pruner = struct {
-    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
+    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied to final scores after global fusion and optional reranking.
     min_score_ratio: ?f64 = null,
     /// Stop returning results when the gap between consecutive scores exceeds this percentage of the total score range (max - min). Detects "elbows" in score distributions regardless of score scale. For example, 30.0 stops when a gap spans 30% of the score range.
     max_score_gap_percent: ?f64 = null,
@@ -24921,6 +24832,15 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
+/// A stable failure envelope for query embedding and reranking dependencies.
+pub const QueryDependencyError = struct {
+    code: []const u8,
+    /// Legacy alias of code. Use code for programmatic handling.
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// A public filter or exclusion query contains an invalid or unsupported node.
 pub const QueryFilterError = struct {
     status: i32,
@@ -25303,7 +25223,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -25334,7 +25254,7 @@ pub const QueryRequest = struct {
     hierarchy: ?QueryHierarchy = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
-    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
@@ -25354,14 +25274,14 @@ pub const QueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
@@ -25802,9 +25722,11 @@ pub const QueryUnprocessableError = union(enum) {
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
+    reranker_candidate_limit_exceeded_error: *RerankerCandidateLimitExceededError,
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
     query_filter_error: *QueryFilterError,
+    query_dependency_error: *QueryDependencyError,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -25949,6 +25871,18 @@ pub const QueryUnprocessableError = union(enum) {
             "status",
             "error",
             "message",
+            "provider",
+            "maximum",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "reranker_candidate_limit_exceeded"))
+        {
+            if (try parseStructuralVariant(RerankerCandidateLimitExceededError, allocator, source, options)) |parsed| return .{ .reranker_candidate_limit_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
             "retryable",
         }) and
             objectStringEquals(source.object, "error", "graph_anchor_filter_requires_index"))
@@ -25974,6 +25908,14 @@ pub const QueryUnprocessableError = union(enum) {
         })) {
             if (try parseStructuralVariant(QueryFilterError, allocator, source, options)) |parsed| return .{ .query_filter_error = parsed };
         }
+        if (objectHasAnyKey(source.object, &.{
+            "code",
+            "error",
+            "message",
+            "retryable",
+        })) {
+            if (try parseStructuralVariant(QueryDependencyError, allocator, source, options)) |parsed| return .{ .query_dependency_error = parsed };
+        }
         return error.UnexpectedToken;
     }
 
@@ -25987,9 +25929,11 @@ pub const QueryUnprocessableError = union(enum) {
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
+            .reranker_candidate_limit_exceeded_error => |v| try jw.write(v.*),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),
             .query_filter_error => |v| try jw.write(v.*),
+            .query_dependency_error => |v| try jw.write(v.*),
         }
     }
 };
@@ -26256,7 +26200,7 @@ pub const ReplicationSource = struct {
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
     postgres_table: []const u8,
-    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
+    /// Template for constructing the Antfly document key from PG columns. When omitted, Antfly first uses `_id`, then falls back to `id` if the row has no `_id` column. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
     key_template: ?[]const u8 = null,
     /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
     slot_name: ?[]const u8 = null,
@@ -26266,7 +26210,7 @@ pub const ReplicationSource = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
     on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Requires PostgreSQL 15 or newer and is applied only when Antfly creates the publication. Changing this value does not alter an existing publication; update or recreate that publication directly. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
     publication_filter: ?RawQuery = null,
     /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
     routes: ?[]const ReplicationRoute = null,
@@ -26568,6 +26512,17 @@ pub const ReplicationTransformOp = struct {
     }
 };
 
+pub const RerankerCandidateLimitExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    /// Human-readable summary of the selected provider's candidate ceiling.
+    message: []const u8,
+    provider: RerankerProvider,
+    /// Maximum candidate window accepted by the selected provider.
+    maximum: i32,
+    retryable: bool,
+};
+
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
     provider: RerankerProvider,
@@ -26575,31 +26530,31 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// The name of the reranking model (e.g., cross-encoder model name).
+    /// Optional provider model name. When omitted, the selected provider's documented default is used.
     model: ?[]const u8 = null,
+    /// Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit and, when supplied explicitly, must be at least that page boundary. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. The effective window must be at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects invalid or provider-specific windows before retrieval fan-out.
+    candidate_count: ?i64 = null,
+    /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
+    top_n: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
+        .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "model", "model", true },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "top_n", "top_n", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
-        .{ "top_n", "top_n", true },
-        .{ "max_chunks_per_doc", "max_chunks_per_doc", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -26628,20 +26583,20 @@ pub const RerankerConfig = struct {
             try jw.objectField("model");
             try jw.write(value);
         }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
             try jw.write(value);
         }
         if (self.top_n) |value| {
             try jw.objectField("top_n");
             try jw.write(value);
         }
-        if (self.max_chunks_per_doc) |value| {
-            try jw.objectField("max_chunks_per_doc");
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -26658,7 +26613,9 @@ pub const RerankerConfig = struct {
 
 /// Reranking execution statistics.
 pub const RerankerProfile = struct {
-    /// Reranker model that was used.
+    /// Reranking provider that executed the request.
+    provider: RerankerProvider,
+    /// Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection.
     model: ?[]const u8 = null,
     /// Number of documents that were reranked.
     documents_reranked: ?i64 = null,
@@ -26667,6 +26624,7 @@ pub const RerankerProfile = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", true },
         .{ "documents_reranked", "documents_reranked", true },
         .{ "duration_ms", "duration_ms", true },
@@ -26682,6 +26640,8 @@ pub const RerankerProfile = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -26701,14 +26661,12 @@ pub const RerankerProfile = struct {
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
     antfly,
-    ollama,
     cohere,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .antfly => "antfly",
-            .ollama => "ollama",
             .cohere => "cohere",
             .vertex => "vertex",
         };
@@ -26722,7 +26680,6 @@ pub const RerankerProvider = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
-            .{ "ollama", .ollama },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
         });
@@ -27373,7 +27330,7 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -27404,7 +27361,7 @@ pub const RetrievalQueryRequest = struct {
     hierarchy: ?QueryHierarchy = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
-    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
@@ -27424,14 +27381,14 @@ pub const RetrievalQueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
@@ -28826,7 +28783,7 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
+    /// Name of the table to query. Required for global-query requests.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -28857,7 +28814,7 @@ pub const StatefulQueryRequest = struct {
     hierarchy: ?QueryHierarchy = null,
     /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
     limit: ?i64 = null,
-    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
+    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
     offset: ?i64 = null,
     /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
     timeout_ms: ?i64 = null,
@@ -28877,14 +28834,14 @@ pub const StatefulQueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?GraphQueries = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
     pruner: ?Pruner = null,
     /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
     join: ?JoinClause = null,
@@ -30102,9 +30059,11 @@ pub const TableSchema = struct {
     enforce_types: ?bool = null,
     /// A map of type names to their document json schemas.
     document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    /// Automatic document expiration. Set this object to enable TTL and set it to null to disable an existing TTL policy.
+    ttl: OpenApiOptionalNullable(TtlConfig) = .absent,
+    /// Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
     ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    /// Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
@@ -30115,6 +30074,7 @@ pub const TableSchema = struct {
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
         .{ "document_schemas", "document_schemas", true },
+        .{ "ttl", "ttl", false },
         .{ "ttl_field", "ttl_field", true },
         .{ "ttl_duration", "ttl_duration", true },
         .{ "dynamic_templates", "dynamic_templates", true },
@@ -30146,6 +30106,17 @@ pub const TableSchema = struct {
             try jw.objectField("document_schemas");
             try jw.write(value);
         }
+        switch (self.ttl) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("ttl");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("ttl");
+                try jw.write(value);
+            },
+        }
         if (self.ttl_field) |value| {
             try jw.objectField("ttl_field");
             try jw.write(value);
@@ -30161,6 +30132,9 @@ pub const TableSchema = struct {
         try jw.endObject();
     }
 };
+
+/// RFC 7396 JSON Merge Patch for a table schema. Object members are merged recursively; null removes a member. The resulting document must be a valid TableSchema and `version` remains server-managed.
+pub const TableSchemaPatch = std.json.ArrayHashMap(std.json.Value);
 
 /// Statistics about a table used for query planning.
 pub const TableStatistics = struct {
@@ -31793,6 +31767,39 @@ pub const TreeSearchConfig = struct {
     }
 };
 
+/// Automatic document-expiration policy for a table.
+pub const TtlConfig = struct {
+    /// Expiration duration using Antfly's integer-component duration format. Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`; examples include `90m`, `1h30m`, and `7d`.
+    duration: []const u8,
+    /// Timestamp field used as the expiration reference.
+    field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "duration", "duration", false },
+        .{ "field", "field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
 pub const UnsupportedHierarchyGroupingError = struct {
     status: i32,
@@ -31981,19 +31988,21 @@ pub const VADOptions = struct {
 
 /// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 pub const VertexEmbedderConfig = struct {
+    provider: []const u8,
     /// The name of the Vertex AI embedding model to use.
     model: []const u8,
     /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
     location: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
     /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
     dimension: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -32011,6 +32020,8 @@ pub const VertexEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.project_id) |value| {
@@ -32035,6 +32046,7 @@ pub const VertexEmbedderConfig = struct {
 
 /// Configuration for Google Cloud Vertex AI generative models.
 pub const VertexGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the Vertex AI model to use.
     model: []const u8,
     /// Google Cloud project ID.
@@ -32054,6 +32066,7 @@ pub const VertexGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -32074,6 +32087,8 @@ pub const VertexGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.project_id) |value| {
@@ -32110,21 +32125,20 @@ pub const VertexGeneratorConfig = struct {
 
 /// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
 pub const VertexRerankerConfig = struct {
+    provider: []const u8,
     /// The ranking model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// Maximum number of records to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
-        .{ "top_n", "top_n", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32137,18 +32151,18 @@ pub const VertexRerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.top_n) |value| {
-            try jw.objectField("top_n");
             try jw.write(value);
         }
         try jw.endObject();

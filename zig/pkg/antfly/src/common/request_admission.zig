@@ -49,15 +49,18 @@ pub const RequestAdmission = struct {
     /// Prefer this at callback and provider boundaries so every error path
     /// returns capacity to the shared admission controller.
     pub const Lease = struct {
-        admission: ?*RequestAdmission,
+        admission: *RequestAdmission,
+        active: bool = true,
 
         pub fn release(self: *Lease) void {
-            const admission = self.admission orelse return;
-            self.admission = null;
-            admission.release();
+            if (!self.active) return;
+            self.admission.release();
+            self.active = false;
         }
     };
 
+    /// Acquires an RAII-style lease so admission can cover setup performed by
+    /// the caller before the core operation begins.
     pub fn tryAcquireLease(self: *RequestAdmission) ?Lease {
         if (!self.tryAcquire()) return null;
         return .{ .admission = self };
@@ -148,6 +151,7 @@ test "request admission lease releases exactly once" {
     var admission = RequestAdmission.init(1);
     var lease = admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
     try std.testing.expect(admission.tryAcquireLease() == null);
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
     lease.release();
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);

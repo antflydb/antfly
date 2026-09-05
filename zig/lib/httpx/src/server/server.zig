@@ -337,6 +337,9 @@ pub const Context = struct {
     data: ?std.StringHashMap(DataEntry) = null,
     decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
+    /// Expanded application request-body ceiling for the matched route.
+    /// Transport admission enforces the same limit on encoded bytes.
+    max_request_body_size: usize = types.default_max_body_size,
 
     // H1 streaming field (set by the server, null for HTTP/2).
     h1_sock: ?*Socket = null,
@@ -738,6 +741,17 @@ pub const Context = struct {
             return self.request.body;
         }
         return null;
+    }
+
+    /// Charge transformed request-body capacity to the server-wide body
+    /// budget. Middleware must reserve before allocating and may release
+    /// excess capacity after an in-place shrink or replacement.
+    pub fn tryReserveRequestBodyBuffer(self: *Self, amount: usize) bool {
+        return self.request.tryReserveBodyBuffer(amount);
+    }
+
+    pub fn releaseRequestBodyBuffer(self: *Self, amount: usize) void {
+        self.request.releaseBodyBuffer(amount);
     }
 
     /// True when reading the body can still block on peer-controlled input.
@@ -2087,6 +2101,8 @@ pub const Server = struct {
 
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
+            ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
+            req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
             // A non-empty suffix is not necessarily a pipelined request: it
             // can be a partial or malformed request line. Preserve this fact
@@ -2817,6 +2833,8 @@ pub const Server = struct {
     fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request, body_reader: ?*Context.H2StreamReader) !void {
         var ctx = Context.init(self.allocator, self.io, req);
         ctx.max_file_size = self.config.max_file_size;
+        ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
+        req.body_budget = &self.body_budget;
         ctx.h2 = h2;
         ctx.h2_sock = sock;
         ctx.h2_body_reader = body_reader;

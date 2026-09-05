@@ -31,11 +31,7 @@ const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
-const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
-const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -82,6 +78,7 @@ const db_mod = struct {
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
+const reranking_runtime = @import("../reranking/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -152,7 +149,7 @@ const ArdOpenApiSpec = struct {
 };
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -163,13 +160,33 @@ const ParsedGlobalQueryTable = struct {
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
     var parsed = parsePublicGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
+    const table_name = parsed.value.table orelse return error.InvalidQueryRequest;
+    if (table_name.len == 0) return error.InvalidQueryRequest;
     return .{
         .parsed = parsed,
-        .table_name = parsed.value.table orelse "",
+        .table_name = table_name,
     };
 }
 
-fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
+test "global query requires a non-empty table name" {
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{}"),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseGlobalQueryTable(std.testing.allocator, "{\"table\":\"\"}"),
+    );
+}
+
+test "OCC version zero matches only an absent document" {
+    try std.testing.expect(ApiHttpServer.readSetVersionMatches(0, null));
+    try std.testing.expect(!ApiHttpServer.readSetVersionMatches(1, null));
+    try std.testing.expect(!ApiHttpServer.readSetVersionMatches(0, 7));
+    try std.testing.expect(ApiHttpServer.readSetVersionMatches(7, 7));
+}
+
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
 }
@@ -1347,6 +1364,8 @@ pub const StatusSource = struct {
         drop_table_exact: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
+        update_schema_versioned_expected: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 = null,
+        mutate_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -1483,6 +1502,40 @@ pub const StatusSource = struct {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         try BoundaryAbi.call("update_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json });
         return null;
+    }
+
+    /// Atomically updates a schema when the authoritative current schema has
+    /// the expected version. Sources without the conditional capability may
+    /// only service unconditional updates.
+    pub fn updateSchemaExpected(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !?u32 {
+        if (self.vtable.update_schema_versioned_expected) |fn_ptr| {
+            return try BoundaryAbi.call("update_schema_versioned_expected", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json, expected_version });
+        }
+        if (expected_version != null) return error.UnsupportedConditionalSchemaUpdate;
+        return try self.updateSchema(alloc, table_name, schema_json);
+    }
+
+    /// Runs replace or merge-patch at the metadata authority and returns the
+    /// exact committed schema. Production sources implement this capability;
+    /// the replace fallback exists only for embedded legacy adapters.
+    pub fn mutateSchema(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        if (self.vtable.mutate_schema) |fn_ptr| {
+            return try BoundaryAbi.call("mutate_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, mode, body, expected_version });
+        }
+        if (mode != .replace) return error.UnsupportedOperation;
+        const version = (try self.updateSchemaExpected(alloc, table_name, body, expected_version)) orelse
+            return error.UnsupportedOperation;
+        return .{
+            .version = version,
+            .schema_json = try tables_api.normalizeSchemaVersion(alloc, body, version),
+        };
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1655,11 +1708,19 @@ pub const StatusSource = struct {
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
-                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, null);
             }
 
             fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
-                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, null);
+            }
+
+            fn updateSchemaVersionedExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 {
+                return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json, expected_version);
+            }
+
+            fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult {
+                return try mutateSchemaOnService(cast(ptr), alloc, table_name, mode, body, expected_version);
             }
 
             fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
@@ -1759,6 +1820,8 @@ pub const StatusSource = struct {
             .drop_table_exact = Gen.dropTableExact,
             .update_schema = Gen.updateSchema,
             .update_schema_versioned = Gen.updateSchemaVersioned,
+            .update_schema_versioned_expected = Gen.updateSchemaVersionedExpected,
+            .mutate_schema = Gen.mutateSchema,
             .create_index = Gen.createIndex,
             .drop_index = Gen.dropIndex,
             .put_artifact_enrichment = Gen.putArtifactEnrichment,
@@ -2255,21 +2318,43 @@ fn dropTableOnServiceExpected(svc: anytype, alloc: std.mem.Allocator, table_name
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, expected_table_id);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
-fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
+fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !u32 {
+    var result = try mutateSchemaOnService(svc, alloc, table_name, .replace, schema_json, expected_version);
+    defer result.deinit(alloc);
+    return result.version;
+}
+
+fn mutateSchemaOnService(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    mode: tables_api.SchemaMutationMode,
+    body: []const u8,
+    expected_version: ?u32,
+) !tables_api.SchemaMutationResult {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    if (expected_version) |expected| {
+        if (try tables_api.schemaVersion(table.schema_json) != expected) return error.SchemaVersionChanged;
+    }
 
-    const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
+    const updated = try tables_api.applySchemaMutationRecord(alloc, table, mode, body);
     defer metadata_table_manager.freeTable(alloc, updated);
     const version = try tables_api.schemaVersion(updated.schema_json);
-    try svc.replaceTableDefinition(table.*, updated);
+    svc.replaceTableDefinition(table.*, updated) catch |err| {
+        if (expected_version != null and err == error.TableGenerationChanged) return error.SchemaVersionChanged;
+        return err;
+    };
     try runPostMutationRound(svc);
-    return version;
+    return .{
+        .version = version,
+        .schema_json = try alloc.dupe(u8, updated.schema_json),
+    };
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -6429,6 +6514,11 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+        query_request_diagnostics.reset();
+
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
             return;
@@ -6489,6 +6579,7 @@ pub const ApiHttpServer = struct {
                     runner.query_embedding_security_scope.value,
                 );
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
                         return error.InvalidRetrievalAgentRequest;
                     }
@@ -6660,8 +6751,22 @@ pub const ApiHttpServer = struct {
                 try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
                 return;
             },
+            error.RerankerCandidateLimitExceeded => {
+                const message = try public_table_http.rerankerCandidateLimitExceededMessageAlloc(alloc);
+                defer alloc.free(message);
+                try queue.status(alloc, task_id, context_id, "failed", message);
+                return;
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid retrieval agent request");
+                return;
+            },
+            error.EmbeddingIndexNotFound => {
+                try queue.status(alloc, task_id, context_id, "failed", "embedding index not found");
+                return;
+            },
+            error.MissingGenerationConfig => {
+                try queue.status(alloc, task_id, context_id, "failed", "steps.generation requires a generator or chain");
                 return;
             },
             error.TableNotFound => {
@@ -6677,14 +6782,17 @@ pub const ApiHttpServer = struct {
                 return;
             },
             else => {
-                if (normalizeQueryEmbeddingOperationalError(err)) |normalized| {
+                if (normalizeQueryOperationalError(err)) |normalized| {
                     const message = switch (normalized) {
                         error.QueryEmbeddingInputTooLarge => "query embedding input too large",
                         error.QueryEmbeddingOverloaded => "query embedding overloaded",
                         error.EmbedRateLimited => "query embedding rate limited",
                         error.EmbedTransientFailure => "query embedding temporarily unavailable",
                         error.EmbedUpstreamFailure => "query embedding provider failed",
-                        error.Timeout => "query embedding timed out",
+                        error.RerankRateLimited => "reranker rate limited",
+                        error.RerankTransientFailure => "reranker temporarily unavailable",
+                        error.RerankUpstreamFailure => "reranker provider failed",
+                        error.Timeout => "query timed out",
                         else => "query embedding failed",
                     };
                     try queue.status(alloc, task_id, context_id, "failed", message);
@@ -6951,6 +7059,10 @@ pub const ApiHttpServer = struct {
         for (tables) |table| try self.validateTableWritesAgainstSchema(table.table_name, table.writes);
     }
 
+    fn readSetVersionMatches(expected_version: u64, actual_version: ?u64) bool {
+        return (actual_version orelse 0) == expected_version;
+    }
+
     pub fn validateCommitReadSet(
         self: *ApiHttpServer,
         req: transactions_api.OwnedTransactionCommitRequest,
@@ -6958,10 +7070,11 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return null;
         for (req.read_set) |item| {
             var lookup = (try source.lookup(self.alloc, item.table_name, item.key, .{}, .read_index)) orelse {
+                if (readSetVersionMatches(item.expected_version, null)) continue;
                 return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, 0);
             };
             defer lookup.deinit(self.alloc);
-            if (lookup.version != item.expected_version) {
+            if (!readSetVersionMatches(item.expected_version, lookup.version)) {
                 return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, lookup.version);
             }
         }
@@ -10661,7 +10774,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
-            error.Timeout => return error.ReadUnavailable,
+            error.Timeout => return error.Timeout,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.TopologyChanged => return error.TopologyChanged,
@@ -10691,10 +10804,14 @@ pub const ApiHttpServer = struct {
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.QueryEmbeddingInputTooLarge => return error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound => return error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.RerankRateLimited => return error.RerankRateLimited,
+            error.RerankTransientFailure => return error.RerankTransientFailure,
+            error.RerankUpstreamFailure => return error.RerankUpstreamFailure,
             error.Cancelled, error.Canceled => return error.Canceled,
             error.InvalidManifest => return error.InvalidManifest,
             error.InvalidTableFile => return error.InvalidTableFile,
@@ -10878,6 +10995,7 @@ pub const ApiHttpServer = struct {
                 error.GraphReverseVariablePathUnsupported,
                 => return err,
                 error.QueryEmbeddingInputTooLarge,
+                error.EmbeddingIndexNotFound,
                 error.QueryEmbeddingOverloaded,
                 error.EmbedRateLimited,
                 error.EmbedTransientFailure,
@@ -10905,6 +11023,7 @@ pub const ApiHttpServer = struct {
                 error.IncompletePublishedSnapshot,
                 => return err,
                 else => {
+                    if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
                 },
@@ -10937,6 +11056,7 @@ pub const ApiHttpServer = struct {
             error.GraphReverseVariablePathUnsupported,
             => return err,
             error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
             error.EmbedTransientFailure,
@@ -10968,6 +11088,7 @@ pub const ApiHttpServer = struct {
             error.IncompletePublishedSnapshot,
             => return err,
             else => {
+                if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -11033,6 +11154,7 @@ pub const ApiHttpServer = struct {
             error.GraphReverseVariablePathUnsupported,
             => return err,
             error.QueryEmbeddingInputTooLarge,
+            error.EmbeddingIndexNotFound,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
             error.EmbedTransientFailure,
@@ -11060,6 +11182,7 @@ pub const ApiHttpServer = struct {
             error.IncompletePublishedSnapshot,
             => return err,
             else => {
+                if (normalizeQueryOperationalError(err)) |normalized| return normalized;
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -14274,8 +14397,8 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
@@ -14285,10 +14408,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
-        graph_query_diagnostic.reset();
-        graph_distinct_budget_diagnostic.reset();
-        graph_path_weight_diagnostic.reset();
-        graph_work_budget_diagnostic.reset();
+        query_request_diagnostics.reset();
         var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -14828,6 +14948,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.RerankerCandidateLimitExceeded => try contextualRerankerCandidateLimitExceededResponse(self.alloc),
             error.GraphWorkBudgetExceeded => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphWorkBudgetExceededBody(self.alloc),
@@ -14873,13 +14994,17 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "reverse_variable_path_not_supported"),
                 false,
             ),
-            error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.QueryEmbeddingInputTooLarge => try contextualQueryDependencyErrorResponse(self.alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.EmbeddingIndexNotFound => try contextualQueryDependencyErrorResponse(self.alloc, 422, "embedding_index_not_found", "embedding index not found", false),
+            error.QueryEmbeddingOverloaded => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true),
+            error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
-            error.EmbedUpstreamFailure => try contextual_operations.textAlloc(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try contextual_operations.textAlloc(self.alloc, 504, "query timed out"),
-            error.Cancelled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
+            error.EmbedUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.RerankRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "reranker_rate_limited", "reranker rate limited", true),
+            error.RerankTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .reranker_temporarily_unavailable),
+            error.RerankUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "reranker_upstream_failure", "reranker provider failed", false),
+            error.Timeout => try contextualQueryDependencyErrorResponse(self.alloc, 504, "query_timeout", "query timed out", true),
+            error.Cancelled, error.Canceled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
             error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
             error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
@@ -14914,8 +15039,8 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         // `/query` selects its table from the body, so path middleware cannot
@@ -14928,10 +15053,7 @@ pub const ApiHttpServer = struct {
 
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
-        graph_query_diagnostic.reset();
-        graph_distinct_budget_diagnostic.reset();
-        graph_path_weight_diagnostic.reset();
-        graph_work_budget_diagnostic.reset();
+        query_request_diagnostics.reset();
         var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -14964,8 +15086,8 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var diagnostic_context: graph_request_diagnostics.Context = .{};
-        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        var diagnostic_context: query_request_diagnostics.Context = .{};
+        const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -15016,10 +15138,7 @@ pub const ApiHttpServer = struct {
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
-            graph_query_diagnostic.reset();
-            graph_distinct_budget_diagnostic.reset();
-            graph_path_weight_diagnostic.reset();
-            graph_work_budget_diagnostic.reset();
+            query_request_diagnostics.reset();
             var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
@@ -17377,12 +17496,22 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            _ = try updateSchemaOnService(service, alloc, table_name, schema_json);
+            _ = try updateSchemaOnService(service, alloc, table_name, schema_json, null);
         }
 
         fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try updateSchemaOnService(service, alloc, table_name, schema_json);
+            return try updateSchemaOnService(service, alloc, table_name, schema_json, null);
+        }
+
+        fn updateSchemaVersionedExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) anyerror!u32 {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try updateSchemaOnService(service, alloc, table_name, schema_json, expected_version);
+        }
+
+        fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            return try mutateSchemaOnService(service, alloc, table_name, mode, body, expected_version);
         }
 
         fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void {
@@ -17408,6 +17537,8 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .drop_table_exact = V.dropTableExact,
             .update_schema = V.updateSchema,
             .update_schema_versioned = V.updateSchemaVersioned,
+            .update_schema_versioned_expected = V.updateSchemaVersionedExpected,
+            .mutate_schema = V.mutateSchema,
             .create_index = V.createIndex,
             .drop_index = V.dropIndex,
         },
@@ -18195,6 +18326,14 @@ fn contextualQueryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !con
     });
 }
 
+fn contextualRerankerCandidateLimitExceededResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.rerankerCandidateLimitExceededBody(alloc),
+    };
+}
+
 fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
     return .{
         .status = 409,
@@ -18224,6 +18363,18 @@ fn contextualQueryTemporarilyUnavailableResponse(
     reason: public_table_http.QueryTemporarilyUnavailableReason,
 ) !contextual_operations.OwnedResponse {
     var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, reason);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
+}
+
+fn contextualQueryDependencyErrorResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.queryDependencyErrorOwnedResponse(alloc, status, code, message, retryable);
     defer response.deinit(alloc);
     return try contextualResponseFromPublicTable(alloc, response);
 }
@@ -20007,6 +20158,17 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
         error.ConnectionTimedOut,
         error.Canceled,
         => error.EmbedTransientFailure,
+        else => null,
+    };
+}
+
+pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
+    if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
+    return switch (reranking_runtime.normalizeOperationalError(err)) {
+        error.RerankRateLimited,
+        error.RerankTransientFailure,
+        error.RerankUpstreamFailure,
+        => |normalized| normalized,
         else => null,
     };
 }
@@ -22302,6 +22464,27 @@ test "api http query budget rejection response exposes stable sort reason" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    const cohere = reranking_runtime.Config{
+        .provider = .cohere,
+        .field = "body",
+        .model = "rerank-v4.0-pro",
+        .candidate_count = reranking_runtime.max_candidate_count + 1,
+    };
+    try std.testing.expectError(error.RerankerCandidateLimitExceeded, cohere.validate());
+
+    var reranker_resp = try contextualRerankerCandidateLimitExceededResponse(alloc);
+    defer reranker_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), reranker_resp.status);
+    var reranker_error = try std.json.parseFromSlice(public_table_http.RerankerCandidateLimitExceededError, alloc, reranker_resp.body, .{});
+    defer reranker_error.deinit();
+    try std.testing.expectEqualStrings("reranker_candidate_limit_exceeded", reranker_error.value.@"error");
+    try std.testing.expectEqual(reranking_runtime.Provider.cohere, reranker_error.value.provider);
+    try std.testing.expectEqual(reranking_runtime.max_candidate_count, reranker_error.value.maximum);
+    try std.testing.expect(!reranker_error.value.retryable);
 }
 
 test "api http unsupported sorted query response exposes stable sort reason" {
@@ -24676,7 +24859,7 @@ test "direct schema update rejects extension-owned data shapes" {
     var service = FakeService{};
     try std.testing.expectError(
         error.ExtensionOwnedObject,
-        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}"),
+        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}", null),
     );
 }
 
@@ -33665,6 +33848,7 @@ test "api http server preserves public query availability errors" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after: bool = false,
         unavailable_code: ?[]const u8 = null,
         unavailable_message: []const u8 = "",
     }{
@@ -33675,6 +33859,9 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
+        .{ .query_error = error.RerankRateLimited, .status = 429, .body = "{\"code\":\"reranker_rate_limited\",\"error\":\"reranker_rate_limited\",\"message\":\"reranker rate limited\",\"retryable\":true}", .json = true, .retry_after = true },
+        .{ .query_error = error.RerankTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "reranker_temporarily_unavailable", .unavailable_message = "reranker temporarily unavailable" },
+        .{ .query_error = error.RerankUpstreamFailure, .status = 502, .body = "{\"code\":\"reranker_upstream_failure\",\"error\":\"reranker_upstream_failure\",\"message\":\"reranker provider failed\",\"retryable\":false}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .query_error = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
@@ -33703,7 +33890,7 @@ test "api http server preserves public query availability errors" {
         }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type);
         try std.testing.expectEqual(
-            case.unavailable_code != null,
+            case.unavailable_code != null or case.retry_after,
             resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
         );
 
@@ -33724,6 +33911,10 @@ test "api http server preserves public query availability errors" {
             try std.testing.expectEqualStrings(case.body, multi_resp.body);
         }
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type);
+        try std.testing.expectEqual(
+            case.unavailable_code != null or case.retry_after,
+            multi_resp.headers.len == 1 and std.ascii.eqlIgnoreCase(multi_resp.headers[0].name, "Retry-After"),
+        );
     }
 }
 
@@ -36297,6 +36488,7 @@ test "api http server serves table create and drop" {
         projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8,
         owns_indexes_json: bool = false,
+        owns_schema_json: bool = false,
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 1,
             .name = "docs",
@@ -36327,6 +36519,7 @@ test "api http server serves table create and drop" {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.owns_indexes_json) alloc.free(self.indexes_json);
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
         }
 
         fn replaceIndexesJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
@@ -36355,6 +36548,7 @@ test "api http server serves table create and drop" {
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
+                    .mutate_schema = mutateSchema,
                     .replace_table_definition = replaceTableDefinition,
                     .drop_index = dropIndex,
                     .wait_table_projection = waitTableProjection,
@@ -36418,6 +36612,36 @@ test "api http server serves table create and drop" {
             try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"document_schemas\"") != null);
             self.created = true;
             self.table_record.schema_json = schema_json;
+        }
+
+        fn mutateSchema(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            mode: tables_api.SchemaMutationMode,
+            body: []const u8,
+            expected_version: ?u32,
+        ) !tables_api.SchemaMutationResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            if (expected_version) |expected| {
+                if (try tables_api.schemaVersion(self.table_record.schema_json) != expected)
+                    return error.SchemaVersionChanged;
+            }
+            const updated = try tables_api.applySchemaMutationRecord(alloc, &self.table_record, mode, body);
+            defer metadata_table_manager.freeTable(alloc, updated);
+            const version = try tables_api.schemaVersion(updated.schema_json);
+            const stored_schema = try alloc.dupe(u8, updated.schema_json);
+            errdefer alloc.free(stored_schema);
+            const response_schema = try alloc.dupe(u8, updated.schema_json);
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
+            self.table_record.schema_json = stored_schema;
+            self.owns_schema_json = true;
+            self.created = true;
+            return .{
+                .version = version,
+                .schema_json = response_schema,
+            };
         }
 
         fn createIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -37187,6 +37411,7 @@ test "status source prefers authoritative schema generation result" {
     const FakeSource = struct {
         legacy_calls: usize = 0,
         versioned_calls: usize = 0,
+        conditional_calls: usize = 0,
 
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -37202,6 +37427,13 @@ test "status source prefers authoritative schema generation result" {
             self.versioned_calls += 1;
             return 7;
         }
+
+        fn conditional(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, expected_version: ?u32) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.conditional_calls += 1;
+            try std.testing.expectEqual(@as(?u32, 6), expected_version);
+            return 7;
+        }
     };
 
     var fake = FakeSource{};
@@ -37211,11 +37443,14 @@ test "status source prefers authoritative schema generation result" {
             .status = FakeSource.status,
             .update_schema = FakeSource.legacy,
             .update_schema_versioned = FakeSource.versioned,
+            .update_schema_versioned_expected = FakeSource.conditional,
         },
     };
     try std.testing.expectEqual(@as(?u32, 7), try source.updateSchema(std.testing.allocator, "docs", "{}"));
+    try std.testing.expectEqual(@as(?u32, 7), try source.updateSchemaExpected(std.testing.allocator, "docs", "{}", 6));
     try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.versioned_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.conditional_calls);
 }
 
 test "schema projection detects a superseding backend generation" {

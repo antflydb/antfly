@@ -21,6 +21,7 @@ const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const query_api = @import("query.zig");
 const public_limits = @import("public_limits.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const OwnedLinearMergeRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
@@ -133,8 +134,16 @@ pub const Response = struct {
         to: []const u8,
     },
     keys_scanned: usize,
+    failed: []const FailedOperation = &.{},
+    took: u64,
     deleted_ids: ?[]const []const u8 = null,
     message: ?[]const u8 = null,
+};
+
+pub const FailedOperation = struct {
+    id: []const u8,
+    operation: []const u8,
+    @"error": []const u8,
 };
 
 pub fn executeResponse(
@@ -145,6 +154,7 @@ pub fn executeResponse(
     req: OwnedLinearMergeRequest,
     request: api_operation.RequestContext,
 ) !Response {
+    const started_ns = platform_time.monotonicNs();
     try request.ensureActive();
     var changed_writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer changed_writes.deinit(alloc);
@@ -231,6 +241,8 @@ pub fn executeResponse(
             .to = next_cursor,
         },
         .keys_scanned = scanned.entries.len,
+        .failed = &.{},
+        .took = platform_time.monotonicNs() -| started_ns,
         .deleted_ids = if (req.dry_run) deleted_ids.items else null,
         .message = if (req.dry_run) "dry run - no changes made" else null,
     };
@@ -242,7 +254,7 @@ fn encodeResponse(alloc: std.mem.Allocator, resp: Response) ![]u8 {
 
     const prefix = try std.fmt.allocPrint(
         alloc,
-        "{{\"status\":{f},\"upserted\":{d},\"deleted\":{d},\"skipped\":{d},\"next_cursor\":{f},\"key_range\":{{\"from\":{f},\"to\":{f}}},\"keys_scanned\":{d}",
+        "{{\"status\":{f},\"upserted\":{d},\"deleted\":{d},\"skipped\":{d},\"next_cursor\":{f},\"key_range\":{{\"from\":{f},\"to\":{f}}},\"keys_scanned\":{d},\"failed\":[],\"took\":{d}",
         .{
             std.json.fmt(resp.status, .{}),
             resp.upserted,
@@ -252,6 +264,7 @@ fn encodeResponse(alloc: std.mem.Allocator, resp: Response) ![]u8 {
             std.json.fmt(resp.key_range.from, .{}),
             std.json.fmt(resp.key_range.to, .{}),
             resp.keys_scanned,
+            resp.took,
         },
     );
     defer alloc.free(prefix);

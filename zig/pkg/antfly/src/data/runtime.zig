@@ -612,6 +612,7 @@ const IndexRepairScheduleCandidate = struct {
     estimated_bytes: u64,
     queued: bool,
     queue_wake_generation: ?u64 = null,
+    metadata_epoch: u64 = 0,
     cursor_distance: usize,
 };
 
@@ -712,6 +713,30 @@ fn indexRepairQueueScheduleFromResult(
     };
 }
 
+const IndexRepairOperatorTransition = enum { none, entered_terminal, left_terminal };
+
+fn indexRepairOperatorTransition(
+    terminal_was_observed: bool,
+    observation: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation,
+) IndexRepairOperatorTransition {
+    return switch (observation) {
+        .unknown => .none,
+        .terminal_degraded => if (terminal_was_observed) .none else .entered_terminal,
+        .non_terminal => if (terminal_was_observed) .left_terminal else .none,
+    };
+}
+
+fn pruneIndexRepairTerminalLogGroups(
+    terminal_groups: *std.AutoHashMapUnmanaged(u64, void),
+    local_groups: *const std.AutoHashMapUnmanaged(u64, usize),
+) void {
+    var iterator = terminal_groups.iterator();
+    while (iterator.next()) |entry| {
+        if (local_groups.contains(entry.key_ptr.*)) continue;
+        terminal_groups.removeByPtr(entry.key_ptr);
+    }
+}
+
 test "data runtime preserves tagged aggregate index repair wake semantics" {
     try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
     try std.testing.expectEqual(IndexRepairQueueWake.retained, indexRepairQueueWakeFromAggregate(.empty));
@@ -720,6 +745,84 @@ test "data runtime preserves tagged aggregate index repair wake semantics" {
         IndexRepairQueueWake.retained,
         indexRepairQueueWakeFromAggregate(.{ .at_realtime_ms = 42 }),
     );
+}
+
+test "index repair no-op audit stays below operator log level" {
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.noop,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{}).activity(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.deferred,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .had_debt = true,
+            .index_repair_pending = true,
+            .busy = true,
+            .index_repair_disk_wait = true,
+        }).activity(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.progressed,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .made_progress = true,
+        }).activity(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.attempted,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .index_repair_attempted = true,
+        }).activity(),
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.Activity.progressed,
+        (antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
+            .cleared_debt = true,
+        }).activity(),
+    );
+}
+
+test "index repair terminal operator events are transition based" {
+    const Observation = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation;
+    try std.testing.expectEqual(IndexRepairOperatorTransition.entered_terminal, indexRepairOperatorTransition(false, Observation.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Observation.terminal_degraded));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.none, indexRepairOperatorTransition(true, Observation.unknown));
+    try std.testing.expectEqual(IndexRepairOperatorTransition.left_terminal, indexRepairOperatorTransition(true, Observation.non_terminal));
+}
+
+test "repair activity without a final audit cannot clear terminal log state" {
+    const Result = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult;
+    const cases = [_]Result{
+        .{ .busy = true, .index_repair_pending = true, .index_repair_attempted = true },
+        .{ .busy = true, .index_repair_pending = true, .made_progress = true },
+        .{ .busy = true, .index_repair_pending = true, .index_repair_repaired = true },
+    };
+    const expected_activity = [_]Result.Activity{ .attempted, .progressed, .repaired };
+    for (cases, expected_activity) |result, activity| {
+        try std.testing.expectEqual(activity, result.activity());
+        try std.testing.expectEqual(Result.RepairHealthObservation.unknown, result.repair_health);
+        try std.testing.expectEqual(
+            IndexRepairOperatorTransition.none,
+            indexRepairOperatorTransition(true, result.repair_health),
+        );
+    }
+}
+
+test "index repair terminal log state survives metadata churn for local groups" {
+    const alloc = std.testing.allocator;
+    var terminal_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer terminal_groups.deinit(alloc);
+    try terminal_groups.put(alloc, 7, {});
+    try terminal_groups.put(alloc, 8, {});
+
+    var local_groups: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer local_groups.deinit(alloc);
+    try local_groups.put(alloc, 8, 0);
+    try local_groups.put(alloc, 9, 1);
+
+    pruneIndexRepairTerminalLogGroups(&terminal_groups, &local_groups);
+    try std.testing.expect(!terminal_groups.contains(7));
+    try std.testing.expect(terminal_groups.contains(8));
+    try std.testing.expect(!terminal_groups.contains(9));
 }
 
 test "cooperative writer contention uses a preemptible bounded repair audit" {
@@ -5546,6 +5649,12 @@ pub const DataServer = struct {
     // Known debt is an O(1) linked hash queue. The cursor lets every pass inspect
     // a fixed window without copying or sorting the entire node's repair debt.
     provisioned_index_repair_group_ages: std.AutoHashMapUnmanaged(u64, IndexRepairQueueEntry) = .empty,
+    // Terminal repair logs are edge-triggered. The durable status/metrics
+    // remain level-triggered, while this compact group set prevents fallback
+    // audits and unrelated metadata epochs from repeating the same warning.
+    // Owned by the single active repair job and destroyed after that owner is
+    // drained during shutdown.
+    provisioned_index_repair_terminal_log_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     provisioned_index_repair_queue_head: ?u64 = null,
     provisioned_index_repair_queue_tail: ?u64 = null,
     provisioned_index_repair_queue_cursor: ?u64 = null,
@@ -7877,6 +7986,7 @@ pub const DataServer = struct {
             if (entry.table_name) |table_name| self.alloc.free(table_name);
         }
         self.provisioned_index_repair_group_ages.deinit(self.alloc);
+        self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
@@ -15945,7 +16055,7 @@ pub const DataServer = struct {
                 }
                 if (!result.had_debt) continue;
                 stats.groups_with_debt += 1;
-                if (result.terminal_degraded) {
+                if (result.terminalDegraded()) {
                     std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
                     self.runtime_status_dirty.store(true, .release);
                     self.store_status_dirty.store(true, .release);
@@ -15980,6 +16090,28 @@ pub const DataServer = struct {
     /// rescans durable intents instead of trusting notifications, reopens the
     /// selected DB through the managed owner, and rechecks placement and
     /// leadership immediately before claiming group work.
+    fn observeProvisionedIndexRepairOperatorTransition(
+        self: *DataServer,
+        group_id: u64,
+        observation: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult.RepairHealthObservation,
+    ) IndexRepairOperatorTransition {
+        const terminal_was_observed = self.provisioned_index_repair_terminal_log_groups.contains(group_id);
+        const transition = indexRepairOperatorTransition(terminal_was_observed, observation);
+        if (observation == .terminal_degraded) {
+            if (transition == .entered_terminal) {
+                self.provisioned_index_repair_terminal_log_groups.put(self.alloc, group_id, {}) catch {
+                    // Logging must never make repair scheduling fallible. If
+                    // the tiny latch cannot grow, retain the important warning
+                    // even though a later audit may repeat it.
+                    return .entered_terminal;
+                };
+            }
+        } else if (transition == .left_terminal) {
+            _ = self.provisioned_index_repair_terminal_log_groups.remove(group_id);
+        }
+        return transition;
+    }
+
     fn runProvisionedIndexRepair(self: *DataServer) void {
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
         const started_ns = self.backgroundMonotonicNs();
@@ -16020,6 +16152,7 @@ pub const DataServer = struct {
         const QueuedRepair = struct {
             group_id: u64,
             wake_generation: u64,
+            metadata_epoch: u64,
             next_retry_at_ms: u64,
             table_name: ?[]u8,
             immediate_wake_pending: bool,
@@ -16056,6 +16189,7 @@ pub const DataServer = struct {
             queued_repairs.append(self.alloc, .{
                 .group_id = group_id,
                 .wake_generation = entry.wake_generation,
+                .metadata_epoch = entry.metadata_epoch,
                 .next_retry_at_ms = entry.next_retry_at_ms,
                 .table_name = queued_table_name,
                 .immediate_wake_pending = entry.immediate_wake_pending,
@@ -16120,6 +16254,7 @@ pub const DataServer = struct {
                 .estimated_bytes = 1,
                 .queued = true,
                 .queue_wake_generation = queued.wake_generation,
+                .metadata_epoch = queued.metadata_epoch,
                 .cursor_distance = 0,
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -16214,6 +16349,7 @@ pub const DataServer = struct {
                     .identity_range_id = route.identity_range_id,
                     .estimated_bytes = 1,
                     .queued = false,
+                    .metadata_epoch = self.provisioned_index_repair_routes.metadata_epoch,
                     .cursor_distance = distance,
                 }) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -16278,7 +16414,7 @@ pub const DataServer = struct {
             ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
             groups_inspected +|= 1;
             const attempt_started_ns = self.backgroundMonotonicNs();
-            std.log.info("provisioned index repair begin group={} table={s} queued={}", .{
+            std.log.debug("provisioned index repair begin group={} table={s} queued={}", .{
                 group_id,
                 table_name,
                 candidate.queued,
@@ -16329,20 +16465,45 @@ pub const DataServer = struct {
                 );
                 continue;
             };
-            std.log.info(
-                "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
-                .{
-                    group_id,
-                    table_name,
-                    (self.backgroundMonotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
-                    result.index_repair_attempted,
-                    result.index_repair_repaired,
-                    result.index_repair_degraded,
-                    result.index_repair_pending,
-                    result.busy,
-                    result.index_repair_disk_wait,
-                },
+            const activity = result.activity();
+            const operator_transition = self.observeProvisionedIndexRepairOperatorTransition(
+                group_id,
+                result.repair_health,
             );
+            const repair_log_args = .{
+                group_id,
+                table_name,
+                (self.backgroundMonotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
+                @tagName(activity),
+                @tagName(result.repair_health),
+                result.index_repair_attempted,
+                result.index_repair_repaired,
+                result.index_repair_degraded,
+                result.index_repair_pending,
+                result.busy,
+                result.index_repair_disk_wait,
+            };
+            std.log.debug(
+                "provisioned index repair pass group={} table={s} duration_ms={} activity={s} repair_health={s} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
+                repair_log_args,
+            );
+            switch (operator_transition) {
+                .entered_terminal => std.log.warn(
+                    "provisioned index repair entered terminal degradation group={} table={s} metadata_epoch={} activity={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(activity) },
+                ),
+                .left_terminal => std.log.info(
+                    "provisioned index repair left terminal degradation group={} table={s} metadata_epoch={} activity={s}",
+                    .{ group_id, table_name, candidate.metadata_epoch, @tagName(activity) },
+                ),
+                .none => switch (activity) {
+                    .progressed, .repaired => std.log.info(
+                        "provisioned index repair operator activity group={} table={s} duration_ms={} activity={s} repair_health={s} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
+                        repair_log_args,
+                    ),
+                    .noop, .deferred, .attempted => {},
+                },
+            }
             found_pending = found_pending or result.index_repair_pending;
             if (result.index_repair_disk_wait) {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
@@ -16508,6 +16669,13 @@ pub const DataServer = struct {
         var previous = self.provisioned_index_repair_routes;
         self.provisioned_index_repair_routes = next;
         previous.deinit(self.alloc);
+        // Metadata churn does not constitute repair recovery. Retain terminal
+        // latches for groups that remain local and prune only groups no longer
+        // present in the authoritative routing projection.
+        pruneIndexRepairTerminalLogGroups(
+            &self.provisioned_index_repair_terminal_log_groups,
+            &self.provisioned_index_repair_routes.by_group,
+        );
         if (self.provisioned_index_repair_scan_cursor.load(.monotonic) >= self.provisioned_index_repair_routes.routes.items.len) {
             self.provisioned_index_repair_scan_cursor.store(0, .monotonic);
         }
@@ -19165,6 +19333,7 @@ const RemoteMetadataSource = struct {
                 .drop_table = remoteDropTable,
                 .drop_table_exact = remoteDropTableExact,
                 .update_schema = remoteUpdateSchema,
+                .mutate_schema = remoteMutateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
                 .put_artifact_enrichment = remotePutArtifactEnrichment,
@@ -20250,6 +20419,46 @@ const RemoteMetadataSource = struct {
             }
         }.call, .{ .table_name = table_name, .schema_json = schema_json });
         self.invalidateCache();
+    }
+
+    fn remoteMutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: antfly.public_api.tables.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !antfly.public_api.tables.SchemaMutationResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            mode: antfly.public_api.tables.SchemaMutationMode,
+            body: []const u8,
+            expected_version: ?u32,
+        };
+        const result = try self.withMetadataApiClient(
+            antfly.public_api.tables.SchemaMutationResult,
+            struct {
+                fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Context) !antfly.public_api.tables.SchemaMutationResult {
+                    var remote = try client.mutateSchema(base_uri, ctx.table_name, ctx.mode, ctx.body, ctx.expected_version);
+                    defer remote.deinit(client.alloc);
+                    return .{
+                        .version = remote.version,
+                        .schema_json = try ctx.alloc.dupe(u8, remote.schema_json),
+                    };
+                }
+            }.call,
+            Context{
+                .alloc = alloc,
+                .table_name = table_name,
+                .mode = mode,
+                .body = body,
+                .expected_version = expected_version,
+            },
+        );
+        self.invalidateCache();
+        return result;
     }
 
     fn remoteCreateIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -30528,6 +30737,7 @@ test "data runtime repair debt hook targets the affected group queue" {
     };
     defer server.provisioned_storage.deinit();
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_groups.deinit(alloc);
     defer server.provisioned_index_repair_cancel_groups.deinit(alloc);
 
     server.runtime_status_dirty.store(false, .release);
@@ -30621,6 +30831,7 @@ test "data runtime repair failures preserve durable backoff and increase retry d
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_groups.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     defer server.removeProvisionedIndexRepair(7001);
@@ -30666,6 +30877,7 @@ test "data runtime coalesces repair progress emitted during an active quantum" {
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_groups.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     defer server.removeProvisionedIndexRepair(7001);
@@ -30703,6 +30915,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_groups.deinit(alloc);
 
     try server.signalProvisionedIndexRepairRunnableForTable("docs", 7001);
     const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
@@ -30830,6 +31043,7 @@ test "data runtime repair queue links and removes debt in constant time" {
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
+    defer server.provisioned_index_repair_terminal_log_groups.deinit(alloc);
 
     for (1..42) |group_id| try server.signalProvisionedIndexRepairRunnable(@intCast(group_id));
     try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);

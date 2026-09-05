@@ -574,7 +574,7 @@ fn executeInternal(
     if (raw_queries_value != .array) return error.InvalidRetrievalAgentRequest;
     const raw_queries = raw_queries_value.array.items;
 
-    const format: ResponseFormat = if (request.stream orelse false) .sse else .json;
+    const format: ResponseFormat = if (request.stream orelse true) .sse else .json;
     var live = LiveEmitter{ .sink = event_sink, .alloc = alloc };
     const tool_policy = try parseToolPolicy(request);
     const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
@@ -2182,7 +2182,7 @@ fn parseGenerationConfig(
         return null;
     }
 
-    const generation = generationStepFromPublic(public_generation);
+    const generation = public_generation;
     const chain = try buildGenerationChain(alloc, request, generation);
     return .{
         .chain = chain,
@@ -2386,7 +2386,6 @@ fn parseClassificationConfig(request: RetrievalAgentRequest) !?ParsedClassificat
     const steps = request.steps orelse return null;
     const classification = steps.classification orelse return null;
     if (classification.enabled != null and classification.enabled.? == false) return null;
-    if (classification.generator != null or classification.chain != null) return error.UnsupportedRetrievalAgentRequest;
     return .{
         .force_strategy = if (classification.force_strategy) |value| value else null,
         .force_semantic_mode = if (classification.force_semantic_mode) |value| value else null,
@@ -2399,8 +2398,9 @@ fn parseFollowupConfig(request: RetrievalAgentRequest, has_generation: bool) !?P
     const followup = steps.followup orelse return null;
     if (followup.enabled != null and followup.enabled.? == false) return null;
     if (!has_generation) return error.UnsupportedRetrievalAgentRequest;
-    if (followup.generator != null or followup.chain != null) return error.UnsupportedRetrievalAgentRequest;
-    const count = @as(usize, @intCast(@max(@as(i64, 1), followup.count orelse 3)));
+    const requested_count = followup.count orelse 3;
+    if (requested_count < 1 or requested_count > 4) return error.InvalidRetrievalAgentRequest;
+    const count = @as(usize, @intCast(requested_count));
     return .{ .count = count };
 }
 
@@ -2414,7 +2414,7 @@ fn parseEvalConfig(
     const public_evaluators = eval.evaluators orelse return null;
     if (public_evaluators.len == 0) return error.InvalidRetrievalAgentRequest;
     if (eval.judge) |judge| {
-        _ = try generatorConfigFromPublic(judge);
+        _ = try generatorConfigFromPublic(alloc, judge);
     }
 
     const relevant_ids = if (eval.ground_truth) |ground_truth|
@@ -2462,7 +2462,6 @@ fn parseConfidenceEnabled(request: RetrievalAgentRequest, has_generation: bool) 
     const confidence = steps.confidence orelse return false;
     if (confidence.enabled != null and confidence.enabled.? == false) return false;
     if (!has_generation) return error.UnsupportedRetrievalAgentRequest;
-    if (confidence.generator != null or confidence.chain != null) return error.UnsupportedRetrievalAgentRequest;
     return true;
 }
 
@@ -2474,89 +2473,43 @@ fn buildGenerationChain(
     var links = std.ArrayListUnmanaged(generating.ChainLink).empty;
     errdefer links.deinit(alloc);
 
-    if (generation.chain != null or request.chain != null) return error.UnsupportedRetrievalAgentRequest;
+    if (generation.generator != null and generation.chain != null) return error.InvalidRetrievalAgentRequest;
+    if (request.generator != null and request.chain != null) return error.InvalidRetrievalAgentRequest;
 
-    if (generation.generator) |generator_cfg| {
-        try links.append(alloc, .{ .generator = try generatorConfigFromGenerated(generator_cfg) });
+    if (generation.chain) |chain| {
+        if (chain.len == 0) return error.InvalidRetrievalAgentRequest;
+        for (chain) |link| {
+            const converted = generating.chainLinkFromOpenApi(alloc, link) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidRetrievalAgentRequest,
+            };
+            try links.append(alloc, converted);
+        }
+    } else if (generation.generator) |generator_cfg| {
+        try links.append(alloc, .{ .generator = try generatorConfigFromPublic(alloc, generator_cfg) });
+    } else if (request.chain) |chain| {
+        if (chain.len == 0) return error.InvalidRetrievalAgentRequest;
+        for (chain) |link| {
+            const converted = generating.chainLinkFromOpenApi(alloc, link) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidRetrievalAgentRequest,
+            };
+            try links.append(alloc, converted);
+        }
     } else if (request.generator) |generator_cfg| {
-        try links.append(alloc, .{ .generator = try generatorConfigFromPublic(generator_cfg) });
+        try links.append(alloc, .{ .generator = try generatorConfigFromPublic(alloc, generator_cfg) });
     } else {
-        return error.UnsupportedRetrievalAgentRequest;
+        return error.MissingGenerationConfig;
     }
 
     return try links.toOwnedSlice(alloc);
 }
 
-fn generationStepFromPublic(generation: generating_api_openapi.GenerationStepConfig) generating_api_openapi.GenerationStepConfig {
-    return .{
-        .enabled = generation.enabled,
-        .generator = if (generation.generator) |cfg| publicGeneratorConfigToGenerated(cfg) else null,
-        // Chain fallback is not implemented yet, but non-null still needs to trip validation.
-        .chain = if (generation.chain != null) &[_]generating_openapi.ChainLink{} else null,
-        .system_prompt = generation.system_prompt,
-        .generation_context = generation.generation_context,
+fn generatorConfigFromPublic(alloc: std.mem.Allocator, cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
+    return generating.configFromOpenApi(alloc, cfg) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidRetrievalAgentRequest,
     };
-}
-
-fn publicGeneratorConfigToGenerated(cfg: generating_openapi.GeneratorConfig) generating_openapi.GeneratorConfig {
-    return .{
-        .provider = switch (cfg.provider) {
-            .gemini => .gemini,
-            .vertex => .vertex,
-            .ollama => .ollama,
-            .openai => .openai,
-            .openrouter => .openrouter,
-            .bedrock => .bedrock,
-            .anthropic => .anthropic,
-            .cohere => .cohere,
-            .antfly => .antfly,
-            .mock => .mock,
-        },
-        .model = cfg.model,
-        .temperature = cfg.temperature,
-        .max_tokens = cfg.max_tokens,
-        .top_p = cfg.top_p,
-        .top_k = cfg.top_k,
-        .api_key = cfg.api_key,
-        .url = cfg.url,
-        .api_url = cfg.api_url,
-        .project_id = cfg.project_id,
-        .location = cfg.location,
-        .credentials_path = cfg.credentials_path,
-        .region = cfg.region,
-    };
-}
-
-fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
-    const provider: generating.Provider = switch (cfg.provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        else => return error.UnsupportedRetrievalAgentRequest,
-    };
-    const model = cfg.model orelse return error.InvalidRetrievalAgentRequest;
-    const url = switch (provider) {
-        .antfly => cfg.api_url orelse "",
-        .gemini, .vertex => cfg.url orelse "",
-        .openai, .ollama => cfg.url orelse return error.InvalidRetrievalAgentRequest,
-        else => return error.UnsupportedRetrievalAgentRequest,
-    };
-    return .{
-        .provider = provider,
-        .model = model,
-        .url = url,
-        .api_key = cfg.api_key,
-        .project_id = cfg.project_id,
-        .location = cfg.location,
-        .credentials_path = cfg.credentials_path,
-        .max_tokens = cfg.max_tokens orelse generating.default_max_tokens,
-    };
-}
-
-fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
-    return try generatorConfigFromGenerated(publicGeneratorConfigToGenerated(cfg));
 }
 
 fn buildGenerationMessages(
@@ -6464,6 +6417,24 @@ test "retrieval agent rejects out of range max tool iterations" {
     );
 }
 
+test "retrieval agent rejects out of range followup counts" {
+    const zero_body =
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":0}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, zero_body),
+    );
+
+    const too_large_body =
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":5}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"},"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, too_large_body),
+    );
+}
+
 test "retrieval agent executes explicit query pipeline" {
     const FakeRunner = struct {
         fn iface() QueryRunner {
@@ -9678,6 +9649,68 @@ test "retrieval agent sse emits error events on query failure" {
     var parsed_error = try parseJsonBody([]const u8, std.testing.allocator, firstSseEventData(events, "error").?);
     defer parsed_error.deinit();
     try std.testing.expect(std.mem.indexOf(u8, parsed_error.value, "TestSyntheticFailure") != null);
+}
+
+test "retrieval agent generation uses the canonical generator and chain contract" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":"answer","queries":[],"steps":{"generation":{"generator":{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":512,"temperature":0.25,"top_p":0.8,"frequency_penalty":0.2,"presence_penalty":-0.1}}}}
+    ;
+    var parsed = try parseJsonBody(RetrievalAgentRequest, alloc, body);
+    defer parsed.deinit();
+    const config = (try parseGenerationConfig(alloc, parsed.value)).?;
+    defer {
+        for (config.chain) |link| {
+            var owned = link;
+            owned.deinit(alloc);
+        }
+        alloc.free(config.chain);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), config.chain.len);
+    const generator = config.chain[0].generator;
+    try std.testing.expectEqual(generating.Provider.openai, generator.provider);
+    try std.testing.expectEqual(@as(i64, 512), generator.max_tokens);
+    try std.testing.expectEqual(@as(?f32, 0.25), generator.temperature);
+    try std.testing.expectEqual(@as(?f32, 0.8), generator.top_p);
+    try std.testing.expectEqual(@as(?f32, 0.2), generator.frequency_penalty);
+    try std.testing.expectEqual(@as(?f32, -0.1), generator.presence_penalty);
+}
+
+test "retrieval agent generation preserves canonical chain order and retry policy" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":"answer","queries":[],"steps":{"generation":{"chain":[{"generator":{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1"},"condition":"on_timeout","retry":{"max_attempts":2,"initial_backoff_ms":100,"max_backoff_ms":500}},{"generator":{"provider":"antfly","model":"local"}}]}}}
+    ;
+    var parsed = try parseJsonBody(RetrievalAgentRequest, alloc, body);
+    defer parsed.deinit();
+    const config = (try parseGenerationConfig(alloc, parsed.value)).?;
+    defer {
+        for (config.chain) |link| {
+            var owned = link;
+            owned.deinit(alloc);
+        }
+        alloc.free(config.chain);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), config.chain.len);
+    try std.testing.expectEqual(generating.Provider.openai, config.chain[0].generator.provider);
+    try std.testing.expectEqual(generating.ChainCondition.on_timeout, config.chain[0].condition.?);
+    try std.testing.expectEqual(@as(u32, 2), config.chain[0].retry.?.max_attempts);
+    try std.testing.expectEqual(generating.Provider.antfly, config.chain[1].generator.provider);
+}
+
+test "retrieval agent generation requires a canonical generator when the step is present" {
+    const body =
+        \\{"query":"answer","queries":[],"steps":{"generation":{}}}
+    ;
+    var parsed = try parseJsonBody(RetrievalAgentRequest, std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.MissingGenerationConfig,
+        parseGenerationConfig(std.testing.allocator, parsed.value),
+    );
 }
 
 fn unreachableRunQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!query_api.QueryResponse {

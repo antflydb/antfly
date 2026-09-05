@@ -40,6 +40,7 @@ pub const Provider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
+    request_timeout_ms: ?u64 = null,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -81,6 +82,10 @@ pub const Provider = struct {
 
     pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
         self.cancellation = cancellation;
+    }
+
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
+        self.request_timeout_ms = timeout_ms;
     }
 
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
@@ -421,7 +426,15 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;

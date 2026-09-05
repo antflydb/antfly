@@ -5467,11 +5467,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -5483,11 +5479,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -5504,11 +5496,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_antfly_idx",
         "body",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-embed-v1",
-            .api_url = antfly_base_uri,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
         .{
             .provider = .antfly,
             .api_url = antfly_chunk_api,
@@ -5524,12 +5512,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_template_idx",
         "{{remoteMedia url=photo}}",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-clip-v1",
-            .api_url = antfly_base_uri,
-            .multimodal = true,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-clip-v1", antfly_base_uri, true),
     );
     defer std.heap.page_allocator.free(semantic_template_index_body);
     var semantic_template_index = try client.createTableIndex(api_base_uris[0], "docs", "semantic_template_idx", semantic_template_index_body);
@@ -5540,11 +5523,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_template_chunked_idx",
         "{{title}} {{remoteText url=transcript}}",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -7336,11 +7315,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -7352,11 +7327,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -7683,11 +7654,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -7699,11 +7666,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
