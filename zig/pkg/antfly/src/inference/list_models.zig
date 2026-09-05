@@ -107,7 +107,7 @@ const default_timeout_ms: u64 = 5_000;
 pub fn listModels(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
     const timeout = if (timeout_ms == 0) default_timeout_ms else timeout_ms;
     return switch (ep.provider) {
-        .openai => try listOpenAi(alloc, http, ep, timeout, "https://api.openai.com"),
+        .openai => try listOpenAi(alloc, http, ep, timeout, provider_defaults.openai_origin),
         .openrouter => try listOpenAi(alloc, http, ep, timeout, "https://openrouter.ai/api/v1"),
         .ollama => try listOllama(alloc, http, ep, timeout),
         .gemini => try listGemini(alloc, http, ep, timeout),
@@ -132,7 +132,7 @@ fn listOpenAi(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 }
 
 fn listOllama(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
-    var base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else "http://localhost:11434", "/");
+    var base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else provider_defaults.ollama_origin, "/");
     if (std.mem.endsWith(u8, base, "/v1")) base = base[0 .. base.len - "/v1".len];
     const url = try std.fmt.allocPrint(alloc, "{s}/api/tags", .{base});
     defer alloc.free(url);

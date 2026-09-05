@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 pub const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const GeminiOptions = struct {
-    base_url: []const u8 = "https://generativelanguage.googleapis.com/v1beta",
+    base_url: []const u8 = provider_defaults.gemini_v1beta_base,
     api_key: []const u8,
 };
 
@@ -150,9 +150,9 @@ pub const GeminiProvider = struct {
 };
 
 pub const Options = struct {
-    base_url: []const u8 = "https://aiplatform.googleapis.com/v1",
+    base_url: []const u8 = provider_defaults.vertex_v1_base,
     project_id: ?[]const u8 = null,
-    location: []const u8 = "us-central1",
+    location: []const u8 = provider_defaults.default_google_location,
     credentials_path: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
