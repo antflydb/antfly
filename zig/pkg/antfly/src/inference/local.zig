@@ -154,6 +154,7 @@ pub const Provider = struct {
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -320,6 +321,7 @@ pub const Provider = struct {
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -403,7 +405,11 @@ pub const Provider = struct {
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.authHeaders(),
-            .timeout_ms = 300_000,
+            .timeout_ms = self.request_timeout_ms orelse 300_000,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;

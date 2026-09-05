@@ -1049,6 +1049,9 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
+            .dense_embed_with_context_fn = embedDenseWithContext,
+            .dense_embed_batch_with_context_fn = embedDenseBatchWithContext,
+            .dense_embed_parts_with_context_fn = embedDensePartsWithContext,
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
@@ -1063,6 +1066,8 @@ pub const ManagedEmbedder = struct {
             .ptr = self,
             .sparse_embed_fn = embedSparse,
             .sparse_embed_batch_fn = embedSparseBatch,
+            .sparse_embed_with_context_fn = embedSparseWithContext,
+            .sparse_embed_batch_with_context_fn = embedSparseBatchWithContext,
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
@@ -1309,6 +1314,23 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, dims);
     }
 
+    fn embedDenseWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedWithEntry(alloc, &entry, text, dims);
+    }
+
     fn embedDenseBatch(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1322,6 +1344,23 @@ pub const ManagedEmbedder = struct {
         return try embedBatchWithEntry(alloc, entry, texts, dims);
     }
 
+    fn embedDenseBatchWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedBatchWithEntry(alloc, &entry, texts, dims);
+    }
+
     fn embedDenseParts(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1333,6 +1372,23 @@ pub const ManagedEmbedder = struct {
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         return try embedWithEntryParts(alloc, entry, parts, dims);
+    }
+
+    fn embedDensePartsWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        parts: []const template_mod.ContentPart,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedWithEntryParts(alloc, &entry, parts, dims);
     }
 
     fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
@@ -1366,6 +1422,22 @@ pub const ManagedEmbedder = struct {
         return try embedSparseWithEntry(alloc, entry, text);
     }
 
+    fn embedSparseWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        context: RequestContext,
+    ) !db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedSparseWithEntry(alloc, &entry, text);
+    }
+
     fn embedSparseBatch(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1378,6 +1450,22 @@ pub const ManagedEmbedder = struct {
         return try embedSparseBatchWithEntry(alloc, entry, texts);
     }
 
+    fn embedSparseBatchWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        context: RequestContext,
+    ) ![]db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedSparseBatchWithEntry(alloc, &entry, texts);
+    }
+
     fn deinitSparseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         _ = alloc;
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
@@ -1386,6 +1474,44 @@ pub const ManagedEmbedder = struct {
         owner_alloc.destroy(self);
     }
 };
+
+/// A request-scoped entry preserves the runtime shutdown token while adding
+/// the caller's independent cancellation source. The adapter is stack-owned
+/// for exactly the synchronous provider invocation that borrows it.
+const CombinedCancellation = struct {
+    configured: ?CancellationToken,
+    request: ?CancellationToken,
+
+    fn init(configured: ?CancellationToken, request: ?CancellationToken) @This() {
+        return .{ .configured = configured, .request = request };
+    }
+
+    fn isCancelled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.configured) |source| if (source.isCancelled()) return true;
+        if (self.request) |source| if (source.isCancelled()) return true;
+        return false;
+    }
+
+    fn token(self: *const @This()) ?CancellationToken {
+        if (self.configured == null and self.request == null) return null;
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+};
+
+fn applyRequestContext(
+    entry: *ManagedEmbeddingEntry,
+    context: RequestContext,
+    cancellation: *const CombinedCancellation,
+) void {
+    entry.io = context.io;
+    entry.deadline_ns = if (entry.deadline_ns) |configured|
+        if (context.deadline_ns) |request| @min(configured, request) else configured
+    else
+        context.deadline_ns;
+    entry.cancellation = cancellation.token();
+    if (context.progress) |progress| entry.progress = progress;
+}
 
 pub const QueryCacheSecurityDomain = enum {
     anonymous,

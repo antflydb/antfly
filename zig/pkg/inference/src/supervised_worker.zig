@@ -111,7 +111,11 @@ pub const Supervisor = struct {
         defer process.close();
         var state = WaitState{ .child = &child, .io = io };
         var group = std.Io.Group.init;
-        group.async(io, WaitState.wait, .{&state});
+        // A supervisor cannot use `Group.async`: that primitive may execute
+        // eagerly when its pool is saturated, which would block here in
+        // child.wait before the deadline loop gets a chance to terminate the
+        // worker. `concurrent` either schedules independently or fails closed.
+        try group.concurrent(io, WaitState.wait, .{&state});
 
         while (!state.done.isSet()) {
             control.check() catch |err| {
@@ -150,13 +154,15 @@ pub const Supervisor = struct {
 test "wedged worker is killed and the supervisor advances generation" {
     if (builtin.os.tag != .linux)
         return error.SkipZigTest;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
     var supervisor = Supervisor{ .cancellation_grace_ns = 10 * std.time.ns_per_ms };
     const control = InferenceExecutionControl{
         .deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_ms,
     };
     try std.testing.expectError(
         error.Timeout,
-        supervisor.run(std.testing.io, &.{ "/bin/sh", "-c", "exec sleep 60" }, control),
+        supervisor.run(io_impl.io(), &.{ "/bin/sh", "-c", "exec sleep 60" }, control),
     );
     try std.testing.expect(supervisor.unhealthy);
     try std.testing.expectEqual(@as(u64, 1), supervisor.restart_count);

@@ -6556,7 +6556,24 @@ pub const ModelManager = struct {
         };
         if (self.load_io == null) self.load_io = coordination_io;
         self.unlockLoadedModels();
-        self.load_group.async(coordination_io, runLoadTask, .{task});
+        if (control != null) {
+            self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
+                // `Group.async` is allowed to execute eagerly when its async pool is
+                // saturated. A request-scoped cold load must never run on the request
+                // lane: the waiter is what translates request cancellation into an
+                // abandoned flight. Fail closed when guaranteed concurrency is not
+                // available and retire the task reference exactly as runLoadTask
+                // would have done.
+                self.finishLoadFlight(flight, null, err);
+                task.deinit();
+                self.releaseLoadFlight(flight_key, flight);
+            };
+        } else {
+            // Startup preloads and direct/offline callers have no request lifetime
+            // to protect. Retain the permissive path for executors such as
+            // std.testing.io that intentionally do not offer concurrency.
+            self.load_group.async(coordination_io, runLoadTask, .{task});
+        }
         return self.waitForLoadFlight(flight_key, flight, control);
     }
 

@@ -85,6 +85,11 @@ pub const ClientConfig = struct {
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
+    /// Default request lifetime for adapters whose provider interface does not
+    /// expose per-call HTTP options. An explicit RequestOptions cancellation
+    /// source takes precedence. The token is borrowed for the client's
+    /// lifetime.
+    request_cancellation: ?CancellationToken = null,
     verify_ssl: bool = true,
     /// Optional explicit CA bundle file. When set, system roots are not loaded.
     tls_ca_file: ?[]const u8 = null,
@@ -724,7 +729,11 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
+        var response = try self.executeRequest(
+            &req,
+            reqOpts.timeout_ms,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -818,7 +827,14 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
+        var response = try self.executeRequestToWriter(
+            &req,
+            reqOpts.timeout_ms,
+            writer,
+            progress_cb,
+            progress_ctx,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -3323,6 +3339,18 @@ test "Client rejects an already cancelled request" {
     try std.testing.expectError(
         error.Cancelled,
         client.get("http://127.0.0.1:1/never", .{ .cancellation = .fromAtomic(&cancellation) }),
+    );
+}
+
+test "ClientConfig supplies cancellation to provider adapters" {
+    var cancellation = std.atomic.Value(bool).init(true);
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .request_cancellation = .fromAtomic(&cancellation),
+    });
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{}),
     );
 }
 

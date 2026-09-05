@@ -109,6 +109,12 @@ pub const Producer = struct {
     };
 
     pub fn foregroundBoundedForRequests(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        // A finite implementation-specific timeout is not sufficient for a
+        // foreground request: the provider must accept the caller's actual
+        // deadline and cancellation token. Legacy callbacks remain available
+        // to durable background replay, but can never advertise foreground
+        // cancellability.
+        if (self.vtable.produce_with_context == null) return false;
         if (self.vtable.foreground_bounded_for_requests) |foreground_bounded|
             return try foreground_bounded(self.ptr, alloc, requests);
         return self.vtable.foreground_bounded;

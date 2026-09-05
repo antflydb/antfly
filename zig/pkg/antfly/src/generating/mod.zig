@@ -192,6 +192,24 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        if (self.request_context) |context| {
+            try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
+            const timeout_ms = try context.remainingTimeoutMs();
+            const cancellation = if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null;
+            switch (self.provider) {
+                .openai => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .remote_antfly => |*provider| {
+                    provider.setRequestTimeoutMs(timeout_ms);
+                    provider.setRequestCancellation(context.cancellation);
+                },
+                .vertex => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .embedded_antfly => {},
+            }
+        }
         var result = switch (self.provider) {
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
@@ -266,6 +284,7 @@ const BackendState = struct {
             },
         };
         defer result.deinit();
+        if (self.request_context) |context| try context.check();
 
         return .{
             .content = try alloc.dupe(u8, result.content),

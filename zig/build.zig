@@ -4938,8 +4938,10 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "context-aware embedder receives the request lifetime and fails closed when absent",
             "inference timeout policy avoids inline retry storms",
             "inference recovery is scoped by model and backend",
+            "asset inference recovery uses one identity from plan through provider call",
             "post-provider deadline records timeout recovery before returning",
             "document extraction reserves PDF decoder peak memory atomically",
             "PDF decoder reservation composes with every live slice owner",
@@ -9707,6 +9709,7 @@ pub fn build(b: *std.Build) void {
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
+    quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
@@ -9728,6 +9731,38 @@ pub fn build(b: *std.Build) void {
     }
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
+
+    const run_bge_m3_native_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_native_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "native",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_native_managed.addArgs(args);
+    const bge_m3_native_managed_step = b.step(
+        "bench-bge-m3-native-managed-e2e",
+        "Benchmark BGE-M3 native through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_native_managed_step.dependOn(&run_bge_m3_native_managed.step);
+
+    const run_bge_m3_metal_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_metal_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "metal",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_metal_managed.addArgs(args);
+    const bge_m3_metal_managed_step = b.step(
+        "bench-bge-m3-metal-managed-e2e",
+        "Benchmark BGE-M3 Metal through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_metal_managed_step.dependOn(&run_bge_m3_metal_managed.step);
 
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("bench/compat_runner.zig"),

@@ -2056,6 +2056,11 @@ pub fn runFromIterator(
 
     const configured_inference: antfly.common.config.Config.InferenceConfig =
         if (loaded_cfg) |cfg| cfg.inference else .{};
+    // An explicit inference endpoint is a process-isolation contract, not a
+    // fallback hint. In this mode standalone must not retain hidden in-process
+    // routes or provider callbacks that can route a wedged native/GPU kernel
+    // back into the database process.
+    const embedded_inference_enabled = configured_inference.api_url == null;
     const effective_kernel_jit_mode = try resolveKernelJitMode(
         configured_inference.kernel_jit.mode,
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
@@ -2095,8 +2100,8 @@ pub fn runFromIterator(
         .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
             process_memory_resolution.effective_source,
         ),
-        .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
-        .preload_len = active_preload.len,
+        .preload_ptr = if (!embedded_inference_enabled or active_preload.len == 0) null else active_preload.ptr,
+        .preload_len = if (embedded_inference_enabled) active_preload.len else 0,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
         .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
@@ -2375,17 +2380,17 @@ pub fn runFromIterator(
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
-            .inference_request_admission_source = .{
+            .inference_request_admission_source = if (embedded_inference_enabled) .{
                 .ptr = antfly_node,
                 .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
                 .release_fn = releaseEmbeddedInferenceRequest,
                 .stats_fn = embeddedInferenceRequestStats,
-            },
-            .local_inference_connection_target = .{
+            } else null,
+            .local_inference_connection_target = if (embedded_inference_enabled) .{
                 .capabilities = inference_connection_abi.Capability.streaming_response,
                 .context = &local_inference_connection_context,
                 .invoke = invokeLocalInferenceConnection,
-            },
+            } else null,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2528,7 +2533,10 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
-    data_server.setAntflyProvider(inferenceBoundaryProvider(&embedded_provider_lifetime));
+    data_server.setAntflyProvider(if (embedded_inference_enabled)
+        inferenceBoundaryProvider(&embedded_provider_lifetime)
+    else
+        null);
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
@@ -2618,6 +2626,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2632,6 +2641,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2770,13 +2780,14 @@ fn serveUnifiedWithInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2793,13 +2804,14 @@ fn serveUnifiedWithLinkedInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2817,6 +2829,7 @@ fn serveUnifiedInner(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
@@ -2844,17 +2857,19 @@ fn serveUnifiedInner(
         for (linked_inference_routes.items) |route| alloc.destroy(route);
         linked_inference_routes.deinit(alloc);
     }
-    if (comptime inline_inference) {
-        try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
-    } else {
-        const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
-        try registerLinkedInferenceManifest(
-            alloc,
-            &server,
-            antfly_node,
-            functions,
-            &linked_inference_routes,
-        );
+    if (register_inference_routes) {
+        if (comptime inline_inference) {
+            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+        } else {
+            const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+            try registerLinkedInferenceManifest(
+                alloc,
+                &server,
+                antfly_node,
+                functions,
+                &linked_inference_routes,
+            );
+        }
     }
 
     // Runtime roles consume the shared direct/linked kernel registrar instead

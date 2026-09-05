@@ -1561,7 +1561,7 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
 /// A canceled or expired backend may still be unwinding model-owned state.
 /// Retry it only through the durable backoff path, never inline.
 fn inferenceControlFailure(err: anyerror) bool {
-    return err == error.Timeout or err == error.Cancelled or
+    return err == error.Timeout or err == error.Cancelled or err == error.Canceled or
         err == error.EnrichmentWaitTimeout or err == error.EnrichmentWaitCanceled;
 }
 
@@ -1599,9 +1599,30 @@ fn sparseInferenceRecoveryKey(embedder: embedder_mod.SparseEmbedder, embedding_n
     return inferenceRecoveryKey(embedder.recoveryIdentity(embedding_name));
 }
 
+fn assetInferenceRecoveryKey(request: asset_producer_mod.Request) InferenceRecoveryKey {
+    return inferenceRecoveryKey(.{
+        // The canonical producer configuration contains the provider, model,
+        // endpoint and operation-specific settings. Hashing the whole value
+        // keeps the circuit scoped to exactly the failing route without
+        // retaining borrowed JSON in recovery state.
+        .model = request.config_json,
+        .backend = @tagName(request.producer_type),
+    });
+}
+
+fn assetRequestRecoveryKey(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) ?InferenceRecoveryKey {
+    var producer = asset_producer_mod.parseProducerConfig(alloc, request.producer_json) catch return null;
+    defer producer.deinit(alloc);
+    return assetInferenceRecoveryKey(.{
+        .producer_type = producer.type,
+        .config_json = producer.config_json,
+        .source_text = "",
+    });
+}
+
 fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceControlFailurePolicy {
     if (!inferenceControlFailure(err)) return null;
-    if (err == error.Cancelled or err == error.EnrichmentWaitCanceled) return .{};
+    if (err == error.Cancelled or err == error.Canceled or err == error.EnrichmentWaitCanceled) return .{};
     if (batch_items > 1) return .{ .next_batch_cap = @max(@as(usize, 1), batch_items / 2) };
     return .{ .open_circuit = true };
 }
@@ -1620,7 +1641,7 @@ fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, recovery_key: Infere
             entry.value_ptr.circuit_open_until_ns = platform_time.monotonicNs() +|
                 workerRetryDelayMs(1) *| std.time.ns_per_ms;
         }
-    } else if (err == error.Cancelled or err == error.EnrichmentWaitCanceled) {
+    } else if (err == error.Cancelled or err == error.Canceled or err == error.EnrichmentWaitCanceled) {
         _ = runtime.inference_cancel_count.fetchAdd(1, .monotonic);
     }
 }
@@ -1671,7 +1692,8 @@ fn effectiveRequestEmbedBatchItems(runtime: *EnrichmentRuntime, request: enrichm
             sparseInferenceRecoveryKey(sparse, requestEmbeddingName(request))
         else
             return configured,
-        .asset, .chunk_text => return configured,
+        .asset => assetRequestRecoveryKey(runtime.alloc, request) orelse return configured,
+        .chunk_text => return configured,
     };
     return @min(configured, recoveryBatchCap(runtime, recovery_key));
 }
@@ -2493,6 +2515,15 @@ fn checkAssetProviderInvocation(
     alloc: Allocator,
     requests: []const asset_producer_mod.Request,
 ) !void {
+    if (requests.len == 0) return;
+    const recovery_key = assetInferenceRecoveryKey(requests[0]);
+    lockInferenceRecovery(runtime);
+    const circuit_open_until_ns = if (runtime.inference_recovery.get(recovery_key)) |state|
+        state.circuit_open_until_ns
+    else
+        0;
+    runtime.inference_recovery_mutex.unlock();
+    if (circuit_open_until_ns > platform_time.monotonicNs()) return error.InferenceCircuitOpen;
     const guard = runtime.active_provider_guard;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
     try guard.check();
@@ -2524,6 +2555,12 @@ fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_co
         .cancellation = if (cancellation.ptr != null) cancellation else null,
         .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
     };
+}
+
+fn foregroundProviderRequestContext(runtime: *EnrichmentRuntime) ?inference_request_context.RequestContext {
+    const guard = runtime.active_provider_guard;
+    if (guard.deadline_ns == null and guard.cancellation.ptr == null) return null;
+    return assetProviderRequestContext(runtime);
 }
 
 fn checkProviderFailureGuardRecording(
@@ -2558,15 +2595,21 @@ fn assetProducerProduceGuarded(
     alloc: Allocator,
     request: asset_producer_mod.Request,
 ) ![]u8 {
+    const recovery_key = assetInferenceRecoveryKey(request);
     try checkAssetProviderInvocation(runtime, producer, alloc, &.{request});
-    const produced = producer.produceWithContext(alloc, request, assetProviderRequestContext(runtime)) catch |err| {
-        try checkProviderFailureGuard(runtime);
+    const produced = (if (foregroundProviderRequestContext(runtime)) |context|
+        producer.produceWithContext(alloc, request, context)
+    else
+        producer.produce(alloc, request)) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |guard_err| return guard_err;
+        if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, 1);
         return err;
     };
-    checkProviderFailureGuard(runtime) catch |err| {
+    checkProviderFailureGuardRecording(runtime, recovery_key, 1) catch |err| {
         alloc.free(produced);
         return err;
     };
+    noteInferenceControlSuccess(runtime, recovery_key);
     return produced;
 }
 
@@ -2576,16 +2619,23 @@ fn assetProducerProduceBatchGuarded(
     alloc: Allocator,
     requests: []const asset_producer_mod.Request,
 ) ![][]u8 {
+    if (requests.len == 0) return try alloc.alloc([]u8, 0);
+    const recovery_key = assetInferenceRecoveryKey(requests[0]);
     try checkAssetProviderInvocation(runtime, producer, alloc, requests);
-    const produced = producer.produceBatchWithContext(alloc, requests, assetProviderRequestContext(runtime)) catch |err| {
-        try checkProviderFailureGuard(runtime);
+    const produced = (if (foregroundProviderRequestContext(runtime)) |context|
+        producer.produceBatchWithContext(alloc, requests, context)
+    else
+        producer.produceBatch(alloc, requests)) catch |err| {
+        checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |guard_err| return guard_err;
+        if (inferenceControlFailure(err)) noteInferenceControlFailure(runtime, recovery_key, err, requests.len);
         return err;
     };
-    checkProviderFailureGuard(runtime) catch |err| {
+    checkProviderFailureGuardRecording(runtime, recovery_key, requests.len) catch |err| {
         for (produced) |output| if (output.len > 0) alloc.free(output);
         alloc.free(produced);
         return err;
     };
+    noteInferenceControlSuccess(runtime, recovery_key);
     return produced;
 }
 
@@ -2600,7 +2650,10 @@ fn embedDenseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims) catch |err| {
+        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+            dense_embedder.embedDenseWithContext(runtime.alloc, embedding_name, text, dims, context)
+        else
+            dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims)) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
@@ -2636,7 +2689,10 @@ fn embedDenseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vectors = dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims) catch |err| {
+        const vectors = (if (foregroundProviderRequestContext(runtime)) |context|
+            dense_embedder.embedDenseBatchWithContext(runtime.alloc, embedding_name, texts, dims, context)
+        else
+            dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims)) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
@@ -2672,7 +2728,10 @@ fn embedDensePartsWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims) catch |err| {
+        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+            dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
+        else
+            dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims)) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
@@ -2707,7 +2766,10 @@ fn embedSparseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse = sparse_embedder.embedSparse(runtime.alloc, embedding_name, text) catch |err| {
+        const sparse = (if (foregroundProviderRequestContext(runtime)) |context|
+            sparse_embedder.embedSparseWithContext(runtime.alloc, embedding_name, text, context)
+        else
+            sparse_embedder.embedSparse(runtime.alloc, embedding_name, text)) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, 1);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, 1);
@@ -2743,7 +2805,10 @@ fn embedSparseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse_batch = sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts) catch |err| {
+        const sparse_batch = (if (foregroundProviderRequestContext(runtime)) |context|
+            sparse_embedder.embedSparseBatchWithContext(runtime.alloc, embedding_name, texts, context)
+        else
+            sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts)) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
@@ -4696,6 +4761,48 @@ test "inference recovery is scoped by model and backend" {
     noteInferenceControlSuccess(&runtime, metal_key);
     try checkProviderInvocation(&runtime, metal_key, true);
     try std.testing.expectEqual(@as(usize, 8), recoveryBatchCap(&runtime, metal_key));
+}
+
+test "asset inference recovery uses one identity from plan through provider call" {
+    const producer_json =
+        \\{"type":"generator","config":{"provider":"antfly","model":"test-model"}}
+    ;
+    const generated = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .asset,
+        .index_name = "summary",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .producer_json = producer_json,
+    };
+    const planned_key = assetRequestRecoveryKey(std.testing.allocator, generated).?;
+
+    var parsed = try asset_producer_mod.parseProducerConfig(std.testing.allocator, producer_json);
+    defer parsed.deinit(std.testing.allocator);
+    const invoked_key = assetInferenceRecoveryKey(.{
+        .producer_type = parsed.type,
+        .config_json = parsed.config_json,
+        .source_text = "hello",
+    });
+    try std.testing.expectEqualSlices(u8, &planned_key, &invoked_key);
+
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer runtime.inference_recovery.deinit(std.testing.allocator);
+    noteInferenceControlFailure(&runtime, invoked_key, error.Timeout, 8);
+    try std.testing.expectEqual(@as(usize, 4), recoveryBatchCap(&runtime, planned_key));
 }
 
 test "post-provider deadline records timeout recovery before returning" {
