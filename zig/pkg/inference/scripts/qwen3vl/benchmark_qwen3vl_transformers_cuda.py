@@ -3,6 +3,9 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
 
 """Run a fail-closed, resident-prefill Qwen3-VL Transformers CUDA benchmark."""
 
@@ -225,6 +228,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.output.exists():
+        print(
+            f"Qwen3-VL CUDA benchmark failed: refusing to overwrite output: {args.output}",
+            file=sys.stderr,
+        )
+        return 2
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "pass": False,

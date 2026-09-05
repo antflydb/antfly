@@ -6,7 +6,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! Strict Qwen3-VL GGUF vision tower and DeepStack projector.
+//! Strict Qwen3-VL vision tower and DeepStack projector.
 //!
 //! The official projector is not a CLIP pooling head: it contains a temporal
 //! split Conv3D patch embed, learned-position interpolation, two-axis vision
@@ -28,7 +28,6 @@ const projector_common = @import("gemma4_projector.zig");
 const qwen3vl_plan = @import("qwen3vl_plan.zig");
 const gpt_arch = @import("gpt.zig");
 const gpt_config = @import("../models/gpt.zig");
-const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
@@ -411,34 +410,6 @@ const WeightCache = struct {
                 }
             }
         }
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda) {
-                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
-                defer tensor_ref.deinit(self.allocator);
-                if (tensor_ref.quantized) {
-                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
-                        var storage = storage_value;
-                        if (storage.shape.len == 2 and
-                            storage.shape[0] == @as(i64, @intCast(out_dim)) and
-                            storage.shape[1] == @as(i64, @intCast(in_dim)))
-                        {
-                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
-                            defer self.allocator.free(cache_key);
-                            const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
-                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
-                                self.cb,
-                                cache_key,
-                                storage,
-                                &shape,
-                            );
-                            errdefer self.cb.free(tensor);
-                            return self.insert(key, tensor);
-                        }
-                        storage.deinit();
-                    }
-                }
-            }
-        }
         const tensor = try projector_common.loadLinearWeightCt(
             self.cb,
             self.allocator,
@@ -493,39 +464,6 @@ const WeightCache = struct {
             .gguf => |value| value,
             .resident => unreachable,
         };
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda) {
-                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
-                defer tensor_ref.deinit(self.allocator);
-                if (tensor_ref.quantized) {
-                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
-                        var storage = storage_value;
-                        if (storage.shape.len == 4 and
-                            storage.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
-                            storage.shape[1] == 3 and
-                            storage.shape[2] == @as(i64, @intCast(cfg.patch_size)) and
-                            storage.shape[3] == @as(i64, @intCast(cfg.patch_size)))
-                        {
-                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
-                            defer self.allocator.free(cache_key);
-                            const shape = [_]i64{
-                                @intCast(cfg.vision_hidden),
-                                @intCast(cfg.patch_size * cfg.patch_size * 3),
-                            };
-                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
-                                self.cb,
-                                cache_key,
-                                storage,
-                                &shape,
-                            );
-                            errdefer self.cb.free(tensor);
-                            return self.insert(key, tensor);
-                        }
-                        storage.deinit();
-                    }
-                }
-            }
-        }
         const tensor = try loadPatchWeight(self.cb, store, name, cfg);
         errdefer self.cb.free(tensor);
         return self.insert(key, tensor);

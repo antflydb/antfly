@@ -92,6 +92,25 @@ class CudaBenchmarkContractTests(unittest.TestCase):
             with self.assertRaisesRegex(benchmark.QualificationError, "requires Linux"):
                 benchmark.validate_args(args())
 
+    def test_existing_report_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "report.json"
+            output.write_text("original", encoding="utf-8")
+            result = benchmark.main(
+                [
+                    "--weights-dir",
+                    "/weights",
+                    "--processor-dir",
+                    "/processor",
+                    "--image",
+                    "/image.jpg",
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(2, result)
+            self.assertEqual("original", output.read_text(encoding="utf-8"))
+
     def test_reference_contract_binds_request_and_logits(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             logits = Path(raw) / "reference.f32le"
