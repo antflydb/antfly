@@ -1131,13 +1131,21 @@ pub const ManagedEmbedder = struct {
         }
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
+        hashQueryCacheField(&hasher, "antfly-query-embedding-v2");
         hashQueryCacheField(&hasher, @tagName(security_domain));
         hashQueryCacheField(&hasher, security_scope);
         hashQueryCacheField(&hasher, @tagName(entry.provider));
         hashQueryCacheField(&hasher, entry.base_url);
         hashQueryCacheField(&hasher, entry.model);
         hashQueryCacheField(&hasher, entry.region);
+        hashQueryCacheField(&hasher, entry.project_id);
+        hashQueryCacheField(&hasher, entry.location);
+        // Keep cache authorization boundaries aligned with CredentialManager,
+        // which keys Vertex token sources by this path or the default-ADC
+        // sentinel. Tokens may refresh without changing vector semantics, but
+        // independently configured credential sources must never coalesce.
+        hashQueryCacheField(&hasher, if (entry.credentials_path.len > 0) entry.credentials_path else "<default-adc>");
+        hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
         hashQueryCacheField(&hasher, entry.document_input_type);
@@ -5675,11 +5683,50 @@ pub fn testQueryEmbeddingCacheKeys() !void {
     const credential_a = try first_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
     const credential_b = try second_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
 
+    var vertex_project_a = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1","credentials_path":"credentials-a.json"}}}
+    );
+    defer vertex_project_a.deinit();
+    var vertex_project_b = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-b","location":"us-central1","credentials_path":"credentials-a.json"}}}
+    );
+    defer vertex_project_b.deinit();
+    var vertex_credentials_b = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","model":"gemini-embedding-001","project_id":"project-a","location":"us-central1","credentials_path":"credentials-b.json"}}}
+    );
+    defer vertex_credentials_b.deinit();
+    const vertex_a = try vertex_project_a.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_b = try vertex_project_b.queryCacheKey("dense", .principal, "alice", "exact input");
+    const vertex_credential_b = try vertex_credentials_b.queryCacheKey("dense", .principal, "alice", "exact input");
+
+    const bedrock_profile = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings";
+    const bedrock_v3_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"dense\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1024,\"embedder\":{{\"provider\":\"bedrock\",\"model\":\"{s}\",\"request_format\":\"cohere_v3\",\"region\":\"us-east-1\"}}}}}}",
+        .{bedrock_profile},
+    );
+    defer std.testing.allocator.free(bedrock_v3_json);
+    const bedrock_v4_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"dense\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1024,\"embedder\":{{\"provider\":\"bedrock\",\"model\":\"{s}\",\"request_format\":\"cohere_v4\",\"region\":\"us-east-1\"}}}}}}",
+        .{bedrock_profile},
+    );
+    defer std.testing.allocator.free(bedrock_v4_json);
+    var bedrock_v3 = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, bedrock_v3_json);
+    defer bedrock_v3.deinit();
+    var bedrock_v4 = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, bedrock_v4_json);
+    defer bedrock_v4.deinit();
+    const bedrock_format_v3 = try bedrock_v3.queryCacheKey("dense", .principal, "alice", "exact input");
+    const bedrock_format_v4 = try bedrock_v4.queryCacheKey("dense", .principal, "alice", "exact input");
+
     try std.testing.expectEqual(first, equivalent);
     try std.testing.expect(!std.mem.eql(u8, &first, &other_principal));
     try std.testing.expect(!std.mem.eql(u8, &first, &anonymous));
     try std.testing.expect(!std.mem.eql(u8, &first, &changed_text));
     try std.testing.expect(!std.mem.eql(u8, &credential_a, &credential_b));
+    try std.testing.expect(!std.mem.eql(u8, &vertex_a, &vertex_b));
+    try std.testing.expect(!std.mem.eql(u8, &vertex_a, &vertex_credential_b));
+    try std.testing.expect(!std.mem.eql(u8, &bedrock_format_v3, &bedrock_format_v4));
 }
 
 test "query embedding cache keys share equivalent indexes and isolate security domains" {
