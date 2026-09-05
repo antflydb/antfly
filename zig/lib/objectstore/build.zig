@@ -25,12 +25,18 @@ pub fn build(b: *std.Build) void {
     const platform_dep = b.dependency("antfly_platform", .{});
     const platform_mod = platform_dep.module("antfly_platform");
     httpx_mod.addImport("antfly-json", json_mod);
+    const credentials_mod = b.createModule(.{
+        .root_source_file = b.path("../credentials/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const google_mod = b.createModule(.{
         .root_source_file = b.path("../google/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_credentials", credentials_mod);
     google_mod.addImport("antfly_platform", platform_mod);
 
     const mod = b.addModule("objectstore", .{

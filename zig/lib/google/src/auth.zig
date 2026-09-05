@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const credential_identity = @import("antfly_credentials");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 
@@ -496,7 +497,10 @@ pub const CredentialManager = struct {
     alloc: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    sources: std.StringHashMapUnmanaged(*CachedTokenSource) = .empty,
+    sources: std.AutoHashMapUnmanaged(
+        [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        *CachedTokenSource,
+    ) = .empty,
 
     pub fn init(alloc: Allocator, io: std.Io) CredentialManager {
         return .{ .alloc = alloc, .io = io };
@@ -508,7 +512,6 @@ pub const CredentialManager = struct {
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.alloc.destroy(entry.value_ptr.*);
-            self.alloc.free(entry.key_ptr.*);
         }
         self.sources.deinit(self.alloc);
         self.mutex.unlock(self.io);
@@ -520,13 +523,11 @@ pub const CredentialManager = struct {
         credentials_path: ?[]const u8,
         scope: []const u8,
     ) !*CachedTokenSource {
-        const key = try credentialSourceCacheKeyAlloc(self.alloc, credentials_path, scope);
-        errdefer self.alloc.free(key);
+        const key = credentialSourceCacheKey(credentials_path, scope);
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.sources.get(key)) |source| {
-            self.alloc.free(key);
             return source;
         }
 
@@ -543,30 +544,34 @@ pub const CredentialManager = struct {
     }
 };
 
-/// Build a tagged credential-source identity. A printable sentinel is not
-/// sufficient here because it can also be a valid user-supplied file path.
-fn credentialSourceCacheKeyAlloc(
-    alloc: Allocator,
+/// Build a typed, fixed-size credential-source key. The shared identity keeps
+/// ADC cache behavior aligned with Vertex execution/cache partitioning.
+fn credentialSourceCacheKey(
     credentials_path: ?[]const u8,
     scope: []const u8,
-) ![]u8 {
-    if (credentials_path) |path|
-        return try std.fmt.allocPrint(alloc, "file\x00{s}\x00{s}", .{ path, scope });
-    return try std.fmt.allocPrint(alloc, "default-adc\x00{s}", .{scope});
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    credential_identity.CredentialSourceIdentity.googleAdc(credentials_path).updateHash(&hasher);
+    credential_identity.updateField(&hasher, scope);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+pub fn testCredentialSourceCacheKeys() !void {
+    const default_adc = credentialSourceCacheKey(null, "scope");
+    const sentinel_file = credentialSourceCacheKey("<default-adc>", "scope");
+    const ordinary_file = credentialSourceCacheKey("credentials.json", "scope");
+    const other_scope = credentialSourceCacheKey(null, "other-scope");
+
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &sentinel_file));
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &ordinary_file));
+    try std.testing.expect(!std.mem.eql(u8, &sentinel_file, &ordinary_file));
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &other_scope));
 }
 
 test "google credential cache keys distinguish default ADC from every file path" {
-    const alloc = std.testing.allocator;
-    const default_adc = try credentialSourceCacheKeyAlloc(alloc, null, "scope");
-    defer alloc.free(default_adc);
-    const sentinel_file = try credentialSourceCacheKeyAlloc(alloc, "<default-adc>", "scope");
-    defer alloc.free(sentinel_file);
-    const ordinary_file = try credentialSourceCacheKeyAlloc(alloc, "credentials.json", "scope");
-    defer alloc.free(ordinary_file);
-
-    try std.testing.expect(!std.mem.eql(u8, default_adc, sentinel_file));
-    try std.testing.expect(!std.mem.eql(u8, default_adc, ordinary_file));
-    try std.testing.expect(!std.mem.eql(u8, sentinel_file, ordinary_file));
+    try testCredentialSourceCacheKeys();
 }
 
 test "google credential manager releases its mutex before invalidation" {
