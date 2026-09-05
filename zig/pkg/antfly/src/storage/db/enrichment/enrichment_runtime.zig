@@ -4791,6 +4791,19 @@ test "inference recovery is scoped by model and backend" {
     noteInferenceControlSuccess(&runtime, metal_key, 1);
     try checkProviderInvocation(&runtime, metal_key, true);
     try std.testing.expectEqual(@as(usize, 5), recoveryBatchCap(&runtime, metal_key));
+
+    noteInferenceControlFailure(&runtime, cpu_key, error.Timeout, 8);
+    for (0..adaptive_growth_successes) |_| noteInferenceControlSuccess(&runtime, cpu_key, 4);
+    try std.testing.expectEqual(@as(usize, 5), recoveryBatchCap(&runtime, cpu_key));
+    for (0..adaptive_growth_successes) |_| noteInferenceControlSuccess(&runtime, cpu_key, 5);
+    try std.testing.expectEqual(@as(usize, 6), recoveryBatchCap(&runtime, cpu_key));
+    for (0..adaptive_growth_successes) |_| noteInferenceControlSuccess(&runtime, cpu_key, 6);
+    try std.testing.expectEqual(@as(usize, 7), recoveryBatchCap(&runtime, cpu_key));
+
+    for (1..adaptive_probe_successes) |_| noteInferenceControlSuccess(&runtime, cpu_key, 7);
+    try std.testing.expectEqual(@as(usize, 7), recoveryBatchCap(&runtime, cpu_key));
+    noteInferenceControlSuccess(&runtime, cpu_key, 7);
+    try std.testing.expectEqual(@as(usize, 8), recoveryBatchCap(&runtime, cpu_key));
 }
 
 test "asset inference recovery uses one identity from plan through provider call" {
