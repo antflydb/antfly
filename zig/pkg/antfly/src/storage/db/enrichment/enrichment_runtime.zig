@@ -2511,6 +2511,21 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
     try guard.check();
 }
 
+fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
+    const guard = runtime.active_provider_guard;
+    const cancellation = if (guard.cancellation.ptr != null)
+        guard.cancellation
+    else
+        runtime.config.cancellation;
+    return .{
+        .io = if (runtime.io_impl) |io_impl| io_impl.io() else std.Io.Threaded.global_single_threaded.io(),
+        .deadline_ns = guard.deadline_ns orelse
+            platform_time.monotonicNs() +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms,
+        .cancellation = if (cancellation.ptr != null) cancellation else null,
+        .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
+    };
+}
+
 fn checkProviderFailureGuardRecording(
     runtime: *EnrichmentRuntime,
     recovery_key: InferenceRecoveryKey,
@@ -2544,7 +2559,7 @@ fn assetProducerProduceGuarded(
     request: asset_producer_mod.Request,
 ) ![]u8 {
     try checkAssetProviderInvocation(runtime, producer, alloc, &.{request});
-    const produced = producer.produce(alloc, request) catch |err| {
+    const produced = producer.produceWithContext(alloc, request, assetProviderRequestContext(runtime)) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };
@@ -2562,7 +2577,7 @@ fn assetProducerProduceBatchGuarded(
     requests: []const asset_producer_mod.Request,
 ) ![][]u8 {
     try checkAssetProviderInvocation(runtime, producer, alloc, requests);
-    const produced = producer.produceBatch(alloc, requests) catch |err| {
+    const produced = producer.produceBatchWithContext(alloc, requests, assetProviderRequestContext(runtime)) catch |err| {
         try checkProviderFailureGuard(runtime);
         return err;
     };

@@ -53,7 +53,7 @@ pub const Supervisor = struct {
         }
 
         fn close(self: *@This()) void {
-            if (comptime builtin.os.tag == .linux) std.posix.close(self.fd);
+            if (comptime builtin.os.tag == .linux) _ = std.posix.system.close(self.fd);
         }
 
         fn signal(self: *@This(), force: bool) void {

@@ -21,6 +21,7 @@ const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
+const RequestContext = @import("inference/request_context.zig").RequestContext;
 
 const Allocator = std.mem.Allocator;
 const local_reader_batch_max_images: usize = 64;
@@ -83,7 +84,13 @@ pub const Runtime = struct {
             // A caller-owned HTTP client may not have a finite request timeout,
             // so this borrowed interface cannot advertise the foreground
             // liveness contract.
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch },
+            .vtable = &.{
+                .produce = produce,
+                .produce_with_context = produceWithContext,
+                .produce_batch = produceBatch,
+                .produce_batch_with_context = produceBatchWithContext,
+                .can_produce_batch = canProduceBatch,
+            },
         };
     }
 
@@ -92,7 +99,9 @@ pub const Runtime = struct {
             .ptr = self,
             .vtable = &.{
                 .produce = produce,
+                .produce_with_context = produceWithContext,
                 .produce_batch = produceBatch,
+                .produce_batch_with_context = produceBatchWithContext,
                 .can_produce_batch = canProduceBatch,
                 .deinit = deinitProducer,
                 .foreground_bounded = true,
@@ -126,9 +135,10 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(parsed.generator.provider == .antfly and
-                    parsed.generator.url.len == 0 and
-                    (local.generate_messages != null or local.generate_text != null));
+                const routes_local = parsed.generator.provider == .antfly and parsed.generator.url.len == 0;
+                break :blk !routes_local or
+                    local.generate_messages_with_context != null or
+                    local.generate_text_with_context != null;
             },
             .reader => blk: {
                 var parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
@@ -137,8 +147,8 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
-                    local.read_images != null);
+                break :blk !isLocalReaderProvider(parsed.value.provider, parsed.value.resolvedUrl()) or
+                    local.read_images_with_context != null;
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
@@ -147,15 +157,15 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl()) and
-                    local.transcribe_audio != null);
+                break :blk !isLocalTranscriberProvider(parsed.value.provider, parsed.value.resolvedUrl()) or
+                    local.transcribe_audio_with_context != null;
             },
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 const local = self.antfly_provider orelse break :blk true;
-                break :blk !(isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl()) and
-                    local.extract != null);
+                break :blk !isLocalExtractionProvider(parsed.provider, parsed.resolvedUrl()) or
+                    local.extract_with_context != null;
             },
         };
     }
@@ -168,7 +178,12 @@ pub const Runtime = struct {
 
     fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
-        return try self.produceOne(alloc, request);
+        return try self.produceOne(alloc, request, null);
+    }
+
+    fn produceWithContext(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request, context: RequestContext) ![]u8 {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        return try self.produceOne(alloc, request, context);
     }
 
     fn canProduceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !bool {
@@ -252,35 +267,46 @@ pub const Runtime = struct {
         defer cfg.deinit(alloc);
         if (!isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) return true;
         const local = self.antfly_provider orelse return false;
-        return local.extract != null;
+        return local.extract != null or local.extract_with_context != null;
     }
 
-    fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request, context: ?RequestContext) ![]u8 {
+        if (context) |active| try active.check();
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
             .document_extraction => error.UnsupportedAssetProducer,
-            .generator => try self.generate(alloc, request),
-            .reader => try self.read(alloc, request),
-            .transcriber => try self.transcribe(alloc, request),
-            .extractor => try self.extract(alloc, request),
+            .generator => try self.generate(alloc, request, context),
+            .reader => try self.read(alloc, request, context),
+            .transcriber => try self.transcribe(alloc, request, context),
+            .extractor => try self.extract(alloc, request, context),
         };
     }
 
     fn produceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
+        return try self.produceBatchImpl(alloc, requests, null);
+    }
+
+    fn produceBatchWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: RequestContext) ![][]u8 {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        return try self.produceBatchImpl(alloc, requests, context);
+    }
+
+    fn produceBatchImpl(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, context: ?RequestContext) ![][]u8 {
+        if (context) |active| try active.check();
         if (requests.len == 0) return try alloc.alloc([]u8, 0);
 
         const first_type = requests[0].producer_type;
         for (requests) |request| {
-            if (request.producer_type != first_type) return try self.produceBatchSequential(alloc, requests);
+            if (request.producer_type != first_type) return try self.produceBatchSequential(alloc, requests, context);
         }
 
         const batch_result = switch (first_type) {
             .copy => self.produceCopyBatch(alloc, requests),
-            .reader => self.tryReadBatch(alloc, requests),
+            .reader => self.tryReadBatch(alloc, requests, context),
             .generator => self.tryGenerateBatch(alloc, requests),
-            .extractor => self.tryExtractBatch(alloc, requests),
-            .transcriber => self.tryTranscribeBatch(alloc, requests),
+            .extractor => self.tryExtractBatch(alloc, requests, context),
+            .transcriber => self.tryTranscribeBatch(alloc, requests, context),
             .document_extraction => error.BatchIncompatible,
         };
         if (batch_result) |items| {
@@ -289,7 +315,7 @@ pub const Runtime = struct {
             error.BatchIncompatible => {},
             else => return err,
         }
-        return try self.produceBatchSequential(alloc, requests);
+        return try self.produceBatchSequential(alloc, requests, context);
     }
 
     fn produceCopyBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -308,7 +334,7 @@ pub const Runtime = struct {
         return out;
     }
 
-    fn produceBatchSequential(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+    fn produceBatchSequential(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, context: ?RequestContext) ![][]u8 {
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
             for (out) |item| {
@@ -318,12 +344,13 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            out[i] = try self.produceOne(alloc, request);
+            if (context) |active| try active.check();
+            out[i] = try self.produceOne(alloc, request, context);
         }
         return out;
     }
 
-    fn tryExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+    fn tryExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, context: ?RequestContext) ![][]u8 {
         for (requests) |request| {
             if (request.producer_type != .extractor) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
@@ -353,6 +380,10 @@ pub const Runtime = struct {
         };
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.BatchIncompatible;
+            if (context) |active| {
+                const extract_fn = local.extract_with_context orelse return error.BatchIncompatible;
+                break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request, active);
+            }
             const extract_fn = local.extract orelse return error.BatchIncompatible;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
@@ -410,7 +441,7 @@ pub const Runtime = struct {
         };
     }
 
-    fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+    fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, context: ?RequestContext) ![][]u8 {
         for (requests) |request| {
             if (request.producer_type != .transcriber) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
@@ -423,7 +454,6 @@ pub const Runtime = struct {
         defer cfg_parsed.deinit();
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
-        const transcribe_audio = local.transcribe_audio orelse return error.BatchIncompatible;
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -434,10 +464,18 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
-            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            if (context) |active| try active.check();
+            const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
-            });
+            };
+            var result = if (context) |active| blk: {
+                const transcribe_audio = local.transcribe_audio_with_context orelse return error.BatchIncompatible;
+                break :blk try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", transcribe_request, active);
+            } else blk: {
+                const transcribe_audio = local.transcribe_audio orelse return error.BatchIncompatible;
+                break :blk try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", transcribe_request);
+            };
             defer transcribing.deinitResponse(alloc, &result);
 
             out[i] = if (isJsonContentType(request.content_type))
@@ -448,7 +486,7 @@ pub const Runtime = struct {
         return out;
     }
 
-    fn tryReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+    fn tryReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, context: ?RequestContext) ![][]u8 {
         for (requests) |request| {
             if (request.producer_type != .reader) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
@@ -503,13 +541,14 @@ pub const Runtime = struct {
         while (image_offset < flat_images.items.len) {
             const image_end = @min(image_offset + local_reader_batch_max_images, flat_images.items.len);
             const chunk_images = flat_images.items[image_offset..image_end];
+            if (context) |active| try active.check();
             const chunk_results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
                 .images = chunk_images,
                 .prompt = shared_prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
                 .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                 .source_fingerprint = requests[0].source_fingerprint,
-            });
+            }, context);
             if (chunk_results.len != chunk_images.len) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
                 alloc.free(chunk_results);
@@ -544,7 +583,7 @@ pub const Runtime = struct {
         return out;
     }
 
-    fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request, context: ?RequestContext) ![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
         const cfg = parsed_cfg.generator;
@@ -559,6 +598,7 @@ pub const Runtime = struct {
         var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
             .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
+            .request_context = context,
         }, &.{
             .{ .role = .user, .content = content },
         });
@@ -569,7 +609,7 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, result.content);
     }
 
-    fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request, context: ?RequestContext) ![]u8 {
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
@@ -585,7 +625,7 @@ pub const Runtime = struct {
             .max_tokens = cfg_parsed.value.max_tokens,
             .inline_content_trust = if (request.inline_media_trusted) .trusted_internal else .untrusted,
             .source_fingerprint = request.source_fingerprint,
-        });
+        }, context);
         defer {
             for (results) |*result| readers.deinitResult(alloc, result);
             alloc.free(results);
@@ -593,9 +633,13 @@ pub const Runtime = struct {
         return try encodeReaderResults(alloc, request.content_type, results);
     }
 
-    fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
+    fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request, context: ?RequestContext) ![]readers.Result {
         if (isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
+            if (context) |active| {
+                const read_images = local.read_images_with_context orelse return error.UncancellableInferenceProvider;
+                return try read_images(local.ptr, alloc, cfg.model orelse "", request, active);
+            }
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             return try read_images(local.ptr, alloc, cfg.model orelse "", request);
         }
@@ -612,7 +656,7 @@ pub const Runtime = struct {
         return try provider.read(alloc, request);
     }
 
-    fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request, context: ?RequestContext) ![]u8 {
         var cfg_parsed = try std.json.parseFromSlice(transcribing.Config, alloc, request.config_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
@@ -621,11 +665,17 @@ pub const Runtime = struct {
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
-            const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
-            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
-            });
+            };
+            var result = if (context) |active| blk: {
+                const transcribe_audio = local.transcribe_audio_with_context orelse return error.UncancellableInferenceProvider;
+                break :blk try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", transcribe_request, active);
+            } else blk: {
+                const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
+                break :blk try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", transcribe_request);
+            };
             defer transcribing.deinitResponse(alloc, &result);
 
             if (isJsonContentType(request.content_type)) {
@@ -652,7 +702,7 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, result.text orelse "");
     }
 
-    fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request, context: ?RequestContext) ![]u8 {
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
         defer cfg.deinit(alloc);
 
@@ -667,6 +717,10 @@ pub const Runtime = struct {
 
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
+            if (context) |active| {
+                const extract_fn = local.extract_with_context orelse return error.UncancellableInferenceProvider;
+                break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request, active);
+            }
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
@@ -1439,6 +1493,11 @@ test "owned asset producer foreground contract follows the selected route" {
         fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
             return error.TestUnexpectedResult;
         }
+
+        fn readImagesWithContext(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request, context: RequestContext) ![]readers.Result {
+            try context.check();
+            return error.TestUnexpectedResult;
+        }
     };
 
     var local = Local{};
@@ -1460,6 +1519,17 @@ test "owned asset producer foreground contract follows the selected route" {
         .producer_type = .copy,
         .config_json = "",
         .source_text = "copy",
+    }}));
+
+    var controlled_provider = local.provider();
+    controlled_provider.read_images_with_context = Local.readImagesWithContext;
+    const controlled_runtime = try Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = controlled_provider });
+    const controlled = controlled_runtime.ownedProducer();
+    defer controlled.deinit(alloc);
+    try std.testing.expect(try controlled.foregroundBoundedForRequests(alloc, &.{.{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+        .source_text = "image",
     }}));
 }
 

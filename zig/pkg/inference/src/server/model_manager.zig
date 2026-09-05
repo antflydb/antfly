@@ -3302,31 +3302,29 @@ const LoadFlight = struct {
     io: std.Io,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
-    /// Protected by ModelManager.load_lock. The owner starts with one reference;
-    /// every waiter takes one before dropping the manager lock.
-    refs: usize = 1,
-    /// Active request waiters other than the synchronous load owner. Once a
-    /// waiter joins, the shared initialization must no longer inherit the
-    /// owner's shorter deadline or cancellation token.
-    waiters: std.atomic.Value(usize) = .init(0),
-    /// The owner already receives a model handle directly from the uncached
-    /// load. Keep its flight reference distinguishable so retirement reserves
-    /// handles only for waiters that have not adopted theirs yet.
-    owner_ref_pending: bool = true,
+    /// Protected by ModelManager.load_lock. The manager-owned task holds one
+    /// reference and every request waiter holds another.
+    refs: usize = 2,
+    /// Active request waiters. The terminal `abandoned` state prevents a new
+    /// request from joining initialization after the final waiter has left.
+    waiters: std.atomic.Value(usize) = .init(1),
+    /// Distinguishes the manager task reference so retirement reserves handles
+    /// only for request waiters that have not adopted theirs yet.
+    task_ref_pending: bool = true,
     /// A retired model detaches its completed flight so a replacement can use
     /// the same key. Detached flights live until existing waiters consume them.
     registered: bool = true,
     /// Retirement reserves one active model handle for every remaining flight
     /// waiter. Waiters adopt those reservations instead of incrementing the
-    /// handle count a second time; the owner already has its handle.
+    /// handle count a second time.
     handles_reserved: bool = false,
 
-    const owner_cancelled = std.math.maxInt(usize);
+    const abandoned = std.math.maxInt(usize);
 
     fn tryAddWaiter(self: *LoadFlight) bool {
         var current = self.waiters.load(.acquire);
-        while (current != owner_cancelled) {
-            std.debug.assert(current < owner_cancelled - 1);
+        while (current != abandoned) {
+            std.debug.assert(current < abandoned - 1);
             if (self.waiters.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
                 current = observed;
             } else return true;
@@ -3334,70 +3332,75 @@ const LoadFlight = struct {
         return false;
     }
 
+    fn releaseWaiter(self: *LoadFlight, abandon_if_last: bool) void {
+        var current = self.waiters.load(.acquire);
+        while (true) {
+            std.debug.assert(current != abandoned and current > 0);
+            const next = if (abandon_if_last and current == 1) abandoned else current - 1;
+            if (self.waiters.cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return;
+        }
+    }
+
     fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
-        std.debug.assert(self.refs >= @intFromBool(self.owner_ref_pending));
-        return self.refs - @intFromBool(self.owner_ref_pending);
+        std.debug.assert(self.refs >= @intFromBool(self.task_ref_pending));
+        return self.refs - @intFromBool(self.task_ref_pending);
     }
 };
 
-const SharedLoadControl = struct {
+const LoadFlightControl = struct {
     flight: *LoadFlight,
-    owner: InferenceExecutionControl,
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        self.owner.check() catch |err| {
-            const observed = self.flight.waiters.cmpxchgStrong(
-                0,
-                LoadFlight.owner_cancelled,
-                .acq_rel,
-                .acquire,
-            );
-            if (observed == null or observed.? == LoadFlight.owner_cancelled) return err;
-            // A waiter won the race. The shared load now belongs to that
-            // waiter too, so the original owner's lifetime cannot abort it.
-        };
+        if (self.flight.waiters.load(.acquire) == LoadFlight.abandoned)
+            return error.Cancelled;
     }
 
     fn control(self: *@This()) InferenceExecutionControl {
         return .{
             .ptr = self,
             .check_fn = check,
-            .progress = self.owner.progress,
         };
     }
 };
 
-test "shared model load stops inheriting owner cancellation after a waiter joins" {
-    var cancelled = std.atomic.Value(bool).init(true);
-    var owner_only = LoadFlight{ .io = std.testing.io };
-    var shared = SharedLoadControl{
-        .flight = &owner_only,
-        .owner = .{
-            .cancellation = .{
-                .ptr = &cancelled,
-                .is_cancelled_fn = struct {
-                    fn check(raw: ?*anyopaque) bool {
-                        const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
-                        return signal.load(.acquire);
-                    }
-                }.check,
-            },
-        },
-    };
-    try std.testing.expectError(error.Cancelled, shared.control().check());
+const LoadTask = struct {
+    manager: *ModelManager,
+    flight: *LoadFlight,
+    flight_key: []u8,
+    model_dir: []u8,
+    preferred_backends: []backends.BackendType,
+    session_manager: backends.SessionManager,
+    cache_default_alias: bool,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 
-    var joined = LoadFlight{ .io = std.testing.io };
-    try std.testing.expect(joined.tryAddWaiter());
-    shared.flight = &joined;
-    try shared.control().check();
-    try std.testing.expect(!owner_only.tryAddWaiter());
+    fn deinit(self: *@This()) void {
+        const allocator = self.manager.allocator;
+        allocator.free(self.flight_key);
+        allocator.free(self.model_dir);
+        allocator.free(self.preferred_backends);
+        allocator.destroy(self);
+    }
+};
+
+test "manager load flight remains active until its final waiter leaves" {
+    var flight = LoadFlight{ .io = std.testing.io };
+    var load_control = LoadFlightControl{ .flight = &flight };
+    try load_control.control().check();
+    try std.testing.expect(flight.tryAddWaiter());
+    flight.releaseWaiter(true);
+    try load_control.control().check();
+    flight.releaseWaiter(true);
+    try std.testing.expectError(error.Cancelled, load_control.control().check());
+    try std.testing.expect(!flight.tryAddWaiter());
 }
 
-test "load flight retirement reservations exclude the owner handle" {
+test "load flight retirement reservations exclude the manager task" {
     var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
     try std.testing.expectEqual(@as(usize, 2), flight.unadoptedWaiterRefs());
-    flight.owner_ref_pending = false;
+    flight.task_ref_pending = false;
     try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
 }
 
@@ -3816,6 +3819,11 @@ pub const ModelManager = struct {
     eviction_group: std.Io.Group = .init,
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
+    /// Cold initialization is owned by the manager rather than whichever
+    /// request happened to miss the cache first. Request waiters may therefore
+    /// cancel independently without invalidating shared work.
+    load_group: std.Io.Group = .init,
+    load_io: ?std.Io = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
     in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
@@ -5579,6 +5587,7 @@ pub const ModelManager = struct {
     }
 
     pub fn deinit(self: *ModelManager) void {
+        if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
         std.debug.assert(self.in_flight_whisper_assets.count() == 0);
@@ -6276,6 +6285,36 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
+    fn runLoadTask(task: *LoadTask) std.Io.Cancelable!void {
+        defer task.deinit();
+        const manager = task.manager;
+        defer manager.releaseLoadFlight(task.flight_key, task.flight);
+
+        var load_control = LoadFlightControl{ .flight = task.flight };
+        var handle = manager.loadFromDirUncached(
+            task.model_dir,
+            &task.session_manager,
+            task.cache_default_alias,
+            task.a4b_request,
+            load_control.control(),
+        ) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        load_control.control().check() catch |err| {
+            // loadFromDirUncached publishes before returning. If every waiter
+            // left during its final non-suspending section, retire that orphan
+            // instead of leaving an unused runtime resident.
+            handle.retire();
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.finishLoadFlight(task.flight, handle.get(), null);
+        // The task owns only the construction handle. Request waiters adopt
+        // their own handles from the completed flight.
+        handle.release();
+    }
+
     fn releaseLoadFlight(
         self: *ModelManager,
         flight_key: []const u8,
@@ -6283,8 +6322,8 @@ pub const ModelManager = struct {
     ) void {
         var removed_key: ?[]const u8 = null;
         self.lockLoadedModels();
-        std.debug.assert(flight.owner_ref_pending);
-        flight.owner_ref_pending = false;
+        std.debug.assert(flight.task_ref_pending);
+        flight.task_ref_pending = false;
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         if (flight.refs != 0) {
@@ -6311,7 +6350,7 @@ pub const ModelManager = struct {
     ) !ModelHandle {
         while (!flight.completed.isSet()) {
             if (control) |active| active.update(.loading_model, 0, 1) catch |err| {
-                self.releaseLoadFlightWaiter(flight_key, flight);
+                self.releaseLoadFlightWaiter(flight_key, flight, true);
                 return err;
             };
             flight.completed.waitTimeout(flight.io, .{
@@ -6322,7 +6361,7 @@ pub const ModelManager = struct {
             }) catch |err| switch (err) {
                 error.Timeout => continue,
                 else => {
-                    self.releaseLoadFlightWaiter(flight_key, flight);
+                    self.releaseLoadFlightWaiter(flight_key, flight, true);
                     return err;
                 },
             };
@@ -6337,8 +6376,7 @@ pub const ModelManager = struct {
         }
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
-        const previous_waiters = flight.waiters.fetchSub(1, .acq_rel);
-        std.debug.assert(previous_waiters > 0);
+        flight.releaseWaiter(false);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6352,6 +6390,13 @@ pub const ModelManager = struct {
 
         if (removed_key) |key| self.allocator.free(key);
         if (destroy_flight) self.allocator.destroy(flight);
+        if (control) |active| active.check() catch |err| {
+            if (model) |loaded| {
+                var handle = ModelHandle{ .manager = self, .model = loaded };
+                handle.release();
+            }
+            return err;
+        };
         if (maybe_err) |err| return err;
         return .{
             .manager = self,
@@ -6359,14 +6404,18 @@ pub const ModelManager = struct {
         };
     }
 
-    fn releaseLoadFlightWaiter(self: *ModelManager, flight_key: []const u8, flight: *LoadFlight) void {
+    fn releaseLoadFlightWaiter(
+        self: *ModelManager,
+        flight_key: []const u8,
+        flight: *LoadFlight,
+        abandon_if_last: bool,
+    ) void {
         var removed_key: ?[]const u8 = null;
         var destroy_flight = false;
         self.lockLoadedModels();
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
-        const previous_waiters = flight.waiters.fetchSub(1, .acq_rel);
-        std.debug.assert(previous_waiters > 0);
+        flight.releaseWaiter(abandon_if_last);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6438,7 +6487,7 @@ pub const ModelManager = struct {
         // and embedded owners can provide different runtime implementations.
         // The process-local fallback is only for offline callers that do not
         // attach a runtime.
-        const coordination_io = self.session_manager.io orelse
+        const coordination_io = self.load_io orelse self.session_manager.io orelse
             std.Io.Threaded.global_single_threaded.io();
         flight.* = .{
             .io = coordination_io,
@@ -6448,7 +6497,31 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return err;
         };
-        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+        const task = self.allocator.create(LoadTask) catch |err| {
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_model_dir = self.allocator.dupe(u8, model_dir) catch |err| {
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_backends = self.allocator.dupe(backends.BackendType, effective_backends) catch |err| {
+            self.allocator.free(task_model_dir);
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
             self.allocator.free(owned_flight_key);
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
@@ -6459,34 +6532,32 @@ pub const ModelManager = struct {
         // runtime for its complete construction.
         var session_manager = sessionManagerForPreferredBackends(
             self.allocator,
-            effective_backends,
+            task_backends,
             &self.session_manager,
         );
+        session_manager.io = coordination_io;
         session_manager.a4b_inference_request = policy.a4b_request;
+        task.* = .{
+            .manager = self,
+            .flight = flight,
+            .flight_key = task_flight_key,
+            .model_dir = task_model_dir,
+            .preferred_backends = task_backends,
+            .session_manager = session_manager,
+            .cache_default_alias = cache_default_alias,
+            .a4b_request = policy.a4b_request,
+        };
+        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+            task.deinit();
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        if (self.load_io == null) self.load_io = coordination_io;
         self.unlockLoadedModels();
-
-        var shared_load_control = if (control) |owner|
-            SharedLoadControl{ .flight = flight, .owner = owner }
-        else
-            null;
-        var handle = self.loadFromDirUncached(
-            model_dir,
-            &session_manager,
-            cache_default_alias,
-            policy.a4b_request,
-            if (shared_load_control) |*shared| shared.control() else null,
-        ) catch |err| {
-            self.finishLoadFlight(flight, null, err);
-            self.releaseLoadFlight(flight_key, flight);
-            return err;
-        };
-        self.finishLoadFlight(flight, handle.get(), null);
-        self.releaseLoadFlight(flight_key, flight);
-        if (control) |active| active.check() catch |err| {
-            handle.release();
-            return err;
-        };
-        return handle;
+        self.load_group.async(coordination_io, runLoadTask, .{task});
+        return self.waitForLoadFlight(flight_key, flight, control);
     }
 
     fn loadFromDirUncached(
@@ -6718,6 +6789,11 @@ pub const ModelManager = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
+
+        // Keep publication behind the same cooperative boundary as expensive
+        // construction. An abandoned manager task should release its fully
+        // built model through the armed errdefers, not briefly expose it.
+        if (control) |active| try active.update(.loading_model, 4, 4);
 
         // The fully initialized model is now the sole owner. Disarm every
         // construction errdefer before publishLoadedModel takes responsibility
@@ -7299,7 +7375,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         .io = std.testing.io,
         .model = &model,
         .refs = 2,
-        .owner_ref_pending = false,
+        .task_ref_pending = false,
     };
     try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
 

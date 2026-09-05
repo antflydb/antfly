@@ -17,6 +17,7 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const RequestContext = @import("../inference/request_context.zig").RequestContext;
 const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
@@ -47,6 +48,7 @@ pub const BackendFactory = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
+    request_context: ?RequestContext = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -64,6 +66,7 @@ pub const BackendFactory = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
+        request_context: ?RequestContext = null,
     };
 
     pub fn initWithOptions(
@@ -77,6 +80,7 @@ pub const BackendFactory = struct {
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
+            .request_context = options.request_context,
         };
     }
 
@@ -89,7 +93,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.request_context);
     }
 };
 
@@ -99,6 +103,7 @@ const BackendState = struct {
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
+    request_context: ?RequestContext = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -114,6 +119,7 @@ const BackendState = struct {
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
+        request_context: ?RequestContext,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -128,6 +134,7 @@ const BackendState = struct {
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
+        state.request_context = request_context;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
@@ -221,14 +228,22 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
-                if (local.generate_messages) |generate_messages| {
+                if (self.request_context) |context| {
+                    try context.check();
+                    if (local.generate_messages_with_context) |generate_messages| {
+                        const content = try generate_messages(local.ptr, alloc, model, messages, context);
+                        break :blk inference.GenerateResult{
+                            .content = content,
+                            .allocator = alloc,
+                        };
+                    }
+                } else if (local.generate_messages) |generate_messages| {
                     const content = try generate_messages(local.ptr, alloc, model, messages);
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
                     };
                 }
-                const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
                 const contents = try alloc.alloc([]const u8, messages.len);
@@ -237,7 +252,13 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = try generate_text(local.ptr, alloc, model, roles, contents);
+                const content = if (self.request_context) |context| blk_content: {
+                    const generate_text = local.generate_text_with_context orelse return error.UncancellableInferenceProvider;
+                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents, context);
+                } else blk_content: {
+                    const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
+                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents);
+                };
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,

@@ -166,11 +166,26 @@ pub const AntflyProvider = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) anyerror![]u8 = null,
+    generate_text_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        context: RequestContext,
+    ) anyerror![]u8 = null,
     generate_messages: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+    ) anyerror![]u8 = null,
+    generate_messages_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        context: RequestContext,
     ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,
@@ -185,17 +200,38 @@ pub const AntflyProvider = struct {
         model: []const u8,
         request: transcribing.Request,
     ) anyerror!transcribing.Response = null,
+    transcribe_audio_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: transcribing.Request,
+        context: RequestContext,
+    ) anyerror!transcribing.Response = null,
     read_images: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         request: readers.Request,
     ) anyerror![]readers.Result = null,
+    read_images_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.Request,
+        context: RequestContext,
+    ) anyerror![]readers.Result = null,
     extract: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         request: extracting.Request,
+    ) anyerror!extracting.Response = null,
+    extract_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: extracting.Request,
+        context: RequestContext,
     ) anyerror!extracting.Response = null,
     /// Returns the task-keyed /ai/v1/models JSON body for the embedded node.
     list_models_json: ?*const fn (

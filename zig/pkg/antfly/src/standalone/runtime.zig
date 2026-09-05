@@ -4972,10 +4972,15 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .rerank_texts = inferenceProviderRerankTexts,
         .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
         .generate_text = inferenceProviderGenerateText,
+        .generate_text_with_context = inferenceProviderGenerateTextWithContext,
         .generate_messages = inferenceProviderGenerateMessages,
+        .generate_messages_with_context = inferenceProviderGenerateMessagesWithContext,
         .read_images = inferenceProviderReadImages,
+        .read_images_with_context = inferenceProviderReadImagesWithContext,
         .transcribe_audio = inferenceProviderTranscribeAudio,
+        .transcribe_audio_with_context = inferenceProviderTranscribeAudioWithContext,
         .extract = inferenceProviderExtract,
+        .extract_with_context = inferenceProviderExtractWithContext,
         .list_models_json = inferenceProviderListModelsJson,
     };
 }
@@ -4988,6 +4993,7 @@ fn invokeInferenceProvider(
     request: anytype,
     request_context: ?antfly.inference.RequestContext,
 ) !Result {
+    if (request_context) |context| try context.check();
     const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
     var call_guard = try lifetime.acquire();
     defer call_guard.deinit();
@@ -5052,6 +5058,7 @@ fn invokeInferenceProvider(
         inference_host.linkedInferenceDestroyProviderResponse(owned_response)
     else
         linkedInferenceApiInfallible().destroy_provider_response(owned_response);
+    if (request_context) |active| try active.check();
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -5409,6 +5416,21 @@ fn inferenceProviderGenerateText(
     }, null);
 }
 
+fn inferenceProviderGenerateTextWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    context: antfly.inference.RequestContext,
+) anyerror![]u8 {
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, .{
+        .model = model,
+        .roles = roles,
+        .contents = contents,
+    }, context);
+}
+
 fn inferenceProviderGenerateMessages(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -5419,6 +5441,19 @@ fn inferenceProviderGenerateMessages(
         .model = model,
         .messages = messages,
     }, null);
+}
+
+fn inferenceProviderGenerateMessagesWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+    context: antfly.inference.RequestContext,
+) anyerror![]u8 {
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, .{
+        .model = model,
+        .messages = messages,
+    }, context);
 }
 
 fn inferenceProviderReadImages(
@@ -5433,6 +5468,19 @@ fn inferenceProviderReadImages(
     }, null);
 }
 
+fn inferenceProviderReadImagesWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.Request,
+    context: antfly.inference.RequestContext,
+) anyerror![]antfly.readers.Result {
+    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
+        .model = model,
+        .request = request,
+    }, context);
+}
+
 fn inferenceProviderTranscribeAudio(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -5445,6 +5493,19 @@ fn inferenceProviderTranscribeAudio(
     }, null);
 }
 
+fn inferenceProviderTranscribeAudioWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.transcribing.Request,
+    context: antfly.inference.RequestContext,
+) anyerror!antfly.transcribing.Response {
+    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
+        .model = model,
+        .request = request,
+    }, context);
+}
+
 fn inferenceProviderExtract(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -5455,6 +5516,20 @@ fn inferenceProviderExtract(
         .model = model,
         .request = request,
     }, null);
+    return .{ .allocator = alloc, .json = json };
+}
+
+fn inferenceProviderExtractWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.extracting.Request,
+    context: antfly.inference.RequestContext,
+) anyerror!antfly.extracting.Response {
+    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
+        .model = model,
+        .request = request,
+    }, context);
     return .{ .allocator = alloc, .json = json };
 }
 
