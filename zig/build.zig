@@ -3738,6 +3738,8 @@ pub fn build(b: *std.Build) void {
         "backend runtime rejects API lane leases after shutdown begins",
         "backend runtime control lane leases are isolated from API leases",
         "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime exposes the cancellation-safe connector on every owned lane",
+        "backend runtime exposes native API filesystem IO separately",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "table runtime snapshot cache preserves active managed admission proof",
@@ -4713,7 +4715,7 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
-        "data runtime startup catch-up clears no-debt busy writer groups",
+        "data runtime startup catch-up retains deferred inspection despite clean cached status",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
@@ -5861,6 +5863,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_connections_test_mod,
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
+            "connection filesystem probes use the explicit filesystem authority",
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
@@ -5901,7 +5904,6 @@ pub fn build(b: *std.Build) void {
             "cluster backup and restore reject duplicate table selectors",
             "backup API requests reject unknown operational fields",
             "backup manifest round trips through metadata path",
-            "backup manifest round trips through remote objectstore location",
             "current Go portable metadata envelope materializes into a verified Zig manifest",
             "current Go portable metadata parsing is allocation failure safe",
             "current Go portable cluster envelope resolves table metadata ids",
@@ -5964,7 +5966,11 @@ pub fn build(b: *std.Build) void {
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
             "owned backup runtime has a finite worker ceiling",
+            "remote backup connection retains network io instead of filesystem io",
+            "dynamic gcs credentials borrow distinct network and filesystem authorities",
+            "dynamic s3 profile and web identity retain explicit credential authorities",
             "backup staging uses configured storage authority and exclusive generations",
+            "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
         },
@@ -6704,8 +6710,7 @@ pub fn build(b: *std.Build) void {
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
             "api http maps missing physical index only for rebuilding lifecycle",
-            "api http missing index classification requires active rebuild evidence",
-            "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
+            "api http classifies catalog-to-serving index convergence without runtime status",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index installs exact visible config and defers lagging projection",
             "api http server create index expands schema-derived algebraic config",
@@ -8375,6 +8380,8 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
+    unit_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+    unit_test_step.dependOn(&run_lib_api_connections_tests.step);
     unit_test_step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
 
     const db_enrichment_tests = b.addTest(.{

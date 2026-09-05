@@ -890,7 +890,8 @@ pub const BackendRuntime = struct {
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
     /// caller-owned and does not imply that background scheduling is enabled.
     pub fn filesystemIo(self: *BackendRuntime) ?Io {
-        return self.io() orelse self.borrowed_filesystem_io;
+        if (comptime builtin.os.tag == .freestanding) return self.borrowed_filesystem_io;
+        return if (self.io_impl) |io_impl| io_impl.io() else self.borrowed_filesystem_io;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -1000,6 +1001,16 @@ pub const BackendRuntime = struct {
     pub fn apiNetworkIo(self: *BackendRuntime) ?Io {
         const io_impl = self.apiIoImpl() orelse return null;
         return self.threadedNetworkIo(io_impl);
+    }
+
+    /// Native API-lane I/O for local filesystem repository operations. The
+    /// connector vtable is intentionally scoped to network transport work;
+    /// substituting it across a request-owned filesystem syscall can surface
+    /// the transport reader's `ReadFailed` classification instead of the OS
+    /// path error.
+    pub fn apiFilesystemIo(self: *BackendRuntime) ?Io {
+        const io_impl = self.apiIoImpl() orelse return null;
+        return io_impl.io();
     }
 
     pub const ApiLaneLease = struct {
@@ -2214,6 +2225,43 @@ test "backend runtime native API lane preserves filesystem errors across executo
     const control_io = handle.ptr().controlIo().?;
     var future = try control_io.concurrent(Probe.run, .{api_io});
     try future.await(control_io);
+}
+
+test "backend runtime exposes native API filesystem IO separately" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const api_io = handle.ptr().apiFilesystemIo().?;
+    try std.testing.expect(api_io.vtable == handle.ptr().api_io_impl.?.io().vtable);
+    try std.testing.expect(api_io.vtable != handle.ptr().apiIo().?.vtable);
+    try std.testing.expect(handle.ptr().filesystemIo().?.vtable == handle.ptr().io_impl.?.io().vtable);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        api_io,
+        root,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(absolute_root);
+    const missing = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/missing",
+        .{absolute_root},
+    );
+    defer std.testing.allocator.free(missing);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(api_io, missing, .{}),
+    );
 }
 
 test "backend runtime rejects control lane leases after shutdown begins" {

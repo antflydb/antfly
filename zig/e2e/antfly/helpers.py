@@ -93,19 +93,38 @@ def wait_until(
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        retry_delay_s = interval_s
         try:
             result = fn()
         except requests.HTTPError as err:
             response = err.response
-            if (
-                response is not None
-                and response.status_code == 503
-                and "doc identity unavailable" in response.text
-            ):
+            retryable = False
+            if response is not None and response.status_code == 503:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                retryable = (
+                    isinstance(payload, dict) and payload.get("retryable") is True
+                )
+                # Preserve compatibility with older servers that returned the
+                # original transient identity response as plain text.
+                retryable = retryable or "doc identity unavailable" in response.text
+                if retryable:
+                    try:
+                        retry_delay_s = max(
+                            interval_s,
+                            float(response.headers.get("Retry-After", interval_s)),
+                        )
+                    except ValueError:
+                        retry_delay_s = interval_s
+            if retryable:
                 result = None
             else:
                 raise
         if ready_when(result) if ready_when is not None else bool(result):
             return result
-        time.sleep(interval_s)
+        remaining_s = deadline - time.monotonic()
+        if remaining_s > 0:
+            time.sleep(min(retry_delay_s, remaining_s))
     return None

@@ -3120,7 +3120,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     );
@@ -3314,7 +3314,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     ));

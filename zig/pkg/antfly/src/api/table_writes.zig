@@ -7360,6 +7360,11 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    pub const DeferredStartupCatchUp = struct {
+        group_id: u64,
+        generation: u64,
+    };
+
     pub const LocalChangeKind = enum {
         data,
         index_repair,
@@ -7370,6 +7375,10 @@ pub const ProvisionedTableWriteSource = struct {
         /// Readiness-neutral owner telemetry. The data runtime refreshes its
         /// local snapshot promptly but rate-limits metadata heartbeats.
         runtime_activity,
+        /// Startup inspection could not acquire this exact shard. The data
+        /// runtime retains a keyed retry and re-drives it after the conflicting
+        /// group owner releases admission.
+        startup_catch_up,
         /// An in-place schema/index reconciliation published fresh runtime
         /// state without replacing the shard root generation.
         runtime_reconciled,
@@ -8078,6 +8087,10 @@ pub const ProvisionedTableWriteSource = struct {
     // this node-local generation before observing status and may retire only
     // that exact edge, including across activity-entry prune/recreate (ABA).
     next_repair_handoff_generation: u64 = 1,
+    // Protected by table_activity_mutex. Exact startup retry generations make
+    // stale-route cleanup conditional, so an older scan cannot remove a newer
+    // deferral for a reused group key.
+    next_startup_catch_up_deferred_generation: u64 = 1,
 
     const Lifecycle = enum(u8) {
         open,
@@ -8101,6 +8114,12 @@ pub const ProvisionedTableWriteSource = struct {
         // so continuous polling cannot extend the drain.
         structural_waiters: usize = 0,
         operation_active: bool = false,
+        // Ordinary startup catch-up observed this exact shard while another
+        // lifecycle owner held admission. Keep the entry alive until catch-up
+        // is admitted; group-owner release uses it as a coalesced wake edge.
+        startup_catch_up_deferred: bool = false,
+        startup_catch_up_deferred_generation: u64 = 0,
+        startup_catch_up_wake_armed: bool = false,
         // Reserved before an exclusive group operation waits for admitted
         // readers to drain. Without this reservation, newly arriving reads
         // can repeatedly overtake a committed Raft apply and starve the
@@ -8481,10 +8500,12 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn withRestoreAccess(
         self: *ProvisionedTableWriteSource,
         node_config: ?*const @import("../common/config.zig").Config,
-        io: ?std.Io,
+        network_io: ?std.Io,
+        filesystem_io: ?std.Io,
     ) *ProvisionedTableWriteSource {
         self.restore_open_options.node_config = node_config;
-        self.restore_open_options.io = io;
+        self.restore_open_options.network_io = network_io;
+        self.restore_open_options.filesystem_io = filesystem_io;
         return self;
     }
 
@@ -10007,7 +10028,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.status_request_active > 0 or entry.structural_waiters > 0 or entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.structural_reconcile_status_pending > 0 or entry.repair_handoff_status_pending > 0 or entry.publication_handoffs.items.len > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.status_request_active > 0 or entry.structural_waiters > 0 or entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.structural_reconcile_status_pending > 0 or entry.repair_handoff_status_pending > 0 or entry.publication_handoffs.items.len > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active or entry.startup_catch_up_deferred) return;
         var removed = self.active_table_activities.swapRemove(index);
         removed.deinit();
         if (self.active_table_activities.items.len == 0) {
@@ -11093,14 +11114,18 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn endGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+    fn endGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         const io = self.table_activity_threaded.io();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_active);
         self.active_table_activities.items[index].operation_active = false;
         self.active_table_activities.items[index].operation_allows_reads = false;
+        const wake_startup_catch_up = self.active_table_activities.items[index].startup_catch_up_deferred and
+            self.active_table_activities.items[index].startup_catch_up_wake_armed;
+        self.active_table_activities.items[index].startup_catch_up_wake_armed = false;
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
+        return wake_startup_catch_up;
     }
 
     fn beginGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -11422,10 +11447,80 @@ pub const ProvisionedTableWriteSource = struct {
         // generic write lets frequent status polling starve the edge-triggered
         // repair scheduler indefinitely. Cold startup/restore catch-up can
         // replace broader runtime state and retains the exclusive admission.
-        return if (advance_index_repairs)
-            self.tryBeginReadCompatibleGroupOperation(table_name, group_id)
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const admitted = if (advance_index_repairs)
+            self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)
         else
-            self.tryBeginGroupOperation(table_name, group_id);
+            self.tryBeginGroupOperationLocked(table_name, group_id);
+        if (!advance_index_repairs) {
+            // Registration and admission share one lock, so the conflicting
+            // owner's release cannot race between a failed try and the keyed
+            // wake becoming visible.
+            const entry = self.activityEntryLocked(table_name, group_id);
+            if (admitted) {
+                entry.startup_catch_up_deferred = false;
+                entry.startup_catch_up_wake_armed = false;
+            } else {
+                self.markStartupCatchUpDeferredLocked(entry);
+            }
+        }
+        return admitted;
+    }
+
+    fn markStartupCatchUpDeferredLocked(
+        self: *ProvisionedTableWriteSource,
+        entry: *TableActivity,
+    ) void {
+        if (!entry.startup_catch_up_deferred) {
+            entry.startup_catch_up_deferred = true;
+            entry.startup_catch_up_deferred_generation = self.next_startup_catch_up_deferred_generation;
+            self.next_startup_catch_up_deferred_generation +%= 1;
+            if (self.next_startup_catch_up_deferred_generation == 0) {
+                self.next_startup_catch_up_deferred_generation = 1;
+            }
+        }
+        // One release edge is enough until the scheduler retries this key.
+        // A subsequent failed attempt rearms it without allocating another
+        // queue entry or changing the stale-scan cleanup generation.
+        entry.startup_catch_up_wake_armed = true;
+    }
+
+    fn markStartupCatchUpDeferred(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const entry = self.activityEntryLocked(table_name, group_id);
+        self.markStartupCatchUpDeferredLocked(entry);
+        if (entry.operation_active) return false;
+        entry.startup_catch_up_wake_armed = false;
+        return true;
+    }
+
+    fn deferredStartupCatchUpResult(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        advance_index_repairs: bool,
+        result: StartupCatchUpResult,
+    ) StartupCatchUpResult {
+        // The durable index-repair scheduler owns its own exact queue. Ordinary
+        // startup inspection uses the group-activity entry as its allocation-
+        // free coalescing key, including contention discovered after admission.
+        if (!advance_index_repairs and self.markStartupCatchUpDeferred(table_name, group_id)) {
+            // Some deferrals release their own optimistic group lease before
+            // they are classified (for example cache/foreground contention).
+            // No future owner-release edge exists in that case, so publish the
+            // coalesced wake after registration. Admission conflicts still
+            // wake from the active owner's endGroupOperation path.
+            self.notifyLocalChange(table_name, .startup_catch_up);
+        }
+        return result;
     }
 
     fn beginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -11456,8 +11551,62 @@ pub const ProvisionedTableWriteSource = struct {
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
+        const wake_startup_catch_up = self.endGroupOperationLocked(table_name, group_id);
+        self.table_activity_mutex.unlock(io);
+        if (wake_startup_catch_up) self.notifyLocalChange(table_name, .startup_catch_up);
+    }
+
+    pub fn snapshotDeferredStartupCatchUpGroups(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+    ) ![]DeferredStartupCatchUp {
+        if (self.local_write_owner) |owner| return try owner.snapshotDeferredStartupCatchUpGroups(alloc);
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        self.endGroupOperationLocked(table_name, group_id);
+
+        var count: usize = 0;
+        for (self.active_table_activities.items) |entry| {
+            if (entry.group_id != null and entry.startup_catch_up_deferred) count += 1;
+        }
+        const groups = try alloc.alloc(DeferredStartupCatchUp, count);
+        var next: usize = 0;
+        for (self.active_table_activities.items) |entry| {
+            if (entry.group_id == null or !entry.startup_catch_up_deferred) continue;
+            groups[next] = .{
+                .group_id = entry.group_id.?,
+                .generation = entry.startup_catch_up_deferred_generation,
+            };
+            next += 1;
+        }
+        return groups;
+    }
+
+    pub fn clearDeferredStartupCatchUpGroupIfUnchanged(
+        self: *ProvisionedTableWriteSource,
+        deferred: DeferredStartupCatchUp,
+    ) void {
+        if (self.local_write_owner) |owner| return owner.clearDeferredStartupCatchUpGroupIfUnchanged(deferred);
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        var index: usize = 0;
+        while (index < self.active_table_activities.items.len) {
+            const entry = &self.active_table_activities.items[index];
+            if (entry.group_id != deferred.group_id or
+                !entry.startup_catch_up_deferred or
+                entry.startup_catch_up_deferred_generation != deferred.generation)
+            {
+                index += 1;
+                continue;
+            }
+            entry.startup_catch_up_deferred = false;
+            entry.startup_catch_up_wake_armed = false;
+            const table_name = entry.table_name;
+            self.pruneTableActivityLocked(table_name, deferred.group_id);
+            // Group ids are globally unique in one catalog generation.
+            return;
+        }
     }
 
     pub const GroupRefreshActivity = struct {
@@ -14134,12 +14283,12 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
         if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) {
             std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=group_operation", .{ table_name, group_id });
-            return busy_result;
+            return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
         }
         if (!self.local_db_mutex.tryLock()) {
             self.endGroupOperation(table_name, group_id);
             std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cache_mutex", .{ table_name, group_id });
-            return busy_result;
+            return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
         }
         // A resident writer is the authoritative owner for every maintenance
         // class, including broad restore repair. Lease it before considering
@@ -14164,12 +14313,12 @@ pub const ProvisionedTableWriteSource = struct {
             self.endGroupOperation(table_name, group_id);
             if (!self.tryBeginGroupOperation(table_name, group_id)) {
                 std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cold_group_operation", .{ table_name, group_id });
-                return busy_result;
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
             }
             if (!self.local_db_mutex.tryLock()) {
                 self.endGroupOperation(table_name, group_id);
                 std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=cold_cache_mutex", .{ table_name, group_id });
-                return busy_result;
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
             }
             live_owner_guard = live_cache: {
                 const cache = self.write_cache orelse break :live_cache null;
@@ -14181,14 +14330,14 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             self.endGroupOperation(table_name, group_id);
             std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=dirty_writer", .{ table_name, group_id });
-            return busy_result;
+            return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
         }
         if (!use_live_owner) if (self.write_cache) |cache| {
             if (cache.hasForegroundStateForGroupTableLocked(group_id, table_name)) {
                 self.local_db_mutex.unlock();
                 self.endGroupOperation(table_name, group_id);
                 std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=foreground_writer", .{ table_name, group_id });
-                return busy_result;
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
             }
         };
         self.local_db_mutex.unlock();
@@ -14262,7 +14411,7 @@ pub const ProvisionedTableWriteSource = struct {
                     });
                 };
                 std.log.debug("managed catch-up admission deferred table={s} group_id={} phase=writer_config", .{ table_name, group_id });
-                return busy_result;
+                return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
             }
         }
         const opening_db_startup = startupCatchUpStatsForPath(path, .opening_db, configured_indexes) catch db_mod.types.StartupCatchUpStats{
@@ -14275,7 +14424,7 @@ pub const ProvisionedTableWriteSource = struct {
         const source_io = self.table_activity_threaded.io();
         if (!use_live_owner) {
             _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
-                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                 std.log.warn("managed startup restore recovery failed phase=import class={s}", .{@errorName(err)});
                 return err;
             };
@@ -14287,7 +14436,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
         else
             db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, source_io, path) catch |err| {
-                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                 std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
                 return err;
             };
@@ -14330,7 +14479,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .schema_json = metadata.schema_json,
                     .identity_namespace = identity_namespace,
                 }) catch |err| {
-                    if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                    if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
@@ -14370,7 +14519,7 @@ pub const ProvisionedTableWriteSource = struct {
                         .ha_async_metadata_mirror = effective_ha_mirror,
                     },
                 ) catch |err| {
-                    if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                    if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
@@ -14398,7 +14547,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_batch_mirror = effective_ha_mirror,
                     .ha_async_metadata_mirror = effective_ha_mirror,
                 }) catch |err| {
-                    if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                    if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
                         const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
                         return .{
@@ -14448,7 +14597,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .identity_namespace = identity_namespace,
                 },
             ) catch |err| {
-                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                 if (isTerminalStartupCatchUpOpenFailure(err)) {
                     const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(
                         self,
@@ -14516,7 +14665,7 @@ pub const ProvisionedTableWriteSource = struct {
                 // the DB lease so its root cannot be retired in the handoff.
                 self.endGroupOperation(table_name, group_id);
                 group_operation_active = false;
-                if (!self.tryBeginGroupOperation(table_name, group_id)) return busy_result;
+                if (!self.tryBeginGroupOperation(table_name, group_id)) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                 group_operation_active = true;
             } else {
                 // The repair lease keeps the authoritative DB/root alive,
@@ -42247,8 +42396,22 @@ test "provisioned startup catch-up enters through forwarded write owner" {
     var caller = ProvisionedTableWriteSource.init("/tmp/unused-antfly-catch-up-caller", NoCatalog.iface());
     _ = caller.withLocalWriteOwner(&owner);
 
+    const Hook = struct {
+        calls: usize = 0,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.kind = kind;
+        }
+    };
+    var hook: Hook = .{};
+    owner.setLocalChangeHook(.{ .ptr = &hook, .on_change = Hook.onChange });
+
     owner.testingMarkGroupOperationActive("docs", 7001);
-    defer owner.endGroupOperation("docs", 7001);
+    var operation_active = true;
+    defer if (operation_active) owner.endGroupOperation("docs", 7001);
 
     const result = try caller.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{});
     try std.testing.expect(result.busy);
@@ -42261,6 +42424,28 @@ test "provisioned startup catch-up enters through forwarded write owner" {
     try std.testing.expect(repair_result.index_repair_pending);
     try std.testing.expect(!caller.startup_catch_up_active.load(.acquire));
     try std.testing.expect(!owner.startup_catch_up_active.load(.acquire));
+
+    const deferred = try caller.snapshotDeferredStartupCatchUpGroups(std.testing.allocator);
+    defer std.testing.allocator.free(deferred);
+    try std.testing.expectEqual(@as(usize, 1), deferred.len);
+    try std.testing.expectEqual(@as(u64, 7001), deferred[0].group_id);
+    try std.testing.expect(deferred[0].generation != 0);
+
+    owner.endGroupOperation("docs", 7001);
+    operation_active = false;
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.startup_catch_up, hook.kind.?);
+
+    owner.testingMarkGroupOperationActive("docs", 7001);
+    owner.endGroupOperation("docs", 7001);
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+
+    try std.testing.expect(owner.tryBeginStartupCatchUpGroupOperation("docs", 7001, false));
+    owner.endGroupOperation("docs", 7001);
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    const cleared = try owner.snapshotDeferredStartupCatchUpGroups(std.testing.allocator);
+    defer std.testing.allocator.free(cleared);
+    try std.testing.expectEqual(@as(usize, 0), cleared.len);
 }
 
 test "provisioned table write source structural activity waits for table request lease" {
