@@ -708,6 +708,35 @@ pub const TextPublicationPlan = struct {
     }
 };
 
+/// Immutable full-text artifacts built after producer admission but before
+/// entering the per-index apply section. The catalog and analysis read locks
+/// pin every borrowed projection dependency while the segments are built;
+/// callers then validate TextPublicationContext once more before publishing.
+pub const PreparedTextMapperPublication = struct {
+    alloc: Allocator,
+    segments: [][]u8 = &.{},
+    observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
+
+    pub fn deinit(self: *PreparedTextMapperPublication) void {
+        for (self.segments) |segment| {
+            if (segment.len > 0) self.alloc.free(segment);
+        }
+        if (self.segments.len > 0) self.alloc.free(self.segments);
+        for (self.observed_field_analyzers) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        if (self.observed_field_analyzers.len > 0) self.alloc.free(self.observed_field_analyzers);
+        self.* = undefined;
+    }
+
+    pub fn estimate(self: PreparedTextMapperPublication) TextPublicationEstimate {
+        var byte_count: u64 = 0;
+        for (self.segments) |segment| byte_count +|= @intCast(segment.len);
+        return .{ .segment_count = @intCast(self.segments.len), .byte_count = byte_count };
+    }
+};
+
 pub const TextPublicationContext = struct {
     alloc: Allocator,
     instance_id: u64,
@@ -2551,18 +2580,18 @@ pub const IndexManager = struct {
         self.alloc.destroy(mutex);
     }
 
-    fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    fn lockAtomicWithBackoff(self: *const IndexManager, mutex: *std.atomic.Mutex) void {
         var attempts: usize = 0;
         while (!mutex.tryLock()) : (attempts += 1) {
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
             if (attempts < 64) {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            std.Thread.yield() catch {};
+            // Yield through the injected runtime so callers running on fibers
+            // do not block an executor thread while another apply lane owns
+            // the mutex. The fallback IO remains valid for test-only managers
+            // which have not yet been attached to a DB runtime.
+            self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
@@ -2591,7 +2620,7 @@ pub const IndexManager = struct {
                 break :blk entry.apply_mutex;
             },
         };
-        lockAtomicWithBackoff(mutex);
+        self.lockAtomicWithBackoff(mutex);
         return .{
             .manager = self,
             .mutex = mutex,
@@ -2607,7 +2636,7 @@ pub const IndexManager = struct {
             entry.apply_mutex
         else
             return error.IndexNotFound;
-        lockAtomicWithBackoff(mutex);
+        self.lockAtomicWithBackoff(mutex);
         return .{
             .manager = self,
             .mutex = mutex,
@@ -2691,10 +2720,20 @@ pub const IndexManager = struct {
         self.schema_registry = registry;
     }
 
+    /// Snapshot the active schema identity without borrowing catalog state.
+    /// Prepared request-local projections use this together with the write-plan
+    /// generation to fail safely to AROW materialization after publication.
+    pub fn activeSchemaVersion(self: *IndexManager) ?u32 {
+        const registry = self.schema_registry orelse return null;
+        var view = registry.acquire() orelse return null;
+        defer view.release();
+        return view.version();
+    }
+
     /// Decode one base row against the immutable layout version carried by the
     /// row. Schema epochs are retained for the duration of decoding. Historical
-    /// epochs load once on first use and then remain registry-resident, avoiding
-    /// eager startup work and schema lifetime races in index/enrichment workers.
+    /// epochs load on demand into the registry's bounded cache, avoiding eager
+    /// startup work, lifetime races, and unbounded schema-history residency.
     pub fn materializeStoredValueAlloc(
         self: *IndexManager,
         alloc: Allocator,
@@ -2735,8 +2774,87 @@ pub const IndexManager = struct {
         historical_owned = false;
         validator_owned = false;
         errdefer epoch.release();
-        try registry.preparePublish(version);
-        return registry.installHistorical(epoch);
+        return try registry.installHistorical(epoch);
+    }
+
+    /// Pins each schema epoch encountered by a scan/backfill once. Historical
+    /// rows are common immediately after schema evolution; resolving them per
+    /// row would otherwise take the registry mutex and may repeat durable
+    /// metadata probes on concurrent cold misses.
+    pub const SchemaViewSet = struct {
+        manager: *IndexManager,
+        views: std.AutoHashMapUnmanaged(u32, schema_registry_mod.SchemaView) = .empty,
+
+        pub fn init(manager: *IndexManager) @This() {
+            return .{ .manager = manager };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            var values = self.views.valueIterator();
+            while (values.next()) |view| view.release();
+            self.views.deinit(self.manager.alloc);
+            self.* = undefined;
+        }
+
+        pub fn get(self: *@This(), version: u32) !*const schema_registry_mod.SchemaView {
+            if (self.views.getPtr(version)) |view| return view;
+            var view = try self.manager.acquireSchemaVersionView(version);
+            errdefer view.release();
+            try self.views.put(self.manager.alloc, version, view);
+            return self.views.getPtr(version).?;
+        }
+    };
+
+    pub const MaterializedStoredDocument = struct {
+        value: []u8,
+        root: ?std.json.Value = null,
+        root_arena: ?*std.heap.ArenaAllocator = null,
+        retained_bytes: usize,
+
+        pub fn retainedBytes(self: *const @This()) usize {
+            return self.retained_bytes;
+        }
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.value);
+            if (self.root_arena) |arena| {
+                arena.deinit();
+                alloc.destroy(arena);
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub fn materializeStoredDocumentWithSchemaViewsAlloc(
+        _: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        schema_views: *SchemaViewSet,
+    ) !MaterializedStoredDocument {
+        if (!internal_keys.isRelationalRowKey(store_key)) {
+            const value = try alloc.dupe(u8, stored_value);
+            return .{ .value = value, .retained_bytes = value.len };
+        }
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        const view = try schema_views.get(version);
+        var materialized = try relational_store.materializeRootForSchemaAndLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+        );
+        errdefer materialized.deinit(alloc);
+        // Text rebuilds never persist source JSON in their segments. Supply an
+        // owned empty slice for the generic MapperDoc lifetime contract while
+        // indexing directly from the typed root.
+        const empty_source = try alloc.alloc(u8, 0);
+        return .{
+            .value = empty_source,
+            .root = materialized.root,
+            .root_arena = materialized.root_arena,
+            .retained_bytes = materialized.retainedBytes(),
+        };
     }
 
     /// Batch-read variant that reuses a request-pinned active epoch. Rows from
@@ -2768,22 +2886,37 @@ pub const IndexManager = struct {
         stored_value: []const u8,
         field_name: []const u8,
         dims: u32,
+        schema_views: ?*SchemaViewSet,
     ) !?[]f32 {
         if (internal_keys.isRelationalRowKey(store_key)) {
             const version = try relational_store.rowSchemaVersion(stored_value);
-            var view = try self.acquireSchemaVersionView(version);
-            defer view.release();
+            var owned_view: ?schema_registry_mod.SchemaView = null;
+            defer if (owned_view) |*view| view.release();
+            const view = if (schema_views) |views|
+                try views.get(version)
+            else blk: {
+                owned_view = try self.acquireSchemaVersionView(version);
+                break :blk &owned_view.?;
+            };
             const ordinal = view.physicalLayout().ordinalForName(
                 view.tableSchema().relational_columns,
                 field_name,
             ) orelse return null;
+            const column = view.tableSchema().relational_columns[ordinal];
             const cell = (try relational_row_codec.findCellByOrdinalWithLayout(
                 stored_value,
                 view.tableSchema().*,
                 view.physicalLayout(),
                 ordinal,
             )) orelse return null;
-            if (cell.is_null or cell.value != .bytes_val or !cell.is_json) return null;
+            if (cell.is_null or cell.value != .bytes_val) return null;
+            if (column.column_type == .dense_vector) {
+                const vector = try relational_row_codec.decodeDenseVectorValueAlloc(alloc, cell.value.bytes_val);
+                errdefer alloc.free(vector);
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                return vector;
+            }
+            if (!cell.is_json) return null;
             return try mapper.extractDenseVectorValue(alloc, cell.value.bytes_val, dims);
         }
         return try mapper.extractDenseVectorField(alloc, stored_value, field_name, dims);
@@ -2795,11 +2928,18 @@ pub const IndexManager = struct {
         store_key: []const u8,
         stored_value: []const u8,
         field_name: []const u8,
+        schema_views: ?*SchemaViewSet,
     ) !?mapper.SparseVectorData {
         if (internal_keys.isRelationalRowKey(store_key)) {
             const version = try relational_store.rowSchemaVersion(stored_value);
-            var view = try self.acquireSchemaVersionView(version);
-            defer view.release();
+            var owned_view: ?schema_registry_mod.SchemaView = null;
+            defer if (owned_view) |*view| view.release();
+            const view = if (schema_views) |views|
+                try views.get(version)
+            else blk: {
+                owned_view = try self.acquireSchemaVersionView(version);
+                break :blk &owned_view.?;
+            };
             const ordinal = view.physicalLayout().ordinalForName(
                 view.tableSchema().relational_columns,
                 field_name,
@@ -4587,7 +4727,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
 
         for (self.text_indexes.items) |*entry| {
-            lockAtomicWithBackoff(entry.apply_mutex);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             entry.analysis_mutex.lockExclusive();
             defer entry.analysis_mutex.unlockExclusive();
@@ -4833,7 +4973,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         admissions: []const docstore_mod.OwnedKVPair,
     ) !void {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         self.clearManagedAdmissionSnapshot();
         try self.managed_admission_indexes.ensureTotalCapacity(self.alloc, @intCast(admissions.len));
@@ -4849,7 +4989,7 @@ pub const IndexManager = struct {
     }
 
     pub fn clearManagedAdmissionSnapshotForIndex(self: *IndexManager, name: []const u8) void {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         if (self.managed_admission_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
     }
@@ -4861,7 +5001,7 @@ pub const IndexManager = struct {
             names.deinit(self.alloc);
         }
         {
-            lockAtomicWithBackoff(&self.managed_admission_mutex);
+            self.lockAtomicWithBackoff(&self.managed_admission_mutex);
             defer self.managed_admission_mutex.unlock();
             try names.ensureTotalCapacity(self.alloc, self.managed_admission_indexes.count());
             var it = self.managed_admission_indexes.keyIterator();
@@ -4871,7 +5011,7 @@ pub const IndexManager = struct {
     }
 
     fn managedAdmissionPending(self: *IndexManager, name: []const u8) bool {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         return self.managed_admission_indexes.contains(name);
     }
@@ -7129,6 +7269,11 @@ pub const IndexManager = struct {
     }
 
     pub fn registerShadowIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        // Algebraic projections live in the logical document store rather than
+        // the manager's physical index directory. Replaying them through a
+        // shadow manager would mutate the primary projection a second time;
+        // split destination construction rebuilds them against its own store.
+        if (cfg.kind == .algebraic) return;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
@@ -11626,6 +11771,7 @@ pub const IndexManager = struct {
             .vector_field_paths = paths,
             .strip_numeric_array_heuristic = false,
             .schema_less_fast_projection = schema_less_fast_projection,
+            .retain_stored_data = false,
         };
     }
 
@@ -11935,7 +12081,10 @@ pub const IndexManager = struct {
         }
 
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
-        const projection_options = try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null);
+        const projection_options = try self.textProjectionOptionsForSchema(
+            arena,
+            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+        );
         var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
         defer atomic_ranges.deinit(arena);
         var start: usize = 0;
@@ -11979,6 +12128,298 @@ pub const IndexManager = struct {
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
     }
 
+    /// Plan publication from an already-parsed document boundary. Relational
+    /// callers supply MapperDoc.root, so both admission estimation and the
+    /// eventual apply avoid reparsing a materialized JSON document.
+    pub fn planTextMapperDocsPublication(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        docs: []const mapper.MapperDoc,
+        reservation_limit: usize,
+    ) !TextPublicationPlan {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+
+        var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
+        errdefer chunks.deinit(context.alloc);
+        if (docs.len == 0) {
+            try chunks.append(context.alloc, .{ .end = 0, .estimate = .{} });
+            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer filtered.deinit(arena);
+        var original_ends = std.ArrayListUnmanaged(usize).empty;
+        defer original_ends.deinit(arena);
+        for (docs, 0..) |doc, doc_idx| {
+            if (!self.keyInRange(doc.key)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(arena, doc);
+            try original_ends.append(arena, doc_idx + 1);
+        }
+        if (filtered.items.len == 0) {
+            try chunks.append(context.alloc, .{ .end = docs.len, .estimate = .{} });
+            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        }
+
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const projection_options = try self.textProjectionOptionsForSchema(
+            arena,
+            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+        );
+        var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
+        defer atomic_ranges.deinit(arena);
+        var start: usize = 0;
+        while (start < filtered.items.len) {
+            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
+            const estimate = try self.estimateTextMapperDocsPublicationRange(
+                entry,
+                projection_options,
+                filtered.items[start..end],
+            );
+            try self.appendTextMapperDocsPublicationAtomicRanges(
+                entry,
+                projection_options,
+                filtered.items,
+                original_ends.items,
+                start,
+                end,
+                estimate,
+                reservation_limit,
+                arena,
+                &atomic_ranges,
+            );
+            start = end;
+        }
+
+        var current = TextPublicationEstimate{};
+        var current_end: usize = 0;
+        for (atomic_ranges.items) |range| {
+            if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and
+                current.segment_count +| range.estimate.segment_count > reservation_limit)
+            {
+                try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
+                current = .{};
+            }
+            current.segment_count +|= range.estimate.segment_count;
+            current.byte_count +|= range.estimate.byte_count;
+            current_end = range.end;
+        }
+        std.debug.assert(current_end > 0);
+        try chunks.append(context.alloc, .{ .end = docs.len, .estimate = current });
+        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+    }
+
+    fn estimateTextMapperDocsPublicationRange(
+        self: *IndexManager,
+        entry: *TextIndex,
+        projection_options: mapper.TextProjectionOptions,
+        docs: []const mapper.MapperDoc,
+    ) !TextPublicationEstimate {
+        var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer projection_arena_state.deinit();
+        const projection_arena = projection_arena_state.allocator();
+        const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+            projection_arena,
+            docs,
+            projection_options,
+        );
+        const projection_batch = try buildTextProjectionBatchForEntry(
+            projection_arena,
+            entry,
+            source_batch.docs,
+            null,
+        );
+        return estimateProjectedTextPublication(projection_batch.docs);
+    }
+
+    /// Build immutable text segments while only read locks are held. This is
+    /// deliberately separate from publication: callers acquire their producer
+    /// capacity first, perform the CPU- and allocation-heavy projection and
+    /// tokenization here, then enter the serialized apply section only to
+    /// commit metadata and publish the finished segment bytes.
+    pub fn prepareTextMapperDocsPublication(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        context: *TextPublicationContext,
+        docs: []const mapper.MapperDoc,
+    ) !PreparedTextMapperPublication {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) {
+            context.projection_revision = entry.projection_revision;
+            context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
+            return error.TextProjectionChanged;
+        }
+
+        var segments = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (segments.items) |segment| alloc.free(segment);
+            segments.deinit(alloc);
+        }
+        var observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+        errdefer freeOwnedObservedFieldAnalyzers(alloc, &observed);
+
+        if (docs.len == 0) return .{ .alloc = alloc };
+
+        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer filtered.deinit(alloc);
+        for (docs) |doc| {
+            if (!self.keyInRange(doc.key)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(alloc, doc);
+        }
+        if (filtered.items.len == 0) return .{ .alloc = alloc };
+
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        var start: usize = 0;
+        while (start < filtered.items.len) {
+            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
+            {
+                var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const projection_options = try self.textProjectionOptionsForSchema(
+                    arena,
+                    entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+                );
+                const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+                    arena,
+                    filtered.items[start..end],
+                    projection_options,
+                );
+                const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_batch.docs);
+                var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+                defer chunk_observed.deinit(arena);
+                const projection_batch = try buildTextProjectionBatchForEntry(
+                    arena,
+                    entry,
+                    source_docs_with_ordinals,
+                    &chunk_observed,
+                );
+                try appendOwnedObservedFieldAnalyzers(alloc, &observed, projection_batch.observed_field_analyzers);
+
+                const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
+                const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
+                const built = try mapper.buildTextSegmentsFromProjectionBatch(
+                    alloc,
+                    projection_batch,
+                    entry.text_analysis,
+                    .{
+                        .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+                        .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+                        .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
+                        .index_sort = index_sort,
+                        .resource_manager = self.resource_manager,
+                        .store_document_source = false,
+                    },
+                );
+                if (built.len > 0) {
+                    segments.ensureUnusedCapacity(alloc, built.len) catch |err| {
+                        for (built) |segment| alloc.free(segment);
+                        alloc.free(built);
+                        return err;
+                    };
+                    for (built) |segment| segments.appendAssumeCapacity(segment);
+                    alloc.free(built);
+                }
+            }
+            start = end;
+        }
+
+        return .{
+            .alloc = alloc,
+            .segments = try segments.toOwnedSlice(alloc),
+            .observed_field_analyzers = try observed.toOwnedSlice(alloc),
+        };
+    }
+
+    fn buildTextProjectionBatchForEntry(
+        arena: Allocator,
+        entry: *TextIndex,
+        source_docs: []const mapper.TextProjectionSourceDoc,
+        observed: ?*std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+    ) !mapper.TextProjectionBatch {
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(
+            arena,
+            entry.text_analysis,
+            entry.runtime_schema,
+            observed,
+            entry.selected_field,
+        );
+        defer builder.deinit();
+        for (source_docs) |doc| {
+            try builder.appendSourceDocWithSelectedField(doc, textIndexSelectedFieldForKey(entry, doc.key));
+        }
+        return .{
+            .docs = try arena.dupe(introducer_mod.TextDocument, builder.text_docs.items),
+            .observed_field_analyzers = if (observed) |items| items.items else &.{},
+        };
+    }
+
+    fn appendTextMapperDocsPublicationAtomicRanges(
+        self: *IndexManager,
+        entry: *TextIndex,
+        projection_options: mapper.TextProjectionOptions,
+        docs: []const mapper.MapperDoc,
+        original_ends: []const usize,
+        start: usize,
+        end: usize,
+        estimate: TextPublicationEstimate,
+        reservation_limit: usize,
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(TextPublicationAtomicRange),
+    ) !void {
+        if (reservation_limit == std.math.maxInt(usize) or estimate.segment_count <= reservation_limit or end - start == 1) {
+            try out.append(alloc, .{ .end = original_ends[end - 1], .estimate = estimate });
+            return;
+        }
+
+        const mid = start + (end - start) / 2;
+        const left_estimate = try self.estimateTextMapperDocsPublicationRange(entry, projection_options, docs[start..mid]);
+        try self.appendTextMapperDocsPublicationAtomicRanges(
+            entry,
+            projection_options,
+            docs,
+            original_ends,
+            start,
+            mid,
+            left_estimate,
+            reservation_limit,
+            alloc,
+            out,
+        );
+        const right_estimate = try self.estimateTextMapperDocsPublicationRange(entry, projection_options, docs[mid..end]);
+        try self.appendTextMapperDocsPublicationAtomicRanges(
+            entry,
+            projection_options,
+            docs,
+            original_ends,
+            mid,
+            end,
+            right_estimate,
+            reservation_limit,
+            alloc,
+            out,
+        );
+    }
+
     fn estimateTextBatchPublicationRange(
         self: *IndexManager,
         entry: *TextIndex,
@@ -11993,11 +12434,10 @@ pub const IndexManager = struct {
             writes,
             projection_options,
         );
-        const projection_batch = try mapper.buildTextProjectionBatchFromSource(
+        const projection_batch = try buildTextProjectionBatchForEntry(
             projection_arena,
+            entry,
             source_batch.docs,
-            entry.text_analysis,
-            entry.runtime_schema,
             null,
         );
         return estimateProjectedTextPublication(projection_batch.docs);
@@ -12598,6 +13038,41 @@ pub const IndexManager = struct {
         return error.IndexNotFound;
     }
 
+    /// Publish a segment set produced by prepareTextMapperDocsPublication.
+    /// The caller owns the managed-index apply guard and has revalidated the
+    /// matching publication context. Persistent indexes may use a different
+    /// allocator than the request pipeline, so publication copies into the
+    /// index's ownership domain; the prepared bytes remain retry-safe.
+    pub fn applyPreparedTextMapperPublicationByNameWithOptions(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        delete_keys: []const []const u8,
+        prepared: *PreparedTextMapperPublication,
+        opts: IndexBatchOptions,
+    ) !void {
+        if (delete_keys.len == 0 and prepared.segments.len == 0 and prepared.observed_field_analyzers.len == 0) return;
+        for (self.text_indexes.items) |*entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+
+            var stats = TextBatchMutationStats{};
+            if (delete_keys.len > 0) {
+                stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
+            }
+            if (prepared.observed_field_analyzers.len > 0) {
+                try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
+            }
+            for (prepared.segments) |segment| {
+                if (segment.len == 0) continue;
+                try entry.persistent.indexSegment(segment);
+                stats.noteIndex(true);
+            }
+            try self.finalizeTextBatchMutations(entry, opts, stats);
+            return;
+        }
+        return error.IndexNotFound;
+    }
+
     pub fn indexDenseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
         return try self.indexDenseBatchByNameWithOptions(store, index_name, writes, .{});
     }
@@ -12874,6 +13349,8 @@ pub const IndexManager = struct {
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -12885,6 +13362,10 @@ pub const IndexManager = struct {
             for (mapped_docs.items) |doc| {
                 self.alloc.free(@constCast(doc.key));
                 self.alloc.free(@constCast(doc.value));
+                if (doc.root_arena) |arena| {
+                    arena.deinit();
+                    self.alloc.destroy(arena);
+                }
             }
             mapped_docs.deinit(self.alloc);
         }
@@ -12916,6 +13397,10 @@ pub const IndexManager = struct {
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
+                    if (doc.root_arena) |arena| {
+                        arena.deinit();
+                        manager.alloc.destroy(arena);
+                    }
                 }
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
@@ -12949,6 +13434,7 @@ pub const IndexManager = struct {
                 scan_budget: usize,
                 doc_limit: usize,
                 source_target_bytes: usize,
+                schema_views: *SchemaViewSet,
                 source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
@@ -12980,27 +13466,33 @@ pub const IndexManager = struct {
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.materializeStoredValueAlloc(state.manager.alloc, key, value);
-                    var doc_value_owned = true;
-                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                    var doc = try state.manager.materializeStoredDocumentWithSchemaViewsAlloc(state.manager.alloc, key, value, state.schema_views);
+                    var doc_owned = true;
+                    errdefer if (doc_owned) doc.deinit(state.manager.alloc);
 
-                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    // Relational materialization retains a decoded projection
+                    // tree instead of canonical JSON. Charge the arena's actual
+                    // capacity so the page target remains a real memory bound.
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) +| doc_id.len +| doc.retainedBytes();
                     if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
                         // Do not consume this key. The next page resumes after
                         // page_last_seen_key and visits it again. Including the
                         // crossing document here created a one-document tail
                         // segment for almost every rebuild page.
                         state.manager.alloc.free(doc_id);
-                        state.manager.alloc.free(doc_value);
+                        doc.deinit(state.manager.alloc);
                         doc_id_owned = false;
-                        doc_value_owned = false;
+                        doc_owned = false;
                         state.stopped_early = true;
                         return .stop;
                     }
 
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
-                        .value = doc_value,
+                        .value = doc.value,
+                        .source_bytes = doc.retainedBytes(),
+                        .root = doc.root,
+                        .root_arena = doc.root_arena,
                         // Resolve ordinals as one sorted batch in
                         // textProjectionSourceDocsWithOrdinals. A point lookup
                         // here turns a full rebuild into millions of sparse LSM
@@ -13008,7 +13500,7 @@ pub const IndexManager = struct {
                         .doc_ordinal = null,
                     });
                     doc_id_owned = false;
-                    doc_value_owned = false;
+                    doc_owned = false;
                     state.source_bytes +|= doc_bytes;
                     try state.rememberKey(key);
 
@@ -13037,6 +13529,7 @@ pub const IndexManager = struct {
                 .scan_budget = scan_budget_per_page,
                 .doc_limit = backfill_doc_limit,
                 .source_target_bytes = backfill_source_target_bytes,
+                .schema_views = &schema_views,
             };
             try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -13070,6 +13563,8 @@ pub const IndexManager = struct {
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -13081,6 +13576,10 @@ pub const IndexManager = struct {
             for (mapped_docs.items) |doc| {
                 self.alloc.free(@constCast(doc.key));
                 self.alloc.free(@constCast(doc.value));
+                if (doc.root_arena) |arena| {
+                    arena.deinit();
+                    self.alloc.destroy(arena);
+                }
             }
             mapped_docs.deinit(self.alloc);
         }
@@ -13124,6 +13623,10 @@ pub const IndexManager = struct {
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
+                    if (doc.root_arena) |arena| {
+                        arena.deinit();
+                        manager.alloc.destroy(arena);
+                    }
                 }
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
@@ -13158,6 +13661,7 @@ pub const IndexManager = struct {
                 scan_budget: usize,
                 doc_limit: usize,
                 source_target_bytes: usize,
+                schema_views: *SchemaViewSet,
                 source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
@@ -13189,30 +13693,33 @@ pub const IndexManager = struct {
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.materializeStoredValueAlloc(state.manager.alloc, key, value);
-                    var doc_value_owned = true;
-                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                    var doc = try state.manager.materializeStoredDocumentWithSchemaViewsAlloc(state.manager.alloc, key, value, state.schema_views);
+                    var doc_owned = true;
+                    errdefer if (doc_owned) doc.deinit(state.manager.alloc);
 
-                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) +| doc_id.len +| doc.retainedBytes();
                     if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
                         state.manager.alloc.free(doc_id);
-                        state.manager.alloc.free(doc_value);
+                        doc.deinit(state.manager.alloc);
                         doc_id_owned = false;
-                        doc_value_owned = false;
+                        doc_owned = false;
                         state.stopped_early = true;
                         return .stop;
                     }
 
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
-                        .value = doc_value,
+                        .value = doc.value,
+                        .source_bytes = doc.retainedBytes(),
+                        .root = doc.root,
+                        .root_arena = doc.root_arena,
                         // Resolve the whole page with getManySorted when the
                         // projection batch is built. The identity mapping is
                         // stable for the lifetime of a document ordinal.
                         .doc_ordinal = null,
                     });
                     doc_id_owned = false;
-                    doc_value_owned = false;
+                    doc_owned = false;
                     state.source_bytes +|= doc_bytes;
                     try state.rememberKey(key);
 
@@ -13241,6 +13748,7 @@ pub const IndexManager = struct {
                 .scan_budget = scan_budget_per_page,
                 .doc_limit = backfill_doc_limit,
                 .source_target_bytes = backfill_source_target_bytes,
+                .schema_views = &schema_views,
             };
             try store.scanReadTxnWithContext(read_txn, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -15127,7 +15635,7 @@ pub const IndexManager = struct {
         // Replay mutates SegmentShared.deleted while holding this same
         // per-index mutex. Reacquire it only for validation and publication;
         // executeTextMergeTask uses the task-owned clones and runs unlocked.
-        lockAtomicWithBackoff(entry.apply_mutex);
+        self.lockAtomicWithBackoff(entry.apply_mutex);
         var index_apply_locked = true;
         defer if (index_apply_locked) entry.apply_mutex.unlock();
         if (!entry.lockMergeDeletionStateCurrent(task.deletion_state)) {
@@ -15895,6 +16403,8 @@ pub const IndexManager = struct {
     }
 
     fn backfillDenseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex) !void {
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -15944,7 +16454,7 @@ pub const IndexManager = struct {
                 if (!self.keyInRange(raw_key)) continue;
                 try items.ensureUnusedCapacity(self.alloc, 1);
                 try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
-                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims)) orelse continue;
+                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
                 errdefer self.alloc.free(vector_values);
 
                 const assignment = try self.ensureDenseVectorIdTxnWithMemo(
@@ -15983,6 +16493,8 @@ pub const IndexManager = struct {
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
         const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -16070,7 +16582,7 @@ pub const IndexManager = struct {
                 const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
                 defer self.alloc.free(raw_key);
                 if (!self.keyInRange(raw_key)) continue;
-                var sparse_vec = (try self.extractSparseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name)) orelse continue;
+                var sparse_vec = (try self.extractSparseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, &schema_views)) orelse continue;
                 var sparse_vec_owned = true;
                 errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
                 saw_visible_doc = true;
@@ -16986,7 +17498,7 @@ pub const IndexManager = struct {
     }
 
     fn estimatedMapperDocBytes(doc: mapper.MapperDoc) usize {
-        return @sizeOf(mapper.MapperDoc) + doc.key.len + doc.value.len;
+        return @sizeOf(mapper.MapperDoc) +| doc.key.len +| @max(doc.value.len, doc.source_bytes);
     }
 
     fn estimateProjectedTextPublication(docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
@@ -19607,9 +20119,14 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            const logical = try manager.materializeStoredValueAlloc(alloc, doc_store_key, raw);
-            defer alloc.free(logical);
-            break :blk (try mapper.extractDenseVectorField(alloc, logical, entry.field_name, entry.dims)) orelse
+            break :blk (try manager.extractDenseVectorFromStoredAlloc(
+                alloc,
+                doc_store_key,
+                raw,
+                entry.field_name,
+                entry.dims,
+                null,
+            )) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
@@ -22691,6 +23208,47 @@ fn containsObservedFieldAnalyzer(
         if (std.mem.eql(u8, item.field_name, needle.field_name) and observedFieldAnalyzerMappingEquals(item, needle)) return true;
     }
     return false;
+}
+
+fn freeOwnedObservedFieldAnalyzers(
+    alloc: Allocator,
+    observed: *std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+) void {
+    for (observed.items) |item| {
+        alloc.free(item.field_name);
+        alloc.free(item.analyzer_name);
+    }
+    observed.deinit(alloc);
+}
+
+fn appendOwnedObservedFieldAnalyzers(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+    additions: []const mapper.ObservedFieldAnalyzer,
+) !void {
+    for (additions) |item| {
+        if (containsObservedFieldAnalyzer(out.items, item)) continue;
+        const field_name = try alloc.dupe(u8, item.field_name);
+        const analyzer_name = alloc.dupe(u8, item.analyzer_name) catch |err| {
+            alloc.free(field_name);
+            return err;
+        };
+        out.append(alloc, .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
+            .field_type = item.field_type,
+            .do_index = item.do_index,
+            .store = item.store,
+            .doc_values = item.doc_values,
+            .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
+            .include_in_all = item.include_in_all,
+        }) catch |err| {
+            alloc.free(field_name);
+            alloc.free(analyzer_name);
+            return err;
+        };
+    }
 }
 
 fn observedFieldAnalyzerMappingEquals(left: mapper.ObservedFieldAnalyzer, right: mapper.ObservedFieldAnalyzer) bool {

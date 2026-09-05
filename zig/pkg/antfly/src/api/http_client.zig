@@ -232,7 +232,20 @@ pub const TransactionSavepointResponse = struct {
     }
 };
 
+pub const TableMutationOutcome = enum {
+    applied,
+    committed_visibility_pending,
+    committed_superseded,
+    committed_repair_required,
+    committed_repair_unavailable,
+    /// The server returned a committed 202 outcome newer than this client.
+    /// Retaining that boundary prevents an unsafe automatic replay.
+    committed_unknown,
+};
+
 pub const TablesResponse = struct {
+    status: u16 = 200,
+    outcome: TableMutationOutcome = .applied,
     body: []u8,
 
     pub fn deinit(self: *TablesResponse, alloc: std.mem.Allocator) void {
@@ -240,6 +253,24 @@ pub const TablesResponse = struct {
         self.* = undefined;
     }
 };
+
+fn tableMutationOutcome(alloc: std.mem.Allocator, status: u16, body: []const u8) !TableMutationOutcome {
+    if (status == 200 or status == 204) return .applied;
+    if (status != 202) return error.UnexpectedHttpStatus;
+    const Wire = struct { status: []const u8 };
+    var parsed = std.json.parseFromSlice(Wire, alloc, body, .{ .ignore_unknown_fields = true }) catch
+        return .committed_unknown;
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.status, "committed_visibility_pending"))
+        return .committed_visibility_pending;
+    if (std.mem.eql(u8, parsed.value.status, "committed_superseded"))
+        return .committed_superseded;
+    if (std.mem.eql(u8, parsed.value.status, "committed_repair_required"))
+        return .committed_repair_required;
+    if (std.mem.eql(u8, parsed.value.status, "committed_repair_unavailable"))
+        return .committed_repair_unavailable;
+    return .committed_unknown;
+}
 
 pub const LoadBalancedTablesResponse = struct {
     body: []u8,
@@ -253,6 +284,9 @@ pub const LoadBalancedTablesResponse = struct {
 };
 
 pub const EmptyResponse = struct {
+    status: u16 = 204,
+    outcome: TableMutationOutcome = .applied,
+
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
 
@@ -3089,8 +3123,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body);
+        return .{
+            .status = resp.status,
+            .outcome = outcome,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn dropTable(
@@ -3108,8 +3146,10 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 204 and resp.status != 202) return error.UnexpectedHttpStatus;
-        return .{};
+        return .{
+            .status = resp.status,
+            .outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body),
+        };
     }
 
     pub fn updateTableSchema(
@@ -3130,8 +3170,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body);
+        return .{
+            .status = resp.status,
+            .outcome = outcome,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchTableIndexes(
@@ -5403,5 +5447,45 @@ test "api http client transports txn resolve cancellation and visibility reason"
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
         client.fetchGroupTxnResolveWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 137, &cancellation),
+    );
+}
+
+test "table mutation outcomes preserve committed nonterminal success" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(
+        TableMutationOutcome.applied,
+        try tableMutationOutcome(alloc, 200, "{}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.applied,
+        try tableMutationOutcome(alloc, 204, ""),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_visibility_pending,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_visibility_pending\",\"poll_after_ms\":50}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_superseded,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_superseded\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_repair_required,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_repair_required\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_repair_unavailable,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_repair_unavailable\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_unknown,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"future_outcome\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_unknown,
+        try tableMutationOutcome(alloc, 202, "not-json"),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        tableMutationOutcome(alloc, 500, "{}"),
     );
 }

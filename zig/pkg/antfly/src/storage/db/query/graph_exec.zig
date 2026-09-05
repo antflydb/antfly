@@ -2707,9 +2707,9 @@ test "prepared pattern filters evaluate scalar and nested ordinal cells" {
         .relational_columns = &columns,
     };
     const cells = [_]relational_row_codec.Cell{
-        .{ .path = "tenant", .value_type = .bytes_val, .value = .{ .bytes_val = "acme" } },
-        .{ .path = "count", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"tier\":\"gold\"}" } },
+        .{ .ordinal = 0, .path = "tenant", .value_type = .bytes_val, .value = .{ .bytes_val = "acme" } },
+        .{ .ordinal = 1, .path = "count", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
+        .{ .ordinal = 2, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"tier\":\"gold\"}" } },
     };
     const encoded = try relational_row_codec.serializeOrdinal(
         alloc,

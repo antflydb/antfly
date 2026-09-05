@@ -188,6 +188,9 @@ pub const RelationalColumnType = enum(u8) {
     geopoint = 6,
     geoshape = 7,
     json = 8,
+    /// Canonical little-endian IEEE-754 f32 payload. The vector length is
+    /// derived from the payload and index contracts validate their dimensions.
+    dense_vector = 9,
 };
 
 pub const RelationalJsonKind = enum(u8) {
@@ -238,9 +241,14 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 // Serialization
 // ============================================================================
 
+/// Current durable runtime-schema format. Catalog compatibility checks use the
+/// same exported constant so a writer can never silently drift from the format
+/// it advertises in transactional table metadata.
+pub const storage_format_version: u32 = 13;
+
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
-    return serializeSchemaFormat(alloc, schema, 13);
+    return serializeSchemaFormat(alloc, schema, storage_format_version);
 }
 
 /// Compare complete runtime schemas through their canonical durable encoding.
@@ -848,6 +856,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 6 => .geopoint,
                 7 => .geoshape,
                 8 => .json,
+                9 => .dense_vector,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1206,47 +1215,79 @@ pub fn saveSchemaWithMetadata(
 ) !bool {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
-    const schema_changed = !(try activeSchemaDataMatches(store, alloc, data));
-    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    return try saveEncodedSchemaWithMetadata(
+        store,
+        alloc,
+        schema.version,
+        data,
+        metadata_writes,
+        metadata_deletes,
+    );
+}
 
-    const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
-    defer alloc.free(versioned_key);
-    const previous_schema = if (schema_changed) try loadSchema(store, alloc) else null;
-    defer if (previous_schema) |loaded| freeSchema(alloc, loaded);
-    if (schema_changed) {
-        if (previous_schema) |loaded| {
-            if (schema.version < loaded.version) return error.SchemaVersionRegression;
-        }
-        const existing_version = try loadSchemaVersion(store, alloc, schema.version);
-        defer if (existing_version) |existing| freeSchema(alloc, existing);
-        if (existing_version) |existing| {
-            const existing_data = try serializeSchema(alloc, existing);
-            defer alloc.free(existing_data);
-            if (!std.mem.eql(u8, existing_data, data)) return error.ImmutableSchemaVersionConflict;
-        }
-    }
-
-    const previous_versioned_data = blk: {
-        const loaded = previous_schema orelse break :blk null;
-        if (loaded.version == schema.version) break :blk null;
-        const existing_version = try loadSchemaVersion(store, alloc, loaded.version);
-        defer if (existing_version) |existing| freeSchema(alloc, existing);
-        if (existing_version != null) break :blk null;
-        break :blk try serializeSchema(alloc, loaded);
-    };
-    defer if (previous_versioned_data) |encoded| alloc.free(encoded);
-
+/// Commit a schema which was serialized and validated before entering the
+/// caller's mutation fence. Runtime schema bytes begin with format and logical
+/// version u32 values, so immutable-version checks need no deserialization.
+pub fn saveEncodedSchemaWithMetadata(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+) !bool {
+    if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
+        std.mem.readInt(u32, data[8..12], .little) != schema_version)
+        return error.InvalidSchema;
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
+    const versioned_key = try schemaVersionKeyAlloc(alloc, schema_version);
+    defer alloc.free(versioned_key);
+    var previous_version: ?u32 = null;
+    var previous_versioned_data: ?[]u8 = null;
+    defer if (previous_versioned_data) |encoded| alloc.free(encoded);
+    const schema_changed = changed_blk: {
+        var probe = try runtime.store.beginProbe();
+        defer probe.abort();
+        const previous_data = probe.get(schema_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const changed = if (previous_data) |loaded| !std.mem.eql(u8, loaded, data) else true;
+        if (!changed) break :changed_blk false;
+
+        if (previous_data) |loaded| {
+            if (loaded.len < 12 or !std.mem.eql(u8, loaded[0..4], "ASCH")) return error.InvalidSchema;
+            previous_version = std.mem.readInt(u32, loaded[8..12], .little);
+            if (schema_version < previous_version.?) return error.SchemaVersionRegression;
+        }
+        const existing_version = probe.get(versioned_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing_version) |existing|
+            if (!std.mem.eql(u8, existing, data)) return error.ImmutableSchemaVersionConflict;
+
+        if (previous_data) |loaded| if (previous_version.? != schema_version) {
+            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
+            defer alloc.free(previous_versioned_key);
+            const existing_previous = probe.get(previous_versioned_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing_previous == null) previous_versioned_data = try alloc.dupe(u8, loaded);
+        };
+        break :changed_blk true;
+    };
+    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     if (schema_changed) {
-        if (previous_schema) |loaded| {
-            if (previous_versioned_data) |encoded| {
-                const previous_versioned_key = try schemaVersionKeyAlloc(alloc, loaded.version);
-                defer alloc.free(previous_versioned_key);
-                try txn.put(previous_versioned_key, encoded);
-            }
+        if (previous_versioned_data) |encoded| {
+            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
+            defer alloc.free(previous_versioned_key);
+            try txn.put(previous_versioned_key, encoded);
         }
         try txn.put(schema_key, data);
         try txn.put(versioned_key, data);
@@ -1258,18 +1299,6 @@ pub fn saveSchemaWithMetadata(
     };
     try txn.commit();
     return schema_changed;
-}
-
-fn activeSchemaDataMatches(store: anytype, alloc: Allocator, expected: []const u8) !bool {
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
-    const raw = txn.get(schema_key) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
-    };
-    return std.mem.eql(u8, raw, expected);
 }
 
 /// Load a schema from DocStore. Returns null if no schema exists.

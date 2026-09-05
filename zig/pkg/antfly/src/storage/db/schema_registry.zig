@@ -20,17 +20,32 @@ const row_codec = @import("algebraic/relational_row_codec.zig");
 
 const Allocator = std.mem.Allocator;
 
+const acquisition_stripe_count = 64;
+const acquisition_bank_count = 2;
+const max_resident_historical_epochs = 32;
+const AcquisitionStripe = struct {
+    readers: std.atomic.Value(usize) align(64) = .init(0),
+    // Keep unrelated reader cohorts off the same cache line. Schema views are
+    // acquired on every request, so a single acquisition-hazard counter
+    // otherwise becomes a coherence bottleneck before the storage engine does.
+    padding: [64 - @sizeOf(std.atomic.Value(usize))]u8 = undefined,
+};
+
 /// An immutable runtime schema generation. The version map owns one reference
-/// and every SchemaView owns another. Historical versions remain available for
-/// decoding. A version is a permanent identity: idempotent publication reuses
-/// the existing epoch and callers must reject conflicting durable metadata
-/// before reaching the registry.
+/// and every pinned view owns another. Banked acquisition hazards protect the
+/// small lock-free load-and-retain window while whole namespaces are replaced.
+/// Historical versions remain available for decoding. A version is a permanent identity:
+/// idempotent publication reuses the existing epoch and callers must reject
+/// conflicting durable metadata before reaching the registry.
 pub const Epoch = struct {
     alloc: Allocator,
     ref_count: std.atomic.Value(usize) = .init(1),
     schema: schema_mod.TableSchema,
     physical_layout: row_codec.PhysicalLayout,
     validator: ?schema_api.CompiledTableValidator = null,
+    /// Protected by Registry.mutex. Active epochs do not participate in the
+    /// historical LRU and therefore do not add an atomic write to request pins.
+    historical_access: u64 = 0,
 
     pub fn createOwned(alloc: Allocator, owned_schema: schema_mod.TableSchema) !*Epoch {
         var physical_layout = try row_codec.PhysicalLayout.init(alloc, owned_schema);
@@ -89,6 +104,10 @@ pub const Epoch = struct {
         schema_mod.freeSchema(self.alloc, self.schema);
         self.alloc.destroy(self);
     }
+
+    fn cacheOwnsOnlyReference(self: *const Epoch) bool {
+        return self.ref_count.load(.acquire) == 1;
+    }
 };
 
 pub const SchemaView = struct {
@@ -122,20 +141,28 @@ pub const SchemaView = struct {
 
 pub const Registry = struct {
     alloc: Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     current: std.atomic.Value(?*Epoch) = .init(null),
-    /// The map owns one permanent reference to every published epoch. Therefore
-    /// `current` never points at reclaimable storage during the registry's
-    /// lifetime and readers do not need a globally contended acquisition gate.
+    /// Readers publish a short acquisition hazard without entering a mutex or
+    /// suspending the current std.Io task. Replacement flips banks, then waits
+    /// only for the old load-and-retain windows; returned SchemaViews own epoch
+    /// references and never delay publication or reclamation admission.
+    acquisition_generation: std.atomic.Value(u64) = .init(0),
+    acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
+        [_][acquisition_stripe_count]AcquisitionStripe{
+            [_]AcquisitionStripe{.{}} ** acquisition_stripe_count,
+        } ** acquisition_bank_count,
+    namespace_generation: std.atomic.Value(u64) = .init(0),
+    pending_publications: usize = 0,
+    historical_clock: u64 = 0,
+    /// The map owns the active epoch plus a bounded, refcount-aware cache of
+    /// historical layouts. Evicted versions remain durable and are faulted back
+    /// through DBCore.acquireSchemaVersionView when an old row needs them.
     epochs: std.AutoHashMapUnmanaged(u32, *Epoch) = .empty,
-    /// Whole-database publication may reuse version numbers for unrelated
-    /// schemas. Retain displaced generations until registry teardown so a
-    /// lock-free acquire which raced the publication can still safely retain
-    /// the old epoch, while new lookups only see the replacement generation.
-    retired_epochs: std.ArrayListUnmanaged(*Epoch) = .empty,
 
-    pub fn initOwned(alloc: Allocator, initial_schema: ?schema_mod.TableSchema) !Registry {
-        var registry = Registry{ .alloc = alloc };
+    pub fn initOwned(alloc: Allocator, io: std.Io, initial_schema: ?schema_mod.TableSchema) !Registry {
+        var registry = Registry{ .alloc = alloc, .io = io };
         errdefer registry.epochs.deinit(alloc);
         if (initial_schema) |schema| {
             var schema_owned = true;
@@ -149,28 +176,47 @@ pub const Registry = struct {
         return registry;
     }
 
-    pub fn initCloned(alloc: Allocator, initial_schema: ?schema_mod.TableSchema) !Registry {
+    pub fn initCloned(alloc: Allocator, io: std.Io, initial_schema: ?schema_mod.TableSchema) !Registry {
         const owned = if (initial_schema) |schema| blk: {
             const encoded = try schema_mod.serializeSchema(alloc, schema);
             defer alloc.free(encoded);
             break :blk try schema_mod.deserializeSchema(alloc, encoded);
         } else null;
-        return try initOwned(alloc, owned);
+        return try initOwned(alloc, io, owned);
     }
 
     pub fn deinit(self: *Registry) void {
-        var iterator = self.epochs.valueIterator();
-        while (iterator.next()) |epoch| epoch.*.release();
-        self.epochs.deinit(self.alloc);
-        for (self.retired_epochs.items) |epoch| epoch.release();
-        self.retired_epochs.deinit(self.alloc);
+        deinitEpochMap(self.alloc, &self.epochs);
         self.* = undefined;
     }
 
     pub fn acquire(self: *Registry) ?SchemaView {
-        const epoch = self.current.load(.acquire) orelse return null;
-        epoch.retain();
-        return .{ .epoch = epoch };
+        const stripe_index = acquisitionStripeIndex();
+        while (true) {
+            // These generation/counter operations are intentionally seq_cst.
+            // Their single total order guarantees one of two safe outcomes:
+            // the replacer observes this hazard before reclaiming the old map,
+            // or this reader observes the bank flip before dereferencing an
+            // epoch. Do not weaken them independently to acquire/release.
+            const generation = self.acquisition_generation.load(.seq_cst);
+            const bank: usize = @intCast(generation & (acquisition_bank_count - 1));
+            const stripe = &self.acquisition_readers[bank][stripe_index];
+            _ = stripe.readers.fetchAdd(1, .seq_cst);
+            // A replacement which changed banks may already be reclaiming the
+            // old namespace. Retry before touching `current`; the writer waits
+            // for this old-bank hazard before releasing any epoch references.
+            if (self.acquisition_generation.load(.seq_cst) != generation) {
+                const previous = stripe.readers.fetchSub(1, .seq_cst);
+                std.debug.assert(previous > 0);
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            const epoch = self.current.load(.acquire);
+            if (epoch) |value| value.retain();
+            const previous = stripe.readers.fetchSub(1, .seq_cst);
+            std.debug.assert(previous > 0);
+            return if (epoch) |value| .{ .epoch = value } else null;
+        }
     }
 
     pub fn acquireVersion(self: *Registry, version: u32) ?SchemaView {
@@ -181,11 +227,64 @@ pub const Registry = struct {
             if (view.version() == version) return view.*;
             view.release();
         }
-        lockMutex(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const epoch = self.epochs.get(version) orelse return null;
+        self.touchHistoricalLocked(epoch);
         epoch.retain();
         return .{ .epoch = epoch };
+    }
+
+    fn touchHistoricalLocked(self: *Registry, epoch: *Epoch) void {
+        if (self.current.load(.acquire) == epoch) return;
+        self.historical_clock +%= 1;
+        if (self.historical_clock == 0) self.historical_clock = 1;
+        epoch.historical_access = self.historical_clock;
+    }
+
+    /// Remove one least-recently-used cache-only historical epoch. Pinned views
+    /// are never selected; their references bound temporary overflow by active
+    /// reader concurrency rather than by schema-update history.
+    fn takeHistoricalEvictionLocked(self: *Registry) ?*Epoch {
+        const active_allowance: usize = @intFromBool(self.current.load(.acquire) != null);
+        if (self.epochs.count() <= max_resident_historical_epochs + active_allowance) return null;
+        const active = self.current.load(.acquire);
+        var candidate_version: ?u32 = null;
+        var candidate_access: u64 = std.math.maxInt(u64);
+        var iterator = self.epochs.iterator();
+        while (iterator.next()) |entry| {
+            const epoch = entry.value_ptr.*;
+            if (epoch == active or !epoch.cacheOwnsOnlyReference()) continue;
+            if (candidate_version == null or epoch.historical_access < candidate_access) {
+                candidate_version = entry.key_ptr.*;
+                candidate_access = epoch.historical_access;
+            }
+        }
+        const version = candidate_version orelse return null;
+        return self.epochs.fetchRemove(version).?.value;
+    }
+
+    /// Close every lock-free load-and-retain window that could still hold the
+    /// previous `current` pointer. Schema publication is rare, so paying this
+    /// short RCU grace period here keeps request acquisition allocation-free and
+    /// lets historical cache eviction safely release its map reference.
+    fn advanceAcquisitionGracePeriodLocked(self: *Registry) void {
+        const retired_generation = self.acquisition_generation.load(.seq_cst);
+        const retired_bank: usize = @intCast(retired_generation & (acquisition_bank_count - 1));
+        self.acquisition_generation.store(retired_generation +% 1, .seq_cst);
+        for (&self.acquisition_readers[retired_bank]) |*stripe| {
+            var spins: usize = 0;
+            while (stripe.readers.load(.seq_cst) != 0) : (spins +|= 1) {
+                if (spins < 64) {
+                    std.atomic.spinLoopHint();
+                } else {
+                    // A preempted or suspended acquirer must not turn rare
+                    // schema publication into an unbounded CPU spin. Yield via
+                    // the injected runtime so this remains fiber-aware.
+                    self.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                }
+            }
+        }
     }
 
     /// Returns whether `view` is the exact active schema generation. Callers
@@ -196,26 +295,109 @@ pub const Registry = struct {
         return self.current.load(.acquire) == view.epoch;
     }
 
-    /// Reserve publication bookkeeping before the durable schema transaction.
-    pub fn preparePublish(self: *Registry, version: u32) !void {
-        lockMutex(&self.mutex);
-        defer self.mutex.unlock();
-        if (!self.epochs.contains(version)) try self.epochs.ensureUnusedCapacity(self.alloc, 1);
+    pub const PublishReservation = struct {
+        registry: *Registry,
+        generation: u64,
+        version: u32,
+        active: bool = true,
+
+        pub fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            self.registry.mutex.lockUncancelable(self.registry.io);
+            std.debug.assert(self.registry.pending_publications > 0);
+            self.registry.pending_publications -= 1;
+            self.registry.mutex.unlock(self.registry.io);
+            self.active = false;
+        }
+
+        pub fn isCurrent(self: *const @This()) bool {
+            return self.active and
+                self.registry.namespace_generation.load(.acquire) == self.generation;
+        }
+
+        pub fn publish(self: *@This(), prepared: *Epoch) void {
+            if (!self.active or prepared.schema.version != self.version)
+                @panic("invalid schema publication reservation");
+            self.registry.mutex.lockUncancelable(self.registry.io);
+            if (self.registry.pending_publications == 0 or
+                self.registry.namespace_generation.load(.acquire) != self.generation)
+                @panic("stale schema publication reservation");
+            self.registry.pending_publications -= 1;
+            self.active = false;
+            if (self.registry.epochs.get(prepared.schema.version)) |existing| {
+                const previous_current = self.registry.current.load(.acquire);
+                self.registry.current.store(existing, .release);
+                if (previous_current != existing) self.registry.advanceAcquisitionGracePeriodLocked();
+                if (previous_current) |epoch| self.registry.touchHistoricalLocked(epoch);
+                const retired = self.registry.takeHistoricalEvictionLocked();
+                self.registry.mutex.unlock(self.registry.io);
+                prepared.release();
+                if (retired) |epoch| epoch.release();
+                return;
+            }
+            const previous_current = self.registry.current.load(.acquire);
+            self.registry.epochs.putAssumeCapacity(prepared.schema.version, prepared);
+            self.registry.current.store(prepared, .release);
+            if (previous_current != prepared) self.registry.advanceAcquisitionGracePeriodLocked();
+            if (previous_current) |epoch| self.registry.touchHistoricalLocked(epoch);
+            const retired = self.registry.takeHistoricalEvictionLocked();
+            self.registry.mutex.unlock(self.registry.io);
+            if (retired) |epoch| epoch.release();
+        }
+    };
+
+    /// Reserve a distinct map insertion before the durable schema transaction.
+    /// Concurrent preparations are counted so none can consume another's slot.
+    pub fn preparePublish(self: *Registry, version: u32) !PublishReservation {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const required = std.math.add(usize, self.pending_publications, 1) catch
+            return error.SchemaCapacityExceeded;
+        try self.epochs.ensureUnusedCapacity(
+            self.alloc,
+            std.math.cast(u32, required) orelse return error.SchemaCapacityExceeded,
+        );
+        self.pending_publications = required;
+        return .{
+            .registry = self,
+            .generation = self.namespace_generation.load(.acquire),
+            .version = version,
+        };
     }
 
-    /// Reserve all bookkeeping needed to replace an entire durable database
-    /// generation. Publication itself must remain allocation-free because it
-    /// runs after the durable generation swap has committed.
-    pub fn prepareReplaceAll(self: *Registry) !void {
-        lockMutex(&self.mutex);
-        defer self.mutex.unlock();
-        try self.retired_epochs.ensureUnusedCapacity(self.alloc, self.epochs.count());
-        try self.epochs.ensureTotalCapacity(self.alloc, 1);
+    pub const PreparedReplacement = struct {
+        alloc: Allocator,
+        epochs: std.AutoHashMapUnmanaged(u32, *Epoch) = .empty,
+        current: ?*Epoch,
+        active: bool = true,
+
+        pub fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            deinitEpochMap(self.alloc, &self.epochs);
+            self.* = undefined;
+        }
+    };
+
+    /// Allocate the complete successor namespace before the durable store
+    /// swap. Publication is therefore infallible.
+    /// On success this object owns `prepared`.
+    pub fn prepareReplaceAll(self: *Registry, prepared: ?*Epoch) !PreparedReplacement {
+        var epochs: std.AutoHashMapUnmanaged(u32, *Epoch) = .empty;
+        errdefer epochs.deinit(self.alloc);
+        if (prepared) |epoch| {
+            try epochs.ensureTotalCapacity(self.alloc, 1);
+            epochs.putAssumeCapacity(epoch.schema.version, epoch);
+        }
+        return .{
+            .alloc = self.alloc,
+            .epochs = epochs,
+            .current = prepared,
+        };
     }
 
     pub fn prepareHistoricalCapacity(self: *Registry, versions: []const u32) !void {
-        lockMutex(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var unique_missing = std.AutoHashMapUnmanaged(u32, void).empty;
         defer unique_missing.deinit(self.alloc);
         try unique_missing.ensureTotalCapacity(self.alloc, std.math.cast(u32, versions.len) orelse
@@ -226,87 +408,143 @@ pub const Registry = struct {
             const result = unique_missing.getOrPutAssumeCapacity(version);
             if (!result.found_existing) missing += 1;
         }
+        const required = std.math.add(usize, self.pending_publications, missing) catch
+            return error.SchemaCapacityExceeded;
         try self.epochs.ensureUnusedCapacity(
             self.alloc,
-            std.math.cast(u32, missing) orelse return error.SchemaCapacityExceeded,
+            std.math.cast(u32, required) orelse return error.SchemaCapacityExceeded,
         );
     }
 
-    /// Publish a fully prepared epoch. This operation cannot allocate or fail,
-    /// so callers can perform all preparation before their durable commit.
-    pub fn publishPrepared(self: *Registry, prepared: *Epoch) void {
-        lockMutex(&self.mutex);
+    /// Publish outside a durable commit path. Reservations are preserved for
+    /// callers which already promised allocation-free publication.
+    pub fn publishPrepared(self: *Registry, prepared: *Epoch) !void {
+        errdefer prepared.release();
+        self.mutex.lockUncancelable(self.io);
+        var locked = true;
+        defer if (locked) self.mutex.unlock(self.io);
         if (self.epochs.get(prepared.schema.version)) |existing| {
+            const previous_current = self.current.load(.acquire);
             self.current.store(existing, .release);
-            self.mutex.unlock();
+            if (previous_current != existing) self.advanceAcquisitionGracePeriodLocked();
+            if (previous_current) |epoch| self.touchHistoricalLocked(epoch);
+            const retired = self.takeHistoricalEvictionLocked();
+            self.mutex.unlock(self.io);
+            locked = false;
             prepared.release();
+            if (retired) |epoch| epoch.release();
             return;
         }
+        const required = std.math.add(usize, self.pending_publications, 1) catch
+            return error.SchemaCapacityExceeded;
+        self.epochs.ensureUnusedCapacity(
+            self.alloc,
+            std.math.cast(u32, required) orelse return error.SchemaCapacityExceeded,
+        ) catch |err| {
+            return err;
+        };
+        const previous_current = self.current.load(.acquire);
         self.epochs.putAssumeCapacity(prepared.schema.version, prepared);
         self.current.store(prepared, .release);
-        self.mutex.unlock();
+        if (previous_current != prepared) self.advanceAcquisitionGracePeriodLocked();
+        if (previous_current) |epoch| self.touchHistoricalLocked(epoch);
+        const retired = self.takeHistoricalEvictionLocked();
+        self.mutex.unlock(self.io);
+        locked = false;
+        if (retired) |epoch| epoch.release();
     }
 
     /// Replace the version namespace after an atomic whole-store restore.
-    /// Displaced epochs remain retained for readers which raced publication,
-    /// but can no longer satisfy lookups against the new durable generation.
-    pub fn replaceAllPrepared(self: *Registry, prepared: ?*Epoch) void {
-        lockMutex(&self.mutex);
-        self.current.store(null, .release);
-        var iterator = self.epochs.valueIterator();
-        while (iterator.next()) |epoch| self.retired_epochs.appendAssumeCapacity(epoch.*);
-        self.epochs.clearRetainingCapacity();
-        if (prepared) |epoch| {
-            self.epochs.putAssumeCapacity(epoch.schema.version, epoch);
-            self.current.store(epoch, .release);
-        }
-        self.mutex.unlock();
+    /// Publication flips the acquisition bank and waits only for readers which
+    /// were inside the old load-and-retain window. New readers immediately use
+    /// the successor bank; request-held views retain their epochs independently.
+    pub fn replaceAllPrepared(self: *Registry, replacement: *PreparedReplacement) void {
+        if (!replacement.active) @panic("schema replacement already consumed");
+        self.mutex.lockUncancelable(self.io);
+        var retired_epochs = self.epochs;
+        self.epochs = replacement.epochs;
+        self.current.store(replacement.current, .release);
+        // See acquire(): the seq_cst flip and counter observations form the
+        // acquisition grace-period handshake across distinct atomics.
+        self.advanceAcquisitionGracePeriodLocked();
+        _ = self.namespace_generation.fetchAdd(1, .acq_rel);
+        replacement.active = false;
+        self.mutex.unlock(self.io);
+        deinitEpochMap(self.alloc, &retired_epochs);
     }
 
     /// Publish the absence of an active schema while retaining historical
     /// layouts. Readers which already pinned a view remain valid and a later
     /// row carrying an old layout version can still resolve that epoch.
     pub fn clearCurrent(self: *Registry) void {
+        self.mutex.lockUncancelable(self.io);
+        const previous_current = self.current.load(.acquire);
         self.current.store(null, .release);
+        if (previous_current != null) self.advanceAcquisitionGracePeriodLocked();
+        if (previous_current) |epoch| self.touchHistoricalLocked(epoch);
+        const retired = self.takeHistoricalEvictionLocked();
+        self.mutex.unlock(self.io);
+        if (retired) |epoch| epoch.release();
     }
 
-    pub fn installHistorical(self: *Registry, prepared: *Epoch) SchemaView {
-        lockMutex(&self.mutex);
+    pub fn installHistorical(self: *Registry, prepared: *Epoch) !SchemaView {
+        self.mutex.lockUncancelable(self.io);
+        var locked = true;
+        defer if (locked) self.mutex.unlock(self.io);
         if (self.epochs.get(prepared.schema.version)) |existing| {
+            self.touchHistoricalLocked(existing);
             existing.retain();
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
+            locked = false;
             prepared.release();
             return .{ .epoch = existing };
         }
+        const required = std.math.add(usize, self.pending_publications, 1) catch
+            return error.SchemaCapacityExceeded;
+        self.epochs.ensureUnusedCapacity(
+            self.alloc,
+            std.math.cast(u32, required) orelse return error.SchemaCapacityExceeded,
+        ) catch |err| {
+            return err;
+        };
         self.epochs.putAssumeCapacity(prepared.schema.version, prepared);
+        self.touchHistoricalLocked(prepared);
         prepared.retain();
-        self.mutex.unlock();
+        const retired = self.takeHistoricalEvictionLocked();
+        self.mutex.unlock(self.io);
+        locked = false;
+        if (retired) |epoch| epoch.release();
         return .{ .epoch = prepared };
     }
 };
 
-fn lockMutex(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (attempts < 64) {
-            std.atomic.spinLoopHint();
-        } else if (comptime builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
+fn deinitEpochMap(alloc: Allocator, epochs: *std.AutoHashMapUnmanaged(u32, *Epoch)) void {
+    var iterator = epochs.valueIterator();
+    while (iterator.next()) |epoch| epoch.*.release();
+    epochs.deinit(alloc);
+}
+
+fn acquisitionStripeIndex() usize {
+    if (comptime builtin.single_threaded) return 0;
+    var stack_marker: u8 = 0;
+    const execution_address = @intFromPtr(&stack_marker);
+    // Fiber stacks provide a stable discriminator across a potentially
+    // suspending std.Io lock acquisition without binding schema lifetime code
+    // to an OS-thread scheduler.
+    var mixed = execution_address ^ (execution_address >> 16);
+    mixed *%= 0x9e3779b1;
+    return mixed & (acquisition_stripe_count - 1);
 }
 
 test "schema views keep retired epochs alive" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, .{ .version = 1 });
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
     defer registry.deinit();
 
     var old = registry.acquire().?;
     defer old.release();
     const replacement = try Epoch.createCloned(alloc, .{ .version = 2, .storage_mode = .relational });
-    registry.publishPrepared(replacement);
+    try registry.publishPrepared(replacement);
 
     try std.testing.expectEqual(@as(u32, 1), old.version());
     var current = registry.acquire().?;
@@ -317,7 +555,7 @@ test "schema views keep retired epochs alive" {
 
 test "same-version publication preserves immutable epoch identity" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, .{ .version = 4 });
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 4 });
     defer registry.deinit();
 
     var pinned = registry.acquire().?;
@@ -325,7 +563,7 @@ test "same-version publication preserves immutable epoch identity" {
     try std.testing.expect(registry.isCurrent(pinned));
     try std.testing.expectEqual(@as(usize, 2), original.ref_count.load(.acquire));
     const replacement = try Epoch.createCloned(alloc, .{ .version = 4, .storage_mode = .relational });
-    registry.publishPrepared(replacement);
+    try registry.publishPrepared(replacement);
     try std.testing.expect(registry.isCurrent(pinned));
     try std.testing.expectEqual(@as(usize, 2), original.ref_count.load(.acquire));
     pinned.release();
@@ -335,21 +573,199 @@ test "same-version publication preserves immutable epoch identity" {
     try std.testing.expectEqual(schema_mod.StorageMode.document, current.storageMode());
 }
 
+test "historical epoch residency is bounded while pinned views remain valid" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    defer registry.deinit();
+
+    var pinned = registry.acquire().?;
+    for (2..max_resident_historical_epochs + 20) |version| {
+        try registry.publishPrepared(try Epoch.createCloned(alloc, .{ .version = @intCast(version) }));
+    }
+    try std.testing.expectEqual(@as(u32, 1), pinned.version());
+    try std.testing.expect(registry.epochs.count() <= max_resident_historical_epochs + 1);
+    pinned.release();
+
+    for (max_resident_historical_epochs + 20..max_resident_historical_epochs + 40) |version| {
+        try registry.publishPrepared(try Epoch.createCloned(alloc, .{ .version = @intCast(version) }));
+    }
+    try std.testing.expect(registry.epochs.count() <= max_resident_historical_epochs + 1);
+    var current = registry.acquire().?;
+    defer current.release();
+    try std.testing.expectEqual(@as(u32, max_resident_historical_epochs + 39), current.version());
+}
+
+test "whole generation replacement does not wait for pinned views" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var registry = try Registry.initCloned(std.testing.allocator, io, .{ .version = 1 });
+    defer registry.deinit();
+
+    var pinned = registry.acquire().?;
+    const old_epoch = pinned.epoch;
+    const replacement_epoch = try Epoch.createCloned(std.testing.allocator, .{ .version = 2 });
+    var replacement = try registry.prepareReplaceAll(replacement_epoch);
+    defer replacement.deinit();
+
+    const Publisher = struct {
+        fn run(target: *Registry, prepared: *Registry.PreparedReplacement, done: *std.atomic.Value(bool)) void {
+            target.replaceAllPrepared(prepared);
+            done.store(true, .release);
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    var publisher = std.Io.async(io, Publisher.run, .{ &registry, &replacement, &done });
+    var awaited = false;
+    defer if (!awaited) publisher.await(io);
+    for (0..5_000) |_| {
+        if (done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(done.load(.acquire));
+    publisher.await(io);
+    awaited = true;
+    try std.testing.expectEqual(@as(u32, 1), pinned.version());
+    try std.testing.expectEqual(@as(usize, 1), old_epoch.ref_count.load(.acquire));
+    pinned.release();
+}
+
+test "concurrent publication reservations preserve capacity and generation fences" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    defer registry.deinit();
+
+    var first = try registry.preparePublish(2);
+    defer first.deinit();
+    var second = try registry.preparePublish(3);
+    defer second.deinit();
+    first.publish(try Epoch.createCloned(alloc, .{ .version = 2 }));
+    second.publish(try Epoch.createCloned(alloc, .{ .version = 3 }));
+    try std.testing.expectEqual(@as(usize, 0), registry.pending_publications);
+
+    var stale = try registry.preparePublish(4);
+    defer stale.deinit();
+    var replacement = try registry.prepareReplaceAll(null);
+    defer replacement.deinit();
+    registry.replaceAllPrepared(&replacement);
+    try std.testing.expect(!stale.isCurrent());
+}
+
 test "whole generation replacement isolates reused schema versions" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, .{ .version = 7 });
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 7 });
     defer registry.deinit();
 
     var old = registry.acquire().?;
-    defer old.release();
-    const replacement = try Epoch.createCloned(alloc, .{ .version = 7, .storage_mode = .relational });
-    try registry.prepareReplaceAll();
-    registry.replaceAllPrepared(replacement);
+    const old_epoch = old.epoch;
+    const replacement_epoch = try Epoch.createCloned(alloc, .{ .version = 7, .storage_mode = .relational });
+    var replacement = try registry.prepareReplaceAll(replacement_epoch);
+    defer replacement.deinit();
+    registry.replaceAllPrepared(&replacement);
 
-    try std.testing.expectEqual(schema_mod.StorageMode.document, old.storageMode());
+    // Replacement releases the registry's reference after the acquisition
+    // grace period. The pinned view independently keeps the old epoch alive.
+    try std.testing.expectEqual(@as(usize, 1), old_epoch.ref_count.load(.acquire));
+    try std.testing.expectEqual(schema_mod.StorageMode.document, old_epoch.schema.storage_mode);
     var current = registry.acquire().?;
     defer current.release();
     try std.testing.expectEqual(@as(u32, 7), current.version());
     try std.testing.expectEqual(schema_mod.StorageMode.relational, current.storageMode());
-    try std.testing.expect(!registry.isCurrent(old));
+    try std.testing.expect(registry.current.load(.acquire) != old_epoch);
+    old.release();
+}
+
+test "banked acquisition remains safe across repeated concurrent replacement" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const reader_count = 8;
+    var io_impl = std.Io.Threaded.init(alloc, .{
+        .concurrent_limit = .limited(reader_count),
+    });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var registry = try Registry.initCloned(alloc, io, .{ .version = 1 });
+    defer registry.deinit();
+
+    var ready: std.atomic.Value(usize) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var stop: std.atomic.Value(bool) = .init(false);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var observations: std.atomic.Value(usize) = .init(0);
+    const Reader = struct {
+        fn run(
+            task_io: std.Io,
+            target: *Registry,
+            ready_flag: *std.atomic.Value(usize),
+            start_flag: *std.atomic.Value(bool),
+            stop_flag: *std.atomic.Value(bool),
+            failed_flag: *std.atomic.Value(bool),
+            observed: *std.atomic.Value(usize),
+        ) std.Io.Cancelable!void {
+            _ = ready_flag.fetchAdd(1, .release);
+            while (!start_flag.load(.acquire)) try task_io.sleep(.fromMilliseconds(1), .awake);
+
+            var local_count: usize = 0;
+            while (!stop_flag.load(.acquire)) : (local_count += 1) {
+                var view = target.acquire() orelse {
+                    failed_flag.store(true, .release);
+                    continue;
+                };
+                const version = view.version();
+                const expected_mode: schema_mod.StorageMode = if (version & 1 == 0) .relational else .document;
+                if (version == 0 or
+                    view.storageMode() != expected_mode or
+                    view.physicalLayout().schema_version != version)
+                    failed_flag.store(true, .release);
+
+                // Occasionally suspend while holding the independently retained
+                // view. Replacement must wait only for the acquisition window,
+                // not for this request-lifetime pin.
+                if (local_count & 63 == 0) try task_io.sleep(.fromNanoseconds(1), .awake);
+                view.release();
+                _ = observed.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var readers = std.Io.Group.init;
+    var readers_active = true;
+    defer if (readers_active) readers.cancel(io);
+    for (0..reader_count) |_| {
+        try readers.concurrent(io, Reader.run, .{
+            io,
+            &registry,
+            &ready,
+            &start,
+            &stop,
+            &failed,
+            &observations,
+        });
+    }
+    while (ready.load(.acquire) != reader_count) try io.sleep(.fromMilliseconds(1), .awake);
+    start.store(true, .release);
+
+    for (2..1_002) |version| {
+        const replacement_epoch = try Epoch.createCloned(alloc, .{
+            .version = @intCast(version),
+            .storage_mode = if (version & 1 == 0) .relational else .document,
+        });
+        var replacement = try registry.prepareReplaceAll(replacement_epoch);
+        registry.replaceAllPrepared(&replacement);
+        replacement.deinit();
+        if (version & 15 == 0) try io.sleep(.fromNanoseconds(1), .awake);
+    }
+
+    stop.store(true, .release);
+    try readers.await(io);
+    readers_active = false;
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(observations.load(.acquire) >= reader_count);
+    var current = registry.acquire().?;
+    defer current.release();
+    try std.testing.expectEqual(@as(u32, 1_001), current.version());
+    try std.testing.expectEqual(schema_mod.StorageMode.document, current.storageMode());
 }

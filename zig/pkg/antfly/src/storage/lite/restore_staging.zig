@@ -922,6 +922,7 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
 }
 
 test "lite portable publication never reports a retryable failure after adoption" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -980,6 +981,7 @@ test "lite portable publication never reports a retryable failure after adoption
 }
 
 test "lite portable publication reports durability unknown after adopting runtime state" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

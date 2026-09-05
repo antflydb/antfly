@@ -3400,8 +3400,7 @@ pub const ProvisionedTableWriteCache = struct {
         // cache owner so healthy repair does not remain indeterminate until an
         // unrelated reopen. Read-only and short-lived catch-up DBs are gated
         // out by the DB worker itself.
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
@@ -3763,8 +3762,7 @@ pub const ProvisionedTableWriteCache = struct {
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         opened.* = null;
         return .{
             .cache = self,
@@ -3823,8 +3821,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
     }
 
     pub fn getLocked(
@@ -26956,13 +26953,16 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?storage_schema.TableSchema = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
                 if (schema_json.len == 0) break :blk null;
                 var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
                 defer parsed_schema.deinit(allocator);
-                break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
+                break :blk .{
+                    .runtime_schema = try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema),
+                    .public_schema_json = schema_json,
+                };
             } else null;
-            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
             if (open_options.native_restore_open_plan) |native_plan| {
                 if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;

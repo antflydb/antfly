@@ -360,6 +360,7 @@ fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) 
 fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
         if (std.mem.eql(u8, field_type, "keyword") or
             std.mem.eql(u8, field_type, "link") or
             std.mem.eql(u8, field_type, "string") or
@@ -1615,14 +1616,14 @@ test "runtime schema materializes default-analyzed search-as-you-type root prefi
 test "runtime schema derives authoritative relational columns" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"score":{"type":["number","null"]},"payload":{"type":"json"}},"required":["id","count"],"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"score":{"type":["number","null"]},"payload":{"type":"json"},"embedding":{"type":"embedding"}},"required":["id","count"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
     try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 4), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 5), runtime.relational_columns.len);
     try std.testing.expectEqual(storage_schema.RelationalColumnType.string, runtime.relational_columns[0].column_type);
     try std.testing.expect(runtime.relational_columns[0].required);
     try std.testing.expectEqual(storage_schema.RelationalColumnType.integer, runtime.relational_columns[1].column_type);
@@ -1630,6 +1631,8 @@ test "runtime schema derives authoritative relational columns" {
     try std.testing.expectEqual(storage_schema.RelationalColumnType.json, runtime.relational_columns[3].column_type);
     try std.testing.expect(runtime.relational_columns[3].is_json);
     try std.testing.expectEqual(storage_schema.RelationalJsonKind.any, runtime.relational_columns[3].json_kind);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.dense_vector, runtime.relational_columns[4].column_type);
+    try std.testing.expect(!runtime.relational_columns[4].is_json);
 }
 
 test "runtime schema derives internal doc values from sortable scalar mappings" {

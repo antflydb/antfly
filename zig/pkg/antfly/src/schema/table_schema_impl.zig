@@ -1412,6 +1412,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "datetime") or
         std.mem.eql(u8, schema_type_name, "geopoint") or
         std.mem.eql(u8, schema_type_name, "geoshape") or
+        std.mem.eql(u8, schema_type_name, "embedding") or
         std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
@@ -2227,6 +2228,7 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "number") or
             std.mem.eql(u8, field_type, "geopoint") or
             std.mem.eql(u8, field_type, "geoshape") or
+            std.mem.eql(u8, field_type, "embedding") or
             std.mem.eql(u8, field_type, "json") or
             std.mem.eql(u8, field_type, "object") or
             std.mem.eql(u8, field_type, "array");

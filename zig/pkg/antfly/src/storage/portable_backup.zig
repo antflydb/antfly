@@ -84,6 +84,11 @@ const PortableOutputMode = union(enum) {
         included: []const bool,
         emitted: []bool,
         footer: *std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry),
+        /// The private file-backed spool is the exact byte stream replayed by
+        /// bundle emission. Per-block CRC still detects accidental spool
+        /// corruption, and the inventory SHA-256 is embedded for strict restore
+        /// verification, so hashing the same private bytes twice is redundant.
+        trust_inventory_digest: bool,
     },
 };
 
@@ -107,10 +112,10 @@ const PortableOutput = struct {
 
     fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
         self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
         switch (self.mode) {
             .inventory => |objects| {
+                var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
                 if (objects.items.len >= backup_bundle.max_objects) return error.BackupManifestTooLarge;
                 var object: PortableObject = .{
                     .block_type = block_type,
@@ -128,9 +133,15 @@ const PortableOutput = struct {
                 if (state.next_ordinal.* >= state.expected.len) return error.NonDeterministicBackupCapture;
                 const ordinal = state.next_ordinal.*;
                 const expected = state.expected[ordinal];
-                if (expected.block_type != block_type or expected.size_bytes != payload.len or
-                    !std.crypto.timing_safe.eql(@TypeOf(digest), expected.sha256, digest))
+                if (expected.block_type != block_type or expected.size_bytes != payload.len)
                     return error.NonDeterministicBackupCapture;
+                const digest = expected.sha256;
+                if (!state.trust_inventory_digest) {
+                    var observed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(payload, &observed, .{});
+                    if (!std.crypto.timing_safe.eql(@TypeOf(digest), digest, observed))
+                        return error.NonDeterministicBackupCapture;
+                }
                 const blob_index = portableBlobIndex(state.blobs, digest) orelse
                     return error.NonDeterministicBackupCapture;
                 state.next_ordinal.* += 1;
@@ -346,6 +357,7 @@ pub fn exportPortableToWriterWithOptions(
             .included = included,
             .emitted = emitted,
             .footer = &footer,
+            .trust_inventory_digest = options.spool != null,
         } },
         .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
     };
@@ -2146,7 +2158,7 @@ fn validatePortableDocumentEntryAgainstArchive(
         else => return error.InvalidBackupRequest,
     };
     if (archive.validatorForVersion(row_version)) |validator| {
-        const logical = relational_store.decodeValueForSchemaAndLayoutAlloc(
+        var logical = relational_store.materializeRootForSchemaAndLayoutAlloc(
             alloc,
             entry.value,
             layout.schema.*,
@@ -2155,13 +2167,8 @@ fn validatePortableDocumentEntryAgainstArchive(
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };
-        defer alloc.free(logical);
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, logical, .{ .parse_numbers = false }) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidBackupRequest,
-        };
-        defer parsed.deinit();
-        validator.validateValue(alloc, &parsed.value) catch |err| switch (err) {
+        defer logical.deinit(alloc);
+        validator.validateValue(alloc, &logical.root) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };

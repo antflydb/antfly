@@ -2849,17 +2849,20 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    const CommittedCreateOutcome = enum { visibility_pending, repair_required, repair_unavailable };
+    const CommittedMutationOutcome = enum { visibility_pending, superseded, repair_required, repair_unavailable };
 
-    fn committedCreateOutcomeResponse(ctx: *httpx.Context, outcome: CommittedCreateOutcome) !httpx.Response {
+    fn committedMutationOutcomeResponse(ctx: *httpx.Context, outcome: CommittedMutationOutcome) !httpx.Response {
         const header_value = switch (outcome) {
             .visibility_pending => metadata_http_routes.Routes.raft_mutation_outcome_committed_visibility_pending,
+            .superseded => metadata_http_routes.Routes.raft_mutation_outcome_committed_superseded,
             .repair_required, .repair_unavailable => metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
         };
         try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, header_value);
+        if (outcome == .visibility_pending) try ctx.setHeader("Retry-After", "1");
         _ = ctx.status(202);
         return ctx.json(.{ .status = switch (outcome) {
             .visibility_pending => "committed_visibility_pending",
+            .superseded => "committed_superseded",
             .repair_required => "committed_repair_required",
             .repair_unavailable => "committed_repair_unavailable",
         } });
@@ -4904,8 +4907,8 @@ pub const AntflyApiHandler = struct {
         std.log.info("public create table metadata done table={s}", .{decoded_table_name});
         const local_outcome = self.api_server.materializeCommittedTableCreate(alloc, decoded_table_name, create_req);
         switch (local_outcome) {
-            .repair_required => return committedCreateOutcomeResponse(ctx, .repair_required),
-            .repair_unavailable => return committedCreateOutcomeResponse(ctx, .repair_unavailable),
+            .repair_required => return committedMutationOutcomeResponse(ctx, .repair_required),
+            .repair_unavailable => return committedMutationOutcomeResponse(ctx, .repair_unavailable),
             .applied, .delegated => {},
         }
         const local_create_handled = local_outcome == .applied;
@@ -4914,22 +4917,22 @@ pub const AntflyApiHandler = struct {
             self.api_server.waitForProjectedTablePresence(decoded_table_name) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
-                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    return committedMutationOutcomeResponse(ctx, .visibility_pending);
                 },
                 else => {
                     std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    return committedMutationOutcomeResponse(ctx, .visibility_pending);
                 },
             };
         } else {
             const metadata_wait_handled = self.api_server.source.waitTableLifecycle(decoded_table_name, .present) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     std.log.warn("public create table committed before metadata lifecycle converged table={s}", .{decoded_table_name});
-                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    return committedMutationOutcomeResponse(ctx, .visibility_pending);
                 },
                 else => {
                     std.log.warn("public create table committed with metadata lifecycle observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    return committedMutationOutcomeResponse(ctx, .visibility_pending);
                 },
             };
             if (!metadata_wait_handled) {
@@ -4937,11 +4940,11 @@ pub const AntflyApiHandler = struct {
                 self.api_server.waitForTableVisibility(decoded_table_name, .present) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
                         std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
-                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                        return committedMutationOutcomeResponse(ctx, .visibility_pending);
                     },
                     else => {
                         std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                        return committedMutationOutcomeResponse(ctx, .visibility_pending);
                     },
                 };
             }
@@ -4949,13 +4952,13 @@ pub const AntflyApiHandler = struct {
         std.log.info("public create table visible table={s}", .{decoded_table_name});
 
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
-            return committedCreateOutcomeResponse(ctx, .visibility_pending);
+            return committedMutationOutcomeResponse(ctx, .visibility_pending);
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, decoded_table_name, null)) orelse {
-            return committedCreateOutcomeResponse(ctx, .visibility_pending);
+            return committedMutationOutcomeResponse(ctx, .visibility_pending);
         };
         return ctx.openApiJson(response);
     }
@@ -5041,8 +5044,7 @@ pub const AntflyApiHandler = struct {
                     std.log.err("public drop table committed but cleanup intent was not durable table={s}", .{decoded_table_name});
                     // The metadata drop committed, so never invite an
                     // automatic DDL replay with a generic failure status.
-                    _ = ctx.status(202);
-                    return ctx.json(.{ .status = "committed_repair_unavailable" });
+                    return committedMutationOutcomeResponse(ctx, .repair_unavailable);
                 },
                 else => {
                     // Metadata is already committed and dropTable persisted
@@ -5055,8 +5057,7 @@ pub const AntflyApiHandler = struct {
             };
         }
         if (repair_required) {
-            _ = ctx.status(202);
-            return ctx.json(.{ .status = "committed_repair_required" });
+            return committedMutationOutcomeResponse(ctx, .repair_required);
         }
         _ = ctx.status(204);
         return ctx.text("");
@@ -5323,23 +5324,33 @@ pub const AntflyApiHandler = struct {
         defer expectation.deinit(alloc);
         if (!local_schema_applied) {
             self.api_server.waitForSchemaUpdateProjection(decoded_table_name, expectation, committed_version) catch |err| switch (err) {
-                error.TableVisibilityTimeout => {
-                    _ = ctx.status(500);
-                    return ctx.text("schema update did not converge");
-                },
                 error.TableGenerationChanged => {
-                    _ = ctx.status(409);
-                    return ctx.text("schema update was superseded; retry request");
+                    std.log.info(
+                        "public schema update committed and was superseded before projection observation table={s} version={?d}",
+                        .{ decoded_table_name, committed_version },
+                    );
+                    return committedMutationOutcomeResponse(ctx, .superseded);
                 },
-                else => return err,
+                else => {
+                    std.log.warn(
+                        "public schema update committed before projection converged table={s} version={?d} err={s}",
+                        .{ decoded_table_name, committed_version, @errorName(err) },
+                    );
+                    return committedMutationOutcomeResponse(ctx, .visibility_pending);
+                },
             };
         }
         self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, mutation.schema_json, local_schema_applied) catch |write_err| switch (write_err) {
-            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                _ = ctx.status(400);
-                return ctx.text(invalid_schema_message);
+            else => {
+                // Metadata is already committed. If no worker accepted the
+                // local materialization, expose durable operator debt without
+                // inviting clients to replay a non-idempotent schema mutation.
+                std.log.err(
+                    "public schema update committed without local repair ownership table={s} version={?d} err={s}",
+                    .{ decoded_table_name, committed_version, @errorName(write_err) },
+                );
+                return committedMutationOutcomeResponse(ctx, .repair_unavailable);
             },
-            else => return write_err,
         };
 
         const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, mutation.schema_json);
@@ -9337,7 +9348,10 @@ test "httpx antfly schema update returns full table status after projection" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    // The authoritative mutation source already exposes the committed version
+    // in its snapshot, so the optimistic projection check avoids a redundant
+    // lifecycle wait before encoding the response.
+    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }

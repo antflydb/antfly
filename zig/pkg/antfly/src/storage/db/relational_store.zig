@@ -68,6 +68,28 @@ pub fn decodeValueForSchemaAndLayoutAlloc(
     return try row_codec.reconstructOrdinalValueWithLayoutAlloc(alloc, packed_row, table_schema, layout);
 }
 
+pub fn materializeDocumentForSchemaAndLayoutAlloc(
+    alloc: Allocator,
+    packed_row: []const u8,
+    table_schema: schema.TableSchema,
+    layout: *const row_codec.PhysicalLayout,
+) !row_codec.MaterializedOrdinalDocument {
+    if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
+    _ = try row_codec.rowSchemaVersion(packed_row);
+    return try row_codec.materializeOrdinalDocumentWithLayoutAlloc(alloc, packed_row, table_schema, layout);
+}
+
+pub fn materializeRootForSchemaAndLayoutAlloc(
+    alloc: Allocator,
+    packed_row: []const u8,
+    table_schema: schema.TableSchema,
+    layout: *const row_codec.PhysicalLayout,
+) !row_codec.MaterializedOrdinalRoot {
+    if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
+    _ = try row_codec.rowSchemaVersion(packed_row);
+    return try row_codec.materializeOrdinalRootWithLayoutAlloc(alloc, packed_row, table_schema, layout);
+}
+
 pub fn rowSchemaVersion(packed_row: []const u8) !u32 {
     return try document_mapper.relationalRowSchemaVersion(packed_row);
 }
@@ -114,9 +136,41 @@ pub fn validateCanonicalValueForSchemaAndLayout(
 ) !void {
     if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
     _ = try row_codec.rowSchemaVersion(packed_row);
+    var iterator = try row_codec.canonicalOrdinalCellIteratorWithLayout(packed_row, table_schema, layout);
+    const stored_hash = iterator.semanticHash();
+    if (iterator.isSparse()) {
+        const cells = try alloc.alloc(row_codec.Cell, iterator.presentCount());
+        defer alloc.free(cells);
+        var count: usize = 0;
+        while (try iterator.next()) |cell| : (count += 1) cells[count] = cell;
+        std.debug.assert(count == cells.len);
+        for (cells) |cell| {
+            if (!cell.is_json or cell.is_null) continue;
+            try validateCanonicalJsonCell(alloc, cell.value.bytes_val);
+        }
+        std.mem.sort(row_codec.Cell, cells, table_schema.relational_columns, struct {
+            fn lessThan(columns: []const schema.RelationalColumn, lhs: row_codec.Cell, rhs: row_codec.Cell) bool {
+                return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
+            }
+        }.lessThan);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(cells, table_schema);
+        if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
+        return;
+    }
+
     const cells = try alloc.alloc(?row_codec.Cell, table_schema.relational_columns.len);
     defer alloc.free(cells);
-    const stored_hash = try row_codec.collectOrdinalCellsWithLayout(packed_row, table_schema, layout, cells);
+    @memset(cells, null);
+    while (try iterator.next()) |cell| cells[cell.ordinal] = cell;
+    // The cell hash intentionally consumes canonical JSON bytes directly on
+    // this hot validation path. Establish that physical invariant before
+    // comparing the logical digest so equivalent-but-noncanonical JSON is
+    // diagnosed as a physical representation error, not content corruption.
+    for (cells) |maybe_cell| {
+        const cell = maybe_cell orelse continue;
+        if (!cell.is_json or cell.is_null) continue;
+        try validateCanonicalJsonCell(alloc, cell.value.bytes_val);
+    }
     const computed_hash = try document_content_hash.hashRelationalCellsWithOrdinals(
         alloc,
         cells,
@@ -124,11 +178,6 @@ pub fn validateCanonicalValueForSchemaAndLayout(
         layout.hash_ordinals,
     );
     if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
-    for (cells) |maybe_cell| {
-        const cell = maybe_cell orelse continue;
-        if (!cell.is_json or cell.is_null) continue;
-        try validateCanonicalJsonCell(alloc, cell.value.bytes_val);
-    }
 }
 
 fn validateCanonicalJsonCell(alloc: Allocator, encoded: []const u8) !void {

@@ -70,6 +70,71 @@ pub const PrimaryBackendKind = db_config.PrimaryBackendKind;
 pub const PrimaryBackend = db_config.PrimaryBackend;
 pub const CoreOpenOptions = db_config.CoreOpenOptions;
 
+/// All allocation- and compilation-heavy schema work prepared before the DB's
+/// exclusive apply fence. The commit path only validates the pinned generation,
+/// fills catalog metadata, performs the durable transaction, and transfers the
+/// already-owned runtime objects into publication.
+pub const PreparedSchemaMetadata = struct {
+    alloc: Allocator,
+    encoded: []u8,
+    resident_schema: ?schema_mod.TableSchema,
+    epoch: ?*schema_registry_mod.Epoch,
+    publication: ?schema_registry_mod.Registry.PublishReservation = null,
+    base_schema_view: ?schema_registry_mod.SchemaView = null,
+    same_version_layout_matches: bool = false,
+    combined_writes: []docstore_mod.KVPair,
+
+    fn init(
+        alloc: Allocator,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+    ) !PreparedSchemaMetadata {
+        const encoded = try schema_mod.serializeSchema(alloc, table_schema);
+        errdefer alloc.free(encoded);
+        const resident_schema = try schema_mod.deserializeSchema(alloc, encoded);
+        errdefer schema_mod.freeSchema(alloc, resident_schema);
+        var validator: ?public_schema_mod.CompiledTableValidator = null;
+        for (metadata_writes) |write| {
+            if (std.mem.eql(u8, write.key, public_schema_json_key)) {
+                validator = try public_schema_mod.CompiledTableValidator.init(alloc, write.value);
+                break;
+            }
+        }
+        var validator_owned = validator != null;
+        errdefer if (validator_owned) validator.?.deinit(alloc);
+        const epoch_schema = try schema_mod.deserializeSchema(alloc, encoded);
+        var epoch_schema_owned = true;
+        errdefer if (epoch_schema_owned) schema_mod.freeSchema(alloc, epoch_schema);
+        const epoch = try schema_registry_mod.Epoch.createOwnedValidated(alloc, epoch_schema, validator);
+        epoch_schema_owned = false;
+        validator_owned = false;
+        errdefer epoch.release();
+        const combined_writes = try alloc.alloc(docstore_mod.KVPair, metadata_writes.len + 1);
+        @memcpy(combined_writes[0..metadata_writes.len], metadata_writes);
+        return .{
+            .alloc = alloc,
+            .encoded = encoded,
+            .resident_schema = resident_schema,
+            .epoch = epoch,
+            .combined_writes = combined_writes,
+        };
+    }
+
+    pub fn deinit(self: *PreparedSchemaMetadata) void {
+        if (self.publication) |*publication| publication.deinit();
+        if (self.base_schema_view) |*view| view.release();
+        if (self.epoch) |epoch| epoch.release();
+        if (self.resident_schema) |resident| schema_mod.freeSchema(self.alloc, resident);
+        self.alloc.free(self.combined_writes);
+        self.alloc.free(self.encoded);
+        self.* = undefined;
+    }
+
+    fn schema(self: *const PreparedSchemaMetadata) *const schema_mod.TableSchema {
+        return &(self.resident_schema orelse unreachable);
+    }
+};
+
 pub const PendingWorkStats = struct {
     derived_target_sequence: u64,
     has_async_indexes: bool,
@@ -395,10 +460,10 @@ pub const DBCore = struct {
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
 
-    pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) !DBCore {
+    pub fn fromOpened(alloc: Allocator, io: std.Io, opened: OpenedCoreResources) !DBCore {
         const schema_registry = try alloc.create(schema_registry_mod.Registry);
         errdefer alloc.destroy(schema_registry);
-        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, opened.schema);
+        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, io, opened.schema);
         errdefer schema_registry.deinit();
         // Historical layouts remain durable and are installed lazily on the
         // first row that references them. Large, long-lived tables should not
@@ -421,7 +486,7 @@ pub const DBCore = struct {
                 const active_epoch = try schema_registry_mod.Epoch.createOwnedValidated(alloc, active_clone, validator);
                 clone_owned = false;
                 validator_owned = false;
-                schema_registry.publishPrepared(active_epoch);
+                try schema_registry.publishPrepared(active_epoch);
             }
         }
         opened.index_manager.setSchemaRegistry(schema_registry);
@@ -1158,11 +1223,53 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
-        const encoded = try schema_mod.serializeSchema(self.alloc, table_schema);
-        defer self.alloc.free(encoded);
+        var prepared = try self.prepareSchemaMetadata(table_schema, metadata_writes);
+        defer prepared.deinit();
+        return try self.commitPreparedSchemaMetadata(
+            &prepared,
+            metadata_writes,
+            metadata_deletes,
+            reconciled_row_count,
+        );
+    }
+
+    pub fn prepareSchemaMetadata(
+        self: *DBCore,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+    ) !PreparedSchemaMetadata {
+        var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
+        errdefer prepared.deinit();
+        prepared.base_schema_view = self.schema_registry.acquire();
+        if (prepared.base_schema_view) |view| {
+            if (view.version() == table_schema.version) {
+                const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
+                defer self.alloc.free(base_encoded);
+                prepared.same_version_layout_matches = std.mem.eql(u8, base_encoded, prepared.encoded);
+            }
+        }
+        prepared.publication = try self.schema_registry.preparePublish(table_schema.version);
+        return prepared;
+    }
+
+    pub fn commitPreparedSchemaMetadata(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+        reconciled_row_count: ?u64,
+    ) !bool {
+        if (prepared.combined_writes.len != metadata_writes.len + 1)
+            return error.InvalidSchemaUpdateRequest;
+        if (!prepared.publication.?.isCurrent()) return error.PreparedGenerationChanged;
+        if (prepared.base_schema_view) |view| {
+            if (!self.schema_registry.isCurrent(view)) return error.PreparedGenerationChanged;
+        } else if (self.schema != null) {
+            return error.PreparedGenerationChanged;
+        }
+        const table_schema = prepared.schema().*;
         const same_active_epoch = if (self.schema) |current|
-            current.version == table_schema.version and
-                try schema_mod.schemasEqual(self.alloc, current, table_schema)
+            current.version == table_schema.version and prepared.same_version_layout_matches
         else
             false;
         if (self.schema) |current| {
@@ -1176,27 +1283,6 @@ pub const DBCore = struct {
             metadata_writes,
             metadata_deletes,
         );
-        const next_schema = try schema_mod.deserializeSchema(self.alloc, encoded);
-        errdefer schema_mod.freeSchema(self.alloc, next_schema);
-        var epoch_validator: ?public_schema_mod.CompiledTableValidator = null;
-        for (metadata_writes) |write| {
-            if (std.mem.eql(u8, write.key, public_schema_json_key)) {
-                epoch_validator = try public_schema_mod.CompiledTableValidator.init(self.alloc, write.value);
-                break;
-            }
-        }
-        var epoch_validator_owned = epoch_validator != null;
-        errdefer if (epoch_validator_owned) epoch_validator.?.deinit(self.alloc);
-        const next_epoch = blk: {
-            const next_epoch_schema = try schema_mod.deserializeSchema(self.alloc, encoded);
-            errdefer schema_mod.freeSchema(self.alloc, next_epoch_schema);
-            const epoch = try schema_registry_mod.Epoch.createOwnedValidated(self.alloc, next_epoch_schema, epoch_validator);
-            epoch_validator_owned = false;
-            break :blk epoch;
-        };
-        errdefer next_epoch.release();
-        try self.schema_registry.preparePublish(table_schema.version);
-
         var next_catalog = self.table_catalog;
         next_catalog.mode_initialized = true;
         next_catalog.storage_mode = table_schema.storage_mode;
@@ -1209,28 +1295,34 @@ pub const DBCore = struct {
         if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
             next_catalog.generation +|= 1;
         const catalog_data = next_catalog.encode();
-        const combined = try self.alloc.alloc(docstore_mod.KVPair, metadata_writes.len + 1);
-        defer self.alloc.free(combined);
-        @memcpy(combined[0..metadata_writes.len], metadata_writes);
-        combined[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
-        const changed = try schema_mod.saveSchemaWithMetadata(
+        @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
+        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
+        const changed = try schema_mod.saveEncodedSchemaWithMetadata(
             self.store,
             self.alloc,
-            table_schema,
-            combined,
+            table_schema.version,
+            prepared.encoded,
+            prepared.combined_writes,
             metadata_deletes,
         );
+        const next_schema = prepared.resident_schema orelse unreachable;
         if (!changed or self.schema == null) {
             if (self.schema == null) {
                 self.schema = next_schema;
+                prepared.resident_schema = null;
             } else {
                 schema_mod.freeSchema(self.alloc, next_schema);
+                prepared.resident_schema = null;
             }
         } else {
             if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
             self.schema = next_schema;
+            prepared.resident_schema = null;
         }
-        self.schema_registry.publishPrepared(next_epoch);
+        const next_epoch = prepared.epoch orelse unreachable;
+        prepared.epoch = null;
+        prepared.publication.?.publish(next_epoch);
+        prepared.publication = null;
         self.table_catalog = next_catalog;
         return changed;
     }
@@ -1322,8 +1414,7 @@ pub const DBCore = struct {
         historical_owned = false;
         validator_owned = false;
         errdefer epoch.release();
-        try self.schema_registry.preparePublish(version);
-        return self.schema_registry.installHistorical(epoch);
+        return try self.schema_registry.installHistorical(epoch);
     }
 
     pub fn refreshSchemaIndexes(self: *DBCore) !void {
@@ -1361,12 +1452,19 @@ pub const DBCore = struct {
             };
         }
         const next_epoch = if (next_schema) |schema| try self.prepareSchemaEpoch(schema, public_json) else null;
-        try self.schema_registry.prepareReplaceAll();
-        self.replaceSchemaOwnedPrepared(next_schema, next_epoch);
+        var epoch_owned = next_epoch != null;
+        errdefer if (epoch_owned) next_epoch.?.release();
+        var replacement = try self.schema_registry.prepareReplaceAll(next_epoch);
+        epoch_owned = false;
+        defer replacement.deinit();
+        self.replaceSchemaOwnedPrepared(next_schema, &replacement);
     }
 
-    pub fn prepareSchemaRegistryReplacement(self: *DBCore) !void {
-        try self.schema_registry.prepareReplaceAll();
+    pub fn prepareSchemaRegistryReplacement(
+        self: *DBCore,
+        next_epoch: ?*schema_registry_mod.Epoch,
+    ) !schema_registry_mod.Registry.PreparedReplacement {
+        return try self.schema_registry.prepareReplaceAll(next_epoch);
     }
 
     /// Allocate and compile every immutable epoch resource before a durable
@@ -1392,7 +1490,6 @@ pub const DBCore = struct {
         cloned_owned = false;
         validator_owned = false;
         errdefer epoch.release();
-        try self.schema_registry.preparePublish(schema.version);
         return epoch;
     }
 
@@ -1401,13 +1498,13 @@ pub const DBCore = struct {
     pub fn replaceSchemaOwnedPrepared(
         self: *DBCore,
         next_schema: ?schema_mod.TableSchema,
-        next_epoch: ?*schema_registry_mod.Epoch,
+        replacement: *schema_registry_mod.Registry.PreparedReplacement,
     ) void {
-        std.debug.assert((next_schema == null) == (next_epoch == null));
-        if (next_schema) |schema| std.debug.assert(next_epoch.?.schema.version == schema.version);
+        std.debug.assert((next_schema == null) == (replacement.current == null));
+        if (next_schema) |schema| std.debug.assert(replacement.current.?.schema.version == schema.version);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
-        self.schema_registry.replaceAllPrepared(next_epoch);
+        self.schema_registry.replaceAllPrepared(replacement);
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -2554,7 +2651,10 @@ pub fn loadTableCatalogForSchema(
     store: *docstore_mod.DocStore,
     schema: ?schema_mod.TableSchema,
 ) !table_catalog_mod.Catalog {
-    if (try table_catalog_mod.load(alloc, store)) |catalog| return catalog;
+    if (try table_catalog_mod.load(alloc, store)) |catalog| {
+        try catalog.validateForSchema(schema);
+        return catalog;
+    }
     const identity_summary = try doc_identity.visibilitySummaryFromStore(store);
     const row_count: u64 = @intFromBool(if (identity_summary) |summary| summary.live_ordinals != 0 else false);
     return .{

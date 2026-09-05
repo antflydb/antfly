@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 const geo_mod = @import("../../../search/geo.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const runtime_schema = @import("../../schema.zig");
+const document_content_hash = @import("../document_content_hash.zig");
 
 pub const magic: [4]u8 = "AROW".*;
 pub const ordinal_version: u32 = 2;
@@ -63,12 +64,19 @@ const sparse_entry_len: usize = @sizeOf(u32) * 2; // ordinal + payload start
 /// the value bytes borrow either the caller's buffers (when serializing) or the
 /// decoded `Row` storage (when reading).
 pub const Cell = struct {
+    /// Stable schema ordinal. Prepared rows are kept in ascending ordinal order,
+    /// allowing sparse encoding to scale with fields present rather than schema
+    /// width. `path` remains only for JSON reconstruction after decode.
+    ordinal: u32,
     /// Dotted JSON path the value is emitted under during reconstruction.
     path: []const u8,
     value_type: typed_dv.ValueType,
     /// When true a `bytes_val` payload is already valid JSON (embedded
     /// verbatim); otherwise it is a plain string (JSON-escaped on read).
     is_json: bool = false,
+    /// The byte payload is a canonical sequence of little-endian f32 values
+    /// which reconstructs as a JSON number array rather than a JSON string.
+    is_dense_vector: bool = false,
     /// Distinguishes an explicitly stored JSON null from an absent column.
     /// `value_type` retains the declared physical type; `value` is ignored.
     is_null: bool = false,
@@ -89,6 +97,8 @@ pub const PhysicalLayout = struct {
     variable_indexes: []u32,
     /// Column ordinals sorted by logical name for stable semantic hashing.
     hash_ordinals: []u32,
+    /// Required columns, in physical ordinal order, for sparse validation.
+    required_ordinals: []u32,
 
     const not_applicable = std.math.maxInt(u32);
 
@@ -101,10 +111,19 @@ pub const PhysicalLayout = struct {
         errdefer alloc.free(variable_indexes);
         const hash_ordinals = try alloc.alloc(u32, columns.len);
         errdefer alloc.free(hash_ordinals);
+        var required_count: usize = 0;
+        for (columns) |column| required_count += @intFromBool(column.required);
+        const required_ordinals = try alloc.alloc(u32, required_count);
+        errdefer alloc.free(required_ordinals);
         var fixed_pos: usize = 0;
         var variable_index: usize = 0;
+        var required_index: usize = 0;
         for (columns, 0..) |column, ordinal| {
             hash_ordinals[ordinal] = @intCast(ordinal);
+            if (column.required) {
+                required_ordinals[required_index] = @intCast(ordinal);
+                required_index += 1;
+            }
             if (isVariableColumn(column)) {
                 fixed_offsets[ordinal] = not_applicable;
                 variable_indexes[ordinal] = std.math.cast(u32, variable_index) orelse return error.InvalidSchema;
@@ -130,6 +149,7 @@ pub const PhysicalLayout = struct {
             .fixed_offsets = fixed_offsets,
             .variable_indexes = variable_indexes,
             .hash_ordinals = hash_ordinals,
+            .required_ordinals = required_ordinals,
         };
     }
 
@@ -137,6 +157,7 @@ pub const PhysicalLayout = struct {
         self.alloc.free(self.fixed_offsets);
         self.alloc.free(self.variable_indexes);
         self.alloc.free(self.hash_ordinals);
+        self.alloc.free(self.required_ordinals);
         self.* = undefined;
     }
 
@@ -291,32 +312,33 @@ fn serializeOrdinalInternal(
         try std.math.mul(usize, variable_count + 1, @sizeOf(u32));
     var variable_payload_len: usize = 0;
     var sparse_payload_len: usize = 0;
-    var cell_index: usize = 0;
-    for (columns) |column| {
-        if (cell_index < cells.len) {
-            const cell = cells[cell_index];
-            if (std.mem.eql(u8, cell.path, column.path)) {
-                if (cell.value_type != columnValueType(column.column_type) or cell.is_json != column.is_json)
-                    return error.InvalidRelationalRow;
-                if (validate_json_cells) try validateCell(alloc, cell);
-                if (!cell.is_null and isVariableColumn(column)) {
-                    const bytes = switch (cell.value) {
-                        .bytes_val => |value| value,
-                        else => return error.InvalidRelationalRow,
-                    };
-                    variable_payload_len = std.math.add(usize, variable_payload_len, bytes.len) catch
-                        return error.InvalidRelationalRow;
-                }
-                if (!cell.is_null) {
-                    const payload_len = if (isVariableColumn(column)) cell.value.bytes_val.len else fixedColumnWidth(column);
-                    sparse_payload_len = std.math.add(usize, sparse_payload_len, payload_len) catch
-                        return error.InvalidRelationalRow;
-                }
-                cell_index += 1;
-            }
+    var previous_ordinal: ?u32 = null;
+    for (cells) |cell| {
+        if (cell.ordinal >= columns.len or
+            (previous_ordinal != null and cell.ordinal <= previous_ordinal.?))
+            return error.InvalidRelationalRow;
+        previous_ordinal = cell.ordinal;
+        const column = columns[cell.ordinal];
+        if (!std.mem.eql(u8, cell.path, column.path) or
+            cell.value_type != columnValueType(column.column_type) or
+            cell.is_json != column.is_json or
+            cell.is_dense_vector != (column.column_type == .dense_vector))
+            return error.InvalidRelationalRow;
+        if (validate_json_cells) try validateCell(alloc, cell);
+        if (!cell.is_null and isVariableColumn(column)) {
+            const bytes = switch (cell.value) {
+                .bytes_val => |value| value,
+                else => return error.InvalidRelationalRow,
+            };
+            variable_payload_len = std.math.add(usize, variable_payload_len, bytes.len) catch
+                return error.InvalidRelationalRow;
+        }
+        if (!cell.is_null) {
+            const payload_len = if (isVariableColumn(column)) cell.value.bytes_val.len else fixedColumnWidth(column);
+            sparse_payload_len = std.math.add(usize, sparse_payload_len, payload_len) catch
+                return error.InvalidRelationalRow;
         }
     }
-    if (cell_index != cells.len) return error.InvalidRelationalRow;
     _ = std.math.cast(u32, variable_payload_len) orelse return error.InvalidRelationalRow;
     _ = std.math.cast(u32, sparse_payload_len) orelse return error.InvalidRelationalRow;
 
@@ -363,11 +385,10 @@ fn serializeOrdinalInternal(
         const sparse_payload = out[pos..][0..sparse_payload_len];
         pos += sparse_payload_len;
 
-        cell_index = 0;
         var payload_pos: usize = 0;
-        for (columns, 0..) |column, ordinal| {
-            if (cell_index >= cells.len or !std.mem.eql(u8, cells[cell_index].path, column.path)) continue;
-            const cell = cells[cell_index];
+        for (cells, 0..) |cell, cell_index| {
+            const ordinal: usize = cell.ordinal;
+            const column = columns[ordinal];
             setBitmapBit(present, ordinal);
             if (cell.is_null) setBitmapBit(nulls, ordinal);
             const entry_pos = entries_start + cell_index * sparse_entry_len;
@@ -384,10 +405,9 @@ fn serializeOrdinalInternal(
                     payload_pos += width;
                 }
             }
-            cell_index += 1;
         }
         std.mem.writeInt(u32, out[terminal_offset_pos..][0..4], @intCast(payload_pos), .little);
-        std.debug.assert(cell_index == cells.len and payload_pos == sparse_payload_len);
+        std.debug.assert(payload_pos == sparse_payload_len);
     } else {
         const fixed = out[pos..][0..fixed_len];
         @memset(fixed, 0);
@@ -397,7 +417,7 @@ fn serializeOrdinalInternal(
         const variable_payload = out[pos..][0..variable_payload_len];
         pos += variable_payload_len;
 
-        cell_index = 0;
+        var cell_index: usize = 0;
         var fixed_pos: usize = 0;
         var variable_index: usize = 0;
         var variable_pos: usize = 0;
@@ -406,7 +426,7 @@ fn serializeOrdinalInternal(
             if (variable) std.mem.writeInt(u32, out[offsets_start + variable_index * 4 ..][0..4], @intCast(variable_pos), .little);
             if (cell_index < cells.len) {
                 const cell = cells[cell_index];
-                if (std.mem.eql(u8, cell.path, column.path)) {
+                if (cell.ordinal == ordinal) {
                     setBitmapBit(present, ordinal);
                     if (cell.is_null) {
                         setBitmapBit(nulls, ordinal);
@@ -492,6 +512,19 @@ pub fn rowWriteTimestampNsTrusted(value: []const u8) !u64 {
 /// equivalent to supplying the digest to the encoder without a second row
 /// traversal.
 pub fn setOrdinalSemanticHash(value: []u8, digest: [semantic_hash_len]u8) !void {
+    const timestamp_ns = try rowWriteTimestampNsTrusted(value);
+    try finalizeOrdinalMetadata(value, digest, timestamp_ns);
+}
+
+/// Install all mutable header metadata and authenticate the physical row in a
+/// single pass. PreparedRow deliberately leaves the checksum pending until the
+/// request timestamp is known so large JSON/vector/blob payloads are not swept
+/// twice merely to patch two adjacent header fields.
+pub fn finalizeOrdinalMetadata(
+    value: []u8,
+    digest: [semantic_hash_len]u8,
+    timestamp_ns: u64,
+) !void {
     if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value))
         return error.InvalidRelationalRow;
     var pos: usize = magic.len;
@@ -499,6 +532,7 @@ pub fn setOrdinalSemanticHash(value: []u8, digest: [semantic_hash_len]u8) !void 
     _ = readU32(value, &pos);
     if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
     @memcpy(value[ordinal_semantic_hash_offset..][0..semantic_hash_len], &digest);
+    std.mem.writeInt(u64, value[ordinal_write_timestamp_offset..][0..@sizeOf(u64)], timestamp_ns, .little);
     const checksum = std.hash.Crc32.hash(value[0 .. value.len - checksum_len]);
     std.mem.writeInt(u32, value[value.len - checksum_len ..][0..checksum_len], checksum, .little);
 }
@@ -507,15 +541,8 @@ pub fn setOrdinalSemanticHash(value: []u8, digest: [semantic_hash_len]u8) !void 
 /// separate from the semantic digest so identical logical rows retain the same
 /// user-visible hash when their write/expiry timestamp changes.
 pub fn setOrdinalWriteTimestampNs(value: []u8, timestamp_ns: u64) !void {
-    if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value))
-        return error.InvalidRelationalRow;
-    var pos: usize = magic.len;
-    if (readU32(value, &pos) != ordinal_version) return error.UnsupportedRelationalRowVersion;
-    _ = readU32(value, &pos);
-    if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
-    std.mem.writeInt(u64, value[ordinal_write_timestamp_offset..][0..@sizeOf(u64)], timestamp_ns, .little);
-    const checksum = std.hash.Crc32.hash(value[0 .. value.len - checksum_len]);
-    std.mem.writeInt(u32, value[value.len - checksum_len ..][0..checksum_len], checksum, .little);
+    const digest = try rowSemanticHashTrusted(value);
+    try finalizeOrdinalMetadata(value, digest, timestamp_ns);
 }
 
 pub fn reconstructOrdinalValueAlloc(
@@ -552,12 +579,146 @@ pub fn reconstructOrdinalValueWithLayoutAlloc(
     for (table_schema.relational_columns, 0..) |column, ordinal| {
         if (!bitmapBit(parsed.present, ordinal)) continue;
         const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Logical JSON source plus its already-decoded tree for callers that need
+/// both representations without reparsing the reconstructed document.
+pub const MaterializedOrdinalDocument = struct {
+    json: []u8,
+    root: std.json.Value,
+    root_arena: *std.heap.ArenaAllocator,
+
+    pub fn retainedBytes(self: *const @This()) usize {
+        return self.json.len +| self.root_arena.queryCapacity();
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.json);
+        self.root_arena.deinit();
+        alloc.destroy(self.root_arena);
+        self.* = undefined;
+    }
+};
+
+/// Owned logical tree for consumers that never persist the reconstructed JSON
+/// source (for example full-text backfill). Keeping this separate prevents an
+/// O(row bytes) stringify allocation for every row in a rebuild.
+pub const MaterializedOrdinalRoot = struct {
+    root: std.json.Value,
+    root_arena: *std.heap.ArenaAllocator,
+
+    pub fn retainedBytes(self: *const @This()) usize {
+        return self.root_arena.queryCapacity();
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.root_arena.deinit();
+        alloc.destroy(self.root_arena);
+        self.* = undefined;
+    }
+};
+
+pub fn materializeOrdinalRootWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !MaterializedOrdinalRoot {
+    var cells = try ordinalCellIteratorWithLayout(value, table_schema, layout);
+    const root_arena = try alloc.create(std.heap.ArenaAllocator);
+    root_arena.* = std.heap.ArenaAllocator.init(alloc);
+    errdefer {
+        root_arena.deinit();
+        alloc.destroy(root_arena);
+    }
+    const root_alloc = root_arena.allocator();
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+    while (try cells.next()) |cell| {
+        const column = table_schema.relational_columns[cell.ordinal];
+        const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
+        try root.object.put(root_alloc, column.name, logical);
+    }
+    return .{ .root = root, .root_arena = root_arena };
+}
+
+pub fn materializeOrdinalDocumentWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !MaterializedOrdinalDocument {
+    var cells = try ordinalCellIteratorWithLayout(value, table_schema, layout);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const root_arena = try alloc.create(std.heap.ArenaAllocator);
+    root_arena.* = std.heap.ArenaAllocator.init(alloc);
+    errdefer {
+        root_arena.deinit();
+        alloc.destroy(root_arena);
+    }
+    const root_alloc = root_arena.allocator();
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try out.append(alloc, '{');
+    var needs_comma = false;
+    while (try cells.next()) |cell| {
+        const column = table_schema.relational_columns[cell.ordinal];
+        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
+        needs_comma = true;
+
+        const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
+        // Schema names outlive this projection arena. Keep them borrowed instead
+        // of retaining a second copy of every field name.
+        try root.object.put(root_alloc, column.name, logical);
+    }
+    try out.append(alloc, '}');
+    return .{ .json = try out.toOwnedSlice(alloc), .root = root, .root_arena = root_arena };
+}
+
+fn ownedJsonValueFromCellAlloc(
+    alloc: Allocator,
+    column: runtime_schema.RelationalColumn,
+    cell: Cell,
+) !std.json.Value {
+    if (cell.is_null) return .null;
+    return switch (column.column_type) {
+        .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
+            .{ .integer = @intCast(cell.value.u64_val) }
+        else
+            .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{cell.value.u64_val}) },
+        .integer => .{ .integer = cell.value.i64_val },
+        .number => .{ .float = cell.value.f64_val },
+        .boolean => .{ .bool = cell.value.bool_val },
+        // Row payloads may be backed by a scan cursor and must be retained.
+        .string, .blob, .geoshape => .{ .string = try alloc.dupe(u8, cell.value.bytes_val) },
+        .json => try std.json.parseFromSliceLeaky(std.json.Value, alloc, cell.value.bytes_val, .{
+            .allocate = .alloc_always,
+            .parse_numbers = false,
+        }),
+        .geopoint => blk: {
+            var object = std.json.ObjectMap.empty;
+            try object.put(alloc, "lat", .{ .float = cell.value.geo_point.lat });
+            try object.put(alloc, "lon", .{ .float = cell.value.geo_point.lon });
+            break :blk .{ .object = object };
+        },
+        .dense_vector => blk: {
+            var array = std.json.Array.init(alloc);
+            errdefer array.deinit();
+            const bytes = cell.value.bytes_val;
+            try array.ensureTotalCapacity(bytes.len / @sizeOf(f32));
+            var pos: usize = 0;
+            while (pos < bytes.len) : (pos += @sizeOf(f32)) {
+                const number: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+                array.appendAssumeCapacity(.{ .float = number });
+            }
+            break :blk .{ .array = array };
+        },
+    };
 }
 
 pub fn validateOrdinal(value: []const u8, table_schema: runtime_schema.TableSchema) !void {
@@ -591,12 +752,9 @@ pub fn collectOrdinalCellsWithLayout(
 ) ![semantic_hash_len]u8 {
     if (cells.len != table_schema.relational_columns.len) return error.InvalidArgument;
     @memset(cells, null);
-    const parsed = try parseOrdinalWithLayout(value, table_schema, layout);
-    for (table_schema.relational_columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal)) continue;
-        cells[ordinal] = try ordinalCell(parsed, table_schema.relational_columns, column, ordinal);
-    }
-    return parsed.semantic_hash;
+    var iterator = try canonicalOrdinalCellIteratorWithLayout(value, table_schema, layout);
+    while (try iterator.next()) |cell| cells[cell.ordinal] = cell;
+    return iterator.semanticHash();
 }
 
 pub fn findCellByOrdinal(
@@ -621,7 +779,7 @@ pub fn findCellByOrdinalWithLayout(
     if (!bitmapBit(parsed.present, ordinal)) return null;
     const column = table_schema.relational_columns[ordinal];
     const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-    return try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
 }
 
 /// Reconstruct only selected top-level columns. Callers preflight that field
@@ -656,7 +814,7 @@ pub fn projectOrdinalPlanWithLayoutAlloc(
         if (!bitmapBit(parsed.present, ordinal)) continue;
         const column = table_schema.relational_columns[ordinal];
         const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -701,7 +859,7 @@ pub fn projectOrdinalPlanTrustedWithLayoutAlloc(
         if (!bitmapBit(parsed.present, ordinal)) continue;
         const column = table_schema.relational_columns[ordinal];
         const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-        const cell = try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+        const cell = try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
         try appendValidatedCellValue(alloc, &out, cell, needs_comma);
         needs_comma = true;
     }
@@ -723,7 +881,7 @@ pub fn findCellByOrdinalTrusted(
     if (!bitmapBit(parsed.present, ordinal)) return null;
     const column = table_schema.relational_columns[ordinal];
     const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
-    return try ordinalCellFromPayload(column, payload, bitmapBit(parsed.nulls, ordinal));
+    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
 }
 
 const ParsedOrdinal = struct {
@@ -740,6 +898,74 @@ const ParsedOrdinal = struct {
     semantic_hash: [semantic_hash_len]u8,
     layout: ?*const PhysicalLayout = null,
 };
+
+/// One validated row traversal. Dense rows advance through the schema bitmap;
+/// sparse rows advance directly through their ordinal directory, keeping
+/// restore, hashing, and index replay proportional to the fields present.
+pub const OrdinalCellIterator = struct {
+    parsed: ParsedOrdinal,
+    table_schema: runtime_schema.TableSchema,
+    next_ordinal: usize = 0,
+    next_sparse_entry: usize = 0,
+
+    pub fn isSparse(self: *const @This()) bool {
+        return self.parsed.capabilities & capability_sparse_slots != 0;
+    }
+
+    pub fn presentCount(self: *const @This()) usize {
+        return if (self.isSparse()) self.parsed.sparse_entry_count else bitmapPopulation(self.parsed.present);
+    }
+
+    pub fn semanticHash(self: *const @This()) [semantic_hash_len]u8 {
+        return self.parsed.semantic_hash;
+    }
+
+    pub fn next(self: *@This()) !?Cell {
+        if (self.isSparse()) {
+            if (self.next_sparse_entry >= self.parsed.sparse_entry_count) return null;
+            const entry_index = self.next_sparse_entry;
+            self.next_sparse_entry += 1;
+            const entry_pos = self.parsed.sparse_entries_start + entry_index * sparse_entry_len;
+            const ordinal: usize = std.mem.readInt(u32, self.parsed.value[entry_pos..][0..4], .little);
+            if (ordinal >= self.table_schema.relational_columns.len) return error.InvalidRelationalRow;
+            const column = self.table_schema.relational_columns[ordinal];
+            const payload = try sparsePayloadSliceAtIndex(self.parsed, entry_index);
+            return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
+        }
+
+        while (self.next_ordinal < self.table_schema.relational_columns.len) {
+            const ordinal = self.next_ordinal;
+            self.next_ordinal += 1;
+            if (!bitmapBit(self.parsed.present, ordinal)) continue;
+            const column = self.table_schema.relational_columns[ordinal];
+            const payload = try ordinalPayloadSliceChecked(self.parsed, column, ordinal);
+            return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
+        }
+        return null;
+    }
+};
+
+pub fn ordinalCellIteratorWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !OrdinalCellIterator {
+    return .{
+        .parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout),
+        .table_schema = table_schema,
+    };
+}
+
+pub fn canonicalOrdinalCellIteratorWithLayout(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !OrdinalCellIterator {
+    return .{
+        .parsed = try parseOrdinalWithLayout(value, table_schema, layout),
+        .table_schema = table_schema,
+    };
+}
 
 /// Parsed, immutable addressing view over one AROW. Filter, projection, and
 /// index execution can resolve several ordinals after paying header/bitmap
@@ -758,7 +984,7 @@ pub const OrdinalRowView = struct {
         if (!bitmapBit(self.parsed.present, ordinal)) return null;
         const column = self.table_schema.relational_columns[ordinal];
         const payload = try ordinalPayloadSliceChecked(self.parsed, column, ordinal);
-        return try ordinalCellFromPayload(column, payload, bitmapBit(self.parsed.nulls, ordinal));
+        return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
     }
 };
 
@@ -911,7 +1137,7 @@ fn parseOrdinalInternal(
             for (0..entry_count) |entry_index| {
                 const entry_pos = entries_start + entry_index * sparse_entry_len;
                 const ordinal: usize = std.mem.readInt(u32, value[entry_pos..][0..4], .little);
-                const slot = sparsePayloadSlice(parsed, ordinal) orelse return error.InvalidRelationalRow;
+                const slot = try sparsePayloadSliceAtIndex(parsed, entry_index);
                 const column = table_schema.relational_columns[ordinal];
                 if (bitmapBit(nulls, ordinal)) {
                     if (slot.len != 0) return error.NonCanonicalRelationalRow;
@@ -957,9 +1183,23 @@ fn parseOrdinalInternal(
     }
     // Unset and null slots must have a unique zero/empty physical encoding.
     // This makes byte equality meaningful during restore verification.
-    if (canonical) {
-        if (sparse != (try shouldUseSparseRepresentation(parsed, table_schema.relational_columns, fixed_len, variable_count)))
-            return error.NonCanonicalRelationalRow;
+    if (canonical and sparse) {
+        if (layout) |compiled| {
+            for (compiled.required_ordinals) |ordinal| {
+                if (!bitmapBit(present, ordinal)) return error.InvalidRelationalRow;
+            }
+        } else {
+            for (table_schema.relational_columns, 0..) |column, ordinal| {
+                if (column.required and !bitmapBit(present, ordinal)) return error.InvalidRelationalRow;
+            }
+        }
+        for (0..parsed.sparse_entry_count) |entry_index| {
+            const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
+            const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
+            const column = table_schema.relational_columns[ordinal];
+            if (bitmapBit(nulls, ordinal) and !column.allows_null) return error.InvalidRelationalRow;
+        }
+    } else if (canonical) {
         for (table_schema.relational_columns, 0..) |column, ordinal| {
             if (!bitmapBit(present, ordinal)) {
                 if (column.required) return error.InvalidRelationalRow;
@@ -976,6 +1216,8 @@ fn parseOrdinalInternal(
             }
         }
     }
+    if (canonical and sparse != (try shouldUseSparseRepresentation(parsed, table_schema.relational_columns, fixed_len, variable_count)))
+        return error.NonCanonicalRelationalRow;
     return parsed;
 }
 
@@ -987,13 +1229,27 @@ fn shouldUseSparseRepresentation(
 ) !bool {
     var dense_variable_payload_len: usize = 0;
     var sparse_payload_len: usize = 0;
-    for (columns, 0..) |column, ordinal| {
-        if (!bitmapBit(parsed.present, ordinal) or bitmapBit(parsed.nulls, ordinal)) continue;
-        const slot = ordinalPayloadSlice(parsed, columns, column, ordinal);
-        if (isVariableColumn(column)) dense_variable_payload_len = std.math.add(usize, dense_variable_payload_len, slot.len) catch
-            return error.InvalidRelationalRow;
-        sparse_payload_len = std.math.add(usize, sparse_payload_len, slot.len) catch
-            return error.InvalidRelationalRow;
+    if (parsed.capabilities & capability_sparse_slots != 0) {
+        for (0..parsed.sparse_entry_count) |entry_index| {
+            const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
+            const ordinal: usize = std.mem.readInt(u32, parsed.value[entry_pos..][0..4], .little);
+            if (bitmapBit(parsed.nulls, ordinal)) continue;
+            const slot = try sparsePayloadSliceAtIndex(parsed, entry_index);
+            if (isVariableColumn(columns[ordinal]))
+                dense_variable_payload_len = std.math.add(usize, dense_variable_payload_len, slot.len) catch
+                    return error.InvalidRelationalRow;
+            sparse_payload_len = std.math.add(usize, sparse_payload_len, slot.len) catch
+                return error.InvalidRelationalRow;
+        }
+    } else {
+        for (columns, 0..) |column, ordinal| {
+            if (!bitmapBit(parsed.present, ordinal) or bitmapBit(parsed.nulls, ordinal)) continue;
+            const slot = ordinalPayloadSlice(parsed, columns, column, ordinal);
+            if (isVariableColumn(column)) dense_variable_payload_len = std.math.add(usize, dense_variable_payload_len, slot.len) catch
+                return error.InvalidRelationalRow;
+            sparse_payload_len = std.math.add(usize, sparse_payload_len, slot.len) catch
+                return error.InvalidRelationalRow;
+        }
     }
     const dense_offsets_len = if (variable_count == 0) 0 else std.math.mul(usize, variable_count + 1, @sizeOf(u32)) catch return error.InvalidRelationalRow;
     const dense_static_len = std.math.add(usize, fixed_len, dense_offsets_len) catch return error.InvalidRelationalRow;
@@ -1018,11 +1274,12 @@ fn ordinalCell(
 ) !Cell {
     const is_null = bitmapBit(parsed.nulls, ordinal);
     const payload = ordinalPayloadSlice(parsed, columns, column, ordinal);
-    return try ordinalCellFromPayload(column, payload, is_null);
+    return try ordinalCellFromPayload(column, ordinal, payload, is_null);
 }
 
 fn ordinalCellFromPayload(
     column: runtime_schema.RelationalColumn,
+    ordinal: usize,
     payload: []const u8,
     is_null: bool,
 ) !Cell {
@@ -1032,17 +1289,23 @@ fn ordinalCellFromPayload(
     else
         try decodeOrdinalPayload(payload, value_type);
     const cell: Cell = .{
+        .ordinal = @intCast(ordinal),
         .path = column.path,
         .value_type = value_type,
         .is_json = column.is_json,
+        .is_dense_vector = column.column_type == .dense_vector,
         .is_null = is_null,
         .value = typed_value,
     };
     if (!cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
     if (!is_null and value_type == .bytes_val) {
-        if (column.is_json) {
+        if (column.column_type == .dense_vector) {
+            try validateDenseVectorBytes(cell.value.bytes_val);
+        } else if (column.is_json) {
             if (!(try std.json.validate(std.heap.page_allocator, cell.value.bytes_val))) return error.InvalidRelationalRow;
-        } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val) and column.column_type != .blob) {
+        } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val) and
+            column.column_type != .blob and column.column_type != .dense_vector)
+        {
             return error.InvalidRelationalRow;
         }
     }
@@ -1110,6 +1373,18 @@ fn sparsePayloadSlice(parsed: ParsedOrdinal, target_ordinal: usize) ?[]const u8 
         }
     }
     return null;
+}
+
+fn sparsePayloadSliceAtIndex(parsed: ParsedOrdinal, entry_index: usize) ![]const u8 {
+    if (entry_index >= parsed.sparse_entry_count) return error.InvalidRelationalRow;
+    const entry_pos = parsed.sparse_entries_start + entry_index * sparse_entry_len;
+    const start: usize = std.mem.readInt(u32, parsed.value[entry_pos + 4 ..][0..4], .little);
+    const end: usize = if (entry_index + 1 < parsed.sparse_entry_count)
+        std.mem.readInt(u32, parsed.value[entry_pos + sparse_entry_len + 4 ..][0..4], .little)
+    else
+        std.mem.readInt(u32, parsed.value[parsed.sparse_terminal_offset_pos..][0..4], .little);
+    if (start > end or end > parsed.payload.len) return error.InvalidRelationalRow;
+    return parsed.payload[start..end];
 }
 
 fn bitmapPopulation(bitmap: []const u8) usize {
@@ -1202,13 +1477,13 @@ fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.Va
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
     };
 }
 
 fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
     return switch (column.column_type) {
-        .string, .blob, .geoshape, .json => true,
+        .string, .blob, .geoshape, .json, .dense_vector => true,
         .datetime, .integer, .number, .boolean, .geopoint => false,
     };
 }
@@ -1218,7 +1493,7 @@ fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
         .datetime, .integer, .number => 8,
         .boolean => 1,
         .geopoint => 16,
-        .string, .blob, .geoshape, .json => 0,
+        .string, .blob, .geoshape, .json, .dense_vector => 0,
     };
 }
 
@@ -1292,8 +1567,15 @@ fn validateCell(alloc: Allocator, cell: Cell) !void {
         !cellValueMatchesType(cell) or
         !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
     if (!cell.is_null and cell.value == .bytes_val) {
-        if (cell.is_json) {
-            if (!(try std.json.validate(alloc, cell.value.bytes_val))) return error.InvalidRelationalRow;
+        if (cell.is_dense_vector) {
+            try validateDenseVectorBytes(cell.value.bytes_val);
+        } else if (cell.is_json) {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, cell.value.bytes_val, .{ .parse_numbers = false }) catch
+                return error.InvalidRelationalRow;
+            defer parsed.deinit();
+            const canonical = try document_content_hash.canonicalJsonValueAlloc(alloc, parsed.value);
+            defer alloc.free(canonical);
+            if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
         } else if (!std.unicode.utf8ValidateSlice(cell.value.bytes_val)) {
             return error.InvalidRelationalRow;
         }
@@ -1412,7 +1694,9 @@ fn appendValidatedCellValue(
         .bool_val => try out.appendSlice(alloc, if (cell.value.bool_val) "true" else "false"),
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
         .bytes_val => {
-            if (cell.is_json) {
+            if (cell.is_dense_vector) {
+                try appendDenseVectorJson(alloc, out, cell.value.bytes_val);
+            } else if (cell.is_json) {
                 // The ordinal parser and appendCellValue validate this before
                 // reaching the hot formatting path.
                 try out.appendSlice(alloc, cell.value.bytes_val);
@@ -1421,6 +1705,59 @@ fn appendValidatedCellValue(
             }
         },
     }
+}
+
+/// Lower a validated logical embedding into AROW's canonical binary payload.
+/// Keeping this conversion in the codec gives writers and restore verification
+/// one physical definition and lets index rebuilds bypass JSON parsing.
+pub fn encodeDenseVectorValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    if (value != .array) return error.InvalidBatchRequest;
+    const byte_len = std.math.mul(usize, value.array.items.len, @sizeOf(f32)) catch
+        return error.InvalidBatchRequest;
+    const bytes = try alloc.alloc(u8, byte_len);
+    errdefer alloc.free(bytes);
+    for (value.array.items, 0..) |item, index| {
+        const number: f64 = switch (item) {
+            .integer => |integer| @floatFromInt(integer),
+            .float => |float| float,
+            .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidBatchRequest,
+            else => return error.InvalidBatchRequest,
+        };
+        const narrowed: f32 = @floatCast(number);
+        if (!std.math.isFinite(number) or !std.math.isFinite(narrowed)) return error.InvalidBatchRequest;
+        std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(narrowed), .little);
+    }
+    return bytes;
+}
+
+pub fn decodeDenseVectorValueAlloc(alloc: Allocator, bytes: []const u8) ![]f32 {
+    try validateDenseVectorBytes(bytes);
+    const vector = try alloc.alloc(f32, bytes.len / @sizeOf(f32));
+    errdefer alloc.free(vector);
+    for (vector, 0..) |*value, index|
+        value.* = @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+    return vector;
+}
+
+fn validateDenseVectorBytes(bytes: []const u8) !void {
+    if (bytes.len % @sizeOf(f32) != 0) return error.InvalidRelationalRow;
+    var offset: usize = 0;
+    while (offset < bytes.len) : (offset += 4) {
+        const value: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+        if (!std.math.isFinite(value)) return error.InvalidRelationalRow;
+    }
+}
+
+fn appendDenseVectorJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    try validateDenseVectorBytes(bytes);
+    try out.append(alloc, '[');
+    var offset: usize = 0;
+    while (offset < bytes.len) : (offset += 4) {
+        if (offset != 0) try out.append(alloc, ',');
+        const value: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+        try appendFmt(alloc, out, "{d}", .{value});
+    }
+    try out.append(alloc, ']');
 }
 
 pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -1490,10 +1827,10 @@ test "ordinal rows bind layout support projection checksum and canonical bytes" 
         .relational_columns = &columns,
     };
     const cells = [_]Cell{
-        .{ .path = "name", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
-        .{ .path = "count", .value_type = .i64_val, .value = .{ .i64_val = -42 } },
-        .{ .path = "active", .value_type = .bool_val, .is_null = true, .value = .{ .bool_val = false } },
-        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"x\":1}" } },
+        .{ .ordinal = 0, .path = "name", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
+        .{ .ordinal = 1, .path = "count", .value_type = .i64_val, .value = .{ .i64_val = -42 } },
+        .{ .ordinal = 2, .path = "active", .value_type = .bool_val, .is_null = true, .value = .{ .bool_val = false } },
+        .{ .ordinal = 3, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"x\":1}" } },
     };
 
     const semantic_hash = [_]u8{0x5a} ** semantic_hash_len;
@@ -1593,7 +1930,7 @@ test "ordinal rows use sparse slots for wide optional schemas" {
         .relational_columns = &columns,
     };
     const cells = [_]Cell{
-        .{ .path = "c15", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
+        .{ .ordinal = 15, .path = "c15", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
     };
     const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x33} ** semantic_hash_len);
     defer alloc.free(encoded);
@@ -1602,4 +1939,99 @@ test "ordinal rows use sparse slots for wide optional schemas" {
     try validateOrdinal(encoded, schema);
     try std.testing.expect((try findCellByOrdinal(encoded, schema, 0)) == null);
     try std.testing.expectEqual(@as(i64, 42), (try findCellByOrdinal(encoded, schema, 15)).?.value.i64_val);
+}
+
+test "ordinal root materialization preserves exact nested JSON numbers" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .version = 10,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const cells = [_]Cell{.{
+        .ordinal = 0,
+        .path = "payload",
+        .value_type = .bytes_val,
+        .is_json = true,
+        .value = .{ .bytes_val = "{\"exact\":9007199254740993}" },
+    }};
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x41} ** semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var materialized = try materializeOrdinalRootWithLayoutAlloc(alloc, encoded, schema, &layout);
+    defer materialized.deinit(alloc);
+    const payload = materialized.root.object.get("payload").?;
+    try std.testing.expectEqualStrings(
+        "9007199254740993",
+        payload.object.get("exact").?.number_string,
+    );
+}
+
+test "ordinal rows store dense vectors as canonical binary values" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+        .{ .name = "name", .path = "name", .column_type = .string },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .version = 11,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "[1.5,-2,0.25]", .{});
+    defer parsed.deinit();
+    const vector_bytes = try encodeDenseVectorValueAlloc(alloc, parsed.value);
+    defer alloc.free(vector_bytes);
+    const cells = [_]Cell{
+        .{
+            .ordinal = 0,
+            .path = "embedding",
+            .value_type = .bytes_val,
+            .is_dense_vector = true,
+            .value = .{ .bytes_val = vector_bytes },
+        },
+        .{ .ordinal = 1, .path = "name", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
+    };
+
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x44} ** semantic_hash_len);
+    defer alloc.free(encoded);
+    const projected = (try findCellByOrdinal(encoded, schema, 0)).?;
+    try std.testing.expect(projected.is_dense_vector);
+    try std.testing.expect(!projected.is_json);
+    try std.testing.expectEqualSlices(u8, vector_bytes, projected.value.bytes_val);
+    const vector = try decodeDenseVectorValueAlloc(alloc, projected.value.bytes_val);
+    defer alloc.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, -2, 0.25 }, vector);
+
+    const reconstructed = try reconstructOrdinalValueAlloc(alloc, encoded, schema);
+    defer alloc.free(reconstructed);
+    try std.testing.expectEqualStrings("{\"embedding\":[1.5,-2,0.25],\"name\":\"alpha\"}", reconstructed);
+
+    var layout = try PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var materialized = try materializeOrdinalDocumentWithLayoutAlloc(alloc, encoded, schema, &layout);
+    defer materialized.deinit(alloc);
+    try std.testing.expectEqualStrings(reconstructed, materialized.json);
+    try std.testing.expect(materialized.retainedBytes() > materialized.json.len);
+    const materialized_vector = materialized.root.object.get("embedding") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), materialized_vector.array.items.len);
+    try std.testing.expectEqual(@as(f64, -2), materialized_vector.array.items[1].float);
+    try std.testing.expectEqualStrings("alpha", materialized.root.object.get("name").?.string);
+
+    const non_finite = [_]u8{ 0, 0, 0x80, 0x7f };
+    const invalid_cells = [_]Cell{.{
+        .ordinal = 0,
+        .path = "embedding",
+        .value_type = .bytes_val,
+        .is_dense_vector = true,
+        .value = .{ .bytes_val = &non_finite },
+    }};
+    try std.testing.expectError(
+        error.InvalidRelationalRow,
+        serializeOrdinal(alloc, schema.version, &columns, &invalid_cells, [_]u8{0x55} ** semantic_hash_len),
+    );
 }

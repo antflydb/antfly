@@ -15,6 +15,7 @@ const std = @import("std");
 const backup_codec = @import("backup_codec.zig");
 const bundle = @import("backup_bundle.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const native_backup = @import("db/native_backup.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const io_buffer_bytes: usize = 256 * 1024;
@@ -23,6 +24,7 @@ const SourceFile = struct {
     logical_path: []u8,
     size_bytes: u64,
     sha256: [Sha256.digest_length]u8,
+    sha256_hex: [Sha256.digest_length * 2]u8,
     stat: std.Io.File.Stat,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -36,6 +38,22 @@ const SourceBlob = struct {
     size_bytes: u64,
     source_index: usize,
     included: bool,
+};
+
+const NativeDigestInventory = struct {
+    const Entry = struct {
+        size_bytes: u64,
+        sha256: [Sha256.digest_length]u8,
+    };
+
+    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        var keys = self.entries.keyIterator();
+        while (keys.next()) |key| alloc.free(key.*);
+        self.entries.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const ExtractingBlob = struct {
@@ -57,6 +75,16 @@ const CountingOutput = struct {
     fn block(self: *@This(), kind: backup_codec.BlockType, payload: []const u8) !void {
         try backup_codec.writeBlockTo(self.writer, kind, payload);
         self.offset += backup_codec.block_envelope_overhead + payload.len;
+    }
+
+    fn blobChunk(self: *@This(), ordinal: u32, chunk_offset: u64, bytes: []const u8) !void {
+        if (bytes.len == 0 or bytes.len > bundle.native_chunk_target_bytes)
+            return error.BackupBlockTooLarge;
+        var prefix: [12]u8 = undefined;
+        std.mem.writeInt(u32, prefix[0..4], ordinal, .little);
+        std.mem.writeInt(u64, prefix[4..12], chunk_offset, .little);
+        try backup_codec.writeBlockPartsTo(self.writer, .blob_chunk, &.{ &prefix, bytes });
+        self.offset += backup_codec.block_envelope_overhead + prefix.len + bytes.len;
     }
 };
 
@@ -138,7 +166,9 @@ pub fn packNativePathsToWriter(
             if (std.mem.eql(u8, path, previous)) return error.InvalidBackupManifest;
         }
     }
-    var files = try collectSourceFiles(alloc, io, source_root, selected_roots);
+    var native_inventory = try loadNativeDigestInventory(alloc, io, source_root, selected_roots);
+    defer native_inventory.deinit(alloc);
+    var files = try collectSourceFiles(alloc, io, source_root, selected_roots, &native_inventory);
     defer {
         for (files.items) |*file| file.deinit(alloc);
         files.deinit(alloc);
@@ -147,28 +177,25 @@ pub fn packNativePathsToWriter(
 
     const objects = try alloc.alloc(bundle.ObjectDescriptor, files.items.len);
     defer alloc.free(objects);
-    var digest_strings = try alloc.alloc([Sha256.digest_length * 2]u8, files.items.len);
-    defer alloc.free(digest_strings);
-    for (files.items, 0..) |file, index| {
-        digest_strings[index] = std.fmt.bytesToHex(file.sha256, .lower);
+    for (files.items, 0..) |*file, index| {
         objects[index] = .{
             .logical_path = file.logical_path,
             .role = "native_file",
             .size_bytes = file.size_bytes,
-            .sha256 = &digest_strings[index],
+            .sha256 = &file.sha256_hex,
         };
     }
     var source_blobs = std.ArrayListUnmanaged(SourceBlob).empty;
     defer source_blobs.deinit(alloc);
     try source_blobs.ensureTotalCapacity(alloc, files.items.len);
-    for (files.items, 0..) |file, source_index| {
+    for (files.items, 0..) |*file, source_index| {
         source_blobs.appendAssumeCapacity(.{
             .sha256 = file.sha256,
             .size_bytes = file.size_bytes,
             .source_index = source_index,
             .included = switch (options.capture) {
                 .full => true,
-                .delta => |base| !base.containsBlob(&digest_strings[source_index]),
+                .delta => |base| !base.containsBlob(&file.sha256_hex),
             },
         });
     }
@@ -194,7 +221,7 @@ pub fn packNativePathsToWriter(
     defer alloc.free(blobs);
     for (source_blobs.items, 0..) |blob, index| {
         blobs[index] = .{
-            .sha256 = &digest_strings[blob.source_index],
+            .sha256 = &files.items[blob.source_index].sha256_hex,
             .logical_size_bytes = blob.size_bytes,
             .stored_size_bytes = blob.size_bytes,
             .included = blob.included,
@@ -226,6 +253,10 @@ pub fn packNativePathsToWriter(
 
     var footer_entries = std.ArrayListUnmanaged(bundle.FooterIndexEntry).empty;
     defer footer_entries.deinit(alloc);
+    try footer_entries.ensureTotalCapacity(
+        alloc,
+        std.math.cast(u32, includedBlobCount(blobs)) orelse return error.BackupManifestTooLarge,
+    );
     var chunk_buffer = try alloc.alloc(u8, bundle.native_chunk_target_bytes);
     defer alloc.free(chunk_buffer);
 
@@ -259,19 +290,18 @@ pub fn packNativePathsToWriter(
             try std.Io.Dir.cwd().openFile(io, absolute_path, .{});
         defer file.close(io);
         var offset: u64 = 0;
+        var emitted_hasher = Sha256.init(.{});
         while (offset < blob.size_bytes) {
             const wanted: usize = @intCast(@min(@as(u64, chunk_buffer.len), blob.size_bytes - offset));
             const read = try file.readPositionalAll(io, chunk_buffer[0..wanted], offset);
             if (read != wanted) return error.SourceFileChanged;
-            const chunk_payload = try bundle.encodeBlobChunkAlloc(alloc, .{
-                .ordinal = @intCast(ordinal),
-                .offset = offset,
-                .bytes = chunk_buffer[0..wanted],
-            });
-            defer alloc.free(chunk_payload);
-            try out.block(.blob_chunk, chunk_payload);
+            emitted_hasher.update(chunk_buffer[0..wanted]);
+            try out.blobChunk(@intCast(ordinal), offset, chunk_buffer[0..wanted]);
             offset += wanted;
         }
+        var emitted_digest: [Sha256.digest_length]u8 = undefined;
+        emitted_hasher.final(&emitted_digest);
+        if (!std.mem.eql(u8, &emitted_digest, &blob.sha256)) return error.SourceFileChanged;
         const final_stat = try file.stat(io);
         if (!sameFileGeneration(source.stat, final_stat)) return error.SourceFileChanged;
     }
@@ -292,6 +322,7 @@ fn collectSourceFiles(
     io: std.Io,
     root: []const u8,
     selected_roots: []const []const u8,
+    native_inventory: *const NativeDigestInventory,
 ) !std.ArrayListUnmanaged(SourceFile) {
     var result = std.ArrayListUnmanaged(SourceFile).empty;
     errdefer {
@@ -305,6 +336,10 @@ fn collectSourceFiles(
     defer dir.close(io);
     var walker = try dir.walk(alloc);
     defer walker.deinit();
+    // The first block must contain the complete native inventory. Reject a
+    // source as soon as its worst-case JSON representation cannot fit instead
+    // of collecting an arbitrarily large file list only to fail encoding.
+    var manifest_budget_used: usize = 16 * 1024;
     while (try walker.next(io)) |entry| {
         switch (entry.kind) {
             .directory => {},
@@ -314,6 +349,14 @@ fn collectSourceFiles(
                 try bundle.validateRelativePath(entry.path);
                 const logical_path = try normalizedPathAlloc(alloc, entry.path);
                 errdefer alloc.free(logical_path);
+                const escaped_path_budget = std.math.mul(usize, logical_path.len, 6) catch
+                    return error.BackupManifestTooLarge;
+                const descriptor_budget = std.math.add(usize, escaped_path_budget, 512) catch
+                    return error.BackupManifestTooLarge;
+                manifest_budget_used = std.math.add(usize, manifest_budget_used, descriptor_budget) catch
+                    return error.BackupManifestTooLarge;
+                if (manifest_budget_used > bundle.max_manifest_bytes)
+                    return error.BackupManifestTooLarge;
                 const absolute_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, entry.path });
                 defer alloc.free(absolute_path);
                 var file = if (std.fs.path.isAbsolute(absolute_path))
@@ -322,24 +365,32 @@ fn collectSourceFiles(
                     try std.Io.Dir.cwd().openFile(io, absolute_path, .{});
                 defer file.close(io);
                 const stat = try file.stat(io);
-                var hasher = Sha256.init(.{});
-                var buffer: [io_buffer_bytes]u8 = undefined;
-                var offset: u64 = 0;
-                while (offset < stat.size) {
-                    const wanted: usize = @intCast(@min(@as(u64, buffer.len), stat.size - offset));
-                    const read = try file.readPositionalAll(io, buffer[0..wanted], offset);
-                    if (read != wanted) return error.SourceFileChanged;
-                    hasher.update(buffer[0..wanted]);
-                    offset += wanted;
+                const inventory_entry = native_inventory.entries.get(logical_path);
+                if (inventory_entry) |known| if (known.size_bytes != stat.size)
+                    return error.SourceFileChanged;
+                var digest: [Sha256.digest_length]u8 = undefined;
+                if (inventory_entry) |known| {
+                    digest = known.sha256;
+                } else {
+                    var hasher = Sha256.init(.{});
+                    var buffer: [io_buffer_bytes]u8 = undefined;
+                    var offset: u64 = 0;
+                    while (offset < stat.size) {
+                        const wanted: usize = @intCast(@min(@as(u64, buffer.len), stat.size - offset));
+                        const read = try file.readPositionalAll(io, buffer[0..wanted], offset);
+                        if (read != wanted) return error.SourceFileChanged;
+                        hasher.update(buffer[0..wanted]);
+                        offset += wanted;
+                    }
+                    hasher.final(&digest);
                 }
                 const final_stat = try file.stat(io);
                 if (!sameFileGeneration(stat, final_stat)) return error.SourceFileChanged;
-                var digest: [Sha256.digest_length]u8 = undefined;
-                hasher.final(&digest);
                 try result.append(alloc, .{
                     .logical_path = logical_path,
                     .size_bytes = stat.size,
                     .sha256 = digest,
+                    .sha256_hex = std.fmt.bytesToHex(digest, .lower),
                     .stat = stat,
                 });
             },
@@ -352,6 +403,84 @@ fn collectSourceFiles(
         }
     }.lessThan);
     return result;
+}
+
+/// Native capture already hashed every immutable artifact before publishing
+/// its generation manifest. Reuse that authenticated inventory so packing
+/// streams large LSM/index files once instead of reading the entire snapshot
+/// once to hash and again to emit. Files outside a native generation (for
+/// example table metadata) retain the ordinary hash pass.
+fn loadNativeDigestInventory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    selected_roots: []const []const u8,
+) !NativeDigestInventory {
+    var result = NativeDigestInventory{};
+    errdefer result.deinit(alloc);
+    if (selected_roots.len == 0) {
+        try loadOneNativeDigestInventory(alloc, io, root, "", &result);
+    } else {
+        for (selected_roots) |selected| {
+            try loadOneNativeDigestInventory(alloc, io, root, selected, &result);
+        }
+    }
+    return result;
+}
+
+fn loadOneNativeDigestInventory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    relative_root: []const u8,
+    result: *NativeDigestInventory,
+) !void {
+    const manifest_path = if (relative_root.len == 0)
+        try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, native_backup.manifest_file_name })
+    else
+        try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ root, relative_root, native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    var file = if (std.fs.path.isAbsolute(manifest_path))
+        std.Io.Dir.openFileAbsolute(io, manifest_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return,
+            else => return err,
+        }
+    else
+        std.Io.Dir.cwd().openFile(io, manifest_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return,
+            else => return err,
+        };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > native_backup.max_manifest_bytes)
+        return error.InvalidNativeBackupManifest;
+    const raw = try alloc.alloc(u8, @intCast(stat.size));
+    defer alloc.free(raw);
+    if (try file.readPositionalAll(io, raw, 0) != raw.len) return error.SourceFileChanged;
+    if (!sameFileGeneration(stat, try file.stat(io))) return error.SourceFileChanged;
+    var loaded = try native_backup.parseManifestBytes(alloc, raw);
+    defer loaded.deinit();
+    for (loaded.value().artifacts) |artifact| {
+        const logical_path = if (relative_root.len == 0)
+            try normalizedPathAlloc(alloc, artifact.path)
+        else blk: {
+            const joined = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ relative_root, artifact.path });
+            defer alloc.free(joined);
+            break :blk try normalizedPathAlloc(alloc, joined);
+        };
+        errdefer alloc.free(logical_path);
+        var digest: [Sha256.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, artifact.sha256) catch return error.InvalidNativeBackupManifest;
+        const inserted = try result.entries.getOrPut(alloc, logical_path);
+        if (inserted.found_existing) {
+            alloc.free(logical_path);
+            if (inserted.value_ptr.size_bytes != artifact.size_bytes or
+                !std.mem.eql(u8, &inserted.value_ptr.sha256, &digest))
+                return error.InvalidNativeBackupManifest;
+            continue;
+        }
+        inserted.value_ptr.* = .{ .size_bytes = artifact.size_bytes, .sha256 = digest };
+    }
 }
 
 fn pathSelected(path: []const u8, selected_roots: []const []const u8) bool {
@@ -543,8 +672,24 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
                 blob.logical_size_bytes,
                 blob_path,
             );
+            // Included blobs were authenticated while their chunks streamed to
+            // disk. Only externally materialized parent blobs need this second
+            // read before entering the staged generation.
+            try verifyFileDigest(io, blob_path, blob.logical_size_bytes, blob.sha256);
         }
-        try verifyFileDigest(io, blob_path, blob.logical_size_bytes, blob.sha256);
+    }
+
+    var blob_reference_counts = std.StringHashMapUnmanaged(usize).empty;
+    defer blob_reference_counts.deinit(alloc);
+    try blob_reference_counts.ensureTotalCapacity(
+        alloc,
+        std.math.cast(u32, parsed_manifest.value.blobs.len) orelse return error.BackupManifestTooLarge,
+    );
+    for (parsed_manifest.value.objects) |object| {
+        const result = blob_reference_counts.getOrPutAssumeCapacity(object.sha256);
+        if (!result.found_existing) result.value_ptr.* = 0;
+        result.value_ptr.* = std.math.add(usize, result.value_ptr.*, 1) catch
+            return error.BackupManifestTooLarge;
     }
     for (parsed_manifest.value.objects) |object| {
         const blob_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ blob_root, object.sha256 });
@@ -552,7 +697,14 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
         const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ staging_root, object.logical_path });
         defer alloc.free(destination);
         if (std.fs.path.dirname(destination)) |parent| try fs_paths.createDirPathPortable(io, parent);
-        try copyFileBounded(io, blob_path, destination, object.size_bytes);
+        // Native generations overwhelmingly map one content blob to one file.
+        // Move those authenticated bytes into place instead of writing the
+        // database a second time. Shared blobs retain copy semantics so future
+        // mutations of one restored file cannot alias another.
+        if (blob_reference_counts.get(object.sha256).? == 1)
+            try renameFilePortable(io, blob_path, destination)
+        else
+            try copyFileBounded(io, blob_path, destination, object.size_bytes);
     }
     try fs_paths.syncDirPortable(io, staging_root);
 }
@@ -614,6 +766,13 @@ fn copyFileBounded(io: std.Io, source_path: []const u8, destination_path: []cons
         offset += wanted;
     }
     try destination.sync(io);
+}
+
+fn renameFilePortable(io: std.Io, source_path: []const u8, destination_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(source_path) and std.fs.path.isAbsolute(destination_path))
+        try std.Io.Dir.renameAbsolute(source_path, destination_path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), destination_path, io);
 }
 
 fn finishExtractedBlob(

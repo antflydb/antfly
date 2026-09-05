@@ -286,6 +286,7 @@ const ha_outbox_id_len: usize = 16;
 const ha_outbox_magic = "AHO1";
 const ha_outbox_header_len: usize = 16;
 const ha_outbox_checksum_len: usize = 4;
+const ha_outbox_recovery_batch_size: usize = 16;
 
 const DurableHAOutbox = struct {
     from_lsn: u64,
@@ -509,6 +510,15 @@ fn backendConfigurationPathFingerprint(path: []const u8) u64 {
     return std.hash.Wyhash.hash(0x9e3779b97f4a7c15, path);
 }
 
+pub const SchemaBeforeIndexLoad = struct {
+    runtime_schema: schema_mod.TableSchema,
+    /// Canonical public schema bytes for the same immutable epoch. Managed
+    /// opens must install these with the runtime layout; otherwise the follow-up
+    /// idempotent publication observes a runtime epoch with no validator and
+    /// correctly rejects changing its meaning.
+    public_schema_json: ?[]const u8 = null,
+};
+
 pub const OpenOptions = struct {
     pub const PhysicalRootMode = enum {
         /// The DB path names a directory-backed physical root. DB owns its
@@ -564,7 +574,7 @@ pub const OpenOptions = struct {
     /// schema-migration ordering hole where an interrupted target-generation
     /// backfill could resume with the previously persisted (or schema-less)
     /// mapper before the provisioner got a chance to call `setSchema`.
-    schema_before_index_load: ?schema_mod.TableSchema = null,
+    schema_before_index_load: ?SchemaBeforeIndexLoad = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
@@ -1520,6 +1530,10 @@ const AsyncContext = struct {
     repair_issue_counter: ?*AtomicU64 = null,
     allow_graph_materialization: bool = true,
     require_graph_resolution_contract: bool = false,
+    /// Apply only physical projection mutations. Shadow split generations read
+    /// committed source rows/artifacts from the primary store but must never
+    /// rewrite its coverage, repair, or graph-binding metadata.
+    projection_only: bool = false,
     query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
     query_visibility_hook: ?QueryVisibilityHook = null,
     query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1750,7 +1764,6 @@ const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
 var portable_activation_retry_jitter_nonce: AtomicU64 = AtomicU64.init(0);
-var test_fail_portable_activation_retry_thread_spawn: std.atomic.Value(bool) = .init(false);
 var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) = .init(false);
 var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
 var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
@@ -2310,6 +2323,9 @@ pub const BatchProfile = struct {
     derived_apply_ns: u64 = 0,
     sync_wait_ns: u64 = 0,
     full_text_apply_ns: u64 = 0,
+    full_text_prepare_ns: u64 = 0,
+    full_text_apply_lock_wait_ns: u64 = 0,
+    full_text_apply_lock_held_ns: u64 = 0,
     dense_apply_ns: u64 = 0,
     dense_delete_ns: u64 = 0,
     dense_doc_index_ns: u64 = 0,
@@ -2403,7 +2419,8 @@ pub const BatchProfile = struct {
 /// allocator until they are promoted or discarded.
 const PreparedRowAllocator = struct {
     child: Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
 
     fn allocator(self: *@This()) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
@@ -2418,29 +2435,29 @@ const PreparedRowAllocator = struct {
 
     fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.child.rawAlloc(len, alignment, ret_addr);
     }
 
     fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.child.rawResize(memory, alignment, new_len, ret_addr);
     }
 
     fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.child.rawRemap(memory, alignment, new_len, ret_addr);
     }
 
     fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.child.rawFree(memory, alignment, ret_addr);
     }
 };
@@ -2453,26 +2470,6 @@ const PreparedRowEffects = struct {
     legacy_document_key: ?[]u8 = null,
     timestamp_key: ?[]u8 = null,
     timestamp_value: ?[]u8 = null,
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.embedding_writes.items) |item| {
-            alloc.free(@constCast(item.key));
-            alloc.free(@constCast(item.value));
-        }
-        self.embedding_writes.deinit(alloc);
-        for (self.graph_writes.items) |item| {
-            alloc.free(@constCast(item.key));
-            alloc.free(@constCast(item.value));
-        }
-        self.graph_writes.deinit(alloc);
-        for (self.graph_clears.items) |*item| item.deinit(alloc);
-        self.graph_clears.deinit(alloc);
-        if (self.store_key) |value| alloc.free(value);
-        if (self.legacy_document_key) |value| alloc.free(value);
-        if (self.timestamp_key) |value| alloc.free(value);
-        if (self.timestamp_value) |value| alloc.free(value);
-        self.* = undefined;
-    }
 };
 
 fn prepareRelationalRows(
@@ -2484,6 +2481,7 @@ fn prepareRelationalRows(
     table_schema: schema_mod.TableSchema,
     physical_layout: *const relational_row_codec.PhysicalLayout,
     write_plan: ?index_manager_mod.IndexManager.WritePlanSnapshot,
+    retain_text_roots: bool,
     preparation_timestamp_ns: u64,
     rows: []?mapper.PreparedRelationalWrite,
 ) !void {
@@ -2497,17 +2495,19 @@ fn prepareRelationalRows(
         physical_layout: *const relational_row_codec.PhysicalLayout,
         db: ?*DB,
         write_plan: ?index_manager_mod.IndexManager.WritePlanSnapshot,
+        retain_text_roots: bool,
         preparation_timestamp_ns: u64,
         rows: []?mapper.PreparedRelationalWrite,
         next: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
-        error_mutex: std.atomic.Mutex = .unlocked,
+        io: std.Io,
+        error_mutex: std.Io.Mutex = .init,
         first_error: ?anyerror = null,
 
         fn fail(ctx: *@This(), err: anyerror) void {
-            lockAtomic(&ctx.error_mutex);
+            ctx.error_mutex.lockUncancelable(ctx.io);
             if (ctx.first_error == null) ctx.first_error = err;
-            ctx.error_mutex.unlock();
+            ctx.error_mutex.unlock(ctx.io);
             ctx.failed.store(true, .release);
         }
 
@@ -2528,6 +2528,7 @@ fn prepareRelationalRows(
                 var prepared = mapper.PreparedRelationalWrite.initInSharedRegion(
                     region,
                     scratch_arena.allocator(),
+                    ctx.retain_text_roots,
                     ctx.writes[index].key,
                     ctx.writes[index].value,
                     ctx.validator,
@@ -2540,6 +2541,10 @@ fn prepareRelationalRows(
                 const owner_alloc = if (ctx.db) |owner_db| owner_db.alloc else ctx.scratch_child;
                 const row_alloc = prepared.preparationAllocator(owner_alloc);
                 if (ctx.write_plan) |pinned_write_plan| {
+                    if (ctx.retain_text_roots) {
+                        prepared.extracted.prepared_schema_version = ctx.table_schema.version;
+                        prepared.extracted.prepared_write_plan_generation = pinned_write_plan.generation;
+                    }
                     augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(
                         pinned_write_plan,
                         row_alloc,
@@ -2585,15 +2590,23 @@ fn prepareRelationalRows(
                             ctx.fail(err);
                             return;
                         };
-                        relational_row_codec.setOrdinalWriteTimestampNs(prepared.packed_row, write_timestamp_ns) catch |err| {
+                        prepared.finalizeMetadata(write_timestamp_ns) catch |err| {
                             prepared.deinit(owner_alloc);
                             ctx.fail(err);
                             return;
                         };
                     }
                 }
-                // No retained output borrows the parse tree. Reclaim/reset it
-                // before publishing the completed row to the batch.
+                prepared.finalizeMetadata(0) catch |err| {
+                    prepared.deinit(owner_alloc);
+                    ctx.fail(err);
+                    return;
+                };
+                // Release the Parsed wrapper before publishing the completed
+                // row. When retain_text_roots is enabled, its backing pages
+                // belong to the row region (whose free operation is a no-op),
+                // so prepared_text_root remains valid until that region is
+                // released; otherwise the worker scratch arena is reset here.
                 prepared.releaseParsed();
                 ctx.rows[index] = prepared;
                 _ = scratch_arena.reset(.retain_capacity);
@@ -2603,10 +2616,13 @@ fn prepareRelationalRows(
 
     var input_bytes: usize = 0;
     for (writes) |write| input_bytes +|= write.key.len + write.value.len;
-    const cpu_count = std.Thread.getCpuCount() catch 1;
     const size_workers = @max(@as(usize, 1), (input_bytes + 256 * 1024 - 1) / (256 * 1024));
-    const desired_workers = @min(@as(usize, 4), @min(cpu_count, @min((writes.len + 31) / 32, size_workers)));
-    const parallel = io != null and desired_workers > 1 and writes.len >= 64 and input_bytes >= 512 * 1024;
+    // A handful of very large rows is just as CPU-heavy as a large row count.
+    // Size the task group from both independent rows and input bytes; the
+    // backend runtime already bounds the shared worker pool, while this local
+    // ceiling prevents one request from monopolizing it.
+    const desired_workers = @min(@as(usize, 8), @min(writes.len, size_workers));
+    const parallel = io != null and desired_workers > 1 and input_bytes >= 512 * 1024;
     var ctx = Context{
         .alloc = if (parallel) allocator_guard.allocator() else allocator_guard.child,
         .scratch_child = if (parallel) allocator_guard.allocator() else allocator_guard.child,
@@ -2616,8 +2632,10 @@ fn prepareRelationalRows(
         .physical_layout = physical_layout,
         .db = db,
         .write_plan = write_plan,
+        .retain_text_roots = retain_text_roots,
         .preparation_timestamp_ns = preparation_timestamp_ns,
         .rows = rows,
+        .io = io orelse std.Options.debug_io,
     };
     if (!parallel) {
         ctx.run();
@@ -2804,6 +2822,9 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.derived_apply_ns += delta.derived_apply_ns;
     total.sync_wait_ns += delta.sync_wait_ns;
     total.full_text_apply_ns += delta.full_text_apply_ns;
+    total.full_text_prepare_ns += delta.full_text_prepare_ns;
+    total.full_text_apply_lock_wait_ns += delta.full_text_apply_lock_wait_ns;
+    total.full_text_apply_lock_held_ns += delta.full_text_apply_lock_held_ns;
     total.dense_apply_ns += delta.dense_apply_ns;
     total.dense_delete_ns += delta.dense_delete_ns;
     total.dense_doc_index_ns += delta.dense_doc_index_ns;
@@ -3139,12 +3160,15 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
+        "antfly_bench_batch_derived writes={d} total_ms={d} derived_apply_ms={d} full_text_apply_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d} applied_sequence_save_ms={d} replay_journal_truncate_ms={d}",
         .{
             req.writes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.derived_apply_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_prepare_ns),
+            nsToMs(profile.full_text_apply_lock_wait_ns),
+            nsToMs(profile.full_text_apply_lock_held_ns),
             nsToMs(profile.dense_apply_ns),
             nsToMs(profile.dense_delete_ns),
             nsToMs(profile.dense_doc_index_ns),
@@ -3278,7 +3302,7 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
 
 fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: derived_types.DerivedBatch, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
+        "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} full_text_prepare_ms={d} full_text_apply_lock_wait_ms={d} full_text_apply_lock_held_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
         .{
             index_ref.name,
             @tagName(index_ref.kind),
@@ -3292,6 +3316,9 @@ fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: 
             batch.graph_deletes.len,
             nsToMs(profile.total_ns),
             nsToMs(profile.full_text_apply_ns),
+            nsToMs(profile.full_text_prepare_ns),
+            nsToMs(profile.full_text_apply_lock_wait_ns),
+            nsToMs(profile.full_text_apply_lock_held_ns),
             nsToMs(profile.dense_apply_ns),
             nsToMs(profile.dense_delete_ns),
             nsToMs(profile.dense_doc_index_ns),
@@ -4747,6 +4774,15 @@ const ShadowState = struct {
     indexes_path: []u8,
     range_start: []u8,
     range_end: []u8,
+    /// Primary commits reserve tickets while holding the global apply fence,
+    /// then apply their derived effects here after releasing it. The ticket
+    /// order preserves replay order without making shadow index I/O part of the
+    /// serialized primary transaction.
+    apply_mutex: std.Io.Mutex = .init,
+    apply_advanced: std.Io.Condition = .init,
+    next_ticket: u64 = 0,
+    applied_ticket: u64 = 0,
+    repair_required: bool = false,
 };
 
 const EmbeddingActivityObservation = struct {
@@ -4795,6 +4831,7 @@ pub const DB = struct {
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
     repair_cleanup_owner_id: u64,
+    ha_recovery_owner_id: u64 = 0,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -4822,6 +4859,17 @@ pub const DB = struct {
     /// under apply before committing an outbox; only an apply-fenced empty scan
     /// may return it to false.
     durable_ha_outbox_maybe: std.atomic.Value(bool) = .init(true),
+    durable_ha_flush_mutex: std.Io.Mutex = .init,
+    /// Crash-left records must be replayed before this process publishes its
+    /// first HA mutation. Once crossed, foreground commits append under the
+    /// apply/log ordering fences and may await independent LSNs concurrently.
+    durable_ha_startup_barrier_pending: std.atomic.Value(bool) = .init(true),
+    /// Owner-scoped recovery keeps remote acknowledgement off the open/read
+    /// path. The startup barrier orders crash-left obligations before new WAL
+    /// records; steady-state mutations then wait on independent LSN watermarks.
+    durable_ha_recovery_state: std.atomic.Value(u8) = .init(0),
+    durable_ha_recovery_failure_streak: u32 = 0,
+    durable_ha_recovery_next_attempt_ns: std.atomic.Value(u64) = .init(0),
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -4837,10 +4885,9 @@ pub const DB = struct {
     // Serializes the stop/load/start lifecycle without coupling worker joins
     // to the apply lock. Public and background retries may race otherwise.
     portable_runtime_activation_mutex: std.atomic.Mutex = .unlocked,
-    // The retry worker is intentionally short-lived: it exits after recovery
-    // instead of retaining one polling thread per DB. It is detached so a
-    // completed generation cannot retain a joinable kernel-thread resource;
-    // this state provides single-flight launch and close-safe lifetime fencing.
+    // The retry worker is owner-scoped and short-lived: it exits after recovery
+    // instead of retaining an OS thread per DB. The runtime owner provides the
+    // close-safe lifetime fence and bounded process-wide concurrency.
     portable_activation_retry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     portable_activation_retry_worker_running: std.atomic.Value(bool) = .init(false),
     portable_activation_retry_stop: std.atomic.Value(bool) = .init(false),
@@ -5138,6 +5185,29 @@ pub const DB = struct {
     /// silently discard a durability obligation.
     fn flushDurableHAOutboxes(self: *DB) !void {
         if (!self.durable_ha_outbox_maybe.load(.acquire)) return;
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        self.durable_ha_flush_mutex.lockUncancelable(io);
+        defer self.durable_ha_flush_mutex.unlock(io);
+        try self.flushDurableHAOutboxesLocked();
+    }
+
+    fn ensureDurableHAStartupBarrier(self: *DB) !void {
+        if (!self.durable_ha_startup_barrier_pending.load(.acquire)) return;
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        self.durable_ha_flush_mutex.lockUncancelable(io);
+        defer self.durable_ha_flush_mutex.unlock(io);
+        if (!self.durable_ha_startup_barrier_pending.load(.acquire)) return;
+        while (self.durable_ha_outbox_maybe.load(.acquire))
+            try self.flushDurableHAOutboxesLocked();
+        self.durable_ha_startup_barrier_pending.store(false, .release);
+    }
+
+    /// The caller owns `durable_ha_flush_mutex`. Recovery may overlap foreground
+    /// acknowledgement, but the apply fence ensures a committed outbox is not
+    /// visible until its WAL record was appended, and WAL matching makes such
+    /// overlap idempotent.
+    fn flushDurableHAOutboxesLocked(self: *DB) !void {
+        if (!self.durable_ha_outbox_maybe.load(.acquire)) return;
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
@@ -5147,7 +5217,15 @@ pub const DB = struct {
         defer if (replay_raw) |raw| self.alloc.free(raw);
         const schema_raw = try self.core.getStoreValue(self.alloc, ha_schema_outbox_key);
         defer if (schema_raw) |raw| self.alloc.free(raw);
-        const pending = try self.core.store.scanPrefix(self.alloc, ha_outbox_v2_prefix);
+        // Recovery is deliberately paged: foreground commits may pipeline while
+        // a standby is slow, so the outbox can be large and must never be copied
+        // wholesale into one recovery allocation.
+        const pending = try self.core.store.scanPrefixPage(
+            self.alloc,
+            ha_outbox_v2_prefix,
+            null,
+            ha_outbox_recovery_batch_size,
+        );
         defer docstore_mod.DocStore.freeResults(self.alloc, pending);
         const any_pending = batch_raw != null or replay_raw != null or schema_raw != null or pending.len != 0;
         if (!any_pending) self.durable_ha_outbox_maybe.store(false, .release);
@@ -5204,6 +5282,100 @@ pub const DB = struct {
             // replace the record which this recovery pass is about to remove.
             try self.clearDurableHAOutbox(entry.key);
         }
+    }
+
+    const DurableHARecoveryWork = struct {
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            self.runDurableHAOutboxRecovery();
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    /// Queue remote acknowledgement without coupling it to DB open or reads.
+    /// The dedicated owner gives this retry state an independent maintenance
+    /// probe and makes close a lifetime barrier for every borrowed callback.
+    fn scheduleDurableHAOutboxRecovery(self: *DB) void {
+        if (!self.stable_address or self.ha_recovery_owner_id == 0) return;
+        if (self.async_context.background_closing.load(.acquire)) return;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
+        if (!self.durable_ha_outbox_maybe.load(.acquire)) {
+            self.backend_runtime.disarmOwnerMaintenanceProbe(self.ha_recovery_owner_id);
+            return;
+        }
+        if (self.backend_runtime.durable_jobs.executesInline()) return;
+        if (monotonicTimeNs() < self.durable_ha_recovery_next_attempt_ns.load(.acquire)) {
+            self.armDurableHARecoveryProbe();
+            return;
+        }
+        if (self.durable_ha_recovery_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
+        self.backend_runtime.durable_jobs.submit(.{
+            .owner_id = self.ha_recovery_owner_id,
+            .class = .maintenance,
+            .ptr = self,
+            .run = DurableHARecoveryWork.run,
+            .deinit = DurableHARecoveryWork.deinit,
+        }) catch |err| {
+            self.durable_ha_recovery_state.store(0, .release);
+            self.durable_ha_recovery_next_attempt_ns.store(
+                monotonicTimeNs() +| portable_activation_retry_base_ns,
+                .release,
+            );
+            self.armDurableHARecoveryProbe();
+            std.log.warn("durable HA recovery queue unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
+        };
+    }
+
+    fn runDurableHAOutboxRecovery(self: *DB) void {
+        // A successful delivery leaves the conservative maybe-bit set until a
+        // fenced empty scan. A second pass supplies that proof without making
+        // every individual clear perform another prefix scan.
+        for (0..2) |_| {
+            self.flushDurableHAOutboxes() catch |err| {
+                if (self.async_context.background_closing.load(.acquire)) {
+                    self.durable_ha_recovery_state.store(0, .release);
+                    return;
+                }
+                self.durable_ha_recovery_failure_streak +|= 1;
+                const delay_ns = portableActivationRetryDelayNs(
+                    self.core.path,
+                    @as(u64, @truncate(self.root_incarnation)) ^ self.ha_recovery_owner_id,
+                    self.durable_ha_recovery_failure_streak - 1,
+                );
+                self.durable_ha_recovery_next_attempt_ns.store(monotonicTimeNs() +| delay_ns, .release);
+                self.durable_ha_recovery_state.store(0, .release);
+                self.armDurableHARecoveryProbe();
+                std.log.warn(
+                    "durable HA acknowledgement pending path={s} err={s} failures={d} next_retry_ms={d}",
+                    .{ self.core.path, @errorName(err), self.durable_ha_recovery_failure_streak, delay_ns / std.time.ns_per_ms },
+                );
+                return;
+            };
+            if (!self.durable_ha_outbox_maybe.load(.acquire)) break;
+        }
+        self.durable_ha_recovery_failure_streak = 0;
+        self.durable_ha_recovery_next_attempt_ns.store(0, .release);
+        self.durable_ha_recovery_state.store(0, .release);
+        if (self.durable_ha_outbox_maybe.load(.acquire)) {
+            self.scheduleDurableHAOutboxRecovery();
+        } else {
+            self.backend_runtime.disarmOwnerMaintenanceProbe(self.ha_recovery_owner_id);
+        }
+    }
+
+    fn armDurableHARecoveryProbe(self: *DB) void {
+        self.backend_runtime.armOwnerMaintenanceProbe(self.ha_recovery_owner_id, .{
+            .ptr = self,
+            .run = durableHARecoveryMaintenanceProbeMain,
+        }) catch |err| {
+            std.log.warn("durable HA recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
+        };
+    }
+
+    fn durableHARecoveryMaintenanceProbeMain(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.scheduleDurableHAOutboxRecovery();
     }
 
     fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
@@ -5309,6 +5481,10 @@ pub const DB = struct {
             var repair_cleanup_owner_transferred = false;
             errdefer if (!repair_cleanup_owner_transferred)
                 backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
+            const ha_recovery_owner_id = try backend_runtime.allocOwnerId();
+            var ha_recovery_owner_transferred = false;
+            errdefer if (!ha_recovery_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(ha_recovery_owner_id);
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
             var effective_index_backends = opts.index_backends;
@@ -5415,7 +5591,11 @@ pub const DB = struct {
             const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
             const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
 
-            const initialized_core = try db_core.DBCore.fromOpened(alloc, core);
+            const initialized_core = try db_core.DBCore.fromOpened(
+                alloc,
+                backend_runtime.io() orelse backend_runtime.filesystemIo() orelse std.Options.debug_io,
+                core,
+            );
             core_owned = false;
             var db = DB{
                 .alloc = alloc,
@@ -5431,6 +5611,7 @@ pub const DB = struct {
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
+                .ha_recovery_owner_id = ha_recovery_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
@@ -5460,6 +5641,7 @@ pub const DB = struct {
             };
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
+            ha_recovery_owner_transferred = true;
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
@@ -5479,12 +5661,21 @@ pub const DB = struct {
                 const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
                 db.root_incarnation = identity.incarnation;
             }
-            if (opts.schema_before_index_load) |table_schema| {
+            if (opts.schema_before_index_load) |prepared_schema| {
                 // This option is used by the metadata-authoritative local
                 // provisioner. Persist directly through the core before index
                 // open; no index runtime exists yet and the metadata record is
                 // already the durable authority for this replica projection.
-                _ = try db.core.commitSchemaMetadata(table_schema, &.{}, &.{public_schema_json_key}, null);
+                if (prepared_schema.public_schema_json) |public_json| {
+                    const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, prepared_schema.runtime_schema.version);
+                    defer alloc.free(versioned_public_key);
+                    _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{
+                        .{ .key = public_schema_json_key, .value = public_json },
+                        .{ .key = versioned_public_key, .value = public_json },
+                    }, &.{}, null);
+                } else {
+                    _ = try db.core.commitSchemaMetadata(prepared_schema.runtime_schema, &.{}, &.{public_schema_json_key}, null);
+                }
                 try db.core.refreshSchemaIndexes();
                 try db.refreshRelationalRuntimeMode();
             }
@@ -5614,10 +5805,11 @@ pub const DB = struct {
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
-                // Recover any local commit that won the crash race before its
-                // synchronous HA append, before background work or callers can
-                // admit a newer mutation over the fixed outbox slots.
-                try db.flushDurableHAOutboxes();
+                // A durable outbox is a write-ordering obligation, not a read
+                // availability dependency. Stable resident owners schedule
+                // recovery after this movable DB value reaches its final
+                // address; the first mutation retains a synchronous crash-order
+                // barrier in case scheduling has not completed yet.
                 if (db.core.table_catalog.index_state != .none and
                     db.core.table_catalog.index_state != .ready)
                     db.reconcilePublishedSchemaIndexes(db.core.table_catalog.active_schema_version);
@@ -5708,9 +5900,19 @@ pub const DB = struct {
         errdefer alloc.destroy(owned);
         owned.* = try open(alloc, path, opts);
         errdefer owned.close();
-        owned.stable_address = true;
-        owned.startQuarantineRetryWorkerIfNeeded();
+        owned.startResidentBackgroundWorkersIfNeeded();
         return owned;
+    }
+
+    /// Mark a DB installed at its final address before scheduling any callback
+    /// that borrows it. Resident caches and owned handles share this entry
+    /// point so newly added maintenance cannot accidentally retain a movable
+    /// stack value.
+    pub fn startResidentBackgroundWorkersIfNeeded(self: *DB) void {
+        self.stable_address = true;
+        self.scheduleDurableHAOutboxRecovery();
+        self.startArtifactRepairMetadataWorkerIfNeeded();
+        self.startQuarantineRetryWorkerIfNeeded();
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -6607,6 +6809,7 @@ pub const DB = struct {
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
+        self.async_context.background_closing.store(true, .release);
         self.stopArtifactRepairMetadataWorker();
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
@@ -6614,11 +6817,14 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
-        self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
         if (self.algebraic_hll_owner_id != 0) {
             self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
             self.algebraic_hll_owner_id = 0;
+        }
+        if (self.ha_recovery_owner_id != 0) {
+            self.backend_runtime.durable_jobs.closeOwner(self.ha_recovery_owner_id);
+            self.ha_recovery_owner_id = 0;
         }
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
@@ -8194,10 +8400,12 @@ pub const DB = struct {
         var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
-        if (!opts.bypass_ha_write_gate) try self.flushDurableHAOutboxes();
+        if (!opts.bypass_ha_write_gate) try self.ensureDurableHAStartupBarrier();
         if (!opts.bypass_ha_write_gate) try self.preflightHABatchSyncCommit();
         const total_start_ns = monotonicTimeNs();
+        var schedule_ha_recovery_on_exit = false;
         defer {
+            if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
             if (profile) |active_profile| {
                 active_profile.total_ns += monotonicTimeNs() - total_start_ns;
             }
@@ -8289,7 +8497,15 @@ pub const DB = struct {
         // mutation is detected after admission by comparing pinned epochs.
         var request_schema_view = self.core.acquireSchemaView();
         defer if (request_schema_view) |*view| view.release();
-        var prepared_row_allocator = PreparedRowAllocator{ .child = self.alloc };
+        var prepared_row_allocator = PreparedRowAllocator{
+            .child = self.alloc,
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+        };
+        // Row side effects outlive speculative preparation but are consumed as
+        // borrowed slices by the serialized commit. A batch arena turns their
+        // many small keys/payloads into bump allocations and one release.
+        var prepared_effects_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer prepared_effects_arena.deinit();
         var preprepared_rows: ?[]?mapper.PreparedRelationalWrite = null;
         var preprepared_effects: ?[]PreparedRowEffects = null;
         var preprepared_generated: ?PrecomputedGeneratedBatch = null;
@@ -8302,7 +8518,6 @@ pub const DB = struct {
             self.alloc.free(rows);
         };
         defer if (preprepared_effects) |effects| {
-            for (effects) |*effect| effect.deinit(self.alloc);
             self.alloc.free(effects);
         };
         defer if (preprepared_generated) |*generated| generated.deinit(self.alloc);
@@ -8349,6 +8564,7 @@ pub const DB = struct {
                     view.tableSchema().*,
                     view.physicalLayout(),
                     write_plan_snapshot.?.plan().*,
+                    req.sync_level == .full_text or req.sync_level == .full_index or splitShadowRequiresMaterializedDerivedBatch(self),
                     preparation_timestamp_ns,
                     rows,
                 );
@@ -8360,21 +8576,23 @@ pub const DB = struct {
                     self.core.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
                     return error.PreparedGenerationChanged;
                 {
+                    const effects_alloc = prepared_effects_arena.allocator();
                     for (effective_req.writes, rows, effects) |write, *maybe_row, *effect| {
                         if (maybe_row.*) |*row| {
+                            row.extracted.artifact_keys_owned_individually = false;
                             if (row.extracted.cleaned_value != null) {
-                                effect.store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
-                                effect.legacy_document_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                                effect.store_key = try encodeStoreLookupKeyAlloc(self, effects_alloc, write.key);
+                                effect.legacy_document_key = try internal_keys.documentKeyAlloc(effects_alloc, write.key);
                                 if (shouldWriteTimestamp(write.key)) {
                                     const write_timestamp_ns = try relational_row_codec.rowWriteTimestampNsTrusted(row.packed_row);
-                                    effect.timestamp_key = try makeTimestampKey(self.alloc, write.key);
-                                    effect.timestamp_value = try encodeTimestampValue(self.alloc, write_timestamp_ns);
+                                    effect.timestamp_key = try makeTimestampKey(effects_alloc, write.key);
+                                    effect.timestamp_value = try encodeTimestampValue(effects_alloc, write_timestamp_ns);
                                 }
                             }
                             for (row.extracted.dense_embeddings) |*embedding| {
                                 if (embedding.artifact_key != null) continue;
                                 embedding.artifact_key = try appendEmbeddingArtifactWrite(
-                                    self.alloc,
+                                    effects_alloc,
                                     &effect.embedding_writes,
                                     write.key,
                                     write.key,
@@ -8388,7 +8606,7 @@ pub const DB = struct {
                             for (row.extracted.sparse_embeddings) |*embedding| {
                                 if (embedding.artifact_key != null) continue;
                                 embedding.artifact_key = try appendSparseEmbeddingArtifactWrite(
-                                    self.alloc,
+                                    effects_alloc,
                                     &effect.embedding_writes,
                                     write.key,
                                     embedding.index_name,
@@ -8399,13 +8617,13 @@ pub const DB = struct {
                             }
                             for (row.extracted.graph_writes) |graph_write| {
                                 const generation = write_plan_snapshot.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
-                                try appendGraphEdgeArtifactWrite(self.alloc, &effect.graph_writes, graph_write, generation);
+                                try appendPreparedGraphEdgeArtifactWrite(effects_alloc, &effect.graph_writes, graph_write, generation);
                             }
                             for (row.extracted.mentioned_graph_indexes) |index_name| {
-                                const clear = try GraphArtifactClear.initAlloc(self.alloc, write.key, index_name);
-                                effect.graph_clears.append(self.alloc, clear) catch |err| {
+                                const clear = try GraphArtifactClear.initAlloc(effects_alloc, write.key, index_name);
+                                effect.graph_clears.append(effects_alloc, clear) catch |err| {
                                     var owned_clear = clear;
-                                    owned_clear.deinit(self.alloc);
+                                    owned_clear.deinit(effects_alloc);
                                     return err;
                                 };
                             }
@@ -8446,6 +8664,24 @@ pub const DB = struct {
                     }
                 }
             }
+        };
+
+        // HA encoding is a pure function of the admitted request and can be
+        // proportional to the entire batch. Prepare it before the serialized
+        // apply section, then reuse the exact bytes for durable outboxes and
+        // the stream append. This also avoids holding the HA log mutex while
+        // walking and encoding every document in a large request.
+        var preencoded_ha_batch_payload: ?[]u8 = null;
+        defer if (preencoded_ha_batch_payload) |payload| self.alloc.free(payload);
+        if (!opts.bypass_ha_write_gate) if (self.ha_async_batch_mirror) |mirror| {
+            preencoded_ha_batch_payload = ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, effective_req) catch |err| blk: {
+                // Best-effort asynchronous mirroring must not turn local
+                // allocator pressure into a pre-commit write rejection. Its
+                // existing post-commit path will retry encoding and account
+                // for a mirror failure if pressure persists.
+                if (haMirrorSyncEnabled(mirror)) return err;
+                break :blk null;
+            };
         };
 
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
@@ -8628,23 +8864,27 @@ pub const DB = struct {
         }
         var timestamp_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer {
-            for (timestamp_writes.items) |item| {
-                self.alloc.free(@constCast(item.key));
-                self.alloc.free(@constCast(item.value));
+            if (!use_preprepared_rows) {
+                for (timestamp_writes.items) |item| {
+                    self.alloc.free(@constCast(item.key));
+                    self.alloc.free(@constCast(item.value));
+                }
             }
             timestamp_writes.deinit(self.alloc);
         }
+        var prepared_embedding_artifact_count: usize = 0;
         var explicit_embedding_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer {
-            for (explicit_embedding_artifact_writes.items) |item| {
+            for (explicit_embedding_artifact_writes.items[prepared_embedding_artifact_count..]) |item| {
                 self.alloc.free(@constCast(item.key));
                 self.alloc.free(@constCast(item.value));
             }
             explicit_embedding_artifact_writes.deinit(self.alloc);
         }
+        var prepared_graph_artifact_count: usize = 0;
         var explicit_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer {
-            for (explicit_graph_artifact_writes.items) |item| {
+            for (explicit_graph_artifact_writes.items[prepared_graph_artifact_count..]) |item| {
                 self.alloc.free(@constCast(item.key));
                 self.alloc.free(@constCast(item.value));
             }
@@ -8659,7 +8899,8 @@ pub const DB = struct {
         }
         var graph_artifact_clears = std.ArrayListUnmanaged(GraphArtifactClear).empty;
         defer {
-            for (graph_artifact_clears.items) |*item| item.deinit(self.alloc);
+            if (!use_preprepared_rows)
+                for (graph_artifact_clears.items) |*item| item.deinit(self.alloc);
             graph_artifact_clears.deinit(self.alloc);
         }
         var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -8760,6 +9001,7 @@ pub const DB = struct {
             if (use_preprepared_rows) {
                 const effects = &preprepared_effects.?[i];
                 try explicit_embedding_artifact_writes.appendSlice(self.alloc, effects.embedding_writes.items);
+                prepared_embedding_artifact_count = explicit_embedding_artifact_writes.items.len;
                 effects.embedding_writes.clearRetainingCapacity();
             } else {
                 for (extracted[i].dense_embeddings) |*embedding| {
@@ -8794,6 +9036,7 @@ pub const DB = struct {
             if (use_preprepared_rows) {
                 const effects = &preprepared_effects.?[i];
                 try explicit_graph_artifact_writes.appendSlice(self.alloc, effects.graph_writes.items);
+                prepared_graph_artifact_count = explicit_graph_artifact_writes.items.len;
                 effects.graph_writes.clearRetainingCapacity();
                 try graph_artifact_clears.appendSlice(self.alloc, effects.graph_clears.items);
                 effects.graph_clears.clearRetainingCapacity();
@@ -8820,8 +9063,8 @@ pub const DB = struct {
                         try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value)
                 else
                     null;
-                if (prepared_relational) |*prepared| if (resolved_write_timestamp_ns) |timestamp_ns|
-                    try relational_row_codec.setOrdinalWriteTimestampNs(prepared.packed_row, timestamp_ns);
+                if (!use_preprepared_rows) if (prepared_relational) |*prepared|
+                    try prepared.finalizeMetadata(resolved_write_timestamp_ns orelse 0);
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try validateDocumentExtractionInlineSourcesParsed(self, prepared.parsedValue(), cleaned)
@@ -8847,7 +9090,7 @@ pub const DB = struct {
                 );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = if (use_preprepared_rows) preprepared_effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
-                try owned_store_keys.append(self.alloc, store_key);
+                if (!use_preprepared_rows) try owned_store_keys.append(self.alloc, store_key);
                 if (use_preprepared_rows) preprepared_effects.?[i].store_key = null;
                 try overwrite_probe_entries.append(self.alloc, .{
                     .key = store_key,
@@ -8861,12 +9104,16 @@ pub const DB = struct {
                 });
                 if (relationalColumns(self) != null) {
                     const legacy_document_key = if (use_preprepared_rows) preprepared_effects.?[i].legacy_document_key.? else try internal_keys.documentKeyAlloc(self.alloc, write.key);
-                    var legacy_document_key_owned = false;
-                    defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
-                    try owned_delete_keys.append(self.alloc, legacy_document_key);
-                    legacy_document_key_owned = true;
-                    if (use_preprepared_rows) preprepared_effects.?[i].legacy_document_key = null;
-                    try delete_keys.append(self.alloc, legacy_document_key);
+                    if (use_preprepared_rows) {
+                        preprepared_effects.?[i].legacy_document_key = null;
+                        try delete_keys.append(self.alloc, legacy_document_key);
+                    } else {
+                        var legacy_document_key_owned = false;
+                        defer if (!legacy_document_key_owned) self.alloc.free(legacy_document_key);
+                        try owned_delete_keys.append(self.alloc, legacy_document_key);
+                        legacy_document_key_owned = true;
+                        try delete_keys.append(self.alloc, legacy_document_key);
+                    }
                 }
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
@@ -8961,14 +9208,30 @@ pub const DB = struct {
         }
         var changed_graph_artifact_key_set = std.StringHashMapUnmanaged(void).empty;
         defer changed_graph_artifact_key_set.deinit(self.alloc);
+        var explicit_graph_write_key_set = std.StringHashMapUnmanaged(void).empty;
+        defer explicit_graph_write_key_set.deinit(self.alloc);
+        try explicit_graph_write_key_set.ensureTotalCapacity(
+            self.alloc,
+            std.math.cast(u32, explicit_graph_artifact_writes.items.len) orelse return error.OutOfMemory,
+        );
+        for (explicit_graph_artifact_writes.items) |write|
+            explicit_graph_write_key_set.putAssumeCapacity(write.key, {});
+        var graph_delete_key_set = std.StringHashMapUnmanaged(void).empty;
+        defer graph_delete_key_set.deinit(self.alloc);
+        try graph_delete_key_set.ensureTotalCapacity(
+            self.alloc,
+            std.math.cast(u32, owned_delete_keys.items.len) orelse return error.OutOfMemory,
+        );
+        for (owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
         for (graph_artifact_clears.items) |clear| {
             const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, clear.doc_key, clear.index_name);
             defer docstore_mod.DocStore.freeResults(self.alloc, existing);
             for (existing) |entry| {
-                if (containsBatchWriteKey(explicit_graph_artifact_writes.items, entry.key)) continue;
-                if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                if (explicit_graph_write_key_set.contains(entry.key)) continue;
+                if (graph_delete_key_set.contains(entry.key)) continue;
                 const owned_key = try self.alloc.dupe(u8, entry.key);
                 try owned_delete_keys.append(self.alloc, owned_key);
+                try graph_delete_key_set.put(self.alloc, owned_key, {});
                 try delete_keys.append(self.alloc, owned_key);
                 try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, entry.key);
             }
@@ -8991,10 +9254,11 @@ pub const DB = struct {
         for (effective_req.graph_deletes) |delete| {
             const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
             defer self.alloc.free(artifact_key);
-            if (containsBatchWriteKey(explicit_graph_artifact_writes.items, artifact_key)) continue;
-            if (containsOwnedKey(owned_delete_keys.items, artifact_key)) continue;
+            if (explicit_graph_write_key_set.contains(artifact_key)) continue;
+            if (graph_delete_key_set.contains(artifact_key)) continue;
             const owned_key = try self.alloc.dupe(u8, artifact_key);
             try owned_delete_keys.append(self.alloc, owned_key);
+            try graph_delete_key_set.put(self.alloc, owned_key, {});
             try delete_keys.append(self.alloc, owned_key);
             try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact_key);
         }
@@ -9108,6 +9372,7 @@ pub const DB = struct {
 
         var sync_targets: ManagedSyncTargets = .{};
         defer sync_targets.deinit(self.alloc);
+        var split_shadow_ticket: ?u64 = null;
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
         var materialized_deleted_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -9263,11 +9528,7 @@ pub const DB = struct {
             precomputed_generated.generated_enrichment_refs = &.{};
             materialized_derived_batch.?.sequence = sequence;
             const payload = try encodeChangeRecordPayload(&self.batchContext(), materialized_derived_batch.?, sequence);
-            try attachInlineUpsertDocumentValues(self.alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
-
-            const apply_shadow_start_ns = monotonicTimeNs();
-            try applyDerivedBatchToShadowIfNeeded(self, materialized_derived_batch.?);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.apply_shadow_ns, apply_shadow_start_ns);
+            try attachPreparedUpsertDocumentProjections(self.alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
             const collect_sync_targets_start_ns = monotonicTimeNs();
             sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, materialized_derived_batch.?);
@@ -9293,13 +9554,9 @@ pub const DB = struct {
         var durable_ha_replay_outbox_key: ?[]const u8 = null;
         if (!opts.bypass_ha_write_gate and opts.transaction_resolution == null) {
             if (self.ha_async_batch_mirror) |mirror| if (haMirrorRequiresDurableOutbox(mirror)) {
-                const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, effective_req);
+                const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
                 const from_lsn = mirror.primary.nextLsn();
-                const outbox = encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload) catch |err| {
-                    self.alloc.free(payload);
-                    return err;
-                };
-                self.alloc.free(payload);
+                const outbox = try encodeDurableHAOutboxAlloc(self.alloc, from_lsn, payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
                     self.alloc.free(outbox);
                     return err;
@@ -9446,8 +9703,11 @@ pub const DB = struct {
         var transaction_ha_replay_payload: ?[]const u8 = null;
         if (opts.transaction_resolution) |resolution| if (!opts.bypass_ha_write_gate) {
             if (self.ha_async_batch_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
-                const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, effective_req);
+                const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
+                // Transfer the preencoded buffer to the committed outbox; its
+                // owner list now controls lifetime through the HA wait below.
                 try owned_store_values.append(self.alloc, payload);
+                preencoded_ha_batch_payload = null;
                 const key_array = transactions_mod.makeTransactionHABatchOutboxKey(resolution.txn_id);
                 const key = try self.alloc.dupe(u8, &key_array);
                 try owned_store_keys.append(self.alloc, key);
@@ -9501,6 +9761,7 @@ pub const DB = struct {
                 replay_append,
                 store_batch_options,
             );
+            schedule_ha_recovery_on_exit = durable_ha_batch_outbox_key != null or durable_ha_replay_outbox_key != null;
             break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
         };
         if (!transaction_applied.applied) {
@@ -9522,6 +9783,8 @@ pub const DB = struct {
             if (transaction_ha_batch_payload) |payload| {
                 deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContext(&ha_ctx, payload));
             } else if (durable_ha_batch_payload) |payload| {
+                deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContext(&ha_ctx, payload));
+            } else if (preencoded_ha_batch_payload) |payload| {
                 deferred_ha_gates.append(try appendHAEncodedBatchMutationCommitLockedContext(&ha_ctx, payload));
             } else deferred_ha_gates.append(try appendHABatchMutationCommitLockedContext(&ha_ctx, effective_req));
             if (transaction_ha_replay_payload) |payload| {
@@ -9555,8 +9818,16 @@ pub const DB = struct {
             self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
         }
+        if (materialized_derived_batch != null) {
+            split_shadow_ticket = reserveSplitShadowApplyTicket(self);
+        }
         unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
         snapshot_mutation.release();
+        if (split_shadow_ticket) |ticket| {
+            const apply_shadow_start_ns = monotonicTimeNs();
+            applyCommittedBatchToShadowOrdered(self, materialized_derived_batch.?, ticket);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.apply_shadow_ns, apply_shadow_start_ns);
+        }
         if (append_derived_replay)
             notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
         releaseHAMutationShared(&ha_mutation);
@@ -19616,11 +19887,61 @@ pub const DB = struct {
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
-        if (!internal_keys.isInternalUserKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
-        const raw = try self.get(alloc, key) orelse return null;
+        // Pin the schema once and keep the physical row intact through TTL and
+        // projection. Relational rows carry their timestamp in the authenticated
+        // AROW header, so a point read does not need a second store lookup.
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
+        defer alloc.free(store_key);
+        const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
         defer alloc.free(raw);
+        if (!internal_keys.isInternalUserKey(key)) {
+            const ttl_duration_ns = if (schema_view) |view| view.tableSchema().ttl_duration_ns else 0;
+            if (ttl_duration_ns != 0) {
+                const timestamp_ns = if (internal_keys.isRelationalRowKey(store_key))
+                    if (self.core.store.valuesAreAuthenticated())
+                        try relational_store.rowWriteTimestampNsTrusted(raw)
+                    else
+                        try relational_store.rowWriteTimestampNs(raw)
+                else
+                    try self.getTimestamp(alloc, key);
+                if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
+            }
+        }
         try checkLookupOptionsActive(opts);
-        const stored = try projectLookupStoredBytes(self, alloc, key, raw, opts);
+        const direct_fields = if (internal_keys.isRelationalRowKey(store_key))
+            exactOrdinalProjectionFields(opts.fields, opts.include_all_fields)
+        else
+            null;
+        const stored = if (direct_fields) |fields| blk: {
+            break :blk if (self.core.store.valuesAreAuthenticated())
+                try self.core.index_manager.projectStoredOrdinalFieldsTrustedWithPinnedSchemaAlloc(
+                    alloc,
+                    store_key,
+                    raw,
+                    fields,
+                    schema_view,
+                )
+            else
+                try self.core.index_manager.projectStoredOrdinalFieldsWithPinnedSchemaAlloc(
+                    alloc,
+                    store_key,
+                    raw,
+                    fields,
+                    schema_view,
+                );
+        } else blk: {
+            const materialized = try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(
+                alloc,
+                store_key,
+                raw,
+                schema_view,
+            );
+            if (opts.fields.len == 0 and opts.include_all_fields) break :blk materialized;
+            defer alloc.free(materialized);
+            break :blk try projectLookupStoredBytes(self, alloc, key, materialized, opts);
+        };
         errdefer alloc.free(stored);
         try checkLookupOptionsActive(opts);
         return .{ .json = stored };
@@ -20172,6 +20493,7 @@ pub const DB = struct {
     }
 
     fn closeShadowIndexManagerLocked(self: *DB) !void {
+        try waitForSplitShadowDrainLocked(self, false);
         const shadow = self.shadow orelse return;
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
@@ -21941,6 +22263,8 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var schedule_ha_recovery_on_exit = false;
+        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
             try db_core.PreparedRecoveryRelationalState.init(
                 self.runtime_alloc,
@@ -21954,7 +22278,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        try self.flushDurableHAOutboxes();
+        try self.ensureDurableHAStartupBarrier();
         try self.preflightHAMetadataSyncCommit();
         const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
             if (haMirrorRequiresDurableOutbox(mirror)) try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, table_schema, null) else null
@@ -21975,34 +22299,64 @@ pub const DB = struct {
         else
             null;
         defer if (durable_ha_schema_outbox_key) |key| self.alloc.free(key);
-        try self.lockApplyForPortableRuntime();
-        var apply_held = true;
-        errdefer if (apply_held) self.core.unlockApply();
-        const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
-        // A direct compiled-schema publication has no public validator for the
-        // new epoch. Clear only the active pointer; historical validator bytes
-        // are immutable and remain available to decode old rows.
         const schema_metadata_writes: []const docstore_mod.KVPair = if (durable_ha_schema_outbox) |outbox|
             &.{.{ .key = durable_ha_schema_outbox_key.?, .value = outbox }}
         else
             &.{};
+        var prepared_schema = try self.core.prepareSchemaMetadata(table_schema, schema_metadata_writes);
+        defer prepared_schema.deinit();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        errdefer if (apply_held) self.core.unlockApply();
+        const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
         if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
-        _ = try self.core.commitSchemaMetadata(table_schema, schema_metadata_writes, &.{public_schema_json_key}, reconciled_row_count);
+        _ = try self.core.commitPreparedSchemaMetadata(
+            &prepared_schema,
+            schema_metadata_writes,
+            &.{public_schema_json_key},
+            reconciled_row_count,
+        );
+        schedule_ha_recovery_on_exit = durable_ha_schema_outbox_key != null;
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
 
         var ctx = self.batchContext();
         var deferred_ha_gates = HADeferredCommitGates.begin(&ctx);
         defer deferred_ha_gates.releaseTransition();
+        var post_commit_error: ?anyerror = null;
         if (durable_ha_schema_payload) |payload|
-            deferred_ha_gates.append(try appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload))
+            deferred_ha_gates.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+                post_commit_error = err;
+                break :blk null;
+            })
         else
-            deferred_ha_gates.append(try appendHASchemaMetadataCommitLockedContext(&ctx, table_schema, null));
+            deferred_ha_gates.append(appendHASchemaMetadataCommitLockedContext(&ctx, table_schema, null) catch |err| blk: {
+                post_commit_error = err;
+                break :blk null;
+            });
         self.core.unlockApply();
         apply_held = false;
         releaseHAMutationShared(&ha_mutation);
-        try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
-        if (durable_ha_schema_outbox_key) |key| try self.clearDurableHAOutbox(key);
+        if (post_commit_error == null) {
+            deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch |err| {
+                post_commit_error = err;
+            };
+        } else {
+            deferred_ha_gates.releaseTransition();
+        }
+        if (post_commit_error == null) if (durable_ha_schema_outbox_key) |key| {
+            self.clearDurableHAOutbox(key) catch |err| std.log.warn(
+                "schema HA durability acknowledged but outbox cleanup is pending path={s} version={d} err={s}",
+                .{ self.core.path, table_schema.version, @errorName(err) },
+            );
+        };
         self.reconcilePublishedSchemaIndexes(table_schema.version);
+        if (post_commit_error) |err| {
+            std.log.warn(
+                "schema committed locally but HA durability outcome is unknown path={s} version={d} err={s}",
+                .{ self.core.path, table_schema.version, @errorName(err) },
+            );
+            return error.DurabilityOutcomeUnknown;
+        }
     }
 
     fn refreshRelationalRuntimeMode(self: *DB) !void {
@@ -22162,6 +22516,8 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var schedule_ha_recovery_on_exit = false;
+        defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         _ = alloc;
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
         defer parsed_schema.deinit(self.alloc);
@@ -22180,7 +22536,7 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        try self.flushDurableHAOutboxes();
+        try self.ensureDurableHAStartupBarrier();
         try self.preflightHAMetadataSyncCommit();
         const durable_ha_schema_payload = if (self.ha_async_metadata_mirror) |mirror|
             if (haMirrorRequiresDurableOutbox(mirror)) try ha_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json) else null
@@ -22201,10 +22557,6 @@ pub const DB = struct {
         else
             null;
         defer if (durable_ha_schema_outbox_key) |key| self.alloc.free(key);
-        try self.lockApplyForPortableRuntime();
-        var apply_held = true;
-        errdefer if (apply_held) self.core.unlockApply();
-        const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
         const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, runtime_schema.version);
         defer self.alloc.free(versioned_public_key);
         var schema_metadata_writes: [3]docstore_mod.KVPair = undefined;
@@ -22215,23 +22567,63 @@ pub const DB = struct {
             schema_metadata_writes[2] = .{ .key = durable_ha_schema_outbox_key.?, .value = outbox };
             schema_metadata_write_count = 3;
         }
+        var prepared_schema = try self.core.prepareSchemaMetadata(
+            runtime_schema,
+            schema_metadata_writes[0..schema_metadata_write_count],
+        );
+        defer prepared_schema.deinit();
+        try self.lockApplyForPortableRuntime();
+        var apply_held = true;
+        errdefer if (apply_held) self.core.unlockApply();
+        const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(runtime_schema);
         if (durable_ha_schema_outbox_key != null) self.durable_ha_outbox_maybe.store(true, .release);
-        _ = try self.core.commitSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count], &.{}, reconciled_row_count);
+        _ = try self.core.commitPreparedSchemaMetadata(
+            &prepared_schema,
+            schema_metadata_writes[0..schema_metadata_write_count],
+            &.{},
+            reconciled_row_count,
+        );
+        schedule_ha_recovery_on_exit = durable_ha_schema_outbox_key != null;
         self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
 
         var ctx = self.batchContext();
         var deferred_ha_gates = HADeferredCommitGates.begin(&ctx);
         defer deferred_ha_gates.releaseTransition();
+        var post_commit_error: ?anyerror = null;
         if (durable_ha_schema_payload) |payload|
-            deferred_ha_gates.append(try appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload))
+            deferred_ha_gates.append(appendHAEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+                post_commit_error = err;
+                break :blk null;
+            })
         else
-            deferred_ha_gates.append(try appendHASchemaMetadataCommitLockedContext(&ctx, runtime_schema, schema_json));
+            deferred_ha_gates.append(appendHASchemaMetadataCommitLockedContext(&ctx, runtime_schema, schema_json) catch |err| blk: {
+                post_commit_error = err;
+                break :blk null;
+            });
         self.core.unlockApply();
         apply_held = false;
         releaseHAMutationShared(&ha_mutation);
-        try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
-        if (durable_ha_schema_outbox_key) |key| try self.clearDurableHAOutbox(key);
+        if (post_commit_error == null) {
+            deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate) catch |err| {
+                post_commit_error = err;
+            };
+        } else {
+            deferred_ha_gates.releaseTransition();
+        }
+        if (post_commit_error == null) if (durable_ha_schema_outbox_key) |key| {
+            self.clearDurableHAOutbox(key) catch |err| std.log.warn(
+                "schema HA durability acknowledged but outbox cleanup is pending path={s} version={d} err={s}",
+                .{ self.core.path, runtime_schema.version, @errorName(err) },
+            );
+        };
         self.reconcilePublishedSchemaIndexes(runtime_schema.version);
+        if (post_commit_error) |err| {
+            std.log.warn(
+                "schema committed locally but HA durability outcome is unknown path={s} version={d} err={s}",
+                .{ self.core.path, runtime_schema.version, @errorName(err) },
+            );
+            return error.DurabilityOutcomeUnknown;
+        }
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -25711,10 +26103,11 @@ pub const DB = struct {
     }
 
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
         var slept: u64 = 0;
         while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
             if (self.artifact_repair_metadata_stop.load(.acquire)) return false;
-            sleepNs(artifact_repair_metadata_sleep_slice_ns);
+            io.sleep(.fromNanoseconds(artifact_repair_metadata_sleep_slice_ns), .awake) catch {};
         }
         return !self.artifact_repair_metadata_stop.load(.acquire);
     }
@@ -25748,7 +26141,9 @@ pub const DB = struct {
         if (comptime builtin.is_test) {
             if (allow_test_background and test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
                 test_portable_activation_retry_probe_paused.store(true, .release);
-                while (!test_release_portable_activation_retry_probe.load(.acquire)) std.Thread.yield() catch {};
+                const io = self.backend_runtime.io() orelse std.Options.debug_io;
+                while (!test_release_portable_activation_retry_probe.load(.acquire))
+                    io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
         }
         _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
@@ -25811,54 +26206,27 @@ pub const DB = struct {
     }
 
     const PortableActivationRetryLaunch = enum {
-        detached_thread,
-        backend_runtime_fallback,
+        backend_runtime,
     };
 
-    fn spawnPortableActivationRetryThread(self: *DB) !std.Thread {
-        if (comptime builtin.is_test) {
-            if (test_fail_portable_activation_retry_thread_spawn.swap(false, .acq_rel)) {
-                return error.InjectedPortableActivationRetryThreadSpawnFailure;
-            }
-        }
-        return try std.Thread.spawn(.{}, portableActivationRetryWorkerMain, .{self});
-    }
-
-    /// The ordinary worker is detached so every completed generation releases
-    /// its kernel resources immediately. If the process cannot create another
-    /// thread, hand the same bounded-backoff state machine to the runtime's
-    /// owner-scoped maintenance lane; DB.close drains that lane before any
-    /// referenced state is released.
+    /// Portable activation belongs to the runtime's bounded maintenance lane,
+    /// not an untracked OS thread. Owner shutdown is the join barrier and the
+    /// runtime controls concurrency across all resident databases.
     fn launchPortableActivationRetryWorkerLocked(self: *DB) !PortableActivationRetryLaunch {
         std.debug.assert(self.portable_activation_retry_worker_running.load(.acquire));
-        const thread = self.spawnPortableActivationRetryThread() catch |spawn_err| {
-            if (self.backend_runtime.durable_jobs.executesInline()) return spawn_err;
-            if (comptime builtin.is_test) {
-                if (test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel)) {
-                    return error.InjectedPortableActivationRetryFallbackSubmitFailure;
-                }
-            }
-            self.backend_runtime.durable_jobs.submit(.{
-                .owner_id = self.backend_owner_id,
-                .class = .maintenance,
-                .ptr = self,
-                .run = portableActivationRetryDurableJobMain,
-                .deinit = portableActivationRetryDurableJobDeinit,
-            }) catch |fallback_err| {
-                std.log.warn(
-                    "portable activation retry fallback scheduling failed path={s} thread_err={s} fallback_err={s}",
-                    .{ self.core.path, @errorName(spawn_err), @errorName(fallback_err) },
-                );
-                return fallback_err;
-            };
-            std.log.warn(
-                "portable activation retry using backend runtime fallback path={s} thread_err={s}",
-                .{ self.core.path, @errorName(spawn_err) },
-            );
-            return .backend_runtime_fallback;
-        };
-        thread.detach();
-        return .detached_thread;
+        if (self.backend_runtime.durable_jobs.executesInline()) return error.BackgroundRuntimeUnavailable;
+        if (comptime builtin.is_test) {
+            if (test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel))
+                return error.InjectedPortableActivationRetrySubmitFailure;
+        }
+        try self.backend_runtime.durable_jobs.submit(.{
+            .owner_id = self.backend_owner_id,
+            .class = .maintenance,
+            .ptr = self,
+            .run = portableActivationRetryDurableJobMain,
+            .deinit = portableActivationRetryDurableJobDeinit,
+        });
+        return .backend_runtime;
     }
 
     fn portableActivationRetryDurableJobMain(ptr: *anyopaque) !void {
@@ -25885,17 +26253,15 @@ pub const DB = struct {
         self.portable_activation_retry_stop.store(true, .release);
         self.portable_activation_retry_lifecycle_mutex.unlock();
 
-        // Detached workers and owner-scoped fallbacks both publish completion.
-        // Wait outside the lifecycle mutex so their final handshake cannot
-        // deadlock shutdown. Sleep rather than spin; the worker observes stop
-        // in at most one short retry slice.
+        // The owner-scoped worker publishes completion. Wait outside the
+        // lifecycle mutex so its final handshake cannot deadlock shutdown.
         while (self.portable_activation_retry_worker_running.load(.acquire)) {
-            sleepNs(std.time.ns_per_ms);
+            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
 
         // Completion is published immediately before the worker releases this
-        // mutex. Reacquiring it is the detached-thread join barrier: after it
-        // succeeds, the worker has made its final access to DB-owned memory.
+        // mutex. Reacquiring it is the final memory-lifetime barrier.
         _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
         std.debug.assert(!self.portable_activation_retry_worker_running.load(.acquire));
         self.portable_activation_retry_lifecycle_mutex.unlock();
@@ -25916,11 +26282,12 @@ pub const DB = struct {
     }
 
     fn sleepPortableActivationRetryWorker(self: *DB, target_ns: u64) bool {
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
         var slept: u64 = 0;
         while (slept < target_ns) {
             if (self.portable_activation_retry_stop.load(.acquire)) return false;
             const slice = @min(quarantine_retry_sleep_slice_ns, target_ns - slept);
-            sleepNs(slice);
+            io.sleep(.fromNanoseconds(slice), .awake) catch {};
             slept += slice;
         }
         return !self.portable_activation_retry_stop.load(.acquire);
@@ -26777,19 +27144,35 @@ pub const DB = struct {
             try final_artifact_mutations.put(alloc, write.key, write_idx);
         }
 
+        // Resolve the committed side of every overwrite through one sorted
+        // probe. Point-reading here made the globally serialized commit section
+        // perform O(artifact mutations) independent backend transactions and
+        // repeatedly decode the same LSM blocks.
+        const artifact_keys = try alloc.alloc([]const u8, final_artifact_mutations.count());
+        defer alloc.free(artifact_keys);
         var final_it = final_artifact_mutations.iterator();
-        while (final_it.next()) |entry| {
-            const artifact_key = entry.key_ptr.*;
-            const old_value = store.get(alloc, artifact_key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            defer if (old_value) |value| alloc.free(value);
+        var artifact_index: usize = 0;
+        while (final_it.next()) |entry| : (artifact_index += 1) {
+            artifact_keys[artifact_index] = entry.key_ptr.*;
+        }
+        std.mem.sort([]const u8, artifact_keys, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.order(u8, lhs, rhs) == .lt;
+            }
+        }.lessThan);
+        const old_values = try alloc.alloc(?[]const u8, artifact_keys.len);
+        defer alloc.free(old_values);
+        var artifact_probe = try store.beginProbeTxn();
+        defer artifact_probe.abort();
+        try artifact_probe.getManySorted(artifact_keys, old_values);
+
+        for (artifact_keys, old_values) |artifact_key, old_value| {
+            const final_write_index = final_artifact_mutations.get(artifact_key).?;
             if (old_value) |value| {
                 try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, artifact_key, value, -1);
             }
-            if (entry.value_ptr.* != deleted_sentinel) {
-                const write = store_writes.items[entry.value_ptr.*];
+            if (final_write_index != deleted_sentinel) {
+                const write = store_writes.items[final_write_index];
                 try applyDenseArtifactCounterDelta(alloc, store, &catalog, &mutations, write.key, write.value, 1);
             }
         }
@@ -29676,13 +30059,13 @@ pub const DB = struct {
         runtime_alloc: Allocator,
         identity_summary: ?doc_identity.VisibilitySummary,
         schema: ?schema_mod.TableSchema,
-        epoch: ?*schema_registry_mod.Epoch,
+        schema_replacement: schema_registry_mod.Registry.PreparedReplacement,
         table_catalog: table_catalog_mod.Catalog,
         recovery: ?db_core.PreparedRecoveryRelationalState,
         target_identity: doc_identity.Namespace,
 
         pub fn deinit(self: *@This()) void {
-            if (self.epoch) |epoch| epoch.release();
+            self.schema_replacement.deinit();
             if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
             if (self.recovery) |*recovery| recovery.deinit();
             self.* = undefined;
@@ -29718,9 +30101,11 @@ pub const DB = struct {
             }
             prepared_epoch = try self.core.prepareSchemaEpoch(runtime_schema, schema_json);
         }
-        try self.core.prepareSchemaRegistryReplacement();
         var prepared_epoch_owned = prepared_epoch != null;
         defer if (prepared_epoch_owned) prepared_epoch.?.release();
+        var schema_replacement = try self.core.prepareSchemaRegistryReplacement(prepared_epoch);
+        prepared_epoch_owned = false;
+        errdefer schema_replacement.deinit();
         // Historical layouts were validated while importing the unpublished
         // image and remain durable in the restored store. Match normal startup:
         // publish only the active epoch and fault historical versions into the
@@ -29742,13 +30127,12 @@ pub const DB = struct {
             .runtime_alloc = self.runtime_alloc,
             .identity_summary = identity_summary,
             .schema = restored_schema,
-            .epoch = prepared_epoch,
+            .schema_replacement = schema_replacement,
             .table_catalog = restored_catalog,
             .recovery = prepared_recovery,
             .target_identity = target_identity,
         };
         restored_schema_owned = false;
-        prepared_epoch_owned = false;
         prepared_recovery = null;
         return result;
     }
@@ -29760,9 +30144,8 @@ pub const DB = struct {
         self.identity_visibility_summary_cache = prepared.identity_summary;
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
-        self.core.replaceSchemaOwnedPrepared(prepared.schema, prepared.epoch);
+        self.core.replaceSchemaOwnedPrepared(prepared.schema, &prepared.schema_replacement);
         prepared.schema = null;
-        prepared.epoch = null;
         self.core.table_catalog = prepared.table_catalog;
         self.core.identity_namespace = prepared.target_identity;
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(prepared.target_identity);
@@ -31398,6 +31781,7 @@ pub const DB = struct {
             ttl_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             document_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             schema_plans: std.ArrayListUnmanaged(SchemaPlan) = .empty,
+            schema_plan_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
             visitor: types.ScanVisitor,
             count: u32 = 0,
 
@@ -31406,6 +31790,7 @@ pub const DB = struct {
                 state.document_key_scratch.deinit(state.alloc);
                 for (state.schema_plans.items) |*plan| plan.deinit();
                 state.schema_plans.deinit(state.alloc);
+                state.schema_plan_indexes.deinit(state.alloc);
             }
 
             fn checkActive(state: *const @This()) !void {
@@ -31416,9 +31801,10 @@ pub const DB = struct {
             }
 
             fn schemaPlan(state: *@This(), version: u32) !*SchemaPlan {
-                for (state.schema_plans.items) |*plan|
-                    if (plan.view.version() == version) return plan;
+                if (state.schema_plan_indexes.get(version)) |index|
+                    return &state.schema_plans.items[index];
 
+                try state.schema_plan_indexes.ensureUnusedCapacity(state.alloc, 1);
                 var view = (try state.db.core.acquireSchemaVersionView(version)) orelse
                     return error.UnknownSchemaVersion;
                 var view_owned = true;
@@ -31451,6 +31837,7 @@ pub const DB = struct {
                     .filter = filter,
                     .projection = projection,
                 });
+                state.schema_plan_indexes.putAssumeCapacity(version, state.schema_plans.items.len - 1);
                 view_owned = false;
                 filter_owned = false;
                 projection_owned = false;
@@ -35924,9 +36311,138 @@ fn loadStoredSearchDocumentsMany(
         original_index: usize,
         store_key: []u8,
     };
+    const SearchSchemaPlans = struct {
+        const HistoricalPlan = struct {
+            view: schema_registry_mod.SchemaView,
+            projection: ?relational_row_codec.OrdinalProjectionPlan,
+
+            fn deinit(plan: *@This()) void {
+                if (plan.projection) |*projection| projection.deinit();
+                plan.view.release();
+                plan.* = undefined;
+            }
+        };
+
+        db: *DB,
+        alloc: Allocator,
+        fields: ?[]const []const u8,
+        pinned: ?*const schema_registry_mod.SchemaView,
+        pinned_projection: ?relational_row_codec.OrdinalProjectionPlan = null,
+        historical: std.ArrayListUnmanaged(HistoricalPlan) = .empty,
+        historical_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+
+        fn deinit(plans: *@This()) void {
+            if (plans.pinned_projection) |*projection| projection.deinit();
+            for (plans.historical.items) |*plan| plan.deinit();
+            plans.historical.deinit(plans.alloc);
+            plans.historical_indexes.deinit(plans.alloc);
+        }
+
+        fn historicalPlan(plans: *@This(), version: u32) !*HistoricalPlan {
+            if (plans.historical_indexes.get(version)) |index|
+                return &plans.historical.items[index];
+
+            try plans.historical_indexes.ensureUnusedCapacity(plans.alloc, 1);
+            var view = (try plans.db.core.acquireSchemaVersionView(version)) orelse
+                return error.UnknownSchemaVersion;
+            var view_owned = true;
+            errdefer if (view_owned) view.release();
+            if (view.storageMode() != .relational) return error.RelationalRowSchemaMismatch;
+            var projection = if (plans.fields) |fields|
+                try relational_row_codec.OrdinalProjectionPlan.init(
+                    plans.alloc,
+                    view.tableSchema().*,
+                    view.physicalLayout(),
+                    fields,
+                )
+            else
+                null;
+            var projection_owned = projection != null;
+            errdefer if (projection_owned) projection.?.deinit();
+            try plans.historical.append(plans.alloc, .{
+                .view = view,
+                .projection = projection,
+            });
+            plans.historical_indexes.putAssumeCapacity(version, plans.historical.items.len - 1);
+            view_owned = false;
+            projection_owned = false;
+            return &plans.historical.items[plans.historical.items.len - 1];
+        }
+
+        fn materialize(
+            plans: *@This(),
+            store_key: []const u8,
+            stored_value: []const u8,
+            values_authenticated: bool,
+        ) ![]u8 {
+            if (!internal_keys.isRelationalRowKey(store_key))
+                return try plans.alloc.dupe(u8, stored_value);
+
+            const version = try relational_store.rowSchemaVersion(stored_value);
+            if (plans.pinned) |view| if (view.version() == version) {
+                if (plans.fields) |fields| {
+                    if (plans.pinned_projection == null) {
+                        plans.pinned_projection = try relational_row_codec.OrdinalProjectionPlan.init(
+                            plans.alloc,
+                            view.tableSchema().*,
+                            view.physicalLayout(),
+                            fields,
+                        );
+                    }
+                    return if (values_authenticated)
+                        try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
+                            plans.alloc,
+                            stored_value,
+                            view.tableSchema().*,
+                            view.physicalLayout(),
+                            plans.pinned_projection.?,
+                        )
+                    else
+                        try relational_row_codec.projectOrdinalPlanWithLayoutAlloc(
+                            plans.alloc,
+                            stored_value,
+                            view.tableSchema().*,
+                            view.physicalLayout(),
+                            plans.pinned_projection.?,
+                        );
+                }
+                return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+                    plans.alloc,
+                    stored_value,
+                    view.tableSchema().*,
+                    view.physicalLayout(),
+                );
+            };
+
+            const plan = try plans.historicalPlan(version);
+            if (plan.projection) |projection| {
+                return if (values_authenticated)
+                    try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
+                        plans.alloc,
+                        stored_value,
+                        plan.view.tableSchema().*,
+                        plan.view.physicalLayout(),
+                        projection,
+                    )
+                else
+                    try relational_row_codec.projectOrdinalPlanWithLayoutAlloc(
+                        plans.alloc,
+                        stored_value,
+                        plan.view.tableSchema().*,
+                        plan.view.physicalLayout(),
+                        projection,
+                    );
+            }
+            return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+                plans.alloc,
+                stored_value,
+                plan.view.tableSchema().*,
+                plan.view.physicalLayout(),
+            );
+        }
+    };
 
     const loaded = try alloc.alloc(?[]u8, keys.len);
-    errdefer alloc.free(loaded);
     @memset(loaded, null);
     if (keys.len == 0) return loaded;
 
@@ -35938,11 +36454,17 @@ fn loadStoredSearchDocumentsMany(
 
     errdefer freeOptionalOwnedBytes(alloc, loaded);
 
+    // Pin the active keyspace once for the whole batch. This both avoids one
+    // schema-registry acquisition per hit and prevents a mixed key encoding if
+    // schema publication races search-result hydration.
+    var schema_view = self.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+
     const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
-            .store_key = try encodeStoreLookupKeyAlloc(self, alloc, key),
+            .store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view),
         });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
@@ -35972,25 +36494,21 @@ fn loadStoredSearchDocumentsMany(
     if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
 
     const materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    var schema_view = self.core.acquireSchemaView();
-    defer if (schema_view) |*view| view.release();
+    const values_authenticated = self.core.store.valuesAreAuthenticated();
+    var schema_plans = SearchSchemaPlans{
+        .db = self,
+        .alloc = alloc,
+        .fields = direct_fields,
+        .pinned = if (schema_view) |*view| view else null,
+    };
+    defer schema_plans.deinit();
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        loaded[item.original_index] = if (direct_fields) |fields|
-            try self.core.index_manager.projectStoredOrdinalFieldsWithPinnedSchemaAlloc(
-                alloc,
-                item.store_key,
-                value,
-                fields,
-                schema_view,
-            )
-        else
-            try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(
-                alloc,
-                item.store_key,
-                value,
-                schema_view,
-            );
+        loaded[item.original_index] = try schema_plans.materialize(
+            item.store_key,
+            value,
+            values_authenticated,
+        );
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - materialize_start_ns;
     if (bench_profile) {
@@ -41037,14 +41555,20 @@ fn appendEmbeddingArtifactWrite(
         try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, base_key, artifact_name)
     else
         try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, base_key, artifact_name);
-    defer alloc.free(key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
-    const owned_key = try alloc.dupe(u8, key);
+    var payload_owned = true;
+    errdefer if (payload_owned) alloc.free(payload);
+    const artifact_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(artifact_key);
     try artifact_writes.append(alloc, .{
-        .key = owned_key,
+        .key = key,
         .value = payload,
     });
-    return try alloc.dupe(u8, key);
+    key_owned = false;
+    payload_owned = false;
+    return artifact_key;
 }
 
 fn appendSparseEmbeddingArtifactWrite(
@@ -41060,14 +41584,20 @@ fn appendSparseEmbeddingArtifactWrite(
         try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, base_key, artifact_name)
     else
         try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, base_key, artifact_name);
-    defer alloc.free(key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, indices, values);
-    const owned_key = try alloc.dupe(u8, key);
+    var payload_owned = true;
+    errdefer if (payload_owned) alloc.free(payload);
+    const artifact_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(artifact_key);
     try artifact_writes.append(alloc, .{
-        .key = owned_key,
+        .key = key,
         .value = payload,
     });
-    return try alloc.dupe(u8, key);
+    key_owned = false;
+    payload_owned = false;
+    return artifact_key;
 }
 
 fn embeddingArtifactKeyForBaseAlloc(alloc: Allocator, base_key: []const u8, artifact_name: []const u8) ![]u8 {
@@ -41125,14 +41655,32 @@ fn appendGraphEdgeArtifactWrite(
     generation: u64,
 ) !void {
     try validateGraphEdgeMetadataJson(alloc, write.metadata_json);
+    return try appendPreparedGraphEdgeArtifactWrite(alloc, artifact_writes, write, generation);
+}
+
+/// Prepared rows produced `metadata_json` from an already-validated JSON object.
+/// Keep the public/direct-write validation boundary above, but do not parse the
+/// same metadata once more while assembling request-owned effects.
+fn appendPreparedGraphEdgeArtifactWrite(
+    alloc: Allocator,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    write: types.GraphEdgeWrite,
+    generation: u64,
+) !void {
     const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
     defer alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
+    var payload_owned = true;
+    errdefer if (payload_owned) alloc.free(payload);
     const owned_key = try alloc.dupe(u8, key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(owned_key);
     try artifact_writes.append(alloc, .{
         .key = owned_key,
         .value = payload,
     });
+    key_owned = false;
+    payload_owned = false;
 }
 
 fn validateGraphEdgeMetadataJson(alloc: Allocator, metadata_json: []const u8) !void {
@@ -41226,13 +41774,6 @@ fn removePendingDeleteKey(
             i += 1;
         }
     }
-}
-
-fn containsBatchWriteKey(list: []const types.BatchWrite, key: []const u8) bool {
-    for (list) |item| {
-        if (std.mem.eql(u8, item.key, key)) return true;
-    }
-    return false;
 }
 
 fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) bool {
@@ -45091,49 +45632,61 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     deleted_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
+    const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, doc_key);
+    defer alloc.free(document_prefix);
     const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(artifact_prefix);
-    try collectDeleteKeysForPrefix(
-        alloc,
-        store,
-        artifact_prefix,
-        delete_keys,
-        owned_delete_keys,
-        deleted_artifact_keys,
-    );
-
     const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(asset_state_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, asset_state_prefix, delete_keys, owned_delete_keys, null);
-
     const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(graph_asset_state_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, delete_keys, owned_delete_keys, null);
-
     const graph_edge_contender_prefix = try internal_keys.graphEdgeContenderRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(graph_edge_contender_prefix);
-    try collectDeleteKeysForPrefix(alloc, store, graph_edge_contender_prefix, delete_keys, owned_delete_keys, null);
-}
+    // All document-owned records are contiguous. Stream borrowed keys directly
+    // from one cursor and retain only keys selected for deletion. In particular,
+    // never copy potentially large chunk/vector/asset payloads merely to delete
+    // their owning records.
+    const upper = try internal_keys.nextPrefixAlloc(alloc, document_prefix);
+    defer if (upper) |key| alloc.free(key);
+    const ScanContext = struct {
+        alloc: Allocator,
+        artifact_prefix: []const u8,
+        asset_state_prefix: []const u8,
+        graph_asset_state_prefix: []const u8,
+        graph_edge_contender_prefix: []const u8,
+        delete_keys: *std.ArrayListUnmanaged([]const u8),
+        owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+        deleted_artifact_keys: *std.ArrayListUnmanaged([]u8),
 
-fn collectDeleteKeysForPrefix(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    prefix: []const u8,
-    deletes: *std.ArrayListUnmanaged([]const u8),
-    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
-    recorded: ?*std.ArrayListUnmanaged([]u8),
-) !void {
-    const existing = try store.scanPrefix(alloc, prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, existing);
-    for (existing) |entry| {
-        const owned = try alloc.dupe(u8, entry.key);
-        errdefer alloc.free(owned);
-        try owned_delete_keys.append(alloc, owned);
-        errdefer _ = owned_delete_keys.pop();
-        try deletes.append(alloc, owned);
-        errdefer _ = deletes.pop();
-        if (recorded) |out| try out.append(alloc, owned);
-    }
+        fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = value;
+            const ctx: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            const is_artifact = std.mem.startsWith(u8, key, ctx.artifact_prefix);
+            if (!is_artifact and
+                !std.mem.startsWith(u8, key, ctx.asset_state_prefix) and
+                !std.mem.startsWith(u8, key, ctx.graph_asset_state_prefix) and
+                !std.mem.startsWith(u8, key, ctx.graph_edge_contender_prefix)) return .@"continue";
+            const owned = try ctx.alloc.dupe(u8, key);
+            errdefer ctx.alloc.free(owned);
+            try ctx.owned_delete_keys.append(ctx.alloc, owned);
+            errdefer _ = ctx.owned_delete_keys.pop();
+            try ctx.delete_keys.append(ctx.alloc, owned);
+            errdefer _ = ctx.delete_keys.pop();
+            if (is_artifact) try ctx.deleted_artifact_keys.append(ctx.alloc, owned);
+            return .@"continue";
+        }
+    };
+    var scan_context = ScanContext{
+        .alloc = alloc,
+        .artifact_prefix = artifact_prefix,
+        .asset_state_prefix = asset_state_prefix,
+        .graph_asset_state_prefix = graph_asset_state_prefix,
+        .graph_edge_contender_prefix = graph_edge_contender_prefix,
+        .delete_keys = delete_keys,
+        .owned_delete_keys = owned_delete_keys,
+        .deleted_artifact_keys = deleted_artifact_keys,
+    };
+    try store.scanWithContext(document_prefix, upper orelse "", .{}, &scan_context, ScanContext.visit);
 }
 
 fn collectGraphArtifactsForDocIndex(
@@ -50138,12 +50691,12 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var write_start: usize = 0;
         var applied_first_chunk = false;
-        while (!applied_first_chunk or write_start < collected.writes.items.len) {
+        while (!applied_first_chunk or write_start < collected.docs.items.len) {
             const plan_base = write_start;
-            var publication_plan = try ctx.index_manager.planTextBatchPublication(
+            var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
                 index_ref.name,
                 publication_context,
-                collected.writes.items[plan_base..],
+                collected.docs.items[plan_base..],
                 reservation_limit,
             );
             defer publication_plan.deinit();
@@ -50152,7 +50705,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             var replan_suffix = false;
             for (publication_plan.chunks) |planned| {
                 const write_end = plan_base + planned.end;
-                const write_chunk = collected.writes.items[plan_base + relative_start .. write_end];
+                const write_chunk = collected.docs.items[plan_base + relative_start .. write_end];
                 var applied_chunk = false;
                 var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                 if (ctx.text_merge_runtime) |runtime| {
@@ -50164,8 +50717,37 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 }
                 defer if (merge_permit) |*permit| permit.release();
 
+                // Capacity is reserved before retaining immutable segment
+                // bytes. Projection, tokenization, sorting, and encoding run
+                // without the per-index apply guard; the read-only catalog and
+                // analysis lease inside preparation pins every borrowed config
+                // pointer for the duration of the build.
+                const prepare_start_ns = monotonicTimeNs();
+                var prepared_publication = ctx.index_manager.prepareTextMapperDocsPublication(
+                    ctx.alloc,
+                    ctx.store,
+                    index_ref.name,
+                    &publication_context,
+                    write_chunk,
+                ) catch |err| switch (err) {
+                    error.TextProjectionChanged => {
+                        if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
+                        replan_suffix = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
+                defer prepared_publication.deinit();
+
+                const apply_lock_wait_start_ns = monotonicTimeNs();
                 var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
-                defer index_apply_guard.unlock();
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_lock_wait_ns, apply_lock_wait_start_ns);
+                const apply_lock_held_start_ns = monotonicTimeNs();
+                defer {
+                    index_apply_guard.unlock();
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_lock_held_ns, apply_lock_held_start_ns);
+                }
 
                 // Admission may wait without holding catalog/apply locks. A
                 // same-instance schema or analyzer update invalidates only
@@ -50189,11 +50771,11 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                             publication_context,
                         );
                     defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
-                    try ctx.index_manager.applyTextBatchByNameWithOptions(
+                    try ctx.index_manager.applyPreparedTextMapperPublicationByNameWithOptions(
                         ctx.store,
                         index_ref.name,
                         delete_keys,
-                        write_chunk,
+                        &prepared_publication,
                         text_replay_options,
                     );
                     applied_chunk = true;
@@ -50209,13 +50791,13 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 applied_first_chunk = true;
                 write_start = write_end;
                 relative_start = planned.end;
-                if (replan_suffix and write_start < collected.writes.items.len) break;
+                if (replan_suffix and write_start < collected.docs.items.len) break;
             }
 
-            if (write_start == collected.writes.items.len) break;
+            if (write_start == collected.docs.items.len) break;
             std.debug.assert(replan_suffix);
         }
-        std.debug.assert(applied_first_chunk and write_start == collected.writes.items.len);
+        std.debug.assert(applied_first_chunk and write_start == collected.docs.items.len);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
         return;
     }
@@ -50244,8 +50826,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
             );
             defer dense_embeddings.deinit();
-            if (ctx.index_manager.denseIndex(index_ref.name)) |entry| {
-                try filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, &dense_embeddings, batch.sequence);
+            if (!ctx.projection_only) {
+                if (ctx.index_manager.denseIndex(index_ref.name)) |entry| {
+                    try filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, &dense_embeddings, batch.sequence);
+                }
             }
             try ctx.index_manager.validateDenseEmbeddingArtifactsByName(ctx.store, index_ref.name, dense_embeddings.writes);
 
@@ -50278,24 +50862,26 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             if (!chunk_backed) {
                 try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
             }
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name) or
-                ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name))
-            {
-                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
-            } else {
-                // Producer-owned exact outcomes are committed atomically with
-                // the source update. Only a request retained for asynchronous
-                // replay makes the prior generated outcome pending.
-                const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
-                    ctx.alloc,
-                    ctx.index_manager,
-                    index_ref.name,
-                    .dense_vector,
-                    batch.generated_enrichment_refs,
-                );
-                defer ctx.alloc.free(pending_doc_keys);
-                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+            if (!ctx.projection_only) {
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+                if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name) or
+                    ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name))
+                {
+                    try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                } else {
+                    // Producer-owned exact outcomes are committed atomically with
+                    // the source update. Only a request retained for asynchronous
+                    // replay makes the prior generated outcome pending.
+                    const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
+                        ctx.alloc,
+                        ctx.index_manager,
+                        index_ref.name,
+                        .dense_vector,
+                        batch.generated_enrichment_refs,
+                    );
+                    defer ctx.alloc.free(pending_doc_keys);
+                    try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+                }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
@@ -50322,7 +50908,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const dense_embedding_start_ns = monotonicTimeNs();
             try ctx.index_manager.applyDenseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, dense_embeddings.writes, batch_options);
-            try accountDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
+            if (!ctx.projection_only)
+                try accountDenseCoverage(ctx, index_ref.name, batch, dense_embeddings.writes);
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.dense_embedding_apply_ns, dense_embedding_start_ns);
                 if (before_hbc_profile) |before| {
@@ -50335,7 +50922,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try ctx.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, dense_finish_options);
                 dense_streaming_session_open = false;
             }
-            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, dense_embeddings.writes, batch.sequence);
+            if (!ctx.projection_only)
+                try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, dense_embeddings.writes, batch.sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_apply_ns, dense_apply_start_ns);
         },
         .sparse_vector => {
@@ -50359,7 +50947,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             );
             defer sparse_embeddings.deinit();
             if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
-            try filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, &sparse_embeddings, batch.sequence);
+            if (!ctx.projection_only)
+                try filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, &sparse_embeddings, batch.sequence);
             try ctx.index_manager.validateSparseEmbeddingArtifactsByName(ctx.store, index_ref.name, sparse_embeddings.writes);
 
             const sparse_delete_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
@@ -50372,21 +50961,23 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, replay_delete_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name) or
-                ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name))
-            {
-                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
-            } else {
-                const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
-                    ctx.alloc,
-                    ctx.index_manager,
-                    index_ref.name,
-                    .sparse_vector,
-                    batch.generated_enrichment_refs,
-                );
-                defer ctx.alloc.free(pending_doc_keys);
-                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+            if (!ctx.projection_only) {
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+                if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name) or
+                    ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name))
+                {
+                    try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+                } else {
+                    const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
+                        ctx.alloc,
+                        ctx.index_manager,
+                        index_ref.name,
+                        .sparse_vector,
+                        batch.generated_enrichment_refs,
+                    );
+                    defer ctx.alloc.free(pending_doc_keys);
+                    try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+                }
             }
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
@@ -50419,8 +51010,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
 
             const sparse_embedding_apply_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
             try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(ctx.store, index_ref.name, sparse_embeddings.writes, batch_options);
-            try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
-            try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
+            if (!ctx.projection_only) {
+                try accountSparseCoverage(ctx, index_ref.name, batch, sparse_embeddings.writes);
+                try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, sparse_embeddings.writes, batch.sequence);
+            }
             if (emit_sparse_write_profile) sparse_embedding_apply_ns = monotonicTimeNs() - sparse_embedding_apply_start_ns;
             if (before_sparse_profile) |before| {
                 if (ctx.index_manager.sparseWriteProfileByName(index_ref.name)) |after| {
@@ -50498,6 +51091,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.graph_apply_ns, apply_start_ns);
         },
         .algebraic => {
+            if (ctx.projection_only) return error.InvalidShadowIndexKind;
             try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
         },
     }
@@ -50544,6 +51138,15 @@ fn managedIndexBatchApplicability(
     batch: derived_types.DerivedBatch,
     index_ref: index_manager_mod.ManagedIndexRef,
 ) ManagedIndexBatchApplicability {
+    return managedIndexBatchApplicabilityWithEmbeddingNames(index_manager, batch, index_ref, null);
+}
+
+fn managedIndexBatchApplicabilityWithEmbeddingNames(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    changed_embedding_names: ?*std.StringHashMapUnmanaged(void),
+) ManagedIndexBatchApplicability {
     switch (index_ref.kind) {
         .full_text, .algebraic => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
@@ -50566,7 +51169,12 @@ fn managedIndexBatchApplicability(
                 const artifact_key = embedding.artifact_key orelse continue;
                 if (index_manager.denseIndexAcceptsArtifactKey(index_ref.name, artifact_key)) return .relevant;
             }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            if (changed_embedding_names) |names| {
+                var iterator = names.keyIterator();
+                while (iterator.next()) |name| {
+                    if (managedIndexConsumesEmbeddingName(index_manager, index_ref, name.*)) return .relevant;
+                }
+            } else if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
         .sparse_vector => {
@@ -50583,7 +51191,12 @@ fn managedIndexBatchApplicability(
                 const artifact_key = embedding.artifact_key orelse continue;
                 if (index_manager.sparseIndexAcceptsArtifactKey(index_ref.name, artifact_key)) return .relevant;
             }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            if (changed_embedding_names) |names| {
+                var iterator = names.keyIterator();
+                while (iterator.next()) |name| {
+                    if (managedIndexConsumesEmbeddingName(index_manager, index_ref, name.*)) return .relevant;
+                }
+            } else if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
         .graph => {
@@ -51327,38 +51940,62 @@ fn sparseEmbeddingDocKeySet(
     return set;
 }
 
-fn attachInlineUpsertDocumentValues(
+fn attachPreparedUpsertDocumentProjections(
     alloc: Allocator,
     batch: *derived_types.DerivedBatch,
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
 ) !void {
-    var cleaned_by_key = std.StringHashMapUnmanaged([]const u8){};
-    defer cleaned_by_key.deinit(alloc);
+    const PreparedProjection = struct {
+        cleaned: []const u8,
+        root: ?std.json.Value,
+        source_bytes: usize,
+        schema_version: u32,
+        write_plan_generation: u64,
+    };
+    var prepared_by_key = std.StringHashMapUnmanaged(PreparedProjection){};
+    defer prepared_by_key.deinit(alloc);
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;
-        try cleaned_by_key.put(alloc, write.key, cleaned);
+        try prepared_by_key.put(alloc, write.key, .{
+            .cleaned = cleaned,
+            .root = extracted[i].prepared_text_root,
+            .source_bytes = extracted[i].prepared_text_source_bytes,
+            .schema_version = extracted[i].prepared_schema_version,
+            .write_plan_generation = extracted[i].prepared_write_plan_generation,
+        });
     }
 
     for (batch.documents) |*const_doc| {
         const doc: *derived_types.DerivedDocument = @constCast(const_doc);
         if (doc.action != .upsert or doc.cleaned_value != null) continue;
-        const cleaned = cleaned_by_key.get(doc.key) orelse continue;
-        doc.cleaned_value = try alloc.dupe(u8, cleaned);
+        const prepared = prepared_by_key.get(doc.key) orelse continue;
+        if (prepared.root) |root| {
+            doc.prepared_text_root = root;
+            doc.prepared_text_source_bytes = if (prepared.source_bytes != 0) prepared.source_bytes else prepared.cleaned.len;
+            doc.prepared_schema_version = prepared.schema_version;
+            doc.prepared_write_plan_generation = prepared.write_plan_generation;
+        } else {
+            // Document-mode and fallback rows have no retained typed root.
+            doc.cleaned_value = try alloc.dupe(u8, prepared.cleaned);
+        }
     }
 }
 
 const CollectedTextDocumentWrites = struct {
     alloc: Allocator,
-    writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty,
     owned_values: std.ArrayListUnmanaged([]u8) = .empty,
+    materialized_documents: std.ArrayListUnmanaged(index_manager_mod.IndexManager.MaterializedStoredDocument) = .empty,
     missing_required: usize = 0,
 
     fn deinit(self: *@This()) void {
+        for (self.materialized_documents.items) |*doc| doc.deinit(self.alloc);
+        self.materialized_documents.deinit(self.alloc);
         for (self.owned_values.items) |value| self.alloc.free(value);
         self.owned_values.deinit(self.alloc);
-        self.writes.deinit(self.alloc);
+        self.docs.deinit(self.alloc);
         self.* = undefined;
     }
 };
@@ -51387,11 +52024,15 @@ fn collectTextDocumentWritesForIndex(
 
     var result = CollectedTextDocumentWrites{ .alloc = alloc };
     errdefer result.deinit();
+    var schema_views = index_manager_mod.IndexManager.SchemaViewSet.init(index_manager);
+    defer schema_views.deinit();
 
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
     else
         false;
+    const active_schema_version = index_manager.activeSchemaVersion();
+    const active_write_plan_generation = index_manager.writePlanGeneration();
 
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
@@ -51405,9 +52046,22 @@ fn collectTextDocumentWritesForIndex(
                 doc.cleaned_value.?,
             );
             if (projected) |value| try result.owned_values.append(alloc, value);
-            try result.writes.append(alloc, .{
+            try result.docs.append(alloc, .{
                 .key = doc.key,
                 .value = projected orelse doc.cleaned_value.?,
+            });
+            continue;
+        }
+        if (trust_inline and doc.prepared_text_root != null and
+            active_schema_version != null and
+            active_schema_version.? == doc.prepared_schema_version and
+            active_write_plan_generation == doc.prepared_write_plan_generation)
+        {
+            try result.docs.append(alloc, .{
+                .key = doc.key,
+                .value = "",
+                .source_bytes = doc.prepared_text_source_bytes,
+                .root = doc.prepared_text_root,
             });
             continue;
         }
@@ -51452,29 +52106,43 @@ fn collectTextDocumentWritesForIndex(
             item.doc_key,
             value,
         );
-        const stable_value_owned = projected != null or read_values[i] != null;
-        const stable_value = if (projected) |owned| blk: {
+        if (projected) |owned| {
             result.owned_values.append(alloc, owned) catch |err| {
                 alloc.free(owned);
                 return err;
             };
-            break :blk owned;
-        } else if (read_values[i] != null) blk: {
-            const owned = try index_manager.materializeStoredValueAlloc(alloc, item.store_key, value);
-            result.owned_values.append(alloc, owned) catch |err| {
-                alloc.free(owned);
-                return err;
-            };
-            break :blk owned;
-        } else value;
-        result.writes.append(alloc, .{
+            try result.docs.append(alloc, .{ .key = item.doc_key, .value = owned });
+            continue;
+        }
+
+        // An inline replay fallback is already a JSON API representation. Only
+        // store-backed relational rows carry AROW bytes and require ordinal-
+        // native materialization through the pinned schema-view set.
+        if (read_values[i] == null) {
+            try result.docs.append(alloc, .{ .key = item.doc_key, .value = value });
+            continue;
+        }
+
+        var materialized = try index_manager.materializeStoredDocumentWithSchemaViewsAlloc(
+            alloc,
+            item.store_key,
+            value,
+            &schema_views,
+        );
+        result.materialized_documents.append(alloc, materialized) catch |err| {
+            materialized.deinit(alloc);
+            return err;
+        };
+        const stable = &result.materialized_documents.items[result.materialized_documents.items.len - 1];
+        result.docs.append(alloc, .{
             .key = item.doc_key,
-            .value = stable_value,
+            .value = stable.value,
+            .source_bytes = stable.retainedBytes(),
+            .root = stable.root,
+            .root_arena = stable.root_arena,
         }) catch |err| {
-            if (stable_value_owned) {
-                const owned = result.owned_values.pop().?;
-                alloc.free(owned);
-            }
+            var removed = result.materialized_documents.pop().?;
+            removed.deinit(alloc);
             return err;
         };
     }
@@ -51912,11 +52580,11 @@ fn applyGraphArtifactMutationPages(
         }
         var graph_mutations = try collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, key_page[0..count], index_name, .{
             .expected_generation = expected_generation,
-            .repair_ctx = ctx,
+            .repair_ctx = if (ctx.projection_only) null else ctx,
             .sequence = sequence,
         });
         defer graph_mutations.deinit();
-        if (graph_mutations.generation_bindings.len > 0) {
+        if (!ctx.projection_only and graph_mutations.generation_bindings.len > 0) {
             try ctx.store.putBatch(graph_mutations.generation_bindings, &.{});
         }
         try ctx.index_manager.applyGraphMutationsByName(index_name, graph_mutations.writes, graph_mutations.deletes);
@@ -54123,6 +54791,20 @@ fn collectManagedSyncTargets(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
 ) !ManagedSyncTargets {
+    // Decode artifact identities once for the commit plan. Previously every
+    // dense and sparse index reparsed and allocated the same identity for every
+    // changed artifact while the primary apply fence was held.
+    var routing_arena = std.heap.ArenaAllocator.init(alloc);
+    defer routing_arena.deinit();
+    var changed_embedding_names = std.StringHashMapUnmanaged(void).empty;
+    defer changed_embedding_names.deinit(alloc);
+    for (batch.changed_artifact_keys) |artifact_key| {
+        var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch continue) orelse continue;
+        defer identity.deinit(alloc);
+        if (changed_embedding_names.contains(identity.embedding_name)) continue;
+        try changed_embedding_names.put(alloc, try routing_arena.allocator().dupe(u8, identity.embedding_name), {});
+    }
+
     const managed_indexes = try index_manager.managedIndexes(alloc);
     defer {
         for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
@@ -54141,10 +54823,17 @@ fn collectManagedSyncTargets(
     }
 
     for (managed_indexes) |index_ref| {
-        if (!batchAffectsManagedIndex(index_manager, batch, index_ref)) continue;
-        try appendUniqueOwnedName(alloc, &all_indexes, index_ref.name);
+        if (managedIndexBatchApplicabilityWithEmbeddingNames(
+            index_manager,
+            batch,
+            index_ref,
+            &changed_embedding_names,
+        ) != .relevant) continue;
+        // Managed index names are catalog-unique, so a linear duplicate scan is
+        // unnecessary here and made routing quadratic in index count.
+        try all_indexes.append(alloc, try alloc.dupe(u8, index_ref.name));
         if (index_ref.kind == .full_text) {
-            try appendUniqueOwnedName(alloc, &full_text_indexes, index_ref.name);
+            try full_text_indexes.append(alloc, try alloc.dupe(u8, index_ref.name));
         }
     }
 
@@ -54414,11 +55103,42 @@ fn startAsyncWorkers(self: *DB) !void {
     }
 }
 
-fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatch) !void {
-    const shadow = self.shadow orelse return;
-    const state = self.core.splitState() orelse return;
-    if (state.phase != .splitting) return;
+fn reserveSplitShadowApplyTicket(self: *DB) ?u64 {
+    const shadow = if (self.shadow) |*active| active else return null;
+    const state = self.core.splitState() orelse return null;
+    if (state.phase != .splitting) return null;
+    const ticket = shadow.next_ticket;
+    shadow.next_ticket = std.math.add(u64, ticket, 1) catch @panic("split shadow ticket overflow");
+    return ticket;
+}
 
+fn applyCommittedBatchToShadowOrdered(self: *DB, batch: derived_types.DerivedBatch, ticket: u64) void {
+    const shadow = if (self.shadow) |*active| active else return;
+    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+    shadow.apply_mutex.lockUncancelable(io);
+    while (shadow.applied_ticket != ticket) {
+        shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
+    }
+    defer {
+        shadow.applied_ticket = ticket + 1;
+        shadow.apply_advanced.broadcast(io);
+        shadow.apply_mutex.unlock(io);
+    }
+    if (shadow.repair_required) return;
+
+    applyCommittedBatchToShadow(self, shadow, batch) catch |err| {
+        // The primary row and its durable replay record are already committed.
+        // Do not report a false write failure. Instead fail split publication
+        // closed; the durable replay remains the repair source of truth.
+        shadow.repair_required = true;
+        std.log.err(
+            "split shadow apply failed after primary commit ticket={} sequence={} err={}",
+            .{ ticket, batch.sequence, err },
+        );
+    };
+}
+
+fn applyCommittedBatchToShadow(self: *DB, shadow: *ShadowState, batch: derived_types.DerivedBatch) !void {
     const managed_indexes = try shadow.manager.managedIndexes(self.alloc);
     defer {
         for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
@@ -54435,12 +55155,27 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
         .apply_mutex = async_resources.apply_mutex,
         .snapshot_replay_admission = async_resources.snapshot_replay_admission,
         .allow_graph_materialization = false,
+        .projection_only = true,
     };
 
     for (managed_indexes) |index_ref| {
         if (!batchAffectsManagedIndex(shadow.manager, batch, index_ref)) continue;
         try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
     }
+}
+
+/// Called with the primary apply fence held. No later primary commit can reserve
+/// a ticket, while already-committed owners need only the shadow-local mutex and
+/// can therefore drain without a lock cycle.
+fn waitForSplitShadowDrainLocked(self: *DB, require_clean: bool) !void {
+    const shadow = if (self.shadow) |*active| active else return;
+    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+    shadow.apply_mutex.lockUncancelable(io);
+    while (shadow.applied_ticket != shadow.next_ticket) {
+        shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
+    }
+    defer shadow.apply_mutex.unlock(io);
+    if (require_clean and shadow.repair_required) return error.ShadowIndexRepairRequired;
 }
 
 const OpenedSplitDestinationStore = struct {
@@ -55577,6 +56312,10 @@ fn indexExistingSplitDestinationDirect(
 fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_state = self.core.splitState() orelse return error.SplitInProgress;
     if (!std.mem.eql(u8, split_state.split_key, new_range.end)) return error.KeyOutOfRange;
+    // A committed user write must never make a split publish an incomplete
+    // secondary generation. Drain every post-commit ticket and fail closed if
+    // any shadow index needs replay repair.
+    try waitForSplitShadowDrainLocked(self, true);
     const replay_floor = self.core.nextDerivedAppendSequence();
 
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
@@ -60276,9 +61015,9 @@ test "prepared relational batch uses bounded parallel workers safely" {
 
     var rows: [writes.len]?mapper.PreparedRelationalWrite = @splat(null);
     defer for (&rows) |*row| if (row.*) |*prepared| prepared.deinit(alloc);
-    var allocator_guard = PreparedRowAllocator{ .child = alloc };
     var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
     defer io_impl.deinit();
+    var allocator_guard = PreparedRowAllocator{ .child = alloc, .io = io_impl.io() };
     var physical_layout = try relational_row_codec.PhysicalLayout.init(alloc, table_schema);
     defer physical_layout.deinit();
     try prepareRelationalRows(
@@ -60290,6 +61029,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         table_schema,
         &physical_layout,
         null,
+        false,
         0,
         &rows,
     );
@@ -60298,6 +61038,37 @@ test "prepared relational batch uses bounded parallel workers safely" {
         try std.testing.expectEqual(@as(u32, 3), row.?.schema_version);
         try std.testing.expectEqual(@as(u32, 3), try mapper.relationalRowSchemaVersion(row.?.packed_row));
     }
+}
+
+test "prepared relational full text projection attaches typed root without duplicating JSON" {
+    const alloc = std.testing.allocator;
+    var documents = [_]derived_types.DerivedDocument{.{
+        .key = "row:a",
+        .targets = &.{.{ .kind = .full_text, .index_name = "ft_rows" }},
+    }};
+    var batch = derived_types.DerivedBatch{ .documents = &documents };
+    const extracted = [_]mapper.ExtractedWrite{.{
+        .cleaned_value = @constCast("{\"title\":\"prepared\"}"),
+        .graph_writes = &.{},
+        .mentioned_graph_indexes = &.{},
+        .dense_embeddings = &.{},
+        .sparse_embeddings = &.{},
+        .prepared_text_root = .null,
+        .prepared_schema_version = 9,
+        .prepared_write_plan_generation = 14,
+    }};
+    try attachPreparedUpsertDocumentProjections(
+        alloc,
+        &batch,
+        .{ .writes = &.{.{ .key = "row:a", .value = "unused" }} },
+        &extracted,
+    );
+
+    try std.testing.expect(documents[0].cleaned_value == null);
+    try std.testing.expect(documents[0].prepared_text_root != null);
+    try std.testing.expectEqual("{\"title\":\"prepared\"}".len, documents[0].prepared_text_source_bytes);
+    try std.testing.expectEqual(@as(u32, 9), documents[0].prepared_schema_version);
+    try std.testing.expectEqual(@as(u64, 14), documents[0].prepared_write_plan_generation);
 }
 
 test "owned db reconciles published schema indexes on its durable worker lane" {
@@ -60369,6 +61140,24 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         try std.testing.expectEqual(@as(u32, 1), db.core.table_catalog.active_schema_version);
         try std.testing.expect(db.core.table_catalog.reconciled);
+        const replay_documents = [_]derived_types.DerivedDocument{.{
+            .key = "row:a",
+            .targets = &.{.{ .kind = .full_text, .index_name = "ft_rows" }},
+        }};
+        var collected_text = try collectTextDocumentWritesForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &replay_documents,
+            "ft_rows",
+            false,
+            db.core.index_manager.byte_range,
+            .{ .relational_base_rows = true },
+        );
+        defer collected_text.deinit();
+        try std.testing.expectEqual(@as(usize, 1), collected_text.docs.items.len);
+        try std.testing.expect(collected_text.docs.items[0].root != null);
+        try std.testing.expectEqual(@as(usize, 0), collected_text.docs.items[0].value.len);
         const document_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
         defer alloc.free(document_key);
         try std.testing.expectError(error.NotFound, db.core.store.get(alloc, document_key));
@@ -60397,6 +61186,15 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqualStrings(
             "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
             raw,
+        );
+        var projected_lookup = (try db.lookup(alloc, "row:a", .{
+            .fields = &.{ "payload", "count" },
+            .include_all_fields = false,
+        })) orelse return error.TestExpectedEqual;
+        defer projected_lookup.deinit(alloc);
+        try std.testing.expectEqualStrings(
+            "{\"payload\":{\"n\":0.10000000000000001},\"count\":9007199254740993}",
+            projected_lookup.json,
         );
 
         try db.runUntilIdle();
@@ -61072,7 +61870,7 @@ test "portable activation retry backoff is bounded stable and exponential" {
     try std.testing.expect(capped != DB.portableActivationRetryDelayNs("/tmp/db-a", 0x5678, 100));
 }
 
-test "portable activation retry worker detaches and can be restarted" {
+test "portable activation retry runtime job can be restarted" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -61089,8 +61887,7 @@ test "portable activation retry worker detaches and can be restarted" {
     defer db.close();
 
     // A worker with no pending activation exits immediately. Exercise two full
-    // detached generations to prove completion releases launch admission and
-    // no stored joinable handle is required to start the next generation.
+    // runtime-owned generations to prove completion releases launch admission.
     for (0..2) |_| {
         _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
         db.portable_activation_retry_stop.store(false, .release);
@@ -61101,7 +61898,7 @@ test "portable activation retry worker detaches and can be restarted" {
             return err;
         };
         db.portable_activation_retry_lifecycle_mutex.unlock();
-        try std.testing.expectEqual(DB.PortableActivationRetryLaunch.detached_thread, launch);
+        try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime, launch);
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
         while (db.portable_activation_retry_worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
@@ -61111,7 +61908,7 @@ test "portable activation retry worker detaches and can be restarted" {
     }
 }
 
-test "portable activation retry stop joins the detached worker final handshake" {
+test "portable activation retry stop joins the runtime worker final handshake" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -61207,9 +62004,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
         .ttl_cleanup = .{ .enabled = false },
     });
 
-    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
-    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
     defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
     defer test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(false, .release);
     defer test_portable_activation_retry_probe_paused.store(false, .release);
@@ -61221,7 +62016,6 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     // Rearm the injected launch failures. The claimed probe must leave these
     // untouched after close publishes the permanent stop state.
-    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     db.portable_activation_retry_next_launch_ns = 0;
     test_release_portable_activation_retry_probe.store(false, .release);
@@ -61293,11 +62087,10 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     try std.testing.expect(poll_completed.load(.acquire));
     try std.testing.expect(close_returned.load(.acquire));
-    try std.testing.expect(test_fail_portable_activation_retry_thread_spawn.load(.acquire));
     try std.testing.expect(test_fail_portable_activation_retry_fallback_submit.load(.acquire));
 }
 
-test "portable activation retry falls back to owner scoped runtime after thread launch failure" {
+test "portable activation retry uses owner scoped runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -61314,9 +62107,6 @@ test "portable activation retry falls back to owner scoped runtime after thread 
     defer db.close();
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
-    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
-
     _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
     db.portable_activation_retry_stop.store(false, .release);
     db.portable_activation_retry_worker_running.store(true, .release);
@@ -61326,7 +62116,7 @@ test "portable activation retry falls back to owner scoped runtime after thread 
         return err;
     };
     db.portable_activation_retry_lifecycle_mutex.unlock();
-    try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime_fallback, launch);
+    try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime, launch);
 
     const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
@@ -61340,7 +62130,7 @@ test "portable activation retry falls back to owner scoped runtime after thread 
     try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
 }
 
-test "portable activation retry automatically rearms after both launch paths fail" {
+test "portable activation retry automatically rearms after runtime submission fails" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -61357,8 +62147,6 @@ test "portable activation retry automatically rearms after both launch paths fai
     defer db.close();
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    test_fail_portable_activation_retry_thread_spawn.store(true, .release);
-    defer test_fail_portable_activation_retry_thread_spawn.store(false, .release);
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
@@ -83729,6 +84517,115 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
 }
 
+test "storage.ha synchronous waits pipeline later commits by lsn" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.heap.c_allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 255,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const SyncWait = struct {
+        io: std.Io,
+        first_waiting: std.atomic.Value(u8) = .init(0),
+        second_acknowledged: std.atomic.Value(u8) = .init(0),
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (target_lsn == 1) {
+                self.first_waiting.store(1, .release);
+                const deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+                while (self.second_acknowledged.load(.acquire) == 0 and monotonicTimeNs() < deadline)
+                    try self.io.sleep(.fromMilliseconds(1), .awake);
+                if (self.second_acknowledged.load(.acquire) == 0) return error.TestExpectedSecondCommitToPipeline;
+                return;
+            }
+            try std.testing.expectEqual(@as(u64, 2), target_lsn);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+            self.second_acknowledged.store(1, .release);
+        }
+    };
+    const Write = struct {
+        db: *DB,
+        key: []const u8,
+        value: []const u8,
+        failed: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = self.key, .value = self.value }},
+                .sync_level = .write,
+            }) catch {
+                self.failed.store(1, .release);
+            };
+        }
+    };
+
+    var wait_state = SyncWait{ .io = io };
+    var last_lsn = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.wait,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    var first = Write{ .db = &db, .key = "doc:first", .value = "{\"title\":\"first\"}" };
+    var first_future = std.Io.async(io, Write.run, .{&first});
+    var first_awaited = false;
+    defer if (!first_awaited) first_future.await(io);
+    for (0..10_000) |_| {
+        if (wait_state.first_waiting.load(.acquire) == 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u8, 1), wait_state.first_waiting.load(.acquire));
+
+    var second = Write{ .db = &db, .key = "doc:second", .value = "{\"title\":\"second\"}" };
+    var second_future = std.Io.async(io, Write.run, .{&second});
+    second_future.await(io);
+    first_future.await(io);
+    first_awaited = true;
+
+    try std.testing.expectEqual(@as(u8, 0), first.failed.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), second.failed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 2), last_lsn.load(.acquire));
+    const first_value = (try db.get(alloc, "doc:first")) orelse return error.TestExpectedEqual;
+    defer alloc.free(first_value);
+    const second_value = (try db.get(alloc, "doc:second")) orelse return error.TestExpectedEqual;
+    defer alloc.free(second_value);
+}
+
 test "storage.ha durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
 
@@ -84729,6 +85626,86 @@ test "db transaction recovery identity context owns schema generations" {
     try std.testing.expectEqualStrings("nested.amount", ctx.relational_columns[0].path);
     try std.testing.expect(ctx.relational_columns[0].required);
     try std.testing.expectEqual(@as(u32, 2), ctx.relational_schema_version);
+}
+
+test "storage.ha schema wait failure reports unknown after durable local commit" {
+    const alloc = std.testing.allocator;
+    const public_schema_json =
+        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 265,
+        .shard_id = 5,
+        .table_id = 12,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const FailOnceWait = struct {
+        calls: usize = 0,
+
+        fn wait(ctx: *anyopaque, active_primary: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.calls == 1) return error.InjectedSchemaMirrorWaitFailure;
+            try active_primary.standbyStatusUpdate("standby-a", active_primary.identity.timeline_id, target_lsn, target_lsn);
+        }
+    };
+    var wait_state = FailOnceWait{};
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .identity_namespace = .{ .shard_id = 5, .table_id = 12 },
+        .ha_async_metadata_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = FailOnceWait.wait,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, db.setSchemaJson(alloc, public_schema_json));
+    try std.testing.expectEqual(@as(usize, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(public_schema_json, stored);
+    const loaded_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestExpectedEqual;
+    defer schema_mod.freeSchema(alloc, loaded_schema);
+    try std.testing.expectEqual(@as(u32, 7), loaded_schema.version);
+
+    const pending = try db.core.store.scanPrefixPage(alloc, ha_outbox_v2_prefix, null, 2);
+    defer docstore_mod.DocStore.freeResults(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(DurableHAOutboxKind.schema, try durableHAOutboxKindFromKey(pending[0].key));
+
+    // Recovery recognizes the already-appended schema record, obtains the
+    // missing acknowledgement, and clears the exact mutation-scoped outbox.
+    try db.flushDurableHAOutboxes();
+    try std.testing.expectEqual(@as(usize, 2), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const remaining = try db.core.store.scanPrefixPage(alloc, ha_outbox_v2_prefix, null, 2);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "storage.ha db mirrors and applies schema metadata mutation records" {
@@ -101706,7 +102683,10 @@ test "db provisioning schema is persisted before configured full text indexes op
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
-        .schema_before_index_load = runtime_schema,
+        .schema_before_index_load = .{
+            .runtime_schema = runtime_schema,
+            .public_schema_json = schema_json,
+        },
     });
     defer reopened.close();
 
@@ -107390,6 +108370,9 @@ test "db shadow index manager backfills split-off range and ignores parent-range
         .sync_level = .full_index,
     });
 
+    try std.testing.expectEqual(@as(u64, 1), db.shadow.?.next_ticket);
+    try std.testing.expectEqual(db.shadow.?.next_ticket, db.shadow.?.applied_ticket);
+    try std.testing.expect(!db.shadow.?.repair_required);
     try std.testing.expectEqual(@as(u32, 1), db.shadow.?.manager.textIndex("ft_v1").?.snapshot().liveDocCount());
 
     try db.closeShadowIndexManager();

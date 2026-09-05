@@ -34,7 +34,15 @@ pub const schema_less_exact_max_bytes: usize = 1024;
 pub const MapperDoc = struct {
     key: []const u8,
     value: []const u8,
+    /// Estimated retained bytes for a typed source whose `value` is empty.
+    /// Publication planning uses this to preserve its memory bound without
+    /// serializing the logical tree back to JSON.
+    source_bytes: usize = 0,
     doc_ordinal: ?u32 = null,
+    /// Relational scans can supply the already-decoded logical tree alongside
+    /// the materialized source bytes, avoiding a whole-document JSON reparse.
+    root: ?std.json.Value = null,
+    root_arena: ?*std.heap.ArenaAllocator = null,
 };
 
 pub const SparseVectorData = struct {
@@ -86,10 +94,21 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
+    /// Transient logical source for immediate full-text application. The tree
+    /// borrows `prepared_region` and is deliberately never cloned or serialized;
+    /// durable replay reconstructs the typed root from the committed AROW.
+    prepared_text_root: ?std.json.Value = null,
+    /// Per-row retained size estimate for the parsed logical tree. This keeps
+    /// source batching proportional to typed-tree memory rather than the often
+    /// much smaller original JSON byte slice.
+    prepared_text_source_bytes: usize = 0,
+    prepared_schema_version: u32 = 0,
+    prepared_write_plan_generation: u64 = 0,
     /// When set, all ordinary fields above borrow this region. Artifact keys
-    /// attached after preparation remain caller-allocator owned and are the
-    /// only values released individually.
+    /// may either be caller-owned or borrow the batch effects arena, as recorded
+    /// by `artifact_keys_owned_individually`.
     prepared_region: ?*PreparedRowRegion = null,
+    artifact_keys_owned_individually: bool = true,
 
     pub fn clone(self: ExtractedWrite, alloc: Allocator) !ExtractedWrite {
         var out: ExtractedWrite = .{
@@ -99,6 +118,11 @@ pub const ExtractedWrite = struct {
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
+            // A clone has no ownership relationship with the source row region.
+            // Falling back to committed AROW materialization is both safe and
+            // still avoids a JSON stringify/parse round trip.
+            .prepared_text_root = null,
+            .prepared_text_source_bytes = self.prepared_text_source_bytes,
         };
         errdefer out.deinit(alloc);
         if (self.cleaned_value) |value| {
@@ -186,10 +210,12 @@ pub const ExtractedWrite = struct {
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
         if (self.prepared_region) |region| {
-            for (self.dense_embeddings) |embedding|
-                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            for (self.sparse_embeddings) |embedding|
-                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            if (self.artifact_keys_owned_individually) {
+                for (self.dense_embeddings) |embedding|
+                    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+                for (self.sparse_embeddings) |embedding|
+                    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            }
             region.release();
             self.* = undefined;
             return;
@@ -233,6 +259,7 @@ pub const PreparedRelationalWrite = struct {
     packed_row: []u8,
     semantic_hash: document_content_hash.Digest,
     schema_version: u32,
+    metadata_finalized: bool = false,
     owned_region: ?*PreparedRowRegion = null,
     packed_row_owned_individually: bool = true,
 
@@ -293,29 +320,21 @@ pub const PreparedRelationalWrite = struct {
         errdefer parsed.deinit();
         if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
 
-        var logical_owned: ?std.json.Value = null;
-        defer if (logical_owned) |*value| freeJsonValue(scratch, value);
-        const logical_value = if (parsed.value == .object and
-            (parsed.value.object.contains("_edges") or parsed.value.object.contains("_embeddings")))
-        blk: {
-            logical_owned = try cloneWithoutSpecialFields(scratch, parsed.value);
-            break :blk logical_owned.?;
-        } else parsed.value;
-
         var extracted = try extractWriteFromParsedPrepared(
             alloc,
             key,
             document_json,
             parsed.value,
-            logical_value,
-            logical_owned == null,
+            null,
+            true,
         );
         errdefer extracted.deinit(alloc);
+        extracted.prepared_text_source_bytes = estimateJsonValueRetainedBytes(parsed.value);
 
         const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
             alloc,
             scratch,
-            logical_value,
+            parsed.value,
             table_schema,
             physical_layout,
         );
@@ -327,6 +346,12 @@ pub const PreparedRelationalWrite = struct {
             .semantic_hash = prepared_row.semantic_hash,
             .schema_version = table_schema.version,
         };
+    }
+
+    pub fn finalizeMetadata(self: *PreparedRelationalWrite, timestamp_ns: u64) !void {
+        if (self.metadata_finalized) return;
+        try relational_row_codec.finalizeOrdinalMetadata(self.packed_row, self.semantic_hash, timestamp_ns);
+        self.metadata_finalized = true;
     }
 
     pub fn initInOwnedRegion(
@@ -360,6 +385,7 @@ pub const PreparedRelationalWrite = struct {
     pub fn initInSharedRegion(
         region: *PreparedRowRegion,
         scratch: Allocator,
+        retain_text_root: bool,
         key: []const u8,
         document_json: []const u8,
         validator: ?schema_api.CompiledTableValidator,
@@ -368,7 +394,7 @@ pub const PreparedRelationalWrite = struct {
     ) !PreparedRelationalWrite {
         var prepared = try initWithAllocators(
             region.arena.allocator(),
-            scratch,
+            if (retain_text_root) region.arena.allocator() else scratch,
             scratch,
             key,
             document_json,
@@ -378,6 +404,7 @@ pub const PreparedRelationalWrite = struct {
         );
         region.retain();
         prepared.owned_region = region;
+        if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
         return prepared;
     }
 
@@ -388,12 +415,15 @@ pub const PreparedRelationalWrite = struct {
     pub fn deinit(self: *PreparedRelationalWrite, alloc: Allocator) void {
         if (self.owned_region) |region| {
             if (self.parsed) |*parsed| parsed.deinit();
-            // Artifact keys are attached after preparation with the DB
-            // allocator; the remaining extracted state belongs to the arena.
-            for (self.extracted.dense_embeddings) |embedding|
-                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            for (self.extracted.sparse_embeddings) |embedding|
-                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            // Ordinary extracted state belongs to the row arena. Artifact keys
+            // either have individual ownership or borrow the batch-effects
+            // arena which outlives this row.
+            if (self.extracted.artifact_keys_owned_individually) {
+                for (self.extracted.dense_embeddings) |embedding|
+                    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+                for (self.extracted.sparse_embeddings) |embedding|
+                    if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+            }
             region.release();
             self.* = undefined;
             return;
@@ -429,6 +459,7 @@ pub const PreparedRelationalWrite = struct {
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
+            .prepared_text_root = null,
         };
         return extracted;
     }
@@ -439,6 +470,28 @@ pub const PreparedRelationalWrite = struct {
         return row_bytes;
     }
 };
+
+fn estimateJsonValueRetainedBytes(value: std.json.Value) usize {
+    var total: usize = @sizeOf(std.json.Value);
+    switch (value) {
+        .string => |text| total +|= text.len,
+        .number_string => |text| total +|= text.len,
+        .array => |array| {
+            total +|= @sizeOf(std.json.Array);
+            for (array.items) |item| total +|= estimateJsonValueRetainedBytes(item);
+        },
+        .object => |object| {
+            total +|= @sizeOf(std.json.ObjectMap);
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                total +|= entry.key_ptr.*.len +| 2 * @sizeOf(usize);
+                total +|= estimateJsonValueRetainedBytes(entry.value_ptr.*);
+            }
+        },
+        else => {},
+    }
+    return total;
+}
 
 pub const DenseEmbeddingWrite = struct {
     index_name: []u8,
@@ -653,6 +706,10 @@ pub const TextProjectionOptions = struct {
     vector_field_paths: []const []const u8 = &.{},
     strip_numeric_array_heuristic: bool = true,
     schema_less_fast_projection: bool = false,
+    /// Full-text segments normally keep the primary store authoritative for
+    /// source retrieval. Disable this to avoid carrying/stringifying a second
+    /// document representation through projection and segment construction.
+    retain_stored_data: bool = true,
 };
 
 const ExtractedTextFields = struct {
@@ -815,7 +872,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.root, opts);
     }
 
     return .{
@@ -839,7 +896,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, opts);
     }
 
     return .{
@@ -853,13 +910,25 @@ fn appendTextProjectionSourceDoc(
     key: []const u8,
     value: []const u8,
     doc_ordinal: ?u32,
+    prepared_root: ?std.json.Value,
     opts: TextProjectionOptions,
 ) !void {
+    if (prepared_root) |root| {
+        const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
+        try source_docs.append(arena, .{
+            .key = key,
+            .root = root,
+            .stored_data = stored_projection.stored_data,
+            .typed_source = stored_projection.typed_source,
+            .doc_ordinal = doc_ordinal,
+        });
+        return;
+    }
     if (opts.schema_less_fast_projection and canUseSchemaLessRawTextFastPath(value, opts)) {
         try source_docs.append(arena, .{
             .key = key,
             .root = .null,
-            .stored_data = value,
+            .stored_data = if (opts.retain_stored_data) value else "",
             .typed_source = null,
             .doc_ordinal = doc_ordinal,
             .schema_less_text_fields = try extractStringFieldsNoSchemaRaw(arena, value, opts),
@@ -1903,9 +1972,7 @@ fn extractWriteFromParsedPrepared(
         if (!has_non_special_fields) break :blk null;
         if (logical_without_special_fields) |logical|
             break :blk try std.json.Stringify.valueAlloc(alloc, logical, .{});
-        var cleaned = try cloneWithoutSpecialFields(alloc, root);
-        defer freeJsonValue(alloc, &cleaned);
-        break :blk try std.json.Stringify.valueAlloc(alloc, cleaned, .{});
+        break :blk try stringifyWithoutSpecialFieldsAlloc(alloc, root.object);
     } else if (borrow_original_json) @constCast(original_json) else try alloc.dupe(u8, original_json);
 
     return .{
@@ -3364,7 +3431,7 @@ const FullTextStoredProjection = struct {
 fn fullTextStoredProjection(alloc: Allocator, root: std.json.Value, original: []const u8, opts: TextProjectionOptions) !FullTextStoredProjection {
     if (!try fullTextProjectionNeedsSanitization(alloc, root, opts)) {
         return .{
-            .stored_data = original,
+            .stored_data = if (opts.retain_stored_data) original else "",
             .typed_source = root,
         };
     }
@@ -3372,7 +3439,10 @@ fn fullTextStoredProjection(alloc: Allocator, root: std.json.Value, original: []
     defer path.deinit(alloc);
     const projected = (try cloneFullTextProjectionValue(alloc, root, &path, opts)) orelse std.json.Value{ .object = std.json.ObjectMap.empty };
     return .{
-        .stored_data = try std.json.Stringify.valueAlloc(alloc, projected, .{}),
+        .stored_data = if (opts.retain_stored_data)
+            try std.json.Stringify.valueAlloc(alloc, projected, .{})
+        else
+            "",
         .typed_source = projected,
     };
 }
@@ -3499,6 +3569,24 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
     }
 
     return value;
+}
+
+fn stringifyWithoutSpecialFieldsAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeByte('{');
+    var first = true;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (isSpecialField(entry.key_ptr.*)) continue;
+        if (!first) try writer.writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, &writer.writer);
+        try writer.writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, &writer.writer);
+    }
+    try writer.writer.writeByte('}');
+    return try writer.toOwnedSlice();
 }
 
 pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
@@ -3634,7 +3722,7 @@ fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
     };
 }
 
-fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
+pub fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     switch (value.*) {
         .null, .bool, .integer, .float => {},
         .number_string => |s| alloc.free(s),
@@ -3674,7 +3762,10 @@ pub fn buildRelationalRowValueForSchemaFromParsedAlloc(
 ) ![]u8 {
     var physical_layout = try relational_row_codec.PhysicalLayout.init(alloc, table_schema);
     defer physical_layout.deinit();
-    return (try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(alloc, alloc, root, table_schema, &physical_layout)).bytes;
+    const prepared = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(alloc, alloc, root, table_schema, &physical_layout);
+    errdefer alloc.free(prepared.bytes);
+    try relational_row_codec.finalizeOrdinalMetadata(prepared.bytes, prepared.semantic_hash, 0);
+    return prepared.bytes;
 }
 
 const PreparedEncodedRow = struct {
@@ -3690,54 +3781,25 @@ fn buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
     physical_layout: *const relational_row_codec.PhysicalLayout,
 ) !PreparedEncodedRow {
     if (root != .object) return error.InvalidBatchRequest;
-    const logical_values = try scratch.alloc(?std.json.Value, table_schema.relational_columns.len);
-    defer scratch.free(logical_values);
-    @memset(logical_values, null);
-    const canonical_json_values = try scratch.alloc(?[]const u8, table_schema.relational_columns.len);
-    defer scratch.free(canonical_json_values);
-    @memset(canonical_json_values, null);
-    var semantic_hash: document_content_hash.Digest = undefined;
-    const bytes = try buildRelationalRowValueFromParsedInternal(
+    return try buildRelationalRowValueFromParsedInternal(
         alloc,
         scratch,
         root,
-        table_schema.relational_columns,
-        table_schema.version,
-        physical_layout,
-        logical_values,
-        canonical_json_values,
-    );
-    errdefer alloc.free(bytes);
-    semantic_hash = try document_content_hash.hashRelationalPreparedValuesCanonicalWithOrdinals(
-        scratch,
-        logical_values,
-        canonical_json_values,
         table_schema,
-        physical_layout.hash_ordinals,
+        physical_layout,
     );
-
-    // The physical encoder needs the digest in its header, so re-encoding here
-    // would defeat the single prepared-row traversal. Patch the reserved digest
-    // and checksum after the row body is complete.
-    relational_row_codec.setOrdinalSemanticHash(bytes, semantic_hash) catch |err| {
-        alloc.free(bytes);
-        return err;
-    };
-    return .{ .bytes = bytes, .semantic_hash = semantic_hash };
 }
 
 fn buildRelationalRowValueFromParsedInternal(
     alloc: Allocator,
     scratch: Allocator,
     root: std.json.Value,
-    columns: []const runtime_schema.RelationalColumn,
-    schema_version: u32,
+    table_schema: runtime_schema.TableSchema,
     physical_layout: *const relational_row_codec.PhysicalLayout,
-    logical_values: ?[]?std.json.Value,
-    canonical_json_values: ?[]?[]const u8,
-) ![]u8 {
+) !PreparedEncodedRow {
     if (root != .object) return error.InvalidBatchRequest;
-
+    const columns = table_schema.relational_columns;
+    const schema_version = table_schema.version;
     var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
     defer cells.deinit(scratch);
     var owned = std.ArrayListUnmanaged([]u8).empty;
@@ -3745,27 +3807,29 @@ fn buildRelationalRowValueFromParsedInternal(
         for (owned.items) |buffer| scratch.free(buffer);
         owned.deinit(scratch);
     }
-    // Preparation normally uses an arena, where ArrayList growth cannot return
-    // superseded buffers. Reserve the schema upper bound once to avoid both
-    // allocator traffic and retained geometric-growth waste.
-    try cells.ensureTotalCapacity(scratch, columns.len);
-    try owned.ensureTotalCapacity(scratch, columns.len);
+    // Sparse rows reserve only for members actually present. This prevents a
+    // wide schema from multiplying per-row scratch by its full column count.
+    const present_capacity = @min(root.object.count(), columns.len);
+    try cells.ensureTotalCapacity(scratch, present_capacity);
+    try owned.ensureTotalCapacity(scratch, present_capacity);
 
     const makeCell = struct {
         fn call(
             output_alloc: Allocator,
+            ordinal: usize,
             column: runtime_schema.RelationalColumn,
             found: std.json.Value,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
-            canonical_json_slot: ?*?[]const u8,
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
             if (found == .null) {
                 if (!column.allows_null) return error.InvalidBatchRequest;
                 return .{
+                    .ordinal = @intCast(ordinal),
                     .path = column.path,
                     .value_type = value_type,
                     .is_json = column.is_json,
+                    .is_dense_vector = column.column_type == .dense_vector,
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -3782,15 +3846,16 @@ fn buildRelationalRowValueFromParsedInternal(
                 const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
-                if (canonical_json_slot) |slot| slot.* = encoded;
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else try relationalTypedValueAlloc(output_alloc, column.column_type, found, owned_buffers) orelse
                 return error.InvalidBatchRequest;
 
             return .{
+                .ordinal = @intCast(ordinal),
                 .path = column.path,
                 .value_type = value_type,
                 .is_json = column.is_json,
+                .is_dense_vector = column.column_type == .dense_vector,
                 .value = value,
             };
         }
@@ -3800,44 +3865,77 @@ fn buildRelationalRowValueFromParsedInternal(
         const layout = physical_layout;
         if (layout.schema_version != schema_version or layout.column_count != columns.len)
             return error.RelationalRowSchemaMismatch;
-        const cells_by_ordinal = try scratch.alloc(?relational_row_codec.Cell, columns.len);
-        defer scratch.free(cells_by_ordinal);
-        @memset(cells_by_ordinal, null);
-
         // Resolve each input member once through the immutable epoch's
         // name-to-ordinal index. This avoids a hash-table probe for every
         // schema column and immediately rejects unknown members.
         var fields = root.object.iterator();
         while (fields.next()) |entry| {
+            if (isSpecialField(entry.key_ptr.*)) continue;
             const ordinal = layout.ordinalForName(columns, entry.key_ptr.*) orelse
                 return error.InvalidBatchRequest;
-            if (cells_by_ordinal[ordinal] != null) return error.InvalidBatchRequest;
             const found = entry.value_ptr.*;
-            if (logical_values) |values| values[ordinal] = found;
-            cells_by_ordinal[ordinal] = try makeCell(
+            try cells.append(scratch, try makeCell(
                 scratch,
+                ordinal,
                 columns[ordinal],
                 found,
                 &owned,
-                if (canonical_json_values) |values| &values[ordinal] else null,
-            );
-        }
-
-        for (columns, 0..) |column, ordinal| {
-            if (cells_by_ordinal[ordinal]) |cell| {
-                try cells.append(scratch, cell);
-            } else if (column.required) {
-                return error.InvalidBatchRequest;
-            }
+            ));
         }
     }
-    return try relational_row_codec.serializePreparedOrdinalDeferredHash(
+
+    const ordinalSort = struct {
+        fn lessThan(_: void, lhs: relational_row_codec.Cell, rhs: relational_row_codec.Cell) bool {
+            return lhs.ordinal < rhs.ordinal;
+        }
+    }.lessThan;
+    const sparse_schema = columns.len > cells.items.len *| 2;
+    const semantic_hash = if (sparse_schema) blk: {
+        // On very sparse rows, walking every schema ordinal and binary-searching
+        // the present cells costs more than sorting the small present set. Check
+        // required columns directly through the already-parsed object, then do
+        // one canonical-name sort and one final physical-ordinal sort.
+        for (physical_layout.required_ordinals) |required_ordinal| {
+            const required_name = columns[required_ordinal].name;
+            if (isSpecialField(required_name) or root.object.get(required_name) == null)
+                return error.InvalidBatchRequest;
+        }
+        std.mem.sort(relational_row_codec.Cell, cells.items, columns, struct {
+            fn lessThan(schema_columns: []const runtime_schema.RelationalColumn, lhs: relational_row_codec.Cell, rhs: relational_row_codec.Cell) bool {
+                return std.mem.lessThan(u8, schema_columns[lhs.ordinal].name, schema_columns[rhs.ordinal].name);
+            }
+        }.lessThan);
+        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(cells.items, table_schema);
+        std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
+        break :blk digest;
+    } else blk: {
+        // Dense rows keep cells in encoder order after one sort. The immutable
+        // layout provides canonical hash order, avoiding two further Cell
+        // reorderings on every prepared write.
+        std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
+        var present_index: usize = 0;
+        for (physical_layout.required_ordinals) |required_ordinal| {
+            while (present_index < cells.items.len and cells.items[present_index].ordinal < required_ordinal)
+                present_index += 1;
+            if (present_index >= cells.items.len or cells.items[present_index].ordinal != required_ordinal)
+                return error.InvalidBatchRequest;
+        }
+        break :blk try document_content_hash.hashRelationalSparseOrdinalCellsCanonical(
+            cells.items,
+            table_schema,
+            physical_layout.hash_ordinals,
+        );
+    };
+    const bytes = try relational_row_codec.serializePreparedOrdinalDeferredHash(
         alloc,
         schema_version,
         columns,
         cells.items,
         physical_layout,
     );
+    // Header metadata and the physical checksum are finalized together after
+    // request-derived system metadata (notably the write timestamp) is known.
+    return .{ .bytes = bytes, .semantic_hash = semantic_hash };
 }
 
 pub fn materializeRelationalRowValueForSchemaAlloc(
@@ -3869,7 +3967,7 @@ fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_d
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
     };
 }
 
@@ -3918,6 +4016,12 @@ fn relationalTypedValueAlloc(
             const lon = schema_api.documentNumberToF64(value.object.get("lon") orelse break :blk null) orelse break :blk null;
             if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) break :blk null;
             break :blk .{ .geo_point = .{ .lat = lat, .lon = lon } };
+        },
+        .dense_vector => blk: {
+            const encoded = try relational_row_codec.encodeDenseVectorValueAlloc(alloc, value);
+            errdefer alloc.free(encoded);
+            try owned.append(alloc, encoded);
+            break :blk .{ .bytes_val = encoded };
         },
         .json => blk: {
             const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -3998,6 +4102,44 @@ test "document mapper full text projection omits vector-like stored payloads" {
     try std.testing.expect((try reader.getSection("embedding", .typed_doc_values)) == null);
     try std.testing.expect((try reader.getSection("sparse.indices", .typed_doc_values)) == null);
     try std.testing.expect((try reader.getSection("sparse.values", .typed_doc_values)) == null);
+}
+
+test "document mapper typed projection does not reparse redundant stored source" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = "{\"title\":\"alpha\",\"embedding\":[0.1,0.2]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, source, .{});
+
+    const source_batch = try buildTextProjectionSourceBatchWithOptions(arena, &.{.{
+        .key = "doc:1",
+        // A prepared relational projection has no JSON source bytes. Invalid
+        // input here proves the typed root is the sole projection boundary.
+        .value = "not-json",
+        .root = parsed.value,
+    }}, .{
+        .vector_field_paths = &.{"embedding"},
+        .strip_numeric_array_heuristic = false,
+        .retain_stored_data = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), source_batch.docs.len);
+    try std.testing.expectEqual(@as(usize, 0), source_batch.docs[0].stored_data.len);
+
+    const projection = try buildTextProjectionBatchFromSource(
+        arena,
+        source_batch.docs,
+        .{},
+        null,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), projection.docs.len);
+    var found_title = false;
+    for (projection.docs[0].text_fields) |field| {
+        if (std.mem.eql(u8, field.field_name, "title") and std.mem.eql(u8, field.text, "alpha"))
+            found_title = true;
+    }
+    try std.testing.expect(found_title);
 }
 
 test "document mapper full text projection uses configured vector fields before numeric array heuristic" {
@@ -5569,19 +5711,83 @@ test "relational JSON cells have canonical physical bytes" {
             .is_json = true,
             .json_kind = .object,
         },
+        .{ .name = "name", .path = "name", .column_type = .string, .required = true },
     };
     const table_schema: runtime_schema.TableSchema = .{
         .version = 11,
         .storage_mode = .relational,
         .relational_columns = &columns,
     };
-    var left = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":{\"z\":1,\"a\":{\"y\":2,\"b\":3}}}", .{ .parse_numbers = false });
+    var left = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":{\"z\":1.0,\"a\":{\"y\":2.00,\"b\":3e0}},\"name\":\"same\"}", .{ .parse_numbers = false });
     defer left.deinit();
-    var right = try std.json.parseFromSlice(std.json.Value, alloc, "{\"payload\":{\"a\":{\"b\":3,\"y\":2},\"z\":1}}", .{ .parse_numbers = false });
+    var right = try std.json.parseFromSlice(std.json.Value, alloc, "{\"name\":\"same\",\"payload\":{\"a\":{\"b\":30e-1,\"y\":0.2e1},\"z\":10e-1}}", .{ .parse_numbers = false });
     defer right.deinit();
     const left_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, left.value, table_schema);
     defer alloc.free(left_row);
     const right_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, right.value, table_schema);
     defer alloc.free(right_row);
     try std.testing.expectEqualSlices(u8, left_row, right_row);
+}
+
+test "sparse relational preparation preserves canonical hash order with one physical sort" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "zeta", .path = "zeta", .column_type = .integer, .required = true },
+        .{ .name = "unused_a", .path = "unused_a", .column_type = .string },
+        .{ .name = "alpha", .path = "alpha", .column_type = .string },
+        .{ .name = "unused_b", .path = "unused_b", .column_type = .boolean },
+        .{ .name = "unused_c", .path = "unused_c", .column_type = .number },
+    };
+    const table_schema: runtime_schema.TableSchema = .{
+        .version = 13,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    var left = try std.json.parseFromSlice(std.json.Value, alloc, "{\"zeta\":7,\"alpha\":\"same\"}", .{ .parse_numbers = false });
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, alloc, "{\"alpha\":\"same\",\"zeta\":7}", .{ .parse_numbers = false });
+    defer right.deinit();
+    const left_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, left.value, table_schema);
+    defer alloc.free(left_row);
+    const right_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, right.value, table_schema);
+    defer alloc.free(right_row);
+    try std.testing.expectEqualSlices(u8, left_row, right_row);
+
+    var missing_required = try std.json.parseFromSlice(std.json.Value, alloc, "{\"alpha\":\"same\"}", .{ .parse_numbers = false });
+    defer missing_required.deinit();
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueForSchemaFromParsedAlloc(alloc, missing_required.value, table_schema),
+    );
+}
+
+test "relational dense vectors bypass JSON storage and hash logical values" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{
+            .name = "embedding",
+            .path = "embedding",
+            .column_type = .dense_vector,
+            .required = true,
+        },
+    };
+    const table_schema: runtime_schema.TableSchema = .{
+        .version = 12,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    var integer_spelling = try std.json.parseFromSlice(std.json.Value, alloc, "{\"embedding\":[1,2,3]}", .{ .parse_numbers = false });
+    defer integer_spelling.deinit();
+    var decimal_spelling = try std.json.parseFromSlice(std.json.Value, alloc, "{\"embedding\":[1.0,2.0,3.0]}", .{ .parse_numbers = false });
+    defer decimal_spelling.deinit();
+    const left_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, integer_spelling.value, table_schema);
+    defer alloc.free(left_row);
+    const right_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, decimal_spelling.value, table_schema);
+    defer alloc.free(right_row);
+    try std.testing.expectEqualSlices(u8, left_row, right_row);
+
+    const cell = (try relational_row_codec.findCellByOrdinal(left_row, table_schema, 0)).?;
+    try std.testing.expect(cell.is_dense_vector);
+    try std.testing.expect(!cell.is_json);
+    try std.testing.expectEqual(@as(usize, 3 * @sizeOf(f32)), cell.value.bytes_val.len);
 }

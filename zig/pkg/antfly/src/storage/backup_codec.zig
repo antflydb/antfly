@@ -197,18 +197,29 @@ pub fn writeHeaderTo(writer: *std.Io.Writer, h: FileHeader) !void {
 }
 
 pub fn writeBlockTo(writer: *std.Io.Writer, block_type: BlockType, payload: []const u8) !void {
-    if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+    return try writeBlockPartsTo(writer, block_type, &.{payload});
+}
+
+/// Write one framed block from discontiguous borrowed parts. Large streaming
+/// payloads use this to prepend compact metadata without allocating and copying
+/// a second payload-sized buffer merely to calculate the common block CRC.
+pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: []const []const u8) !void {
+    var payload_len: usize = 0;
+    for (parts) |part| payload_len = std.math.add(usize, payload_len, part.len) catch
+        return error.BackupBlockTooLarge;
+    if (payload_len > max_block_payload_bytes or payload_len > std.math.maxInt(u32))
+        return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
     env_header[0] = @intFromEnum(block_type);
     env_header[1] = 0;
-    std.mem.writeInt(u32, env_header[2..6], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, env_header[2..6], @intCast(payload_len), .little);
     var crc = Crc32.init();
     crc.update(&env_header);
-    crc.update(payload);
+    for (parts) |part| crc.update(part);
     var crc_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
     try writer.writeAll(&env_header);
-    try writer.writeAll(payload);
+    for (parts) |part| try writer.writeAll(part);
     try writer.writeAll(&crc_buf);
 }
 
