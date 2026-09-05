@@ -700,6 +700,8 @@ pub fn runWithBoundValuesControl(
         allocator,
     );
     try active.check();
+    var hard_cancellation = try active.enterUninterruptible(session.interruption());
+    defer hard_cancellation.deinit();
 
     const api = getApi();
     var run_options: ?*c.OrtRunOptions = null;
