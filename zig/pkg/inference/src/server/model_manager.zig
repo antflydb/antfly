@@ -7561,7 +7561,19 @@ fn sessionManagerForPreferredBackends(
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
+        .process_isolation_available = source.process_isolation_available,
     };
+}
+
+test "session manager load clones preserve process isolation policy" {
+    var source = backends.SessionManager.init(std.testing.allocator);
+    source.process_isolation_available = false;
+    const clone = sessionManagerForPreferredBackends(
+        std.testing.allocator,
+        &.{.native},
+        &source,
+    );
+    try std.testing.expect(!clone.process_isolation_available);
 }
 
 pub const ManagedSession = struct {
