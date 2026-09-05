@@ -545,12 +545,12 @@ pub fn compatibilitySummaryForBackend(
     }
     if (man.embedding_style == .qwen3_embedding and
         man.usesGgufWeights() and
-        backend != .metal)
+        !qwen3EmbeddingSupportsBackend(backend))
     {
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-Embedding GGUF bundles require the Metal backend",
+            .message = "production-qualified Qwen3-Embedding GGUF bundles require the Metal or native CPU backend",
         };
     }
 
@@ -695,6 +695,16 @@ pub fn compatibilitySummaryForBackend(
         }
     }
     return summaryFromAssessment(assessment);
+}
+
+fn qwen3EmbeddingSupportsBackend(backend: backends.BackendType) bool {
+    return backend == .metal or backend == .native;
+}
+
+test "Qwen3 embedding production backends include native CPU" {
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
+    try std.testing.expect(!qwen3EmbeddingSupportsBackend(.cuda));
 }
 
 fn qwen3VlPromotionSupportsBackend(

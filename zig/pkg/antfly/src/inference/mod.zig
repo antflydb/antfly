@@ -75,6 +75,11 @@ test "bedrock provider request helpers" {
     try managed_embedder.testBedrockRequestFormatConfiguration();
 }
 
+test "embedding provider request helpers" {
+    try vertex.testEmbeddingStatusMapping();
+    try managed_embedder.testCohereBatchLimit();
+}
+
 test "managed embedder resolves file-backed api key rotation at request time" {
     try managed_embedder.testFileBackedApiKeyRotation();
 }

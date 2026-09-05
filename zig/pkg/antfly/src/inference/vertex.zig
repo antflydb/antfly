@@ -105,7 +105,7 @@ pub const GeminiProvider = struct {
             .cancellation = options.cancellation,
         });
         defer response.deinit();
-        if (!response.ok()) return error.EmbedRequestFailed;
+        if (!response.ok()) return mapEmbeddingStatus(response.status.code);
         const Response = struct { embeddings: []const struct { values: []const f32 } = &.{} };
         var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -341,7 +341,7 @@ pub const Provider = struct {
             .cancellation = options.cancellation,
         });
         defer response.deinit();
-        if (!response.ok()) return error.EmbedRequestFailed;
+        if (!response.ok()) return mapEmbeddingStatus(response.status.code);
         const Response = struct {
             predictions: []const struct {
                 embeddings: struct { values: []const f32 },
@@ -693,6 +693,28 @@ fn appendJsonString(
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+fn mapEmbeddingStatus(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.EmbedRateLimited,
+        500...503, 505...599 => error.EmbedTransientFailure,
+        else => error.EmbedRequestFailed,
+    };
+}
+
+pub fn testEmbeddingStatusMapping() !void {
+    try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(408));
+    try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(504));
+    try std.testing.expectEqual(error.EmbedRateLimited, mapEmbeddingStatus(429));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbeddingStatus(500));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbeddingStatus(599));
+    try std.testing.expectEqual(error.EmbedRequestFailed, mapEmbeddingStatus(400));
+}
+
+test "google embedding status mapping preserves retryability" {
+    try testEmbeddingStatusMapping();
 }
 
 test "vertex provider exchanges service account credentials and generates content" {

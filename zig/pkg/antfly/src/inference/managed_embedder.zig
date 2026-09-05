@@ -4433,7 +4433,7 @@ pub fn testEmbeddingTaskRouting() !void {
         .alloc = std.testing.allocator,
         .index_name = @constCast("semantic"),
         .provider = .bedrock,
-        .model = @constCast("cohere.embed-v4"),
+        .model = @constCast("cohere.embed-v4:0"),
         .base_url = @constCast("https://bedrock.example"),
         .dimensions = 1024,
         .query_input_type = @constCast("custom_query"),
@@ -4451,7 +4451,7 @@ pub fn testEmbeddingTaskRouting() !void {
     try std.testing.expect(document_context.instruction == null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"provider":"bedrock","model":"cohere.embed-v4","region":"us-east-1","retrieval":{"query_input_type":"search_query","document_input_type":"search_document"}}
+        \\{"provider":"bedrock","model":"cohere.embed-v4:0","region":"us-east-1","retrieval":{"query_input_type":"search_query","document_input_type":"search_document"}}
     , .{});
     defer parsed.deinit();
     var config = try parseEmbedderConfigFromValue(std.testing.allocator, parsed.value);
@@ -4611,6 +4611,36 @@ fn embedBatchWithVertex(
 }
 
 fn embedBatchWithCohere(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]const []const f32 {
+    var out = std.ArrayListUnmanaged([]const f32).empty;
+    errdefer {
+        for (out.items) |vector| alloc.free(vector);
+        out.deinit(alloc);
+    }
+
+    var offset: usize = 0;
+    while (offset < texts.len) {
+        const end = cappedEmbeddingBatchEnd(
+            offset,
+            texts.len,
+            provider_defaults.cohere_max_embedding_batch_size,
+        );
+        const vectors = try embedBatchWithCohereRequest(alloc, entry, texts[offset..end], dims, task_type);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try out.ensureUnusedCapacity(alloc, vectors.len);
+        for (vectors) |vector| out.appendAssumeCapacity(vector);
+        alloc.free(vectors);
+        offset = end;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn embedBatchWithCohereRequest(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
@@ -4854,6 +4884,23 @@ fn mapEmbedStatus(status: u16) anyerror {
         => error.EmbedTransientFailure,
         else => if (status >= 500 and status < 600) error.EmbedTransientFailure else error.EmbedRequestFailed,
     };
+}
+
+fn cappedEmbeddingBatchEnd(offset: usize, total: usize, maximum: usize) usize {
+    std.debug.assert(offset <= total);
+    std.debug.assert(maximum > 0);
+    return offset + @min(total - offset, maximum);
+}
+
+pub fn testCohereBatchLimit() !void {
+    const maximum = provider_defaults.cohere_max_embedding_batch_size;
+    try std.testing.expectEqual(@as(usize, 96), cappedEmbeddingBatchEnd(0, 97, maximum));
+    try std.testing.expectEqual(@as(usize, 97), cappedEmbeddingBatchEnd(96, 97, maximum));
+    try std.testing.expectEqual(@as(usize, 12), cappedEmbeddingBatchEnd(0, 12, maximum));
+}
+
+test "Cohere embedding batches respect the provider request limit" {
+    try testCohereBatchLimit();
 }
 
 fn adoptDenseBatchResult(

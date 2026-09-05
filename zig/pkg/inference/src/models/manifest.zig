@@ -1367,7 +1367,14 @@ fn applyGgufTokenizerMetadata(
     // Do not issue a whole-file DONTNEED that defeats rolling-worker prefetch.
     region.preserveFileCacheOnDeinit();
 
-    var parsed = try gguf_format.parse(allocator, region.data);
+    const has_external_tokenizer = artifactExists(catalog, allocator, model_dir_path, "tokenizer.json") or
+        artifactExists(catalog, allocator, model_dir_path, "tokenizer.model") or
+        artifactExists(catalog, allocator, model_dir_path, "vocab.json") or
+        artifactExists(catalog, allocator, model_dir_path, "vocab.txt");
+    var parsed = if (has_external_tokenizer)
+        try gguf_format.parseWithExternalTokenizer(allocator, region.data)
+    else
+        try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);
 
     const view = gguf_metadata.View.init(&parsed);

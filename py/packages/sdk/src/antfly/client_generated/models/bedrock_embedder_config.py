@@ -24,17 +24,17 @@ class BedrockEmbedderConfig:
     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2
     instance roles.
 
-    **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
+    **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
 
     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 
         Example:
-            {'provider': 'bedrock', 'model': 'cohere.embed-v4', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
+            {'provider': 'bedrock', 'model': 'cohere.embed-v4:0', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
 
         Attributes:
             provider (BedrockEmbedderConfigProvider):
-            model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
-                'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4.
+            model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0',
+                'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4:0.
             request_format (BedrockEmbedderConfigRequestFormat | Unset): Bedrock provider request schema. `auto` recognizes
                 direct foundation-model IDs,
                 foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly

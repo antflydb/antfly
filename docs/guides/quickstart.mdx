@@ -100,7 +100,8 @@ antfly inference list
 Qwen3-Embedding uses an instruction for search queries but embeds indexed
 documents without it. Antfly applies that distinction automatically: index and
 artifact writes use the document role, while semantic searches use the query
-role.
+role. The Q8_0 bundle runs on native CPU on Linux and macOS, and uses Metal
+automatically when it is available.
 
 If the running standalone process does not detect the newly installed model,
 restart it once before creating the embeddings index.

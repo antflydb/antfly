@@ -18,6 +18,21 @@ Fixed protocol per cell: 3 warmup iterations, 20 measured iterations, quiet
 machine (no other GPU work), report p50/p95 latency and embeddings/sec. For the
 pretokenized bench also record real tok/s vs padded tok/s (padding waste).
 
+## Native CPU admission qualification — 2026-09-04
+
+An Apple arm64 host loaded the managed Q8_0 bundle through the production model
+manager with both `native` and `metal`. The tested GGUF SHA-256 was
+`06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
+Single measured smoke iterations produced normalized 1,024-dimensional vectors:
+
+| Tokens | Native latency | Metal latency | Native/Metal cosine | Max absolute difference |
+|--------|----------------|---------------|---------------------|-------------------------|
+| 20     | 202.44 ms      | 45.72 ms      | 0.999503            | 0.004179                |
+| 256    | 1102.38 ms     | 62.78 ms      | 0.999262            | 0.004604                |
+
+These are admission and output-parity smoke results, not stable performance
+baselines. Use the full warmup/iteration protocol below for performance claims.
+
 ## Pretokenized encoder bench (no tokenizer, no HTTP)
 
 ```bash

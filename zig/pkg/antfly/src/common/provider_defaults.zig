@@ -14,6 +14,10 @@ pub const vertex_v1beta1_base = "https://aiplatform.googleapis.com/v1beta1";
 pub const default_google_location = "us-central1";
 pub const default_aws_region = "us-east-1";
 
+/// Cohere Embed v2 accepts at most 96 texts per request. This applies to both
+/// the direct Cohere API and Cohere models invoked through Bedrock.
+pub const cohere_max_embedding_batch_size: usize = 96;
+
 pub fn normalizedBase(configured: []const u8, default_value: []const u8) []const u8 {
     return std.mem.trimEnd(u8, if (configured.len > 0) configured else default_value, "/");
 }
@@ -59,4 +63,8 @@ test "provider endpoint defaults preserve explicit deployment endpoints" {
     const regional = try vertexRegionalV1BaseAlloc(alloc, "", "europe-west4");
     defer alloc.free(regional);
     try std.testing.expectEqualStrings("https://europe-west4-aiplatform.googleapis.com/v1", regional);
+}
+
+test "shared provider limits match upstream APIs" {
+    try std.testing.expectEqual(@as(usize, 96), cohere_max_embedding_batch_size);
 }

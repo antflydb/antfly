@@ -56,7 +56,12 @@ const Timing = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.page_allocator;
+    // Tokenizer construction owns many small strings. A general-purpose
+    // allocator keeps qualification representative of the server and avoids
+    // one mmap per token when this benchmark is run against a full tokenizer.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
     var opts = try parseArgs(allocator, init);
     if (opts.show_help) {
         printUsage();
