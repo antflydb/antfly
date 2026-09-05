@@ -17,6 +17,7 @@ pub const config = @import("config.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
+pub const credential_source_identity = @import("credential_source_identity.zig");
 pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
 pub const runtime_lifecycle = @import("runtime_lifecycle.zig");
@@ -36,6 +37,7 @@ test {
     _ = http;
     _ = audio_runtime;
     _ = secrets;
+    _ = credential_source_identity;
     _ = remote_content_runtime;
     _ = health_server;
     _ = runtime_lifecycle;

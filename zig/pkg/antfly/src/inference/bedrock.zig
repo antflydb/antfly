@@ -8,6 +8,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
@@ -72,7 +73,7 @@ pub const CredentialCache = struct {
     const Snapshot = struct {
         alloc: std.mem.Allocator,
         refs: std.atomic.Value(usize) = .init(1), // one cache-owned reference
-        source_key: u64,
+        source_key: [std.crypto.hash.sha2.Sha256.digest_length]u8,
         credentials: Credentials,
 
         fn retain(self: *Snapshot) void {
@@ -181,7 +182,7 @@ pub const CredentialCache = struct {
                 return error.CredentialCacheClosed;
             }
             if (self.cached) |snapshot| {
-                if (snapshot.source_key == source_key and snapshot.credentials.isFresh(now)) {
+                if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isFresh(now)) {
                     snapshot.retain();
                     self.mutex.unlock(io);
                     return .{ .snapshot = snapshot };
@@ -192,7 +193,7 @@ pub const CredentialCache = struct {
                 // During proactive refresh, continue serving the still-valid
                 // snapshot. Only callers with expired credentials block.
                 if (self.cached) |snapshot| {
-                    if (snapshot.source_key == source_key and snapshot.credentials.isUnexpired(now)) {
+                    if (std.mem.eql(u8, &snapshot.source_key, &source_key) and snapshot.credentials.isUnexpired(now)) {
                         snapshot.retain();
                         self.mutex.unlock(io);
                         return .{ .snapshot = snapshot };
@@ -215,7 +216,7 @@ pub const CredentialCache = struct {
                 const closing = self.closing;
                 const fallback = if (!closing and self.cached != null) blk: {
                     const snapshot = self.cached.?;
-                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(fallback_now)) break :blk null;
+                    if (!std.mem.eql(u8, &snapshot.source_key, &source_key) or !snapshot.credentials.isUnexpired(fallback_now)) break :blk null;
                     snapshot.retain();
                     break :blk snapshot;
                 } else null;
@@ -277,25 +278,32 @@ pub const CredentialCache = struct {
     }
 };
 
-fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
-    var hash = std.hash.Wyhash.init(0);
-    hash.update(region);
-    const tag: [1]u8 = .{@intFromEnum(std.meta.activeTag(source))};
-    hash.update(&tag);
-    switch (source) {
-        .default => {},
-        .profile => |profile| {
-            hash.update(profile.name);
-            if (profile.shared_credentials_file) |value| hash.update(value);
-        },
-        .web_identity => |identity| {
-            hash.update(identity.role_arn);
-            hash.update(identity.token_file);
-            hash.update(identity.session_name);
-            if (identity.sts_endpoint) |value| hash.update(value);
-        },
-    }
-    return hash.final();
+fn credentialSourceIdentity(source: CredentialSource) credential_source_identity.CredentialSourceIdentity {
+    const Identity = credential_source_identity.CredentialSourceIdentity;
+    return switch (source) {
+        .default => Identity.awsDefaultChain(),
+        .profile => |profile| Identity.awsProfile(profile.name, profile.shared_credentials_file),
+        .web_identity => |identity| Identity.awsWebIdentity(
+            identity.role_arn,
+            identity.token_file,
+            identity.session_name,
+            identity.sts_endpoint,
+        ),
+    };
+}
+
+fn credentialSourceKey(
+    region: []const u8,
+    source: CredentialSource,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_region_len = std.mem.nativeToLittle(u64, @intCast(region.len));
+    hasher.update(std.mem.asBytes(&encoded_region_len));
+    hasher.update(region);
+    credentialSourceIdentity(source).updateHash(&hasher);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
 }
 
 pub const RequestFormat = enum {
@@ -1653,6 +1661,53 @@ pub fn testEndpointHostIncludesExplicitPort() !void {
     try std.testing.expectEqualStrings("http://localhost:4566", endpoint);
 }
 
+pub fn testCredentialSourceKeysAreStructured() !void {
+    const profile_a = CredentialSource{ .profile = .{
+        .name = "ab",
+        .shared_credentials_file = "c",
+    } };
+    const profile_b = CredentialSource{ .profile = .{
+        .name = "a",
+        .shared_credentials_file = "bc",
+    } };
+    const profile_omitted = CredentialSource{ .profile = .{ .name = "default" } };
+    const profile_empty = CredentialSource{ .profile = .{
+        .name = "default",
+        .shared_credentials_file = "",
+    } };
+    const web_identity_a = CredentialSource{ .web_identity = .{
+        .role_arn = "ab",
+        .token_file = "c",
+        .session_name = "d",
+    } };
+    const web_identity_b = CredentialSource{ .web_identity = .{
+        .role_arn = "a",
+        .token_file = "bc",
+        .session_name = "d",
+    } };
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &credentialSourceKey("us-east-1", profile_a),
+        &credentialSourceKey("us-east-1", profile_b),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &credentialSourceKey("us-east-1", profile_omitted),
+        &credentialSourceKey("us-east-1", profile_empty),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &credentialSourceKey("us-east-1", web_identity_a),
+        &credentialSourceKey("us-east-1", web_identity_b),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &credentialSourceKey("us-east-1", .default),
+        &credentialSourceKey("us-west-2", .default),
+    ));
+}
+
 test "titan multimodal body omits empty inputText" {
     try testTitanMultimodalBodyOmitsEmptyInputText();
 }
@@ -1691,6 +1746,10 @@ test "metadata credential parsers" {
 
 test "credential url encoding" {
     try testCredentialUrlEncoding();
+}
+
+test "credential source keys are structured" {
+    try testCredentialSourceKeysAreStructured();
 }
 
 test "credential cache shutdown waits for an in-flight refresh" {

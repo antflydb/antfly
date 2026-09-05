@@ -563,6 +563,22 @@ fn assessWithRuntimeFacts(
     }
 
     if (man.isQwen3VlBundle()) {
+        // The CUDA generation route uses the official integrated BF16
+        // safetensors bundle instead of the split GGUF decoder/projector
+        // promotion used by Metal.
+        if (man.isQwen3VlGenerationSafetensorsBundle()) {
+            if (man.model_type == .generator and stringIn(architecture, &.{ "qwen3_vl", "qwen3vl" })) {
+                return makeCompatible(
+                    architecture,
+                    "declared Qwen3-VL integrated BF16 safetensors generation bundle",
+                );
+            }
+            return makeIncompatible(
+                architecture,
+                .unsupported_backend,
+                "Qwen3-VL BF16 safetensors bundle does not match the declared generation role",
+            );
+        }
         return switch (qwen3vl_promotion) {
             .generation_2b_q4_k_m => if (man.model_type == .generator and
                 std.mem.eql(u8, man.inference_bundle_family, manifest_mod.qwen3_vl_gguf_bundle_family))

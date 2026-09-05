@@ -56,12 +56,11 @@ const Timing = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    // Tokenizer construction owns many small strings. A general-purpose
-    // allocator keeps qualification representative of the server and avoids
-    // one mmap per token when this benchmark is run against a full tokenizer.
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Match the production CLI allocator. GGUF session construction performs
+    // large growable allocations; page_allocator's mmap-per-resize behavior
+    // can transiently exhaust the address-space reservation even when the
+    // final CUDA-resident model comfortably fits.
+    const allocator = std.heap.c_allocator;
     var opts = try parseArgs(allocator, init);
     if (opts.show_help) {
         printUsage();
