@@ -89,7 +89,9 @@ class Gemma4UnslothPreferenceBenchmarkTest(unittest.TestCase):
         parsed = baseline.parse_models([f"e2b={model}"])
         self.assertEqual("e2b", parsed[0].label)
         self.assertEqual(model.resolve(), parsed[0].path)
-        self.assertEqual(baseline.sha256_file(model / "config.json"), parsed[0].config_sha256)
+        self.assertEqual(
+            baseline.sha256_file(model / "config.json"), parsed[0].config_sha256
+        )
 
     def test_model_parser_accepts_shards_and_rejects_path_escape(self) -> None:
         model = self.write_model()
@@ -113,7 +115,10 @@ class Gemma4UnslothPreferenceBenchmarkTest(unittest.TestCase):
 
         outside = self.root / "outside.safetensors"
         outside.write_bytes(b"outside")
-        index.write_text(json.dumps({"weight_map": {"a": "../outside.safetensors"}}), encoding="utf-8")
+        index.write_text(
+            json.dumps({"weight_map": {"a": "../outside.safetensors"}}),
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(baseline.BenchmarkError, "escapes model directory"):
             baseline.parse_models([f"e2b={model}"])
 
@@ -123,7 +128,9 @@ class Gemma4UnslothPreferenceBenchmarkTest(unittest.TestCase):
             baseline.parse_models([f"same={model}", f"same={model}"])
 
         other = self.write_model("other")
-        (other / "config.json").write_text('{"model_type":"gemma3"}\n', encoding="utf-8")
+        (other / "config.json").write_text(
+            '{"model_type":"gemma3"}\n', encoding="utf-8"
+        )
         with self.assertRaisesRegex(baseline.BenchmarkError, "not a Gemma4"):
             baseline.parse_models([f"other={other}"])
 
@@ -163,7 +170,9 @@ class Gemma4UnslothPreferenceBenchmarkTest(unittest.TestCase):
         aggregate = baseline.aggregate_case(model, "dpo", runs)
         self.assertEqual(75.0, aggregate["median_wall_seconds"])
         self.assertEqual(9_500.0, aggregate["median_peak_gpu_memory_mib"])
-        self.assertAlmostEqual(baseline.UPDATES / 75.0, aggregate["median_optimizer_steps_per_second"])
+        self.assertAlmostEqual(
+            baseline.UPDATES / 75.0, aggregate["median_optimizer_steps_per_second"]
+        )
         self.assertEqual(0.2, aggregate["loss"])
         self.assertEqual(0.4, aggregate["mean_grad_norm"])
 

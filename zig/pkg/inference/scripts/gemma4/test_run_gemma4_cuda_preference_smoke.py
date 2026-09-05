@@ -11,7 +11,9 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = pathlib.Path(__file__).resolve().with_name("run_gemma4_cuda_preference_smoke.py")
+SCRIPT = (
+    pathlib.Path(__file__).resolve().with_name("run_gemma4_cuda_preference_smoke.py")
+)
 SPEC = importlib.util.spec_from_file_location("gemma4_cuda_preference_smoke", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 smoke = importlib.util.module_from_spec(SPEC)
@@ -39,7 +41,9 @@ def write_safetensors(
         }
     }
     stored_double = (
-        use_double_wide_mlp if stored_double_wide_mlp is None else stored_double_wide_mlp
+        use_double_wide_mlp
+        if stored_double_wide_mlp is None
+        else stored_double_wide_mlp
     )
     first_shared_layer = num_hidden_layers - num_kv_shared_layers
     for layer in range(num_hidden_layers):
@@ -210,7 +214,9 @@ class Gemma4CudaPreferenceSmokeTest(unittest.TestCase):
             use_double_wide_mlp=False,
             stored_double_wide_mlp=True,
         )
-        with self.assertRaisesRegex(smoke.QualificationError, "text MLP shape mismatch"):
+        with self.assertRaisesRegex(
+            smoke.QualificationError, "text MLP shape mismatch"
+        ):
             smoke.inspect_model(smoke.ModelSpec("e2b", model))
 
     def test_preflight_rejects_packed_gguf_and_rank2_f16(self) -> None:
@@ -230,10 +236,13 @@ class Gemma4CudaPreferenceSmokeTest(unittest.TestCase):
         model = write_model(self.root)
         (model / "model.safetensors").unlink()
         (model / "model.safetensors.index.json").write_text(
-            json.dumps({"weight_map": {"weight": "../outside.safetensors"}}), encoding="utf-8"
+            json.dumps({"weight_map": {"weight": "../outside.safetensors"}}),
+            encoding="utf-8",
         )
         (self.root / "outside.safetensors").write_bytes(b"outside")
-        with self.assertRaisesRegex(smoke.QualificationError, "escapes model directory"):
+        with self.assertRaisesRegex(
+            smoke.QualificationError, "escapes model directory"
+        ):
             smoke.inspect_model(smoke.ModelSpec("e2b", model))
 
     def test_recipe_is_bounded_and_strictly_selects_cuda(self) -> None:
@@ -265,7 +274,9 @@ class Gemma4CudaPreferenceSmokeTest(unittest.TestCase):
         self.assertEqual(1, parsed["cuda_optimizer_steps"])
         self.assertGreater(parsed["mean_grad_norm"], 0)
 
-    def test_report_accepts_f32_objective_parameters_and_rejects_real_drift(self) -> None:
+    def test_report_accepts_f32_objective_parameters_and_rejects_real_drift(
+        self,
+    ) -> None:
         report = valid_report()
         report["beta"] = 0.10000000149011612
         path = self.root / "dpo_f32_report.json"
@@ -319,7 +330,9 @@ class Gemma4CudaPreferenceSmokeTest(unittest.TestCase):
             report["device_execution"][field] = 13
             path = self.root / f"{field}.json"
             path.write_text(json.dumps(report), encoding="utf-8")
-            with self.assertRaisesRegex(smoke.QualificationError, "scalar readback budget"):
+            with self.assertRaisesRegex(
+                smoke.QualificationError, "scalar readback budget"
+            ):
                 smoke.validate_report(path, "dpo", 1)
 
     def test_report_rejects_nonfinite_loss_gradient_and_delta(self) -> None:
@@ -422,7 +435,9 @@ pathlib.Path(artifacts["report_path"]).write_text(json.dumps(report), encoding="
         self.assertEqual("passed", result["status"])
         self.assertEqual(512, result["peak_gpu_memory_mib"])
         self.assertGreater(result["optimizer_steps_per_second"], 0)
-        self.assertNotEqual(result["initial_adapter_sha256"], result["trained_adapter_sha256"])
+        self.assertNotEqual(
+            result["initial_adapter_sha256"], result["trained_adapter_sha256"]
+        )
 
     def test_successful_process_metrics_reject_missing_gpu_memory_samples(self) -> None:
         executable = self.root / "success"
@@ -533,7 +548,9 @@ pathlib.Path(artifacts["report_path"]).write_text(json.dumps(report), encoding="
             )
 
     def test_monolith_binary_command_includes_inference_namespace(self) -> None:
-        command = smoke.finetune_command(self.root / "antfly", self.root / "recipe.json")
+        command = smoke.finetune_command(
+            self.root / "antfly", self.root / "recipe.json"
+        )
         self.assertEqual(["inference", "finetune", "run"], command[1:4])
 
 

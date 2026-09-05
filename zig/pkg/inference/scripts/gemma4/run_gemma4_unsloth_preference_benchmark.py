@@ -122,7 +122,9 @@ class ProcessMetrics:
 def atomic_write_json(path: pathlib.Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
 
 
@@ -154,7 +156,9 @@ def checkpoint_shards(model_dir: pathlib.Path) -> list[pathlib.Path]:
         parsed = json.loads(index.read_text(encoding="utf-8"))
         weight_map = parsed["weight_map"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-        raise BenchmarkError(f"invalid sharded SafeTensors index {index}: {error}") from error
+        raise BenchmarkError(
+            f"invalid sharded SafeTensors index {index}: {error}"
+        ) from error
     if not isinstance(weight_map, dict) or not weight_map:
         raise BenchmarkError(f"empty sharded SafeTensors weight_map: {index}")
 
@@ -192,7 +196,9 @@ def parse_models(values: Iterable[str]) -> list[ModelSpec]:
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise BenchmarkError(f"cannot read model config {config_path}: {error}") from error
+            raise BenchmarkError(
+                f"cannot read model config {config_path}: {error}"
+            ) from error
         if not isinstance(config, dict) or config.get("model_type") != "gemma4":
             raise BenchmarkError(f"model is not a Gemma4 checkpoint: {path}")
         result.append(ModelSpec(label, path, sha256_file(config_path)))
@@ -223,7 +229,11 @@ def expected_qv_lora_trainable_tensors(config: dict[str, Any]) -> int:
 
 
 def finite_number(value: Any, label: str, *, positive: bool = False) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
         raise BenchmarkError(f"{label} must be finite")
     result = float(value)
     if positive and result <= 0:
@@ -237,7 +247,11 @@ def query_gpu_memory_mib(pid: int) -> int | None:
         return None
     try:
         completed = subprocess.run(
-            [tool, "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            [
+                tool,
+                "--query-compute-apps=pid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
             text=True,
             capture_output=True,
             timeout=2,
@@ -261,13 +275,17 @@ def query_gpu_memory_mib(pid: int) -> int | None:
     return total if found else None
 
 
-def run_process(command: list[str], log_path: pathlib.Path, timeout_seconds: int) -> ProcessMetrics:
+def run_process(
+    command: list[str], log_path: pathlib.Path, timeout_seconds: int
+) -> ProcessMetrics:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     peak_gpu_memory_mib = 0
     gpu_memory_samples = 0
     with log_path.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True)
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, text=True
+        )
         while process.poll() is None:
             if time.monotonic() - started > timeout_seconds:
                 process.terminate()
@@ -276,7 +294,9 @@ def run_process(command: list[str], log_path: pathlib.Path, timeout_seconds: int
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-                raise BenchmarkError(f"worker timed out after {timeout_seconds}s; see {log_path}")
+                raise BenchmarkError(
+                    f"worker timed out after {timeout_seconds}s; see {log_path}"
+                )
             sample = query_gpu_memory_mib(process.pid)
             if sample is not None:
                 peak_gpu_memory_mib = max(peak_gpu_memory_mib, sample)
@@ -287,45 +307,72 @@ def run_process(command: list[str], log_path: pathlib.Path, timeout_seconds: int
     if return_code != 0:
         raise BenchmarkError(f"worker exited with status {return_code}; see {log_path}")
     if gpu_memory_samples == 0 or peak_gpu_memory_mib <= 0:
-        raise BenchmarkError(f"worker produced no process GPU-memory evidence; see {log_path}")
+        raise BenchmarkError(
+            f"worker produced no process GPU-memory evidence; see {log_path}"
+        )
     return ProcessMetrics(wall_seconds, peak_gpu_memory_mib, gpu_memory_samples)
 
 
-def validate_worker_result(path: pathlib.Path, objective: str, model: ModelSpec) -> dict[str, Any]:
+def validate_worker_result(
+    path: pathlib.Path, objective: str, model: ModelSpec
+) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise BenchmarkError(f"cannot read worker result {path}: {error}") from error
     if not isinstance(payload, dict) or payload.get("status") != "passed":
         raise BenchmarkError(f"worker did not publish a passing result: {path}")
-    if payload.get("objective") != objective or payload.get("model_config_sha256") != model.config_sha256:
+    if (
+        payload.get("objective") != objective
+        or payload.get("model_config_sha256") != model.config_sha256
+    ):
         raise BenchmarkError(f"worker result identity mismatch: {path}")
     if payload.get("optimizer_steps") != UPDATES:
-        raise BenchmarkError(f"worker did not execute exactly {UPDATES} optimizer steps: {path}")
+        raise BenchmarkError(
+            f"worker did not execute exactly {UPDATES} optimizer steps: {path}"
+        )
     if payload.get("versions") != PINNED_VERSIONS:
         raise BenchmarkError(f"worker package fingerprint drifted: {path}")
     finite_number(payload.get("loss"), "worker loss")
     finite_number(payload.get("mean_grad_norm"), "worker mean grad norm", positive=True)
-    finite_number(payload.get("torch_peak_gpu_memory_mib"), "worker torch peak memory", positive=True)
+    finite_number(
+        payload.get("torch_peak_gpu_memory_mib"),
+        "worker torch peak memory",
+        positive=True,
+    )
     trainable = payload.get("trainable_parameters")
     if not isinstance(trainable, int) or isinstance(trainable, bool) or trainable <= 0:
         raise BenchmarkError(f"worker has invalid trainable-parameter evidence: {path}")
     adapter_path = pathlib.Path(str(payload.get("adapter_path", "")))
-    if not (adapter_path / "adapter_config.json").is_file() or not (
-        adapter_path / "adapter_model.safetensors"
-    ).is_file():
+    if (
+        not (adapter_path / "adapter_config.json").is_file()
+        or not (adapter_path / "adapter_model.safetensors").is_file()
+    ):
         raise BenchmarkError(f"worker did not publish a PEFT adapter: {path}")
     return payload
 
 
-def aggregate_case(model: ModelSpec, objective: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_case(
+    model: ModelSpec, objective: str, runs: list[dict[str, Any]]
+) -> dict[str, Any]:
     if len(runs) < MIN_REPETITIONS:
-        raise BenchmarkError(f"{model.label}/{objective} requires at least {MIN_REPETITIONS} repetitions")
-    walls = [finite_number(run["wall_seconds"], "wall seconds", positive=True) for run in runs]
+        raise BenchmarkError(
+            f"{model.label}/{objective} requires at least {MIN_REPETITIONS} repetitions"
+        )
+    walls = [
+        finite_number(run["wall_seconds"], "wall seconds", positive=True)
+        for run in runs
+    ]
     rates = [UPDATES / wall for wall in walls]
-    peaks = [finite_number(run["peak_gpu_memory_mib"], "peak GPU memory", positive=True) for run in runs]
+    peaks = [
+        finite_number(run["peak_gpu_memory_mib"], "peak GPU memory", positive=True)
+        for run in runs
+    ]
     losses = [finite_number(run["loss"], "loss") for run in runs]
-    grad_norms = [finite_number(run["mean_grad_norm"], "mean grad norm", positive=True) for run in runs]
+    grad_norms = [
+        finite_number(run["mean_grad_norm"], "mean grad norm", positive=True)
+        for run in runs
+    ]
     return {
         "label": model.label,
         "objective": objective,
@@ -347,7 +394,9 @@ def aggregate_case(model: ModelSpec, objective: str, runs: list[dict[str, Any]])
 def benchmark_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="append", default=[], metavar="LABEL=PATH")
-    parser.add_argument("--objective", action="append", choices=("dpo", "grpo"), default=[])
+    parser.add_argument(
+        "--objective", action="append", choices=("dpo", "grpo"), default=[]
+    )
     parser.add_argument("--repetitions", type=int, default=MIN_REPETITIONS)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
@@ -420,7 +469,9 @@ def run_benchmark(argv: list[str]) -> int:
             for objective in objectives:
                 runs: list[dict[str, Any]] = []
                 for repetition in range(1, args.repetitions + 1):
-                    run_dir = out_dir / model.label / objective / f"run-{repetition:02d}"
+                    run_dir = (
+                        out_dir / model.label / objective / f"run-{repetition:02d}"
+                    )
                     run_dir.mkdir(parents=True)
                     result_path = run_dir / "worker.json"
                     log_path = run_dir / "worker.log"
@@ -452,24 +503,33 @@ def run_benchmark(argv: list[str]) -> int:
                             "worker_result_path": str(result_path),
                         }
                     )
-                    summary["metadata"]["last_completed"] = f"{model.label}/{objective}/run-{repetition:02d}"
+                    summary["metadata"]["last_completed"] = (
+                        f"{model.label}/{objective}/run-{repetition:02d}"
+                    )
                     atomic_write_json(summary_path, summary)
                 summary["cases"].append(aggregate_case(model, objective, runs))
                 atomic_write_json(summary_path, summary)
         summary["status"] = "passed"
-        summary["metadata"]["completed_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        summary["metadata"]["completed_at_utc"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
         atomic_write_json(summary_path, summary)
         print(summary_path)
         return 0
     except BenchmarkError as error:
         if summary_path is not None and summary is not None:
             summary["status"] = "failed"
-            summary["metadata"]["completed_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            summary["metadata"]["completed_at_utc"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
             summary["metadata"]["failure"] = str(error)
             try:
                 atomic_write_json(summary_path, summary)
             except OSError as write_error:
-                print(f"Could not publish failed benchmark summary: {write_error}", file=sys.stderr)
+                print(
+                    f"Could not publish failed benchmark summary: {write_error}",
+                    file=sys.stderr,
+                )
         print(f"Gemma4 Unsloth preference benchmark error: {error}", file=sys.stderr)
         return 2
 
@@ -490,7 +550,9 @@ def configure_worker_environment() -> None:
 
 def render_user_prompt(processor: Any, prompt: str) -> str:
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-    rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    rendered = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
     if not isinstance(rendered, str) or not rendered:
         raise BenchmarkError("Gemma4 processor produced an empty prompt")
     return rendered
@@ -507,7 +569,9 @@ def sequence_hash_reward(completion_ids: list[list[int]]) -> list[float]:
     return rewards
 
 
-def training_evidence(trainer: Any, train_output: Any) -> tuple[float, float, list[float]]:
+def training_evidence(
+    trainer: Any, train_output: Any
+) -> tuple[float, float, list[float]]:
     loss = finite_number(getattr(train_output, "training_loss", None), "training loss")
     grad_norms: list[float] = []
     for entry in trainer.state.log_history:
@@ -533,7 +597,9 @@ def run_worker(argv: list[str]) -> int:
         worker_dir.mkdir(parents=True, exist_ok=True)
         versions = installed_versions()
         if versions != PINNED_VERSIONS:
-            raise BenchmarkError(f"pinned package mismatch: expected {PINNED_VERSIONS}, got {versions}")
+            raise BenchmarkError(
+                f"pinned package mismatch: expected {PINNED_VERSIONS}, got {versions}"
+            )
 
         configure_worker_environment()
 
@@ -555,7 +621,9 @@ def run_worker(argv: list[str]) -> int:
         try:
             model_config = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise BenchmarkError(f"cannot read model config {config_path}: {error}") from error
+            raise BenchmarkError(
+                f"cannot read model config {config_path}: {error}"
+            ) from error
         if not isinstance(model_config, dict):
             raise BenchmarkError(f"model config is not an object: {config_path}")
         expected_trainable_tensors = expected_qv_lora_trainable_tensors(model_config)
@@ -591,8 +659,16 @@ def run_worker(argv: list[str]) -> int:
             use_rslora=False,
             loftq_config=None,
         )
-        trainable_inventory = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
-        trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        trainable_inventory = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        ]
+        trainable_parameters = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
         trainable_tensors = len(trainable_inventory)
         if trainable_tensors != expected_trainable_tensors:
             raise BenchmarkError(
@@ -604,8 +680,12 @@ def run_worker(argv: list[str]) -> int:
             for name in trainable_inventory
         ):
             raise BenchmarkError("LoRA inventory escaped the Gemma4 language q/v scope")
-        trainable_inventory_sha256 = hashlib.sha256("\n".join(trainable_inventory).encode()).hexdigest()
-        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        trainable_inventory_sha256 = hashlib.sha256(
+            "\n".join(trainable_inventory).encode()
+        ).hexdigest()
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
         common = {
             "output_dir": str(trainer_path),
             "max_steps": args.worker_updates,
@@ -641,7 +721,13 @@ def run_worker(argv: list[str]) -> int:
         if args.worker_objective == "dpo":
             rendered_prompt = render_user_prompt(processor, DPO_FIXTURE["prompt"])
             dataset = Dataset.from_list(
-                [{"prompt": rendered_prompt, "chosen": DPO_FIXTURE["chosen"], "rejected": DPO_FIXTURE["rejected"]}]
+                [
+                    {
+                        "prompt": rendered_prompt,
+                        "chosen": DPO_FIXTURE["chosen"],
+                        "rejected": DPO_FIXTURE["rejected"],
+                    }
+                ]
             )
             training_args = DPOConfig(
                 **common,
@@ -665,10 +751,16 @@ def run_worker(argv: list[str]) -> int:
             input_contract = {
                 "raw": DPO_FIXTURE,
                 "rendered_prompt": rendered_prompt,
-                "prompt_ids": tokenizer(rendered_prompt, add_special_tokens=False)["input_ids"],
-                "chosen_ids": tokenizer(DPO_FIXTURE["chosen"], add_special_tokens=False)["input_ids"]
+                "prompt_ids": tokenizer(rendered_prompt, add_special_tokens=False)[
+                    "input_ids"
+                ],
+                "chosen_ids": tokenizer(
+                    DPO_FIXTURE["chosen"], add_special_tokens=False
+                )["input_ids"]
                 + [tokenizer.eos_token_id],
-                "rejected_ids": tokenizer(DPO_FIXTURE["rejected"], add_special_tokens=False)["input_ids"]
+                "rejected_ids": tokenizer(
+                    DPO_FIXTURE["rejected"], add_special_tokens=False
+                )["input_ids"]
                 + [tokenizer.eos_token_id],
             }
             objective_config = {
@@ -678,9 +770,13 @@ def run_worker(argv: list[str]) -> int:
             }
         else:
             rendered_prompt = render_user_prompt(processor, GRPO_FIXTURE["prompt"])
-            dataset = Dataset.from_list([{"prompt": rendered_prompt, "target": GRPO_TARGET}])
+            dataset = Dataset.from_list(
+                [{"prompt": rendered_prompt, "target": GRPO_TARGET}]
+            )
 
-            def token_hash_reward(completion_ids: list[list[int]], **_: Any) -> list[float]:
+            def token_hash_reward(
+                completion_ids: list[list[int]], **_: Any
+            ) -> list[float]:
                 return sequence_hash_reward(completion_ids)
 
             training_args = GRPOConfig(
@@ -713,7 +809,9 @@ def run_worker(argv: list[str]) -> int:
             input_contract = {
                 "raw": GRPO_FIXTURE,
                 "rendered_prompt": rendered_prompt,
-                "prompt_ids": tokenizer(rendered_prompt, add_special_tokens=False)["input_ids"],
+                "prompt_ids": tokenizer(rendered_prompt, add_special_tokens=False)[
+                    "input_ids"
+                ],
                 "reward_mode": "sequence-hash-fnv1a-token-ids",
             }
             objective_config = {
@@ -740,7 +838,9 @@ def run_worker(argv: list[str]) -> int:
         torch.cuda.synchronize()
         adapter_weights = adapter_path / "adapter_model.safetensors"
         if not adapter_weights.is_file():
-            raise BenchmarkError("PEFT adapter publication did not produce adapter_model.safetensors")
+            raise BenchmarkError(
+                "PEFT adapter publication did not produce adapter_model.safetensors"
+            )
         result = {
             "status": "passed",
             "objective": args.worker_objective,
@@ -751,8 +851,10 @@ def run_worker(argv: list[str]) -> int:
             "mean_grad_norm": mean_grad_norm,
             "grad_norms": grad_norms,
             "train_seconds": train_seconds,
-            "torch_peak_gpu_memory_mib": torch.cuda.max_memory_allocated() / (1024 * 1024),
-            "torch_peak_reserved_gpu_memory_mib": torch.cuda.max_memory_reserved() / (1024 * 1024),
+            "torch_peak_gpu_memory_mib": torch.cuda.max_memory_allocated()
+            / (1024 * 1024),
+            "torch_peak_reserved_gpu_memory_mib": torch.cuda.max_memory_reserved()
+            / (1024 * 1024),
             "trainable_parameters": trainable_parameters,
             "trainable_tensors": trainable_tensors,
             "expected_trainable_tensors": expected_trainable_tensors,
@@ -782,7 +884,11 @@ def run_worker(argv: list[str]) -> int:
         atomic_write_json(result_path, result)
         return 0
     except Exception as error:
-        failure = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
+        failure = {
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
         try:
             atomic_write_json(args.worker_result.resolve(), failure)
         except Exception:

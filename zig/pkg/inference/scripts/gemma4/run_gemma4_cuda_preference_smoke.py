@@ -127,14 +127,18 @@ def sha256_file(path: pathlib.Path) -> str:
 def atomic_write_json(path: pathlib.Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
 
 
 def parse_assignment(raw: str, option: str) -> tuple[str, str]:
     label, separator, value = raw.partition("=")
     if not separator or not LABEL_RE.fullmatch(label) or not value:
-        raise QualificationError(f"{option} must use a safe LABEL=VALUE assignment: {raw!r}")
+        raise QualificationError(
+            f"{option} must use a safe LABEL=VALUE assignment: {raw!r}"
+        )
     return label, value
 
 
@@ -156,13 +160,17 @@ def safetensors_header(path: pathlib.Path) -> dict[str, Any]:
                 raise QualificationError(f"truncated SafeTensors header length: {path}")
             header_size = int.from_bytes(size_raw, "little")
             if header_size <= 0 or header_size > MAX_SAFETENSORS_HEADER_BYTES:
-                raise QualificationError(f"invalid SafeTensors header size {header_size}: {path}")
+                raise QualificationError(
+                    f"invalid SafeTensors header size {header_size}: {path}"
+                )
             raw = source.read(header_size)
             if len(raw) != header_size:
                 raise QualificationError(f"truncated SafeTensors header: {path}")
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
-        raise QualificationError(f"cannot inspect SafeTensors header {path}: {error}") from error
+        raise QualificationError(
+            f"cannot inspect SafeTensors header {path}: {error}"
+        ) from error
     if not isinstance(value, dict):
         raise QualificationError(f"SafeTensors header must be an object: {path}")
     return value
@@ -178,7 +186,9 @@ def checkpoint_shards(model_dir: pathlib.Path) -> tuple[str, list[pathlib.Path]]
             parsed = json.loads(index.read_text(encoding="utf-8"))
             weight_map = parsed["weight_map"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise QualificationError(f"invalid sharded SafeTensors index {index}: {error}") from error
+            raise QualificationError(
+                f"invalid sharded SafeTensors index {index}: {error}"
+            ) from error
         if not isinstance(weight_map, dict) or not weight_map:
             raise QualificationError(f"empty sharded SafeTensors weight_map: {index}")
         resolved_root = model_dir.resolve()
@@ -193,7 +203,9 @@ def checkpoint_shards(model_dir: pathlib.Path) -> tuple[str, list[pathlib.Path]]
             try:
                 shard.relative_to(resolved_root)
             except ValueError as error:
-                raise QualificationError(f"shard escapes model directory: {name}") from error
+                raise QualificationError(
+                    f"shard escapes model directory: {name}"
+                ) from error
             if not shard.is_file():
                 raise QualificationError(f"missing SafeTensors shard: {shard}")
             shards.append(shard)
@@ -204,7 +216,9 @@ def checkpoint_shards(model_dir: pathlib.Path) -> tuple[str, list[pathlib.Path]]
             f"{model_dir} contains packed GGUF deployment weights; strict CUDA preference "
             "training requires a BF16 SafeTensors model directory"
         )
-    raise QualificationError(f"no model.safetensors or model.safetensors.index.json in {model_dir}")
+    raise QualificationError(
+        f"no model.safetensors or model.safetensors.index.json in {model_dir}"
+    )
 
 
 def text_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -222,7 +236,9 @@ def config_topology(config: dict[str, Any]) -> dict[str, bool | int | str | None
         return None
 
     return {
-        "model_type": config.get("model_type") if isinstance(config.get("model_type"), str) else None,
+        "model_type": config.get("model_type")
+        if isinstance(config.get("model_type"), str)
+        else None,
         "hidden_size": value("hidden_size"),
         "num_hidden_layers": value("num_hidden_layers"),
         "num_attention_heads": value("num_attention_heads"),
@@ -239,7 +255,9 @@ def config_topology(config: dict[str, Any]) -> dict[str, bool | int | str | None
     }
 
 
-def required_positive_int(mapping: dict[str, Any], name: str, config_path: pathlib.Path) -> int:
+def required_positive_int(
+    mapping: dict[str, Any], name: str, config_path: pathlib.Path
+) -> int:
     value = mapping.get(name)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise QualificationError(f"{name} must be a positive integer in {config_path}")
@@ -269,7 +287,9 @@ def validate_text_mlp_shapes(
         )
     use_double_wide_mlp = text.get("use_double_wide_mlp", False)
     if not isinstance(use_double_wide_mlp, bool):
-        raise QualificationError(f"use_double_wide_mlp must be boolean in {config_path}")
+        raise QualificationError(
+            f"use_double_wide_mlp must be boolean in {config_path}"
+        )
     if use_double_wide_mlp and num_kv_shared_layers == num_hidden_layers:
         raise QualificationError(
             f"double-wide MLP requires at least one non-shared KV donor layer in {config_path}"
@@ -322,7 +342,9 @@ def inspect_model(spec: ModelSpec) -> ModelPreflight:
     model_dir = spec.path.resolve()
     if not model_dir.is_dir():
         if model_dir.is_file() and model_dir.suffix.lower() == ".gguf":
-            raise QualificationError(f"{model_dir} is packed GGUF, not a BF16 training directory")
+            raise QualificationError(
+                f"{model_dir} is packed GGUF, not a BF16 training directory"
+            )
         raise QualificationError(f"model path is not a directory: {model_dir}")
     artifact_kind, shards = checkpoint_shards(model_dir)
     config_path = model_dir / "config.json"
@@ -330,16 +352,27 @@ def inspect_model(spec: ModelSpec) -> ModelPreflight:
         config_bytes = config_path.read_bytes()
         config = json.loads(config_bytes)
     except (OSError, json.JSONDecodeError) as error:
-        raise QualificationError(f"cannot load model config {config_path}: {error}") from error
+        raise QualificationError(
+            f"cannot load model config {config_path}: {error}"
+        ) from error
     if not isinstance(config, dict):
         raise QualificationError(f"model config must be an object: {config_path}")
     model_type = config.get("model_type")
-    normalized = model_type.lower().replace("_", "") if isinstance(model_type, str) else ""
+    normalized = (
+        model_type.lower().replace("_", "") if isinstance(model_type, str) else ""
+    )
     if not normalized.startswith("gemma4") or "assistant" in normalized:
-        raise QualificationError(f"expected Gemma4 model_type in {config_path}, found {model_type!r}")
+        raise QualificationError(
+            f"expected Gemma4 model_type in {config_path}, found {model_type!r}"
+        )
     if not any(
         (model_dir / name).is_file()
-        for name in ("tokenizer.json", "tokenizer.model", "spiece.model", "tokenizer_config.json")
+        for name in (
+            "tokenizer.json",
+            "tokenizer.model",
+            "spiece.model",
+            "tokenizer_config.json",
+        )
     ):
         raise QualificationError(f"no tokenizer artifact found in {model_dir}")
 
@@ -356,11 +389,20 @@ def inspect_model(spec: ModelSpec) -> ModelPreflight:
             dtype = metadata.get("dtype")
             shape = metadata.get("shape")
             if not isinstance(dtype, str) or not isinstance(shape, list):
-                raise QualificationError(f"incomplete tensor metadata {name!r} in {shard}")
-            if not all(isinstance(dimension, int) and not isinstance(dimension, bool) and dimension >= 0 for dimension in shape):
+                raise QualificationError(
+                    f"incomplete tensor metadata {name!r} in {shard}"
+                )
+            if not all(
+                isinstance(dimension, int)
+                and not isinstance(dimension, bool)
+                and dimension >= 0
+                for dimension in shape
+            ):
                 raise QualificationError(f"invalid tensor shape {name!r} in {shard}")
             if name in tensor_shapes:
-                raise QualificationError(f"duplicate tensor metadata {name!r} across checkpoint shards")
+                raise QualificationError(
+                    f"duplicate tensor metadata {name!r} across checkpoint shards"
+                )
             tensor_shapes[name] = tuple(shape)
             dtypes.add(dtype)
             tensor_count += 1
@@ -454,7 +496,11 @@ def query_gpu_memory_mib(pid: int) -> int | None:
         return None
     try:
         completed = subprocess.run(
-            [tool, "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            [
+                tool,
+                "--query-compute-apps=pid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
             text=True,
             capture_output=True,
             timeout=2,
@@ -478,7 +524,9 @@ def query_gpu_memory_mib(pid: int) -> int | None:
     return total if found else None
 
 
-def run_command(command: list[str], log_path: pathlib.Path, timeout_seconds: int) -> ProcessMetrics:
+def run_command(
+    command: list[str], log_path: pathlib.Path, timeout_seconds: int
+) -> ProcessMetrics:
     environment = os.environ.copy()
     environment["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
     environment["TERMITE_REQUIRE_TRAINING_GRAPH_EXECUTOR"] = "1"
@@ -495,7 +543,9 @@ def run_command(command: list[str], log_path: pathlib.Path, timeout_seconds: int
     with log_path.open("w", encoding="utf-8") as log:
         log.write("command: " + json.dumps(command) + "\n")
         log.flush()
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment, text=True)
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, env=environment, text=True
+        )
         try:
             while True:
                 observed = query_gpu_memory_mib(process.pid)
@@ -512,29 +562,43 @@ def run_command(command: list[str], log_path: pathlib.Path, timeout_seconds: int
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
-                    raise QualificationError(f"command timed out after {timeout_seconds}s; see {log_path}")
+                    raise QualificationError(
+                        f"command timed out after {timeout_seconds}s; see {log_path}"
+                    )
                 time.sleep(0.2)
         finally:
             if process.poll() is None:
                 process.terminate()
-    return ProcessMetrics(process.returncode, time.monotonic() - started, peak_gpu_mib, gpu_samples)
+    return ProcessMetrics(
+        process.returncode, time.monotonic() - started, peak_gpu_mib, gpu_samples
+    )
 
 
 def validate_process_metrics(metrics: ProcessMetrics) -> None:
     finite_number(metrics.wall_seconds, "process wall_seconds", positive=True)
     if metrics.gpu_samples < 1 or metrics.peak_gpu_memory_mib < 1:
-        raise QualificationError("strict CUDA qualification captured no positive nvidia-smi process-memory sample")
+        raise QualificationError(
+            "strict CUDA qualification captured no positive nvidia-smi process-memory sample"
+        )
 
 
 def validate_trainable_update(report: dict[str, Any], objective: str) -> dict[str, Any]:
     update = report.get("trainable_update")
     if not isinstance(update, dict):
-        raise QualificationError(f"{objective} report is missing trainable tensor movement evidence")
+        raise QualificationError(
+            f"{objective} report is missing trainable tensor movement evidence"
+        )
     tensor_count = nonnegative_int(update, "tensor_count", namespace="trainable_update")
-    changed = nonnegative_int(update, "changed_tensor_count", namespace="trainable_update")
-    delta = finite_number(update.get("max_abs_delta"), "trainable_update.max_abs_delta", positive=True)
+    changed = nonnegative_int(
+        update, "changed_tensor_count", namespace="trainable_update"
+    )
+    delta = finite_number(
+        update.get("max_abs_delta"), "trainable_update.max_abs_delta", positive=True
+    )
     if tensor_count < 1 or changed < 1 or changed > tensor_count:
-        raise QualificationError(f"{objective} report has an invalid changed-tensor count")
+        raise QualificationError(
+            f"{objective} report has an invalid changed-tensor count"
+        )
     if delta <= 0.0:
         raise QualificationError(f"{objective} report has no trainable delta")
     return update
@@ -544,14 +608,27 @@ def validate_execution_evidence(
     report: dict[str, Any], objective: str, optimizer_steps: int
 ) -> dict[str, Any]:
     if report.get("device_execution_scope") != DEVICE_EXECUTION_SCOPE:
-        raise QualificationError(f"{objective} report does not scope strict CUDA evidence to optimizer steps")
+        raise QualificationError(
+            f"{objective} report does not scope strict CUDA evidence to optimizer steps"
+        )
     evidence = report.get("device_execution")
-    if not isinstance(evidence, dict) or evidence.get("schema_version") != EXECUTION_EVIDENCE_SCHEMA:
-        raise QualificationError(f"{objective} report is missing strict CUDA execution evidence")
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != EXECUTION_EVIDENCE_SCHEMA
+    ):
+        raise QualificationError(
+            f"{objective} report is missing strict CUDA execution evidence"
+        )
     train_steps = nonnegative_int(evidence, "train_steps", namespace="device_execution")
     if train_steps < optimizer_steps:
-        raise QualificationError(f"{objective} report has fewer CUDA train steps than optimizer steps")
-    for name in ("graph_executor_partitions", "graph_executor_planned_dispatches", "cuda_kernel_launches"):
+        raise QualificationError(
+            f"{objective} report has fewer CUDA train steps than optimizer steps"
+        )
+    for name in (
+        "graph_executor_partitions",
+        "graph_executor_planned_dispatches",
+        "cuda_kernel_launches",
+    ):
         if nonnegative_int(evidence, name, namespace="device_execution") < 1:
             raise QualificationError(f"{objective} report has no {name}")
     for name in (
@@ -566,44 +643,77 @@ def validate_execution_evidence(
         "host_gradient_tensors",
     ):
         if nonnegative_int(evidence, name, namespace="device_execution") != 0:
-            raise QualificationError(f"{objective} strict CUDA fallback violation: {name} != 0")
+            raise QualificationError(
+                f"{objective} strict CUDA fallback violation: {name} != 0"
+            )
     for observed, declared in (
         ("runtime_input_uploads", "declared_runtime_input_uploads"),
         ("runtime_input_upload_bytes", "declared_runtime_input_upload_bytes"),
         ("runtime_input_h2d_bytes", "declared_runtime_input_h2d_bytes"),
     ):
-        if nonnegative_int(evidence, observed, namespace="device_execution") != nonnegative_int(
-            evidence, declared, namespace="device_execution"
-        ):
-            raise QualificationError(f"{objective} undeclared CUDA transfer: {observed} != {declared}")
+        if nonnegative_int(
+            evidence, observed, namespace="device_execution"
+        ) != nonnegative_int(evidence, declared, namespace="device_execution"):
+            raise QualificationError(
+                f"{objective} undeclared CUDA transfer: {observed} != {declared}"
+            )
     eval_steps = nonnegative_int(evidence, "eval_steps", namespace="device_execution")
-    if nonnegative_int(evidence, "graph_execution_d2h_bytes", namespace="device_execution") > (
-        train_steps + eval_steps
-    ) * 4:
-        raise QualificationError(f"{objective} graph readback exceeds one f32 loss per graph step")
+    if (
+        nonnegative_int(
+            evidence, "graph_execution_d2h_bytes", namespace="device_execution"
+        )
+        > (train_steps + eval_steps) * 4
+    ):
+        raise QualificationError(
+            f"{objective} graph readback exceeds one f32 loss per graph step"
+        )
     # A hot training step may read back its scalar loss; an optimizer update
     # may additionally read back one scalar global gradient norm for clipping
     # and report telemetry. No tensor-sized or unaccounted D2H is allowed.
     scalar_readback_budget = (train_steps + eval_steps + optimizer_steps) * 4
     for name in ("training_runtime_d2h_bytes", "cuda_d2h_bytes"):
-        if nonnegative_int(evidence, name, namespace="device_execution") > scalar_readback_budget:
-            raise QualificationError(f"{objective} CUDA scalar readback budget exceeded: {name}")
-    if nonnegative_int(evidence, "cuda_largest_d2h_transfer_bytes", namespace="device_execution") > 4:
+        if (
+            nonnegative_int(evidence, name, namespace="device_execution")
+            > scalar_readback_budget
+        ):
+            raise QualificationError(
+                f"{objective} CUDA scalar readback budget exceeded: {name}"
+            )
+    if (
+        nonnegative_int(
+            evidence, "cuda_largest_d2h_transfer_bytes", namespace="device_execution"
+        )
+        > 4
+    ):
         raise QualificationError(f"{objective} CUDA readback exceeds one f32 scalar")
-    if nonnegative_int(evidence, "peak_resident_bytes", namespace="device_execution") < 1:
-        raise QualificationError(f"{objective} report has no device-resident memory evidence")
+    if (
+        nonnegative_int(evidence, "peak_resident_bytes", namespace="device_execution")
+        < 1
+    ):
+        raise QualificationError(
+            f"{objective} report has no device-resident memory evidence"
+        )
     return evidence
 
 
-def validate_report(path: pathlib.Path, objective: str, expected_updates: int) -> dict[str, Any]:
+def validate_report(
+    path: pathlib.Path, objective: str, expected_updates: int
+) -> dict[str, Any]:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise QualificationError(f"cannot load {objective} report {path}: {error}") from error
+        raise QualificationError(
+            f"cannot load {objective} report {path}: {error}"
+        ) from error
     if not isinstance(report, dict):
         raise QualificationError(f"{objective} report must be an object")
-    if report.get("policy_backend") != "cuda" or report.get("optimizer_backend") != "cuda":
-        raise QualificationError(f"{objective} policy and optimizer must both report CUDA")
+    if (
+        report.get("policy_backend") != "cuda"
+        or report.get("optimizer_backend") != "cuda"
+    ):
+        raise QualificationError(
+            f"{objective} policy and optimizer must both report CUDA"
+        )
     optimizer_steps = report.get("optimizer_steps")
     cuda_optimizer_steps = report.get("cuda_optimizer_steps")
     if optimizer_steps != expected_updates or cuda_optimizer_steps != optimizer_steps:
@@ -612,15 +722,27 @@ def validate_report(path: pathlib.Path, objective: str, expected_updates: int) -
             f"optimizer_steps={optimizer_steps!r}, cuda_optimizer_steps={cuda_optimizer_steps!r}"
         )
     micro_batches = report.get("micro_batch_steps")
-    if not isinstance(micro_batches, int) or isinstance(micro_batches, bool) or micro_batches < optimizer_steps:
-        raise QualificationError(f"{objective} report has invalid micro-batch accounting")
+    if (
+        not isinstance(micro_batches, int)
+        or isinstance(micro_batches, bool)
+        or micro_batches < optimizer_steps
+    ):
+        raise QualificationError(
+            f"{objective} report has invalid micro-batch accounting"
+        )
     finite_number(report.get("loss"), f"{objective}.loss")
-    finite_number(report.get("mean_grad_norm"), f"{objective}.mean_grad_norm", positive=True)
+    finite_number(
+        report.get("mean_grad_norm"), f"{objective}.mean_grad_norm", positive=True
+    )
     if objective == "grpo":
         finite_number(report.get("mean_reward"), "grpo.mean_reward")
         finite_number(report.get("reward_std"), "grpo.reward_std", positive=True)
         informative_groups = report.get("informative_groups")
-        if not isinstance(informative_groups, int) or isinstance(informative_groups, bool) or informative_groups < 1:
+        if (
+            not isinstance(informative_groups, int)
+            or isinstance(informative_groups, bool)
+            or informative_groups < 1
+        ):
             raise QualificationError("grpo report has no informative reward groups")
         expected_exact_contract = {
             "group_size": GRPO_GROUP_SIZE,
@@ -691,12 +813,18 @@ def run_case(
     recipe_path = run_dir / "recipe.json"
     atomic_write_json(
         recipe_path,
-        recipe_for(objective, model, dataset_path, run_dir, max_seq_len, rank, alpha, updates),
+        recipe_for(
+            objective, model, dataset_path, run_dir, max_seq_len, rank, alpha, updates
+        ),
     )
     log_path = run_dir / "run.log"
-    metrics = run_command(finetune_command(antfly_bin, recipe_path), log_path, timeout_seconds)
+    metrics = run_command(
+        finetune_command(antfly_bin, recipe_path), log_path, timeout_seconds
+    )
     if metrics.return_code != 0:
-        raise QualificationError(f"{model.label} {objective} exited {metrics.return_code}; see {log_path}")
+        raise QualificationError(
+            f"{model.label} {objective} exited {metrics.return_code}; see {log_path}"
+        )
     validate_process_metrics(metrics)
     report_path = run_dir / f"{objective}_report.json"
     report = validate_report(report_path, objective, updates)
@@ -705,7 +833,9 @@ def run_case(
     initial_sha256 = sha256_file(initial)
     trained_sha256 = sha256_file(trained)
     if initial_sha256 == trained_sha256:
-        raise QualificationError(f"{model.label} {objective} persisted adapter did not change")
+        raise QualificationError(
+            f"{model.label} {objective} persisted adapter did not change"
+        )
     throughput = updates / metrics.wall_seconds
     finite_number(throughput, "optimizer_steps_per_second", positive=True)
     evidence = report["device_execution"]
@@ -734,9 +864,16 @@ def run_case(
 def benchmark_aggregate(cases: list[dict[str, Any]]) -> dict[str, Any]:
     if not cases:
         raise QualificationError("cannot aggregate an empty benchmark")
-    seconds = [finite_number(case["wall_seconds"], "wall_seconds", positive=True) for case in cases]
+    seconds = [
+        finite_number(case["wall_seconds"], "wall_seconds", positive=True)
+        for case in cases
+    ]
     throughputs = [
-        finite_number(case["optimizer_steps_per_second"], "optimizer_steps_per_second", positive=True)
+        finite_number(
+            case["optimizer_steps_per_second"],
+            "optimizer_steps_per_second",
+            positive=True,
+        )
         for case in cases
     ]
     memory = [
@@ -765,13 +902,20 @@ def load_unsloth_baseline(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise QualificationError(f"cannot load Unsloth baseline {path}: {error}") from error
-    if not isinstance(payload, dict) or payload.get("schema_version") != BASELINE_SCHEMA:
+        raise QualificationError(
+            f"cannot load Unsloth baseline {path}: {error}"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != BASELINE_SCHEMA
+    ):
         raise QualificationError(f"Unsloth baseline must use {BASELINE_SCHEMA}")
     if payload.get("status") != "passed":
         raise QualificationError("Unsloth baseline must have terminal passed status")
     if payload.get("protocol") != protocol:
-        raise QualificationError("Unsloth baseline protocol does not exactly match the Zig benchmark protocol")
+        raise QualificationError(
+            "Unsloth baseline protocol does not exactly match the Zig benchmark protocol"
+        )
     expected_configs = {item.label: item.config_sha256 for item in preflight}
     rows = payload.get("cases")
     if not isinstance(rows, list):
@@ -786,11 +930,17 @@ def load_unsloth_baseline(
             continue
         key = (label, objective)
         if key in indexed:
-            raise QualificationError(f"duplicate Unsloth baseline case: {label}/{objective}")
+            raise QualificationError(
+                f"duplicate Unsloth baseline case: {label}/{objective}"
+            )
         if row.get("model_config_sha256") != expected_configs[label]:
-            raise QualificationError(f"Unsloth baseline model fingerprint mismatch: {label}/{objective}")
+            raise QualificationError(
+                f"Unsloth baseline model fingerprint mismatch: {label}/{objective}"
+            )
         if row.get("optimizer_steps") != protocol["updates"]:
-            raise QualificationError(f"Unsloth optimizer-step mismatch: {label}/{objective}")
+            raise QualificationError(
+                f"Unsloth optimizer-step mismatch: {label}/{objective}"
+            )
         for name in (
             "median_wall_seconds",
             "median_optimizer_steps_per_second",
@@ -798,7 +948,11 @@ def load_unsloth_baseline(
             "loss",
             "mean_grad_norm",
         ):
-            finite_number(row.get(name), f"Unsloth {label}/{objective}.{name}", positive=name != "loss")
+            finite_number(
+                row.get(name),
+                f"Unsloth {label}/{objective}.{name}",
+                positive=name != "loss",
+            )
         indexed[key] = row
     missing = [
         f"{item.label}/{objective}"
@@ -807,20 +961,30 @@ def load_unsloth_baseline(
         if (item.label, objective) not in indexed
     ]
     if missing:
-        raise QualificationError("Unsloth baseline is missing cases: " + ", ".join(missing))
+        raise QualificationError(
+            "Unsloth baseline is missing cases: " + ", ".join(missing)
+        )
     return indexed
 
 
 def compare_with_unsloth(
     zig: dict[str, Any], baseline: dict[str, Any]
 ) -> dict[str, Any]:
-    zig_wall = finite_number(zig["median_wall_seconds"], "Zig median wall seconds", positive=True)
-    base_wall = finite_number(baseline["median_wall_seconds"], "Unsloth median wall seconds", positive=True)
+    zig_wall = finite_number(
+        zig["median_wall_seconds"], "Zig median wall seconds", positive=True
+    )
+    base_wall = finite_number(
+        baseline["median_wall_seconds"], "Unsloth median wall seconds", positive=True
+    )
     zig_rate = finite_number(
-        zig["median_optimizer_steps_per_second"], "Zig optimizer throughput", positive=True
+        zig["median_optimizer_steps_per_second"],
+        "Zig optimizer throughput",
+        positive=True,
     )
     base_rate = finite_number(
-        baseline["median_optimizer_steps_per_second"], "Unsloth optimizer throughput", positive=True
+        baseline["median_optimizer_steps_per_second"],
+        "Unsloth optimizer throughput",
+        positive=True,
     )
     zig_memory = finite_number(
         zig["median_peak_gpu_memory_mib"], "Zig peak GPU memory", positive=True
@@ -881,10 +1045,14 @@ def validate_grpo_targets(
         return
     missing = [model.label for model in models if not targets.get(model.label)]
     if missing:
-        raise QualificationError("GRPO requires --grpo-target for: " + ", ".join(missing))
+        raise QualificationError(
+            "GRPO requires --grpo-target for: " + ", ".join(missing)
+        )
     if benchmark:
         mismatched = [
-            model.label for model in models if targets[model.label] != BENCHMARK_GRPO_TARGET
+            model.label
+            for model in models
+            if targets[model.label] != BENCHMARK_GRPO_TARGET
         ]
         if mismatched:
             raise QualificationError(
@@ -896,8 +1064,12 @@ def validate_grpo_targets(
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--model", action="append", required=True, metavar="LABEL=DIR")
-    result.add_argument("--grpo-target", action="append", default=[], metavar="LABEL=TEXT")
-    result.add_argument("--objective", action="append", choices=("dpo", "grpo"), default=[])
+    result.add_argument(
+        "--grpo-target", action="append", default=[], metavar="LABEL=TEXT"
+    )
+    result.add_argument(
+        "--objective", action="append", choices=("dpo", "grpo"), default=[]
+    )
     result.add_argument("--antfly-bin", type=pathlib.Path)
     result.add_argument("--out", type=pathlib.Path)
     result.add_argument("--preflight-only", action="store_true")
@@ -922,14 +1094,22 @@ def main(argv: list[str] | None = None) -> int:
             or args.alpha <= 0
             or args.timeout_seconds < 1
         ):
-            raise QualificationError("repetitions, sequence length, rank, alpha, and timeout must be positive")
+            raise QualificationError(
+                "repetitions, sequence length, rank, alpha, and timeout must be positive"
+            )
         if args.benchmark and args.repetitions < BENCHMARK_MIN_REPETITIONS:
-            raise QualificationError(f"--benchmark requires at least {BENCHMARK_MIN_REPETITIONS} repetitions")
+            raise QualificationError(
+                f"--benchmark requires at least {BENCHMARK_MIN_REPETITIONS} repetitions"
+            )
         if args.benchmark and args.unsloth_baseline is None:
-            raise QualificationError("--benchmark requires --unsloth-baseline for a matched comparison")
+            raise QualificationError(
+                "--benchmark requires --unsloth-baseline for a matched comparison"
+            )
         if not args.benchmark and args.unsloth_baseline is not None:
             raise QualificationError("--unsloth-baseline requires --benchmark")
-        if args.benchmark and (args.max_seq_len != 128 or rank != 16 or args.alpha != 32.0):
+        if args.benchmark and (
+            args.max_seq_len != 128 or rank != 16 or args.alpha != 32.0
+        ):
             raise QualificationError(
                 "--benchmark locks --max-seq-len=128, --rank=16, and --alpha=32"
             )
@@ -938,32 +1118,50 @@ def main(argv: list[str] | None = None) -> int:
         targets = parse_unique_assignments(args.grpo_target, "--grpo-target")
         unknown_targets = sorted(set(targets) - set(models_raw))
         if unknown_targets:
-            raise QualificationError("--grpo-target has no matching --model: " + ", ".join(unknown_targets))
-        models = [ModelSpec(label, pathlib.Path(path)) for label, path in models_raw.items()]
+            raise QualificationError(
+                "--grpo-target has no matching --model: " + ", ".join(unknown_targets)
+            )
+        models = [
+            ModelSpec(label, pathlib.Path(path)) for label, path in models_raw.items()
+        ]
         preflight = [inspect_model(model) for model in models]
         preflight_payload = [asdict(item) for item in preflight]
         if args.preflight_only:
-            print(json.dumps({"status": "passed", "models": preflight_payload}, indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {"status": "passed", "models": preflight_payload},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
 
         objectives = list(dict.fromkeys(args.objective or ["dpo", "grpo"]))
         validate_grpo_targets(models, targets, objectives, args.benchmark)
         package_root = pathlib.Path(__file__).resolve().parents[2]
-        antfly_bin = (args.antfly_bin or package_root / "zig-out/bin/antfly-inference").resolve()
+        antfly_bin = (
+            args.antfly_bin or package_root / "zig-out/bin/antfly-inference"
+        ).resolve()
         if not antfly_bin.is_file() or not os.access(antfly_bin, os.X_OK):
-            raise QualificationError(f"inference binary is not executable: {antfly_bin}")
+            raise QualificationError(
+                f"inference binary is not executable: {antfly_bin}"
+            )
         out_dir = (
             args.out
             or pathlib.Path("/tmp")
             / f"antfly-gemma4-cuda-preference-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
         ).resolve()
         if out_dir.exists():
-            raise QualificationError(f"refusing to reuse existing output directory: {out_dir}")
+            raise QualificationError(
+                f"refusing to reuse existing output directory: {out_dir}"
+            )
 
         updates = BENCHMARK_UPDATES if args.benchmark else SMOKE_UPDATES
         protocol = benchmark_protocol(args.max_seq_len, rank, args.alpha)
         baseline = (
-            load_unsloth_baseline(args.unsloth_baseline.resolve(), preflight, objectives, protocol)
+            load_unsloth_baseline(
+                args.unsloth_baseline.resolve(), preflight, objectives, protocol
+            )
             if args.benchmark
             else {}
         )
@@ -973,7 +1171,9 @@ def main(argv: list[str] | None = None) -> int:
             "status": "running",
             "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "mode": "benchmark" if args.benchmark else "smoke",
-            "protocol": protocol if args.benchmark else {**protocol, "updates": SMOKE_UPDATES},
+            "protocol": protocol
+            if args.benchmark
+            else {**protocol, "updates": SMOKE_UPDATES},
             "antfly_bin": str(antfly_bin),
             "antfly_bin_sha256": sha256_file(antfly_bin),
             "runner_sha256": sha256_file(pathlib.Path(__file__).resolve()),
