@@ -4966,6 +4966,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .embed_dense_texts = inferenceProviderEmbedDenseTexts,
         .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
         .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
+        .embed_sparse_texts_with_context = inferenceProviderEmbedSparseTextsWithContext,
         .embed_dense_parts = inferenceProviderEmbedDenseParts,
         .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
         .rerank_texts = inferenceProviderRerankTexts,
@@ -5004,6 +5005,15 @@ fn invokeInferenceProvider(
             return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
         }
     };
+    const RequestProgress = struct {
+        fn update(raw: ?*anyopaque, phase: u8, completed: u64, total: u64) callconv(.c) void {
+            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return));
+            const active = context.* orelse return;
+            const progress = active.progress orelse return;
+            const typed_phase = std.enums.fromInt(antfly.inference.request_context.Phase, phase) orelse return;
+            progress.update(.{ .phase = typed_phase, .completed = completed, .total = total });
+        }
+    };
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
@@ -5015,6 +5025,10 @@ fn invokeInferenceProvider(
         .out_response_json = &response_json,
         .cancellation = if (request_context != null and request_context.?.cancellation != null)
             .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
+        else
+            .{},
+        .progress = if (request_context != null and request_context.?.progress != null)
+            .{ .context = @constCast(&request_context), .update_progress = RequestProgress.update }
         else
             .{},
     };
@@ -5298,6 +5312,20 @@ fn inferenceProviderEmbedSparseTexts(
         .model = model,
         .texts = texts,
     }, null);
+}
+
+fn inferenceProviderEmbedSparseTextsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![]antfly.db.embedder.SparseEmbedding {
+    try context.check();
+    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
+        .model = model,
+        .texts = texts,
+    }, context);
 }
 
 fn inferenceProviderEmbedDenseParts(

@@ -18,6 +18,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const BackendType = @import("backends.zig").BackendType;
 const memory = @import("../runtime/tier/memory.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const ResidentInput = struct {
     value: ops.CT,
@@ -314,6 +315,9 @@ pub const Session = struct {
         runResident: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentInputs: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
         runResidentTextEmbedding: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) anyerror!?ResidentOutputs = null,
+        runWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror![]Tensor = null,
+        runResidentWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
+        runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
     };
 
     /// Run a forward pass with the given input tensors.
@@ -461,6 +465,23 @@ pub const RunPermit = struct {
         return self.session.vtable.run(self.session.ptr, inputs, allocator);
     }
 
+    pub fn runWithControl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) ![]Tensor {
+        const active = control orelse return self.run(inputs, allocator);
+        try active.check();
+        const outputs = if (self.session.vtable.runWithControl) |run_controlled|
+            try run_controlled(self.session.ptr, inputs, allocator, active)
+        else
+            try self.run(inputs, allocator);
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return outputs;
+    }
+
     pub fn runResident(
         self: *RunPermit,
         inputs: []const Tensor,
@@ -468,6 +489,23 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         const run_resident = self.session.vtable.runResident orelse return null;
         return run_resident(self.session.ptr, inputs, allocator);
+    }
+
+    pub fn runResidentWithControl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?ResidentOutputs {
+        const active = control orelse return self.runResident(inputs, allocator);
+        try active.check();
+        var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
+            (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
+        else
+            (try self.runResident(inputs, allocator)) orelse return null;
+        errdefer outputs.deinit();
+        try active.check();
+        return outputs;
     }
 
     pub fn runResidentInputs(
@@ -490,6 +528,24 @@ pub const RunPermit = struct {
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
 
+    pub fn runResidentTextEmbeddingWithControl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        request: ResidentTextEmbeddingRequest,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?ResidentOutputs {
+        const active = control orelse return self.runResidentTextEmbedding(inputs, request, allocator);
+        try active.check();
+        var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
+            (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
+        else
+            (try self.runResidentTextEmbedding(inputs, request, allocator)) orelse return null;
+        errdefer outputs.deinit();
+        try active.check();
+        return outputs;
+    }
+
     pub fn deinit(self: *RunPermit) void {
         if (self.lease) |*lease| lease.release();
         self.lease = null;
@@ -504,7 +560,7 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 8), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 11), info.@"struct".fields.len);
 }
 
 const AdmissionProbeSession = struct {
@@ -552,6 +608,75 @@ const AdmissionProbeSession = struct {
         .close = close,
     };
 };
+
+const DeadlineProbeSession = struct {
+    fn run(
+        _: *anyopaque,
+        _: []const Tensor,
+        _: std.mem.Allocator,
+    ) ![]Tensor {
+        return error.UncontrolledRunUsed;
+    }
+
+    fn runWithControl(
+        _: *anyopaque,
+        _: []const Tensor,
+        _: std.mem.Allocator,
+        control: InferenceExecutionControl,
+    ) ![]Tensor {
+        while (true) {
+            try control.check();
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn inputInfo(_: *anyopaque) []const TensorInfo {
+        return &.{};
+    }
+
+    fn outputInfo(_: *anyopaque) []const TensorInfo {
+        return &.{};
+    }
+
+    fn backend(_: *anyopaque) BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    const vtable = Session.VTable{
+        .run = run,
+        .inputInfo = inputInfo,
+        .outputInfo = outputInfo,
+        .backend = backend,
+        .close = close,
+        .runWithControl = runWithControl,
+    };
+};
+
+test "controlled blocked backend expires and admission unwinds" {
+    var controller = memory.AdmissionController{};
+    var probe: u8 = 0;
+    const session = Session{
+        .ptr = &probe,
+        .vtable = &DeadlineProbeSession.vtable,
+        .run_admission = .{
+            .controller = &controller,
+            .backend_class = .cpu,
+            .limits = .{},
+            .static_workspace_bytes = 1,
+        },
+    };
+    var permit = try session.admit(.{ .batch = 1, .sequence = 1 });
+    defer permit.deinit();
+    try std.testing.expect(controller.snapshot().host_scratch_bytes > 0);
+    const control = InferenceExecutionControl{
+        .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_ms,
+    };
+    try std.testing.expectError(error.Timeout, permit.runWithControl(&.{}, std.testing.allocator, control));
+    permit.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
 
 test "run admission scales dynamic outputs and honors reserved backend workspace" {
     var controller = memory.AdmissionController{};

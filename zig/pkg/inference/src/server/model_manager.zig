@@ -18,6 +18,7 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -5827,6 +5828,21 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            control,
         );
     }
 
@@ -5841,6 +5857,7 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            null,
         );
     }
 
@@ -5860,6 +5877,7 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
         );
     }
 
@@ -5875,6 +5893,7 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
         );
     }
 
@@ -6022,8 +6041,26 @@ pub const ModelManager = struct {
         self: *ModelManager,
         flight_key: []const u8,
         flight: *LoadFlight,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
-        flight.completed.waitUncancelable(flight.io);
+        while (!flight.completed.isSet()) {
+            if (control) |active| active.update(.loading_model, 0, 1) catch |err| {
+                self.releaseLoadFlightWaiter(flight_key, flight);
+                return err;
+            };
+            flight.completed.waitTimeout(flight.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => {
+                    self.releaseLoadFlightWaiter(flight_key, flight);
+                    return err;
+                },
+            };
+        }
         var removed_key: ?[]const u8 = null;
         var destroy_flight = false;
         self.lockLoadedModels();
@@ -6054,13 +6091,35 @@ pub const ModelManager = struct {
         };
     }
 
+    fn releaseLoadFlightWaiter(self: *ModelManager, flight_key: []const u8, flight: *LoadFlight) void {
+        var removed_key: ?[]const u8 = null;
+        var destroy_flight = false;
+        self.lockLoadedModels();
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        if (flight.refs == 0) {
+            if (flight.registered) {
+                const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
+                std.debug.assert(removed.value == flight);
+                flight.registered = false;
+                removed_key = removed.key;
+            }
+            destroy_flight = true;
+        }
+        self.unlockLoadedModels();
+        if (removed_key) |key| self.allocator.free(key);
+        if (destroy_flight) self.allocator.destroy(flight);
+    }
+
     fn loadFromDirCoordinated(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -6092,7 +6151,7 @@ pub const ModelManager = struct {
         if (self.in_flight_loads.get(flight_key)) |flight| {
             flight.refs += 1;
             self.unlockLoadedModels();
-            return self.waitForLoadFlight(flight_key, flight);
+            return self.waitForLoadFlight(flight_key, flight, control);
         }
 
         const flight = self.allocator.create(LoadFlight) catch |err| {
@@ -6136,6 +6195,7 @@ pub const ModelManager = struct {
             &session_manager,
             cache_default_alias,
             policy.a4b_request,
+            control,
         ) catch |err| {
             self.finishLoadFlight(flight, null, err);
             self.releaseLoadFlight(flight_key, flight);
@@ -6152,10 +6212,13 @@ pub const ModelManager = struct {
         sm: *backends.SessionManager,
         cache_default_alias: bool,
         a4b_request: ?backend_contracts.A4bInferenceRequest,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 4);
 
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        if (control) |active| try active.update(.loading_model, 1, 4);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
         var policy_backend_scratch: [7]backends.BackendType = undefined;
@@ -6246,12 +6309,14 @@ pub const ModelManager = struct {
                 sp_tok = sp;
             },
         }
+        if (control) |active| try active.update(.loading_model, 2, 4);
         if (tokenizer_resource_lease) |*lease| {
             try lease.retain(tokenizer_admission_plan.?.resident);
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
         var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
+        if (control) |active| try active.update(.loading_model, 3, 4);
         errdefer if (loaded_session.resource_lease) |*lease| lease.release();
         const session = loaded_session.session;
         var session_owned = true;

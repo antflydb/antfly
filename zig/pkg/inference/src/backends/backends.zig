@@ -844,6 +844,22 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
         man.audio_projection_path == null;
 }
 
+fn bgeM3MetalQualified() bool {
+    if (build_options.enable_wasm or !build_options.link_libc) return false;
+    const value = std.c.getenv("ANTFLY_BGE_M3_METAL_QUALIFIED") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1") or
+        std.ascii.eqlIgnoreCase(std.mem.span(value), "true");
+}
+
+fn shouldPreferNativeBgeM3(man: manifest_mod.ModelManifest) bool {
+    return !bgeM3MetalQualified() and man.model_type == .embedder and
+        std.mem.eql(u8, man.config_model_arch, "xlm-roberta") and
+        man.bert_model_type == .roberta and
+        man.bert_vocab_size == 250002 and man.hidden_size == 1024 and
+        man.num_hidden_layers == 24 and man.num_attention_heads == 16 and
+        man.intermediate_size == 4096 and man.max_position_embeddings == 8194;
+}
+
 fn effectiveBackendOrder(
     allocator: std.mem.Allocator,
     scratch: *[backend_order_capacity]BackendType,
@@ -852,6 +868,9 @@ fn effectiveBackendOrder(
 ) []const BackendType {
     const prefer_blas_before_gpu = shouldPreferBlasBeforeGpu(allocator, manifest);
     if (manifest) |man| {
+        if (shouldPreferNativeBgeM3(man)) {
+            return reorderNativeAheadOfOnnx(scratch, preferred, true);
+        }
         if (shouldPreferNativeTextEncoder(man)) {
             return reorderNativeAheadOfOnnx(scratch, preferred, true);
         }
@@ -980,6 +999,26 @@ test "effective backend order preserves order for non-gguf models" {
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
+}
+
+test "unqualified BGE-M3 prefers native ahead of Metal" {
+    const preferred = [_]BackendType{ .metal, .native };
+    var scratch: [backend_order_capacity]BackendType = undefined;
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .config_model_arch = "xlm-roberta",
+        .bert_model_type = .roberta,
+        .bert_vocab_size = 250002,
+        .hidden_size = 1024,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .intermediate_size = 4096,
+        .max_position_embeddings = 8194,
+        .safetensors_path = "model.safetensors",
+    };
+    const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
+    try std.testing.expectEqualSlices(BackendType, &.{ .native, .metal }, effective);
 }
 
 test "effective backend order prefers native layoutlmv3 before onnx" {

@@ -19,6 +19,7 @@ const platform = @import("antfly_platform");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const inference_request_context = @import("../../../inference/request_context.zig");
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
@@ -844,6 +845,7 @@ fn clearIndexEmbeddingActivity(runtime: *EnrichmentRuntime) void {
 
 fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize) void {
     const now_ms = runtime.config.clock.nowRealtimeMs();
+    const now_ns = platform_time.monotonicNs();
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -851,6 +853,10 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        runtime.active_embed_batch_started_ns = now_ns;
+        runtime.active_inference_phase = .loading_model;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
         return;
     }
@@ -864,6 +870,10 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        runtime.active_embed_batch_started_ns = now_ns;
+        runtime.active_inference_phase = .loading_model;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
         runtime.mutex.unlock(io);
     } else {
@@ -873,6 +883,10 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        runtime.active_embed_batch_started_ns = now_ns;
+        runtime.active_inference_phase = .loading_model;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
     }
     runtime.notifyActivityHook();
@@ -887,6 +901,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
             runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_progress_ns = platform_time.monotonicNs();
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -894,6 +909,10 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        runtime.active_embed_batch_started_ns = 0;
+        runtime.active_inference_phase = .queued;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
         return;
     }
@@ -908,6 +927,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
             runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_progress_ns = platform_time.monotonicNs();
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -915,6 +935,10 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        runtime.active_embed_batch_started_ns = 0;
+        runtime.active_inference_phase = .queued;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
         runtime.mutex.unlock(io);
     } else {
@@ -925,6 +949,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
             runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_progress_ns = platform_time.monotonicNs();
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -932,9 +957,56 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        runtime.active_embed_batch_started_ns = 0;
+        runtime.active_inference_phase = .queued;
+        runtime.active_model_len = 0;
+        runtime.active_backend_len = 0;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
     }
     runtime.notifyActivityHook();
+}
+
+fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.Progress) void {
+    const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw.?));
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.active_inference_phase = progress.phase;
+        runtime.last_progress_ns = platform_time.monotonicNs();
+        if (progress.model.len > 0) {
+            runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
+            @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
+        }
+        if (progress.backend.len > 0) {
+            runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
+            @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
+        }
+        return;
+    }
+    const io_impl = runtime.io_impl orelse return;
+    const io = io_impl.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.active_inference_phase = progress.phase;
+    runtime.last_progress_ns = platform_time.monotonicNs();
+    if (progress.model.len > 0) {
+        runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
+        @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
+    }
+    if (progress.backend.len > 0) {
+        runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
+        @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
+    }
+    runtime.mutex.unlock(io);
+    runtime.notifyActivityHook();
+}
+
+fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const u8 {
+    if (!active) return "idle";
+    return switch (phase) {
+        .queued, .loading_model, .preparing_weights => "loading_model",
+        .tokenizing => "tokenizing",
+        .executing => "executing",
+        .serializing => "serializing",
+        .publishing => "publishing",
+    };
 }
 
 // Request-path embeddings can overlap each other and the single replay
@@ -1347,6 +1419,62 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
     }
     if (attempt + 1 >= @max(runtime.config.inline_retry_max_attempts, 1)) return .yield_to_worker;
     return .retry_inline;
+}
+
+/// A canceled or expired backend may still be unwinding model-owned state.
+/// Retry it only through the durable backoff path, never inline.
+fn inferenceControlFailure(err: anyerror) bool {
+    return err == error.Timeout or err == error.Cancelled or
+        err == error.EnrichmentWaitTimeout or err == error.EnrichmentWaitCanceled;
+}
+
+const InferenceControlFailurePolicy = struct {
+    next_batch_cap: ?usize = null,
+    open_circuit: bool = false,
+};
+
+fn inferenceControlFailurePolicy(err: anyerror, batch_items: usize) ?InferenceControlFailurePolicy {
+    if (!inferenceControlFailure(err)) return null;
+    if (err == error.Cancelled or err == error.EnrichmentWaitCanceled) return .{};
+    if (batch_items > 1) return .{ .next_batch_cap = @max(@as(usize, 1), batch_items / 2) };
+    return .{ .open_circuit = true };
+}
+
+fn noteInferenceControlFailure(runtime: *EnrichmentRuntime, err: anyerror, batch_items: usize) void {
+    const policy = inferenceControlFailurePolicy(err, batch_items) orelse return;
+    if (err == error.Timeout or err == error.EnrichmentWaitTimeout) {
+        _ = runtime.inference_timeout_count.fetchAdd(1, .monotonic);
+        if (policy.next_batch_cap) |reduced| {
+            const current = runtime.adaptive_embed_batch_max.load(.acquire);
+            if (reduced < current) runtime.adaptive_embed_batch_max.store(reduced, .release);
+        } else if (policy.open_circuit) {
+            runtime.provider_circuit_open_until_ms.store(
+                runtime.config.clock.nowRealtimeMs() +| workerRetryDelayMs(1),
+                .release,
+            );
+        }
+    } else if (err == error.Cancelled or err == error.EnrichmentWaitCanceled) {
+        _ = runtime.inference_cancel_count.fetchAdd(1, .monotonic);
+    }
+}
+
+test "inference timeout policy avoids inline retry storms" {
+    const reduced = inferenceControlFailurePolicy(error.Timeout, 8).?;
+    try std.testing.expectEqual(@as(?usize, 4), reduced.next_batch_cap);
+    try std.testing.expect(!reduced.open_circuit);
+
+    const singleton = inferenceControlFailurePolicy(error.Timeout, 1).?;
+    try std.testing.expect(singleton.next_batch_cap == null);
+    try std.testing.expect(singleton.open_circuit);
+
+    const cancelled = inferenceControlFailurePolicy(error.Cancelled, 8).?;
+    try std.testing.expect(cancelled.next_batch_cap == null);
+    try std.testing.expect(!cancelled.open_circuit);
+    try std.testing.expect(inferenceControlFailurePolicy(error.ConnectionResetByPeer, 8) == null);
+}
+
+fn effectiveRequestEmbedBatchItems(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) usize {
+    return @min(requestEmbedBatchItems(runtime.alloc, request), runtime.adaptive_embed_batch_max.load(.acquire));
 }
 
 const EnrichmentErrorDisposition = enum {
@@ -2147,6 +2275,8 @@ fn rememberPublishedGeneratedBatch(runtime: *EnrichmentRuntime, batch: derived_t
 }
 
 fn checkProviderInvocation(runtime: *EnrichmentRuntime, foreground_bounded: bool) !void {
+    if (runtime.provider_circuit_open_until_ms.load(.acquire) > runtime.config.clock.nowRealtimeMs())
+        return error.InferenceCircuitOpen;
     const guard = runtime.active_provider_guard;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return;
     try guard.check();
@@ -2241,6 +2371,10 @@ fn embedDenseWithRetry(
         try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vector = dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims) catch |err| {
             try checkProviderFailureGuard(runtime);
+            if (inferenceControlFailure(err)) {
+                noteInferenceControlFailure(runtime, err, 1);
+                return err;
+            }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -2271,6 +2405,10 @@ fn embedDenseBatchWithRetry(
         try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vectors = dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims) catch |err| {
             try checkProviderFailureGuard(runtime);
+            if (inferenceControlFailure(err)) {
+                noteInferenceControlFailure(runtime, err, texts.len);
+                return err;
+            }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -2301,6 +2439,10 @@ fn embedDensePartsWithRetry(
         try checkProviderInvocation(runtime, dense_embedder.foreground_bounded);
         const vector = dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims) catch |err| {
             try checkProviderFailureGuard(runtime);
+            if (inferenceControlFailure(err)) {
+                noteInferenceControlFailure(runtime, err, 1);
+                return err;
+            }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -2330,6 +2472,10 @@ fn embedSparseWithRetry(
         try checkProviderInvocation(runtime, sparse_embedder.foreground_bounded);
         const sparse = sparse_embedder.embedSparse(runtime.alloc, embedding_name, text) catch |err| {
             try checkProviderFailureGuard(runtime);
+            if (inferenceControlFailure(err)) {
+                noteInferenceControlFailure(runtime, err, 1);
+                return err;
+            }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -2360,6 +2506,10 @@ fn embedSparseBatchWithRetry(
         try checkProviderInvocation(runtime, sparse_embedder.foreground_bounded);
         const sparse_batch = sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts) catch |err| {
             try checkProviderFailureGuard(runtime);
+            if (inferenceControlFailure(err)) {
+                noteInferenceControlFailure(runtime, err, texts.len);
+                return err;
+            }
             if (!isRetryableEnrichmentError(err)) return err;
             switch (transientEmbedRetryDecision(runtime, attempt)) {
                 .retry_inline => {},
@@ -2840,12 +2990,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     active_embed_batch_bytes: u64 = 0,
     active_embed_batch_max_bytes: u64 = 0,
     active_embed_batch_started_ms: u64 = 0,
+    active_embed_batch_started_ns: u64 = 0,
+    last_progress_ns: u64 = 0,
+    active_inference_phase: inference_request_context.Phase = .queued,
+    active_model_buf: [256]u8 = undefined,
+    active_model_len: usize = 0,
+    active_backend_buf: [32]u8 = undefined,
+    active_backend_len: usize = 0,
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
     last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
+    adaptive_embed_batch_max: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    provider_circuit_open_until_ms: std.atomic.Value(u64) = .init(0),
+    inference_timeout_count: std.atomic.Value(u64) = .init(0),
+    inference_cancel_count: std.atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -3284,12 +3445,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     active_embed_batch_bytes: u64 = 0,
     active_embed_batch_max_bytes: u64 = 0,
     active_embed_batch_started_ms: u64 = 0,
+    active_embed_batch_started_ns: u64 = 0,
+    last_progress_ns: u64 = 0,
+    active_inference_phase: inference_request_context.Phase = .queued,
+    active_model_buf: [256]u8 = undefined,
+    active_model_len: usize = 0,
+    active_backend_buf: [32]u8 = undefined,
+    active_backend_len: usize = 0,
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
     last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
+    adaptive_embed_batch_max: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    provider_circuit_open_until_ms: std.atomic.Value(u64) = .init(0),
+    inference_timeout_count: std.atomic.Value(u64) = .init(0),
+    inference_cancel_count: std.atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -3436,6 +3608,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.config.cancellation = cancellation;
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.setCancellation(cancellation);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setCancellation(cancellation);
+        const progress = inference_request_context.ProgressSink{ .ptr = self, .update_fn = noteInferenceProgress };
+        if (self.config.dense_embedder) |dense_embedder| dense_embedder.setProgress(progress);
+        if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.setProgress(progress);
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
     }
@@ -3789,6 +3964,18 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.config.asset_producer != null or
             self.config.enable_without_producers;
         const worker_started = self.future != null;
+        const stall_reason = enrichmentWorkerStallReason(.{
+            .enabled = enabled,
+            .pending = self.target_sequence > self.applied_sequence,
+            .worker_started = worker_started,
+            .retrying = self.retrying,
+            .worker_failed = self.worker_failed,
+            .active_started_ns = self.active_embed_batch_started_ns,
+            .last_progress_ns = self.last_progress_ns,
+            .active_phase = self.active_inference_phase,
+            .now_ns = platform_time.monotonicNs(),
+            .grace_ns = @max(self.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms,
+        });
         return .{
             .enabled = enabled,
             .lease_owned = ownership_stats.lease_owned,
@@ -3812,14 +3999,18 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .worker_started = worker_started,
-            .stalled = enrichmentWorkerStalled(
-                enabled,
-                self.target_sequence,
-                self.applied_sequence,
-                worker_started,
-                self.retrying,
-                self.worker_failed,
-            ),
+            .stalled = stall_reason != null,
+            .stall_reason = stall_reason orelse "",
+            .active_phase = statusPhaseName(self.active_embed_batch_items > 0, self.active_inference_phase),
+            .active_model = self.active_model_buf[0..self.active_model_len],
+            .active_backend = self.active_backend_buf[0..self.active_backend_len],
+            .active_deadline_ms = if (self.active_embed_batch_started_ms > 0)
+                self.active_embed_batch_started_ms +| @max(self.config.sync_wait_timeout_ms, 1)
+            else
+                0,
+            .last_progress_ms = self.last_embed_batch_completed_ms,
+            .inference_timeout_count = self.inference_timeout_count.load(.acquire),
+            .inference_cancel_count = self.inference_cancel_count.load(.acquire),
             .skip_by_hash_count = self.skip_by_hash_count,
             .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
@@ -3953,28 +4144,49 @@ fn broadcastRuntimeStateChanged(runtime: *EnrichmentRuntime, io: Io) void {
     Io.futexWake(io, u32, &runtime.sync_wait_epoch.raw, std.math.maxInt(u32));
 }
 
-fn enrichmentWorkerStalled(
+const EnrichmentStallInputs = struct {
     enabled: bool,
-    target_sequence: u64,
-    applied_sequence: u64,
+    pending: bool,
     worker_started: bool,
     retrying: bool,
     worker_failed: bool,
-) bool {
-    return enabled and
-        target_sequence > applied_sequence and
-        !worker_started and
-        !retrying and
-        !worker_failed;
+    active_started_ns: u64,
+    last_progress_ns: u64,
+    active_phase: inference_request_context.Phase,
+    now_ns: u64,
+    grace_ns: u64,
+};
+
+fn enrichmentWorkerStallReason(input: EnrichmentStallInputs) ?[]const u8 {
+    if (!input.enabled or !input.pending or input.retrying or input.worker_failed) return null;
+    if (!input.worker_started) return "worker_missing";
+    if (input.active_started_ns != 0 and input.now_ns -| input.active_started_ns >= input.grace_ns) {
+        return switch (input.active_phase) {
+            .queued, .loading_model, .preparing_weights => "model_loading",
+            .serializing, .publishing => "publishing_overdue",
+            .tokenizing, .executing => "embedding_overdue",
+        };
+    }
+    if (input.last_progress_ns != 0 and input.now_ns -| input.last_progress_ns >= input.grace_ns)
+        return "publishing_overdue";
+    return null;
 }
 
 test "enrichment runtime status reports worker lifecycle diagnostics" {
-    try std.testing.expect(enrichmentWorkerStalled(true, 5, 1, false, false, false));
-    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, true, false, false));
-    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, true, false));
-    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, false, true));
-    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 5, false, false, false));
-    try std.testing.expect(!enrichmentWorkerStalled(false, 5, 1, false, false, false));
+    const base = EnrichmentStallInputs{ .enabled = true, .pending = true, .worker_started = true, .retrying = false, .worker_failed = false, .active_started_ns = 0, .last_progress_ns = 0, .active_phase = .executing, .now_ns = 100, .grace_ns = 10 };
+    var missing = base;
+    missing.worker_started = false;
+    try std.testing.expectEqualStrings("worker_missing", enrichmentWorkerStallReason(missing).?);
+    var embedding = base;
+    embedding.active_started_ns = 1;
+    try std.testing.expectEqualStrings("embedding_overdue", enrichmentWorkerStallReason(embedding).?);
+    var loading = embedding;
+    loading.active_phase = .loading_model;
+    try std.testing.expectEqualStrings("model_loading", enrichmentWorkerStallReason(loading).?);
+    var publishing = base;
+    publishing.last_progress_ns = 1;
+    try std.testing.expectEqualStrings("publishing_overdue", enrichmentWorkerStallReason(publishing).?);
+    try std.testing.expect(enrichmentWorkerStallReason(base) == null);
 }
 
 test "enrichment visibility wait wakes immediately on applied state" {
@@ -9623,7 +9835,7 @@ fn processMaterializedChunkDenseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     const max_window_items = generatedReplayWindowItems();
-    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
 
     var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
@@ -9851,7 +10063,7 @@ fn processMaterializedChunkSparseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     const max_window_items = generatedReplayWindowItems();
-    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
 
     var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
@@ -10127,7 +10339,7 @@ fn processPlainDenseWindow(
         processed[i] = true;
 
         const seed = requests[i];
-        const max_batch_items = requestEmbedBatchItems(runtime.alloc, seed);
+        const max_batch_items = effectiveRequestEmbedBatchItems(runtime, seed);
         const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         const embedding_artifact_name = requestEmbeddingName(seed);
         const consumer_indexes = try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, embedding_artifact_name, seed.expected_dims);
@@ -10237,7 +10449,7 @@ fn processChunkedDenseWindow(
             freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
             chunk_items.deinit(runtime.alloc);
         }
-        const max_batch_items = requestEmbedBatchItems(runtime.alloc, seed);
+        const max_batch_items = effectiveRequestEmbedBatchItems(runtime, seed);
         const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         var batch_source_bytes: usize = 0;
 
@@ -11014,7 +11226,7 @@ fn buildChunkDenseEmbeddingsFromSources(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
     var start: usize = 0;
     while (start < chunk_texts.items.len) {
@@ -11142,7 +11354,7 @@ fn buildChunkSparseEmbeddingsFromSources(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
     var start: usize = 0;
     while (start < chunk_texts.items.len) {

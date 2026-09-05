@@ -16,6 +16,33 @@ const std = @import("std");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_time = @import("antfly_platform").time;
 
+pub const Phase = enum(u8) {
+    queued,
+    loading_model,
+    preparing_weights,
+    tokenizing,
+    executing,
+    serializing,
+    publishing,
+};
+
+pub const Progress = struct {
+    phase: Phase,
+    completed: u64 = 0,
+    total: u64 = 0,
+    model: []const u8 = "",
+    backend: []const u8 = "",
+};
+
+pub const ProgressSink = struct {
+    ptr: ?*anyopaque = null,
+    update_fn: *const fn (?*anyopaque, Progress) void,
+
+    pub fn update(self: ProgressSink, progress: Progress) void {
+        self.update_fn(self.ptr, progress);
+    }
+};
+
 /// Provider-neutral request lifetime for in-process inference operations.
 /// Absolute deadlines survive queueing and component boundaries; cancellation
 /// remains a borrowed semantic token within the process.
@@ -23,6 +50,7 @@ pub const RequestContext = struct {
     io: std.Io,
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
+    progress: ?ProgressSink = null,
 
     pub fn check(self: RequestContext) !void {
         if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -35,6 +63,22 @@ pub const RequestContext = struct {
         const deadline = self.deadline_ns orelse return null;
         const remaining_ns = deadline -| platform_time.monotonicNs();
         return @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
+    }
+
+    pub fn update(self: RequestContext, phase: Phase, completed: u64, total: u64) !void {
+        try self.check();
+        if (self.progress) |sink| sink.update(.{ .phase = phase, .completed = completed, .total = total });
+    }
+
+    pub fn updateDetail(self: RequestContext, phase: Phase, completed: u64, total: u64, model: []const u8, backend: []const u8) !void {
+        try self.check();
+        if (self.progress) |sink| sink.update(.{
+            .phase = phase,
+            .completed = completed,
+            .total = total,
+            .model = model,
+            .backend = backend,
+        });
     }
 };
 

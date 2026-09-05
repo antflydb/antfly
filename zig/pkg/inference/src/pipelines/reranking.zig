@@ -98,16 +98,8 @@ pub const GenerativeQualificationTrace = struct {
     }
 };
 
-/// Optional request-lifetime hook installed by servers. The pipeline checks it
-/// at bounded batch boundaries without depending on an HTTP or API context.
-pub const ExecutionControl = struct {
-    ptr: ?*anyopaque,
-    check_fn: *const fn (?*anyopaque) anyerror!void,
-
-    pub fn check(self: ExecutionControl) !void {
-        return self.check_fn(self.ptr);
-    }
-};
+/// Compatibility alias while callers migrate to the package-wide contract.
+pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const RerankingPipeline = struct {
     allocator: std.mem.Allocator,
@@ -632,9 +624,14 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, allocator);
+        return permit.runWithControl(inputs, allocator, self.execution_control);
     }
 
     fn admitTextRun(
@@ -642,9 +639,10 @@ pub const RerankingPipeline = struct {
         batch: usize,
         sequence: usize,
     ) !session_mod.RunPermit {
+        try self.checkExecution();
         const tokens = std.math.mul(usize, batch, sequence) catch
             return error.ResourceLimitExceeded;
-        return self.session.admit(.{
+        var permit = try self.session.admit(.{
             .batch = batch,
             .sequence = sequence,
             .input_bytes = std.math.mul(usize, tokens, 24) catch
@@ -652,6 +650,9 @@ pub const RerankingPipeline = struct {
             .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
                 return error.ResourceLimitExceeded,
         });
+        errdefer permit.deinit();
+        try self.checkExecution();
+        return permit;
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
@@ -754,7 +755,7 @@ test "cross encoder observes cancellation between bounded batches" {
         fn check(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             const count = self.checks.fetchAdd(1, .acq_rel) + 1;
-            if (count >= 3) return error.Cancelled;
+            if (count >= 6) return error.Cancelled;
         }
     };
 

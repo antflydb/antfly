@@ -97,6 +97,7 @@ pub const ReadingPipeline = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     config: ReadConfig,
     florence_final_logits_bias_zero_cache: ?*?bool = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -118,6 +119,7 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
@@ -157,6 +159,7 @@ pub const ReadingPipeline = struct {
     /// back to the existing serial path; native Florence uses a batched encoder
     /// and KV-decoder path where the selected backend supports it.
     pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        if (self.execution_control) |control| try control.check();
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
@@ -655,7 +658,16 @@ pub const ReadingPipeline = struct {
                 pv_tensor,
                 prompt_i32,
             );
-        } else try self.vision_encoder.run(&.{pv_tensor}, allocator);
+        } else blk: {
+            if (self.execution_control) |control| try control.update(.executing, 0, 1);
+            const outputs = try self.vision_encoder.run(&.{pv_tensor}, allocator);
+            if (self.execution_control) |control| control.check() catch |err| {
+                for (outputs) |*output| output.deinit();
+                allocator.free(outputs);
+                return err;
+            };
+            break :blk outputs;
+        };
         if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
         defer {
             for (encoder_outputs) |*t| {
@@ -1292,7 +1304,9 @@ pub const ReadingPipeline = struct {
             try decoder_inputs.append(allocator, enc_hidden);
 
             const decoder_run_start = nowNs();
+            if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
             const dec_outputs = try self.decoder.run(decoder_inputs.items, allocator);
+            if (self.execution_control) |control| try control.check();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;

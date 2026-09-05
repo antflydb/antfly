@@ -213,7 +213,7 @@ pub const LoadedVisionReader = struct {
     fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {
         const prefix_len: usize = if (self.dec_config.forced_bos_token_id == null) 1 else 2;
         const max_length = try resolveMaxLength(self.dec_config.max_length, options.max_tokens, prefix_len);
-        return reading_pipeline_mod.ReadingPipeline.init(
+        var reader_pipeline = reading_pipeline_mod.ReadingPipeline.init(
             self.allocator,
             self.encoder_session,
             self.decoder_session,
@@ -239,6 +239,8 @@ pub const LoadedVisionReader = struct {
             },
             &self.florence_final_logits_bias_zero,
         );
+        reader_pipeline.execution_control = options.execution_control;
+        return reader_pipeline;
     }
 
     fn tokenizer(self: *LoadedVisionReader) tokenizer_mod.Tokenizer {

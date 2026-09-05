@@ -34,6 +34,7 @@ const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const qwen3_embedding_resident_override_level = 4;
 
@@ -265,6 +266,8 @@ pub const EmbeddingPipeline = struct {
     /// from the same loaded model. Tokenization and tensor preparation remain
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    /// Request lifetime propagated from ingress through model execution.
+    execution_control: ?InferenceExecutionControl = null,
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
@@ -306,6 +309,7 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of texts, returning [batch_size][hidden_dim] embeddings.
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, @intCast(texts.len));
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
         const text_session = self.textEncodingSession();
         if (textSessionBatchPlan(text_session, texts.len)) |plan| {
@@ -359,6 +363,7 @@ pub const EmbeddingPipeline = struct {
 
         var effective_len: usize = if (self.config.trim_padding_to_batch_max and !fixed_len) 1 else max_len;
         for (texts, 0..) |text, i| {
+            if (self.execution_control) |control| try control.update(.tokenizing, @intCast(i), @intCast(texts.len));
             const token_text = if (self.config.text_prefix.len > 0)
                 try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text })
             else
@@ -374,6 +379,7 @@ pub const EmbeddingPipeline = struct {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
             }
         }
+        if (self.execution_control) |control| try control.update(.tokenizing, @intCast(texts.len), @intCast(texts.len));
 
         // The tokenizer/preprocessing lease above covers the conservative
         // maximum-context host allocation. Once the real longest row is known,
@@ -382,6 +388,7 @@ pub const EmbeddingPipeline = struct {
         // batches to reserve 8K-token attention/FFN scratch.
         const admitted_tokens = std.math.mul(usize, batch, effective_len) catch
             return error.ResourceLimitExceeded;
+        if (self.execution_control) |control| try control.check();
         var run_permit = try text_session.admit(.{
             .batch = batch,
             .sequence = effective_len,
@@ -389,6 +396,7 @@ pub const EmbeddingPipeline = struct {
                 return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
+        if (self.execution_control) |control| try control.check();
 
         const all_ids = try alloc.alloc(i32, batch * effective_len);
         defer alloc.free(all_ids);
@@ -462,6 +470,7 @@ pub const EmbeddingPipeline = struct {
         for (attention_mask, 0..) |value, index| {
             mask_i32[index] = std.math.cast(i32, value) orelse return error.InvalidInputShape;
         }
+        if (self.execution_control) |control| try control.check();
         var run_permit = try text_session.admit(.{
             .batch = batch,
             .sequence = seq_len,
@@ -471,6 +480,7 @@ pub const EmbeddingPipeline = struct {
                 return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
+        if (self.execution_control) |control| try control.check();
         return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_permit);
     }
 
@@ -490,10 +500,15 @@ pub const EmbeddingPipeline = struct {
         run_permit: *session_mod.RunPermit,
     ) ![][]f32 {
         const alloc = self.allocator;
+        if (self.execution_control) |control| try control.update(.executing, 0, 0);
         if (self.execution_lock) |lock| {
-            platform.sync.lockYielding(lock);
+            if (self.execution_control) |control|
+                try control.lock(lock)
+            else
+                platform.sync.lockYielding(lock);
         }
         defer if (self.execution_lock) |lock| lock.unlock();
+        if (self.execution_control) |control| try control.check();
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(
@@ -516,7 +531,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run inference
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try run_permit.run(inputs, alloc);
+        var outputs = try run_permit.runWithControl(inputs, alloc, self.execution_control);
         logEmbedTiming("text.encoder", batch, encoder_start);
         defer {
             for (outputs) |*o| o.deinit();
@@ -585,6 +600,7 @@ pub const EmbeddingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < texts.len) {
+            if (self.execution_control) |control| try control.check();
             const real_count = @min(plan.batch_size, texts.len - offset);
             if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
             const batch_embeddings = try self.embedDirect(
@@ -760,7 +776,7 @@ pub const EmbeddingPipeline = struct {
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
-        self.lockExecution();
+        try self.lockExecution();
         defer self.unlockExecution();
         return self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
@@ -1043,7 +1059,7 @@ pub const EmbeddingPipeline = struct {
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
-        self.lockExecution();
+        try self.lockExecution();
         defer self.unlockExecution();
         return self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
@@ -1053,9 +1069,12 @@ pub const EmbeddingPipeline = struct {
         };
     }
 
-    fn lockExecution(self: *EmbeddingPipeline) void {
+    fn lockExecution(self: *EmbeddingPipeline) !void {
         const mutex = self.execution_lock orelse return;
-        platform.sync.lockYielding(mutex);
+        if (self.execution_control) |control|
+            try control.lock(mutex)
+        else
+            platform.sync.lockYielding(mutex);
     }
 
     fn unlockExecution(self: *EmbeddingPipeline) void {
@@ -1590,7 +1609,7 @@ pub const EmbeddingPipeline = struct {
                 "unknown_projection_input_dim",
             );
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1641,10 +1660,10 @@ pub const EmbeddingPipeline = struct {
     ) !?[][]f32 {
         const encoder_start = embedTimingStart(self.print_timing);
         if (self.config.pooling == .mean) {
-            if (try permit.runResidentTextEmbedding(inputs, .{
+            if (try permit.runResidentTextEmbeddingWithControl(inputs, .{
                 .pooling = .mean,
                 .normalize = self.config.normalize,
-            }, self.allocator)) |ready_output_value| {
+            }, self.allocator, self.execution_control)) |ready_output_value| {
                 var ready_outputs = ready_output_value;
                 defer ready_outputs.deinit();
                 if (ready_outputs.outputs.len == 0) return error.NoOutputTensors;
@@ -1655,7 +1674,7 @@ pub const EmbeddingPipeline = struct {
                 return embeddings;
             }
         }
-        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1699,7 +1718,7 @@ pub const EmbeddingPipeline = struct {
             return self.residentProjectionFallback(modality, projection_phase, batch, "unknown_projection_input_dim");
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResidentWithControl(inputs, self.allocator, self.execution_control)) orelse
             return self.residentProjectionFallback(modality, encoder_phase, batch, "unsupported");
         logEmbedTiming(encoder_phase, batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -2572,7 +2591,7 @@ test "embedding execution gate owns the supplied mutex" {
         .execution_lock = &gate,
     };
 
-    pipeline.lockExecution();
+    try pipeline.lockExecution();
     try std.testing.expect(!gate.tryLock());
     pipeline.unlockExecution();
 

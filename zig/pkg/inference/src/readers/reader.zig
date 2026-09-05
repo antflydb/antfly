@@ -294,6 +294,7 @@ pub const LoadedReader = union(enum) {
     }
 
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        if (options.execution_control) |control| try control.check();
         try validateReadOptions(options);
         const allocator = self.resultAllocator();
         const results = try switch (self.*) {
@@ -307,6 +308,11 @@ pub const LoadedReader = union(enum) {
             allocator.free(results);
         }
         for (results) |*result| try sanitizeResultUtf8(result);
+        if (options.execution_control) |control| control.check() catch |err| {
+            for (results) |*result| result.deinit();
+            allocator.free(results);
+            return err;
+        };
         return results;
     }
 

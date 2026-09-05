@@ -15,7 +15,8 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
-const RequestContext = @import("request_context.zig").RequestContext;
+const request_context = @import("request_context.zig");
+const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -123,6 +124,13 @@ pub const AntflyProvider = struct {
         model: []const u8,
         texts: []const []const u8,
     ) anyerror![]db_embedder.SparseEmbedding,
+    embed_sparse_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        context: EmbeddingRequestContext,
+    ) anyerror![]db_embedder.SparseEmbedding = null,
     embed_dense_parts: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -266,6 +274,7 @@ pub const InitOptions = struct {
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    progress: ?request_context.ProgressSink = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -497,6 +506,7 @@ pub const ManagedEmbeddingEntry = struct {
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    progress: ?request_context.ProgressSink = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     embedding_names: [][]u8 = &.{},
@@ -1006,6 +1016,7 @@ pub const ManagedEmbedder = struct {
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
+            .set_progress_fn = setEmbedderProgress,
             .foreground_bounded = self.denseForegroundBounded(),
         };
     }
@@ -1017,6 +1028,7 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_batch_fn = embedSparseBatch,
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
+            .set_progress_fn = setEmbedderProgress,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
     }
@@ -1288,6 +1300,11 @@ pub const ManagedEmbedder = struct {
     fn setEmbedderCancellation(ptr: *anyopaque, cancellation: CancellationToken) void {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         for (self.entries) |*entry| entry.cancellation = cancellation;
+    }
+
+    fn setEmbedderProgress(ptr: *anyopaque, progress: request_context.ProgressSink) void {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        for (self.entries) |*entry| entry.progress = progress;
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -3673,6 +3690,7 @@ fn buildManagedEmbeddingEntry(
         .bounded_http_request = options.bounded_http_request,
         .deadline_ns = options.deadline_ns,
         .cancellation = options.cancellation,
+        .progress = options.progress,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .embedding_names = owned_embedding_names,
@@ -4291,6 +4309,13 @@ fn embedWithEntryPartsForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]f32 {
+    try embeddingRequestContext(entry, task_type).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         try waitForEntryPacer(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -4400,13 +4425,26 @@ fn embedSparseBatchWithEntry(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
 ) ![]db_embedder.SparseEmbedding {
+    try embeddingRequestContext(entry, .retrieval_document).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
     switch (entry.provider) {
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const embeddings = AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts }) catch |err|
+                const context = embeddingRequestContext(entry, .retrieval_document);
+                try context.check();
+                const embeddings = (if (local.embed_sparse_texts_with_context) |embed_with_context|
+                    AntflyProviderBoundary.call("embed_sparse_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
+                else
+                    AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
+                try context.check();
                 try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
             }
@@ -4729,6 +4767,13 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    try embeddingRequestContext(entry, task_type).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
     switch (entry.provider) {
         .openai, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {

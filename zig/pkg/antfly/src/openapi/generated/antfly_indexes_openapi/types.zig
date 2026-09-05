@@ -3597,8 +3597,17 @@ pub const EnrichmentRuntimeStatus = struct {
     worker_failed: bool,
     /// Whether the background enrichment worker is currently running.
     worker_started: bool,
-    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    /// Whether pending work has no worker or has exceeded its execution/progress deadline.
     stalled: bool,
+    stall_reason: []const u8,
+    active_phase: []const u8,
+    active_model: []const u8,
+    active_backend: []const u8,
+    /// Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+    active_deadline_ms: i64,
+    last_progress_ms: i64,
+    inference_timeout_count: i64,
+    inference_cancel_count: i64,
     skip_by_hash_count: i64,
     skipped_source_count: i64,
     codec_decode_failures: i64,

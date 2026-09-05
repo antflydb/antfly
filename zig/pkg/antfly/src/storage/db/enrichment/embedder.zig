@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const inference_request_context = @import("../../../inference/request_context.zig");
 const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
@@ -29,6 +30,7 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const EmbedSetCancellationFn = *const fn (ptr: *anyopaque, cancellation: CancellationToken) void;
+pub const EmbedSetProgressFn = *const fn (ptr: *anyopaque, progress: inference_request_context.ProgressSink) void;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
 pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
@@ -52,6 +54,7 @@ pub const DenseEmbedder = struct {
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
+    set_progress_fn: ?EmbedSetProgressFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
     /// implementations that cannot make this guarantee; background replay
@@ -109,6 +112,11 @@ pub const DenseEmbedder = struct {
         const set_cancellation_fn = self.set_cancellation_fn orelse return;
         set_cancellation_fn(self.ptr, cancellation);
     }
+
+    pub fn setProgress(self: DenseEmbedder, progress: inference_request_context.ProgressSink) void {
+        const set_progress_fn = self.set_progress_fn orelse return;
+        set_progress_fn(self.ptr, progress);
+    }
 };
 
 pub const SparseEmbedder = struct {
@@ -117,6 +125,7 @@ pub const SparseEmbedder = struct {
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
+    set_progress_fn: ?EmbedSetProgressFn = null,
     foreground_bounded: bool = false,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
@@ -146,6 +155,11 @@ pub const SparseEmbedder = struct {
     pub fn setCancellation(self: SparseEmbedder, cancellation: CancellationToken) void {
         const set_cancellation_fn = self.set_cancellation_fn orelse return;
         set_cancellation_fn(self.ptr, cancellation);
+    }
+
+    pub fn setProgress(self: SparseEmbedder, progress: inference_request_context.ProgressSink) void {
+        const set_progress_fn = self.set_progress_fn orelse return;
+        set_progress_fn(self.ptr, progress);
     }
 };
 

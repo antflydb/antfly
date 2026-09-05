@@ -1434,6 +1434,14 @@ components:
         - worker_failed
         - worker_started
         - stalled
+        - stall_reason
+        - active_phase
+        - active_model
+        - active_backend
+        - active_deadline_ms
+        - last_progress_ms
+        - inference_timeout_count
+        - inference_cancel_count
         - skip_by_hash_count
         - skipped_source_count
         - codec_decode_failures
@@ -1509,7 +1517,30 @@ components:
           description: "Whether the background enrichment worker is currently running."
         stalled:
           type: boolean
-          description: "Whether work is pending with no running worker, retry, or terminal failure explaining the backlog."
+          description: "Whether pending work has no worker or has exceeded its execution/progress deadline."
+        stall_reason:
+          type: string
+          enum: ["", worker_missing, model_loading, embedding_overdue, publishing_overdue]
+        active_phase:
+          type: string
+          enum: [idle, loading_model, tokenizing, executing, serializing, publishing]
+        active_model:
+          type: string
+        active_backend:
+          type: string
+        active_deadline_ms:
+          type: integer
+          format: uint64
+          description: "Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock."
+        last_progress_ms:
+          type: integer
+          format: uint64
+        inference_timeout_count:
+          type: integer
+          format: uint64
+        inference_cancel_count:
+          type: integer
+          format: uint64
         skip_by_hash_count:
           type: integer
           format: uint64

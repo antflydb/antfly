@@ -22,6 +22,7 @@
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
@@ -3297,6 +3298,7 @@ pub const NativeGenerationPipeline = struct {
     /// intentionally withholding private reasoning text.
     continue_ctx: ?*anyopaque = null,
     continue_fn: ?*const fn (ctx: *anyopaque) bool = null,
+    execution_control: ?InferenceExecutionControl = null,
     /// Local diagnostics may request the complete generated sequence. Serving
     /// callers must keep the default so private Gemma4 channel tokens stay hidden.
     return_raw_token_ids: bool = false,
@@ -3342,6 +3344,13 @@ pub const NativeGenerationPipeline = struct {
 
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
+
+    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !void {
+        if (self.execution_control) |control|
+            try control.lock(mutex)
+        else
+            platform.sync.lockYielding(mutex);
+    }
 
     fn shouldStopOnEos(self: *const NativeGenerationPipeline, config: GenerationConfig, token: usize) bool {
         return !config.ignore_eos and self.gpt_config.isEosToken(token);
@@ -3426,6 +3435,7 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const grammar_opens_public_final_channel =
@@ -3579,6 +3589,7 @@ pub const NativeGenerationPipeline = struct {
             encoded_ids = owned_encoded.?.ids;
             encoded_attention_mask = owned_encoded.?.attention_mask;
         }
+        if (self.execution_control) |control| try control.update(.tokenizing, 1, 1);
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         var actual_prompt_tokens: usize = 0;
@@ -4119,7 +4130,7 @@ pub const NativeGenerationPipeline = struct {
                     prefill_greedy_token = null;
                     var continued_decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
                     const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                    if (kv_mutation_mutex) |mutex| platform.sync.lockYielding(mutex);
+                    if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
                     defer if (kv_mutation_mutex) |mutex| mutex.unlock();
                     _ = try continued_decode_runtime.appendGeneratedToken();
                 }
@@ -4375,6 +4386,7 @@ pub const NativeGenerationPipeline = struct {
                     0;
                 var mtp_acceptance_gate_checked = false;
                 while (tokens_generated < max_tokens) {
+                    if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
                     const remaining = max_tokens - tokens_generated;
                     const step_k = if (use_gemma4_mtp)
                         mtp_adaptive_k.nextK(remaining)
@@ -5345,9 +5357,7 @@ pub const NativeGenerationPipeline = struct {
                     use_metal_prefill_greedy_token,
                     self.execution_lock,
                 );
-                if (direct_execution_mutex) |mutex| {
-                    platform.sync.lockYielding(mutex);
-                }
+                if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
                 defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
@@ -5598,7 +5608,7 @@ pub const NativeGenerationPipeline = struct {
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| platform.sync.lockYielding(mutex);
+        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
         defer if (direct_execution_mutex) |mutex| mutex.unlock();
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
         const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
@@ -5945,6 +5955,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         while (tokens_generated < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
             var used_decode_microbatch = false;
             var direct_decode_turn_acquired = false;
             defer if (direct_decode_turn_acquired) {
@@ -6009,9 +6020,7 @@ pub const NativeGenerationPipeline = struct {
                                 }
                             }
                         }
-                        if (self.execution_lock) |mutex| {
-                            platform.sync.lockYielding(mutex);
-                        }
+                        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
                         defer if (self.execution_lock) |mutex| mutex.unlock();
                         break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
                             token_ids,
@@ -6139,7 +6148,7 @@ pub const NativeGenerationPipeline = struct {
             tokens_generated += 1;
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                if (kv_mutation_mutex) |mutex| platform.sync.lockYielding(mutex);
+                if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
                 defer if (kv_mutation_mutex) |mutex| mutex.unlock();
                 _ = try decode_runtime.appendGeneratedToken();
             }
@@ -6239,6 +6248,7 @@ pub const NativeGenerationPipeline = struct {
             _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
         }
         while (tokens_generated.* < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated.*), @intCast(max_tokens));
             const remaining = max_tokens - tokens_generated.*;
             var next_token: i64 = -1;
             var speculative_appended = false;
@@ -6361,6 +6371,7 @@ pub const NativeGenerationPipeline = struct {
         );
 
         while (tokens_generated < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
             if (candidate_token_tensor == null) {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
@@ -6932,9 +6943,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        if (self.execution_lock) |mutex| {
-            platform.sync.lockYielding(mutex);
-        }
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
         defer if (self.execution_lock) |mutex| mutex.unlock();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
