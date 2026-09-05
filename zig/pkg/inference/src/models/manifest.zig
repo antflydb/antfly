@@ -30,6 +30,7 @@ const build_options = @import("build_options");
 const jinja = @import("jinja");
 
 pub const qwen3_vl_gguf_bundle_family = "qwen3_vl_gguf_bundle/v1";
+pub const qwen3_vl_safetensors_bundle_family = "qwen3_vl_safetensors_bundle/v1";
 pub const qwen3_vl_reranker_gguf_bundle_family = "qwen3_vl_reranker_gguf_bundle/v1";
 pub const qwen3_vl_reranker_safetensors_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
 
@@ -538,6 +539,10 @@ pub const ModelManifest = struct {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
     }
 
+    pub fn isQwen3VlGenerationSafetensorsBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_safetensors_bundle_family);
+    }
+
     pub fn isQwen3VlReranker(self: *const ModelManifest) bool {
         return self.isQwen3VlRerankerGgufBundle() or
             self.isQwen3VlRerankerSafetensorsBundle() or
@@ -547,10 +552,19 @@ pub const ModelManifest = struct {
     }
 
     pub fn isQwen3VlBundle(self: *const ModelManifest) bool {
-        return self.isQwen3VlGgufBundle() or self.isQwen3VlRerankerSafetensorsBundle();
+        return self.isQwen3VlGgufBundle() or
+            self.isQwen3VlGenerationSafetensorsBundle() or
+            self.isQwen3VlRerankerSafetensorsBundle();
     }
 
     pub fn hasIncompleteQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        if (self.isQwen3VlGenerationSafetensorsBundle()) {
+            return self.safetensors_path == null or
+                self.config_path == null or
+                self.tokenizer_json_path == null or
+                self.tokenizer_config_path == null or
+                self.preprocessor_config_path == null;
+        }
         if (self.isQwen3VlRerankerSafetensorsBundle()) {
             return self.safetensors_path == null or
                 self.config_path == null or
@@ -2538,48 +2552,40 @@ fn parseInferenceBundleJsonWithCatalog(
 /// explicit model_manifest.json declaration. Both files are executable Antfly
 /// contracts: agreement preserves the manifest's provenance, disagreement is
 /// invalid rather than letting parse order choose the runtime implementation.
-fn applyBundleModelTypeContract(manifest: *ModelManifest, bundle_type: ModelType) !void {
-    if (manifest.model_manifest_declarations.model_type) {
-        if (manifest.model_type != bundle_type) return error.InvalidModelManifest;
-        return;
-    }
-    manifest.model_type = bundle_type;
-    manifest.model_type_origin = .bundle;
-}
-
-fn applyBundleInputsContract(
+fn applyBundleContract(
     allocator: std.mem.Allocator,
     manifest: *ModelManifest,
+    bundle_type: ModelType,
     bundle_inputs: []const []const u8,
 ) !void {
-    if (manifest.model_manifest_declarations.inputs) {
-        if (!stringSetEql(manifest.inputs, bundle_inputs)) return error.InvalidModelManifest;
-        return;
+    // Validate the complete contract before mutating either field. This keeps a
+    // rejected bundle from partially changing a manifest when, for example,
+    // the declared type agrees but the declared input set does not.
+    if (manifest.model_manifest_declarations.model_type and manifest.model_type != bundle_type)
+        return error.InvalidModelManifest;
+    if (manifest.model_manifest_declarations.inputs and !stringSetEql(manifest.inputs, bundle_inputs))
+        return error.InvalidModelManifest;
+
+    if (!manifest.model_manifest_declarations.inputs)
+        try setManifestInputs(allocator, manifest, bundle_inputs);
+    if (!manifest.model_manifest_declarations.model_type) {
+        manifest.model_type = bundle_type;
+        manifest.model_type_origin = .bundle;
     }
-    try setManifestInputs(allocator, manifest, bundle_inputs);
 }
 
 fn stringSetEql(lhs: []const []const u8, rhs: []const []const u8) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs) |candidate| {
-        var found = false;
-        for (rhs) |other| {
-            if (std.mem.eql(u8, candidate, other)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    for (rhs) |candidate| {
-        var found = false;
+        var lhs_count: usize = 0;
+        var rhs_count: usize = 0;
         for (lhs) |other| {
-            if (std.mem.eql(u8, candidate, other)) {
-                found = true;
-                break;
-            }
+            if (std.mem.eql(u8, candidate, other)) lhs_count += 1;
         }
-        if (!found) return false;
+        for (rhs) |other| {
+            if (std.mem.eql(u8, candidate, other)) rhs_count += 1;
+        }
+        if (lhs_count != rhs_count) return false;
     }
     return true;
 }
@@ -2618,8 +2624,7 @@ fn parseInferenceBundleJsonInternal(
             else
                 null;
             errdefer if (owned_wrapper) |value| allocator.free(value);
-            try applyBundleModelTypeContract(manifest, .recognizer);
-            try applyBundleInputsContract(allocator, manifest, &.{"text"});
+            try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
             return;
@@ -2636,8 +2641,7 @@ fn parseInferenceBundleJsonInternal(
         else
             null;
         errdefer if (owned_wrapper) |value| allocator.free(value);
-        try applyBundleModelTypeContract(manifest, .recognizer);
-        try applyBundleInputsContract(allocator, manifest, &.{"text"});
+        try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
@@ -2661,8 +2665,7 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const config_model_arch = try allocator.dupe(u8, "clipclap");
         errdefer allocator.free(config_model_arch);
-        try applyBundleModelTypeContract(manifest, .embedder);
-        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image", "audio" });
+        try applyBundleContract(allocator, manifest, .embedder, &.{ "text", "image", "audio" });
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         setOptionalPath(allocator, &manifest.gguf_path, clip_path);
@@ -2682,16 +2685,18 @@ fn parseInferenceBundleJsonInternal(
         }
         return;
     }
-    if (std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family)) {
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_safetensors_bundle_family) or
+        std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family))
+    {
         const model = obj.get("model") orelse obj.get("safetensors");
+        const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
         if (model == null or model.? != .string or model.?.string.len == 0) {
             if (catalog != null) return;
             const owned_family = try allocator.dupe(u8, bundle_family);
             errdefer allocator.free(owned_family);
             const owned_arch = try allocator.dupe(u8, "qwen3_vl");
             errdefer allocator.free(owned_arch);
-            try applyBundleModelTypeContract(manifest, .reranker);
-            try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
+            try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
             return;
@@ -2702,8 +2707,7 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const owned_arch = try allocator.dupe(u8, "qwen3_vl");
         errdefer allocator.free(owned_arch);
-        try applyBundleModelTypeContract(manifest, .reranker);
-        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
+        try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.safetensors_path, model_path);
@@ -2724,8 +2728,7 @@ fn parseInferenceBundleJsonInternal(
             errdefer allocator.free(owned_family);
             const owned_arch = try allocator.dupe(u8, "qwen3_vl");
             errdefer allocator.free(owned_arch);
-            try applyBundleModelTypeContract(manifest, if (is_reranker) .reranker else .generator);
-            try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
+            try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
             replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
             replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
             return;
@@ -2739,8 +2742,7 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const owned_arch = try allocator.dupe(u8, "qwen3_vl");
         errdefer allocator.free(owned_arch);
-        try applyBundleModelTypeContract(manifest, if (is_reranker) .reranker else .generator);
-        try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
+        try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
@@ -2848,8 +2850,7 @@ fn parseInferenceVariantsJsonInternal(
     errdefer allocator.free(family);
     const arch = try allocator.dupe(u8, "clipclap");
     errdefer allocator.free(arch);
-    try applyBundleModelTypeContract(manifest, .embedder);
-    try applyBundleInputsContract(allocator, manifest, &.{ "text", "image", "audio" });
+    try applyBundleContract(allocator, manifest, .embedder, &.{ "text", "image", "audio" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2905,8 +2906,7 @@ fn parseGliner2InferenceVariantsJson(
     errdefer allocator.free(family);
     const wrapper = try allocator.dupe(u8, "gliner2");
     errdefer allocator.free(wrapper);
-    try applyBundleModelTypeContract(manifest, .recognizer);
-    try applyBundleInputsContract(allocator, manifest, &.{"text"});
+    try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2967,8 +2967,7 @@ fn applyFlorence2GgufBundle(
     errdefer if (family.len > 0) allocator.free(family);
     var arch = try allocator.dupe(u8, "florence2");
     errdefer if (arch.len > 0) allocator.free(arch);
-    try applyBundleModelTypeContract(manifest, .reader);
-    try applyBundleInputsContract(allocator, manifest, &.{ "text", "image" });
+    try applyBundleContract(allocator, manifest, .reader, &.{ "text", "image" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -4391,14 +4390,28 @@ test "Antfly bundles must agree with explicit manifest contracts" {
     try parseModelManifestJson(
         &conflicting_inputs,
         allocator,
-        "{\"type\":\"recognizer\",\"inputs\":[\"image\"]}",
+        "{\"inputs\":[\"image\"]}",
     );
     try std.testing.expectError(
         error.InvalidModelManifest,
         ignoreOptionalAntflyMetadataError(parseInferenceBundleJson(&conflicting_inputs, allocator, ".", gliner_bundle)),
     );
+    try std.testing.expectEqual(ModelType.embedder, conflicting_inputs.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.default, conflicting_inputs.model_type_origin);
     try std.testing.expectEqualStrings("image", conflicting_inputs.inputs[0]);
     try std.testing.expectEqualStrings("", conflicting_inputs.inference_bundle_family);
+
+    var duplicate_inputs = ModelManifest{ .allocator = allocator };
+    defer duplicate_inputs.deinit();
+    try parseModelManifestJson(&duplicate_inputs, allocator, "{\"inputs\":[\"text\",\"text\"]}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&duplicate_inputs, allocator, ".",
+            \\{"family":"qwen3_vl_safetensors_bundle/v1"}
+        ),
+    );
+    try std.testing.expectEqual(ModelType.embedder, duplicate_inputs.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.default, duplicate_inputs.model_type_origin);
 }
 
 test "manifest parses clipclap gguf bundle marker" {
@@ -4493,6 +4506,26 @@ test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
     generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
     try std.testing.expect(!generation.hasIncompleteQwen3VlGgufBundle());
 
+    var safetensors_generation = ModelManifest{ .allocator = allocator };
+    defer safetensors_generation.deinit();
+    try parseInferenceBundleJson(&safetensors_generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expect(safetensors_generation.isQwen3VlGenerationSafetensorsBundle());
+    try std.testing.expect(!safetensors_generation.isQwen3VlReranker());
+    try std.testing.expect(safetensors_generation.isQwen3VlBundle());
+    try std.testing.expectEqual(ModelType.generator, safetensors_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, safetensors_generation.model_type_origin);
+    try std.testing.expectEqualStrings("qwen3_vl", safetensors_generation.config_model_arch);
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_generation.nativeWeightArtifactKind().?);
+    try std.testing.expect(safetensors_generation.hasIncompleteQwen3VlGgufBundle());
+
+    safetensors_generation.config_path = try allocator.dupe(u8, "config.json");
+    safetensors_generation.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    safetensors_generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    safetensors_generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    try std.testing.expect(!safetensors_generation.hasIncompleteQwen3VlGgufBundle());
+
     var reranker = ModelManifest{ .allocator = allocator };
     defer reranker.deinit();
     try parseInferenceBundleJson(&reranker, allocator, model_dir,
@@ -4514,6 +4547,39 @@ test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
     try std.testing.expectEqual(ModelType.reranker, safetensors_reranker.model_type);
     try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_reranker.nativeWeightArtifactKind().?);
     try std.testing.expect(safetensors_reranker.hasIncompleteQwen3VlGgufBundle());
+
+    var declared_generation = ModelManifest{ .allocator = allocator };
+    defer declared_generation.deinit();
+    try parseModelManifestJson(&declared_generation, allocator, "{\"type\":\"generator\",\"inputs\":[\"image\",\"text\"]}");
+    try parseInferenceBundleJson(&declared_generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expectEqual(ModelType.generator, declared_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, declared_generation.model_type_origin);
+    try std.testing.expect(declared_generation.model_manifest_declarations.inputs);
+
+    var declared_reranker = ModelManifest{ .allocator = allocator };
+    defer declared_reranker.deinit();
+    try parseModelManifestJson(&declared_reranker, allocator, "{\"type\":\"reranker\",\"inputs\":[\"image\",\"text\"]}");
+    try parseInferenceBundleJson(&declared_reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expectEqual(ModelType.reranker, declared_reranker.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, declared_reranker.model_type_origin);
+    try std.testing.expect(declared_reranker.model_manifest_declarations.inputs);
+
+    var conflicting_generation = ModelManifest{ .allocator = allocator };
+    defer conflicting_generation.deinit();
+    try parseModelManifestJson(&conflicting_generation, allocator, "{\"type\":\"reranker\",\"inputs\":[\"text\",\"image\"]}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&conflicting_generation, allocator, model_dir,
+            \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+        ),
+    );
+    try std.testing.expectEqual(ModelType.reranker, conflicting_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, conflicting_generation.model_type_origin);
+    try std.testing.expectEqualStrings("", conflicting_generation.inference_bundle_family);
 }
 
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
