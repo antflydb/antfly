@@ -1138,7 +1138,7 @@ fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.P
 fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const u8 {
     if (!active) return "idle";
     return switch (phase) {
-        .queued, .loading_model, .preparing_weights => "loading_model",
+        .queued, .loading_model, .loading_weights, .preparing_weights => "loading_model",
         .tokenizing => "tokenizing",
         .executing => "executing",
         .serializing => "serializing",
@@ -4421,14 +4421,14 @@ fn enrichmentWorkerStallReason(input: EnrichmentStallInputs) ?[]const u8 {
     if (input.active_started_ns == 0) return null;
     if (input.active_started_ns != 0 and input.active_deadline_ns != 0 and input.now_ns >= input.active_deadline_ns) {
         return switch (input.active_phase) {
-            .queued, .loading_model, .preparing_weights => "model_loading",
+            .queued, .loading_model, .loading_weights, .preparing_weights => "model_loading",
             .serializing, .publishing => "publishing_overdue",
             .tokenizing, .executing => "embedding_overdue",
         };
     }
     if (input.last_progress_ns != 0 and input.now_ns -| input.last_progress_ns >= input.grace_ns) {
         return switch (input.active_phase) {
-            .queued, .loading_model, .preparing_weights => "model_loading",
+            .queued, .loading_model, .loading_weights, .preparing_weights => "model_loading",
             .serializing, .publishing => "publishing_overdue",
             .tokenizing, .executing => "embedding_overdue",
         };

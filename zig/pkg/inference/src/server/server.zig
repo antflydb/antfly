@@ -2712,6 +2712,16 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
+        error.Timeout => ctx.status(504).json(.{
+            .@"error" = "INFERENCE_TIMEOUT",
+            .message = "the inference deadline expired while loading the model",
+            .retryable = true,
+        }),
+        error.Canceled, error.Cancelled => ctx.status(408).json(.{
+            .@"error" = "INFERENCE_CANCELLED",
+            .message = "the inference request was cancelled",
+            .retryable = false,
+        }),
         error.UnknownModelCompatibility => ctx.status(400).json(.{
             .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
             .message = "model compatibility is unknown; restart with --allow-unknown-models to opt in",
@@ -2737,6 +2747,16 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
+        error.Timeout => ctx.status(504).json(.{
+            .@"error" = "INFERENCE_TIMEOUT",
+            .message = "the inference deadline expired",
+            .retryable = true,
+        }),
+        error.Canceled, error.Cancelled => ctx.status(408).json(.{
+            .@"error" = "INFERENCE_CANCELLED",
+            .message = "the inference request was cancelled",
+            .retryable = false,
+        }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
@@ -16379,6 +16399,24 @@ test "managed download markers return the model publication retry contract" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"reason\":\"model_publication\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
+}
+
+test "inference lifetime errors preserve timeout and cancellation semantics" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var timeout_response = try inferenceFailureResponse(&ctx, error.Timeout);
+    defer timeout_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), timeout_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_response.body.?, "INFERENCE_TIMEOUT") != null);
+
+    var cancelled_response = try modelLoadFailureResponse(&ctx, error.Cancelled);
+    defer cancelled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), cancelled_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, cancelled_response.body.?, "INFERENCE_CANCELLED") != null);
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {

@@ -5332,7 +5332,7 @@ fn inferenceProviderEmbedSparseTextsWithContext(
     return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
         .model = model,
         .texts = texts,
-    }, context);
+    }, context.request);
 }
 
 fn inferenceProviderEmbedDenseParts(

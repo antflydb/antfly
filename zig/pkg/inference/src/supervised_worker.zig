@@ -36,41 +36,58 @@ pub const Supervisor = struct {
         }
     };
 
-    fn signalWithoutWaiting(id: std.process.Child.Id, force: bool) void {
-        // Child.kill() also waits and cleans up the Child. The wait task below
-        // owns that operation, so use the platform's signal primitive here to
-        // avoid two concurrent waiters mutating the same Child.
-        switch (builtin.os.tag) {
-            .windows => {
-                // Windows has no POSIX-style cooperative process signal. The
-                // child protocol is expected to carry cancellation; once the
-                // protocol grace expires this is the hard-stop fallback.
-                if (!force) return;
-                _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1));
-            },
-            .wasi, .freestanding => unreachable,
-            else => std.posix.kill(id, if (force) .KILL else .TERM) catch {},
+    /// Linux pidfds bind signals to a process identity rather than a reusable
+    /// numeric PID. Other platforms stay fail-closed until they have an
+    /// equivalent stable process handle implementation.
+    const StableProcess = struct {
+        fd: if (builtin.os.tag == .linux) std.posix.fd_t else void,
+
+        fn open(id: std.process.Child.Id) !@This() {
+            if (comptime builtin.os.tag != .linux) return error.StableProcessHandleUnsupported;
+            const rc = std.os.linux.syscall2(.pidfd_open, @intCast(id), 0);
+            return switch (std.posix.errno(rc)) {
+                .SUCCESS => .{ .fd = @intCast(rc) },
+                .NOSYS => error.StableProcessHandleUnsupported,
+                else => error.StableProcessHandleUnavailable,
+            };
         }
-    }
+
+        fn close(self: *@This()) void {
+            if (comptime builtin.os.tag == .linux) std.posix.close(self.fd);
+        }
+
+        fn signal(self: *@This(), force: bool) void {
+            if (comptime builtin.os.tag == .linux) {
+                const signal_number: usize = @intFromEnum(if (force) std.posix.SIG.KILL else std.posix.SIG.TERM);
+                _ = std.os.linux.syscall4(
+                    .pidfd_send_signal,
+                    @as(usize, @bitCast(@as(isize, self.fd))),
+                    signal_number,
+                    0,
+                    0,
+                );
+            }
+        }
+    };
 
     fn stopAndReap(
         self: *Supervisor,
         io: std.Io,
-        child_id: std.process.Child.Id,
+        process: *StableProcess,
         state: *WaitState,
         group: *std.Io.Group,
     ) void {
         // The worker's IPC loop treats TERM as cooperative cancellation. Give
         // it a bounded interval to unwind its own resources, then force the
         // process down. Only WaitState.wait reaps and mutates Child.
-        signalWithoutWaiting(child_id, false);
+        process.signal(false);
         if (!state.done.isSet()) {
             state.done.waitTimeout(io, .{
                 .duration = .{
                     .raw = std.Io.Duration.fromNanoseconds(self.cancellation_grace_ns),
                     .clock = .awake,
                 },
-            }) catch signalWithoutWaiting(child_id, true);
+            }) catch process.signal(true);
         }
         if (!state.done.isSet()) state.done.waitUncancelable(io);
         group.await(io) catch {};
@@ -89,7 +106,9 @@ pub const Supervisor = struct {
             .stdout = .ignore,
             .stderr = .inherit,
         });
-        const child_id = child.id.?;
+        errdefer child.kill(io);
+        var process = try StableProcess.open(child.id.?);
+        defer process.close();
         var state = WaitState{ .child = &child, .io = io };
         var group = std.Io.Group.init;
         group.async(io, WaitState.wait, .{&state});
@@ -99,7 +118,7 @@ pub const Supervisor = struct {
                 // A process is the ownership boundary: killing it cannot race
                 // model buffers retained by the parent. Wait for reaping before
                 // advertising the replacement generation.
-                self.stopAndReap(io, child_id, &state, &group);
+                self.stopAndReap(io, &process, &state, &group);
                 self.unhealthy = true;
                 self.restart_count +|= 1;
                 self.generation +|= 1;
@@ -113,7 +132,7 @@ pub const Supervisor = struct {
             }) catch |err| switch (err) {
                 error.Timeout => continue,
                 error.Canceled => {
-                    self.stopAndReap(io, child_id, &state, &group);
+                    self.stopAndReap(io, &process, &state, &group);
                     self.unhealthy = true;
                     self.restart_count +|= 1;
                     self.generation +|= 1;
@@ -129,7 +148,7 @@ pub const Supervisor = struct {
 };
 
 test "wedged worker is killed and the supervisor advances generation" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding)
+    if (builtin.os.tag != .linux)
         return error.SkipZigTest;
     var supervisor = Supervisor{ .cancellation_grace_ns = 10 * std.time.ns_per_ms };
     const control = InferenceExecutionControl{

@@ -1491,7 +1491,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_bge_m3_e2e_bench.addArgs(args);
     }
-    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run managed-request and pretokenized BGE-M3 encoder E2E benchmarks");
+    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run node-request and pretokenized BGE-M3 encoder benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
     const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{

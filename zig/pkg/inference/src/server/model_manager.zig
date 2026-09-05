@@ -3305,6 +3305,10 @@ const LoadFlight = struct {
     /// Protected by ModelManager.load_lock. The owner starts with one reference;
     /// every waiter takes one before dropping the manager lock.
     refs: usize = 1,
+    /// Active request waiters other than the synchronous load owner. Once a
+    /// waiter joins, the shared initialization must no longer inherit the
+    /// owner's shorter deadline or cancellation token.
+    waiters: std.atomic.Value(usize) = .init(0),
     /// The owner already receives a model handle directly from the uncached
     /// load. Keep its flight reference distinguishable so retirement reserves
     /// handles only for waiters that have not adopted theirs yet.
@@ -3317,11 +3321,78 @@ const LoadFlight = struct {
     /// handle count a second time; the owner already has its handle.
     handles_reserved: bool = false,
 
+    const owner_cancelled = std.math.maxInt(usize);
+
+    fn tryAddWaiter(self: *LoadFlight) bool {
+        var current = self.waiters.load(.acquire);
+        while (current != owner_cancelled) {
+            std.debug.assert(current < owner_cancelled - 1);
+            if (self.waiters.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return true;
+        }
+        return false;
+    }
+
     fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
         std.debug.assert(self.refs >= @intFromBool(self.owner_ref_pending));
         return self.refs - @intFromBool(self.owner_ref_pending);
     }
 };
+
+const SharedLoadControl = struct {
+    flight: *LoadFlight,
+    owner: InferenceExecutionControl,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.owner.check() catch |err| {
+            const observed = self.flight.waiters.cmpxchgStrong(
+                0,
+                LoadFlight.owner_cancelled,
+                .acq_rel,
+                .acquire,
+            );
+            if (observed == null or observed.? == LoadFlight.owner_cancelled) return err;
+            // A waiter won the race. The shared load now belongs to that
+            // waiter too, so the original owner's lifetime cannot abort it.
+        };
+    }
+
+    fn control(self: *@This()) InferenceExecutionControl {
+        return .{
+            .ptr = self,
+            .check_fn = check,
+            .progress = self.owner.progress,
+        };
+    }
+};
+
+test "shared model load stops inheriting owner cancellation after a waiter joins" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    var owner_only = LoadFlight{ .io = std.testing.io };
+    var shared = SharedLoadControl{
+        .flight = &owner_only,
+        .owner = .{
+            .cancellation = .{
+                .ptr = &cancelled,
+                .is_cancelled_fn = struct {
+                    fn check(raw: ?*anyopaque) bool {
+                        const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+                        return signal.load(.acquire);
+                    }
+                }.check,
+            },
+        },
+    };
+    try std.testing.expectError(error.Cancelled, shared.control().check());
+
+    var joined = LoadFlight{ .io = std.testing.io };
+    try std.testing.expect(joined.tryAddWaiter());
+    shared.flight = &joined;
+    try shared.control().check();
+    try std.testing.expect(!owner_only.tryAddWaiter());
+}
 
 test "load flight retirement reservations exclude the owner handle" {
     var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
@@ -6266,6 +6337,8 @@ pub const ModelManager = struct {
         }
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
+        const previous_waiters = flight.waiters.fetchSub(1, .acq_rel);
+        std.debug.assert(previous_waiters > 0);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6292,6 +6365,8 @@ pub const ModelManager = struct {
         self.lockLoadedModels();
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
+        const previous_waiters = flight.waiters.fetchSub(1, .acq_rel);
+        std.debug.assert(previous_waiters > 0);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6345,6 +6420,11 @@ pub const ModelManager = struct {
         }
         if (self.in_flight_loads.get(flight_key)) |flight| {
             flight.refs += 1;
+            if (!flight.tryAddWaiter()) {
+                flight.refs -= 1;
+                self.unlockLoadedModels();
+                return error.ResourceTemporarilyUnavailable;
+            }
             self.unlockLoadedModels();
             return self.waitForLoadFlight(flight_key, flight, control);
         }
@@ -6385,12 +6465,16 @@ pub const ModelManager = struct {
         session_manager.a4b_inference_request = policy.a4b_request;
         self.unlockLoadedModels();
 
+        var shared_load_control = if (control) |owner|
+            SharedLoadControl{ .flight = flight, .owner = owner }
+        else
+            null;
         var handle = self.loadFromDirUncached(
             model_dir,
             &session_manager,
             cache_default_alias,
             policy.a4b_request,
-            control,
+            if (shared_load_control) |*shared| shared.control() else null,
         ) catch |err| {
             self.finishLoadFlight(flight, null, err);
             self.releaseLoadFlight(flight_key, flight);
@@ -6398,6 +6482,10 @@ pub const ModelManager = struct {
         };
         self.finishLoadFlight(flight, handle.get(), null);
         self.releaseLoadFlight(flight_key, flight);
+        if (control) |active| active.check() catch |err| {
+            handle.release();
+            return err;
+        };
         return handle;
     }
 
@@ -6511,7 +6599,7 @@ pub const ModelManager = struct {
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
-        if (control) |active| try active.update(.preparing_weights, 0, 1);
+        if (control) |active| try active.update(.loading_weights, 0, 1);
         var loaded_session = try loadSessionForPreferredBackends(
             self,
             sm.preferred_backends,

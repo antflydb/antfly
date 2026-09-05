@@ -6,9 +6,10 @@ const platform_time = @import("antfly_platform").time;
 
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
 /// backends. Progress is advisory; cancellation and deadlines are mandatory.
-pub const Phase = enum {
+pub const Phase = enum(u8) {
     queued,
     loading_model,
+    loading_weights,
     preparing_weights,
     tokenizing,
     executing,

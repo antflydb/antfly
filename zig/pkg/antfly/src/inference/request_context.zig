@@ -19,6 +19,7 @@ const platform_time = @import("antfly_platform").time;
 pub const Phase = enum(u8) {
     queued,
     loading_model,
+    loading_weights,
     preparing_weights,
     tokenizing,
     executing,

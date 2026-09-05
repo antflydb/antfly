@@ -750,19 +750,18 @@ test "cross encoder bounds working memory with configured batches" {
 
 test "cross encoder observes cancellation between bounded batches" {
     const Control = struct {
-        checks: std.atomic.Value(usize) = .init(0),
+        runs: *std.atomic.Value(usize),
 
         fn check(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
-            if (count >= 6) return error.Cancelled;
+            if (self.runs.load(.acquire) != 0) return error.Cancelled;
         }
     };
 
     const allocator = std.testing.allocator;
     var tokenizer_state = FakeRerankingTokenizer{};
     var session_state = FakeRerankingSession{ .fixed_sequence = false };
-    var control = Control{};
+    var control = Control{ .runs = &session_state.run_count };
     var pipeline = RerankingPipeline.init(
         allocator,
         session_state.session(),
@@ -898,6 +897,7 @@ const FakeRerankingSession = struct {
             .ptr = self,
             .vtable = &.{
                 .run = run,
+                .runWithControl = runWithControl,
                 .inputInfo = inputInfo,
                 .outputInfo = outputInfo,
                 .backend = backend,
@@ -919,6 +919,22 @@ const FakeRerankingSession = struct {
         const out = try allocator.alloc(Tensor, 1);
         out[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), 1 }, logits);
         return out;
+    }
+
+    fn runWithControl(
+        ptr: *anyopaque,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ExecutionControl,
+    ) anyerror![]Tensor {
+        try control.check();
+        const outputs = try run(ptr, inputs, allocator);
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            allocator.free(outputs);
+        }
+        try control.check();
+        return outputs;
     }
 
     fn inputInfo(ptr: *anyopaque) []const backends.TensorInfo {

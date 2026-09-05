@@ -185,6 +185,7 @@ pub fn main(init: std.process.Init) !void {
     allocator.free(cold_json);
     freeEmbeddings(allocator, cold_embeddings);
     const cold_managed = managedTiming(cold_capture, load_started_ns, cold_forward_done_ns, cold_done_ns);
+    try validateManagedTiming(cold_managed);
 
     var warm_capture = PhaseCapture{};
     const warm_control = inference.InferenceExecutionControl{ .progress = .{ .ptr = &warm_capture, .update_fn = PhaseCapture.update } };
@@ -201,6 +202,7 @@ pub fn main(init: std.process.Init) !void {
     allocator.free(warm_json);
     freeEmbeddings(allocator, warm_embeddings);
     const warm_managed = managedTiming(warm_capture, warm_started_ns, warm_forward_done_ns, warm_done_ns);
+    try validateManagedTiming(warm_managed);
 
     var model_handle = try node.model_manager.acquireFromDirWithControl(opts.model_dir, cold_control);
     defer model_handle.release();
@@ -314,7 +316,7 @@ pub fn main(init: std.process.Init) !void {
     const measured_embeddings = std.math.mul(usize, opts.batch, opts.measure_iters) catch return error.InvalidArguments;
     const embeddings_per_second = if (total_ns == 0) 0.0 else @as(f64, @floatFromInt(measured_embeddings)) /
         (@as(f64, @floatFromInt(total_ns)) / 1.0e9);
-    const managed_warm_embeddings_per_second = if (warm_managed.total_ns == 0) 0.0 else @as(f64, @floatFromInt(opts.batch)) /
+    const node_warm_embeddings_per_second = if (warm_managed.total_ns == 0) 0.0 else @as(f64, @floatFromInt(opts.batch)) /
         (@as(f64, @floatFromInt(warm_managed.total_ns)) / 1.0e9);
     const expected_projection_slots: u64 = 24 * 6;
     const all_projection_slots_prepared = provider_stats.metal_runtime_dense_linear_f16_slots >= expected_projection_slots;
@@ -323,13 +325,9 @@ pub fn main(init: std.process.Init) !void {
         provider_stats.metal_runtime_dense_pair_packed_calls > 0 and
         provider_stats.metal_runtime_dense_pair_packed_fallbacks == 0;
     const no_unexpected_host_materialization = provider_stats.prepared_view_owned_materializations == 0;
-    const metal_qualification_pass = opts.backend == .metal and
-        managed_warm_embeddings_per_second >= backends.bge_m3_metal_min_managed_embeddings_per_second and
-        all_projection_slots_prepared and fused_routes_selected and no_unexpected_host_materialization;
-
     std.debug.print(
-        "{{\"kind\":\"bge_m3_managed\",\"model\":\"{s}\",\"backend\":\"{s}\",\"batch\":{d},\"sequence_length\":{d},\"cold\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6}}},\"warm\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6},\"embeddings_per_second\":{d:.6}}},\"metal_qualification\":{{\"minimum_managed_embeddings_per_second\":{d:.6},\"pass\":{}}}}}\n",
-        .{ fixture.model, @tagName(opts.backend), opts.batch, managed_sequence_length, nsToMs(cold_managed.total_ns), nsToMs(cold_managed.model_load_ns), nsToMs(cold_managed.tokenization_ns), nsToMs(cold_managed.weight_prep_ns), nsToMs(cold_managed.forward_ns), nsToMs(cold_managed.serialization_ns), nsToMs(warm_managed.total_ns), nsToMs(warm_managed.model_load_ns), nsToMs(warm_managed.tokenization_ns), nsToMs(warm_managed.weight_prep_ns), nsToMs(warm_managed.forward_ns), nsToMs(warm_managed.serialization_ns), managed_warm_embeddings_per_second, backends.bge_m3_metal_min_managed_embeddings_per_second, metal_qualification_pass },
+        "{{\"kind\":\"bge_m3_node_request\",\"scope\":\"node_request_without_enrichment_publication\",\"model\":\"{s}\",\"backend\":\"{s}\",\"batch\":{d},\"sequence_length\":{d},\"cold\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6}}},\"warm\":{{\"total_ms\":{d:.6},\"model_load_ms\":{d:.6},\"tokenization_ms\":{d:.6},\"weight_prep_ms\":{d:.6},\"forward_ms\":{d:.6},\"response_serialization_ms\":{d:.6},\"embeddings_per_second\":{d:.6}}}}}\n",
+        .{ fixture.model, @tagName(opts.backend), opts.batch, managed_sequence_length, nsToMs(cold_managed.total_ns), nsToMs(cold_managed.model_load_ns), nsToMs(cold_managed.tokenization_ns), nsToMs(cold_managed.weight_prep_ns), nsToMs(cold_managed.forward_ns), nsToMs(cold_managed.serialization_ns), nsToMs(warm_managed.total_ns), nsToMs(warm_managed.model_load_ns), nsToMs(warm_managed.tokenization_ns), nsToMs(warm_managed.weight_prep_ns), nsToMs(warm_managed.forward_ns), nsToMs(warm_managed.serialization_ns), node_warm_embeddings_per_second },
     );
 
     std.debug.print(
@@ -453,6 +451,11 @@ fn managedTiming(capture: PhaseCapture, started: u64, forward_done: u64, done: u
     };
 }
 
+fn validateManagedTiming(timing: ManagedTiming) !void {
+    const attributed = timing.model_load_ns +| timing.tokenization_ns +| timing.weight_prep_ns +| timing.forward_ns +| timing.serialization_ns;
+    if (attributed > timing.total_ns) return error.InvalidPhaseTiming;
+}
+
 test "managed BGE timing partitions ordered request phases" {
     const timing = managedTiming(.{
         .loading_ns = 10,
@@ -466,6 +469,18 @@ test "managed BGE timing partitions ordered request phases" {
     try std.testing.expectEqual(@as(u64, 50), timing.forward_ns);
     try std.testing.expectEqual(@as(u64, 20), timing.serialization_ns);
     try std.testing.expectEqual(@as(u64, 140), timing.total_ns);
+    try validateManagedTiming(timing);
+}
+
+test "managed BGE timing rejects overlapping phase attribution" {
+    try std.testing.expectError(error.InvalidPhaseTiming, validateManagedTiming(.{
+        .total_ns = 10,
+        .model_load_ns = 10,
+        .tokenization_ns = 10,
+        .weight_prep_ns = 0,
+        .forward_ns = 0,
+        .serialization_ns = 0,
+    }));
 }
 
 fn ensureBackendAvailable(backend: BackendChoice) !void {

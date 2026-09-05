@@ -81,6 +81,7 @@ pub fn forward(
     defer if (attn_bias) |bias| cb.free(bias);
 
     for (0..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
         const next = try encoderLayer(cb, allocator, config, hidden, final_attention_mask, attn_bias, batch, seq_len, layer);
         cb.free(hidden);
         hidden = next;

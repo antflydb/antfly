@@ -6125,12 +6125,16 @@ fn archRunResidentWithControl(
     if (self.task == .classifier or self.task == .recognizer) return null;
     const cfg = switch (self.arch_config) {
         .bert => |cfg| cfg,
-        else => return archRunResident(ptr, inputs, allocator),
+        // Returning null forces the caller through runWithControl. Never
+        // advertise a controlled resident fast path by delegating to an
+        // implementation that cannot observe the request lifetime.
+        else => return null,
     };
     const bert_inputs = try parseBertRunInputs(inputs);
     const cb = try allocator.create(ops.ComputeBackend);
     errdefer allocator.destroy(cb);
     cb.* = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
     errdefer cb.deinit();
     const hidden = try bert_arch.forwardCtWithControl(
         cb,
@@ -6897,6 +6901,7 @@ fn archRunImpl(
 
     // Create the appropriate ComputeBackend
     var cb = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
     if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
     defer cb.deinit();
 
