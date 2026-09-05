@@ -9184,8 +9184,10 @@ export interface components {
             /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
             api_key?: string;
             /**
-             * @description Specifies the type of input for optimized embeddings.
-             * @default search_document
+             * @deprecated
+             * @description Legacy fixed input type applied to every embedding operation. When omitted,
+             *     Antfly derives `search_query` for semantic searches and `search_document`
+             *     for indexed documents. Prefer the role-specific fields under `retrieval`.
              * @enum {string}
              */
             input_type?: "search_document" | "search_query" | "classification" | "clustering";

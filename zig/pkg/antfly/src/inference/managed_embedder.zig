@@ -198,19 +198,59 @@ pub const AntflyProvider = struct {
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
+const BedrockCredentialPool = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    by_region: std.StringHashMapUnmanaged(*bedrock_provider.CredentialCache) = .empty,
+
+    fn init(alloc: std.mem.Allocator, io: std.Io) BedrockCredentialPool {
+        return .{ .alloc = alloc, .io = io };
+    }
+
+    fn cacheForRegion(self: *BedrockCredentialPool, region: []const u8) !*bedrock_provider.CredentialCache {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.by_region.get(region)) |cache| return cache;
+
+        const owned_region = try self.alloc.dupe(u8, region);
+        errdefer self.alloc.free(owned_region);
+        const cache = try self.alloc.create(bedrock_provider.CredentialCache);
+        errdefer self.alloc.destroy(cache);
+        cache.* = .{};
+        try self.by_region.put(self.alloc, owned_region, cache);
+        return cache;
+    }
+
+    fn deinit(self: *BedrockCredentialPool) void {
+        var iterator = self.by_region.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.*.deinit(self.alloc);
+            self.alloc.destroy(entry.value_ptr.*);
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.by_region.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 /// Long-lived provider resources shared by independently constructed managed
 /// embedders. API runtimes should own one of these for their full service
 /// lifetime so request-scoped embedders reuse credentials and refresh work.
 pub const ProviderRuntime = struct {
     google_credentials: google_auth.CredentialManager,
+    bedrock_credentials: BedrockCredentialPool,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
             .google_credentials = google_auth.CredentialManager.init(alloc, io),
+            .bedrock_credentials = BedrockCredentialPool.init(alloc, io),
         };
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
+        self.bedrock_credentials.deinit();
         self.google_credentials.deinit();
         self.* = undefined;
     }
@@ -480,10 +520,11 @@ pub const ManagedEmbeddingEntry = struct {
     query_instruction: []u8 = "",
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
-    /// ManagedEmbedder's standalone fallback. A service-scoped manager keeps
-    /// ADC tokens across request embedders and serializes refreshes.
+    /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
+    /// cloud credentials across request embedders and serialize refreshes.
     google_credentials: ?*google_auth.CredentialManager = null,
-    bedrock_credentials: bedrock_provider.CredentialCache = .{},
+    bedrock_credentials: ?*bedrock_provider.CredentialCache = null,
+    owns_bedrock_credentials: bool = false,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
@@ -515,7 +556,11 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.document_input_type.len > 0) alloc.free(self.document_input_type);
         if (self.query_instruction.len > 0) alloc.free(self.query_instruction);
         if (self.truncate.len > 0) alloc.free(self.truncate);
-        self.bedrock_credentials.deinit(alloc);
+        if (self.owns_bedrock_credentials) {
+            const cache = self.bedrock_credentials.?;
+            cache.deinit(alloc);
+            alloc.destroy(cache);
+        }
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
         self.* = undefined;
@@ -812,6 +857,25 @@ fn attachManagedGoogleCredentialManager(
     return owned_manager;
 }
 
+fn attachManagedBedrockCredentialCaches(
+    alloc: std.mem.Allocator,
+    entries: []ManagedEmbeddingEntry,
+    provider_runtime: ?*ProviderRuntime,
+) !void {
+    for (entries) |*entry| {
+        if (entry.provider != .bedrock) continue;
+        if (provider_runtime) |runtime| {
+            entry.bedrock_credentials = try runtime.bedrock_credentials.cacheForRegion(entry.region);
+            continue;
+        }
+
+        const cache = try alloc.create(bedrock_provider.CredentialCache);
+        cache.* = .{};
+        entry.bedrock_credentials = cache;
+        entry.owns_bedrock_credentials = true;
+    }
+}
+
 pub const ManagedEmbedder = struct {
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
@@ -886,6 +950,11 @@ pub const ManagedEmbedder = struct {
             manager.deinit();
             alloc.destroy(manager);
         };
+        try attachManagedBedrockCredentialCaches(
+            alloc,
+            entries.items,
+            options.provider_runtime,
+        );
 
         return .{
             .alloc = alloc,
@@ -1038,8 +1107,7 @@ pub const ManagedEmbedder = struct {
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var request_entry = configured_entry.*;
-        request_entry.bedrock_credentials = .{};
-        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.owns_bedrock_credentials = false;
         request_entry.auth_header_cache = .{};
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
@@ -1112,8 +1180,7 @@ pub const ManagedEmbedder = struct {
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         var request_entry = configured_entry.*;
-        request_entry.bedrock_credentials = .{};
-        defer request_entry.bedrock_credentials.deinit(alloc);
+        request_entry.owns_bedrock_credentials = false;
         request_entry.auth_header_cache = .{};
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
@@ -4228,7 +4295,7 @@ fn embedWithEntryPartsForTask(
             .truncate = entry.truncate,
             .dimension = dims,
             .cancellation = entry.cancellation,
-        }, &@constCast(entry).bedrock_credentials);
+        }, entry.bedrock_credentials orelse return error.MissingBedrockCredentialCache);
         defer provider.deinit();
 
         var result = try provider.embedParts(alloc, entry.model, parts);
@@ -4950,7 +5017,7 @@ fn embedBatchWithBedrockRequest(
         .truncate = entry.truncate,
         .dimension = dims,
         .cancellation = entry.cancellation,
-    }, &@constCast(entry).bedrock_credentials);
+    }, entry.bedrock_credentials orelse return error.MissingBedrockCredentialCache);
     defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
@@ -5156,6 +5223,48 @@ pub fn testManagedVertexCredentialManagerLifetime() !void {
 
 test "request-scoped managed Vertex embedders borrow the service credential manager" {
     try testManagedVertexCredentialManagerLifetime();
+}
+
+test "request-scoped managed Bedrock embedders borrow region-scoped credential caches" {
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"cohere.embed-v4:0","request_format":"cohere_v4","region":"us-east-1"}}}
+    ;
+    var provider_runtime = ProviderRuntime.init(
+        std.testing.allocator,
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    defer provider_runtime.deinit();
+
+    var first_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer first_request.deinit();
+    var second_request = try ManagedEmbedder.initFromIndexesJsonWithOptions(
+        std.testing.allocator,
+        indexes_json,
+        .{ .provider_runtime = &provider_runtime },
+    );
+    defer second_request.deinit();
+
+    const east_cache = first_request.entries[0].bedrock_credentials.?;
+    try std.testing.expect(east_cache == second_request.entries[0].bedrock_credentials.?);
+    try std.testing.expect(!first_request.entries[0].owns_bedrock_credentials);
+    try std.testing.expect(!second_request.entries[0].owns_bedrock_credentials);
+    const west_cache = try provider_runtime.bedrock_credentials.cacheForRegion("us-west-2");
+    try std.testing.expect(east_cache != west_cache);
+}
+
+test "standalone managed Bedrock embedders own their credential cache" {
+    const indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"cohere.embed-v4:0","request_format":"cohere_v4","region":"us-east-1"}}}
+    ;
+    var embedder = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator, indexes_json);
+    defer embedder.deinit();
+
+    try std.testing.expect(embedder.entries[0].bedrock_credentials != null);
+    try std.testing.expect(embedder.entries[0].owns_bedrock_credentials);
 }
 
 fn vertexEmbeddingRequestCount(model: []const u8, input_count: usize) usize {

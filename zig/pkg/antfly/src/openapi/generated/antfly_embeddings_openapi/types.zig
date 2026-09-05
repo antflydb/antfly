@@ -145,7 +145,7 @@ pub const CohereEmbedderConfig = struct {
     model: []const u8,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
-    /// Specifies the type of input for optimized embeddings.
+    /// Legacy fixed input type applied to every embedding operation. When omitted, Antfly derives `search_query` for semantic searches and `search_document` for indexed documents. Prefer the role-specific fields under `retrieval`.
     input_type: ?[]const u8 = null,
     /// How to handle inputs longer than the max token length.
     truncate: ?[]const u8 = null,

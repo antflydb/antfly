@@ -279,6 +279,9 @@ pub const ModelManifest = struct {
     /// True only when model_manifest.json explicitly declares the profile.
     /// Explicit profiles replace family defaults and must be complete.
     embedding_profile_explicit: bool = false,
+    /// Tracks a contract declared by either the legacy top-level field or the
+    /// declarative profile so later parsing cannot silently replace it.
+    embedding_task_contract_explicit: bool = false,
     embedding_style: EmbeddingStyle = .none,
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
@@ -2190,8 +2193,13 @@ fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !v
     // An explicit profile replaces inferred config.json defaults. Mark it
     // unresolved first so malformed or partial role mappings fail closed in
     // finalizeEmbeddingProfile instead of silently reverting to raw text.
+    const inherited_contract = manifest.embedding_profile.task_contract;
+    const inherited_contract_explicit = manifest.embedding_task_contract_explicit;
     manifest.embedding_profile.deinit(manifest.allocator);
-    manifest.embedding_profile.task_contract = .required;
+    manifest.embedding_profile.task_contract = if (inherited_contract_explicit)
+        inherited_contract
+    else
+        .required;
     manifest.embedding_profile_explicit = true;
     if (value != .object) return error.InvalidEmbeddingTaskProfile;
 
@@ -2205,8 +2213,13 @@ fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !v
         }
     }
 
-    if (value.object.get("task_contract")) |contract|
-        manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(contract);
+    if (value.object.get("task_contract")) |contract| {
+        const parsed_contract = try parseEmbeddingTaskContractJson(contract);
+        if (inherited_contract_explicit and parsed_contract != inherited_contract)
+            return error.InvalidEmbeddingTaskProfile;
+        manifest.embedding_profile.task_contract = parsed_contract;
+        manifest.embedding_task_contract_explicit = true;
+    }
     if (value.object.get("query")) |query| {
         if (query != .object) return error.InvalidEmbeddingTaskProfile;
         var query_fields = query.object.iterator();
@@ -2302,6 +2315,7 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     }
     if (obj.get("embedding_task_contract")) |v| {
         manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(v);
+        manifest.embedding_task_contract_explicit = true;
     }
     if (obj.get("embedding_profile")) |v| try parseEmbeddingProfileJson(manifest, v);
     // Legacy flat fields remain read-compatible. New manifests should use
@@ -2999,11 +3013,6 @@ fn setEmbeddingProfilePrefix(
     const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
     replaceOwnedString(manifest.allocator, &transform.prefix, owned);
     transform.declared = true;
-    if (manifest.embedding_profile.query.declared and manifest.embedding_profile.document.declared) {
-        manifest.embedding_profile.task_contract = .profiled;
-    } else if (manifest.embedding_profile.task_contract == .symmetric) {
-        manifest.embedding_profile.task_contract = .required;
-    }
 }
 
 fn setEmbeddingInstructionTemplate(manifest: *ModelManifest, value: []const u8) !void {
@@ -3038,18 +3047,27 @@ fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
         .none => {},
     }
 
-    if (manifest.embedding_profile.query.declared and manifest.embedding_profile.document.declared) {
-        manifest.embedding_profile.task_contract = .profiled;
+    // Validate an explicitly symmetric declaration before deriving the
+    // resolved state. Prefix setters must never rewrite declared intent.
+    const has_declared_transform = manifest.embedding_profile.query.declared or
+        manifest.embedding_profile.document.declared or
+        manifest.embedding_profile.instruction_template.len > 0;
+    if (manifest.embedding_task_contract_explicit and
+        manifest.embedding_profile.task_contract == .symmetric and
+        has_declared_transform)
+    {
+        return error.InvalidEmbeddingTaskProfile;
     }
+    if (manifest.embedding_profile.query.declared and manifest.embedding_profile.document.declared)
+        manifest.embedding_profile.task_contract = .profiled;
+    if (has_declared_transform and manifest.embedding_profile.task_contract == .symmetric)
+        manifest.embedding_profile.task_contract = .required;
     switch (manifest.embedding_profile.task_contract) {
         .required => return error.MissingEmbeddingTaskProfile,
         .profiled => if (!manifest.embedding_profile.query.declared or
             !manifest.embedding_profile.document.declared)
             return error.MissingEmbeddingTaskProfile,
-        .symmetric => if (manifest.embedding_profile.query.declared or
-            manifest.embedding_profile.document.declared or
-            manifest.embedding_profile.instruction_template.len > 0)
-            return error.InvalidEmbeddingTaskProfile,
+        .symmetric => {},
     }
     const template = manifest.embedding_profile.instruction_template;
     if (template.len > 0 and std.mem.count(u8, template, "{instruction}") != 1)
@@ -3409,6 +3427,7 @@ test "NomicBERT config installs its asymmetric retrieval task profile" {
     defer manifest.deinit();
 
     try parseConfigJson(&manifest, allocator, "{\"model_type\":\"nomic_bert\"}");
+    try finalizeEmbeddingProfile(&manifest);
     try std.testing.expect(manifest.hasEmbeddingTaskProfile());
     try std.testing.expectEqualStrings("search_query: ", manifest.embedding_profile.query.prefix);
     try std.testing.expectEqualStrings("search_document: ", manifest.embedding_profile.document.prefix);
@@ -3453,6 +3472,37 @@ test "task-required embedding manifests fail without a complete profile" {
         \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
     );
     try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
+}
+
+test "explicit symmetric embedding contracts reject role transforms" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_profile":{"task_contract":"symmetric","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","query_prefix":"query: ","document_prefix":"document: "}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try parseModelManifestJson(&manifest, allocator, manifest_json);
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&manifest));
+    }
+}
+
+test "duplicate embedding contract declarations must agree" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingTaskProfile,
+        parseModelManifestJson(&manifest, allocator,
+            \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ),
+    );
 }
 
 test "embedding task contract declarations reject unknown values and types" {

@@ -36,8 +36,10 @@ class CohereEmbedderConfig:
             model (str): The name of the Cohere embedding model to use. Default: 'embed-english-v3.0'. Example: embed-
                 english-v3.0.
             api_key (str | Unset): The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-            input_type (CohereEmbedderConfigInputType | Unset): Specifies the type of input for optimized embeddings.
-                Default: CohereEmbedderConfigInputType.SEARCH_DOCUMENT.
+            input_type (CohereEmbedderConfigInputType | Unset): Legacy fixed input type applied to every embedding
+                operation. When omitted,
+                Antfly derives `search_query` for semantic searches and `search_document`
+                for indexed documents. Prefer the role-specific fields under `retrieval`.
             truncate (CohereEmbedderConfigTruncate | Unset): How to handle inputs longer than the max token length. Default:
                 CohereEmbedderConfigTruncate.END.
             retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
@@ -50,7 +52,7 @@ class CohereEmbedderConfig:
     provider: CohereEmbedderConfigProvider
     model: str = "embed-english-v3.0"
     api_key: str | Unset = UNSET
-    input_type: CohereEmbedderConfigInputType | Unset = CohereEmbedderConfigInputType.SEARCH_DOCUMENT
+    input_type: CohereEmbedderConfigInputType | Unset = UNSET
     truncate: CohereEmbedderConfigTruncate | Unset = CohereEmbedderConfigTruncate.END
     retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
