@@ -702,16 +702,24 @@ test "serverless fs artifact verification cache detects in-place mutation with r
     defer io_impl.deinit();
     const io = io_impl.io();
     const before = try std.Io.Dir.cwd().statFile(io, path, .{});
-    {
-        var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
-        defer file.close(io);
-        var buffer: [32]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try writer.interface.writeAll("omega");
-        try writer.end();
+    // Some CI filesystems expose ctime at a coarser resolution than their
+    // write path. Wait for that observable clock to advance so this test
+    // exercises cache invalidation instead of assuming nanosecond precision.
+    var after = before;
+    for (0..200) |attempt| {
+        if (attempt > 0) try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+        {
+            var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+            defer file.close(io);
+            var buffer: [32]u8 = undefined;
+            var writer = file.writer(io, &buffer);
+            try writer.interface.writeAll(if (attempt % 2 == 0) "omega" else "sigma");
+            try writer.end();
+        }
+        try std.Io.Dir.cwd().setTimestamps(io, path, .{ .modify_timestamp = .{ .new = before.mtime } });
+        after = try std.Io.Dir.cwd().statFile(io, path, .{});
+        if (!std.meta.eql(before.ctime, after.ctime)) break;
     }
-    try std.Io.Dir.cwd().setTimestamps(io, path, .{ .modify_timestamp = .{ .new = before.mtime } });
-    const after = try std.Io.Dir.cwd().statFile(io, path, .{});
     try std.testing.expectEqual(before.inode, after.inode);
     try std.testing.expectEqual(before.size, after.size);
     try std.testing.expect(std.meta.eql(before.mtime, after.mtime));
