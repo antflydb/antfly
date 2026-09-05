@@ -232,26 +232,49 @@ pub const Stats = struct {
     canceled_items: u64 = 0,
 };
 
-pub const Broker = struct {
-    allocator: std.mem.Allocator,
+const broker_shard_count: usize = 16;
+
+const BrokerShard = struct {
     mutex: std.Io.Mutex = .init,
     groups: std.ArrayListUnmanaged(*Group) = .empty,
     stats: Stats = .{},
+};
+
+fn updateBrokerKeyHash(hasher: *std.hash.Wyhash, value: []const u8) void {
+    var len = value.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(value);
+}
+
+pub const Broker = struct {
+    allocator: std.mem.Allocator,
+    /// Independent model/task cohorts never contend on one process-wide lock.
+    /// Exact-key grouping remains unchanged within a shard.
+    shards: [broker_shard_count]BrokerShard = [_]BrokerShard{.{}} ** broker_shard_count,
 
     pub fn init(allocator: std.mem.Allocator) Broker {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Broker) void {
-        std.debug.assert(self.groups.items.len == 0);
-        self.groups.deinit(self.allocator);
+        for (&self.shards) |*shard| {
+            std.debug.assert(shard.groups.items.len == 0);
+            shard.groups.deinit(self.allocator);
+        }
         self.* = undefined;
     }
 
     pub fn snapshot(self: *Broker, io: std.Io) Stats {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.stats;
+        var total = Stats{};
+        for (&self.shards) |*shard| {
+            shard.mutex.lockUncancelable(io);
+            total.native_batches +|= shard.stats.native_batches;
+            total.native_items +|= shard.stats.native_items;
+            total.bypass_items +|= shard.stats.bypass_items;
+            total.canceled_items +|= shard.stats.canceled_items;
+            shard.mutex.unlock(io);
+        }
+        return total;
     }
 
     pub fn submit(
@@ -329,16 +352,18 @@ pub const Broker = struct {
         if (limits.mode != .native or limits.max_items == 1) {
             execute_fn(execute_ctx, &.{ticket.item});
             if (!slot.completed) slot.fail(error.MissingMicrobatchResult);
-            self.mutex.lockUncancelable(io);
-            self.stats.bypass_items +|= 1;
-            self.mutex.unlock(io);
+            const shard = self.shardFor(key);
+            shard.mutex.lockUncancelable(io);
+            shard.stats.bypass_items +|= 1;
+            shard.mutex.unlock(io);
             return takeResult(Output, identity, &output, slot);
         }
 
+        const shard = self.shardFor(key);
         var group: *Group = undefined;
         var leader = false;
-        self.mutex.lockUncancelable(io);
-        for (self.groups.items) |candidate| {
+        shard.mutex.lockUncancelable(io);
+        for (shard.groups.items) |candidate| {
             if (candidate.key.eql(key) and candidate.limits.eql(limits) and
                 candidate.execute_ctx == execute_ctx and candidate.execute_fn == execute_fn and
                 candidate.fits(shape))
@@ -348,7 +373,7 @@ pub const Broker = struct {
             }
         } else {
             group = self.allocator.create(Group) catch |err| {
-                self.mutex.unlock(io);
+                shard.mutex.unlock(io);
                 return err;
             };
             group.* = .{
@@ -358,19 +383,19 @@ pub const Broker = struct {
                 .execute_fn = execute_fn,
                 .created_at = std.Io.Clock.Timestamp.now(io, .awake),
             };
-            self.groups.append(self.allocator, group) catch |err| {
+            shard.groups.append(self.allocator, group) catch |err| {
                 self.allocator.destroy(group);
-                self.mutex.unlock(io);
+                shard.mutex.unlock(io);
                 return err;
             };
             leader = true;
         }
         const deadline_shortened = group.append(self.allocator, &ticket, shape) catch |err| {
             if (leader) {
-                _ = self.groups.pop();
+                _ = shard.groups.pop();
                 self.allocator.destroy(group);
             }
-            self.mutex.unlock(io);
+            shard.mutex.unlock(io);
             return err;
         };
         if (group.tickets.items.len >= group.limits.preferred_items or
@@ -384,11 +409,11 @@ pub const Broker = struct {
             // batch when there is still time to admit compatible work.
             group.wake.set(io);
         }
-        self.mutex.unlock(io);
+        shard.mutex.unlock(io);
 
         if (leader) {
-            self.waitForGroupWindow(io, group, &ticket);
-            self.executeGroup(io, group);
+            self.waitForGroupWindow(io, shard, group, &ticket);
+            self.executeGroup(io, shard, group);
         } else {
             ticket.done.wait(io) catch |err| switch (err) {
                 error.Canceled => {
@@ -408,12 +433,26 @@ pub const Broker = struct {
         return takeResult(Output, identity, &output, slot);
     }
 
-    fn waitForGroupWindow(self: *Broker, io: std.Io, group: *Group, leader: *Ticket) void {
+    fn shardFor(self: *Broker, key: Key) *BrokerShard {
+        var hasher = std.hash.Wyhash.init(0);
+        updateBrokerKeyHash(&hasher, key.model);
+        hasher.update(std.mem.asBytes(&key.generation));
+        hasher.update(std.mem.asBytes(&key.task));
+        updateBrokerKeyHash(&hasher, key.prompt);
+        updateBrokerKeyHash(&hasher, key.schema);
+        updateBrokerKeyHash(&hasher, key.transform);
+        hasher.update(std.mem.asBytes(&key.option_key));
+        hasher.update(std.mem.asBytes(&key.resource_class));
+        const index: usize = @intCast(hasher.final() % broker_shard_count);
+        return &self.shards[index];
+    }
+
+    fn waitForGroupWindow(_: *Broker, io: std.Io, shard: *BrokerShard, group: *Group, leader: *Ticket) void {
         if (group.limits.max_wait_us == 0) return;
         while (true) {
-            self.mutex.lockUncancelable(io);
+            shard.mutex.lockUncancelable(io);
             if (group.flush_requested) {
-                self.mutex.unlock(io);
+                shard.mutex.unlock(io);
                 return;
             }
             const wait_deadline = boundedLeaderWaitDeadline(
@@ -423,14 +462,14 @@ pub const Broker = struct {
             );
             const now = std.Io.Clock.Timestamp.now(io, .awake);
             if (wait_deadline.raw.nanoseconds <= now.raw.nanoseconds) {
-                self.mutex.unlock(io);
+                shard.mutex.unlock(io);
                 return;
             }
             // Reset while holding the group lock. A follower either published
             // its deadline before this recomputation, or will set the event
             // after acquiring the same lock; no update can be lost.
             group.wake.reset();
-            self.mutex.unlock(io);
+            shard.mutex.unlock(io);
 
             const timeout: std.Io.Timeout = .{ .deadline = wait_deadline };
             group.wake.waitTimeout(io, timeout) catch |err| switch (err) {
@@ -443,17 +482,17 @@ pub const Broker = struct {
         }
     }
 
-    fn executeGroup(self: *Broker, io: std.Io, group: *Group) void {
-        self.mutex.lockUncancelable(io);
-        for (self.groups.items, 0..) |candidate, index| {
+    fn executeGroup(self: *Broker, io: std.Io, shard: *BrokerShard, group: *Group) void {
+        shard.mutex.lockUncancelable(io);
+        for (shard.groups.items, 0..) |candidate, index| {
             if (candidate == group) {
-                _ = self.groups.swapRemove(index);
+                _ = shard.groups.swapRemove(index);
                 break;
             }
         }
         const items = self.allocator.alloc(ExecuteItem, group.tickets.items.len) catch {
             for (group.tickets.items) |ticket| ticket.item.slot.fail(error.OutOfMemory);
-            self.finishGroupLocked(io, group, 0);
+            self.finishGroupLocked(io, shard, group, 0);
             return;
         };
         var active_count: usize = 0;
@@ -466,14 +505,14 @@ pub const Broker = struct {
                 false;
             if (canceled or expired) {
                 ticket.item.slot.fail(if (expired) error.DeadlineExceeded else error.Canceled);
-                self.stats.canceled_items +|= 1;
+                shard.stats.canceled_items +|= 1;
                 continue;
             }
             ticket.state = .executing;
             items[active_count] = ticket.item;
             active_count += 1;
         }
-        self.mutex.unlock(io);
+        shard.mutex.unlock(io);
 
         if (active_count > 0) {
             group.execute_fn(group.execute_ctx, items[0..active_count]);
@@ -483,20 +522,20 @@ pub const Broker = struct {
         }
         self.allocator.free(items);
 
-        self.mutex.lockUncancelable(io);
-        self.stats.native_batches +|= @intFromBool(active_count > 0);
-        self.stats.native_items +|= active_count;
-        self.finishGroupLocked(io, group, active_count);
+        shard.mutex.lockUncancelable(io);
+        shard.stats.native_batches +|= @intFromBool(active_count > 0);
+        shard.stats.native_items +|= active_count;
+        self.finishGroupLocked(io, shard, group, active_count);
     }
 
-    fn finishGroupLocked(self: *Broker, io: std.Io, group: *Group, _: usize) void {
+    fn finishGroupLocked(self: *Broker, io: std.Io, shard: *BrokerShard, group: *Group, _: usize) void {
         for (group.tickets.items) |ticket| {
             ticket.state = .complete;
             ticket.done.set(io);
         }
         group.tickets.deinit(self.allocator);
         self.allocator.destroy(group);
-        self.mutex.unlock(io);
+        shard.mutex.unlock(io);
     }
 };
 

@@ -552,8 +552,19 @@ test "clip batch preprocessing matches single image preprocessing" {
     );
     defer alloc.free(single);
 
+    var caller_owned: [24]f32 = undefined;
+    try preprocessClipBatchIntoBounded(
+        &caller_owned,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .{},
+    );
+
     try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
     try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
+    try std.testing.expectEqualSlices(f32, batch, &caller_owned);
 }
 
 test "bounded batch preprocessing preserves input-indexed tensor order" {
@@ -1623,6 +1634,30 @@ pub fn preprocessClipBatchWithOptions(
     return result;
 }
 
+/// CLIP/SigLIP preprocessing into caller-owned model storage. This is the
+/// ownership-preserving counterpart to `preprocessClipBatchWithOptions` and
+/// avoids retaining a temporary normalized tensor alongside the model input.
+pub fn preprocessClipBatchIntoBounded(
+    result: []f32,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    try runBoundedPreprocessBatch(image_list, result, per_image, .{ .clip = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+    } }, options);
+}
+
 const maximum_preprocess_workers: usize = 8;
 const preprocess_slab_worker_headroom_bytes: usize = 64 * 1024;
 
@@ -2235,6 +2270,8 @@ fn preprocessImageViewClip(
     std.debug.assert(img.width > 0 and img.height > 0);
 
     const ts: usize = target_size;
+    const channels = img.channels();
+    const stride = img.rowStride() catch unreachable;
     const resized = clipResizeDims(img.width, img.height, target_size);
     const resized_w = resized.width;
     const resized_h = resized.height;
@@ -2261,10 +2298,10 @@ fn preprocessImageViewClip(
             const fx = src_x - @as(f32, @floatFromInt(x0));
 
             for (0..3) |ch| {
-                const p00 = pixelAtView(img, x0, y0, ch);
-                const p10 = pixelAtView(img, x1, y0, ch);
-                const p01 = pixelAtView(img, x0, y1, ch);
-                const p11 = pixelAtView(img, x1, y1, ch);
+                const p00 = pixelAtResolvedView(img.data, stride, channels, x0, y0, ch);
+                const p10 = pixelAtResolvedView(img.data, stride, channels, x1, y0, ch);
+                const p01 = pixelAtResolvedView(img.data, stride, channels, x0, y1, ch);
+                const p11 = pixelAtResolvedView(img.data, stride, channels, x1, y1, ch);
                 const top = p00 * (1.0 - fx) + p10 * fx;
                 const bottom = p01 * (1.0 - fx) + p11 * fx;
                 const value = top * (1.0 - fy) + bottom * fy;
@@ -2274,13 +2311,11 @@ fn preprocessImageViewClip(
     }
 }
 
-fn pixelAtView(img: ImageU8, x: u32, y: u32, ch: usize) f32 {
-    const channels = img.channels();
-    const stride = img.rowStride() catch unreachable;
-    const xi: usize = @intCast(@min(x, img.width - 1));
-    const yi: usize = @intCast(@min(y, img.height - 1));
+inline fn pixelAtResolvedView(data: []const u8, stride: usize, channels: usize, x: u32, y: u32, ch: usize) f32 {
+    const xi: usize = @intCast(x);
+    const yi: usize = @intCast(y);
     const ci = @min(ch, channels - 1);
-    return @floatFromInt(img.data[yi * stride + xi * channels + ci]);
+    return @floatFromInt(data[yi * stride + xi * channels + ci]);
 }
 
 const ClipResizeDims = struct {

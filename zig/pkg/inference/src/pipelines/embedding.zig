@@ -763,8 +763,6 @@ pub const EmbeddingPipeline = struct {
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
-        self.lockExecution();
-        defer self.unlockExecution();
         return self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
                 return self.embedImagesIndividually(images);
@@ -803,43 +801,50 @@ pub const EmbeddingPipeline = struct {
             // raw pixels for the transformer activation profile.
             .sequence = 1,
             .input_bytes = pixel_bytes,
-            .host_preprocess_bytes = std.math.add(
-                usize,
-                encoded_bytes,
-                std.math.mul(usize, pixel_bytes, 2) catch
-                    return error.ResourceLimitExceeded,
-            ) catch return error.ResourceLimitExceeded,
+            // Normalized pixels are allocated once and adopted by the input
+            // tensor below. Encoded sources remain separately resident while
+            // bounded codec scratch is charged by the preprocessing executor.
+            .host_preprocess_bytes = encoded_bytes,
         });
         defer run_permit.deinit();
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
-        const pixel_values = switch (self.config.image_preprocess_profile) {
-            .default => try image.preprocessBatchWithOptions(
-                alloc,
+        const pixel_values = try alloc.alloc(f32, pixel_elements);
+        var pixel_values_owned = true;
+        defer if (pixel_values_owned) alloc.free(pixel_values);
+        switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBatchIntoBounded(
+                pixel_values,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+                .bilinear,
+                .{ .io = self.config.preprocess_io },
+            ),
+            .clip => try image.preprocessClipBatchIntoBounded(
+                pixel_values,
                 images,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
                 .{ .io = self.config.preprocess_io },
             ),
-            .clip => try image.preprocessClipBatchWithOptions(
-                alloc,
-                images,
-                img_size,
-                image.IMAGENET_MEAN,
-                image.IMAGENET_STD,
-                .{ .io = self.config.preprocess_io },
-            ),
-        };
-        defer alloc.free(pixel_values);
+        }
         logEmbedTiming("image.preprocess", batch, preprocess_start);
 
         // Build input tensor
         const sz: i64 = @intCast(img_size);
         const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
-        var pv_tensor = try Tensor.initFloat32(alloc, "pixel_values", &pv_shape, pixel_values);
+        var pv_tensor = try Tensor.initFloat32Owned(alloc, "pixel_values", &pv_shape, pixel_values);
+        pixel_values_owned = false;
         defer pv_tensor.deinit();
+
+        // Admission and bounded CPU preprocessing are independent across
+        // requests. Serialize only access to resident backend/session state.
+        self.lockExecution();
+        defer self.unlockExecution();
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
@@ -882,8 +887,6 @@ pub const EmbeddingPipeline = struct {
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) anyerror![][]f32 {
         if (rasters.len == 0) return try self.allocator.alloc([]f32, 0);
-        self.lockExecution();
-        defer self.unlockExecution();
         return self.embedBorrowedRastersBatch(rasters) catch |err| {
             if (rasters.len > 1 and shouldFallbackBatchedImageError(err)) {
                 const embeddings = try self.allocator.alloc([]f32, rasters.len);
@@ -974,6 +977,9 @@ pub const EmbeddingPipeline = struct {
         pixel_values_owned = false;
         defer pv_tensor.deinit();
 
+        self.lockExecution();
+        defer self.unlockExecution();
+
         if (self.visual_projection) |proj| {
             const resident = try self.tryEmbedResidentProjection(
                 &.{pv_tensor},
@@ -1041,9 +1047,6 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            // The public entry point already owns execution_lock while it
-            // evaluates the batch fallback. Call the unlocked implementation
-            // directly so the non-reentrant mutex is not acquired twice.
             const single = try self.embedImagesBatch(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];

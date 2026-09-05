@@ -5554,17 +5554,12 @@ pub const Node = struct {
             security.max_image_dimension,
         );
         admission.units = @max(admission.units, estimateReadAdmissionUnits(request.images.len, max_tokens));
-        try self.acquireAdmissionUnits(admission.units);
-        var reserved_units = admission.units;
-        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("read.local.encoded");
         defer self.metrics.decActive();
 
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (request.images) |image| try decoded_budget.addImage(image.bytes);
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        try self.growAdmissionUnits(reserved_units, required_units);
-        reserved_units = required_units;
 
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
@@ -5699,6 +5694,12 @@ pub const Node = struct {
             }
         }
 
+        // Direct batches acquire their full execution lease here. Singleton
+        // native-batch candidates above are admitted once by the broker leader
+        // for the fused group, rather than each follower pinning a full model
+        // lease while it waits for compatible work.
+        try self.acquireAdmissionUnits(required_units);
+        defer self.releaseAdmissionUnits(required_units);
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
         for (request.images, 0..) |image, i| image_datas[i] = image.bytes;
@@ -5821,15 +5822,40 @@ pub const Node = struct {
         };
         defer allocator.free(result_allocators);
         const first = items[0].payloadAs(ReadMicrobatchPayload);
+        const security = effectiveRequestContentSecurity(self);
+        var encoded_bytes: usize = 0;
         var common_profile_source = first.profile_source_fingerprint;
         for (items, 0..) |item, index| {
             const payload = item.payloadAs(ReadMicrobatchPayload);
+            encoded_bytes = std.math.add(usize, encoded_bytes, payload.image.bytes.len) catch {
+                for (items) |failed| failed.slot.fail(error.ReadBatchTooLarge);
+                return;
+            };
             images[index] = payload.image;
             image_datas[index] = payload.image.bytes;
             result_allocators[index] = item.allocator;
             if (!optionalBytesEql(common_profile_source, payload.profile_source_fingerprint))
                 common_profile_source = null;
         }
+
+        var admission = readResidentEncodedAdmissionForLimits(
+            items.len,
+            encoded_bytes,
+            self.inference_admission.capacity,
+            security.max_image_dimension,
+        );
+        admission.units = @max(admission.units, estimateReadAdmissionUnits(items.len, first.max_tokens));
+        var decoded_budget = ReadDecodedImageBudget.init(admission, security.max_image_dimension);
+        for (images) |image| decoded_budget.addImage(image.bytes) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        self.acquireAdmissionUnits(required_units) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer self.releaseAdmissionUnits(required_units);
 
         const batch = self.runReadImageBatchReportedDirect(
             allocator,

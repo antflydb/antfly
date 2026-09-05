@@ -6049,10 +6049,10 @@ fn inferenceProviderEmbedDenseRasters(
             .raster_count = rasters.len,
             .rasters = borrowed.metadata,
         },
-        context.deadline_ns,
+        context.request.deadline_ns,
         borrowed.payloads,
         borrowed.refs,
-        context.cancellation orelse .none,
+        context.request.cancellation orelse .none,
     );
     errdefer {
         for (vectors) |vector| alloc.free(vector);

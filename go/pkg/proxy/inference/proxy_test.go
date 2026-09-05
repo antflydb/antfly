@@ -1089,6 +1089,91 @@ func TestRefreshEndpointSendsUpstreamAuthorization(t *testing.T) {
 	}
 }
 
+func TestProxyModelCatalogReusesAuthorizationScopedRefreshSnapshot(t *testing.T) {
+	t.Parallel()
+
+	const authToken = "Bearer bridge-token"
+	var modelRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != authToken {
+			http.Error(w, "missing auth", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/readyz":
+			w.WriteHeader(http.StatusOK)
+		case "/ai/v1/models":
+			modelRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"readers":{"reader-a":{"inputs":["image"]}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p := NewProxy(Config{
+		DefaultPool:           RoutePoolTarget{Pool: "bridge"},
+		RefreshInterval:       time.Minute,
+		UpstreamAuthorization: authToken,
+		Logger:                zap.NewNop(),
+	})
+	p.RegisterEndpointWithHealth(server.URL, server.URL+"/readyz", "bridge", WorkloadTypeGeneral)
+	if err := p.registry.RefreshEndpoint(context.Background(), server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.registry.RefreshEndpoint(context.Background(), server.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		p.handleModels(recorder, httptest.NewRequest(http.MethodGet, "/ai/v1/models", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("catalog status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+	}
+	if got := modelRequests.Load(); got != 1 {
+		t.Fatalf("upstream model catalog requests = %d, want one refresh fetch", got)
+	}
+}
+
+func TestRegistryCatalogSnapshotFencesAuthorizationAndIncarnation(t *testing.T) {
+	t.Parallel()
+
+	registry := NewModelRegistry(time.Minute)
+	const address = "http://catalog.internal"
+	registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	registry.mu.RLock()
+	endpoint := registry.endpoints[address]
+	incarnation := endpoint.incarnation
+	registry.mu.RUnlock()
+	const body = `{"readers":{"reader-a":{}}}`
+	registry.updateModelCatalogForEndpoint(address, endpoint, incarnation, []byte(body), "Bearer tenant-a", map[string]map[OperationType]bool{
+		"reader-a": {"read": true},
+	})
+
+	if snapshot, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-a"); !ok || string(snapshot) != body {
+		t.Fatalf("matching snapshot = %q, %t", snapshot, ok)
+	}
+	if _, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-b"); ok {
+		t.Fatal("catalog crossed authorization authority")
+	}
+	registry.mu.Lock()
+	endpoint.catalogCapturedAt = time.Now().Add(-registry.catalogSnapshotMaxAge() - time.Second)
+	registry.mu.Unlock()
+	if _, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-a"); ok {
+		t.Fatal("expired catalog snapshot remained reusable")
+	}
+	registry.updateModelCatalogForEndpoint(address, endpoint, incarnation, []byte(body), "Bearer tenant-a", map[string]map[OperationType]bool{
+		"reader-a": {"read": true},
+	})
+	registry.RegisterEndpoint(address, "replacement", WorkloadTypeGeneral)
+	if _, ok := registry.catalogSnapshotAtIncarnation(address, incarnation, "Bearer tenant-a"); ok {
+		t.Fatal("catalog crossed endpoint incarnation")
+	}
+}
+
 func TestForwardRequestSendsUpstreamAuthorization(t *testing.T) {
 	t.Parallel()
 

@@ -119,9 +119,17 @@ type Endpoint struct {
 	// yet. Bootstrap endpoints participate only in task-unscoped legacy lookup;
 	// executable routes require a discovered per-model operation.
 	catalogKnown bool
-	runtime      *endpointRuntime
-	lastSeen     time.Time
-	healthy      bool
+	// catalogBody is the bounded, immutable discovery response captured by the
+	// health refresher for this exact endpoint incarnation and authorization
+	// authority. Scoped /models requests can reuse it instead of refetching the
+	// same catalog from every node. It remains private registry state because a
+	// caller credential must never observe a catalog fetched with another one.
+	catalogBody                []byte
+	catalogAuthorizationDigest [sha256.Size]byte
+	catalogCapturedAt          time.Time
+	runtime                    *endpointRuntime
+	lastSeen                   time.Time
+	healthy                    bool
 	// incarnation is assigned by the registry and changes whenever an address is
 	// replaced or its routing topology changes. It is the authority captured by
 	// distributed capability discovery and execution leases.
@@ -401,6 +409,9 @@ type ModelRegistry struct {
 	client                *http.Client
 	ownedTransport        *http.Transport
 	upstreamAuthorization string
+	// Raw refresher snapshots are an optimization, never routing authority.
+	// Keep their aggregate residency independent of endpoint cardinality.
+	catalogSnapshotBytes int64
 
 	mu sync.RWMutex
 }
@@ -485,7 +496,24 @@ func (t *boundedResponseHeaderTransport) CloseIdleConnections() {
 func (r *ModelRegistry) SetUpstreamAuthorization(value string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.upstreamAuthorization = strings.TrimSpace(value)
+	value = strings.TrimSpace(value)
+	if r.upstreamAuthorization == value {
+		return
+	}
+	r.upstreamAuthorization = value
+	for _, endpoint := range r.endpoints {
+		r.clearCatalogSnapshotLocked(endpoint)
+	}
+}
+
+func (r *ModelRegistry) clearCatalogSnapshotLocked(endpoint *Endpoint) {
+	if endpoint == nil {
+		return
+	}
+	r.catalogSnapshotBytes -= int64(len(endpoint.catalogBody))
+	endpoint.catalogBody = nil
+	endpoint.catalogAuthorizationDigest = [sha256.Size]byte{}
+	endpoint.catalogCapturedAt = time.Time{}
 }
 
 func (r *ModelRegistry) upstreamAuthorizationValue() string {
@@ -545,6 +573,7 @@ func (r *ModelRegistry) RegisterEndpointWithHealthInNamespace(address, healthURL
 		oldPool := ep.pool
 		oldMetricPool := ep.metricPool()
 		if ep.healthURL != healthURL || ep.namespace != namespace || ep.pool != pool || ep.workloadType != workloadType {
+			r.clearCatalogSnapshotLocked(ep)
 			r.removeEndpointFromPoolLocked(address, oldPool)
 			newMetricPool := qualifiedPoolName(namespace, pool)
 			if oldMetricPool != newMetricPool {
@@ -646,6 +675,7 @@ func (r *ModelRegistry) UnregisterEndpoint(address string) {
 	if !exists {
 		return
 	}
+	r.clearCatalogSnapshotLocked(ep)
 
 	// Remove from pool index
 	r.removeEndpointFromPoolLocked(address, ep.pool)
@@ -716,6 +746,81 @@ func (r *ModelRegistry) updateModelOperationsForEndpoint(address string, expecte
 	r.updateModelsForEndpoint(address, expected, expectedIncarnation, models, operations, true)
 }
 
+func (r *ModelRegistry) updateModelCatalogForEndpoint(address string, expected *Endpoint, expectedIncarnation uint64, body []byte, authorization string, operations map[string]map[OperationType]bool) {
+	models := make([]string, 0, len(operations))
+	for model := range operations {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ep := r.endpoints[address]
+	if ep == nil || ep != expected || ep.incarnation != expectedIncarnation {
+		return
+	}
+	r.updateModelsForEndpointLocked(ep, address, models, operations, true)
+	r.clearCatalogSnapshotLocked(ep)
+	if int64(len(body)) > maxRegistryCatalogSnapshotBytes {
+		return
+	}
+	for r.catalogSnapshotBytes+int64(len(body)) > maxRegistryCatalogSnapshotBytes {
+		var oldest *Endpoint
+		for _, candidate := range r.endpoints {
+			if candidate == ep || len(candidate.catalogBody) == 0 {
+				continue
+			}
+			if oldest == nil || candidate.catalogCapturedAt.Before(oldest.catalogCapturedAt) {
+				oldest = candidate
+			}
+		}
+		if oldest == nil {
+			return
+		}
+		r.clearCatalogSnapshotLocked(oldest)
+	}
+	ep.catalogBody = bytes.Clone(body)
+	ep.catalogAuthorizationDigest = sha256.Sum256([]byte(authorization))
+	ep.catalogCapturedAt = time.Now()
+	r.catalogSnapshotBytes += int64(len(ep.catalogBody))
+}
+
+func (r *ModelRegistry) catalogSnapshotAtIncarnation(address string, incarnation uint64, authorization string) ([]byte, bool) {
+	digest := sha256.Sum256([]byte(authorization))
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ep := r.endpoints[address]
+	if !r.catalogSnapshotMatchesLocked(ep, incarnation, digest, time.Now()) {
+		return nil, false
+	}
+	return bytes.Clone(ep.catalogBody), true
+}
+
+func (r *ModelRegistry) catalogSnapshotFreshAtIncarnation(address string, incarnation uint64, authorization string) bool {
+	digest := sha256.Sum256([]byte(authorization))
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.catalogSnapshotMatchesLocked(r.endpoints[address], incarnation, digest, time.Now())
+}
+
+func (r *ModelRegistry) catalogSnapshotMatchesLocked(ep *Endpoint, incarnation uint64, digest [sha256.Size]byte, now time.Time) bool {
+	return ep != nil && ep.incarnation == incarnation && len(ep.catalogBody) > 0 &&
+		ep.catalogAuthorizationDigest == digest && now.Sub(ep.catalogCapturedAt) <= r.catalogSnapshotMaxAge()
+}
+
+func (r *ModelRegistry) catalogSnapshotMaxAge() time.Duration {
+	age := minRegistryCatalogSnapshotAge
+	if r.refreshInterval > 0 {
+		if r.refreshInterval >= maxRegistryCatalogSnapshotAge/2 {
+			return maxRegistryCatalogSnapshotAge
+		}
+		if doubled := 2 * r.refreshInterval; doubled > age {
+			age = doubled
+		}
+	}
+	return min(age, maxRegistryCatalogSnapshotAge)
+}
+
 func (r *ModelRegistry) updateModels(address string, models []string, operations map[string]map[OperationType]bool, catalogKnown bool) {
 	r.updateModelsForEndpoint(address, nil, 0, models, operations, catalogKnown)
 }
@@ -735,6 +840,20 @@ func (r *ModelRegistry) updateModelsForEndpoint(
 	if !exists || (expected != nil && (ep != expected || ep.incarnation != expectedIncarnation)) {
 		return
 	}
+	// A caller that replaces only the derived operation index has not supplied
+	// the descriptor bytes that produced it. Never serve an older raw snapshot
+	// as though it represented the new index.
+	r.clearCatalogSnapshotLocked(ep)
+	r.updateModelsForEndpointLocked(ep, address, models, operations, catalogKnown)
+}
+
+func (r *ModelRegistry) updateModelsForEndpointLocked(
+	ep *Endpoint,
+	address string,
+	models []string,
+	operations map[string]map[OperationType]bool,
+	catalogKnown bool,
+) {
 
 	// Track old models for cleanup
 	oldModels := make(map[string]bool)
@@ -1166,6 +1285,13 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 			return fmt.Errorf("health check returned %d", resp.StatusCode)
 		}
 	}
+	// Health probes run more frequently than immutable catalog refresh. Reuse
+	// the exact authorization/incarnation snapshot until its bounded freshness
+	// horizon, avoiding a manifest walk on every health tick.
+	if r.catalogSnapshotFreshAtIncarnation(address, expectedIncarnation, authorization) {
+		r.markEndpointHealth(address, expected, expectedIncarnation, true)
+		return nil
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ai/v1/models", nil)
 	if err != nil {
@@ -1198,7 +1324,7 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		r.markEndpointHealth(address, expected, expectedIncarnation, false)
 		return err
 	}
-	r.updateModelOperationsForEndpoint(address, expected, expectedIncarnation, models)
+	r.updateModelCatalogForEndpoint(address, expected, expectedIncarnation, body, authorization, models)
 	r.markEndpointHealth(address, expected, expectedIncarnation, true)
 	return nil
 }
@@ -2578,6 +2704,9 @@ func (p *Proxy) prepareCatalogEndpointCohort(ctx context.Context, routing Routin
 
 const maxModelCatalogBytes = 8 << 20
 const maxMergedModelCatalogBytes = 32 << 20
+const maxRegistryCatalogSnapshotBytes int64 = 64 << 20
+const minRegistryCatalogSnapshotAge = 30 * time.Second
+const maxRegistryCatalogSnapshotAge = 5 * time.Minute
 const maxConcurrentModelCatalogRequests = 8
 const maxModelCatalogWorkingBytes = 3 * maxModelCatalogBytes
 
@@ -2710,30 +2839,33 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	for range workerCount {
 		go func() {
 			for target := range jobs {
-				address := target.address
-				request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
-				if err != nil {
-					results <- catalogResult{err: err}
-					continue
-				}
-				if authorization != "" {
-					request.Header.Set("Authorization", authorization)
-				}
-				response, err := p.registry.client.Do(request)
-				if err != nil {
-					results <- catalogResult{err: err}
-					continue
-				}
-				if response.StatusCode < 200 || response.StatusCode >= 300 {
+				body, cached := p.registry.catalogSnapshotAtIncarnation(target.address, target.incarnation, authorization)
+				if !cached {
+					address := target.address
+					request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(address, "/")+"/ai/v1/models", nil)
+					if err != nil {
+						results <- catalogResult{err: err}
+						continue
+					}
+					if authorization != "" {
+						request.Header.Set("Authorization", authorization)
+					}
+					response, err := p.registry.client.Do(request)
+					if err != nil {
+						results <- catalogResult{err: err}
+						continue
+					}
+					if response.StatusCode < 200 || response.StatusCode >= 300 {
+						_ = response.Body.Close()
+						results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
+						continue
+					}
+					body, err = io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
 					_ = response.Body.Close()
-					results <- catalogResult{err: fmt.Errorf("upstream catalog returned %d", response.StatusCode)}
-					continue
-				}
-				body, err := io.ReadAll(io.LimitReader(response.Body, maxModelCatalogBytes+1))
-				_ = response.Body.Close()
-				if err != nil || len(body) > maxModelCatalogBytes {
-					results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
-					continue
+					if err != nil || len(body) > maxModelCatalogBytes {
+						results <- catalogResult{err: errors.New("upstream model catalog is unreadable or too large")}
+						continue
+					}
 				}
 				var catalog map[string]json.RawMessage
 				if err := json.Unmarshal(body, &catalog); err != nil {

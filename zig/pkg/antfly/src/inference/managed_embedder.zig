@@ -6042,12 +6042,13 @@ fn embedBatchWithGemini(
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     try waitForEntryPacer(entry);
-    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
-    defer http.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = try entry.httpClient(alloc, &fallback_http);
     const api_key_ref = if (entry.api_key) |*value| value else return error.MissingEmbeddingApiKey;
     const api_key = (try api_key_ref.resolveOwned(alloc, entry.secret_store)) orelse return error.MissingEmbeddingApiKey;
     defer alloc.free(api_key);
-    var provider = try vertex_provider.GeminiProvider.init(alloc, &http, .{
+    var provider = try vertex_provider.GeminiProvider.init(alloc, http, .{
         .base_url = entry.base_url,
         .api_key = api_key,
     });
@@ -6070,8 +6071,9 @@ fn embedBatchWithVertex(
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     if (texts.len == 0) return error.EmptyEmbeddingResponse;
-    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
-    defer http.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = try entry.httpClient(alloc, &fallback_http);
     const token_source = if (entry.google_credentials) |manager|
         manager.tokenSource(
             if (entry.credentials_path.len > 0) entry.credentials_path else null,
@@ -6082,7 +6084,7 @@ fn embedBatchWithVertex(
         }
     else
         null;
-    var provider = try vertex_provider.Provider.init(alloc, &http, .{
+    var provider = try vertex_provider.Provider.init(alloc, http, .{
         .base_url = entry.base_url,
         .project_id = if (entry.project_id.len > 0) entry.project_id else null,
         .location = entry.location,
@@ -6186,8 +6188,9 @@ fn embedBatchWithCohereRequest(
         .{ "authorization", auth_header },
     };
     try waitForEntryPacer(entry);
-    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
-    defer client.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const client = try entry.httpClient(alloc, &fallback_http);
     var response = try client.post(url, .{
         .json = body,
         .headers = &headers,

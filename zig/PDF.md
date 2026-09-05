@@ -3542,6 +3542,99 @@ report model qualification after running only the fake providers.
   and borrowed binary MIME rejection without importing `inference_host.zig`.
   The focused standalone runtime test depends on this executable.
 
+## Performance architecture after review
+
+The durable optimization boundary is the resolved executor, not a Florence-
+specific PDF loop. Every task follows the same four-stage ownership model:
+
+1. prepare task-neutral document units under source admission;
+2. form capability-compatible, resource-bounded windows;
+3. preprocess independent CPU/media inputs outside the model lock; and
+4. acquire the resolved executor once for the fused model operation.
+
+This applies to readers, generators, embedders, rerankers, extractors,
+classifiers through extraction, rewriters, chunkers, and transcribers. A family
+that has only singleton execution may use a bounded ordered compatibility
+window, but it must continue to advertise `serial_compatibility`. Only a real
+fused kernel/provider operation may advertise `native`.
+
+The post-implementation performance review resulted in these concrete changes:
+
+- Florence's ordinary greedy batch decoder performs row-wise argmax on the
+  backend and transfers only one token id per row. Host materialization of
+  `batch * vocabulary` logits remains only for no-repeat-ngram filtering or a
+  backend without row argmax.
+- Encoded visual embedding now allocates normalized model input once and
+  adopts that allocation into the tensor. Image and borrowed-raster decode,
+  resize, and normalization happen before the model execution lock; only
+  resident projector/session use is serialized.
+- CLIP/SigLIP raster preprocessing resolves channel count and row stride once
+  per image rather than in the inner sample loop.
+- A native reader broker candidate no longer owns a singleton inference lease
+  while waiting. The group leader derives decoded-pixel residency for the
+  complete fused batch and acquires one authoritative lease immediately before
+  execution.
+- The task-neutral microbatch broker is sharded by the complete resolved
+  executor key. Independent models, tasks, prompts, schemas, transformations,
+  options, and resource classes therefore do not contend on one global group
+  mutex.
+- Remote transcription compatibility batches run through a bounded ordered
+  window when runtime I/O is available. Worker results use a thread-safe
+  temporary allocator, are joined before transfer to the caller allocator, and
+  preserve input order and cancellation semantics. Linked model state remains
+  serial.
+- Gemini, Vertex, and Cohere embedding adapters borrow the managed embedder's
+  shared HTTP client. Connection pools and TLS sessions now live with the
+  resolved provider entry instead of one request.
+- The distributed proxy reuses the registry refresher's exact node catalog
+  snapshot when the endpoint incarnation and authorization digest match.
+  Snapshot residency has a process-wide 64 MiB cap with oldest-snapshot
+  eviction, and freshness is bounded to twice the configured refresh interval
+  (between 30 seconds and five minutes). Caller-specific authorization never
+  reuses another authority's catalog. This removes request-time all-node
+  discovery and repeated node manifest scans on the common service-credential
+  path while retaining exact capability leases.
+
+### Resource and pool ownership
+
+Long-lived pools are lazy children of the runtime that owns their physical
+resource:
+
+- `BackendRuntime` owns fixed CPU lanes, including PDF rendering and bounded
+  preprocessing scratch;
+- the inference `Node` owns model-generation-aware microbatch groups and model
+  admission;
+- a resolved provider entry owns reusable HTTP connections, pacing, and
+  provider credentials; and
+- `PreparedDocument` owns source bytes, immutable parse metadata, and
+  document-affine transformation state only for the pending document group.
+
+This prevents process-global document caches, avoids worker pools hidden in
+individual task adapters, and gives shutdown one explicit join order. Pools
+are created on first use and destroyed only after their admission gate has
+closed and outstanding leases have drained.
+
+### Remaining high-cost boundaries
+
+Two optimizations require explicit protocols rather than local shortcuts:
+
+- Distributed raw attachments need a versioned framed transport with
+  authentication, per-item attachment indexes and provenance, MIME and length
+  validation, checksums, flow control, cancellation, and strict response
+  cardinality. Until that protocol is negotiated, remote JSON uses admitted
+  base64 and linked execution uses borrowed binary/raster buffers. A proxy must
+  not infer binary support from logical model capabilities.
+- Cross-page font/image reuse needs a byte-bounded immutable resource cache
+  owned by `PreparedDocument`, with worker forks borrowing immutable entries.
+  It must not retain objects in resettable backend-lane scratch or share the
+  current mutable `Reader` caches across threads. The current task-local caches
+  are the safe fallback until corpus benchmarks justify that separate cache.
+
+Similarly, Gemma4 multimodal generation stays `serial_compatibility` until its
+resolved generator exposes a genuinely fused image-message batch. The generic
+envelope and media ABI do not by themselves make serial projector/session calls
+a native batch.
+
 ## Implementation status and follow-ups
 
 ### Phase 0: Baseline and parity coverage

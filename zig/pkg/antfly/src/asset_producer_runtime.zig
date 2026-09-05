@@ -956,10 +956,10 @@ pub const Runtime = struct {
                     break :blk .serial_compatibility;
                 break :blk capabilities.batch.mode;
             },
-            // The transcriber interface accepts one audio input per call. Its
-            // produceBatch implementation is therefore a compatibility loop,
-            // not an atomic provider batch, and must be isolated by callers.
-            .transcriber => .none,
+            // Transcription has one input per provider call. The compatibility
+            // batch preserves result order and uses bounded concurrency only
+            // for remote/stateless routes; linked model state stays serial.
+            .transcriber => .serial_compatibility,
             .extractor => blk: {
                 if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
@@ -1444,6 +1444,80 @@ pub const Runtime = struct {
         return out;
     }
 
+    /// Execute independent remote items through a bounded ordered window. Task
+    /// outputs use the process thread-safe allocator while workers are active,
+    /// then transfer to the caller allocator after the join. This keeps caller
+    /// allocator thread-safety out of the executor contract and bounds retained
+    /// response memory even when a provider route fans out across nodes.
+    fn produceRemoteCompatibilityBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        if (requests.len == 0) return try alloc.alloc([]u8, 0);
+        const io = self.execution.io orelse return self.produceBatchSequential(alloc, requests);
+        const per_item_response_bytes = @max(
+            @as(usize, 1),
+            try self.configuredResultLimit(requests[0].producer_type, 1),
+        );
+        const response_budget: usize = 64 << 20;
+        const width = @max(
+            @as(usize, 1),
+            @min(
+                @as(usize, 8),
+                @min(requests.len, response_budget / @min(per_item_response_bytes, response_budget)),
+            ),
+        );
+
+        const Task = struct {
+            runtime: *Runtime,
+            request: asset_producer.Request,
+            output: ?[]u8 = null,
+            failure: ?anyerror = null,
+
+            fn run(task: *@This()) std.Io.Cancelable!void {
+                task.runtime.execution.check(platform.time.monotonicNs()) catch |err| {
+                    task.failure = err;
+                    return;
+                };
+                task.output = task.runtime.produceOne(std.heap.smp_allocator, task.request) catch |err| {
+                    task.failure = err;
+                    return;
+                };
+                task.runtime.execution.check(platform.time.monotonicNs()) catch |err| {
+                    std.heap.smp_allocator.free(task.output.?);
+                    task.output = null;
+                    task.failure = err;
+                };
+            }
+        };
+
+        const tasks = try alloc.alloc(Task, requests.len);
+        defer alloc.free(tasks);
+        for (tasks, requests) |*task, request| task.* = .{ .runtime = self, .request = request };
+        errdefer for (tasks) |*task| if (task.output) |output| std.heap.smp_allocator.free(output);
+
+        var start: usize = 0;
+        while (start < tasks.len) : (start += width) {
+            const end = @min(start + width, tasks.len);
+            var group: std.Io.Group = .init;
+            for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
+            try group.await(io);
+            for (tasks[start..end]) |task| if (task.failure) |err| return err;
+        }
+
+        const out = try alloc.alloc([]u8, requests.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |output| alloc.free(output);
+            alloc.free(out);
+        }
+        for (tasks, out) |*task, *output| {
+            const temporary = task.output orelse return error.MissingAssetProducerOutput;
+            output.* = try alloc.dupe(u8, temporary);
+            initialized += 1;
+            std.heap.smp_allocator.free(temporary);
+            task.output = null;
+        }
+        return out;
+    }
+
     fn tryExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         var batch = try self.tryExtractBatchReported(alloc, requests);
         defer batch.deinit(alloc);
@@ -1826,7 +1900,8 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
-        if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
+        if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl()))
+            return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
 
