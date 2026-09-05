@@ -4147,6 +4147,7 @@ pub fn build(b: *std.Build) void {
         "api http server marks every proven table mutation pre-admission failure",
         "api http server retries only pre-admission public table drop failures",
         "ambiguous mutation response is explicitly non-retryable",
+        "authoritative catalog mutation boundaries reject orphaned semantic producers",
         "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",

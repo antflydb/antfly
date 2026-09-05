@@ -2233,14 +2233,16 @@ fn replaceTableDefinitionOnService(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
-    _ = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
+    try svc.replaceTableDefinition(expected, replacement);
+    try runPostMutationRound(svc);
 }
 
-fn replaceTableDefinitionOnServiceStamped(
+fn validateTableDefinitionReplacementOnService(
     svc: anytype,
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
-) !metadata_api.CatalogMutationStamp {
+) !void {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
@@ -2253,7 +2255,14 @@ fn replaceTableDefinitionOnServiceStamped(
         expected,
         replacement,
     )) return error.ExtensionOwnedObject;
+}
 
+fn replaceTableDefinitionOnServiceStamped(
+    svc: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+) !metadata_api.CatalogMutationStamp {
+    try validateTableDefinitionReplacementOnService(svc, expected, replacement);
     const stamp = try svc.replaceTableDefinitionStamped(expected, replacement);
     try runPostMutationRound(svc);
     return stamp;
@@ -16943,6 +16952,8 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
             .indexes_json = "{}",
             .placement_role = "data",
         },
+        replacement_calls: usize = 0,
+        round_calls: usize = 0,
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
@@ -16957,11 +16968,14 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         }
 
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
-        fn replaceTableDefinition(_: *@This(), _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !void {
-            return error.UnexpectedCatalogCommit;
+        fn replaceTableDefinition(self: *@This(), expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+            if (!metadata_table_manager.tableDefinitionsEqual(self.table, expected))
+                return error.TableGenerationChanged;
+            self.replacement_calls += 1;
+            self.table = replacement;
         }
-        fn runRound(_: *@This()) !void {
-            return error.UnexpectedCatalogCommit;
+        fn runRound(self: *@This()) !void {
+            self.round_calls += 1;
         }
     };
 
@@ -16993,6 +17007,18 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
         error.InvalidEmbeddingArtifactProducer,
         replaceTableDefinitionOnService(&service, service.table, replacement),
     );
+    try std.testing.expectEqual(@as(usize, 0), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 0), service.round_calls);
+
+    // The released, receipt-free service capability remains a complete
+    // mutation boundary of its own. It must not need to implement the newer
+    // stamped method, and the post-commit control round runs exactly once.
+    var valid_replacement = service.table;
+    valid_replacement.description = "updated";
+    try replaceTableDefinitionOnService(&service, service.table, valid_replacement);
+    try std.testing.expectEqual(@as(usize, 1), service.replacement_calls);
+    try std.testing.expectEqual(@as(usize, 1), service.round_calls);
+    try std.testing.expectEqualStrings("updated", service.table.description);
 }
 
 fn borrowedTestRestoreManifest(backup_id: []const u8, table_name: []const u8) backups_api.TableBackupManifest {
