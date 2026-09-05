@@ -1708,6 +1708,37 @@ pub fn downloadPinnedQwen3VlGenerationBundle(
     );
 }
 
+/// Download the immutable official Qwen3-VL generation checkpoint without
+/// quantization. Decoder and vision weights remain BF16 on CUDA; the generated
+/// bundle marker selects the integrated resident projector rather than a split
+/// GGUF mmproj.
+pub fn downloadPinnedQwen3VlGenerationSafetensorsBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const qwen3vl_catalog.GenerationSafetensorsBundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try qwen3vl_catalog.validate();
+    const artifacts = bundle.artifacts();
+    return downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        &artifacts,
+        qwen3vl_catalog.generation_safetensors_bundle_manifest,
+        dest_dir,
+        config,
+        progress,
+    );
+}
+
 /// Download the immutable official Qwen3-VL-Reranker BF16 oracle bundle. The
 /// generated bundle marker makes its generative yes/no semantics explicit and
 /// prevents it from being discovered as an ordinary CLS cross-encoder.

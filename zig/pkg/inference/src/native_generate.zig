@@ -3007,6 +3007,9 @@ fn cudaStatsCompactJson(
         \\"launch_elementwise":{d},
         \\"launch_scalar":{d},
         \\"launch_argmax":{d},
+        \\"launch_qwen3vl_mrope":{d},
+        \\"launch_qwen3vl_vision_rope":{d},
+        \\"launch_qwen3vl_vision_attention":{d},
         \\"decoder_runtime_linear_apply_hits":{d},
         \\"decoder_runtime_linear_pair_apply_hits":{d},
         \\"decoder_runtime_linear_qkv_apply_hits":{d},
@@ -3037,6 +3040,9 @@ fn cudaStatsCompactJson(
             stats.launch_elementwise,
             stats.launch_scalar,
             stats.launch_argmax,
+            stats.launch_qwen3vl_mrope,
+            stats.launch_qwen3vl_vision_rope,
+            stats.launch_qwen3vl_vision_attention,
             stats.decoder_runtime_linear_apply_hits,
             stats.decoder_runtime_linear_pair_apply_hits,
             stats.decoder_runtime_linear_qkv_apply_hits,
@@ -4624,6 +4630,9 @@ fn writeJsonTiming(
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
+                \\"launch_qwen3vl_mrope":{d},
+                \\"launch_qwen3vl_vision_rope":{d},
+                \\"launch_qwen3vl_vision_attention":{d},
                 \\
             ,
                 .{
@@ -4655,6 +4664,9 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                    cuda_stats.launch_qwen3vl_mrope,
+                    cuda_stats.launch_qwen3vl_vision_rope,
+                    cuda_stats.launch_qwen3vl_vision_attention,
                 },
             );
             try appendFmt(
@@ -5555,6 +5567,20 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"launch_qwen3vl_mrope":{d},
+                \\"launch_qwen3vl_vision_rope":{d},
+                \\"launch_qwen3vl_vision_attention":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_qwen3vl_mrope,
+                    cuda_stats.launch_qwen3vl_vision_rope,
+                    cuda_stats.launch_qwen3vl_vision_attention,
                 },
             );
             try appendFmt(

@@ -2960,13 +2960,15 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             trace_sink,
         );
         var new_hidden = block_hidden;
-        const deepstack_hidden = applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context) catch |err| {
-            if (block_hidden != hidden) cb.free(block_hidden);
-            return err;
-        };
-        if (deepstack_hidden) |injected| {
-            if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
+        var owns_new_hidden = new_hidden != hidden;
+        errdefer if (owns_new_hidden) cb.free(new_hidden);
+        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+            if (injected != block_hidden and block_hidden != hidden) {
+                cb.free(block_hidden);
+                owns_new_hidden = false;
+            }
             new_hidden = injected;
+            owns_new_hidden = new_hidden != hidden;
         }
         if (layer == 0) layer0_attn_norm_pending = null;
         if (layer == 0) layer0_fused_qkv_pending = null;
@@ -2975,6 +2977,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         if (layer == 0) layer0_v_pending = null;
         if (reserved_hidden) |*carrier| {
             try carrier.replaceActive(cb, new_hidden);
+            owns_new_hidden = false;
             hidden = carrier.active();
             owns_hidden = false;
         } else {
@@ -2986,6 +2989,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             }
             hidden = new_hidden;
             owns_hidden = true;
+            owns_new_hidden = false;
         }
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
@@ -3591,16 +3595,19 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             null,
         );
         var new_hidden = block_hidden;
-        const deepstack_hidden = applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context) catch |err| {
-            if (block_hidden != hidden) cb.free(block_hidden);
-            return err;
-        };
-        if (deepstack_hidden) |injected| {
-            if (injected != block_hidden and block_hidden != hidden) cb.free(block_hidden);
+        var owns_new_hidden = new_hidden != hidden;
+        errdefer if (owns_new_hidden) cb.free(new_hidden);
+        if (try applyQwen3VlDeepstack(cb, allocator, config, block_hidden, total, layer, decode_context)) |injected| {
+            if (injected != block_hidden and block_hidden != hidden) {
+                cb.free(block_hidden);
+                owns_new_hidden = false;
+            }
             new_hidden = injected;
+            owns_new_hidden = new_hidden != hidden;
         }
         if (new_hidden != hidden) cb.free(hidden);
         hidden = new_hidden;
+        owns_new_hidden = false;
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
             cb.free(hidden);
@@ -5846,7 +5853,12 @@ fn decoderBlockImpl(
                 break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
             }
         }
-        if (cb.kind() == .cuda and config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
+        // CUDA can stage the shared activation once for the three native
+        // no-bias Q/K/V projections. Qwen3-VL has the same projection
+        // contract as Gemma here, so keep it on the existing BF16/Q4-aware
+        // triple route instead of converting the activation three times.
+        const use_cuda_qkv = config.family == .gemma or config.family == .qwen3_vl;
+        if (cb.kind() == .cuda and use_cuda_qkv and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
             const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
             const q_w = try getModelWeight(cb, config, q_name);
             defer cb.free(q_w);
@@ -8023,6 +8035,48 @@ fn maybeDebugLayerTensorLastRow(
 
 // --- Attention with optional RoPE ---
 
+fn applyUniformBatchRope(
+    cb: *const ComputeBackend,
+    input: CT,
+    batch: usize,
+    seq_len: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    consecutive_pairs: bool,
+) !CT {
+    if (batch <= 1) {
+        return cb.rope(input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    }
+
+    // The scalar rope contract receives only seq_len. For a flattened
+    // [batch, seq, heads * head_dim] tensor it therefore cannot distinguish
+    // batch from heads and derives batch * heads chunks per position. Use the
+    // explicit batch-aware contract even when every item has the same length
+    // and offset so positions restart at zero for each batch row.
+    const allocator = std.heap.page_allocator;
+    const query_lengths = try allocator.alloc(usize, batch);
+    defer allocator.free(query_lengths);
+    const position_offsets = try allocator.alloc(usize, batch);
+    defer allocator.free(position_offsets);
+    @memset(query_lengths, seq_len);
+    @memset(position_offsets, position_offset);
+    return cb.ropePerItem(
+        input,
+        batch,
+        seq_len,
+        head_dim,
+        rope_dim,
+        theta,
+        freq_scale,
+        query_lengths,
+        position_offsets,
+        consecutive_pairs,
+    );
+}
+
 pub fn applyAttention(
     cb: *const ComputeBackend,
     config: Config,
@@ -8299,7 +8353,9 @@ fn applyAttentionWithSink(
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
         const Q_rope = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
-            if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
+            if (batch == 1) {
+                if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
+            }
             const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
                 scaled_q
             else scaled_blk: {
@@ -8309,10 +8365,10 @@ fn applyAttentionWithSink(
                 break :scaled_blk try cb.multiply(Q, scale_ct);
             };
             defer cb.free(scaled);
-            break :blk try cb.rope(scaled, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
-        } else try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+            break :blk try applyUniformBatchRope(cb, scaled, batch, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        } else try applyUniformBatchRope(cb, Q, batch, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(Q_rope);
-        const K_rope = try cb.rope(K, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        const K_rope = try applyUniformBatchRope(cb, K, batch, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(K_rope);
         debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
         try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "q-rope", Q_rope, num_heads * head_dim);
@@ -10794,7 +10850,7 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
 
 fn getModelWeightUnprefixedFallback(cb: *const ComputeBackend, name: []const u8) !CT {
     return cb.getWeight(name) catch |err| switch (err) {
-        error.MissingWeight => if (modelPrefixStrippedName(name)) |stripped| cb.getWeight(stripped) else err,
+        error.MissingWeight, error.WeightNotFound => if (modelPrefixStrippedName(name)) |stripped| cb.getWeight(stripped) else err,
         else => err,
     };
 }
@@ -11498,6 +11554,42 @@ test "final logit softcap greedy argmax fast path policy is Gemma-only" {
     try std.testing.expectEqual(@as(f32, 30.0), logits[0]);
     try std.testing.expectEqual(@as(f32, 30.0), logits[1]);
     try std.testing.expectEqual(@as(usize, 0), activations.argmax(&logits));
+}
+
+test "uniform batched RoPE restarts positions for each item" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(allocator, &store);
+    var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+
+    const first_values = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
+    const second_values = [_]f32{ 2.0, 0.0, 0.0, 2.0 };
+    const batched_values = first_values ++ second_values;
+    const batched_input = try cb.fromFloat32Shape(&batched_values, &.{ 4, 2 });
+    defer cb.free(batched_input);
+    const first_input = try cb.fromFloat32Shape(&first_values, &.{ 2, 2 });
+    defer cb.free(first_input);
+    const second_input = try cb.fromFloat32Shape(&second_values, &.{ 2, 2 });
+    defer cb.free(second_input);
+
+    const batched = try applyUniformBatchRope(&cb, batched_input, 2, 2, 2, 2, 10_000.0, 1.0, 0, false);
+    defer cb.free(batched);
+    const first = try cb.rope(first_input, 2, 2, 2, 10_000.0, 1.0, 0, false);
+    defer cb.free(first);
+    const second = try cb.rope(second_input, 2, 2, 2, 10_000.0, 1.0, 0, false);
+    defer cb.free(second);
+
+    const batched_host = try cb.toFloat32(batched, allocator);
+    defer allocator.free(batched_host);
+    const first_host = try cb.toFloat32(first, allocator);
+    defer allocator.free(first_host);
+    const second_host = try cb.toFloat32(second, allocator);
+    defer allocator.free(second_host);
+
+    try std.testing.expectEqualSlices(f32, first_host, batched_host[0..first_host.len]);
+    try std.testing.expectEqualSlices(f32, second_host, batched_host[first_host.len..]);
 }
 
 test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" {
