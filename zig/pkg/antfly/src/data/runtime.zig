@@ -5408,6 +5408,12 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_target_group_id: u64 = 0,
     provisioned_startup_catch_up_target_table_name: ?[]u8 = null,
     provisioned_startup_catch_up_dirty: std.atomic.Value(bool) = .init(true),
+    // Full scans and exact admission retries are separate work classes. A
+    // monotonic epoch lets exact retries avoid rescanning every local shard
+    // without allowing a concurrent topology/data wake to be mistaken for an
+    // exact-only pass.
+    provisioned_startup_catch_up_full_scan_epoch: std.atomic.Value(u64) = .init(1),
+    provisioned_startup_catch_up_completed_full_scan_epoch: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_started: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_completed: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_failed: std.atomic.Value(u64) = .init(0),
@@ -5618,6 +5624,10 @@ pub const DataServer = struct {
         quarantined_groups: u64 = 0,
         debt_remaining: bool = false,
         unparked_debt_remaining: bool = false,
+        // Admission contention retains its own exact group key. Every other
+        // retry class needs another catalog-wide scan because the durable
+        // route may have changed or no keyed owner remains after admission.
+        full_scan_retry_required: bool = false,
         earliest_retry_at_ms: u64 = 0,
         duration_ns: u64 = 0,
     };
@@ -5639,22 +5649,29 @@ pub const DataServer = struct {
         return true;
     }
 
-    fn busyStartupCatchUpNeedsRetry(
-        result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
-        durable_metadata_debt: bool,
-        runtime_status_refresh_pending: bool,
-        cached_status_has_debt: ?bool,
+    fn deferredStartupCatchUpLessThan(
+        _: void,
+        lhs: antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
+        rhs: antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
     ) bool {
-        // The catch-up owner has inspected durable state more recently than
-        // the runtime-status cache. In particular, native restore debt is not
-        // represented by replay_catch_up_required or backfill_active, so a
-        // busy return with had_debt=true must remain level-triggered even when
-        // the cached projection looks clean. The cache is only an optimization
-        // for contention where the owner did not observe durable debt.
-        return result.had_debt or
-            durable_metadata_debt or
-            runtime_status_refresh_pending or
-            (cached_status_has_debt orelse true);
+        return lhs.group_id < rhs.group_id;
+    }
+
+    fn containsSortedDeferredStartupCatchUpGroup(
+        groups: []const antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
+        group_id: u64,
+    ) bool {
+        var lo: usize = 0;
+        var hi = groups.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (groups[mid].group_id < group_id) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo < groups.len and groups[lo].group_id == group_id;
     }
 
     const StartupCatchUpCompletion = struct {
@@ -5673,6 +5690,17 @@ pub const DataServer = struct {
             .dirty = if (inspection_complete) stats.debt_remaining else true,
             .not_before_ms = startupCatchUpNotBeforeMs(stats, inspection_complete),
         };
+    }
+
+    fn startupCatchUpCompletesFullScan(
+        full_scan: bool,
+        stats: ProvisionedStartupCatchUpStats,
+        requested_epoch: u64,
+        current_epoch: u64,
+    ) bool {
+        return full_scan and
+            !stats.full_scan_retry_required and
+            requested_epoch == current_epoch;
     }
 
     const StartupCatchUpGroupDisposition = enum {
@@ -5958,7 +5986,7 @@ pub const DataServer = struct {
             .manager = api_server_cfg.user_manager,
             .auth_enabled = api_server_cfg.auth_enabled,
         });
-        const restore_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null;
+        const restore_io = if (self.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
         _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
         _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
@@ -9884,6 +9912,19 @@ pub const DataServer = struct {
         kind: antfly.public_api.ProvisionedTableWriteSource.LocalChangeKind,
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (kind == .startup_catch_up) {
+            // The source retains the exact (table, group) key. This callback
+            // is only its edge-triggered lease-release wake; the dirty bit and
+            // periodic control loop remain the lost-notification fallback.
+            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            self.maybeRequestProvisionedStartupCatchUp() catch |err| switch (err) {
+                error.ThreadQuotaExceeded,
+                error.SystemResources,
+                => std.log.debug("startup catch-up admission wake deferred table={s} err={s}", .{ table_name, @errorName(err) }),
+                else => std.log.warn("startup catch-up admission wake failed table={s} err={s}", .{ table_name, @errorName(err) }),
+            };
+            return;
+        }
         if (kind == .runtime_activity) {
             self.markRuntimeStatusDirty(table_name, kind);
             self.embedding_activity_status_dirty.store(true, .release);
@@ -9913,7 +9954,7 @@ pub const DataServer = struct {
         self.markLocalSplitKeyCacheDirty();
         switch (kind) {
             .data, .index_repair => self.markLocalGroupDataChanged(),
-            .runtime_status, .runtime_activity => unreachable,
+            .runtime_status, .runtime_activity, .startup_catch_up => unreachable,
             .runtime_reconciled => {
                 // Reconciliation updates indexes inside the current root.
                 // Invalidate the status plane and report immediately, but do
@@ -10120,13 +10161,18 @@ pub const DataServer = struct {
         _ = table_name;
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
-            .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
-            .index_repair, .runtime_reconciled, .runtime_status, .runtime_activity => {},
+            .data => self.markProvisionedStartupCatchUpFullScanDirty(),
+            .index_repair, .runtime_reconciled, .runtime_status, .runtime_activity, .startup_catch_up => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
-                self.provisioned_startup_catch_up_dirty.store(true, .release);
+                self.markProvisionedStartupCatchUpFullScanDirty();
             },
         }
+    }
+
+    fn markProvisionedStartupCatchUpFullScanDirty(self: *DataServer) void {
+        _ = self.provisioned_startup_catch_up_full_scan_epoch.fetchAdd(1, .release);
+        self.provisioned_startup_catch_up_dirty.store(true, .release);
     }
 
     fn markLocalSplitKeyCacheDirty(self: *DataServer) void {
@@ -10247,7 +10293,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
         self.runtime_status_dirty.store(true, .release);
         if (schedule_startup_catch_up) {
-            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            self.markProvisionedStartupCatchUpFullScanDirty();
         }
         self.store_status_dirty.store(true, .release);
     }
@@ -13257,7 +13303,7 @@ pub const DataServer = struct {
         }
         if (invalidated_tables.count() > 0) {
             self.runtime_status_dirty.store(true, .release);
-            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            self.markProvisionedStartupCatchUpFullScanDirty();
         }
     }
 
@@ -14331,6 +14377,9 @@ pub const DataServer = struct {
 
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
         const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
+        const requested_full_scan_epoch = self.provisioned_startup_catch_up_full_scan_epoch.load(.acquire);
+        const full_scan = requested_full_scan_epoch !=
+            self.provisioned_startup_catch_up_completed_full_scan_epoch.load(.acquire);
         // Consume the work that launched this pass. Producers only raise this
         // level-triggered bit, so work published while the scan is running
         // remains armed for the next pass.
@@ -14363,6 +14412,25 @@ pub const DataServer = struct {
             return stats;
         };
 
+        const deferred_groups = self.liveRuntimeWriteSource().snapshotDeferredStartupCatchUpGroups(self.alloc) catch |err| {
+            _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
+            std.log.warn("provisioned startup catch-up deferred-group snapshot failed err={s}", .{@errorName(err)});
+            return stats;
+        };
+        defer self.alloc.free(deferred_groups);
+        if (!full_scan) {
+            std.mem.sort(
+                antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp,
+                deferred_groups,
+                {},
+                deferredStartupCatchUpLessThan,
+            );
+        }
+        if (!full_scan and deferred_groups.len == 0) {
+            inspection_complete = true;
+            return stats;
+        }
+
         const snapshot_opt = self.adminSnapshotForMaintenance() catch |err| {
             _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned startup catch-up snapshot failed err={}", .{err});
@@ -14390,158 +14458,194 @@ pub const DataServer = struct {
 
         if (local_group_ids.len == 0) return stats;
 
-        for (snapshot.tables) |table| {
-            for (local_group_ids) |group_id| {
-                const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
-                if (range.table_id != table.table_id) continue;
-                // Restore imports a distinct physical generation into every
-                // placement, and metadata does not complete the range intent
-                // until every placement reports its local runtime repair
-                // proof. Unlike ordinary replay/index maintenance, this work
-                // therefore cannot be restricted to the current Raft leader.
-                // Keeping the exception scoped to a live restore identity
-                // preserves single-leader admission for all steady-state debt.
-                const restore_repair_pending = range.restore_backup_id.len != 0 and range.restore_location.len != 0;
-                if (!restore_repair_pending) {
-                    switch (startupCatchUpGroupDisposition(
-                        snapshot.stores,
-                        snapshot.placement_intents,
-                        snapshot.merged_group_statuses,
-                        registration,
-                        self.group_leadership_source,
-                        group_id,
-                    )) {
-                        .attempt => {},
-                        .skip_nonlocal => continue,
-                        .retry_unknown => {
-                            stats.debt_remaining = true;
-                            stats.unparked_debt_remaining = true;
-                            continue;
-                        },
-                    }
+        // Group ids are the routing identity and are unique within the catalog.
+        // Walk ranges once with logarithmic membership checks instead of the
+        // former table/group Cartesian product plus repeated range scans.
+        // Exact retries perform disk work only for their keyed targets.
+        for (snapshot.ranges) |range| {
+            const group_id = range.group_id;
+            if (!containsSortedU64(local_group_ids, group_id)) continue;
+            if (!full_scan and !containsSortedDeferredStartupCatchUpGroup(deferred_groups, group_id)) continue;
+            const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+            // Restore imports a distinct physical generation into every
+            // placement, and metadata does not complete the range intent
+            // until every placement reports its local runtime repair
+            // proof. Unlike ordinary replay/index maintenance, this work
+            // therefore cannot be restricted to the current Raft leader.
+            // Keeping the exception scoped to a live restore identity
+            // preserves single-leader admission for all steady-state debt.
+            const restore_repair_pending = range.restore_backup_id.len != 0 and range.restore_location.len != 0;
+            if (!restore_repair_pending) {
+                switch (startupCatchUpGroupDisposition(
+                    snapshot.stores,
+                    snapshot.placement_intents,
+                    snapshot.merged_group_statuses,
+                    registration,
+                    self.group_leadership_source,
+                    group_id,
+                )) {
+                    .attempt => {},
+                    .skip_nonlocal => continue,
+                    .retry_unknown => {
+                        stats.debt_remaining = true;
+                        stats.unparked_debt_remaining = true;
+                        stats.full_scan_retry_required = true;
+                        continue;
+                    },
                 }
+            }
 
-                const db_path = antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id) catch |err| {
+            const db_path = antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id) catch |err| {
+                _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
+                std.log.warn("provisioned startup catch-up path failed group={} table={s} err={}", .{ group_id, table.name, err });
+                stats.debt_remaining = true;
+                stats.unparked_debt_remaining = true;
+                stats.full_scan_retry_required = true;
+                continue;
+            };
+            defer self.alloc.free(db_path);
+
+            var io_impl = std.Io.Threaded.init(self.alloc, .{});
+            defer io_impl.deinit();
+            _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
+                error.FileNotFound => {
+                    stats.debt_remaining = true;
+                    stats.unparked_debt_remaining = true;
+                    stats.full_scan_retry_required = true;
+                    continue;
+                },
+                else => {
                     _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
-                    std.log.warn("provisioned startup catch-up path failed group={} table={s} err={}", .{ group_id, table.name, err });
+                    std.log.warn("provisioned startup catch-up stat failed group={} table={s} err={}", .{ group_id, table.name, err });
                     stats.debt_remaining = true;
                     stats.unparked_debt_remaining = true;
+                    stats.full_scan_retry_required = true;
                     continue;
-                };
-                defer self.alloc.free(db_path);
+                },
+            };
 
-                var io_impl = std.Io.Threaded.init(self.alloc, .{});
-                defer io_impl.deinit();
-                _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
-                    error.FileNotFound => {
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    },
-                    else => {
-                        _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned startup catch-up stat failed group={} table={s} err={}", .{ group_id, table.name, err });
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    },
-                };
-
-                const result = result_blk: {
-                    self.setProvisionedStartupCatchUpTarget(group_id, table.name) catch |err| {
-                        _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned startup catch-up target set failed group={} table={s} err={}", .{ group_id, table.name, err });
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    };
-                    defer self.clearProvisionedStartupCatchUpTarget();
-
-                    break :result_blk self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table.name, .{
-                        .indexes_json = table.indexes_json,
-                        .schema_json = table.schema_json,
-                        .identity_namespace = .{
-                            .table_id = table.table_id,
-                            .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
-                            .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
-                        },
-                    }) catch |err| {
-                        _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    };
-                };
-                stats.group_count += 1;
-                if (result.index_repair_pending) {
-                    // Startup catch-up is a periodic level observation, not a
-                    // causal progress edge. It may recover a lost queue entry,
-                    // but must not erase the exact repair owner's deadline or
-                    // manufacture a new immediate wake once debt is known.
-                    self.observeProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
-                        _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                        std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
-                        self.provisioned_index_repair_dirty.store(true, .release);
-                    };
-                    self.cacheQueuedProvisionedIndexRepairRoute(
-                        group_id,
-                        snapshot.status.metadata_epoch,
-                        range.table_id,
-                        antfly.metadata.table_manager.rangeDocIdentityShardId(range),
-                        antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
-                    );
-                }
-                // Runnable repair is delegated to its durable queue, while an
-                // operator-paused intent is deliberately parked without one.
-                // Neither belongs in startup catch-up's retry/quarantine loop.
-                if (accountParkedIndexRepair(&stats, result)) continue;
-                if (result.busy) {
-                    stats.busy_groups += 1;
-                    const runtime_status_refresh_pending = self.runtime_status_dirty.load(.acquire) or
-                        self.runtime_status_refresh_active.load(.acquire);
-                    const cached_debt: ?bool = if (result.had_debt or runtime_status_refresh_pending)
-                        null
-                    else
-                        self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch null;
-                    if (busyStartupCatchUpNeedsRetry(result, restore_repair_pending, runtime_status_refresh_pending, cached_debt)) {
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                    }
-                    continue;
-                }
-                if (result.quarantined) {
-                    stats.groups_with_debt += 1;
-                    stats.quarantined_groups += 1;
+            const result = result_blk: {
+                self.setProvisionedStartupCatchUpTarget(group_id, table.name) catch |err| {
+                    _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
+                    std.log.warn("provisioned startup catch-up target set failed group={} table={s} err={}", .{ group_id, table.name, err });
                     stats.debt_remaining = true;
-                    if (stats.earliest_retry_at_ms == 0 or result.retry_at_ms < stats.earliest_retry_at_ms) {
-                        stats.earliest_retry_at_ms = result.retry_at_ms;
-                    }
-                    if (result.quarantine_retry_scheduled) {
-                        const retry_in_ms = result.retry_at_ms -| started_at_ms;
-                        std.log.err("provisioned startup catch-up quarantined after repeated zero progress group={} table={s} retry_in_ms={}", .{ group_id, table.name, retry_in_ms });
-                    }
+                    stats.unparked_debt_remaining = true;
+                    stats.full_scan_retry_required = true;
                     continue;
-                }
-                if (!result.had_debt) continue;
+                };
+                defer self.clearProvisionedStartupCatchUpTarget();
+
+                break :result_blk self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table.name, .{
+                    .indexes_json = table.indexes_json,
+                    .schema_json = table.schema_json,
+                    .identity_namespace = .{
+                        .table_id = table.table_id,
+                        .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                        .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                    },
+                }) catch |err| {
+                    _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
+                    std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
+                    stats.debt_remaining = true;
+                    stats.unparked_debt_remaining = true;
+                    stats.full_scan_retry_required = true;
+                    continue;
+                };
+            };
+            stats.group_count += 1;
+            if (result.index_repair_pending) {
+                // Startup catch-up is a periodic level observation, not a
+                // causal progress edge. It may recover a lost queue entry,
+                // but must not erase the exact repair owner's deadline or
+                // manufacture a new immediate wake once debt is known.
+                self.observeProvisionedIndexRepairForTable(table.name, group_id) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    std.log.warn("provisioned index repair debt observation failed group={} err={s}", .{ group_id, @errorName(err) });
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                };
+                self.cacheQueuedProvisionedIndexRepairRoute(
+                    group_id,
+                    snapshot.status.metadata_epoch,
+                    range.table_id,
+                    antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                    antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                );
+            }
+            // Runnable repair is delegated to its durable queue, while an
+            // operator-paused intent is deliberately parked without one.
+            // Neither belongs in startup catch-up's retry/quarantine loop.
+            if (accountParkedIndexRepair(&stats, result)) continue;
+            if (result.busy) {
+                stats.busy_groups += 1;
+                // Admission contention means this pass did not inspect the
+                // durable shard at all. A cached clean projection cannot
+                // prove there is no startup debt: it may predate the
+                // structural owner that currently holds the shard, and a
+                // concurrent status refresh may be deferred by that same
+                // owner. Retain one level-triggered retry unconditionally.
+                // The scheduler coalesces the wake in a single dirty bit,
+                // selects only exact deferred groups on the next pass, and
+                // enforces provisioned_startup_catch_up_interval_ms.
+                stats.debt_remaining = true;
+                stats.unparked_debt_remaining = true;
+                continue;
+            }
+            if (result.quarantined) {
                 stats.groups_with_debt += 1;
-                if (result.terminalDegraded()) {
-                    std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
-                    self.runtime_status_dirty.store(true, .release);
-                    self.store_status_dirty.store(true, .release);
-                    continue;
+                stats.quarantined_groups += 1;
+                stats.debt_remaining = true;
+                stats.full_scan_retry_required = true;
+                if (stats.earliest_retry_at_ms == 0 or result.retry_at_ms < stats.earliest_retry_at_ms) {
+                    stats.earliest_retry_at_ms = result.retry_at_ms;
                 }
-                if (result.cleared_debt) {
-                    stats.groups_cleared += 1;
-                } else {
-                    stats.debt_remaining = true;
-                    stats.unparked_debt_remaining = true;
-                    std.log.warn("provisioned startup catch-up debt persists group={} table={s}", .{ group_id, table.name });
+                if (result.quarantine_retry_scheduled) {
+                    const retry_in_ms = result.retry_at_ms -| started_at_ms;
+                    std.log.err("provisioned startup catch-up quarantined after repeated zero progress group={} table={s} retry_in_ms={}", .{ group_id, table.name, retry_in_ms });
                 }
+                continue;
+            }
+            if (!result.had_debt) continue;
+            stats.groups_with_debt += 1;
+            if (result.terminalDegraded()) {
+                std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
+                self.runtime_status_dirty.store(true, .release);
+                self.store_status_dirty.store(true, .release);
+                continue;
+            }
+            if (result.cleared_debt) {
+                stats.groups_cleared += 1;
+            } else {
+                stats.debt_remaining = true;
+                stats.unparked_debt_remaining = true;
+                stats.full_scan_retry_required = true;
+                std.log.warn("provisioned startup catch-up debt persists group={} table={s}", .{ group_id, table.name });
             }
         }
 
         inspection_complete = true;
+        if (!stats.debt_remaining) {
+            // Admission clears live keys as it succeeds. Any exact key left
+            // after a complete debt-free pass no longer maps to a local route
+            // in this catalog snapshot, so retire it instead of retaining an
+            // unbounded topology tombstone.
+            for (deferred_groups) |deferred| {
+                self.liveRuntimeWriteSource().clearDeferredStartupCatchUpGroupIfUnchanged(deferred);
+            }
+        }
+        if (stats.full_scan_retry_required and !full_scan) {
+            // An exact retry can graduate into replay/restore/quarantine debt
+            // after it acquires the shard. Re-arm broad discovery because the
+            // successful admission cleared its exact deferral key.
+            self.markProvisionedStartupCatchUpFullScanDirty();
+        }
+        if (startupCatchUpCompletesFullScan(
+            full_scan,
+            stats,
+            requested_full_scan_epoch,
+            self.provisioned_startup_catch_up_full_scan_epoch.load(.acquire),
+        )) {
+            self.provisioned_startup_catch_up_completed_full_scan_epoch.store(requested_full_scan_epoch, .release);
+        }
         if (stats.groups_cleared > 0) {
             self.runtime_status_dirty.store(true, .release);
             self.store_status_dirty.store(true, .release);
@@ -15030,7 +15134,7 @@ pub const DataServer = struct {
                     _ = self.provisioned_index_repair_repaired.fetchAdd(1, .monotonic);
                     self.runtime_status_dirty.store(true, .release);
                     self.store_status_dirty.store(true, .release);
-                    self.provisioned_startup_catch_up_dirty.store(true, .release);
+                    self.markProvisionedStartupCatchUpFullScanDirty();
                 }
                 break;
             }
@@ -15328,7 +15432,7 @@ pub const DataServer = struct {
 
     pub fn requestProvisionedStartupCatchUpNow(self: *DataServer) !void {
         self.clearProvisionedStartupCatchUpBackoffs();
-        self.provisioned_startup_catch_up_dirty.store(true, .release);
+        self.markProvisionedStartupCatchUpFullScanDirty();
         try self.requestProvisionedStartupCatchUp();
     }
 
@@ -15625,7 +15729,7 @@ pub const DataServer = struct {
     }
 
     fn noteProvisionedStartupCatchUpDebt(self: *DataServer, debt_present: bool) void {
-        if (debt_present) self.provisioned_startup_catch_up_dirty.store(true, .release);
+        if (debt_present) self.markProvisionedStartupCatchUpFullScanDirty();
     }
 
     fn publishProvisionedStartupCatchUpCompletion(self: *DataServer, completion: StartupCatchUpCompletion) void {
@@ -15634,13 +15738,6 @@ pub const DataServer = struct {
         // that would erase a producer wake published during this pass.
         self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
         if (completion.dirty) self.provisioned_startup_catch_up_dirty.store(true, .release);
-    }
-
-    fn cachedRuntimeStatusHasStartupCatchUpDebt(self: *DataServer, table_name: []const u8, group_id: u64) !?bool {
-        const status = try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table_name, group_id);
-        var owned = status orelse return null;
-        defer owned.deinit(self.alloc);
-        return runtimeStatusStartupCatchUpDebtPresent((&[_]runtime_status.LocalTableRuntimeStatus{owned})[0..]);
     }
 
     fn setProvisionedStartupCatchUpTarget(self: *DataServer, group_id: u64, table_name: []const u8) !void {
@@ -16244,7 +16341,7 @@ pub const DataServer = struct {
             self.last_provision_metadata_epoch = head.metadata_epoch;
             self.last_provision_fingerprint = null;
             self.provisioned_root_refresh_dirty.store(true, .release);
-            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            self.markProvisionedStartupCatchUpFullScanDirty();
             return;
         }
         if (try self.localRestoreRepairPending(provisioning_ranges, local_group_ids)) {
@@ -16262,7 +16359,7 @@ pub const DataServer = struct {
             // scheduler and per-group backoff so repair starts on this control
             // turn instead of waiting behind unrelated pre-import history.
             self.clearProvisionedStartupCatchUpBackoffs();
-            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            self.markProvisionedStartupCatchUpFullScanDirty();
             return;
         }
 
@@ -16349,7 +16446,7 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpBackoffs();
         self.invalidateLocalGroupStatusCache();
         self.runtime_status_dirty.store(true, .release);
-        self.provisioned_startup_catch_up_dirty.store(true, .release);
+        self.markProvisionedStartupCatchUpFullScanDirty();
         self.store_status_dirty.store(true, .release);
     }
 
@@ -19959,6 +20056,20 @@ fn containsU64(values: []const u64, needle: u64) bool {
         if (value == needle) return true;
     }
     return false;
+}
+
+fn containsSortedU64(values: []const u64, needle: u64) bool {
+    var lo: usize = 0;
+    var hi = values.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (values[mid] < needle) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < values.len and values[lo] == needle;
 }
 
 fn collectAllRangeGroupIds(
@@ -27391,24 +27502,29 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     try std.testing.expect(!delegated.dirty);
     try std.testing.expectEqual(@as(u64, 0), delegated.not_before_ms);
 
-    const durable_restore_debt = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
-        .had_debt = true,
-        .busy = true,
+    const exact_retry = DataServer.ProvisionedStartupCatchUpStats{
+        .debt_remaining = true,
+        .unparked_debt_remaining = true,
     };
-    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(
-        durable_restore_debt,
-        false,
-        false,
-        false,
-    ));
+    try std.testing.expect(DataServer.startupCatchUpCompletesFullScan(true, exact_retry, 9, 9));
+    const broad_retry = DataServer.ProvisionedStartupCatchUpStats{
+        .debt_remaining = true,
+        .unparked_debt_remaining = true,
+        .full_scan_retry_required = true,
+    };
+    try std.testing.expect(!DataServer.startupCatchUpCompletesFullScan(true, broad_retry, 9, 9));
+    try std.testing.expect(!DataServer.startupCatchUpCompletesFullScan(true, exact_retry, 9, 10));
 
-    const unknown_busy = antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult{
-        .busy = true,
+    const deferred = [_]antfly.public_api.ProvisionedTableWriteSource.DeferredStartupCatchUp{
+        .{ .group_id = 7, .generation = 1 },
+        .{ .group_id = 11, .generation = 2 },
     };
-    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, true, false, false));
-    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, false, null));
-    try std.testing.expect(DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, true, false));
-    try std.testing.expect(!DataServer.busyStartupCatchUpNeedsRetry(unknown_busy, false, false, false));
+    try std.testing.expect(DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 7));
+    try std.testing.expect(DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 11));
+    try std.testing.expect(!DataServer.containsSortedDeferredStartupCatchUpGroup(&deferred, 9));
+    try std.testing.expect(containsSortedU64(&.{ 7, 11 }, 7));
+    try std.testing.expect(containsSortedU64(&.{ 7, 11 }, 11));
+    try std.testing.expect(!containsSortedU64(&.{ 7, 11 }, 9));
 }
 
 test "data runtime provisioned startup catch-up clears replay debt for local groups" {
@@ -27817,18 +27933,17 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
     try std.testing.expectEqualStrings("FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
 }
 
-test "data runtime startup catch-up clears no-debt busy writer groups" {
+test "data runtime startup catch-up retains deferred inspection despite clean cached status" {
     const alloc = std.testing.allocator;
 
     const cases = [_]struct {
         suffix: []const u8,
         runtime_status_dirty: bool = false,
         runtime_status_refresh_active: bool = false,
-        expect_dirty: bool,
     }{
-        .{ .suffix = "quiescent", .expect_dirty = false },
-        .{ .suffix = "runtime-dirty", .runtime_status_dirty = true, .expect_dirty = true },
-        .{ .suffix = "refresh-active", .runtime_status_refresh_active = true, .expect_dirty = true },
+        .{ .suffix = "quiescent" },
+        .{ .suffix = "runtime-dirty", .runtime_status_dirty = true },
+        .{ .suffix = "refresh-active", .runtime_status_refresh_active = true },
     };
 
     for (cases) |tc| {
@@ -27970,7 +28085,10 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
         try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic));
-        try std.testing.expectEqual(tc.expect_dirty, server.provisioned_startup_catch_up_dirty.load(.monotonic));
+        // The live writer group operation deliberately blocks catch-up while
+        // the cached status reports no debt. The uninspected shard must still
+        // retain the coalesced retry after this pass completes.
+        try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
     }
 }
 

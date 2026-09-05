@@ -3607,6 +3607,25 @@ pub const ApiHttpServer = struct {
         return runtime.apiIo();
     }
 
+    /// Local backup repositories need the API lane's native filesystem
+    /// contract. Remote repositories retain the cancellation-safe connector
+    /// used by request-scoped network transport.
+    fn backupLocationIo(
+        self: *ApiHttpServer,
+        location: *const backups_api.BackupLocation,
+    ) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return switch (location.*) {
+            .file => runtime.apiFilesystemIo(),
+            .remote => runtime.apiIo(),
+        };
+    }
+
+    fn sharedApiFilesystemIo(self: *ApiHttpServer) ?std.Io {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        return runtime.apiFilesystemIo();
+    }
+
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
         return .{
             .ptr = self,
@@ -4032,6 +4051,7 @@ pub const ApiHttpServer = struct {
                     self.rotateToNextTarget();
                     continue;
                 };
+                const repository_io = self.server.backupLocationIo(&location) orelse io;
                 const run_cluster_maintenance = blk: {
                     platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
                     defer self.server.backup_maintenance_mutex.unlock();
@@ -4040,14 +4060,14 @@ pub const ApiHttpServer = struct {
                 if (run_cluster_maintenance) {
                     _ = backups_api.reclaimStaleClusterBackupAttempts(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         now_unix_ns,
                     ) catch |err| {
                         std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
                     };
                 }
-                self.reclaimDueTableAttempts(io, &location, now_unix_ns);
+                self.reclaimDueTableAttempts(repository_io, &location, now_unix_ns);
                 location.deinit(self.server.owner_alloc);
                 self.rotateToNextTarget();
             }
@@ -4265,13 +4285,14 @@ pub const ApiHttpServer = struct {
                 },
             );
             defer location.deinit(self.server.owner_alloc);
+            const repository_io = self.server.backupLocationIo(&location) orelse io;
             switch (self.attempt) {
                 .table => |table| switch (table.action) {
                     .rollback => {
                         var object_budget: usize = backups_api.backup_attempt_reclaim_object_budget;
                         const progress = try backups_api.advanceUnpublishedTableBackupAttemptCleanupAtLocationWithCancellation(
                             self.server.owner_alloc,
-                            io,
+                            repository_io,
                             &location,
                             table.backup_id,
                             table.artifact_backup_id,
@@ -4285,20 +4306,20 @@ pub const ApiHttpServer = struct {
                     },
                     .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         table.artifact_backup_id,
                     ),
                     .committed_logical_state => _ = try backups_api.reconcileCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
-                        io,
+                        repository_io,
                         &location,
                         table.backup_id,
                     ),
                 },
                 .cluster => |cluster_attempt| backups_api.cleanupClusterBackupAttemptByIdAtLocation(
                     self.server.owner_alloc,
-                    io,
+                    repository_io,
                     &location,
                     cluster_attempt.attempt_id,
                 ) catch |err| switch (err) {
@@ -8946,7 +8967,8 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         request: api_operation.RequestContext,
     ) ![]backups_api.ShardSnapshot {
-        const io = self.sharedApiIo() orelse return error.BackupStorageUnavailable;
+        const io = self.backupLocationIo(backup_location) orelse
+            return error.BackupStorageUnavailable;
         const writer_not_after = fence.writer_not_after_unix_ns orelse
             return error.InvalidBackupFence;
         const ensure_writer_active = struct {
@@ -9696,13 +9718,13 @@ pub const ApiHttpServer = struct {
                 }
             }
         }
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(backup_location) == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
         try self.prepareOwnedRestoreArtifactIntegrity(
-            self.sharedApiIo() orelse fallback_io.?.io(),
+            self.backupLocationIo(backup_location) orelse fallback_io.?.io(),
             backup_location,
             local_backup_root,
             materialize_snapshot,
@@ -9779,7 +9801,7 @@ pub const ApiHttpServer = struct {
                     .reconcile_only = target_exists and !replace_existing,
                     .replace_existing = replace_existing,
                     .publication_hook = publication_hook,
-                    .io = self.sharedApiIo(),
+                    .io = self.backupLocationIo(backup_location),
                     .cancellation = cancellation,
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
@@ -10044,7 +10066,7 @@ pub const ApiHttpServer = struct {
             if (node_config.storage.lite_path) |path| break :blk std.fs.path.dirname(path) orelse ".";
             return error.BackupStagingUnavailable;
         };
-        if (self.sharedApiIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
+        if (self.sharedApiFilesystemIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try createBackupStagingRootAt(self.alloc, io_impl.io(), configured_root, generation_id);
@@ -10079,7 +10101,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn destroyBackupStagingRoot(self: *ApiHttpServer, path: []const u8) void {
-        if (self.sharedApiIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
+        if (self.sharedApiFilesystemIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         destroyBackupStagingRootAt(self.alloc, io_impl.io(), path);
@@ -11779,12 +11801,12 @@ pub const ApiHttpServer = struct {
             break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
         defer metadata_table_manager.freeTable(self.alloc, table);
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
-        const io = self.sharedApiIo() orelse fallback_io.?.io();
+        const io = self.backupLocationIo(location) orelse fallback_io.?.io();
         // Establish admission before publication. Cancellation remains safe
         // afterward because the operation control drains in-flight work and
         // the reservation rollback path converts uncertain delivery into an
@@ -11885,7 +11907,7 @@ pub const ApiHttpServer = struct {
                 error.DeadlineExceeded => error.DeadlineExceeded,
             };
             self.admitExternalRestoreArtifactIntegrity(
-                self.sharedApiIo() orelse return error.InternalFailure,
+                self.backupLocationIo(location) orelse return error.InternalFailure,
                 location,
                 &manifest,
                 null,
@@ -13097,12 +13119,12 @@ pub const ApiHttpServer = struct {
             .remote => true,
         };
         const op_alloc = self.alloc;
-        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
-        const backup_io = self.sharedApiIo() orelse fallback_io.?.io();
+        const backup_io = self.backupLocationIo(location) orelse fallback_io.?.io();
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
@@ -13672,7 +13694,7 @@ pub const ApiHttpServer = struct {
         } else api_operation.CancellationToken.none;
         const restore_connection = req.connection orelse return error.InvalidRequest;
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
-        const restore_io = self.sharedApiIo() orelse return error.InternalFailure;
+        const restore_io = self.backupLocationIo(location) orelse return error.InternalFailure;
 
         try self.ensureRestoreActive(cancellation);
 
@@ -15814,7 +15836,7 @@ pub const ApiHttpServer = struct {
             const credential_supported = std.mem.startsWith(u8, identity.credential_principal, "basic:") or
                 std.mem.startsWith(u8, identity.credential_principal, "api-key:");
             if (!credential_supported) {
-                const restore_io = self.sharedApiIo() orelse
+                const restore_io = self.backupLocationIo(&location) orelse
                     return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
                 var verification_cache: backups_api.ArtifactVerificationCache = .{};
                 defer verification_cache.deinit(self.alloc);
@@ -23364,9 +23386,10 @@ test "api http server obtains query embedding policy from resource manager" {
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
     const selected_io = ApiHttpServer.queryEmbeddingCacheIo(.{ .backend_runtime = runtime.ptr() });
-    const runtime_io = runtime.ptr().apiIoImpl().?.io();
+    const runtime_io = runtime.ptr().apiIo().?;
     try std.testing.expect(selected_io.userdata == runtime_io.userdata);
     try std.testing.expect(selected_io.vtable == runtime_io.vtable);
+    try std.testing.expect(selected_io.vtable != runtime.ptr().apiFilesystemIo().?.vtable);
 }
 
 test "api http query parsing preserves operational embedding failures" {
