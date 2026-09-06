@@ -16,14 +16,15 @@ const std = @import("std");
 const bridge = @import("inference_bridge.zig");
 const http = @import("../runtime_http_abi.zig");
 
-pub const version: u32 = 1;
-pub const Envelope = struct { operation: Operation, data: []const u8 };
+pub const version: u32 = 2;
+// Only options are JSON metadata. The application payload is carried raw.
+pub const Request = struct { operation: Operation, options: []const u8 = "" };
+pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
 pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache };
-pub const Reply = struct { status: bridge.Status = .ok, data: []const u8 = "" };
+pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
     kind: enum { progress, stream_start, stream_write, stream_close },
     status: u16 = 200,
-    data: []const u8 = "",
     phase: u8 = 0,
     completed: u64 = 0,
     total: u64 = 0,
@@ -134,7 +135,7 @@ pub const Create = struct {
     }
 };
 
-pub const Provider = struct { operation: c_int, request_json: []const u8, deadline_ns: ?u64 };
+pub const Provider = struct { operation: c_int, deadline_ns: ?u64 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
     route: []const u8,
@@ -143,36 +144,12 @@ pub const Http = struct {
     query: ?[]const u8,
     headers: []const Header,
     params: []const Header,
-    body_b64: ?[]const u8,
+    has_body: bool,
 };
-pub const HttpResponse = struct { status: u16, headers: []const Header, body_b64: []const u8 };
+pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
-pub fn encodeBytes(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
-    const out = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(value.len));
-    _ = std.base64.standard.Encoder.encode(out, value);
-    return out;
-}
-
-pub fn decodeBytes(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
-    const out = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(value));
-    errdefer alloc.free(out);
-    try std.base64.standard.Decoder.decode(out, value);
-    return out;
-}
-
-test "inference worker wire preserves binary HTTP and SSE bytes" {
-    const alloc = std.testing.allocator;
-    const original = "\x00\xff\xfe\r\n\"multimodal\"";
-    const encoded = try encodeBytes(alloc, original);
-    defer alloc.free(encoded);
-    const json = try std.json.Stringify.valueAlloc(alloc, Event{ .kind = .stream_write, .data = encoded }, .{});
-    defer alloc.free(json);
-    var parsed = try std.json.parseFromSlice(Event, alloc, json, .{});
-    defer parsed.deinit();
-    const decoded = try decodeBytes(alloc, parsed.value.data);
-    defer alloc.free(decoded);
-    try std.testing.expectEqualStrings(original, decoded);
-    try std.testing.expectError(error.InvalidCharacter, decodeBytes(alloc, "!!!!"));
+test "inference worker logical body limit matches the public HTTP contract" {
+    try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("inference_worker_rpc.zig").max_body_bytes);
 }
