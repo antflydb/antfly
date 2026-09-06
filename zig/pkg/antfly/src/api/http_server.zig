@@ -29643,6 +29643,22 @@ test "api http server serves retrieval agent response envelope" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
     try std.testing.expectEqual(metadata_openapi.RetrievalStrategy.bm25, parsed.value.strategy_used.?);
 
+    const streaming_body =
+        \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
+    ;
+    var streamed = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/db/v1/agents/retrieval",
+        .content_type = "application/json",
+        .body = streaming_body,
+    });
+    defer streamed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), streamed.status);
+    try std.testing.expect(std.mem.startsWith(u8, streamed.content_type.?, "text/event-stream"));
+    try std.testing.expect(std.mem.indexOf(u8, streamed.body, "event: hit\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, streamed.body, "event: done\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+
     const internal_query_body =
         \\{"query":"find hello","stream":false,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]},"limit":5}]}
     ;
@@ -29891,7 +29907,7 @@ test "api http server serves retrieval agent event stream" {
     });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("text/event-stream", resp.content_type.?);
+    try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", resp.content_type.?);
 
     const events = try parseSseEventsAlloc(alloc, resp.body);
     defer alloc.free(events);

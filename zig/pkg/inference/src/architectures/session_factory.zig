@@ -7288,7 +7288,7 @@ fn archRunImpl(
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
 
-            if (self.task == .classifier and cfg.family == .qwen3_vl) {
+            if (self.task == .classifier and (cfg.family == .qwen3_vl or cfg.family == .qwen3)) {
                 if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
                     return error.MissingInputs;
                 }
