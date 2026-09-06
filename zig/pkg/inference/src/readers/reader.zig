@@ -29,6 +29,7 @@ const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
@@ -55,10 +56,26 @@ const VisionLoadedReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !VisionLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !VisionLoadedReader {
         return .{
             .allocator = allocator,
             .parser_kind = try detectParserKind(allocator, model_path),
-            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager),
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromDirWithControl(
+                allocator,
+                model_path,
+                session_manager,
+                model_manager,
+                control,
+            ),
         };
     }
 
@@ -69,11 +86,11 @@ const VisionLoadedReader = struct {
     pub fn read(self: *VisionLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
-        var raw = try self.core.readRaw(image_data, .{
-            .prompt = normalized_prompt,
-            .max_tokens = options.max_tokens,
-            .source_fingerprint = options.source_fingerprint,
-        });
+        // Normalize only the family-specific field; retain the complete
+        // request contract, including cancellation and future option fields.
+        var forwarded = options;
+        forwarded.prompt = normalized_prompt;
+        var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
@@ -82,11 +99,9 @@ const VisionLoadedReader = struct {
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
-        const raw_results = try self.core.readRawBatch(image_datas, .{
-            .prompt = normalized_prompt,
-            .max_tokens = options.max_tokens,
-            .source_fingerprint = options.source_fingerprint,
-        });
+        var forwarded = options;
+        forwarded.prompt = normalized_prompt;
+        const raw_results = try self.core.readRawBatch(image_datas, forwarded);
         defer {
             for (raw_results) |raw| {
                 var tmp = raw;
@@ -119,13 +134,21 @@ const VlmLoadedReader = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !VlmLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !VlmLoadedReader {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
 
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path),
+            .pipeline = try onnx_decoder_only_vlm.Pipeline.loadWithControl(allocator, model_path, control),
         };
     }
 
@@ -144,7 +167,7 @@ const VlmLoadedReader = struct {
         var raw = try self.pipeline.generatePrompt(prompt, images[0..], .{
             .max_tokens = @intCast(options.max_tokens orelse 256),
             .cache_dtype = options.cache_dtype,
-        });
+        }, options.execution_control);
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
@@ -165,6 +188,14 @@ const GenAiLoadedReader = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !GenAiLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !GenAiLoadedReader {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
 
         const parser_kind = try detectParserKind(allocator, model_path);
@@ -174,7 +205,7 @@ const GenAiLoadedReader = struct {
             return error.InvalidModelForReading;
         errdefer allocator.free(prepared_model_dir);
 
-        const model = try ortgenai.GenAiModel.load(allocator, prepared_model_dir);
+        const model = try ortgenai.GenAiModel.loadWithControl(allocator, prepared_model_dir, control);
         errdefer {
             var model_mut = model;
             model_mut.deinit();
@@ -210,6 +241,7 @@ const GenAiLoadedReader = struct {
             prompt,
             images[0..],
             .{ .max_tokens = @intCast(options.max_tokens orelse 256) },
+            options.execution_control,
         );
         defer raw.deinit();
 
@@ -233,12 +265,23 @@ pub const LoadedReader = union(enum) {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedReader {
         if (try multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,
                 model_path,
                 session_manager,
                 model_manager,
+                control,
             ) };
         }
 
@@ -246,12 +289,17 @@ pub const LoadedReader = union(enum) {
         if (parser_kind == .moondream) {
             if (try session_manager.allowsDirectBackend(.onnx)) {
                 if (try onnx_decoder_only_vlm.probeModelDir(allocator, model_path)) {
-                    return .{ .vlm = try VlmLoadedReader.loadFromDir(allocator, model_path) };
+                    return .{ .vlm = try VlmLoadedReader.loadFromDirWithControl(allocator, model_path, control) };
                 }
                 if (build_options.enable_onnx) {
-                    if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |reader| {
+                    if (GenAiLoadedReader.loadFromDirWithControl(allocator, model_path, control)) |reader| {
                         return .{ .genai = reader };
                     } else |err| {
+                        switch (err) {
+                            error.Canceled, error.Cancelled, error.Timeout => return err,
+                            else => {},
+                        }
+                        if (control) |active| try active.check();
                         std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
                     }
                 }
@@ -261,7 +309,13 @@ pub const LoadedReader = union(enum) {
             return error.NativePix2StructNotYetSupported;
         }
 
-        return .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager) };
+        return .{ .vision = try VisionLoadedReader.loadFromDirWithControl(
+            allocator,
+            model_path,
+            session_manager,
+            model_manager,
+            control,
+        ) };
     }
 
     pub fn deinit(self: *LoadedReader) void {
@@ -294,6 +348,7 @@ pub const LoadedReader = union(enum) {
     }
 
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        if (options.execution_control) |control| try control.check();
         try validateReadOptions(options);
         const allocator = self.resultAllocator();
         const results = try switch (self.*) {
@@ -302,12 +357,7 @@ pub const LoadedReader = union(enum) {
             .vlm => |*reader| reader.readBatch(image_datas, options),
             .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
         };
-        errdefer {
-            for (results) |*result| result.deinit();
-            allocator.free(results);
-        }
-        for (results) |*result| try sanitizeResultUtf8(result);
-        return results;
+        return finishReadBatch(allocator, results, options.execution_control);
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {
@@ -316,6 +366,46 @@ pub const LoadedReader = union(enum) {
         };
     }
 };
+
+/// Takes ownership of the batch, transferring it to the caller only after all
+/// fallible publication work succeeds. Every error has the same cleanup owner.
+fn finishReadBatch(allocator: std.mem.Allocator, results: []Result, control: ?InferenceExecutionControl) ![]Result {
+    errdefer {
+        for (results) |*result| result.deinit();
+        allocator.free(results);
+    }
+    for (results) |*result| try sanitizeResultUtf8(result);
+    if (control) |active| try active.check();
+    return results;
+}
+
+test "batch publication owns cleanup on cancellation and timeout" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]InferenceExecutionControl{
+        .{ .check_fn = Cancel.check },
+        .{ .deadline_ns = 0 },
+    }, [_]anyerror{ error.Cancelled, error.Timeout }) |control, expected| {
+        const results = try std.testing.allocator.alloc(Result, 2);
+        for (results) |*result| result.* = .{
+            .text = try std.testing.allocator.dupe(u8, "finished"),
+            .allocator = std.testing.allocator,
+        };
+        try std.testing.expectError(expected, finishReadBatch(std.testing.allocator, results, control));
+    }
+}
+
+test "batch publication transfers successful results to caller" {
+    const results = try std.testing.allocator.alloc(Result, 1);
+    results[0] = .{ .text = try std.testing.allocator.dupe(u8, "finished"), .allocator = std.testing.allocator };
+    const published = try finishReadBatch(std.testing.allocator, results, .{});
+    defer std.testing.allocator.free(published);
+    defer published[0].deinit();
+    try std.testing.expectEqualStrings("finished", published[0].text);
+}
 
 fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: []const []const u8, options: ReadOptions) ![]Result {
     const allocator = reader.allocator;
@@ -331,6 +421,29 @@ fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: 
         filled += 1;
     }
     return out;
+}
+
+test "vision option normalization preserves cancellation for single and batch reads" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]InferenceExecutionControl{
+        .{ .deadline_ns = 0 },
+        .{ .check_fn = Cancel.check },
+    }, [_]anyerror{ error.Timeout, error.Cancelled }) |control, expected| {
+        // Expired requests must stop before consulting the loaded sessions or
+        // tokenizer. This also covers the wrapper, not just the raw pipeline.
+        var reader = VisionLoadedReader{
+            .allocator = std.testing.allocator,
+            .parser_kind = .florence,
+            .core = undefined,
+        };
+        const options = ReadOptions{ .prompt = "", .execution_control = control };
+        try std.testing.expectError(expected, reader.read("unused", options));
+        try std.testing.expectError(expected, reader.readBatch(&.{ "unused", "unused" }, options));
+    }
 }
 
 fn validateReadOptions(options: ReadOptions) !void {

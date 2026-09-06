@@ -5166,7 +5166,15 @@ pub const ApiHttpServer = struct {
     ) db_mod.types.EnrichmentStats {
         var stats: db_mod.types.EnrichmentStats = .{};
         inline for (std.meta.fields(metadata_table_manager.RuntimeEnrichmentStatusReport)) |field| {
-            @field(stats, field.name) = @field(report, field.name);
+            if (comptime std.mem.eql(u8, field.name, "active_model")) {
+                stats.active_model = .init(report.active_model);
+            } else if (comptime std.mem.eql(u8, field.name, "active_backend")) {
+                stats.active_backend = .init(report.active_backend);
+            } else if (comptime std.mem.eql(u8, field.name, "active_phase")) {
+                stats.active_phase = if (report.active_phase.len > 0) report.active_phase else "idle";
+            } else {
+                @field(stats, field.name) = @field(report, field.name);
+            }
         }
         return stats;
     }

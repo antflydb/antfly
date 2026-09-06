@@ -26790,6 +26790,7 @@ fn createManagedDbEnrichments(
         const io = managed_io orelse return error.MissingBackendRuntimeIo;
         break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
             .antfly_provider = local_provider,
+            .inference_api_url = inference_api_url,
             .secret_store = store,
         });
     } else null;

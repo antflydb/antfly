@@ -52,8 +52,10 @@ pub const RewritingPipeline = struct {
         const allocator = self.allocator;
 
         // 1. Tokenize input text (raw, no [CLS]/[SEP] — T5/BART have their own special tokens)
+        if (self.enc_dec.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const token_ids_i32 = try self.tokenizer.encode(allocator, text);
         defer allocator.free(token_ids_i32);
+        if (self.enc_dec.execution_control) |control| try control.update(.tokenizing, 1, 1);
 
         // Convert i32 token IDs to i64 for the backend
         const seq_len = @min(token_ids_i32.len, self.config.max_length);
@@ -80,6 +82,7 @@ pub const RewritingPipeline = struct {
         defer gen_result.deinit();
 
         // 5. Decode output token IDs to text
+        if (self.enc_dec.execution_control) |control| try control.update(.serializing, 0, 1);
         const output_text = try self.tokenizer.decode(allocator, gen_result.text_ids);
 
         return .{

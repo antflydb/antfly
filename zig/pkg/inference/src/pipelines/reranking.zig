@@ -98,16 +98,8 @@ pub const GenerativeQualificationTrace = struct {
     }
 };
 
-/// Optional request-lifetime hook installed by servers. The pipeline checks it
-/// at bounded batch boundaries without depending on an HTTP or API context.
-pub const ExecutionControl = struct {
-    ptr: ?*anyopaque,
-    check_fn: *const fn (?*anyopaque) anyerror!void,
-
-    pub fn check(self: ExecutionControl) !void {
-        return self.check_fn(self.ptr);
-    }
-};
+/// Compatibility alias while callers migrate to the package-wide contract.
+pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const RerankingPipeline = struct {
     allocator: std.mem.Allocator,
@@ -632,9 +624,14 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, allocator);
+        return permit.runWithControl(inputs, allocator, self.execution_control);
     }
 
     fn admitTextRun(
@@ -642,9 +639,10 @@ pub const RerankingPipeline = struct {
         batch: usize,
         sequence: usize,
     ) !session_mod.RunPermit {
+        try self.checkExecution();
         const tokens = std.math.mul(usize, batch, sequence) catch
             return error.ResourceLimitExceeded;
-        return self.session.admit(.{
+        var permit = try self.session.admit(.{
             .batch = batch,
             .sequence = sequence,
             .input_bytes = std.math.mul(usize, tokens, 24) catch
@@ -652,6 +650,9 @@ pub const RerankingPipeline = struct {
             .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
                 return error.ResourceLimitExceeded,
         });
+        errdefer permit.deinit();
+        try self.checkExecution();
+        return permit;
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
@@ -749,19 +750,18 @@ test "cross encoder bounds working memory with configured batches" {
 
 test "cross encoder observes cancellation between bounded batches" {
     const Control = struct {
-        checks: std.atomic.Value(usize) = .init(0),
+        runs: *std.atomic.Value(usize),
 
         fn check(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
-            if (count >= 3) return error.Cancelled;
+            if (self.runs.load(.acquire) != 0) return error.Cancelled;
         }
     };
 
     const allocator = std.testing.allocator;
     var tokenizer_state = FakeRerankingTokenizer{};
     var session_state = FakeRerankingSession{ .fixed_sequence = false };
-    var control = Control{};
+    var control = Control{ .runs = &session_state.run_count };
     var pipeline = RerankingPipeline.init(
         allocator,
         session_state.session(),
@@ -897,6 +897,7 @@ const FakeRerankingSession = struct {
             .ptr = self,
             .vtable = &.{
                 .run = run,
+                .runWithControl = runWithControl,
                 .inputInfo = inputInfo,
                 .outputInfo = outputInfo,
                 .backend = backend,
@@ -918,6 +919,22 @@ const FakeRerankingSession = struct {
         const out = try allocator.alloc(Tensor, 1);
         out[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), 1 }, logits);
         return out;
+    }
+
+    fn runWithControl(
+        ptr: *anyopaque,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ExecutionControl,
+    ) anyerror![]Tensor {
+        try control.check();
+        const outputs = try run(ptr, inputs, allocator);
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            allocator.free(outputs);
+        }
+        try control.check();
+        return outputs;
     }
 
     fn inputInfo(ptr: *anyopaque) []const backends.TensorInfo {

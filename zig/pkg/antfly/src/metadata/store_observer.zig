@@ -544,7 +544,12 @@ fn runtimeEnrichmentStatusEqual(
     rhs: table_manager.RuntimeEnrichmentStatusReport,
 ) bool {
     inline for (std.meta.fields(table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
+        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status") or
+            std.mem.eql(u8, field.name, "stall_reason") or
+            std.mem.eql(u8, field.name, "active_phase") or
+            std.mem.eql(u8, field.name, "active_model") or
+            std.mem.eql(u8, field.name, "active_backend"))
+        {
             if (!std.mem.eql(u8, @field(lhs, field.name), @field(rhs, field.name))) return false;
         } else if (@field(lhs, field.name) != @field(rhs, field.name)) {
             return false;

@@ -115,6 +115,7 @@ comptime {
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
     _ = @import("db/relational_store.zig");
+    _ = @import("db/schema_cache_admission.zig");
     _ = @import("db/schema_registry.zig");
     _ = @import("db/table_catalog.zig");
     _ = @import("db/resolution_handoff.zig");
