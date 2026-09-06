@@ -44,7 +44,9 @@ class SupervisorTests(unittest.TestCase):
         proc.communicate(timeout=5)
 
     def worker(self, proc):
-        self.assertTrue(select.select([proc.stdout], [], [], 5)[0], "worker startup timed out")
+        self.assertTrue(
+            select.select([proc.stdout], [], [], 5)[0], "worker startup timed out"
+        )
         line = proc.stdout.readline().decode().strip()
         self.assertTrue(line.startswith("worker "), line)
         return int(line.split()[1])
