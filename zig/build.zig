@@ -3499,6 +3499,14 @@ pub fn build(b: *std.Build) void {
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
 
+    const lib_managed_embedder_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"managed embedder"},
+    });
+    const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
+    const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
+    lib_managed_embedder_test_step.dependOn(&run_lib_managed_embedder_tests.step);
+
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
     });
@@ -3706,6 +3714,10 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder rejects unsupported execution namespaces",
+        "managed embedder separates index and artifact lookup namespaces",
+        "managed embedder validates sparse config with probe during normalization",
+        "managed embedder routes antfly without api_url to local provider",
         "managed embedder artifact backed embedding translation",
         "managed embedder binds execution to catalog semantic producer identity",
         "managed embedder reuses an executable owner for producerless artifact consumers",

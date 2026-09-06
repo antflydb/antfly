@@ -5422,10 +5422,11 @@ fn appendExecutionObjectIfPresent(
     root: std.json.ObjectMap,
 ) !void {
     const execution = root.get("execution") orelse return;
-    if (execution != .object) return error.InvalidCreateTableRequest;
+    // Reject unsupported namespaces and policy fields with the public domain
+    // error before the generated parser can expose an incidental JSON error.
+    try validateIndexExecutionObjectForCreateTable(execution);
     var parsed = try std.json.parseFromValue(indexes_openapi.IndexExecutionConfig, alloc, execution, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    try validateIndexExecutionObjectForCreateTable(execution);
     const encoded = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, ",\"execution\":");
@@ -5940,12 +5941,22 @@ test "managed embedder preserves coverage policy in storage config" {
 
 test "managed embedder rejects unsupported execution namespaces" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":8}}}
-    , .{});
-    defer parsed.deinit();
-
-    try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+    for ([_][]const u8{
+        \\{"indexing":{"batch_items":8}}
+        ,
+        \\{"embedding":{"batch_items":8},"indexing":{}}
+        ,
+        \\{"embedding":{"unknown_option":8}}
+        ,
+    }) |execution| {
+        const json = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"type":"embeddings","field":"body","dimension":384,"embedder":{{"provider":"antfly","model":"antflydb/clipclap"}},"execution":{s}}}
+        , .{execution});
+        defer std.testing.allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+    }
 }
 
 pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
@@ -6282,14 +6293,24 @@ test "managed embedder rejects conflicting embedding name aliases" {
     , local.provider()));
 }
 
-test "managed embedder rejects index name and embedding name collisions with different configs" {
+test "managed embedder separates index and artifact lookup namespaces with different configs" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
-    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
         \\  "aliased_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
         \\  "document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors_v2","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
-    , local.provider()));
+    , local.provider());
+    defer managed.deinit();
+
+    // Neither namespace may depend on the catalog's insertion order.
+    for (0..2) |_| {
+        try std.testing.expectEqualStrings("antflydb/other", managed.findQueryEntry("document_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/clipclap", managed.findArtifactEntry("document_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/clipclap", managed.findQueryEntry("aliased_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/other", managed.findArtifactEntry("document_vectors_v2").?.model);
+        std.mem.reverse(ManagedEmbeddingEntry, managed.entries);
+    }
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {
@@ -6333,9 +6354,20 @@ test "managed embedder validates sparse config with probe during normalization" 
     , .{});
     defer parsed.deinit();
 
-    const normalized = try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", parsed.value, .{ .antfly_provider = local.provider() });
-    try std.testing.expect(normalized == null);
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", parsed.value, .{ .antfly_provider = local.provider() })) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(normalized);
     try std.testing.expectEqual(@as(usize, 1), local.sparse_calls);
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized, .{});
+    defer normalized_parsed.deinit();
+    try std.testing.expect(normalized_parsed.value.object.get("dimension") == null);
+    const identity = normalized_parsed.value.object.get("semantic_producer") orelse return error.TestUnexpectedResult;
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator,
+        \\{"provider":"antfly","model":"antflydb/clipclap","sparse":true,"endpoint":"antfly:embedded"}
+    , identity.string);
+    // A normalized catalog entry preserves its admitted identity on replay.
+    const replay = try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", normalized_parsed.value, .{ .antfly_provider = local.provider() });
+    defer if (replay) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(replay == null);
 }
 
 test "managed embedder translates typed distance metric and embedder dimensions" {
@@ -7274,7 +7306,7 @@ test "managed embedder routes antfly without api_url to local provider" {
         fn dense(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqualStrings("", model);
+            try std.testing.expectEqualStrings("local-model", model);
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             for (texts, 0..) |_, i| {
@@ -7296,8 +7328,13 @@ test "managed embedder routes antfly without api_url to local provider" {
     };
 
     const indexes_json =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}}}
     ;
+    // An omitted URL selects the embedded provider, but does not relax the
+    // schema's independently required model field.
+    try std.testing.expectError(error.MissingField, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+    , provider));
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
 
