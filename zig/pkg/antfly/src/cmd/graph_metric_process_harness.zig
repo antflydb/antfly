@@ -2755,12 +2755,14 @@ fn verifyMetricExhaustedAttemptProcess(
         std.debug.print("expected coordinator process to fail exhausted {s} page attempts without publishing\n", .{label});
         return error.GraphMetricProcessProofFailed;
     }
+    const exhaustion_reason = try std.fmt.allocPrint(alloc, "GraphMetricBuildPageAttemptsExhausted: phase={s}, iteration={d}, page_id={d}, attempt=3, cause=GraphMetricBuildPageLeaseExpired", .{ @tagName(phase), iteration, exhausted_page_id });
+    defer alloc.free(exhaustion_reason);
     try verifyMetricFailedPreservesPublishedAtPhase(
         alloc,
         db_path,
         metric_name,
         initial_generation,
-        "GraphMetricBuildPageAttemptsExhausted",
+        exhaustion_reason,
         phase,
         iteration,
     );
@@ -2783,7 +2785,7 @@ fn verifyMetricExhaustedAttemptProcess(
         db_path,
         metric_name,
         initial_generation,
-        "GraphMetricBuildPageAttemptsExhausted",
+        exhaustion_reason,
         phase,
         iteration,
     );
@@ -3228,11 +3230,13 @@ fn verifyHitsExhaustedAttemptProcess(
         std.debug.print("expected coordinator process to fail exhausted HITS page attempts without publishing\n", .{});
         return error.GraphMetricProcessProofFailed;
     }
+    const exhaustion_reason = try std.fmt.allocPrint(alloc, "GraphMetricBuildPageAttemptsExhausted: phase=hits_hub_reduce_ranks, iteration=1, page_id={d}, attempt=3, cause=GraphMetricBuildPageLeaseExpired", .{exhausted_page_id});
+    defer alloc.free(exhaustion_reason);
     try verifyHitsFailedPreservesPublishedAtPhase(
         alloc,
         db_path,
         initial_generation,
-        "GraphMetricBuildPageAttemptsExhausted",
+        exhaustion_reason,
         .hits_hub_reduce_ranks,
         1,
     );
@@ -3252,7 +3256,7 @@ fn verifyHitsExhaustedAttemptProcess(
         alloc,
         db_path,
         initial_generation,
-        "GraphMetricBuildPageAttemptsExhausted",
+        exhaustion_reason,
         .hits_hub_reduce_ranks,
         1,
     );
@@ -5800,7 +5804,7 @@ fn verifyPageRankServiceTargetedMultiPageWorkerPoolProcess(
             defer alloc.free(coordinator_owner);
             const coordinator_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
             defer alloc.free(coordinator_now);
-            const coordinator = try runServiceCoordinatorRoleProcessAt(
+            var coordinator = try runServiceCoordinatorRoleProcessAt(
                 alloc,
                 io,
                 antfly_exe,
@@ -5812,8 +5816,7 @@ fn verifyPageRankServiceTargetedMultiPageWorkerPoolProcess(
             );
             now_ms += 1;
             if (coordinator.result.phases_advanced == 0) {
-                std.debug.print("expected service coordinator process to advance PageRank phase after {}\n", .{phase});
-                return error.GraphMetricPageRankProcessProofFailed;
+                coordinator = try drainServicePhaseRemainder(alloc, io, antfly_exe, base_uri, coordinator_runtime, worker_pool_runtime, &now_ms);
             }
             const next_phase = switch (phase) {
                 .prepare_generation => antfly.graph.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree,
@@ -6210,7 +6213,7 @@ fn verifyEigenvectorServiceTargetedMultiPageWorkerPoolProcess(
             defer alloc.free(coordinator_owner);
             const coordinator_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
             defer alloc.free(coordinator_now);
-            const coordinator = try runServiceCoordinatorRoleProcessAt(
+            var coordinator = try runServiceCoordinatorRoleProcessAt(
                 alloc,
                 io,
                 antfly_exe,
@@ -6222,8 +6225,7 @@ fn verifyEigenvectorServiceTargetedMultiPageWorkerPoolProcess(
             );
             now_ms += 1;
             if (coordinator.result.phases_advanced == 0) {
-                std.debug.print("expected service coordinator process to advance eigenvector phase after {}\n", .{phase});
-                return error.GraphMetricProcessProofFailed;
+                coordinator = try drainServicePhaseRemainder(alloc, io, antfly_exe, base_uri, coordinator_runtime, worker_pool_runtime, &now_ms);
             }
             const next_phase = switch (phase) {
                 .prepare_generation => antfly.graph.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree,
@@ -6623,7 +6625,7 @@ fn verifyHitsServiceTargetedMultiPageWorkerPoolProcess(
             defer alloc.free(coordinator_owner);
             const coordinator_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
             defer alloc.free(coordinator_now);
-            const coordinator = try runServiceCoordinatorRoleProcessAt(
+            var coordinator = try runServiceCoordinatorRoleProcessAt(
                 alloc,
                 io,
                 antfly_exe,
@@ -6635,8 +6637,7 @@ fn verifyHitsServiceTargetedMultiPageWorkerPoolProcess(
             );
             now_ms += 1;
             if (coordinator.result.phases_advanced == 0) {
-                std.debug.print("expected service coordinator process to advance HITS phase after {}\n", .{phase});
-                return error.GraphMetricProcessProofFailed;
+                coordinator = try drainServicePhaseRemainder(alloc, io, antfly_exe, base_uri, coordinator_runtime, worker_pool_runtime, &now_ms);
             }
             const next_phase = switch (phase) {
                 .prepare_generation => antfly.graph.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree,
@@ -9238,6 +9239,54 @@ fn workerSetHash(worker_ids: []const []const u8) u64 {
         sum_hash,
     };
     return std.hash.Wyhash.hash(0, std.mem.asBytes(&fingerprint_words));
+}
+
+/// Summary leaves/root and ordinal shards add bounded checkpoints within a
+/// phase. Drive those through real service processes, stopping at exactly the
+/// next coordinator barrier so callers can still assert the next phase.
+fn drainServicePhaseRemainder(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    antfly_exe: []const u8,
+    base_uri: []const u8,
+    coordinator_runtime: []const u8,
+    worker_runtime: []const u8,
+    now_ms: *u64,
+) !RoleRunSummary {
+    for (0..64) |_| {
+        const worker_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms.*});
+        defer alloc.free(worker_now);
+        const worker = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            worker_runtime,
+            "bounded-phase-worker",
+            "service-process-worker-a,service-process-worker-b",
+            "5000",
+            worker_now,
+            "4",
+        );
+        now_ms.* += 1;
+        const coordinator_now = try std.fmt.allocPrint(alloc, "{d}", .{now_ms.*});
+        defer alloc.free(coordinator_now);
+        const coordinator = try runServiceCoordinatorRoleProcessAt(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            coordinator_runtime,
+            "bounded-phase-coordinator",
+            "5000",
+            coordinator_now,
+        );
+        now_ms.* += 1;
+        if (coordinator.result.phases_advanced != 0) return coordinator;
+        if (!worker.durable_progressed and !coordinator.durable_progressed)
+            return error.GraphMetricProcessProofFailed;
+    }
+    return error.GraphMetricProcessProofFailed;
 }
 
 fn runRoleProcess(
