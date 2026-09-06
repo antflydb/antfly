@@ -54,6 +54,53 @@ const Node = struct {
 
 pub const Error = error{InvalidRegex} || Allocator.Error;
 
+/// Immutable parsed matcher. Matching uses caller-owned scratch, so one
+/// instance can be shared by concurrent schema-epoch readers. This deliberately
+/// uses the same parser/evaluator as matches, including interior anchors.
+pub const PreparedPattern = struct {
+    arena: std.heap.ArenaAllocator,
+    root: *const Node,
+    anchored_start: bool,
+
+    pub fn init(alloc: Allocator, pattern: []const u8) Error!PreparedPattern {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        var parser = Parser{ .alloc = arena.allocator(), .pattern = pattern };
+        const root = try parser.parse();
+        return .{ .root = root, .arena = arena, .anchored_start = requiresStart(root) };
+    }
+
+    pub fn deinit(self: *PreparedPattern) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn matches(self: *const PreparedPattern, alloc: Allocator, text: []const u8) Error!bool {
+        var results = std.ArrayListUnmanaged(usize).empty;
+        defer results.deinit(alloc);
+        const starts: usize = if (self.anchored_start) 1 else text.len + 1;
+        for (0..starts) |start| {
+            results.clearRetainingCapacity();
+            try matchNode(alloc, self.root, text, start, &results);
+            if (results.items.len > 0) return true;
+        }
+        return false;
+    }
+
+    fn requiresStart(node: *const Node) bool {
+        return switch (node.tag) {
+            .anchor_start => true,
+            .seq => node.children.len > 0 and requiresStart(node.children[0]),
+            .alt => blk: {
+                for (node.children) |child| if (!requiresStart(child)) break :blk false;
+                break :blk node.children.len > 0;
+            },
+            .repeat => node.min > 0 and requiresStart(node.child.?),
+            else => false,
+        };
+    }
+};
+
 pub fn matchesCompiled(pattern: []const u8, compiled: *RegexAutomaton, text: []const u8) bool {
     _ = pattern;
     const automaton_view = compiled.automaton();
@@ -109,23 +156,9 @@ fn findAnyPrefixCandidate(
 }
 
 pub fn matches(alloc: Allocator, pattern: []const u8, text: []const u8) Error!bool {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    var parser = Parser{
-        .alloc = arena.allocator(),
-        .pattern = pattern,
-    };
-    const root = try parser.parse();
-
-    for (0..text.len + 1) |start| {
-        var results = std.ArrayListUnmanaged(usize).empty;
-        defer results.deinit(alloc);
-        try matchNode(alloc, root, text, start, &results);
-        if (results.items.len > 0) return true;
-    }
-
-    return false;
+    var prepared = try PreparedPattern.init(alloc, pattern);
+    defer prepared.deinit();
+    return prepared.matches(alloc, text);
 }
 
 fn verifyCompiledFrom(automaton_view: vellum.Automaton, anchored_end: bool, text: []const u8, start_idx: usize) bool {
@@ -552,6 +585,39 @@ fn matchRepeat(
     }
 
     for (accepted.items) |candidate| try appendUnique(out, alloc, candidate);
+}
+
+test "prepared pattern owns its parse and supports repeated independent matches" {
+    const alloc = std.testing.allocator;
+    const source = try alloc.dupe(u8, "(^a|b$)");
+    var prepared = PreparedPattern.init(alloc, source) catch |err| {
+        alloc.free(source);
+        return err;
+    };
+    defer prepared.deinit();
+    alloc.free(source);
+    try std.testing.expect(!prepared.anchored_start);
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        try std.testing.expect(try prepared.matches(scratch.allocator(), "ax"));
+        try std.testing.expect(try prepared.matches(scratch.allocator(), "xb"));
+        try std.testing.expect(!try prepared.matches(scratch.allocator(), "xa"));
+        try std.testing.expect(!try prepared.matches(scratch.allocator(), "bx"));
+    }
+}
+
+test "prepared pattern start anchoring is conservative across alternatives and optional repeats" {
+    const alloc = std.testing.allocator;
+    var anchored = try PreparedPattern.init(alloc, "(^a|^b)+");
+    defer anchored.deinit();
+    try std.testing.expect(anchored.anchored_start);
+    try std.testing.expect(!try anchored.matches(alloc, "xa"));
+    try std.testing.expect(try anchored.matches(alloc, "ax"));
+    var optional = try PreparedPattern.init(alloc, "(^a)?b");
+    defer optional.deinit();
+    try std.testing.expect(!optional.anchored_start);
+    try std.testing.expect(try optional.matches(alloc, "xb"));
 }
 
 test "regex supports counted character classes" {

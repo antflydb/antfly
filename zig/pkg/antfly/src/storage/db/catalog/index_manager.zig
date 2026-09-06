@@ -2797,6 +2797,9 @@ pub const IndexManager = struct {
                 entry.access = self.clock;
                 return &entry.view;
             }
+            if (self.transient) |*view| {
+                if (view.version() == version) return view;
+            }
             var view = try self.manager.acquireSchemaVersionView(version);
             errdefer view.release();
             if (self.views.count() >= max_resident_views) {
@@ -3354,6 +3357,8 @@ pub const IndexManager = struct {
     pub const WritePlanSnapshot = struct {
         alloc: Allocator,
         generation: u64,
+        /// Artifact-only text indexes consume generated records, not base rows.
+        has_text_consumers: bool = false,
         dense_fields: []DenseFieldWritePlan,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
@@ -3765,6 +3770,12 @@ pub const IndexManager = struct {
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
+            .has_text_consumers = blk: {
+                for (self.text_indexes.items) |*entry| {
+                    if (!textEntryHasExplicitArtifactSources(entry)) break :blk true;
+                }
+                break :blk false;
+            },
             .dense_fields = dense_fields,
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
@@ -3884,6 +3895,25 @@ pub const IndexManager = struct {
         try std.testing.expect(first.plan() != next.plan());
         try std.testing.expectEqual(first.generation() + 1, next.generation());
         try std.testing.expectEqual(@as(usize, 0), first.plan().dense_fields.len);
+        try std.testing.expect(!first.plan().has_text_consumers);
+    }
+
+    test "schema view set reuses transient epoch without consulting the registry" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        var views = SchemaViewSet.init(&manager);
+        defer views.deinit();
+        const epoch = try schema_registry_mod.Epoch.createCloned(std.testing.allocator, .{ .version = 77 });
+        views.transient = .{ .epoch = epoch };
+        for (0..256) |_| {
+            const view = try views.get(77);
+            try std.testing.expect(view.epoch == epoch);
+            try std.testing.expectEqual(@as(usize, 1), epoch.ref_count.load(.monotonic));
+        }
+        // No registry is installed: a real miss must attempt the loader rather
+        // than returning a cached epoch with the wrong schema identity.
+        try std.testing.expectError(error.SchemaRegistryUnavailable, views.get(78));
+        try std.testing.expectEqual(@as(u32, 77), views.transient.?.version());
     }
 
     test "borrowed generated row plan preserves chunk consumer routing" {
@@ -26968,6 +26998,42 @@ test "generated target cache detects sparse and graph artifact consumers indepen
         try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
         try std.testing.expect(!try manager.computeGeneratedEnrichmentTargetCacheExcluding("relations_graph", null));
     }
+}
+
+test "write plan retains base text roots only for document consumers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "text-root-consumers");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "text_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .chunk_size = 64,
+    }));
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "artifact_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"text_chunks\"}]}",
+    }});
+    var artifacts = try manager.acquireWritePlanSnapshot();
+    defer artifacts.release();
+    try std.testing.expect(!artifacts.plan().has_text_consumers);
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "base_text",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+    var documents = try manager.acquireWritePlanSnapshot();
+    defer documents.release();
+    try std.testing.expect(documents.plan().has_text_consumers);
+    try std.testing.expect(!artifacts.plan().has_text_consumers);
+    try std.testing.expect(documents.generation() != artifacts.generation());
 }
 
 test "multi-source consumers participate in generation routing and preserve source isolation" {

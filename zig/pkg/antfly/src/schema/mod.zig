@@ -58,7 +58,7 @@ pub fn validateWritesAgainstTableSchema(
     writes: anytype,
 ) !void {
     var compiled = try CompiledTableValidator.initParsed(alloc, schema);
-    defer compiled.deinitPhysicalFields(alloc);
+    defer compiled.deinit(alloc);
     try compiled.validateWrites(alloc, writes);
 }
 
@@ -71,23 +71,22 @@ pub fn validateWritesAgainstTableSchema(
 pub const CompiledTableValidator = struct {
     schema: ParsedTableSchema,
     physical_fields: []impl.PhysicalFieldValidation,
+    execution: impl.CompiledValidationPlan,
     owns_schema: bool,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
         errdefer schema.deinit(alloc);
-        const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
-        return .{
-            .schema = schema,
-            .physical_fields = physical_fields,
-            .owns_schema = true,
-        };
+        return takeParsed(alloc, schema);
     }
 
     pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
+        const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
+        errdefer freePhysicalFieldValidations(alloc, physical_fields);
         return .{
             .schema = schema,
-            .physical_fields = try derivePhysicalFieldValidations(alloc, schema),
+            .physical_fields = physical_fields,
+            .execution = try impl.CompiledValidationPlan.init(alloc, schema),
             .owns_schema = false,
         };
     }
@@ -99,24 +98,63 @@ pub const CompiledTableValidator = struct {
     }
 
     pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
-        self.deinitPhysicalFields(alloc);
+        self.execution.deinit(alloc);
+        freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;
     }
 
-    fn deinitPhysicalFields(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
-        freePhysicalFieldValidations(alloc, self.physical_fields);
-        self.physical_fields = &.{};
-    }
-
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
-        try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, self.schema, writes, self.physical_fields);
+        try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
     }
 
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
-        try impl.validateDocumentValueWithPhysicalFields(alloc, self.schema, value, self.physical_fields);
+        try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
     }
 };
+
+const compiled_validator_fixture =
+    \\{"default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"string","pattern":"^(ab|cd)+$"},"b":{"type":"integer"},"c":{"type":"boolean"},"d":{"type":"string"},"e":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"c":{"type":"integer"},"d":{"type":"integer"},"e":{"type":"string","pattern":"^x$"}},"additionalProperties":false}},"patternProperties":{"^tag_":{"type":"string","pattern":"^x$"}},"additionalProperties":false}}}}
+;
+
+test "compiled validator reuses wide nested property dispatch and deduplicates patterns" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc, compiled_validator_fixture);
+    defer compiled.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), compiled.execution.properties.count());
+    try std.testing.expectEqual(@as(u32, 3), compiled.execution.patterns.count());
+    const cases = [_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"a\":\"abcd\",\"b\":1,\"c\":true,\"d\":\"ok\",\"e\":{\"a\":1,\"e\":\"x\"},\"tag_1\":\"x\"}", .valid = true },
+        .{ .json = "{\"a\":\"ac\"}", .valid = false },
+        .{ .json = "{\"e\":{\"e\":\"y\"}}", .valid = false },
+        .{ .json = "{\"e\":{\"unknown\":1}}", .valid = false },
+        .{ .json = "{\"tag_1\":\"y\"}", .valid = false },
+        .{ .json = "{\"unknown\":1}", .valid = false },
+    };
+    for (0..3) |_| for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        if (case.valid) {
+            try compiled.validateValue(alloc, &parsed.value);
+            try impl.validateDocumentValueWithPhysicalFields(alloc, compiled.schema, &parsed.value, compiled.physical_fields);
+        } else {
+            try std.testing.expectError(error.InvalidBatchRequest, compiled.validateValue(alloc, &parsed.value));
+            try std.testing.expectError(error.InvalidBatchRequest, impl.validateDocumentValueWithPhysicalFields(alloc, compiled.schema, &parsed.value, compiled.physical_fields));
+        }
+    };
+}
+
+test "compiled validator construction cleans up allocation failures without consuming borrowed schema" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, schema: ParsedTableSchema) !void {
+            var compiled = try CompiledTableValidator.initParsed(alloc, schema);
+            defer compiled.deinit(alloc);
+        }
+    };
+    var schema = try parseValidatedTableSchema(std.testing.allocator, compiled_validator_fixture);
+    defer schema.deinit(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{schema});
+}
 
 fn derivePhysicalFieldValidations(
     alloc: std.mem.Allocator,

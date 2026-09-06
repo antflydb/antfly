@@ -112,6 +112,12 @@ against the active cached contract, including embedded batches, transaction
 prepares, replicated callers, and recovery resolution. API validation remains
 an early feedback optimization rather than the only integrity boundary.
 
+The validator's immutable execution plan includes hashed property dispatch for
+wide objects (including nested and composed schemas) and deduplicated parsed
+regex patterns. Small objects keep linear lookup to avoid hash-table overhead.
+Pattern evaluation uses request-local scratch; concurrent preparation and
+restore never mutate shared matcher state or reparse a pattern per field.
+
 The raw JSON Schema type `json` is accepted for a relational property. It is
 not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
 column and later indexed like a document subtree (path facts + dynamic
@@ -174,7 +180,10 @@ borrow the request body for derived consumers instead of copying it; rows with
 reserved fields clone and stringify one stripped logical tree. Large batches
 prepare on the bounded runtime worker pool into one ref-counted arena per
 worker, so allocator synchronization occurs at page granularity without one
-allocator/page chain per row. Store keys, timestamps, and derived write effects
+allocator/page chain per row. Parsed trees survive preparation only when a
+synchronous base-document text consumer or split shadow needs them. Vector-only
+and artifact-only `full_index` writes recycle parse scratch per row rather than
+retaining all batch JSON trees. Store keys, timestamps, and derived write effects
 are prepared from a ref-counted immutable
 `WritePlanSnapshot`. Graph/vector extraction and generated-enrichment templates
 are compiled once per durable catalog generation, so foreground work does not
@@ -298,6 +307,7 @@ Historical caches use an aging frequency sketch for admission. An interleaved
 scan spanning more than 32 epochs must not flush every resident query plan or
 layout on each row. Scan, search, index-backfill, and shared-registry caches
 apply that policy; a request-owned transient entry serves non-admitted epochs.
+Repeated hits reuse that transient plan without faulting or compiling it again.
 Sixteen `std.Io` fault lanes coalesce same-version misses while unrelated
 versions can load concurrently. Whole-store replacement acquires all lanes
 before replacing the registry namespace.

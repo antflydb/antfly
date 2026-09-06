@@ -378,12 +378,99 @@ const SchemaContext = struct {
     }
 };
 
+/// Execution data owned by the same immutable epoch as the parsed schema.
+/// Slice identities remain stable when schema/property structs are copied.
+pub const CompiledValidationPlan = struct {
+    const PropertyMap = std.StringHashMapUnmanaged(usize);
+    properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
+    patterns: std.StringHashMapUnmanaged(schema_regex.PreparedPattern) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
+        var plan: CompiledValidationPlan = .{};
+        errdefer plan.deinit(alloc);
+        for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
+        return plan;
+    }
+
+    pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
+        var maps = self.properties.valueIterator();
+        while (maps.next()) |map| map.deinit(alloc);
+        self.properties.deinit(alloc);
+        var patterns = self.patterns.valueIterator();
+        while (patterns.next()) |pattern| pattern.deinit();
+        self.patterns.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn addPattern(self: *CompiledValidationPlan, alloc: std.mem.Allocator, pattern: []const u8) !void {
+        if (self.patterns.contains(pattern)) return;
+        var prepared = schema_regex.PreparedPattern.init(alloc, pattern) catch |err| switch (err) {
+            error.InvalidRegex => return error.InvalidSchemaUpdateRequest,
+            else => return err,
+        };
+        errdefer prepared.deinit();
+        try self.patterns.put(alloc, pattern, prepared);
+    }
+
+    fn addProperty(self: *CompiledValidationPlan, alloc: std.mem.Allocator, property: DocumentProperty) anyerror!void {
+        // Tiny objects are cheaper to search directly; wide objects get O(1)
+        // dispatch without duplicating property names or schema nodes.
+        if (property.properties.len > 4) {
+            const identity = @intFromPtr(property.properties.ptr);
+            if (!self.properties.contains(identity)) {
+                var map: PropertyMap = .empty;
+                errdefer map.deinit(alloc);
+                for (property.properties, 0..) |child, index| {
+                    const entry = try map.getOrPut(alloc, child.name);
+                    if (!entry.found_existing) entry.value_ptr.* = index;
+                }
+                try self.properties.put(alloc, identity, map);
+            }
+        }
+        if (property.pattern) |pattern| try self.addPattern(alloc, pattern);
+        for (property.pattern_properties) |pattern| {
+            try self.addPattern(alloc, pattern.pattern);
+            try self.addProperty(alloc, pattern.property.*);
+        }
+        inline for (.{ "properties", "prefix_items", "all_of", "any_of", "one_of" }) |field| {
+            for (@field(property, field)) |child| try self.addProperty(alloc, child);
+        }
+        inline for (.{ "additional_properties_schema", "unevaluated_properties_schema", "property_names", "not_schema", "if_schema", "then_schema", "else_schema", "contains_schema", "item", "unevaluated_items_schema" }) |field| {
+            if (@field(property, field)) |child| try self.addProperty(alloc, child.*);
+        }
+        for (property.dependent_schemas) |dependency| try self.addProperty(alloc, dependency.schema.*);
+    }
+
+    fn findProperty(self: *const CompiledValidationPlan, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
+        if (self.properties.get(@intFromPtr(properties.ptr))) |map| {
+            return if (map.get(name)) |index| properties[index] else null;
+        }
+        return findDocumentProperty(properties, name);
+    }
+};
+
 const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
+    compiled: ?*const CompiledValidationPlan = null,
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+
+    fn findProperty(self: *const RuntimeValidationContext, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
+        if (self.compiled) |compiled| return compiled.findProperty(properties, name);
+        return findDocumentProperty(properties, name);
+    }
+
+    fn matchPattern(self: *const RuntimeValidationContext, pattern: []const u8, value: []const u8) !bool {
+        if (self.compiled) |compiled| {
+            if (compiled.patterns.getPtr(pattern)) |prepared| return prepared.matches(self.alloc, value);
+        }
+        return schema_regex.matches(self.alloc, pattern, value) catch |err| switch (err) {
+            error.InvalidRegex => error.InvalidSchemaUpdateRequest,
+            else => err,
+        };
+    }
 
     fn deinit(self: *RuntimeValidationContext) void {
         self.active_root_ref_values.deinit(self.alloc);
@@ -526,32 +613,42 @@ pub fn validateWritesAgainstSchemaWithPhysicalFields(
     writes: anytype,
     physical_fields: []const PhysicalFieldValidation,
 ) !void {
+    return validateWritesWithPlan(alloc, schema, writes, physical_fields, null);
+}
+
+pub fn validateWritesWithPlan(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    writes: anytype,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: ?*const CompiledValidationPlan,
+) !void {
     const Writes = @TypeOf(writes);
     switch (@typeInfo(Writes)) {
         .pointer => |pointer| {
             if (pointer.size == .slice) {
-                for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
+                for (writes) |write| try validateDocumentJsonWithPlan(alloc, schema, write.value, physical_fields, compiled);
                 return;
             }
             if (pointer.size == .one) {
                 const child = @typeInfo(pointer.child);
                 if (child == .array) {
-                    for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
+                    for (writes.*) |write| try validateDocumentJsonWithPlan(alloc, schema, write.value, physical_fields, compiled);
                     return;
                 }
                 if (child == .@"struct" and child.@"struct".is_tuple) {
-                    inline for (writes.*) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
+                    inline for (writes.*) |write| try validateDocumentJsonWithPlan(alloc, schema, write.value, physical_fields, compiled);
                     return;
                 }
             }
         },
         .array => {
-            for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
+            for (writes) |write| try validateDocumentJsonWithPlan(alloc, schema, write.value, physical_fields, compiled);
             return;
         },
         .@"struct" => |struct_info| {
             if (struct_info.is_tuple) {
-                inline for (writes) |write| try validateDocumentJsonWithPhysicalFields(alloc, schema, write.value, physical_fields);
+                inline for (writes) |write| try validateDocumentJsonWithPlan(alloc, schema, write.value, physical_fields, compiled);
                 return;
             }
         },
@@ -565,20 +662,21 @@ pub fn validateDocumentJson(
     schema: TableSchema,
     value_json: []const u8,
 ) !void {
-    try validateDocumentJsonWithPhysicalFields(alloc, schema, value_json, &.{});
+    try validateDocumentJsonWithPlan(alloc, schema, value_json, &.{}, null);
 }
 
-fn validateDocumentJsonWithPhysicalFields(
+fn validateDocumentJsonWithPlan(
     alloc: std.mem.Allocator,
     schema: TableSchema,
     value_json: []const u8,
     physical_fields: []const PhysicalFieldValidation,
+    compiled: ?*const CompiledValidationPlan,
 ) !void {
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    try validateDocumentValueWithPhysicalFields(alloc, schema, &parsed.value, physical_fields);
+    try validateDocumentValueWithPlan(alloc, schema, &parsed.value, physical_fields, compiled);
 }
 
 /// Validate an already parsed document. Relational storage preparation uses
@@ -590,6 +688,16 @@ pub fn validateDocumentValueWithPhysicalFields(
     value: *std.json.Value,
     physical_fields: []const PhysicalFieldValidation,
 ) !void {
+    return validateDocumentValueWithPlan(alloc, schema, value, physical_fields, null);
+}
+
+pub fn validateDocumentValueWithPlan(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    value: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: ?*const CompiledValidationPlan,
+) !void {
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     const root = switch (value.*) {
@@ -600,6 +708,7 @@ pub fn validateDocumentValueWithPhysicalFields(
     const document_schema = try resolveDocumentSchema(schema, root);
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
+        .compiled = compiled,
         .require_physical_encoding = schema.storage_mode == .relational,
     };
     defer validation_context.deinit();
@@ -621,7 +730,7 @@ pub fn validateDocumentValueWithPhysicalFields(
         }
 
         if (document_schema) |resolved_document_schema| {
-            if (findDocumentProperty(resolved_document_schema.properties, field_name)) |property| {
+            if (validation_context.findProperty(resolved_document_schema.properties, field_name)) |property| {
                 try validateDocumentFieldValueWithContext(&validation_context, property, entry.value_ptr, schema.enforce_types);
                 continue;
             }
@@ -3601,7 +3710,7 @@ fn validateDocumentFieldValueWithContext(
     }
 
     if (property.pattern) |pattern| {
-        if (value.* == .string and !try regexMatch(pattern, value.string)) return error.InvalidBatchRequest;
+        if (value.* == .string and !try context.matchPattern(pattern, value.string)) return error.InvalidBatchRequest;
     }
 
     if (property.format) |format| {
@@ -3695,7 +3804,7 @@ fn validateDocumentFieldValueWithContext(
         property.max_properties != null) and value.* == .object)
     {
         const object = value.object;
-        try validateObjectCardinality(object, property.properties, property.min_properties, property.max_properties);
+        try validateObjectCardinality(context, object, property.properties, property.min_properties, property.max_properties);
         try validateRequiredFieldsPresent(object, property.required_fields);
         if (property.property_names) |property_names| try validatePropertyNames(context, object, property.properties, property_names.*, enforce_types);
         try validateDependentRequired(object, property.dependent_required);
@@ -3705,7 +3814,7 @@ fn validateDocumentFieldValueWithContext(
         try collectComposedObjectFieldCoverage(context, property, object, enforce_types, &composition_evaluated_fields, false);
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (findDocumentProperty(property.properties, entry.key_ptr.*)) |child_property| {
+            if (context.findProperty(property.properties, entry.key_ptr.*)) |child_property| {
                 try validateDocumentFieldValueWithContext(context, child_property, entry.value_ptr, enforce_types);
                 continue;
             }
@@ -4075,6 +4184,7 @@ fn validateRequiredFieldsPresent(object: std.json.ObjectMap, required_fields: []
 }
 
 fn validateObjectCardinality(
+    context: *const RuntimeValidationContext,
     object: std.json.ObjectMap,
     properties: []const DocumentProperty,
     min_properties: ?u64,
@@ -4085,7 +4195,7 @@ fn validateObjectCardinality(
     var count: u64 = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and findDocumentProperty(properties, entry.key_ptr.*) == null) continue;
+        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and context.findProperty(properties, entry.key_ptr.*) == null) continue;
         count += 1;
     }
 
@@ -4133,7 +4243,7 @@ fn validatePropertyNames(
 ) anyerror!void {
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and findDocumentProperty(properties, entry.key_ptr.*) == null) continue;
+        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*) and context.findProperty(properties, entry.key_ptr.*) == null) continue;
         const key_value: std.json.Value = .{ .string = entry.key_ptr.* };
         try validateDocumentFieldValueWithContext(context, property_names, &key_value, enforce_types);
     }
@@ -4148,7 +4258,7 @@ fn validatePatternProperties(
 ) anyerror!bool {
     var matched = false;
     for (pattern_properties) |pattern_property| {
-        if (!try regexMatch(pattern_property.pattern, field_name)) continue;
+        if (!try context.matchPattern(pattern_property.pattern, field_name)) continue;
         try validateDocumentFieldValueWithContext(context, pattern_property.property.*, value, enforce_types);
         matched = true;
     }
@@ -4220,7 +4330,7 @@ fn markDirectObjectFieldCoverage(
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (findDocumentProperty(property.properties, entry.key_ptr.*) != null) {
+        if (context.findProperty(property.properties, entry.key_ptr.*) != null) {
             try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
             continue;
         }
@@ -5292,10 +5402,10 @@ test "parse schema and validate document writes" {
     );
 }
 
-test "document storage preserves legacy mapped value validation" {
+test "document storage preserves legacy unmapped value validation" {
     const alloc = std.testing.allocator;
     var parsed = try parseSchema(alloc,
-        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"large_integer":{"type":"integer"},"legacy_date":{"type":"datetime"},"legacy_payload":{"type":"string","x-antfly-field":{"type":"json"}}},"required":["large_integer","legacy_date","legacy_payload"],"additionalProperties":false}}}}
+        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"large_integer":{"type":"integer"},"legacy_date":{"type":"datetime"},"legacy_payload":{"type":"string"}},"required":["large_integer","legacy_date","legacy_payload"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
@@ -5604,6 +5714,7 @@ test "parse accepts sortable without public doc values and rejects unsupported s
 
 test "parse rejects document field mappings incompatible with their schema value domain" {
     const incompatible_schemas = [_][]const u8{
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"json\"}}}}}}}",
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}}}}}}}",
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"price\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
         "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"active\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"boolean\",\"sortable\":true}}}}}}}",

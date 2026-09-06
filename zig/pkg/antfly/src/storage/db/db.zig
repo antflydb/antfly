@@ -2472,6 +2472,10 @@ const PreparedRowEffects = struct {
     timestamp_value: ?[]u8 = null,
 };
 
+fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
+    return split_shadow or (has_text_consumers and (sync_level == .full_text or sync_level == .full_index));
+}
+
 fn prepareRelationalRows(
     allocator_guard: *PreparedRowAllocator,
     io: ?std.Io,
@@ -8564,7 +8568,7 @@ pub const DB = struct {
                     view.tableSchema().*,
                     view.physicalLayout(),
                     write_plan_snapshot.?.plan().*,
-                    req.sync_level == .full_text or req.sync_level == .full_index or splitShadowRequiresMaterializedDerivedBatch(self),
+                    retainPreparedTextRoots(req.sync_level, write_plan_snapshot.?.plan().has_text_consumers, splitShadowRequiresMaterializedDerivedBatch(self)),
                     preparation_timestamp_ns,
                     rows,
                 );
@@ -31853,6 +31857,9 @@ pub const DB = struct {
                     state.schema_plans.items[index].access = state.schema_plan_clock;
                     return &state.schema_plans.items[index];
                 }
+                if (state.transient_schema_plan) |*plan| {
+                    if (plan.version == version) return plan;
+                }
 
                 try state.schema_plan_indexes.ensureUnusedCapacity(state.alloc, 1);
                 var view = (try state.db.core.acquireSchemaVersionView(version)) orelse
@@ -36422,6 +36429,9 @@ fn loadStoredSearchDocumentsMany(
             if (plans.historical_indexes.get(version)) |index| {
                 plans.historical.items[index].access = plans.historical_clock;
                 return &plans.historical.items[index];
+            }
+            if (plans.transient) |*plan| {
+                if (plan.version == version) return plan;
             }
 
             try plans.historical_indexes.ensureUnusedCapacity(plans.alloc, 1);
@@ -61116,7 +61126,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         table_schema,
         &physical_layout,
         null,
-        false,
+        retainPreparedTextRoots(.full_index, false, false),
         0,
         &rows,
     );
@@ -61126,6 +61136,14 @@ test "prepared relational batch uses bounded parallel workers safely" {
         try std.testing.expectEqual(@as(u32, 3), try mapper.relationalRowSchemaVersion(row.?.packed_row));
         try std.testing.expectEqual(@as(usize, 0), row.?.extracted.prepared_text_source_bytes);
         try std.testing.expect(row.?.extracted.prepared_text_root == null);
+    }
+}
+
+test "prepared relational roots are retained only for synchronous text or split consumers" {
+    inline for (std.meta.tags(types.SyncLevel)) |level| {
+        try std.testing.expect(!retainPreparedTextRoots(level, false, false));
+        try std.testing.expect(retainPreparedTextRoots(level, false, true));
+        try std.testing.expectEqual(level == .full_text or level == .full_index, retainPreparedTextRoots(level, true, false));
     }
 }
 
