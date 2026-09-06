@@ -507,6 +507,8 @@ from .index_source_readiness_status_state import IndexSourceReadinessStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
+from .inference_a4b_load_strategy import InferenceA4BLoadStrategy
+from .inference_a4b_prepared_pack_mode import InferenceA4BPreparedPackMode
 from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
@@ -658,6 +660,7 @@ from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
 from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
+from .inference_warm_model_startup_strategy import InferenceWarmModelStartupStrategy
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -1512,6 +1515,8 @@ __all__ = (
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
+    "InferenceA4BLoadStrategy",
+    "InferenceA4BPreparedPackMode",
     "InferenceA4BResidencyMode",
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
@@ -1662,6 +1667,7 @@ __all__ = (
     "InferenceTranscribeResponseObject",
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
+    "InferenceWarmModelStartupStrategy",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",

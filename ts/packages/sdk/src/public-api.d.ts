@@ -14308,6 +14308,21 @@ export interface components {
          */
         InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
         /**
+         * @description Loader implementation for qualified Gemma 4 26B-A4B Q4_0 loads. Auto selects the production default, pipeline requires the bounded pinned-host pipeline, and legacy selects the single-threaded loader.
+         * @enum {string}
+         */
+        InferenceA4bLoadStrategy: "auto" | "pipeline" | "legacy";
+        /**
+         * @description Prepared-pack policy for qualified A4B CUDA loads. Required fails closed unless a valid pack is installed.
+         * @enum {string}
+         */
+        InferenceA4bPreparedPackMode: "auto" | "off" | "required";
+        /**
+         * @description Eager loads and publishes a reusable session. Prefetch only reads A4B CUDA artifact pages into the host page cache and does not publish a session.
+         * @enum {string}
+         */
+        InferenceWarmModelStartupStrategy: "eager" | "prefetch";
+        /**
          * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
          *     where device defaults to `auto`.
          *
@@ -14348,6 +14363,29 @@ export interface components {
              * @default 0
              */
             memory_budget_mb?: number;
+            /** @default auto */
+            load_strategy?: components["schemas"]["InferenceA4bLoadStrategy"];
+            /**
+             * Format: uint8
+             * @description Bounded loader worker count for qualified A4B loads. Zero selects the runtime default.
+             * @default 0
+             */
+            load_workers?: number;
+            /**
+             * Format: uint32
+             * @description Aggregate pinned-host staging budget in MiB. Zero selects the runtime default; explicit values must be between 64 and 1024.
+             * @default 0
+             */
+            load_staging_mb?: number;
+            /** @default auto */
+            prepared_pack?: components["schemas"]["InferenceA4bPreparedPackMode"];
+            /**
+             * @description Drop clean GGUF pages from the host page cache after a successful A4B load.
+             * @default false
+             */
+            drop_host_cache_after_load?: boolean;
+            /** @default eager */
+            startup_strategy?: components["schemas"]["InferenceWarmModelStartupStrategy"];
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {

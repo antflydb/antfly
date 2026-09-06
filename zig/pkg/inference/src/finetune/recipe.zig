@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 
 const grpo = @import("grpo.zig");
 const preference_loss = @import("preference_loss.zig");
+const preference_optimizer = @import("preference_optimizer.zig");
 const gemma4 = @import("gemma4.zig");
 const gemma4_real_autodiff = @import("gemma4_real_autodiff.zig");
 const gemma4_mm_real_autodiff = @import("gemma4_multimodal_real_autodiff.zig");
@@ -345,6 +346,14 @@ const DirectoryDigest = struct {
     entries: usize,
 };
 
+const TrainableUpdateTelemetry = struct {
+    tensor_count: usize,
+    changed_tensor_count: usize,
+    max_abs_delta: f32,
+};
+
+const strict_cuda_device_execution_scope = "optimizer-steps-only;excludes-rollout-and-reference-scoring";
+
 const DpoReport = struct {
     schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v1",
     examples: usize,
@@ -352,6 +361,15 @@ const DpoReport = struct {
     mean_reward_margin: f32,
     accuracy: f32,
     beta: f32,
+    policy_backend: ?[]const u8 = null,
+    optimizer_backend: ?[]const u8 = null,
+    optimizer_steps: ?u64 = null,
+    cuda_optimizer_steps: ?u64 = null,
+    micro_batch_steps: ?u64 = null,
+    mean_grad_norm: ?f64 = null,
+    trainable_update: ?TrainableUpdateTelemetry = null,
+    device_execution_scope: ?[]const u8 = null,
+    device_execution: ?real_autodiff.TrainingExecutionEvidence = null,
 };
 
 const SftReport = struct {
@@ -368,10 +386,85 @@ const GrpoReport = struct {
     completions: usize,
     tokens: usize,
     groups: usize,
+    informative_groups: usize = 0,
+    mean_reward: f32 = 0,
+    reward_std: f32 = 0,
     loss: f32,
     pg_loss: f32,
     kl_loss: f32,
     clip_fraction: f32,
+    group_size: ?usize = null,
+    clip_epsilon: ?f32 = null,
+    kl_coef: ?f32 = null,
+    advantage_epsilon: ?f32 = null,
+    advantage_standard_deviation_correction: ?u8 = null,
+    reward_scaling: ?[]const u8 = null,
+    loss_normalization: ?[]const u8 = null,
+    policy_backend: ?[]const u8 = null,
+    optimizer_backend: ?[]const u8 = null,
+    optimizer_steps: ?u64 = null,
+    cuda_optimizer_steps: ?u64 = null,
+    micro_batch_steps: ?u64 = null,
+    mean_grad_norm: ?f64 = null,
+    trainable_update: ?TrainableUpdateTelemetry = null,
+    device_execution_scope: ?[]const u8 = null,
+    device_execution: ?real_autodiff.TrainingExecutionEvidence = null,
+};
+
+/// Host snapshot used to prove that an optimizer-backed run changed the
+/// policy adapter. Device optimizers are synchronized exactly once after the
+/// training region before this snapshot is compared.
+const TrainableParameterSnapshot = struct {
+    allocator: std.mem.Allocator,
+    tensors: [][]f32,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        slots: []const real_autodiff.RealAutodiffTrainer.ParamSlot,
+    ) !TrainableParameterSnapshot {
+        const tensors = try allocator.alloc([]f32, slots.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tensors[0..initialized]) |tensor| allocator.free(tensor);
+            allocator.free(tensors);
+        }
+        for (slots, 0..) |slot, idx| {
+            tensors[idx] = try allocator.dupe(f32, slot.weights);
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .tensors = tensors };
+    }
+
+    fn deinit(self: *TrainableParameterSnapshot) void {
+        for (self.tensors) |tensor| self.allocator.free(tensor);
+        self.allocator.free(self.tensors);
+        self.* = undefined;
+    }
+
+    fn summarize(
+        self: *const TrainableParameterSnapshot,
+        slots: []const real_autodiff.RealAutodiffTrainer.ParamSlot,
+    ) !TrainableUpdateTelemetry {
+        if (self.tensors.len != slots.len) return error.TrainableSnapshotShapeMismatch;
+        var changed_tensor_count: usize = 0;
+        var max_abs_delta: f32 = 0.0;
+        for (self.tensors, slots) |initial, slot| {
+            if (initial.len != slot.weights.len) return error.TrainableSnapshotShapeMismatch;
+            var tensor_changed = false;
+            for (initial, slot.weights) |before, after| {
+                if (!std.math.isFinite(before) or !std.math.isFinite(after)) return error.NonFiniteTrainableParameter;
+                const delta = @abs(after - before);
+                max_abs_delta = @max(max_abs_delta, delta);
+                tensor_changed = tensor_changed or delta > 0.0;
+            }
+            if (tensor_changed) changed_tensor_count += 1;
+        }
+        return .{
+            .tensor_count = slots.len,
+            .changed_tensor_count = changed_tensor_count,
+            .max_abs_delta = max_abs_delta,
+        };
+    }
 };
 
 const FastSmokeMode = enum {
@@ -493,7 +586,7 @@ pub fn loadRecipe(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !s
     defer allocator.free(raw);
     return std.json.parseFromSlice(Recipe, allocator, raw, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
+        .ignore_unknown_fields = false,
     });
 }
 
@@ -1544,19 +1637,7 @@ fn runPlan(
                 defer allocator.free(report_path);
                 runDirectSft(allocator, io, recipe, report_path) catch |err| {
                     step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return err;
                 };
                 step_manifests[idx].stdout_bytes = 0;
@@ -1574,19 +1655,7 @@ fn runPlan(
                 defer allocator.free(report_path);
                 runDirectDpo(allocator, io, recipe, report_path) catch |err| {
                     step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return err;
                 };
                 step_manifests[idx].stdout_bytes = 0;
@@ -1604,19 +1673,7 @@ fn runPlan(
                 defer allocator.free(report_path);
                 runDirectGrpo(allocator, io, recipe, report_path) catch |err| {
                     step_manifests[idx].status = .failed;
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return err;
                 };
                 step_manifests[idx].stdout_bytes = 0;
@@ -1673,19 +1730,7 @@ fn runPlan(
             .stderr_limit = .limited(16 * 1024 * 1024),
         }) catch |err| {
             step_manifests[idx].status = .failed;
-            try writeRunManifest(allocator, io, manifest_path, .{
-                .status = .failed,
-                .recipe = recipe,
-                .artifact_root = recipe.artifacts.root,
-                .steps = step_manifests,
-            });
-            try writeTrainingReport(allocator, io, training_report_path, .{
-                .status = .failed,
-                .recipe = recipe,
-                .artifact_root = recipe.artifacts.root,
-                .steps = step_manifests,
-                .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-            });
+            try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
             return err;
         };
         defer allocator.free(result.stdout);
@@ -1699,37 +1744,13 @@ fn runPlan(
                 step_manifests[idx].exit_code = code;
                 step_manifests[idx].status = if (code == 0) .succeeded else .failed;
                 if (code != 0) {
-                    try writeRunManifest(allocator, io, manifest_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                    });
-                    try writeTrainingReport(allocator, io, training_report_path, .{
-                        .status = .failed,
-                        .recipe = recipe,
-                        .artifact_root = recipe.artifacts.root,
-                        .steps = step_manifests,
-                        .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                    });
+                    try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                     return error.FinetuneStepFailed;
                 }
             },
             else => {
                 step_manifests[idx].status = .failed;
-                try writeRunManifest(allocator, io, manifest_path, .{
-                    .status = .failed,
-                    .recipe = recipe,
-                    .artifact_root = recipe.artifacts.root,
-                    .steps = step_manifests,
-                });
-                try writeTrainingReport(allocator, io, training_report_path, .{
-                    .status = .failed,
-                    .recipe = recipe,
-                    .artifact_root = recipe.artifacts.root,
-                    .steps = step_manifests,
-                    .metadata = try collectReportMetadata(allocator, io, recipe, plan, manifest_path, training_config_path, training_report_path, static_metadata),
-                });
+                try writeFailedRunStatus(allocator, io, recipe, plan, step_manifests, manifest_path, training_config_path, training_report_path, static_metadata);
                 return error.FinetuneStepFailed;
             },
         }
@@ -1990,6 +2011,93 @@ fn validateGemmaAdapterOptions(adapter: AdapterConfig) !void {
     try validateAdapterScaling(adapter);
     try validateAdapterTargetSelection(adapter);
     if (adapter.target_modules == null) _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+}
+
+/// The current optimizer graph owns standard LoRA A/B tensors only. Gemma's
+/// artifact tooling can construct DoRA and transformed initializers for other
+/// workflows, but accepting them here would silently omit trainable state or
+/// the corresponding base-weight transform.
+fn validateGemmaPreferenceAdapterOptions(adapter: AdapterConfig) !void {
+    try validateGemmaAdapterOptions(adapter);
+    if (adapter.quantization != null) return error.UnsupportedPreferenceQuantization;
+    if (adapter.use_dora orelse false) return error.UnsupportedPreferenceLoRAOption;
+    if (adapter.init_lora_weights != null) return error.UnsupportedPreferenceLoRAOption;
+    if ((adapter.dropout orelse 0.0) != 0.0) return error.UnsupportedPreferenceLoRAOption;
+    if (adapter.target_modules) |modules| try validateGemmaPreferenceTargetModules(modules);
+}
+
+fn validateGemmaPreferenceTargetModules(modules: []const []const u8) !void {
+    for (modules) |module| {
+        // Selective scoring projects hidden states with the frozen tied head.
+        // Adapting that head would make rollout/scoring and backward observe
+        // different policies, so fail closed until head-LoRA projection is
+        // explicitly implemented.
+        if (std.mem.indexOf(u8, module, "lm_head") != null or
+            std.mem.indexOf(u8, module, "embed_tokens") != null or
+            std.mem.indexOf(u8, module, "token_embd") != null)
+        {
+            return error.UnsupportedPreferenceLoRATarget;
+        }
+    }
+}
+
+fn validateGemmaPreferenceLifecycleOptions(recipe: Recipe) !void {
+    // Preference training currently publishes a final adapter and report. It
+    // does not yet implement held-out evaluation, checkpoint/resume, prepared
+    // dataset caches, or user-configurable runtime policy. Reject those knobs
+    // instead of accepting a recipe whose requested lifecycle is not honored.
+    if (recipe.eval != null or
+        recipe.dataset.eval_path != null or
+        recipe.dataset.eval_split != null or
+        recipe.dataset.eval_max_examples != null)
+    {
+        return error.UnsupportedPreferenceEvaluation;
+    }
+    if (recipe.checkpoint != null) return error.UnsupportedPreferenceCheckpointing;
+    if (recipe.runtime != null) return error.UnsupportedPreferenceRuntimeOption;
+    if (recipe.dataset.prepared_path != null or
+        recipe.dataset.cache_path != null or
+        recipe.dataset.train_cache_path != null or
+        recipe.dataset.eval_cache_path != null)
+    {
+        return error.UnsupportedPreferenceDatasetCache;
+    }
+    if (recipe.artifacts.materialized_dir != null or
+        recipe.artifacts.validation_report_path != null or
+        recipe.artifacts.evaluation_report_path != null or
+        recipe.artifacts.reload_report_path != null)
+    {
+        return error.UnsupportedPreferenceArtifactOption;
+    }
+}
+
+fn validateGemmaDpoObjectiveOptions(recipe: Recipe) !void {
+    if (recipe.preference.simpo_gamma != null or
+        recipe.preference.sft_lambda != null or
+        recipe.preference.ipo_tau != null)
+    {
+        return error.UnsupportedGemmaDpoLossOption;
+    }
+    if (recipe.grpo.group_size != null or
+        recipe.grpo.clip_epsilon != null or
+        recipe.grpo.kl_coef != null or
+        recipe.grpo.advantage_eps != null or
+        recipe.grpo.normalize_advantage != null or
+        recipe.grpo.max_completion_tokens != null or
+        recipe.grpo.reward_mode != null)
+    {
+        return error.UnsupportedGemmaDpoOption;
+    }
+}
+
+fn validateGemmaGrpoObjectiveOptions(recipe: Recipe) !void {
+    if (recipe.preference.beta != null or
+        recipe.preference.simpo_gamma != null or
+        recipe.preference.sft_lambda != null or
+        recipe.preference.ipo_tau != null)
+    {
+        return error.UnsupportedGemmaGrpoOption;
+    }
 }
 
 fn validateNonGemmaAdapterOptions(adapter: AdapterConfig) !void {
@@ -3217,11 +3325,21 @@ const DecoderLogprobScorer = struct {
     }
 };
 
+fn validateReferenceVocabulary(
+    reference_model: *model_manager_mod.LoadedModel,
+    policy_vocab_size: u32,
+) !void {
+    const reference_config = session_factory.getGptConfig(reference_model.session) orelse
+        return error.InvalidReferenceModel;
+    if (reference_config.vocab_size != policy_vocab_size) return error.IncompatibleReferenceVocabulary;
+}
+
 const DecoderGrpoSampler = struct {
     allocator: std.mem.Allocator,
     model: *model_manager_mod.LoadedModel,
     max_seq_len: usize,
     max_completion_tokens: usize,
+    rollout_nonce: u64 = 0,
 
     fn sample(
         ctx: *anyopaque,
@@ -3239,10 +3357,11 @@ const DecoderGrpoSampler = struct {
         var cb = try session_factory.getComputeBackend(self.model.session, self.allocator);
         defer cb.deinit();
 
-        const top_rank_cap: usize = @min(num_samples, 8);
         const eos_id = self.model.getTokenizer().specialTokens().sep_id;
 
         for (0..num_samples) |sample_idx| {
+            var prng = std.Random.DefaultPrng.init(grpoRolloutSeed(self.rollout_nonce, 0, sample_idx));
+            const random = prng.random();
             var seq = std.ArrayListUnmanaged(i64).empty;
             defer seq.deinit(allocator);
             try seq.ensureTotalCapacity(allocator, prompt.len + self.max_completion_tokens);
@@ -3259,7 +3378,7 @@ const DecoderGrpoSampler = struct {
                 defer self.allocator.free(logits);
                 const vocab_size: usize = @intCast(gpt_config.vocab_size);
                 const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
-                const token_id = try selectRankedTokenFromLogits(allocator, row, sample_idx % top_rank_cap);
+                const token_id = try sampleTokenFromLogits(row, random);
                 const token_logp = logProbAtToken(row, token_id);
                 try completion.append(allocator, token_id);
                 try old_logps.append(allocator, token_logp);
@@ -3271,6 +3390,7 @@ const DecoderGrpoSampler = struct {
             try out_tokens.append(allocator, try completion.toOwnedSlice(allocator));
             try out_old_logps.append(allocator, try old_logps.toOwnedSlice(allocator));
         }
+        self.rollout_nonce +%= 1;
     }
 };
 
@@ -3278,6 +3398,7 @@ const TextRewardMode = enum {
     exact_match,
     exact_match_ci,
     prefix_match,
+    sequence_hash,
 };
 
 const TextRewardCtx = struct {
@@ -3293,6 +3414,7 @@ const TextRewardCtx = struct {
     ) !f32 {
         const self: *TextRewardCtx = @ptrCast(@alignCast(ctx));
         if (prompt_idx >= self.targets.len) return error.InvalidPromptIndex;
+        if (self.mode == .sequence_hash) return tokenSequenceHashReward(completion_tokens);
         const decoded = try self.tokenizer.decode(self.allocator, completion_tokens);
         defer self.allocator.free(decoded);
         const completion_trimmed = std.mem.trim(u8, decoded, " \t\r\n");
@@ -3310,7 +3432,22 @@ fn scoreTextReward(mode: TextRewardMode, completion_trimmed: []const u8, target_
         },
         .exact_match_ci => if (std.ascii.eqlIgnoreCase(completion_trimmed, target_trimmed)) 1.0 else 0.0,
         .prefix_match => if (std.mem.startsWith(u8, completion_trimmed, target_trimmed)) 1.0 else 0.0,
+        .sequence_hash => unreachable,
     };
+}
+
+/// Deterministic systems-qualification reward. It is intentionally based on
+/// generated token IDs rather than semantic correctness so distinct seeded
+/// rollouts almost certainly yield distinct group-relative advantages. Real
+/// tasks should use a semantic reward mode or the GRPO Rewarder API.
+fn tokenSequenceHashReward(completion_tokens: []const i32) f32 {
+    var hash: u64 = 0xcbf29ce484222325;
+    for (completion_tokens) |token| {
+        hash ^= @as(u32, @bitCast(token));
+        hash *%= 0x100000001b3;
+    }
+    const mantissa: u32 = @truncate(hash >> 40);
+    return @as(f32, @floatFromInt(mantissa)) / 16_777_215.0;
 }
 
 fn runDirectSft(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report_path: []const u8) !void {
@@ -3333,6 +3470,10 @@ fn shouldRunOptimizerBackedQwen35Sft(recipe: Recipe, format: []const u8) !bool {
 fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report_path: []const u8) !void {
     const path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
     const format = recipe.dataset.format orelse "scalar-logprobs";
+    if (recipe.model.projector_path != null) {
+        const family = recipe.model.family orelse try inferFamily(recipe);
+        if (eqlAny(family, &.{ "gemma4", "gemma" })) return error.UnsupportedGemmaMultimodalDpo;
+    }
     if (std.mem.eql(u8, format, "scalar-logprobs")) {
         const batch = try loadDpoScalarJsonl(allocator, io, path);
         defer batch.deinit(allocator);
@@ -3424,8 +3565,11 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
 fn shouldRunOptimizerBackedGemmaDpo(recipe: Recipe, format: []const u8) !bool {
     if (!std.mem.eql(u8, format, "text-preference") and !std.mem.eql(u8, format, "rendered-text-preference")) return false;
     const family = recipe.model.family orelse try inferFamily(recipe);
-    if (!eqlAny(family, &.{ "gemma4", "gemma" })) return false;
-    return recipe.artifacts.trained_adapter_dir != null or recipe.artifacts.adapter_dir != null or recipe.adapter != null;
+    // A text DPO recipe is a policy-training recipe. The optimizer-backed
+    // implementation can bootstrap a default LoRA bundle and default output
+    // paths, so the absence of an explicit adapter block must not silently
+    // downgrade the request to loss-only scoring.
+    return eqlAny(family, &.{ "gemma4", "gemma" });
 }
 
 fn shouldRunOptimizerBackedQwen2Dpo(recipe: Recipe, format: []const u8) !bool {
@@ -3664,6 +3808,7 @@ fn runOptimizerBackedGemmaDpo(
     report_path: []const u8,
 ) !void {
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
+    if (recipe.model.projector_path != null) return error.UnsupportedGemmaMultimodalDpo;
     const adapter = recipe.adapter orelse AdapterConfig{};
     const bootstrap_dir_config = adapter.path orelse adapterBootstrapDir(recipe);
     const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
@@ -3672,10 +3817,12 @@ fn runOptimizerBackedGemmaDpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = .native;
+    const backend_kind = try gemmaAutodiffBackendKind(recipe.backend);
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
-    try validateGemmaAdapterOptions(adapter);
+    try validateGemmaPreferenceAdapterOptions(adapter);
+    try validateGemmaPreferenceLifecycleOptions(recipe);
+    try validateGemmaDpoObjectiveOptions(recipe);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
@@ -3691,12 +3838,21 @@ fn runOptimizerBackedGemmaDpo(
     };
 
     var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, try parseRecipeBackendChoice(recipe.backend));
+    // Keep tokenizer and any external reference off the training device. A
+    // same-base reference reuses the policy's resident checkpoint through an
+    // adapter-free graph below, without a second device copy.
+    native_backend_choice.configureSessionPreference(&session_manager, .native);
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
-    const reference_model = try model_manager.loadFromDir(reference_path);
+    const tokenizer_model = try model_manager.loadFromDir(base_model_dir);
+    const reference_model = if (std.mem.eql(u8, reference_path, base_model_dir))
+        tokenizer_model
+    else
+        try model_manager.loadFromDir(reference_path);
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, reference_model);
+    // Preference tokens always belong to the trainable policy vocabulary.
+    // An external reference checkpoint only supplies reference log-probs.
+    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, tokenizer_model);
     defer samples.deinit();
 
     var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
@@ -3706,44 +3862,101 @@ fn runOptimizerBackedGemmaDpo(
     if (chosen_prepared.examples.len != rejected_prepared.examples.len or chosen_prepared.examples.len != samples.samples.len) {
         return error.DpoBatchAlignmentMismatch;
     }
+    const preference_seq_len = try gemmaPreferenceBatchSequenceLength(
+        chosen_prepared.examples,
+        rejected_prepared.examples,
+        max_seq_len,
+    );
 
     const graph_config = try gemma4_real_autodiff.loadGraphConfig(allocator, base_model_dir);
+    try validateReferenceVocabulary(reference_model, graph_config.vocab_size);
     var backend = try gemma4_real_autodiff.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
+    var shared_base_reference: ?gemma4_real_autodiff.FrozenBaseScorer = null;
+    if (std.mem.eql(u8, reference_path, base_model_dir)) {
+        shared_base_reference = try gemma4_real_autodiff.FrozenBaseScorer.init(
+            allocator,
+            backend.backendPtr(),
+            graph_config,
+            preference_seq_len,
+        );
+    }
+    defer if (shared_base_reference) |*scorer| scorer.deinit();
 
     var adapter_inspect = try gemma4.inspectCheckpoint(allocator, bootstrap_dir);
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
+    if (adapter_inspect.use_dora orelse false) return error.UnsupportedPreferenceLoRAOption;
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
     const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
+    try validateGemmaPreferenceTargetModules(target_modules);
+    // Chosen and rejected sequences share one physical batch/backward pass.
+    const optimizer_plan = try buildPreferenceOptimizerPlan(recipe, chosen_prepared.examples.len, 1);
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
+        .dropout = optimizer_plan.lora_dropout,
         .target_patterns = target_modules,
+        .strict_target_patterns = true,
     };
 
     var trainer = try @import("real_autodiff_trainer.zig").RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
-        .optimizer = .{},
-        .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
-        .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = @max((recipe.optimizer.gradient_accumulation_steps orelse 1) * 2, 1),
+        .optimizer = optimizer_plan.optimizer,
+        .lr_schedule = optimizer_plan.lr_schedule,
+        .max_grad_norm = optimizer_plan.max_grad_norm,
+        .grad_accum_steps = optimizer_plan.physical_gradient_accumulation_steps,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
+        .compiled_required = backend_kind == .cuda,
+        .strict_cuda_execution = backend_kind == .cuda,
     });
     defer trainer.deinit();
 
-    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.initPreference(graph_config);
     const bootstrap_example = gemma4_real_autodiff.findFirstSupervisedExample(chosen_prepared.examples) orelse return error.NoTrainingData;
-    try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, bootstrap_example, @intCast(max_seq_len));
+    try gemma4_real_autodiff.initializeTrainerFromAdapterDirBatched(
+        allocator,
+        &trainer,
+        &ctx,
+        bootstrap_dir,
+        bootstrap_example,
+        @intCast(preference_seq_len),
+        2,
+    );
+    var trainable_snapshot = try TrainableParameterSnapshot.init(allocator, trainer.lora_params.items);
+    defer trainable_snapshot.deinit();
 
     var ref_scorer = DecoderLogprobScorer{
         .allocator = allocator,
         .model = reference_model,
         .max_seq_len = max_seq_len,
     };
+    const reference_chosen_logps = try allocator.alloc(f32, chosen_prepared.examples.len);
+    defer allocator.free(reference_chosen_logps);
+    const reference_rejected_logps = try allocator.alloc(f32, rejected_prepared.examples.len);
+    defer allocator.free(reference_rejected_logps);
+    for (chosen_prepared.examples, rejected_prepared.examples, samples.samples, 0..) |*chosen_ex, *rejected_ex, sample, sample_idx| {
+        if (shared_base_reference) |*scorer| {
+            reference_chosen_logps[sample_idx] = try scorer.sequenceLogprobForExample(chosen_ex);
+            reference_rejected_logps[sample_idx] = try scorer.sequenceLogprobForExample(rejected_ex);
+        } else {
+            try DecoderLogprobScorer.modelForward(
+                @ptrCast(&ref_scorer),
+                &.{sample.prompt_tokens},
+                &.{sample.chosen_tokens},
+                reference_chosen_logps[sample_idx .. sample_idx + 1],
+            );
+            try DecoderLogprobScorer.modelForward(
+                @ptrCast(&ref_scorer),
+                &.{sample.prompt_tokens},
+                &.{sample.rejected_tokens},
+                reference_rejected_logps[sample_idx .. sample_idx + 1],
+            );
+        }
+    }
 
-    const epochs = recipe.optimizer.epochs orelse 1;
     var total_loss: f64 = 0.0;
     var total_margin: f64 = 0.0;
     var total_accuracy: f64 = 0.0;
@@ -3755,76 +3968,85 @@ fn runOptimizerBackedGemmaDpo(
     var single_cl = [_]u32{0};
     var single_rl = [_]u32{0};
     var single_sft = [_]f32{0};
+    var optimizer_grad_norm_sum: f64 = 0.0;
+    var optimizer_grad_norm_count: usize = 0;
 
-    var epoch_idx: usize = 0;
-    while (epoch_idx < epochs) : (epoch_idx += 1) {
-        for (chosen_prepared.examples, rejected_prepared.examples, samples.samples) |*chosen_ex, *rejected_ex, sample| {
-            const policy_chosen = try gemma4_real_autodiff.sequenceLogprobForExample(allocator, &trainer, &ctx, chosen_ex, @intCast(max_seq_len));
-            const policy_rejected = try gemma4_real_autodiff.sequenceLogprobForExample(allocator, &trainer, &ctx, rejected_ex, @intCast(max_seq_len));
+    var preference_unit: usize = 0;
+    while (preference_unit < optimizer_plan.preference_units) : (preference_unit += 1) {
+        const sample_idx = preference_unit % chosen_prepared.examples.len;
+        const chosen_ex = &chosen_prepared.examples[sample_idx];
+        const rejected_ex = &rejected_prepared.examples[sample_idx];
+        const sample = samples.samples[sample_idx];
+        const policy_chosen = try gemma4_real_autodiff.sequenceLogprobForExample(allocator, &trainer, &ctx, chosen_ex, @intCast(preference_seq_len));
+        const policy_rejected = try gemma4_real_autodiff.sequenceLogprobForExample(allocator, &trainer, &ctx, rejected_ex, @intCast(preference_seq_len));
 
-            try DecoderLogprobScorer.modelForward(
-                @ptrCast(&ref_scorer),
-                &.{sample.prompt_tokens},
-                &.{sample.chosen_tokens},
-                single_rc[0..1],
-            );
-            try DecoderLogprobScorer.modelForward(
-                @ptrCast(&ref_scorer),
-                &.{sample.prompt_tokens},
-                &.{sample.rejected_tokens},
-                single_rr[0..1],
-            );
+        single_pc[0] = policy_chosen;
+        single_pr[0] = policy_rejected;
+        single_rc[0] = reference_chosen_logps[sample_idx];
+        single_rr[0] = reference_rejected_logps[sample_idx];
+        single_cl[0] = @intCast(sample.chosen_tokens.len);
+        single_rl[0] = @intCast(sample.rejected_tokens.len);
+        single_sft[0] = sample.sft_chosen_loss orelse 0;
 
-            single_pc[0] = policy_chosen;
-            single_pr[0] = policy_rejected;
-            single_cl[0] = @intCast(sample.chosen_tokens.len);
-            single_rl[0] = @intCast(sample.rejected_tokens.len);
-            single_sft[0] = sample.sft_chosen_loss orelse 0;
+        var step_result = try preference_loss.pairedPreferenceLoss(allocator, .{
+            .policy_chosen_logps = single_pc[0..1],
+            .policy_rejected_logps = single_pr[0..1],
+            .ref_chosen_logps = single_rc[0..1],
+            .ref_rejected_logps = single_rr[0..1],
+            .chosen_lengths = single_cl[0..1],
+            .rejected_lengths = single_rl[0..1],
+            .sft_chosen_loss = single_sft[0..1],
+        }, .{
+            .kind = .dpo,
+            .beta = recipe.preference.beta orelse 0.1,
+            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
+            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
+            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
+        });
+        defer step_result.deinit();
 
-            var step_result = try preference_loss.pairedPreferenceLoss(allocator, .{
-                .policy_chosen_logps = single_pc[0..1],
-                .policy_rejected_logps = single_pr[0..1],
-                .ref_chosen_logps = single_rc[0..1],
-                .ref_rejected_logps = single_rr[0..1],
-                .chosen_lengths = single_cl[0..1],
-                .rejected_lengths = single_rl[0..1],
-                .sft_chosen_loss = single_sft[0..1],
-            }, .{
-                .kind = .dpo,
-                .beta = recipe.preference.beta orelse 0.1,
-                .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-                .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-                .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-            });
-            defer step_result.deinit();
+        total_loss += step_result.loss;
+        total_margin += step_result.mean_reward_margin;
+        total_accuracy += step_result.accuracy;
+        examples_seen += 1;
 
-            total_loss += step_result.loss;
-            total_margin += step_result.mean_reward_margin;
-            total_accuracy += step_result.accuracy;
-            examples_seen += 1;
-
-            var chosen_input = try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
-                allocator,
-                &ctx,
-                chosen_ex,
-                @intCast(max_seq_len),
-                step_result.grad_chosen[0],
-            );
-            defer chosen_input.deinit(allocator);
-            _ = try trainer.step(chosen_input.trainer_input);
-
-            var rejected_input = try gemma4_real_autodiff.makeTrainerInputForLogprobCoeff(
-                allocator,
-                &ctx,
-                rejected_ex,
-                @intCast(max_seq_len),
-                step_result.grad_rejected[0],
-            );
-            defer rejected_input.deinit(allocator);
-            _ = try trainer.step(rejected_input.trainer_input);
+        const pair_examples = [_]gemma4.PreparedExampleInput{ chosen_ex.*, rejected_ex.* };
+        const pair_token_count = std.math.add(
+            usize,
+            chosen_ex.num_supervised_tokens,
+            rejected_ex.num_supervised_tokens,
+        ) catch return error.InvalidTensorShape;
+        const pair_token_grads = try allocator.alloc(f32, pair_token_count);
+        defer allocator.free(pair_token_grads);
+        @memset(pair_token_grads[0..chosen_ex.num_supervised_tokens], step_result.grad_chosen[0]);
+        @memset(pair_token_grads[chosen_ex.num_supervised_tokens..], step_result.grad_rejected[0]);
+        var pair_input = try gemma4_real_autodiff.makeTrainerInputForTokenLogprobGradsBatch(
+            allocator,
+            &ctx,
+            &pair_examples,
+            @intCast(preference_seq_len),
+            pair_token_grads,
+        );
+        defer pair_input.deinit(allocator);
+        const train_step = try trainer.step(pair_input.trainer_input);
+        if (train_step.optimizer_stepped) {
+            optimizer_grad_norm_sum += train_step.grad_norm;
+            optimizer_grad_norm_count += 1;
         }
     }
 
+    if (try trainer.flushAccumulatedGradients()) |flush| {
+        optimizer_grad_norm_sum += flush.grad_norm;
+        optimizer_grad_norm_count += 1;
+    }
+    if (trainer.optimizerSteps() != optimizer_plan.target_optimizer_steps) return error.PreferenceOptimizerStepMismatch;
+    if (optimizer_grad_norm_count != trainer.optimizerSteps()) return error.PreferenceOptimizerTelemetryMismatch;
+    if (!std.math.isFinite(optimizer_grad_norm_sum) or !(optimizer_grad_norm_sum > 0.0)) {
+        return error.NoDpoPolicyGradient;
+    }
+    try trainer.syncDeviceTrainablesToHost();
+    const trainable_update = try trainable_snapshot.summarize(trainer.lora_params.items);
+    if (trainable_update.changed_tensor_count == 0 or !(trainable_update.max_abs_delta > 0.0)) return error.NoDpoPolicyMovement;
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(examples_seen, 1)));
@@ -3834,6 +4056,15 @@ fn runOptimizerBackedGemmaDpo(
         .mean_reward_margin = @floatCast(total_margin / denom),
         .accuracy = @floatCast(total_accuracy / denom),
         .beta = recipe.preference.beta orelse 0.1,
+        .policy_backend = @tagName(backend_kind),
+        .optimizer_backend = if (backend_kind == .cuda) "cuda" else "host",
+        .optimizer_steps = trainer.optimizerSteps(),
+        .cuda_optimizer_steps = if (backend_kind == .cuda) trainer.optimizerSteps() else 0,
+        .micro_batch_steps = trainer.microBatchSteps(),
+        .mean_grad_norm = optimizer_grad_norm_sum / @as(f64, @floatFromInt(optimizer_grad_norm_count)),
+        .trainable_update = trainable_update,
+        .device_execution_scope = if (backend_kind == .cuda) strict_cuda_device_execution_scope else null,
+        .device_execution = if (backend_kind == .cuda) trainer.trainingExecutionEvidence() else null,
     });
     print("dpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -3909,7 +4140,7 @@ fn runOptimizerBackedQwen2Dpo(
         .optimizer = .{},
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = @max((recipe.optimizer.gradient_accumulation_steps orelse 1) * 2, 1),
+        .grad_accum_steps = try preferenceAccumulationSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, 2),
         .hidden_size_hint = graph_config.arch.hidden_size,
         .num_layers_hint = graph_config.arch.num_hidden_layers,
     });
@@ -3976,19 +4207,20 @@ fn runOptimizerBackedQwen2Dpo(
             examples_seen += 1;
 
             {
-                var chosen_input = try qwen2_real_autodiff.makeTrainerInputForLogprobCoeff(allocator, &ctx, chosen_ex, @intCast(max_seq_len), step_result.grad_chosen[0]);
+                var chosen_input = try qwen2_real_autodiff.makeTrainerInputForLogprobCoeff(allocator, &ctx, chosen_ex, @intCast(max_seq_len), step_result.grad_chosen[0] * 2.0);
                 defer chosen_input.deinit(allocator);
                 _ = try trainer.step(chosen_input.trainer_input);
             }
 
             {
-                var rejected_input = try qwen2_real_autodiff.makeTrainerInputForLogprobCoeff(allocator, &ctx, rejected_ex, @intCast(max_seq_len), step_result.grad_rejected[0]);
+                var rejected_input = try qwen2_real_autodiff.makeTrainerInputForLogprobCoeff(allocator, &ctx, rejected_ex, @intCast(max_seq_len), step_result.grad_rejected[0] * 2.0);
                 defer rejected_input.deinit(allocator);
                 _ = try trainer.step(rejected_input.trainer_input);
             }
         }
     }
 
+    _ = try trainer.flushAccumulatedGradients();
     try qwen2_real_autodiff.saveTrainerAsQwenAdapterDir(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(examples_seen, 1)));
@@ -4057,8 +4289,9 @@ fn prepareGemmaDpoPreparedExamplesFromSamples(
 fn shouldRunOptimizerBackedGemmaGrpo(recipe: Recipe, format: []const u8) !bool {
     if (!std.mem.eql(u8, format, "text-grpo") and !std.mem.eql(u8, format, "rendered-text-grpo")) return false;
     const family = recipe.model.family orelse try inferFamily(recipe);
-    if (!eqlAny(family, &.{ "gemma4", "gemma" })) return false;
-    return recipe.artifacts.trained_adapter_dir != null or recipe.artifacts.adapter_dir != null or recipe.adapter != null;
+    // As with DPO, text GRPO denotes policy training. Default LoRA/artifact
+    // settings are sufficient and must not turn into inference-only scoring.
+    return eqlAny(family, &.{ "gemma4", "gemma" });
 }
 
 fn shouldRunOptimizerBackedQwen2Grpo(recipe: Recipe, format: []const u8) !bool {
@@ -4072,6 +4305,7 @@ fn parseTextRewardMode(value: []const u8) !TextRewardMode {
     if (std.mem.eql(u8, value, "exact-match")) return .exact_match;
     if (std.mem.eql(u8, value, "exact-match-ci")) return .exact_match_ci;
     if (std.mem.eql(u8, value, "prefix-match")) return .prefix_match;
+    if (std.mem.eql(u8, value, "sequence-hash")) return .sequence_hash;
     return error.UnsupportedRewardMode;
 }
 
@@ -4091,12 +4325,24 @@ fn runOptimizerBackedGemmaGrpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = .native;
+    const backend_kind = try gemmaAutodiffBackendKind(recipe.backend);
+    if (backend_kind == .cuda and recipe.model.projector_path != null) return error.UnsupportedGemmaCudaMultimodalTraining;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
-    try validateGemmaAdapterOptions(adapter);
+    const cfg = grpo.GRPOConfig{
+        .group_size = group_size,
+        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
+        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
+        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
+    };
+    try grpo.validateConfig(cfg);
+    try validateGemmaPreferenceAdapterOptions(adapter);
+    try validateGemmaPreferenceLifecycleOptions(recipe);
+    try validateGemmaGrpoObjectiveOptions(recipe);
 
     compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
@@ -4132,7 +4378,10 @@ fn runOptimizerBackedGemmaGrpo(
     }
 
     var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, try parseRecipeBackendChoice(recipe.backend));
+    // Keep tokenizer, reward, and any external reference off the training
+    // device. A same-base reference reuses the policy's resident checkpoint
+    // through an adapter-free graph below, without a second device copy.
+    native_backend_choice.configureSessionPreference(&session_manager, .native);
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
@@ -4144,37 +4393,73 @@ fn runOptimizerBackedGemmaGrpo(
 
     var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_model);
     defer prompt_batch.deinit();
+    const preference_seq_len = try gemmaGrpoBatchSequenceLength(
+        prompt_batch.prompts,
+        max_completion_tokens,
+        max_seq_len,
+    );
 
     const graph_config = try gemma4_real_autodiff.loadGraphConfig(allocator, base_model_dir);
+    try validateReferenceVocabulary(reference_model, graph_config.vocab_size);
     var backend = try gemma4_real_autodiff.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
+    var shared_base_reference: ?gemma4_real_autodiff.FrozenBaseScorer = null;
+    if (std.mem.eql(u8, reference_path, base_model_dir)) {
+        shared_base_reference = try gemma4_real_autodiff.FrozenBaseScorer.init(
+            allocator,
+            backend.backendPtr(),
+            graph_config,
+            preference_seq_len,
+        );
+    }
+    defer if (shared_base_reference) |*scorer| scorer.deinit();
 
     var adapter_inspect = try gemma4.inspectCheckpoint(allocator, bootstrap_dir);
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
+    if (adapter_inspect.use_dora orelse false) return error.UnsupportedPreferenceLoRAOption;
     const lora_rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const lora_alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
     const target_modules = adapter_inspect.target_modules orelse (adapter.target_modules orelse gemma4.default_lora_target_modules[0..]);
+    try validateGemmaPreferenceTargetModules(target_modules);
+    // One group is one physical batch/backward pass, independent of the
+    // number of sampled completions in that group.
+    const optimizer_plan = try buildPreferenceOptimizerPlan(recipe, prompt_batch.prompts.len, 1);
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = @intCast(lora_rank),
         .alpha = lora_alpha,
+        .dropout = optimizer_plan.lora_dropout,
         .target_patterns = target_modules,
+        .strict_target_patterns = true,
     };
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
-        .optimizer = .{},
-        .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
-        .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = recipe.optimizer.gradient_accumulation_steps orelse 1,
+        .optimizer = optimizer_plan.optimizer,
+        .lr_schedule = optimizer_plan.lr_schedule,
+        .max_grad_norm = optimizer_plan.max_grad_norm,
+        .grad_accum_steps = optimizer_plan.physical_gradient_accumulation_steps,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
+        .compiled_required = backend_kind == .cuda,
+        .strict_cuda_execution = backend_kind == .cuda,
     });
     defer trainer.deinit();
 
-    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.init(graph_config);
+    var ctx = gemma4_real_autodiff.GemmaAutodiffCtx.initPreference(graph_config);
     const bootstrap_example = try buildGemmaPreparedExampleFromTokens(allocator, prompt_batch.prompts[0], &.{}, max_seq_len);
     defer freeGemmaPreparedExample(allocator, &bootstrap_example);
-    try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
+    try gemma4_real_autodiff.initializeTrainerFromAdapterDirBatched(
+        allocator,
+        &trainer,
+        &ctx,
+        bootstrap_dir,
+        &bootstrap_example,
+        @intCast(preference_seq_len),
+        group_size,
+    );
+    var trainable_snapshot = try TrainableParameterSnapshot.init(allocator, trainer.lora_params.items);
+    defer trainable_snapshot.deinit();
 
     var ref_scorer = DecoderLogprobScorer{
         .allocator = allocator,
@@ -4192,135 +4477,192 @@ fn runOptimizerBackedGemmaGrpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
-
     var total_loss: f64 = 0.0;
     var total_pg_loss: f64 = 0.0;
     var total_kl_loss: f64 = 0.0;
     var total_clip_fraction: f64 = 0.0;
     var total_groups: usize = 0;
+    var informative_groups: usize = 0;
     var total_completions: usize = 0;
     var total_tokens: usize = 0;
+    var reward_sum: f64 = 0.0;
+    var reward_square_sum: f64 = 0.0;
+    var reward_count: usize = 0;
+    var optimizer_grad_norm_sum: f64 = 0.0;
+    var optimizer_grad_norm_count: usize = 0;
 
-    const top_rank_cap: usize = @min(group_size, 8);
     const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
-    const epochs = recipe.optimizer.epochs orelse 1;
-    var epoch_idx: usize = 0;
-    while (epoch_idx < epochs) : (epoch_idx += 1) {
-        for (prompt_batch.prompts, 0..) |prompt, prompt_idx| {
-            var completions = std.ArrayList(grpo.Completion).empty;
-            defer {
-                for (completions.items) |completion| {
-                    allocator.free(completion.tokens);
-                    allocator.free(completion.old_logps);
-                    allocator.free(completion.ref_logps);
-                }
-                completions.deinit(allocator);
+    var preference_unit: usize = 0;
+    while (preference_unit < optimizer_plan.preference_units) : (preference_unit += 1) {
+        const prompt_idx = preference_unit % prompt_batch.prompts.len;
+        const epoch_idx = preference_unit / prompt_batch.prompts.len;
+        const prompt = prompt_batch.prompts[prompt_idx];
+        var completions = std.ArrayList(grpo.Completion).empty;
+        defer {
+            for (completions.items) |completion| {
+                allocator.free(completion.tokens);
+                allocator.free(completion.old_logps);
+                allocator.free(completion.ref_logps);
             }
-            var flat_new_logps = std.ArrayList(f32).empty;
-            defer flat_new_logps.deinit(allocator);
+            completions.deinit(allocator);
+        }
+        var flat_new_logps = std.ArrayList(f32).empty;
+        defer flat_new_logps.deinit(allocator);
 
-            var completion_idx: usize = 0;
-            while (completion_idx < group_size) : (completion_idx += 1) {
-                var sampled_tokens = std.ArrayList(i32).empty;
-                defer sampled_tokens.deinit(allocator);
-                var sampled_old_logps = std.ArrayList(f32).empty;
-                defer sampled_old_logps.deinit(allocator);
-                try gemma4_real_autodiff.sampleCompletionRanked(
-                    allocator,
-                    &trainer,
-                    &ctx,
-                    prompt,
-                    @intCast(max_seq_len),
-                    max_completion_tokens,
-                    completion_idx % top_rank_cap,
-                    if (eos_id >= 0) eos_id else null,
-                    &sampled_tokens,
-                    &sampled_old_logps,
-                );
-                const tokens_owned = try sampled_tokens.toOwnedSlice(allocator);
-                errdefer allocator.free(tokens_owned);
-                const old_logps_owned = try sampled_old_logps.toOwnedSlice(allocator);
-                errdefer allocator.free(old_logps_owned);
-                const new_logps_owned = try allocator.alloc(f32, tokens_owned.len);
-                defer allocator.free(new_logps_owned);
-                try gemma4_real_autodiff.tokenLogprobsForPromptCompletion(
-                    allocator,
-                    &trainer,
-                    &ctx,
-                    prompt,
-                    tokens_owned,
-                    @intCast(max_seq_len),
-                    new_logps_owned,
-                );
-                const ref_logps_owned = try allocator.alloc(f32, tokens_owned.len);
-                errdefer allocator.free(ref_logps_owned);
+        var completion_idx: usize = 0;
+        while (completion_idx < group_size) : (completion_idx += 1) {
+            var sampled_tokens = std.ArrayList(i32).empty;
+            defer sampled_tokens.deinit(allocator);
+            var sampled_old_logps = std.ArrayList(f32).empty;
+            defer sampled_old_logps.deinit(allocator);
+            try gemma4_real_autodiff.sampleCompletion(
+                allocator,
+                &trainer,
+                &ctx,
+                prompt,
+                @intCast(preference_seq_len),
+                max_completion_tokens,
+                grpoRolloutSeed(epoch_idx, prompt_idx, completion_idx),
+                if (eos_id >= 0) eos_id else null,
+                &sampled_tokens,
+                &sampled_old_logps,
+            );
+            const tokens_owned = try sampled_tokens.toOwnedSlice(allocator);
+            errdefer allocator.free(tokens_owned);
+            const old_logps_owned = try sampled_old_logps.toOwnedSlice(allocator);
+            errdefer allocator.free(old_logps_owned);
+            const ref_logps_owned = try allocator.alloc(f32, tokens_owned.len);
+            errdefer allocator.free(ref_logps_owned);
+            if (shared_base_reference) |*scorer| {
+                try scorer.tokenLogprobs(prompt, tokens_owned, ref_logps_owned);
+            } else {
                 try DecoderLogprobScorer.tokenLogprobs(
                     @ptrCast(&ref_scorer),
                     prompt,
                     tokens_owned,
                     ref_logps_owned,
                 );
-                try flat_new_logps.appendSlice(allocator, new_logps_owned);
-                try completions.append(allocator, .{
-                    .prompt_idx = prompt_idx,
-                    .tokens = tokens_owned,
-                    .old_logps = old_logps_owned,
-                    .ref_logps = ref_logps_owned,
-                });
-                total_tokens += tokens_owned.len;
             }
+            // This implementation performs exactly one fresh-policy update per
+            // rollout group. No trainable parameter changes between sampling
+            // and loss construction, so the current-policy log-probabilities
+            // are bit-for-bit the behavior log-probabilities recorded by the
+            // sampler. Re-scoring here would add a full policy forward per
+            // completion without changing the PPO ratio (which is exactly 1).
+            try flat_new_logps.appendSlice(allocator, old_logps_owned);
+            try completions.append(allocator, .{
+                .prompt_idx = prompt_idx,
+                .tokens = tokens_owned,
+                .old_logps = old_logps_owned,
+                .ref_logps = ref_logps_owned,
+            });
+            total_tokens += tokens_owned.len;
+        }
 
-            var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
-            defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+        var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
+        defer ga.deinit();
+        try grpo.computeAdvantages(&ga, completions.items, cfg);
+        var informative = false;
+        for (ga.advantages) |advantage| informative = informative or advantage != 0.0;
+        if (informative) informative_groups += 1;
+        for (ga.rewards) |reward| {
+            reward_sum += reward;
+            reward_square_sum += @as(f64, reward) * @as(f64, reward);
+            reward_count += 1;
+        }
 
-            var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
-            defer loss_result.deinit();
+        var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
+        defer loss_result.deinit();
 
-            total_loss += loss_result.loss;
-            total_pg_loss += loss_result.pg_loss;
-            total_kl_loss += loss_result.kl_loss;
-            total_clip_fraction += loss_result.clip_fraction;
-            total_groups += 1;
-            total_completions += completions.items.len;
+        total_loss += loss_result.loss;
+        total_pg_loss += loss_result.pg_loss;
+        total_kl_loss += loss_result.kl_loss;
+        total_clip_fraction += loss_result.clip_fraction;
+        total_groups += 1;
+        total_completions += completions.items.len;
 
-            var token_offset: usize = 0;
-            for (completions.items) |completion| {
-                var prepared = try buildGemmaPreparedExampleFromTokens(allocator, prompt, completion.tokens, max_seq_len);
-                defer freeGemmaPreparedExample(allocator, &prepared);
-                const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
-                var input = try gemma4_real_autodiff.makeTrainerInputForTokenLogprobGrads(
-                    allocator,
-                    &ctx,
-                    &prepared,
-                    @intCast(max_seq_len),
-                    grads,
-                );
-                defer input.deinit(allocator);
-                _ = try trainer.step(input.trainer_input);
-                token_offset += completion.tokens.len;
-            }
+        const prepared_batch = try allocator.alloc(gemma4.PreparedExampleInput, completions.items.len);
+        var prepared_count: usize = 0;
+        defer {
+            for (prepared_batch[0..prepared_count]) |*prepared| freeGemmaPreparedExample(allocator, prepared);
+            allocator.free(prepared_batch);
+        }
+        for (completions.items, 0..) |completion, prepared_idx| {
+            prepared_batch[prepared_idx] = try buildGemmaPreparedExampleFromTokens(
+                allocator,
+                prompt,
+                completion.tokens,
+                max_seq_len,
+            );
+            prepared_count += 1;
+        }
+        var input = try gemma4_real_autodiff.makeTrainerInputForTokenLogprobGradsBatch(
+            allocator,
+            &ctx,
+            prepared_batch,
+            @intCast(preference_seq_len),
+            loss_result.grad_new_logps,
+        );
+        defer input.deinit(allocator);
+        const train_step = try trainer.step(input.trainer_input);
+        if (train_step.optimizer_stepped) {
+            optimizer_grad_norm_sum += train_step.grad_norm;
+            optimizer_grad_norm_count += 1;
         }
     }
 
+    if (try trainer.flushAccumulatedGradients()) |flush| {
+        optimizer_grad_norm_sum += flush.grad_norm;
+        optimizer_grad_norm_count += 1;
+    }
+    if (trainer.optimizerSteps() != optimizer_plan.target_optimizer_steps) return error.PreferenceOptimizerStepMismatch;
+    if (optimizer_grad_norm_count != trainer.optimizerSteps()) return error.PreferenceOptimizerTelemetryMismatch;
+    // AdamW weight decay can move nonzero LoRA A tensors even when every
+    // group-relative advantage is zero. Require an actual policy gradient so
+    // a degenerate reward group cannot be reported as successful GRPO.
+    if (!std.math.isFinite(optimizer_grad_norm_sum) or !(optimizer_grad_norm_sum > 0.0)) {
+        std.log.err(
+            "GRPO produced no policy gradient: informative_groups={} groups={} reward_count={}",
+            .{ informative_groups, total_groups, reward_count },
+        );
+        return error.NoGrpoPolicyGradient;
+    }
+    try trainer.syncDeviceTrainablesToHost();
+    const trainable_update = try trainable_snapshot.summarize(trainer.lora_params.items);
+    if (trainable_update.changed_tensor_count == 0 or !(trainable_update.max_abs_delta > 0.0)) return error.NoGrpoPolicyMovement;
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
+    const reward_denom = @as(f64, @floatFromInt(@max(reward_count, 1)));
+    const mean_reward = reward_sum / reward_denom;
+    const reward_variance = @max(0.0, reward_square_sum / reward_denom - mean_reward * mean_reward);
     try writeJsonFile(allocator, io, report_path, GrpoReport{
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .informative_groups = informative_groups,
+        .mean_reward = @floatCast(mean_reward),
+        .reward_std = @floatCast(@sqrt(reward_variance)),
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
         .clip_fraction = @floatCast(total_clip_fraction / denom),
+        .group_size = cfg.group_size,
+        .clip_epsilon = cfg.clip_epsilon,
+        .kl_coef = cfg.kl_coef,
+        .advantage_epsilon = cfg.advantage_eps,
+        .advantage_standard_deviation_correction = 1,
+        .reward_scaling = if (cfg.normalize_advantage) "group-sample-std" else "none",
+        .loss_normalization = "per-completion-token-mean",
+        .policy_backend = @tagName(backend_kind),
+        .optimizer_backend = if (backend_kind == .cuda) "cuda" else "host",
+        .optimizer_steps = trainer.optimizerSteps(),
+        .cuda_optimizer_steps = if (backend_kind == .cuda) trainer.optimizerSteps() else 0,
+        .micro_batch_steps = trainer.microBatchSteps(),
+        .mean_grad_norm = optimizer_grad_norm_sum / @as(f64, @floatFromInt(optimizer_grad_norm_count)),
+        .trainable_update = trainable_update,
+        .device_execution_scope = if (backend_kind == .cuda) strict_cuda_device_execution_scope else null,
+        .device_execution = if (backend_kind == .cuda) trainer.trainingExecutionEvidence() else null,
     });
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
@@ -4345,9 +4687,18 @@ fn runOptimizerBackedQwen2Grpo(
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
+    const cfg = grpo.GRPOConfig{
+        .group_size = group_size,
+        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
+        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
+        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
+    };
+    try grpo.validateConfig(cfg);
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
@@ -4395,7 +4746,7 @@ fn runOptimizerBackedQwen2Grpo(
         .optimizer = .{},
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = recipe.optimizer.gradient_accumulation_steps orelse 1,
+        .grad_accum_steps = try preferenceAccumulationSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, group_size),
         .hidden_size_hint = graph_config.arch.hidden_size,
         .num_layers_hint = graph_config.arch.num_hidden_layers,
     });
@@ -4422,14 +4773,6 @@ fn runOptimizerBackedQwen2Grpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
-
     var total_loss: f64 = 0.0;
     var total_pg_loss: f64 = 0.0;
     var total_kl_loss: f64 = 0.0;
@@ -4438,7 +4781,6 @@ fn runOptimizerBackedQwen2Grpo(
     var total_completions: usize = 0;
     var total_tokens: usize = 0;
 
-    const top_rank_cap: usize = @min(group_size, 8);
     const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
     const epochs = recipe.optimizer.epochs orelse 1;
     var epoch_idx: usize = 0;
@@ -4462,14 +4804,14 @@ fn runOptimizerBackedQwen2Grpo(
                 defer sampled_tokens.deinit(allocator);
                 var sampled_old_logps = std.ArrayList(f32).empty;
                 defer sampled_old_logps.deinit(allocator);
-                try qwen2_real_autodiff.sampleCompletionRanked(
+                try qwen2_real_autodiff.sampleCompletion(
                     allocator,
                     &trainer,
                     &ctx,
                     prompt,
                     @intCast(max_seq_len),
                     max_completion_tokens,
-                    completion_idx % top_rank_cap,
+                    grpoRolloutSeed(epoch_idx, prompt_idx, completion_idx),
                     if (eos_id >= 0) eos_id else null,
                     &sampled_tokens,
                     &sampled_old_logps,
@@ -4504,7 +4846,7 @@ fn runOptimizerBackedQwen2Grpo(
 
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
@@ -4521,7 +4863,10 @@ fn runOptimizerBackedQwen2Grpo(
                 var prepared = try buildGemmaPreparedExampleFromTokens(allocator, prompt, completion.tokens, max_seq_len);
                 defer freeGemmaPreparedExample(allocator, &prepared);
                 const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
-                var input = try qwen2_real_autodiff.makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &prepared, @intCast(max_seq_len), grads);
+                const scaled_grads = try allocator.alloc(f32, grads.len);
+                defer allocator.free(scaled_grads);
+                for (scaled_grads, grads) |*scaled, grad| scaled.* = grad * @as(f32, @floatFromInt(group_size));
+                var input = try qwen2_real_autodiff.makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &prepared, @intCast(max_seq_len), scaled_grads);
                 defer input.deinit(allocator);
                 _ = try trainer.step(input.trainer_input);
                 token_offset += completion.tokens.len;
@@ -4529,6 +4874,7 @@ fn runOptimizerBackedQwen2Grpo(
         }
     }
 
+    _ = try trainer.flushAccumulatedGradients();
     try qwen2_real_autodiff.saveTrainerAsQwenAdapterDir(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
@@ -4562,6 +4908,15 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
 ) !void {
     const projector_path = recipe.model.projector_path orelse return error.MissingGgufProjector;
     if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
+    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
+    const cfg = grpo.GRPOConfig{
+        .group_size = group_size,
+        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
+        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
+        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
+    };
+    try grpo.validateConfig(cfg);
 
     var session_manager = backends.SessionManager.init(allocator);
     native_backend_choice.configureSessionPreference(&session_manager, try parseRecipeBackendChoice(recipe.backend));
@@ -4592,9 +4947,11 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .optimizer = .{},
         .lr_schedule = .{ .constant = recipe.optimizer.learning_rate orelse 0.0001 },
         .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
-        .grad_accum_steps = recipe.optimizer.gradient_accumulation_steps orelse 1,
+        .grad_accum_steps = try preferenceAccumulationSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, group_size),
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
+        .compiled_required = backend_kind == .cuda,
     });
     defer trainer.deinit();
     const tokenizer = try gemma4_mm_real_autodiff.loadTokenizerForModelDir(allocator, base_model_dir);
@@ -4610,12 +4967,23 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .grad_accum_steps = 1,
         .hidden_size_hint = graph_config.hidden_size,
         .num_layers_hint = graph_config.num_hidden_layers,
+        .execution_engine = if (backend_kind == .cuda) .compiled_device else .interpreter,
+        .compiled_required = backend_kind == .cuda,
     });
     defer ref_trainer.deinit();
     const ref_tokenizer = try gemma4_mm_real_autodiff.loadTokenizerForModelDir(allocator, base_model_dir);
     var ref_ctx = gemma4_mm_real_autodiff.MultimodalCtx.init(allocator, backend.backendPtr(), graph_config, projector_path, prompt_batch.summaries[0].gguf_projector_sha256.?, ref_tokenizer);
     defer ref_ctx.deinit();
-    try gemma4_mm_real_autodiff.initializeTrainerFromAdapterDir(allocator, &ref_trainer, &ref_ctx, bootstrap_dir, prompt_batch.prompts[0], @intCast(max_seq_len));
+    // The reference is the frozen base policy. Building the graph initializes
+    // zero-effect LoRA slots; loading the policy adapter here would silently
+    // change the KL anchor to the trainable policy's bootstrap checkpoint.
+    var ref_bootstrap = try gemma4_mm_real_autodiff.makeTrainerInputForExample(allocator, &ref_ctx, prompt_batch.prompts[0], @intCast(max_seq_len));
+    defer ref_bootstrap.deinit(allocator);
+    try ref_trainer.ensureGraphBuilt(ref_bootstrap.trainer_input);
+    for (ref_trainer.lora_params.items) |*slot| {
+        @memset(slot.weights, 0.0);
+        @memset(slot.grad_accum, 0.0);
+    }
 
     var rewarder_ctx = TextRewardCtx{
         .allocator = allocator,
@@ -4627,14 +4995,6 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
-
     var total_loss: f64 = 0.0;
     var total_pg_loss: f64 = 0.0;
     var total_kl_loss: f64 = 0.0;
@@ -4643,7 +5003,6 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     var total_completions: usize = 0;
     var total_tokens: usize = 0;
 
-    const top_rank_cap: usize = @min(group_size, 8);
     const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
     const epochs = recipe.optimizer.epochs orelse 1;
     var epoch_idx: usize = 0;
@@ -4667,14 +5026,14 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
                 defer sampled_tokens.deinit(allocator);
                 var sampled_old_logps = std.ArrayList(f32).empty;
                 defer sampled_old_logps.deinit(allocator);
-                try sampleGemmaMultimodalCompletionRanked(
+                try sampleGemmaMultimodalCompletion(
                     allocator,
                     &trainer,
                     &ctx,
                     prompt,
                     max_seq_len,
                     max_completion_tokens,
-                    completion_idx % top_rank_cap,
+                    grpoRolloutSeed(epoch_idx, prompt_idx, completion_idx),
                     if (eos_id >= 0) eos_id else null,
                     &sampled_tokens,
                     &sampled_old_logps,
@@ -4701,7 +5060,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
 
             var ga = try grpo.scoreGroup(allocator, rewarder, completions.items);
             defer ga.deinit();
-            grpo.computeAdvantages(&ga, completions.items, cfg);
+            try grpo.computeAdvantages(&ga, completions.items, cfg);
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
@@ -4718,12 +5077,15 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
                 var prepared = try buildGemmaPreparedExampleFromPromptExample(allocator, prompt, completion.tokens, max_seq_len);
                 defer freeGemmaPreparedExample(allocator, &prepared);
                 const grads = loss_result.grad_new_logps[token_offset .. token_offset + completion.tokens.len];
+                const scaled_grads = try allocator.alloc(f32, grads.len);
+                defer allocator.free(scaled_grads);
+                for (scaled_grads, grads) |*scaled, grad| scaled.* = grad * @as(f32, @floatFromInt(group_size));
                 var input = try gemma4_mm_real_autodiff.makeTrainerInputForTokenLogprobGrads(
                     allocator,
                     &ctx,
                     &prepared,
                     @intCast(max_seq_len),
-                    grads,
+                    scaled_grads,
                 );
                 defer input.deinit(allocator);
                 _ = try trainer.step(input.trainer_input);
@@ -4732,6 +5094,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         }
     }
 
+    _ = try trainer.flushAccumulatedGradients();
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
 
     const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
@@ -4747,18 +5110,20 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     print("grpo report: {s}\ntrained adapter: {s}\n", .{ report_path, trained_dir });
 }
 
-fn sampleGemmaMultimodalCompletionRanked(
+fn sampleGemmaMultimodalCompletion(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,
     ctx: *gemma4_mm_real_autodiff.MultimodalCtx,
     prompt: *const gemma4.PreparedExampleInput,
     max_seq_len: usize,
     max_completion_tokens: usize,
-    rank: usize,
+    seed: u64,
     eos_token_id: ?i32,
     out_tokens: *std.ArrayList(i32),
     out_logps: *std.ArrayList(f32),
 ) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
     var seq = std.ArrayList(i32).empty;
     defer seq.deinit(allocator);
 
@@ -4770,7 +5135,7 @@ fn sampleGemmaMultimodalCompletionRanked(
         defer allocator.free(logits);
         const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
         const row = logits[(prompt.prompt_input_ids.len + seq.items.len - 1) * vocab_size ..][0..vocab_size];
-        const token_id = try selectRankedTokenFromLogits(allocator, row, rank);
+        const token_id = try sampleTokenFromLogits(row, random);
         try out_tokens.append(allocator, token_id);
         try out_logps.append(allocator, logProbAtToken(row, token_id));
         try seq.append(allocator, token_id);
@@ -4833,6 +5198,45 @@ fn buildGemmaPreparedExampleFromTokens(
         .num_input_tokens = input_ids.len,
         .num_supervised_tokens = completion_copy.len,
     };
+}
+
+/// Use the longest active sequence in the preference dataset instead of the
+/// configured truncation ceiling. The graph remains shape-stable for the run,
+/// while avoiding full-vocabulary logits and transformer activations for rows
+/// that are padding in every DPO example.
+fn gemmaPreferenceBatchSequenceLength(
+    chosen: []const gemma4.PreparedExampleInput,
+    rejected: []const gemma4.PreparedExampleInput,
+    max_seq_len: usize,
+) !usize {
+    if (max_seq_len == 0 or chosen.len == 0 or chosen.len != rejected.len) return error.InvalidPreparedInputLength;
+    var active_seq_len: usize = 0;
+    for (chosen, rejected) |chosen_example, rejected_example| {
+        if (chosen_example.input_ids.len > max_seq_len or rejected_example.input_ids.len > max_seq_len) {
+            return error.SequenceTooLong;
+        }
+        active_seq_len = @max(active_seq_len, chosen_example.input_ids.len);
+        active_seq_len = @max(active_seq_len, rejected_example.input_ids.len);
+    }
+    if (active_seq_len == 0) return error.InvalidPreparedInputLength;
+    return active_seq_len;
+}
+
+/// GRPO completion lengths are bounded before sampling, so the longest prompt
+/// plus that bound is a stable training/rollout bucket for the entire run.
+fn gemmaGrpoBatchSequenceLength(
+    prompts: []const []const i32,
+    max_completion_tokens: usize,
+    max_seq_len: usize,
+) !usize {
+    if (prompts.len == 0 or max_completion_tokens == 0 or max_seq_len == 0) return error.InvalidPreparedInputLength;
+    var longest_prompt: usize = 0;
+    for (prompts) |prompt| {
+        if (prompt.len == 0 or prompt.len >= max_seq_len) return error.SequenceTooLong;
+        longest_prompt = @max(longest_prompt, prompt.len);
+    }
+    const unbounded = std.math.add(usize, longest_prompt, max_completion_tokens) catch return error.SequenceTooLong;
+    return @min(unbounded, max_seq_len);
 }
 
 fn buildGemmaPreparedExampleFromPromptExample(
@@ -5004,12 +5408,21 @@ fn tokenizeDpoTextRow(
 ) !TokenizedPreferenceRow {
     const tokenizer = model.getTokenizer();
     const max_seq_len = recipe.dataset.max_seq_len orelse 2048;
+    const joint_max_seq_len = if (model.manifest.add_eos_token) blk: {
+        if (max_seq_len <= 1) return error.NoCompletionBudget;
+        break :blk max_seq_len - 1;
+    } else max_seq_len;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-preference", "rendered-text-preference");
     const prompt_text = if (render_prompt)
         try renderDpoPrompt(allocator, model, row.prompt)
     else
         try allocator.dupe(u8, row.prompt);
     defer allocator.free(prompt_text);
+
+    const chosen_text = try std.mem.concat(allocator, u8, &.{ prompt_text, row.chosen });
+    defer allocator.free(chosen_text);
+    const rejected_text = try std.mem.concat(allocator, u8, &.{ prompt_text, row.rejected });
+    defer allocator.free(rejected_text);
 
     var prompt_encoded = try generation.encodePromptForGeneration(
         tokenizer,
@@ -5020,23 +5433,74 @@ fn tokenizeDpoTextRow(
         model.manifest.bos_token,
     );
     defer prompt_encoded.deinit();
+    var chosen_encoded = try generation.encodePromptForGeneration(
+        tokenizer,
+        allocator,
+        chosen_text,
+        joint_max_seq_len,
+        model.manifest.add_bos_token,
+        model.manifest.bos_token,
+    );
+    defer chosen_encoded.deinit();
+    var rejected_encoded = try generation.encodePromptForGeneration(
+        tokenizer,
+        allocator,
+        rejected_text,
+        joint_max_seq_len,
+        model.manifest.add_bos_token,
+        model.manifest.bos_token,
+    );
+    defer rejected_encoded.deinit();
 
     const prompt_len = countAttentionMask(prompt_encoded.attention_mask);
-    if (prompt_len == 0) return error.EmptyPrompt;
-    const remaining_budget = max_seq_len - prompt_len;
-    if (remaining_budget == 0) return error.NoCompletionBudget;
+    const chosen_len = countAttentionMask(chosen_encoded.attention_mask);
+    const rejected_len = countAttentionMask(rejected_encoded.attention_mask);
+    var common_prompt_len: usize = 0;
+    const common_limit = @min(prompt_len, @min(chosen_len, rejected_len));
+    while (common_prompt_len < common_limit and
+        prompt_encoded.ids[common_prompt_len] == chosen_encoded.ids[common_prompt_len] and
+        prompt_encoded.ids[common_prompt_len] == rejected_encoded.ids[common_prompt_len]) : (common_prompt_len += 1)
+    {}
+    if (common_prompt_len == 0) return error.EmptyPrompt;
+    if (chosen_len <= common_prompt_len or rejected_len <= common_prompt_len) return error.EmptyCompletion;
 
-    const chosen_tokens = try tokenizeCompletion(allocator, tokenizer, row.chosen, remaining_budget);
-    const rejected_tokens = try tokenizeCompletion(allocator, tokenizer, row.rejected, remaining_budget);
-    if (chosen_tokens.len == 0 or rejected_tokens.len == 0) return error.EmptyCompletion;
-
-    const prompt_tokens = try allocator.alloc(i32, prompt_len);
-    for (0..prompt_len) |idx| prompt_tokens[idx] = prompt_encoded.ids[idx];
+    // Encode each prompt+response jointly. Any tokenizer token that straddles
+    // the byte boundary is conservatively assigned to the response by taking
+    // only the common token prefix as prompt supervision.
+    const prompt_tokens = try allocator.dupe(i32, prompt_encoded.ids[0..common_prompt_len]);
+    const eos_token_id = tokenizer.specialTokens().sep_id;
+    const chosen_tokens = try copyCompletionWithManifestEos(
+        allocator,
+        chosen_encoded.ids[common_prompt_len..chosen_len],
+        model.manifest.add_eos_token,
+        eos_token_id,
+    );
+    const rejected_tokens = try copyCompletionWithManifestEos(
+        allocator,
+        rejected_encoded.ids[common_prompt_len..rejected_len],
+        model.manifest.add_eos_token,
+        eos_token_id,
+    );
     return .{
         .prompt_tokens = prompt_tokens,
         .chosen_tokens = chosen_tokens,
         .rejected_tokens = rejected_tokens,
     };
+}
+
+fn copyCompletionWithManifestEos(
+    allocator: std.mem.Allocator,
+    tokens: []const i32,
+    add_eos_token: bool,
+    eos_token_id: i32,
+) ![]i32 {
+    if (!add_eos_token) return allocator.dupe(i32, tokens);
+    if (eos_token_id < 0) return error.MissingEosToken;
+    if (tokens.len > 0 and tokens[tokens.len - 1] == eos_token_id) return allocator.dupe(i32, tokens);
+    const out = try allocator.alloc(i32, tokens.len + 1);
+    @memcpy(out[0..tokens.len], tokens);
+    out[tokens.len] = eos_token_id;
+    return out;
 }
 
 fn renderDpoPrompt(allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, prompt: []const u8) ![]u8 {
@@ -5090,6 +5554,59 @@ fn parseRecipeBackendChoice(value: ?[]const u8) !native_backend_choice.Choice {
     return native_backend_choice.parse(raw) orelse error.InvalidBackend;
 }
 
+fn gemmaAutodiffBackendKind(value: ?[]const u8) !gemma4_real_autodiff.BackendKind {
+    const choice = try parseRecipeBackendChoice(value);
+    return switch (choice) {
+        .auto => .native,
+        .native => blk: {
+            try native_backend_choice.validate(choice);
+            break :blk .native;
+        },
+        .cuda => blk: {
+            try native_backend_choice.validate(choice);
+            break :blk .cuda;
+        },
+        else => error.UnsupportedGemmaTrainingBackend,
+    };
+}
+
+fn preferenceAccumulationSteps(configured: u32, objective_components: usize) !u32 {
+    if (objective_components == 0) return error.InvalidGradientAccumulation;
+    const component_count = std.math.cast(u32, objective_components) orelse return error.InvalidGradientAccumulation;
+    return std.math.mul(u32, @max(configured, 1), component_count) catch error.InvalidGradientAccumulation;
+}
+
+fn buildPreferenceOptimizerPlan(
+    recipe: Recipe,
+    units_per_epoch: usize,
+    objective_components: usize,
+) !preference_optimizer.Plan {
+    const adapter = recipe.adapter orelse AdapterConfig{};
+    return preference_optimizer.build(units_per_epoch, objective_components, .{
+        .learning_rate = recipe.optimizer.learning_rate orelse 0.0001,
+        .weight_decay = recipe.optimizer.weight_decay orelse 0.01,
+        .lr_scheduler = recipe.optimizer.lr_scheduler orelse "constant",
+        .warmup_ratio = recipe.optimizer.warmup_ratio orelse 0.0,
+        .warmup_steps = recipe.optimizer.warmup_steps,
+        .num_cycles = recipe.optimizer.num_cycles orelse 1.0,
+        .max_steps = recipe.optimizer.max_steps,
+        .epochs = recipe.optimizer.epochs orelse 1,
+        .micro_batch_size = recipe.optimizer.micro_batch_size orelse 1,
+        .gradient_accumulation_steps = recipe.optimizer.gradient_accumulation_steps orelse 1,
+        .max_grad_norm = recipe.optimizer.max_grad_norm orelse 1.0,
+        .schedule_free = recipe.optimizer.schedule_free orelse false,
+        .llrd_decay = recipe.optimizer.llrd_decay,
+        .lora_dropout = adapter.dropout orelse 0.0,
+    });
+}
+
+fn grpoRolloutSeed(epoch_idx: usize, prompt_idx: usize, completion_idx: usize) u64 {
+    return 0x6a09_e667_f3bc_c909 ^
+        (@as(u64, @intCast(epoch_idx)) *% 0x9e37_79b9_7f4a_7c15) ^
+        (@as(u64, @intCast(prompt_idx)) *% 0xbf58_476d_1ce4_e5b9) ^
+        (@as(u64, @intCast(completion_idx)) *% 0x94d0_49bb_1331_11eb);
+}
+
 const GrpoScalarRow = struct {
     prompt_idx: usize,
     tokens: []const i32,
@@ -5124,9 +5641,10 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
             .group_size = recipe.grpo.group_size orelse 8,
             .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
             .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
+            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
             .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
         };
+        try grpo.validateConfig(cfg);
         var ga = grpo.GroupAdvantages{
             .allocator = allocator,
             .rewards = try allocator.dupe(f32, batch.rewards),
@@ -5135,7 +5653,7 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         };
         defer ga.deinit();
         @memset(ga.advantages, 0);
-        grpo.computeAdvantages(&ga, batch.completions, cfg);
+        try grpo.computeAdvantages(&ga, batch.completions, cfg);
         var result = try grpo.grpoLoss(allocator, batch.completions, batch.new_logps, ga.advantages, cfg);
         defer result.deinit();
         try writeJsonFile(allocator, io, report_path, GrpoReport{
@@ -5181,12 +5699,14 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
     defer prompt_batch.deinit();
 
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    if (max_completion_tokens == 0) return error.InvalidGRPOConfig;
 
     var sampler = DecoderGrpoSampler{
         .allocator = allocator,
         .model = policy_model,
         .max_seq_len = recipe.dataset.max_seq_len orelse 128,
-        .max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4,
+        .max_completion_tokens = max_completion_tokens,
     };
     var policy_scorer = DecoderLogprobScorer{
         .allocator = allocator,
@@ -5222,7 +5742,7 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
             .group_size = recipe.grpo.group_size orelse 2,
             .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
             .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
+            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
             .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
         },
         .num_prompts = prompt_batch.prompts.len,
@@ -5451,6 +5971,25 @@ fn selectRankedTokenFromLogits(allocator: std.mem.Allocator, logits: []const f32
         }
     }.lessThan);
     return @intCast(entries[@min(rank, entries.len - 1)].idx);
+}
+
+fn sampleTokenFromLogits(logits: []const f32, random: std.Random) !i32 {
+    if (logits.len == 0) return error.InvalidLogits;
+    var max_logit = logits[0];
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidLogits;
+        max_logit = @max(max_logit, value);
+    }
+    var total: f64 = 0.0;
+    for (logits) |value| total += @exp(@as(f64, value - max_logit));
+    if (!std.math.isFinite(total) or total <= 0.0) return error.InvalidLogits;
+    const threshold = random.float(f64) * total;
+    var cumulative: f64 = 0.0;
+    for (logits, 0..) |value, idx| {
+        cumulative += @exp(@as(f64, value - max_logit));
+        if (cumulative >= threshold) return @intCast(idx);
+    }
+    return @intCast(logits.len - 1);
 }
 
 fn argv(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
@@ -5699,6 +6238,116 @@ test "gemma4 lora recipe rejects conflicting target selectors" {
         .artifacts = .{ .root = "/tmp/out" },
     };
     try std.testing.expectError(error.ConflictingLoRATargetSelection, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gemma4 preference adapter rejects semantically mismatched scoring options" {
+    try std.testing.expectError(
+        error.UnsupportedPreferenceLoRAOption,
+        validateGemmaPreferenceAdapterOptions(.{ .dropout = 0.05 }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceLoRATarget,
+        validateGemmaPreferenceAdapterOptions(.{ .target_modules = &.{"lm_head"} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceLoRATarget,
+        validateGemmaPreferenceTargetModules(&.{"model.embed_tokens"}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceQuantization,
+        validateGemmaPreferenceAdapterOptions(.{ .quantization = "4bit" }),
+    );
+    try validateGemmaPreferenceAdapterOptions(.{ .target_modules = &.{ "q_proj", "v_proj" } });
+}
+
+test "gemma4 preference batches specialize below the configured sequence ceiling" {
+    var chosen_ids = [_]i32{ 1, 2, 3, 4, 5 };
+    var rejected_ids = [_]i32{ 1, 2, 6 };
+    const chosen = [_]gemma4.PreparedExampleInput{.{
+        .mode = .instruction,
+        .prompt_input_ids = &.{},
+        .response_input_ids = &.{},
+        .num_prompt_tokens = 0,
+        .num_response_tokens = 0,
+        .input_ids = &chosen_ids,
+    }};
+    const rejected = [_]gemma4.PreparedExampleInput{.{
+        .mode = .instruction,
+        .prompt_input_ids = &.{},
+        .response_input_ids = &.{},
+        .num_prompt_tokens = 0,
+        .num_response_tokens = 0,
+        .input_ids = &rejected_ids,
+    }};
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try gemmaPreferenceBatchSequenceLength(&chosen, &rejected, 128),
+    );
+
+    const short_prompt = [_]i32{ 1, 2, 3 };
+    const long_prompt = [_]i32{ 4, 5, 6, 7, 8 };
+    const prompts = [_][]const i32{ &short_prompt, &long_prompt };
+    try std.testing.expectEqual(
+        @as(usize, 9),
+        try gemmaGrpoBatchSequenceLength(&prompts, 4, 128),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 7),
+        try gemmaGrpoBatchSequenceLength(&prompts, 4, 7),
+    );
+}
+
+test "gemma4 text preference recipes always select policy training" {
+    const dpo_recipe = Recipe{
+        .recipe = "dpo",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/dpo.jsonl", .format = "text-preference" },
+    };
+    try std.testing.expect(try shouldRunOptimizerBackedGemmaDpo(dpo_recipe, "text-preference"));
+
+    const grpo_recipe = Recipe{
+        .recipe = "grpo",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/grpo.jsonl", .format = "text-grpo" },
+    };
+    try std.testing.expect(try shouldRunOptimizerBackedGemmaGrpo(grpo_recipe, "text-grpo"));
+}
+
+test "gemma4 preference recipes reject unimplemented lifecycle and cross-objective knobs" {
+    try std.testing.expectError(
+        error.UnsupportedPreferenceEvaluation,
+        validateGemmaPreferenceLifecycleOptions(.{ .eval = .{} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceCheckpointing,
+        validateGemmaPreferenceLifecycleOptions(.{ .checkpoint = .{} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceRuntimeOption,
+        validateGemmaPreferenceLifecycleOptions(.{ .runtime = .{} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedPreferenceDatasetCache,
+        validateGemmaPreferenceLifecycleOptions(.{ .dataset = .{ .cache_path = "/tmp/cache" } }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedGemmaDpoLossOption,
+        validateGemmaDpoObjectiveOptions(.{ .preference = .{ .simpo_gamma = 0.5 } }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedGemmaGrpoOption,
+        validateGemmaGrpoObjectiveOptions(.{ .preference = .{ .beta = 0.1 } }),
+    );
+}
+
+test "recipe JSON rejects unknown fields" {
+    try std.testing.expectError(
+        error.UnknownField,
+        std.json.parseFromSlice(Recipe, std.testing.allocator, "{\"recipe\":\"dpo\",\"optimzer\":{}}", .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        }),
+    );
 }
 
 test "qwen adapter target presets map to supported module sets" {
@@ -6101,6 +6750,29 @@ test "text reward modes score as expected" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTextReward(.exact_match_ci, "yes indeed", "yes"), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scoreTextReward(.prefix_match, "yes indeed", "yes"), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), scoreTextReward(.prefix_match, "indeed yes", "yes"), 1e-6);
+    const reward_a = tokenSequenceHashReward(&.{ 42, 7 });
+    const reward_a_repeat = tokenSequenceHashReward(&.{ 42, 7 });
+    const reward_b = tokenSequenceHashReward(&.{ 42, 8 });
+    try std.testing.expectEqual(reward_a, reward_a_repeat);
+    try std.testing.expect(reward_a >= 0.0 and reward_a <= 1.0);
+    try std.testing.expect(reward_a != reward_b);
+    try std.testing.expectEqual(TextRewardMode.sequence_hash, try parseTextRewardMode("sequence-hash"));
+}
+
+test "DPO completion EOS follows manifest without duplication" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]i32{ 4, 5 };
+    const with_eos = try copyCompletionWithManifestEos(allocator, &tokens, true, 1);
+    defer allocator.free(with_eos);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 5, 1 }, with_eos);
+
+    const already_terminated = try copyCompletionWithManifestEos(allocator, &.{ 4, 1 }, true, 1);
+    defer allocator.free(already_terminated);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 1 }, already_terminated);
+
+    const unchanged = try copyCompletionWithManifestEos(allocator, &tokens, false, -1);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualSlices(i32, &tokens, unchanged);
 }
 
 fn expectStepCommands(plan: Plan, expected: []const []const u8) !void {

@@ -45,6 +45,7 @@ pub const fused_chunker_splade = @import("fused_chunker_splade.zig");
 pub const fused_chunker_train = @import("fused_chunker_train.zig");
 pub const preference_loss = @import("preference_loss.zig");
 pub const preference_harness = @import("preference_harness.zig");
+pub const preference_optimizer = @import("preference_optimizer.zig");
 pub const grpo = @import("grpo.zig");
 pub const lora_adapter_set = @import("lora_adapter_set.zig");
 pub const tokenizer_batch = @import("tokenizer_batch.zig");
@@ -91,6 +92,7 @@ test {
     _ = fused_chunker_train;
     _ = preference_loss;
     _ = preference_harness;
+    _ = preference_optimizer;
     _ = grpo;
     _ = lora_adapter_set;
     _ = tokenizer_batch;

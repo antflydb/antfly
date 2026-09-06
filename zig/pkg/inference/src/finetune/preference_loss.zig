@@ -68,6 +68,8 @@ pub const PreferenceResult = struct {
 };
 
 pub const PreferenceError = error{
+    InvalidPreferenceConfig,
+    InvalidPreferenceInput,
     MissingReferenceLogps,
     MissingLengths,
     MissingSFTLoss,
@@ -76,6 +78,55 @@ pub const PreferenceError = error{
     WrongLossKind,
     OutOfMemory,
 };
+
+pub fn validateConfig(config: PreferenceConfig) PreferenceError!void {
+    switch (config.kind) {
+        .dpo => {
+            if (!std.math.isFinite(config.beta) or config.beta <= 0.0)
+                return error.InvalidPreferenceConfig;
+        },
+        .ipo => {
+            if (!std.math.isFinite(config.beta) or config.beta <= 0.0 or
+                !std.math.isFinite(config.ipo_tau) or config.ipo_tau <= 0.0)
+            {
+                return error.InvalidPreferenceConfig;
+            }
+        },
+        .kto => {
+            if (!std.math.isFinite(config.beta) or config.beta <= 0.0 or
+                !std.math.isFinite(config.kto_desirable_weight) or config.kto_desirable_weight < 0.0 or
+                !std.math.isFinite(config.kto_undesirable_weight) or config.kto_undesirable_weight < 0.0 or
+                (config.kto_desirable_weight == 0.0 and config.kto_undesirable_weight == 0.0))
+            {
+                return error.InvalidPreferenceConfig;
+            }
+        },
+        .simpo => {
+            if (!std.math.isFinite(config.beta) or config.beta <= 0.0 or
+                !std.math.isFinite(config.simpo_gamma))
+            {
+                return error.InvalidPreferenceConfig;
+            }
+        },
+        .orpo => {
+            if (!std.math.isFinite(config.sft_lambda) or config.sft_lambda < 0.0)
+                return error.InvalidPreferenceConfig;
+        },
+        .cpo => {
+            if (!std.math.isFinite(config.sft_lambda) or config.sft_lambda < 0.0 or
+                !std.math.isFinite(config.simpo_gamma))
+            {
+                return error.InvalidPreferenceConfig;
+            }
+        },
+    }
+}
+
+fn requireFinite(values: []const f32) PreferenceError!void {
+    for (values) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidPreferenceInput;
+    }
+}
 
 inline fn sigmoid(x: f32) f32 {
     // Numerically stable sigmoid.
@@ -116,9 +167,12 @@ inline fn log1mExp(a: f32) f32 {
 }
 
 fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!usize {
+    try validateConfig(config);
     const n = batch.policy_chosen_logps.len;
     if (n == 0) return error.EmptyBatch;
     if (batch.policy_rejected_logps.len != n) return error.BatchSizeMismatch;
+    try requireFinite(batch.policy_chosen_logps);
+    try requireFinite(batch.policy_rejected_logps);
 
     switch (config.kind) {
         .dpo, .ipo => {
@@ -126,6 +180,8 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
                 return error.MissingReferenceLogps;
             if (batch.ref_chosen_logps.len != n or batch.ref_rejected_logps.len != n)
                 return error.BatchSizeMismatch;
+            try requireFinite(batch.ref_chosen_logps);
+            try requireFinite(batch.ref_rejected_logps);
         },
         .simpo => {
             if (batch.chosen_lengths.len == 0 or batch.rejected_lengths.len == 0)
@@ -136,6 +192,7 @@ fn validatePaired(batch: PairedBatch, config: PreferenceConfig) PreferenceError!
         .orpo, .cpo => {
             if (batch.sft_chosen_loss.len != 0 and batch.sft_chosen_loss.len != n)
                 return error.BatchSizeMismatch;
+            try requireFinite(batch.sft_chosen_loss);
         },
         .kto => return error.WrongLossKind,
     }
@@ -311,10 +368,13 @@ pub fn unpairedKTOLoss(
     config: PreferenceConfig,
 ) PreferenceError!PreferenceResult {
     if (config.kind != .kto) return error.WrongLossKind;
+    try validateConfig(config);
     const n = batch.policy_logps.len;
     if (n == 0) return error.EmptyBatch;
     if (batch.ref_logps.len == 0) return error.MissingReferenceLogps;
     if (batch.ref_logps.len != n or batch.desirable.len != n) return error.BatchSizeMismatch;
+    try requireFinite(batch.policy_logps);
+    try requireFinite(batch.ref_logps);
 
     const n_f: f32 = @floatFromInt(n);
     const beta = config.beta;
@@ -368,6 +428,37 @@ pub fn unpairedKTOLoss(
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "preference config rejects non-finite and degenerate objectives" {
+    try std.testing.expectError(error.InvalidPreferenceConfig, validateConfig(.{ .kind = .dpo, .beta = 0.0 }));
+    try std.testing.expectError(error.InvalidPreferenceConfig, validateConfig(.{ .kind = .dpo, .beta = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidPreferenceConfig, validateConfig(.{ .kind = .ipo, .ipo_tau = 0.0 }));
+    try std.testing.expectError(error.InvalidPreferenceConfig, validateConfig(.{
+        .kind = .kto,
+        .kto_desirable_weight = 0.0,
+        .kto_undesirable_weight = 0.0,
+    }));
+    try std.testing.expectError(error.InvalidPreferenceConfig, validateConfig(.{ .kind = .orpo, .sft_lambda = -1.0 }));
+}
+
+test "DPO rejects non-finite policy and reference log-probs" {
+    const valid = [_]f32{-0.5};
+    const invalid = [_]f32{std.math.nan(f32)};
+    const lengths = [_]u32{1};
+    const batch = PairedBatch{
+        .policy_chosen_logps = &invalid,
+        .policy_rejected_logps = &valid,
+        .ref_chosen_logps = &valid,
+        .ref_rejected_logps = &valid,
+        .chosen_lengths = &lengths,
+        .rejected_lengths = &lengths,
+        .sft_chosen_loss = &.{},
+    };
+    try std.testing.expectError(
+        error.InvalidPreferenceInput,
+        pairedPreferenceLoss(std.testing.allocator, batch, .{ .kind = .dpo }),
+    );
+}
 
 const testing = std.testing;
 
