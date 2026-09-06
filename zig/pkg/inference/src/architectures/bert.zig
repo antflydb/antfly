@@ -24,6 +24,7 @@ const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const bert_config = @import("../models/bert.zig");
 const native_compute_mod = @import("../ops/native_compute.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Config = bert_config.Config;
 
@@ -255,8 +256,23 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len);
+    return forwardWithControl(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len, null);
+}
+
+pub fn forwardWithControl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+    control: ?InferenceExecutionControl,
+) ![]f32 {
+    const hidden = try forwardCtWithControl(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len, control);
     defer cb.free(hidden);
+    if (control) |active| try active.check();
     return cb.toFloat32(hidden, allocator);
 }
 
@@ -314,11 +330,30 @@ pub fn forwardCt(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    return forwardCtWithControl(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len, null);
+}
+
+/// Controlled encoder entry point. GPU work is deliberately split into small
+/// layer groups when a request can expire so cancellation latency is bounded
+/// by a frame rather than the complete encoder.
+pub fn forwardCtWithControl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+    control: ?InferenceExecutionControl,
+) !CT {
+    if (control) |active| try active.update(.preparing_weights, 0, @intCast(config.num_hidden_layers));
     const H = config.hidden_size;
     const total = try validateBertForwardInputs(config, input_ids, attention_mask, token_type_ids, batch, seq_len);
     // Preparation is lazy on the first request; subsequent requests validate
     // backend-owned slot metadata without loading or wrapping model weights.
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
+    if (control) |active| try active.update(.executing, 0, @intCast(config.num_hidden_layers));
 
     var encoder_frame_active = false;
     if (resident_slots and !cb.decoderRuntimeHasActiveFrame()) {
@@ -342,9 +377,20 @@ pub fn forwardCt(
 
     // 2. Encoder layers
     for (0..config.num_hidden_layers) |layer| {
+        if (control) |active| try active.update(.executing, @intCast(layer), @intCast(config.num_hidden_layers));
         const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer, resident_slots);
         cb.free(hidden);
         hidden = new_hidden;
+        const bounded_frame = control != null and encoder_frame_active and
+            ((layer + 1) % 2 == 0 or layer + 1 == config.num_hidden_layers);
+        if (bounded_frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            encoder_frame_active = false;
+            if (control) |active| try active.update(.executing, @intCast(layer + 1), @intCast(config.num_hidden_layers));
+            if (layer + 1 < config.num_hidden_layers) {
+                encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+            }
+        }
     }
 
     if (encoder_frame_active) {

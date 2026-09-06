@@ -25,6 +25,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 pub const ExecutionProvider = @import("backend_runtime.zig").OnnxExecutionProvider;
 
 const c = @cImport({
@@ -122,6 +123,7 @@ pub const OnnxSession = struct {
     output_names: std.ArrayListUnmanaged([:0]const u8),
     input_info: std.ArrayListUnmanaged(TensorInfo),
     output_info: std.ArrayListUnmanaged(TensorInfo),
+    execution_provider: ExecutionProvider,
 
     pub fn deinit(self: *OnnxSession) void {
         const api = getApi();
@@ -379,6 +381,7 @@ pub fn createSessionWithOptions(
         .output_names = std.ArrayListUnmanaged([:0]const u8).empty,
         .input_info = std.ArrayListUnmanaged(TensorInfo).empty,
         .output_info = std.ArrayListUnmanaged(TensorInfo).empty,
+        .execution_provider = execution_provider,
     };
 
     // Introspect model inputs and outputs
@@ -462,13 +465,97 @@ test "CUDA provider options preserve ORT C++ defaults and admitted limit" {
 
 const onnx_vtable = Session.VTable{
     .run = &onnxRun,
+    .runWithControl = &onnxRunWithControl,
     .inputInfo = &onnxInputInfo,
     .outputInfo = &onnxOutputInfo,
     .backend = &onnxBackend,
+    .interruption = &onnxInterruption,
     .close = &onnxClose,
 };
 
+fn onnxInterruption(ptr: *anyopaque) @import("../execution_control.zig").Interruption {
+    const self: *const OnnxSession = @ptrCast(@alignCast(ptr));
+    return if (self.execution_provider == .cuda) .process_required else .native_terminable;
+}
+
+fn onnxRunWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    try control.check();
+    const api = getApi();
+    var run_options: ?*c.OrtRunOptions = null;
+    try checkStatus(api, api.CreateRunOptions.?(&run_options));
+    defer api.ReleaseRunOptions.?(run_options.?);
+
+    var watcher = RunCancellationWatcher{
+        .api = api,
+        .run_options = run_options.?,
+        .control = control,
+    };
+    var owned_io: ?std.Io.Threaded = if (control.io == null)
+        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    else
+        null;
+    defer if (owned_io) |*runtime| runtime.deinit();
+    const io = control.io orelse owned_io.?.io();
+    var watcher_group: std.Io.Group = .init;
+    try watcher_group.concurrent(io, RunCancellationWatcher.run, .{ &watcher, io });
+    defer {
+        watcher.finished.store(true, .release);
+        watcher_group.cancel(io);
+        watcher_group.await(io) catch {};
+    }
+
+    const outputs = onnxRunImpl(ptr, inputs, allocator, run_options) catch |err| {
+        if (watcher.termination_requested.load(.acquire)) {
+            control.check() catch |control_err| return control_err;
+        }
+        return err;
+    };
+    errdefer deinitTensorSlice(outputs, allocator);
+    try control.check();
+    return outputs;
+}
+
+const RunCancellationWatcher = struct {
+    api: *const c.OrtApi,
+    run_options: *c.OrtRunOptions,
+    control: InferenceExecutionControl,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    termination_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *@This(), io: std.Io) std.Io.Cancelable!void {
+        while (!self.finished.load(.acquire)) {
+            self.control.check() catch {
+                self.termination_requested.store(true, .release);
+                if (self.api.RunOptionsSetTerminate.?(self.run_options)) |status| {
+                    self.api.ReleaseStatus.?(status);
+                }
+                return;
+            };
+            try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
+    }
+};
+
+fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
+    for (tensors) |*tensor| tensor.deinit();
+    allocator.free(tensors);
+}
+
 fn onnxRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+    return onnxRunImpl(ptr, inputs, allocator, null);
+}
+
+fn onnxRunImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    run_options: ?*c.OrtRunOptions,
+) ![]Tensor {
     const self: *OnnxSession = @ptrCast(@alignCast(ptr));
     const api = getApi();
 
@@ -537,7 +624,7 @@ fn onnxRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
     // Run inference
     try checkStatus(api, api.Run.?(
         self.session,
-        null, // run options
+        run_options,
         input_name_ptrs.ptr,
         @ptrCast(input_values.ptr),
         num_inputs,
@@ -583,6 +670,89 @@ pub fn runWithBoundValues(
     retain_output_names: []const []const u8,
     allocator: std.mem.Allocator,
 ) !BoundRunResult {
+    return runWithBoundValuesImpl(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+        null,
+    );
+}
+
+/// Run an IO-bound ONNX request with the same native termination contract as
+/// Session.runWithControl. This is separate from Session because retained
+/// OrtValues are an ONNX-specific cache optimization, but it must not create a
+/// cancellation blind spot for backend-owned KV runtimes.
+pub fn runWithBoundValuesControl(
+    session: Session,
+    tensor_inputs: []const Tensor,
+    retained_inputs: []const RetainedInput,
+    retain_output_names: []const []const u8,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !BoundRunResult {
+    const active = control orelse return runWithBoundValues(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+    );
+    try active.check();
+    var hard_cancellation = try active.enterUninterruptible(session.interruption());
+    defer hard_cancellation.deinit();
+
+    const api = getApi();
+    var run_options: ?*c.OrtRunOptions = null;
+    try checkStatus(api, api.CreateRunOptions.?(&run_options));
+    defer api.ReleaseRunOptions.?(run_options.?);
+
+    var watcher = RunCancellationWatcher{
+        .api = api,
+        .run_options = run_options.?,
+        .control = active,
+    };
+    var owned_io: ?std.Io.Threaded = if (active.io == null)
+        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    else
+        null;
+    defer if (owned_io) |*runtime| runtime.deinit();
+    const io = active.io orelse owned_io.?.io();
+    var watcher_group: std.Io.Group = .init;
+    try watcher_group.concurrent(io, RunCancellationWatcher.run, .{ &watcher, io });
+    defer {
+        watcher.finished.store(true, .release);
+        watcher_group.cancel(io);
+        watcher_group.await(io) catch {};
+    }
+
+    var result = runWithBoundValuesImpl(
+        session,
+        tensor_inputs,
+        retained_inputs,
+        retain_output_names,
+        allocator,
+        run_options,
+    ) catch |err| {
+        if (watcher.termination_requested.load(.acquire)) {
+            active.check() catch |control_err| return control_err;
+        }
+        return err;
+    };
+    errdefer result.deinit();
+    try active.check();
+    return result;
+}
+
+fn runWithBoundValuesImpl(
+    session: Session,
+    tensor_inputs: []const Tensor,
+    retained_inputs: []const RetainedInput,
+    retain_output_names: []const []const u8,
+    allocator: std.mem.Allocator,
+    run_options: ?*c.OrtRunOptions,
+) !BoundRunResult {
     const self: *OnnxSession = @ptrCast(@alignCast(session.ptr));
     const api = getApi();
 
@@ -620,7 +790,7 @@ pub fn runWithBoundValues(
         try checkStatus(api, api.BindOutputToDevice.?(binding.?, name.ptr, memory_info.?));
     }
 
-    try checkStatus(api, api.RunWithBinding.?(self.session, null, binding.?));
+    try checkStatus(api, api.RunWithBinding.?(self.session, run_options, binding.?));
 
     const ort_allocator = try getDefaultAllocator(api);
     var output_values: [*c]?*c.OrtValue = null;

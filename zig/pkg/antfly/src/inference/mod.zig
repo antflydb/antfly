@@ -83,6 +83,8 @@ test "embedding provider request helpers" {
     try @import("../common/provider_limits.zig").testProviderQuotas();
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
+    try managed_embedder.testManagedEmbeddingRequestContextProgress();
     try google_auth.testCredentialSourceCacheKeys();
     try credential_source_identity.testCredentialSourceIdentities();
     try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();

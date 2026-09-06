@@ -2395,6 +2395,32 @@ pub const TTLCleanupStats = struct {
     last_acquired_ms: u64 = 0,
 };
 
+pub fn InlineStatusText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        len: u16 = 0,
+
+        pub fn init(value: []const u8) @This() {
+            var result: @This() = .{};
+            const copy_len = @min(value.len, capacity);
+            @memcpy(result.bytes[0..copy_len], value[0..copy_len]);
+            result.len = @intCast(copy_len);
+            return result;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.slice());
+        }
+    };
+}
+
+pub const EnrichmentActiveModel = InlineStatusText(256);
+pub const EnrichmentActiveBackend = InlineStatusText(32);
+
 pub const EnrichmentStats = struct {
     enabled: bool = false,
     lease_owned: bool = true,
@@ -2421,6 +2447,16 @@ pub const EnrichmentStats = struct {
     worker_failed: bool = false,
     worker_started: bool = false,
     stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "idle",
+    active_model: EnrichmentActiveModel = .{},
+    active_backend: EnrichmentActiveBackend = .{},
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
