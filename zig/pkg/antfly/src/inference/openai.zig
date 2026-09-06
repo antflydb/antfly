@@ -25,6 +25,7 @@ const inference = @import("types.zig");
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
@@ -124,6 +125,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,
@@ -192,12 +194,13 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();

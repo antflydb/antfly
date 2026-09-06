@@ -29,6 +29,7 @@ const inference_work = @import("inference/work.zig");
 const remote_capabilities = @import("inference/remote_capabilities.zig");
 const execution_context = @import("inference/execution_context.zig");
 
+const provider_limits = @import("common/provider_limits.zig");
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
 const test_png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
@@ -203,6 +204,7 @@ pub const Runtime = struct {
     owned_http: ?*httpx.Client = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
+    limits: *provider_limits.Registry = &provider_limits.process_registry,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
@@ -210,6 +212,7 @@ pub const Runtime = struct {
     result_limits: ResultLimits = .{},
 
     pub const Options = struct {
+        limits: *provider_limits.Registry = &provider_limits.process_registry,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         max_provider_response_bytes: usize = default_asset_provider_response_bytes,
@@ -236,6 +239,7 @@ pub const Runtime = struct {
                 .io = http.io,
                 .routing = .{ .source_table = options.source_table },
             },
+            .limits = options.limits,
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .max_provider_response_bytes = options.max_provider_response_bytes,
@@ -1693,6 +1697,16 @@ pub const Runtime = struct {
         defer parsed_cfg.deinit(alloc);
         try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
         const cfg = parsed_cfg.generator;
+        try generating_runtime.validateGenerationOutputTokenBudget(cfg, requests.len);
+        const generation_policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+        if (generation_policy.tokens_per_minute != 0) for (requests) |request| {
+            if (request.media.len > 0) return error.UnsupportedMediaTokenBudget;
+            if (request.source_parts_json) |raw_parts| {
+                const content_parts = try parseGeneratorContentParts(alloc, request.source_text, raw_parts, &.{}, false);
+                defer freeGeneratorContentParts(alloc, content_parts);
+                for (content_parts) |part| if (part != .text) return error.UnsupportedMediaTokenBudget;
+            }
+        };
         if (cfg.provider != .antfly) return error.BatchIncompatible;
         if (cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
         if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
@@ -1752,6 +1766,10 @@ pub const Runtime = struct {
             header_count += 1;
         }
         const headers = header_storage[0..header_count];
+        var quota = try generating_runtime.acquireGenerationQuota(alloc, cfg, .{
+            .limits = self.limits,
+        });
+        defer quota.release();
 
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
@@ -1780,6 +1798,9 @@ pub const Runtime = struct {
             var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
             defer body.deinit(alloc);
             var request_options = httpx.RequestOptions{
+                .attempt_observer = quota.limiter().observer(
+                    try generating_runtime.generationOutputTokenBudget(cfg, chunk.len),
+                ),
                 .headers = headers,
                 .timeout_ms = try self.execution.remainingTimeoutMs(
                     platform.time.monotonicNs(),
@@ -2188,7 +2209,10 @@ pub const Runtime = struct {
             break :blk .{ .parts = parts.? };
         } else .{ .text = request.source_text };
         const messages = [_]generating_runtime.ChatMessage{.{ .role = .user, .content = content }};
+        try generating_runtime.validateGenerationMessagesTokenBudget(cfg, &messages);
         if (local_attachments) {
+            if ((try provider_limits.Policy.fromConfig(cfg.rate_limit)).enabled())
+                return error.UnsupportedLocalRateLimit;
             const local = self.antfly_provider.?;
             const capabilities = (try self.linkedModelCapabilities(alloc, local, cfg.model, .generate)) orelse
                 return error.InvalidInferenceCapabilities;
@@ -2247,6 +2271,7 @@ pub const Runtime = struct {
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
+            .limits = self.limits,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateGeneratorCapabilityLease(alloc, cfg);
@@ -2960,67 +2985,28 @@ fn parseGeneratorProducerConfig(alloc: Allocator, raw: []const u8) !GeneratorPro
 
 fn generatorConfigFromValue(alloc: Allocator, value: std.json.Value) !generating_runtime.GeneratorConfig {
     if (value != .object) return error.InvalidGeneratorConfig;
-    const provider_value = value.object.get("provider") orelse return error.InvalidGeneratorConfig;
-    if (provider_value != .string) return error.InvalidGeneratorConfig;
-    const provider = generatorProviderFromString(provider_value.string) orelse return error.UnsupportedGeneratorProvider;
-
-    const model = jsonStringField(value, "model") orelse "";
-    const url = jsonStringField(value, "url") orelse jsonStringField(value, "api_url") orelse "";
-    var cfg = generating_runtime.GeneratorConfig{
-        .provider = provider,
-        .model = if (model.len > 0) try alloc.dupe(u8, model) else "",
-        .url = if (url.len > 0) try alloc.dupe(u8, url) else "",
-        .api_key = if (jsonStringField(value, "api_key")) |text| try alloc.dupe(u8, text) else null,
-        .project_id = if (jsonStringField(value, "project_id")) |text| try alloc.dupe(u8, text) else null,
-        .location = if (jsonStringField(value, "location")) |text| try alloc.dupe(u8, text) else null,
-        .credentials_path = if (jsonStringField(value, "credentials_path")) |text| try alloc.dupe(u8, text) else null,
-        .tools_json = if (value.object.get("tools")) |tools| try std.json.Stringify.valueAlloc(alloc, tools, .{}) else null,
-        .tool_choice_json = if (value.object.get("tool_choice")) |tool_choice| try std.json.Stringify.valueAlloc(alloc, tool_choice, .{}) else null,
-        .max_tokens = jsonIntegerField(value, "max_tokens") orelse generating_runtime.default_max_tokens,
-        .temperature = jsonFloatField(value, "temperature"),
-        .top_p = jsonFloatField(value, "top_p"),
-        .top_k = jsonIntegerField(value, "top_k"),
-        .frequency_penalty = jsonFloatField(value, "frequency_penalty"),
-        .presence_penalty = jsonFloatField(value, "presence_penalty"),
-    };
+    // Asset-only envelope fields are handled here; all provider configuration
+    // is parsed by the canonical generator contract (including future fields).
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(alloc);
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "tools") or std.mem.eql(u8, key, "tool_choice") or
+            std.mem.eql(u8, key, "tool_name") or std.mem.eql(u8, key, "tool_output")) continue;
+        try object.put(alloc, key, entry.value_ptr.*);
+    }
+    var cfg = try generating_runtime.parseConfigFromValue(alloc, .{ .object = object });
     errdefer cfg.deinit(alloc);
-    try cfg.validate();
+    if (value.object.get("tools")) |tools| cfg.tools_json = try std.json.Stringify.valueAlloc(alloc, tools, .{});
+    if (value.object.get("tool_choice")) |choice| cfg.tool_choice_json = try std.json.Stringify.valueAlloc(alloc, choice, .{});
     return cfg;
-}
-
-fn generatorProviderFromString(value: []const u8) ?generating_runtime.Provider {
-    if (std.mem.eql(u8, value, "gemini")) return .gemini;
-    if (std.mem.eql(u8, value, "vertex")) return .vertex;
-    if (std.mem.eql(u8, value, "openai")) return .openai;
-    if (std.mem.eql(u8, value, "ollama")) return .ollama;
-    if (std.mem.eql(u8, value, "antfly")) return .antfly;
-    if (std.mem.eql(u8, value, "mock")) return .mock;
-    return null;
 }
 
 fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const found = value.object.get(field) orelse return null;
     return if (found == .string) found.string else null;
-}
-
-fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .integer => |integer| integer,
-        else => null,
-    };
-}
-
-fn jsonFloatField(value: std.json.Value, field: []const u8) ?f32 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .float => |float| @floatCast(float),
-        .integer => |integer| @floatFromInt(integer),
-        else => null,
-    };
 }
 
 fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
@@ -5491,6 +5477,25 @@ test "owned asset producer foreground contract follows the selected route" {
         .config_json = "",
         .source_text = "copy",
     }}));
+}
+
+test "asset producer runtime preserves generator policies for single and batch dispatch" {
+    const alloc = std.testing.allocator;
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .limits = &registry });
+    defer runtime.deinit();
+    const raw =
+        \\{"provider":"antfly","model":"test","api_url":"http://127.0.0.1:1","max_tokens":10,"rate_limit":{"tokens_per_minute":1}}
+    ;
+    var parsed = try parseGeneratorProducerConfig(alloc, raw);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(?i64, 1), parsed.generator.rate_limit.?.tokens_per_minute);
+    const request = asset_producer.Request{ .producer_type = .generator, .config_json = raw, .source_text = "hello" };
+    try std.testing.expectError(error.ProviderTokenBudgetExceeded, runtime.produceOne(alloc, request));
+    try std.testing.expectError(error.ProviderTokenBudgetExceeded, runtime.tryGenerateBatch(alloc, &.{ request, request }));
 }
 
 test "asset producer runtime batches compatible antfly generator requests" {

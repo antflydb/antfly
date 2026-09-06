@@ -736,7 +736,7 @@ fn discoverReaderModelPathFromRegistry(
         defer manifest.deinit();
         if (manifest.model_type != .reader and entry.kind != .reader) continue;
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) continue;
-        if (!readers_mod.isSupportedManifest(ctx.allocator, entry.path, manifest)) continue;
+        if (!(try readers_mod.probeManifest(ctx.allocator, entry.path, manifest)).isSupported()) continue;
 
         const rank = extractionReaderPreference(entry.name, extractor_model_name);
         if (best_name == null or rank < best_rank or (rank == best_rank and std.mem.lessThan(u8, entry.name, best_name.?))) {
@@ -809,7 +809,7 @@ fn resolveSupportedNamedReaderPath(ctx: Context, requested_name: []const u8) ![]
     var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
     defer manifest.deinit();
     if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) return error.ModelNotFound;
-    if (!readers_mod.isSupportedManifest(ctx.allocator, path, manifest)) return error.ModelNotFound;
+    if (!(try readers_mod.probeManifest(ctx.allocator, path, manifest)).isSupported()) return error.ModelNotFound;
     return path;
 }
 

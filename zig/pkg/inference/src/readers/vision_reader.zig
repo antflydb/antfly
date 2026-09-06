@@ -282,17 +282,10 @@ pub fn resolveMaxLength(model_max: usize, requested: ?usize, prefix_len: usize) 
     return max_length;
 }
 
-pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
-    if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
-        allocator.free(paths.encoder);
-        allocator.free(paths.decoder);
-        return true;
-    } else |_| {}
-
-    var man = manifest_mod.loadFromDir(allocator, model_path) catch return false;
+pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) !bool {
+    var man = try manifest_mod.loadListingFromDir(allocator, model_path);
     defer man.deinit();
-
-    return isSupportedManifest(man);
+    return try enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man) or isSupportedManifest(man);
 }
 
 /// Same check against a manifest the caller already has.
@@ -323,5 +316,5 @@ test "vision reader supports gguf-backed native Florence directories" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
 
-    try std.testing.expect(isSupportedModelDir(allocator, model_dir));
+    try std.testing.expect(try isSupportedModelDir(allocator, model_dir));
 }

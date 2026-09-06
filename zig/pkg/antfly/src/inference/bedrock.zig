@@ -441,6 +441,10 @@ pub fn resolveRequestFormat(model: []const u8, configured: RequestFormat) !Reque
 }
 
 pub const Options = struct {
+    /// Model invocation admission only; credential resolution is a distinct
+    /// upstream operation and must not consume this model's quota.
+    attempt_observer: ?httpx.AttemptObserver = null,
+    credential_source: CredentialSource = .default,
     region: []const u8,
     endpoint: []const u8,
     request_format: RequestFormat = .auto,
@@ -545,11 +549,12 @@ pub const Provider = struct {
         const cache = self.credential_cache orelse &self.owned_credential_cache;
         // Cached snapshots outlive this invocation and may be refreshed by a
         // concurrent request. Never allocate them from the caller's arena.
-        var creds = try cache.getWithContext(
+        var creds = try cache.getForSourceWithContext(
             alloc,
             std.heap.smp_allocator,
             self.http,
             self.options.region,
+            self.options.credential_source,
             request_context,
         );
         defer creds.deinit(alloc);
@@ -567,6 +572,7 @@ pub const Provider = struct {
         defer freeHeaderPairs(alloc, signed);
 
         var resp = try self.http.request(.POST, url, .{
+            .attempt_observer = self.options.attempt_observer,
             .headers = signed,
             .body = json_body,
             .timeout_ms = try request_context.remainingTimeoutMs(self.http.io),

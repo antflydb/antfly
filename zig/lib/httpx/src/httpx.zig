@@ -199,6 +199,7 @@ pub const negotiateVersion = http.negotiateVersion;
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const AttemptObserver = @import("core/attempt_observer.zig").AttemptObserver;
 pub const CancellationToken = client_mod.CancellationToken;
 pub const WriterProgress = client_mod.WriterProgress;
 pub const WriterProgressCallback = client_mod.WriterProgressCallback;

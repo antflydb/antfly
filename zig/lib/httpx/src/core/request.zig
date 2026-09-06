@@ -52,6 +52,7 @@ pub const Request = struct {
     /// Optional caller-specific response ceiling. Client execution clamps
     /// this to the configured client-wide maximum.
     max_response_size: ?usize = null,
+    attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
 
     const Self = @This();
 

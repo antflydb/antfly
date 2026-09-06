@@ -290,6 +290,7 @@ fn hasBinaryPart(parts: []const template_mod.ContentPart) bool {
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     request_timeout_ms: ?u64 = null,
@@ -418,6 +419,7 @@ pub const Provider = struct {
         fallback_timeout_ms: ?u64,
     ) httpx.RequestOptions {
         return .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.requestHeaders(),
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -439,6 +441,7 @@ pub const Provider = struct {
         const count = if (base_headers) |headers| headers.len else 0;
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
+            .attempt_observer = self.attempt_observer,
             .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -726,6 +729,8 @@ pub const Provider = struct {
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale
+        else if (resp.status.code == 429)
+            error.RateLimit
         else
             error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;

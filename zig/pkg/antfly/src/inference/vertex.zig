@@ -37,6 +37,7 @@ pub const EmbedOptions = struct {
 pub const GeminiProvider = struct {
     allocator: Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     api_key_header: [2][]const u8,
     max_tokens: ?i64 = null,
@@ -102,6 +103,7 @@ pub const GeminiProvider = struct {
         defer self.allocator.free(url);
         const headers = [_][2][]const u8{self.api_key_header};
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = &headers,
             .timeout_ms = options.timeout_ms,
@@ -145,12 +147,13 @@ pub const GeminiProvider = struct {
 
         const headers = [_][2][]const u8{self.api_key_header};
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = &headers,
             .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse);
     }
 
@@ -176,6 +179,7 @@ pub const RerankOptions = struct {
 pub const Provider = struct {
     allocator: Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     project_id: []const u8,
     location: []const u8,
@@ -292,6 +296,7 @@ pub const Provider = struct {
         try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
 
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = request_body,
             .headers = headers.items,
             .timeout_ms = options.timeout_ms,
@@ -392,6 +397,7 @@ pub const Provider = struct {
         defer if (minted_auth) |value| alloc.free(value);
         try self.appendAuthHeaders(alloc, &headers, &minted_auth);
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = headers.items,
             .timeout_ms = options.timeout_ms,
@@ -454,12 +460,13 @@ pub const Provider = struct {
         try self.appendAuthHeaders(alloc, &headers, &minted_auth);
 
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
 
         return try parseGenerateResponseAlloc(alloc, body);

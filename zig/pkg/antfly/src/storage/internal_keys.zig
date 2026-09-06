@@ -687,7 +687,7 @@ fn hashCanonicalJsonValue(
 fn derivedCoverageConfigKeyIsSemantic(context: CoverageFingerprintContext, key: []const u8) bool {
     if (context == .root and std.mem.eql(u8, key, "execution")) return false;
     if (context != .embedder) return true;
-    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst");
+    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst") and !std.mem.eql(u8, key, "rate_limit");
 }
 
 fn hashLengthPrefixed(hasher: *std.hash.Wyhash, bytes: []const u8) void {
@@ -726,6 +726,10 @@ test "derived coverage config fingerprint is semantic and execution independent"
     );
 
     try std.testing.expectEqual(first, reordered);
+    const limited = try derivedCoverageConfigFingerprint(alloc,
+        \\{"generator":{"source_field":"body","kind":"dense_embedding"},"embedder":{"model":"clipclap","rate_limit":{"tokens_per_minute":60000,"max_concurrency":2}},"dims":384,"field":"body"}
+    );
+    try std.testing.expectEqual(first, limited);
     try std.testing.expect(first != changed);
     try std.testing.expect(first != semantic_burst);
 }

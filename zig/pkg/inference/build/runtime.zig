@@ -217,6 +217,11 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     var shared_with_generating = shared;
+    if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    }));
     shared_with_generating.generating_openapi = generating_openapi_mod;
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
     shared_with_generating.chunking_api_openapi = chunking_api_openapi_mod;
@@ -611,6 +616,11 @@ fn addInferenceApiModule(
         .target = target,
         .optimize = optimize,
     });
+    if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    }));
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
 
     if (skip_openapi) {
