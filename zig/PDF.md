@@ -79,6 +79,60 @@ after all consumers of that window finish. A future transform cache is keyed by
 source fingerprint, page, renderer version, DPI, pixel/dimension limits, and
 render profile; it must never be keyed by URL alone.
 
+### Compatibility-first queues and shared render windows
+
+The bounded deferred-asset queue is partitioned by execution compatibility
+**before materialization**. Interleaved producers `A, B, A, B` become compatible
+groups `A, A` and `B, B`; ordering within a group is stable. Only request indexes
+and borrowed configuration participate in planning. The materializer retains
+one byte-bounded batch plus its next candidate, not every producer's inputs.
+Dependency-establishing copy and document-extraction requests remain in their
+normal ordered path.
+
+Within a document group, the enrichment thread owns a shared-window scheduler.
+Before dispatching an owner's rendered window or starting speculative render
+prefetch, it offers the borrowed pages to later compatible consumers. Physical
+compatibility includes source identity and credentials, DPI, pixel/dimension
+limits, preferred image geometry, encoded-output allowance, representation,
+and decode limits. Model names, prompts, and result types are not render keys.
+
+- Each consumer partitions the borrowed window by its own item, byte, and
+  pixel limits and acquires incremental transport/inference/result admission.
+  The owner continues to account for the page buffers; consumers do not copy
+  them or retain their allocator.
+- Page embedders stage vectors in their existing source-hashed, lease-epoch
+  namespace. Final or staged matching vectors are skipped before inference.
+  The v2 page identity includes the resolved model's target geometry, resize
+  mode, and resampling policy, so a changed preprocessing contract invalidates
+  old vectors even when the configured model name is unchanged.
+- Reader- and generator-backed OCR consumers preserve their distinct prompts
+  and typed output handling. Compatible OCR page-selection and quality policies
+  permit finalized units to be privately spooled and restored during the
+  consumer's ordinary traversal. A page-image-only owner does not invent the
+  embedded-text metadata needed to decide another consumer's auto-OCR policy.
+  Custom extraction routes and incompatible policies retain independent
+  execution.
+- Only typed results survive the window callback. Each consumer keeps its own
+  publication and coverage boundary. An unavailable optional memory lease
+  falls back to its normal traversal; a consumer failure does not mutate the
+  owner's units or prevent other compatible consumers from using the window.
+  Private OCR rows are scavenged at the next document-group entry, including
+  after reconfiguration removes their original consumer, and are removed when
+  their active group finishes. They never participate in public artifact scans.
+- Fan-out is synchronous on the enrichment thread, before prefetch. Renderer
+  workers never enter enrichment state or concurrently use another consumer's
+  PDF session. There is no document-sized rendered-image cache.
+
+Typed asset batch failures consume the failing item's durable retry budget,
+not the identity of whichever item happened to lead the batch. Successful
+siblings are applied before a retained retry is returned, including serial
+compatibility execution. Publishing those siblings does not forgive the
+pending failed request's durable attempt count. Borrowed-image read
+invocations carry cancellation and deadlines through model loading and backend
+execution. A fused invocation stays live while any member is live; once all
+members cancel or expire, its backend control stops the work. Canceled members
+do not receive results belonging to still-live siblings.
+
 ### Runtime-owned execution lanes
 
 Worker lifecycle belongs to `BackendRuntime`, not to a renderer, codec, model,

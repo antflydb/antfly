@@ -46,6 +46,8 @@ pub const pdf_page_embedding_stage_kind: u8 = 0x40;
 /// Keeping the spool in its own kind prevents it from being mistaken for a
 /// user-visible artifact or from participating in artifact source indexes.
 pub const document_extraction_unit_spool_kind: u8 = 0x41;
+/// Private typed results produced by consumers of a shared PDF render window.
+pub const shared_pdf_consumer_kind: u8 = 0x42;
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
@@ -382,6 +384,14 @@ pub fn documentExtractionUnitSpoolRootPrefixAlloc(
     defer alloc.free(artifact_root);
     try list.appendSlice(alloc, artifact_root);
     try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, shared_pdf_consumer_kind);
     return try list.toOwnedSlice(alloc);
 }
 

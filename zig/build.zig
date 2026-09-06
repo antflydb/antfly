@@ -5043,6 +5043,8 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
             "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
             "asset preparation is lazy and byte bounded across retryable provider batches",
+            "asset planning groups interleaved providers",
+            "shared PDF",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",

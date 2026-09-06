@@ -171,9 +171,44 @@ pub const ExecuteItem = struct {
     identity: Identity,
     payload: *const anyopaque,
     slot: *ResultSlot,
+    control: ItemControl = .{},
 
     pub fn payloadAs(self: ExecuteItem, comptime T: type) *const T {
         return @ptrCast(@alignCast(self.payload));
+    }
+};
+
+/// Borrowed through execution, including any backend cancellation monitor.
+pub const ItemControl = struct {
+    io: ?std.Io = null,
+    deadline: ?std.Io.Clock.Timestamp = null,
+    cancellation: Cancellation = .{},
+    cancel_requested: ?*const std.atomic.Value(bool) = null,
+
+    pub fn check(self: ItemControl) !void {
+        if (self.cancellation.isCancelled() or
+            (if (self.cancel_requested) |signal| signal.load(.acquire) else false))
+            return error.Canceled;
+        if (self.io) |io| if (deadlineExpired(io, self.deadline)) return error.DeadlineExceeded;
+    }
+};
+
+/// A fused invocation serves every live member. One caller cannot cancel
+/// unrelated callers; once every member is gone the backend must stop too.
+pub const ExecutionControl = struct {
+    items: []const ExecuteItem,
+
+    pub fn check(raw: ?*anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        var last_error: anyerror = error.Canceled;
+        for (self.items) |item| {
+            item.control.check() catch |err| {
+                last_error = err;
+                continue;
+            };
+            return;
+        }
+        return last_error;
     }
 };
 
@@ -350,6 +385,12 @@ pub const Broker = struct {
             },
             .cancellation = cancellation,
             .deadline = deadline,
+        };
+        ticket.item.control = .{
+            .io = io,
+            .deadline = deadline,
+            .cancellation = cancellation,
+            .cancel_requested = &ticket.cancel_requested,
         };
 
         // Serial compatibility is deliberately not queued: accepting a batch
@@ -731,6 +772,28 @@ const TestExecutor = struct {
         }
     }
 };
+
+test "fused execution stays live for healthy members and stops when all members cancel or expire" {
+    var first_canceled: std.atomic.Value(bool) = .init(false);
+    var second_canceled: std.atomic.Value(bool) = .init(false);
+    var output: usize = 0;
+    var slot = ResultSlot{ .output = &output };
+    var items = [_]ExecuteItem{
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &output, .slot = &slot, .control = .{ .cancellation = Cancellation.fromAtomic(&first_canceled) } },
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &output, .slot = &slot, .control = .{ .cancellation = Cancellation.fromAtomic(&second_canceled) } },
+    };
+    var control = ExecutionControl{ .items = &items };
+    try ExecutionControl.check(&control);
+    first_canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, items[0].control.check());
+    try ExecutionControl.check(&control);
+    second_canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, ExecutionControl.check(&control));
+    second_canceled.store(false, .release);
+    items[1].control.io = std.testing.io;
+    items[1].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
+}
 
 test "microbatch grouping key is exact across task conditioning and resource class" {
     const base = Key{

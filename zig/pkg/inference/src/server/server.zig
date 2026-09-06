@@ -6260,8 +6260,11 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
+        var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+        const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
+        try execution_control.check();
 
         // Flatten even an existing PDF/window batch into independently
         // attributable tickets. Compatible work from other requests can fill
@@ -6296,6 +6299,7 @@ pub const Node = struct {
             request.source_fingerprint,
             null,
             null,
+            execution_control,
         );
     }
 
@@ -6498,8 +6502,11 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
+        var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+        const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
+        try execution_control.check();
 
         // Keep renderer-owned raster bytes borrowed while compatible pages
         // from this and other documents fill one native model invocation. The
@@ -6526,12 +6533,24 @@ pub const Node = struct {
             request.source_fingerprint,
             null,
             null,
+            execution_control,
         );
         errdefer batch.deinit(allocator);
         if (cancellation.isCancelled()) return error.Canceled;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return batch;
     }
+
+    const BorrowedReadControl = struct {
+        deadline_ns: ?u64,
+        cancellation: ExecutorCancellation,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancellation.isCancelled()) return error.Canceled;
+            try ensureDirectEmbeddingDeadline(self.deadline_ns);
+        }
+    };
 
     const ReadRasterMicrobatchPayload = struct {
         model_path: []const u8,
@@ -6715,6 +6734,11 @@ pub const Node = struct {
         };
         defer self.releaseAdmissionUnits(required_units);
 
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const execution_control = self.bindExecutionControl(items[0].control.io, .{
+            .ptr = &group_control,
+            .check_fn = executor_microbatch.ExecutionControl.check,
+        });
         const batch = self.runReadImageBatchReportedDirect(
             allocator,
             first.model_path,
@@ -6727,6 +6751,7 @@ pub const Node = struct {
             common_profile_source,
             first.fence,
             result_allocators,
+            execution_control,
         ) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
@@ -6752,8 +6777,15 @@ pub const Node = struct {
             .native_batch
         else
             .serial;
-        for (items, batch.items) |item, result|
+        for (items, batch.items) |item, result| {
+            item.control.check() catch |err| {
+                var discarded = result;
+                readers_api.deinitResult(item.allocator, &discarded);
+                item.slot.fail(err);
+                continue;
+            };
             item.slot.setValue(readers_api.Result, result, execution);
+        }
     }
 
     fn executeReadRasterMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
@@ -6816,6 +6848,11 @@ pub const Node = struct {
         };
         defer self.releaseAdmissionUnits(required_units);
 
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const execution_control = self.bindExecutionControl(items[0].control.io, .{
+            .ptr = &group_control,
+            .check_fn = executor_microbatch.ExecutionControl.check,
+        });
         const batch = self.runReadRasterBatchReportedDirect(
             allocator,
             first.model_path,
@@ -6825,6 +6862,7 @@ pub const Node = struct {
             common_profile_source,
             first.fence,
             result_allocators,
+            execution_control,
         ) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
@@ -6847,8 +6885,15 @@ pub const Node = struct {
             .native_batch
         else
             .serial;
-        for (items, batch.items) |item, result|
+        for (items, batch.items) |item, result| {
+            item.control.check() catch |err| {
+                var discarded = result;
+                readers_api.deinitResult(item.allocator, &discarded);
+                item.slot.fail(err);
+                continue;
+            };
             item.slot.setValue(readers_api.Result, result, execution);
+        }
     }
 
     fn collectReadMicrobatchResults(
@@ -6929,6 +6974,7 @@ pub const Node = struct {
             source_fingerprint,
             null,
             null,
+            self.bindExecutionControl(null, .{}),
         )).items;
     }
 
@@ -6942,7 +6988,9 @@ pub const Node = struct {
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
+        control: InferenceExecutionControl,
     ) !readers_api.BatchResult {
+        try control.check();
         if (result_allocators) |allocators| {
             if (allocators.len != rasters.len) return error.InvalidReadResultCount;
         }
@@ -6979,13 +7027,15 @@ pub const Node = struct {
         var reader = if (execution_fence) |fence|
             try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
         else
-            try readers_mod.LoadedReader.loadFromDir(
+            try readers_mod.LoadedReader.loadFromDirWithControl(
                 allocator,
                 model_path,
                 &self.session_manager,
                 &self.model_manager,
+                control,
             );
         defer reader.deinit();
+        try control.check();
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
@@ -7005,6 +7055,7 @@ pub const Node = struct {
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
+            .execution_control = control,
         });
         const results = raw_batch.results;
         defer {
@@ -7070,7 +7121,9 @@ pub const Node = struct {
         source_fingerprint: ?[]const u8,
         execution_fence: ?*const readers_mod.ExecutionFence,
         result_allocators: ?[]const std.mem.Allocator,
+        control: InferenceExecutionControl,
     ) !readers_api.BatchResult {
+        try control.check();
         if (result_allocators) |allocators| {
             if (allocators.len != image_datas.len) return error.InvalidReadResultCount;
         }
@@ -7104,13 +7157,15 @@ pub const Node = struct {
         var reader = if (execution_fence) |fence|
             try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
         else
-            try readers_mod.LoadedReader.loadFromDir(
+            try readers_mod.LoadedReader.loadFromDirWithControl(
                 allocator,
                 model_path,
                 &self.session_manager,
                 &self.model_manager,
+                control,
             );
         defer reader.deinit();
+        try control.check();
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
@@ -7141,6 +7196,7 @@ pub const Node = struct {
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
+            .execution_control = control,
         });
         const results = batch.results;
         defer {
