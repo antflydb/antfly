@@ -151,13 +151,20 @@ def main() -> int:
         fail("the quickstart must have one text wait and one image wait")
     for index, condition in expected_waits.items():
         matching = [block for block in wait_blocks if f"--index {index}" in block]
-        if len(matching) != 1 or condition not in matching[0] or "--timeout 45m" not in matching[0]:
+        if (
+            len(matching) != 1
+            or condition not in matching[0]
+            or "--timeout 45m" not in matching[0]
+        ):
             fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
     if "--until source-covered=10%" not in quickstart_tape:
         fail("the quickstart recording must wait for 10% source coverage")
-    if "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape or "--timeout 45m" not in quickstart_tape:
+    if (
+        "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape
+        or "--timeout 45m" not in quickstart_tape
+    ):
         fail("the quickstart recording must match the source-coverage success message")
     if "--until searchable-artifacts=1" in quickstart_tape:
         fail("the quickstart recording must not retain the legacy single-artifact wait")
