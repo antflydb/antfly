@@ -941,9 +941,8 @@ pub fn findCellByOrdinalTrusted(
     layout: *const PhysicalLayout,
     ordinal: usize,
 ) !?Cell {
-    if (ordinal >= table_schema.relational_columns.len) return null;
-    const parsed = try parseOrdinalInternal(value, table_schema, layout, false, false);
-    return try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal);
+    const row = try ordinalRowViewTrusted(value, table_schema, layout);
+    return try row.findCell(ordinal);
 }
 
 const ParsedOrdinal = struct {
@@ -1039,6 +1038,7 @@ pub const OrdinalRowView = struct {
     parsed: ParsedOrdinal,
     table_schema: runtime_schema.TableSchema,
     layout: *const PhysicalLayout,
+    payloads_validated: bool = false,
 
     pub fn ordinalForName(self: OrdinalRowView, name: []const u8) ?usize {
         return self.layout.ordinalForName(self.table_schema.relational_columns, name);
@@ -1046,7 +1046,7 @@ pub const OrdinalRowView = struct {
 
     pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
-        return try findParsedOrdinalCell(self.parsed, self.table_schema.relational_columns, ordinal);
+        return try findParsedOrdinalCellWithValidation(self.parsed, self.table_schema.relational_columns, ordinal, !self.payloads_validated);
     }
 
     /// Shared logical interpretation for projection and predicate execution.
@@ -1088,8 +1088,10 @@ pub fn ordinalRowView(
     };
 }
 
-/// Storage pages with authenticated values may omit the row CRC pass. Bounds,
-/// schema identity, capabilities, and addressed cell types remain validated.
+/// Only for canonical rows produced by preparation or admitted through strict
+/// restore validation and protected by storage authentication. These rows need
+/// neither another CRC pass nor another scan of each addressed JSON/vector
+/// payload. Bounds, schema identity and addressed scalar types remain checked.
 pub fn ordinalRowViewTrusted(
     value: []const u8,
     table_schema: runtime_schema.TableSchema,
@@ -1102,6 +1104,7 @@ pub fn ordinalRowViewTrusted(
         .parsed = try parseOrdinalInternal(value, table_schema, layout, false, false),
         .table_schema = table_schema,
         .layout = layout,
+        .payloads_validated = true,
     };
 }
 
@@ -1380,18 +1383,27 @@ fn findParsedOrdinalCell(
     columns: []const runtime_schema.RelationalColumn,
     ordinal: usize,
 ) !?Cell {
+    return try findParsedOrdinalCellWithValidation(parsed, columns, ordinal, true);
+}
+
+fn findParsedOrdinalCellWithValidation(
+    parsed: ParsedOrdinal,
+    columns: []const runtime_schema.RelationalColumn,
+    ordinal: usize,
+    validate_payload: bool,
+) !?Cell {
     const column = columns[ordinal];
     if (parsed.capabilities & capability_sparse_slots != 0) {
         const entry_index = sparseEntryIndex(parsed, ordinal) orelse return null;
         const payload = try sparsePayloadSliceAtIndex(parsed, entry_index);
-        return try ordinalCellFromPayload(column, ordinal, payload, sparseEntryIsNull(parsed, entry_index));
+        return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, sparseEntryIsNull(parsed, entry_index), validate_payload);
     }
     if (!bitmapBit(parsed.present, ordinal)) return null;
     const payload = if (parsed.layout != null)
         try ordinalPayloadSliceChecked(parsed, column, ordinal)
     else
         ordinalPayloadSlice(parsed, columns, column, ordinal);
-    return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
+    return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal), validate_payload);
 }
 
 fn ordinalCellFromPayload(
@@ -1399,6 +1411,16 @@ fn ordinalCellFromPayload(
     ordinal: usize,
     payload: []const u8,
     is_null: bool,
+) !Cell {
+    return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, is_null, true);
+}
+
+fn ordinalCellFromPayloadWithValidation(
+    column: runtime_schema.RelationalColumn,
+    ordinal: usize,
+    payload: []const u8,
+    is_null: bool,
+    validate_payload: bool,
 ) !Cell {
     const value_type = columnValueType(column.column_type);
     const typed_value = if (is_null)
@@ -1415,6 +1437,11 @@ fn ordinalCellFromPayload(
         .value = typed_value,
     };
     if (!cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
+    // Consumers address f32 elements directly; retain this structural check
+    // even when semantic payload validation was done at the ingestion boundary.
+    if (!is_null and cell.is_dense_vector and payload.len % @sizeOf(f32) != 0)
+        return error.InvalidRelationalRow;
+    if (!validate_payload) return cell;
     if (!is_null and value_type == .bytes_val) {
         if (column.column_type == .dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);

@@ -72,6 +72,7 @@ pub const CompiledTableValidator = struct {
     schema: ParsedTableSchema,
     physical_fields: []impl.PhysicalFieldValidation,
     execution: impl.CompiledValidationPlan,
+    restore: impl.RelationalRestorePlan,
     owns_schema: bool,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
@@ -83,10 +84,13 @@ pub const CompiledTableValidator = struct {
     pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
         const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
         errdefer freePhysicalFieldValidations(alloc, physical_fields);
+        var restore = try impl.RelationalRestorePlan.init(alloc, schema, physical_fields);
+        errdefer restore.deinit(alloc);
         return .{
             .schema = schema,
             .physical_fields = physical_fields,
             .execution = try impl.CompiledValidationPlan.init(alloc, schema),
+            .restore = restore,
             .owns_schema = false,
         };
     }
@@ -99,6 +103,7 @@ pub const CompiledTableValidator = struct {
 
     pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
         self.execution.deinit(alloc);
+        self.restore.deinit(alloc);
         freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;
@@ -110,6 +115,22 @@ pub const CompiledTableValidator = struct {
 
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
+    }
+
+    /// The caller must first validate canonical bytes/hash against the runtime
+    /// layout. Its binding to this public schema must be verified before any
+    /// validated rows are published (archive finish checks staged restores).
+    pub fn validateRelationalRestoreFields(self: *const CompiledTableValidator, alloc: std.mem.Allocator, row: anytype) !void {
+        std.debug.assert(!self.restore.full_root);
+        for (self.restore.properties) |index| {
+            const property = self.schema.document_schemas[0].properties[index];
+            const ordinal = row.ordinalForName(property.name) orelse return error.InvalidBatchRequest;
+            const cell = (try row.findCell(ordinal)) orelse continue;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try row.materializeCellAlloc(arena.allocator(), cell);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+        }
     }
 };
 

@@ -2463,6 +2463,38 @@ const PreparedRowAllocator = struct {
     }
 };
 
+/// Address-stable request owner shared by batch and transaction preparation.
+/// Initialize in place: the guard points into this context's budget ledger.
+const RequestPreparationContext = struct {
+    budget: ?resource_manager_mod.BudgetedAllocator,
+    guard: PreparedRowAllocator,
+
+    fn init(self: *@This(), db: *DB) void {
+        self.budget = if (db.core.index_manager.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, db.alloc, 1)
+        else
+            null;
+        self.guard = .{
+            .child = if (self.budget) |*tracked| tracked.allocator() else db.alloc,
+            .io = db.backend_runtime.io() orelse std.Options.debug_io,
+        };
+    }
+
+    fn mapError(self: *@This(), err: anyerror) anyerror {
+        if (err == error.OutOfMemory) if (self.budget) |*tracked|
+            if (tracked.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.budget) |*tracked| {
+            std.debug.assert(tracked.live_bytes == 0);
+            tracked.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
 const PreparedRowEffects = struct {
     embedding_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
     graph_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
@@ -8377,15 +8409,32 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        // One budget spans transforms, provider memoization, optimistic retries
+        // and commit-side consumption. No request-owned allocation may outlive
+        // this context, including generated results moved into derived batches.
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        self.batchInternalWithPreparationAllocator(req, profile, opts, &preparation.guard) catch |err|
+            return preparation.mapError(err);
+    }
+
+    fn batchInternalWithPreparationAllocator(
+        self: *DB,
+        req: types.BatchRequest,
+        profile: ?*BatchProfile,
+        opts: BatchExecutionOptions,
+        allocator_guard: *PreparedRowAllocator,
+    ) anyerror!void {
         const max_prepared_generation_retries = 2;
         var retry_count: usize = 0;
         // Provider results are semantic request data, not schema/index-plan
         // data. Keep them across optimistic publication retries so catalog
         // churn cannot multiply expensive external work.
-        var generated_memo = GeneratedEmbeddingMemo.init(self.alloc);
+        var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
         defer generated_memo.deinit();
         while (true) {
-            self.batchInternalOnce(req, profile, opts, &generated_memo) catch |err| switch (err) {
+            self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retry_count >= max_prepared_generation_retries) return err;
                     retry_count += 1;
@@ -8395,36 +8444,6 @@ pub const DB = struct {
             };
             return;
         }
-    }
-
-    fn batchInternalOnce(
-        self: *DB,
-        req: types.BatchRequest,
-        profile: ?*BatchProfile,
-        opts: BatchExecutionOptions,
-        generated_memo: *GeneratedEmbeddingMemo,
-    ) anyerror!void {
-        // Actual arena pages, including retained rows and side effects, are
-        // charged across concurrent requests before allocation. Never wait for
-        // another preparer while retaining a partial batch: fail the admission
-        // cleanly, release every page, and let the caller retry with backoff.
-        var budget = if (self.core.index_manager.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
-        else
-            null;
-        defer if (budget) |*tracked| {
-            std.debug.assert(tracked.live_bytes == 0);
-            tracked.deinit();
-        };
-        var allocator_guard = PreparedRowAllocator{
-            .child = if (budget) |*tracked| tracked.allocator() else self.alloc,
-            .io = self.backend_runtime.io() orelse std.Options.debug_io,
-        };
-        self.batchInternalPrepared(req, profile, opts, generated_memo, &allocator_guard) catch |err| {
-            if (err == error.OutOfMemory) if (budget) |*tracked|
-                if (tracked.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
     }
 
     fn batchInternalPrepared(
@@ -8459,6 +8478,7 @@ pub const DB = struct {
             try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
         }
         const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else currentTimeNs();
+        const preparation_alloc = prepared_row_allocator.allocator();
 
         // Resolve request ordering and transforms before row preparation. A
         // transform that reads durable state carries an optimistic version
@@ -8466,21 +8486,23 @@ pub const DB = struct {
         // JSON and every derived artifact from a fresh base.
         const resolve_transforms_start_ns = monotonicTimeNs();
         var transform_snapshot = try self.captureTransformReadSnapshot(
+            preparation_alloc,
             types.BatchWrite,
             req.writes,
             req.deletes,
             req.transforms,
         );
-        defer transform_snapshot.deinit(self.alloc);
+        defer transform_snapshot.deinit(preparation_alloc);
         var effective_ops = try coalesceKeyValueRequest(
             self,
+            preparation_alloc,
             types.BatchWrite,
             req.writes,
             req.deletes,
             req.transforms,
             &transform_snapshot,
         );
-        defer effective_ops.deinit(self.alloc);
+        defer effective_ops.deinit(preparation_alloc);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
         if (req.reject_graph_transform_projections and
@@ -8491,11 +8513,11 @@ pub const DB = struct {
 
         const merge_effective_req_start_ns = monotonicTimeNs();
         var owned_effective_graph_writes: ?[]types.GraphEdgeWrite = null;
-        defer if (owned_effective_graph_writes) |owned| self.alloc.free(owned);
+        defer if (owned_effective_graph_writes) |owned| preparation_alloc.free(owned);
         const effective_graph_writes = if (effective_ops.graph_writes.items.len == 0)
             req.graph_writes
         else blk: {
-            const combined = try self.alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
+            const combined = try preparation_alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
             @memcpy(combined[0..req.graph_writes.len], req.graph_writes);
             @memcpy(combined[req.graph_writes.len..], effective_ops.graph_writes.items);
             owned_effective_graph_writes = combined;
@@ -8503,11 +8525,11 @@ pub const DB = struct {
         };
 
         var owned_effective_graph_deletes: ?[]types.GraphEdgeDelete = null;
-        defer if (owned_effective_graph_deletes) |owned| self.alloc.free(owned);
+        defer if (owned_effective_graph_deletes) |owned| preparation_alloc.free(owned);
         const effective_graph_deletes = if (effective_ops.graph_deletes.items.len == 0)
             req.graph_deletes
         else blk: {
-            const combined = try self.alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
+            const combined = try preparation_alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
             @memcpy(combined[0..req.graph_deletes.len], req.graph_deletes);
             @memcpy(combined[req.graph_deletes.len..], effective_ops.graph_deletes.items);
             owned_effective_graph_deletes = combined;
@@ -8537,7 +8559,6 @@ pub const DB = struct {
         // mutation is detected after admission by comparing pinned epochs.
         var request_schema_view = self.core.acquireSchemaView();
         defer if (request_schema_view) |*view| view.release();
-        const preparation_alloc = prepared_row_allocator.allocator();
         // Row side effects outlive speculative preparation but are consumed as
         // borrowed slices by the serialized commit. A batch arena turns their
         // many small keys/payloads into bump allocations and one release.
@@ -8551,18 +8572,18 @@ pub const DB = struct {
         var write_plan_snapshot: ?index_manager_mod.IndexManager.WritePlanSnapshotView = null;
         defer if (write_plan_snapshot) |*plan_snapshot| plan_snapshot.release();
         defer if (preprepared_rows) |rows| {
-            for (rows) |*maybe_row| if (maybe_row.*) |*row| row.deinit(self.alloc);
+            for (rows) |*maybe_row| if (maybe_row.*) |*row| row.deinit(preparation_alloc);
             preparation_alloc.free(rows);
         };
         defer if (preprepared_effects) |effects| {
             preparation_alloc.free(effects);
         };
-        defer if (preprepared_generated) |*generated| generated.deinit(self.alloc);
+        defer if (preprepared_generated) |*generated| generated.deinit(preparation_alloc);
         defer if (preprepared_generated_plan) |*plan| plan.deinit();
         if (request_schema_view) |view| if (view.storageMode() == .relational) {
             var stable_keys = std.StringHashMapUnmanaged(void).empty;
-            defer stable_keys.deinit(self.alloc);
-            try stable_keys.ensureTotalCapacity(self.alloc, std.math.cast(u32, effective_req.writes.len) orelse
+            defer stable_keys.deinit(preparation_alloc);
+            try stable_keys.ensureTotalCapacity(preparation_alloc, std.math.cast(u32, effective_req.writes.len) orelse
                 return error.InvalidBatchRequest);
             var eligible = true;
             for (effective_req.writes) |write| if (isMetadataKey(write.key)) {
@@ -8666,11 +8687,11 @@ pub const DB = struct {
                         }
                     }
                     if (requires_inline_generated) {
-                        const extracted_rows = try self.alloc.alloc(mapper.ExtractedWrite, rows.len);
-                        defer self.alloc.free(extracted_rows);
+                        const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
+                        defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
                         preprepared_generated_plan = try planGeneratedEnrichmentsForRows(
-                            self,
+                            preparation_alloc,
                             effective_req,
                             extracted_rows,
                             write_plan_snapshot.?.plan().*,
@@ -8678,11 +8699,12 @@ pub const DB = struct {
                     }
                 }
                 if (preprepared_generated_plan != null) {
-                    var extracted_rows = try self.alloc.alloc(mapper.ExtractedWrite, rows.len);
-                    defer self.alloc.free(extracted_rows);
+                    var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
+                    defer preparation_alloc.free(extracted_rows);
                     for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
                     preprepared_generated = try prepareGeneratedEnrichments(
                         self,
+                        preparation_alloc,
                         effective_req,
                         extracted_rows,
                         generatedPrecomputeModeForSyncLevel(req.sync_level),
@@ -8708,13 +8730,13 @@ pub const DB = struct {
         // the stream append. This also avoids holding the HA log mutex while
         // walking and encoding every document in a large request.
         var preencoded_ha_batch_payload: ?[]u8 = null;
-        defer if (preencoded_ha_batch_payload) |payload| self.alloc.free(payload);
+        defer if (preencoded_ha_batch_payload) |payload| preparation_alloc.free(payload);
         if (!opts.bypass_ha_write_gate) if (self.ha_async_batch_mirror) |mirror| {
-            preencoded_ha_batch_payload = ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, effective_req) catch |err| blk: {
-                // Best-effort asynchronous mirroring must not turn local
-                // allocator pressure into a pre-commit write rejection. Its
-                // existing post-commit path will retry encoding and account
-                // for a mirror failure if pressure persists.
+            preencoded_ha_batch_payload = ha_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, effective_req) catch |err| blk: {
+                if (err == error.OutOfMemory) return err;
+                // Non-resource encoding failures retain best-effort async
+                // behavior. Admission failures must never retry allocation
+                // uncharged after commit.
                 if (haMirrorSyncEnabled(mirror)) return err;
                 break :blk null;
             };
@@ -8724,31 +8746,31 @@ pub const DB = struct {
         // serialized section. These buffers are request-owned and contain no
         // mutable store state; allocating them while holding apply only extends
         // tail latency for every writer queued behind this batch.
-        const extracted = try self.alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
+        const extracted = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
         var extracted_initialized: usize = 0;
         defer {
             for (extracted[0..extracted_initialized]) |*item| item.deinit(self.alloc);
-            self.alloc.free(extracted);
+            preparation_alloc.free(extracted);
         }
-        const overwritten_flags = try self.alloc.alloc(bool, effective_req.writes.len);
-        defer self.alloc.free(overwritten_flags);
+        const overwritten_flags = try preparation_alloc.alloc(bool, effective_req.writes.len);
+        defer preparation_alloc.free(overwritten_flags);
         @memset(overwritten_flags, false);
-        const derived_changed_flags = try self.alloc.alloc(bool, effective_req.writes.len);
-        defer self.alloc.free(derived_changed_flags);
+        const derived_changed_flags = try preparation_alloc.alloc(bool, effective_req.writes.len);
+        defer preparation_alloc.free(derived_changed_flags);
         @memset(derived_changed_flags, true);
-        const overwrite_probe_keys = try self.alloc.alloc([]const u8, effective_req.writes.len);
-        defer self.alloc.free(overwrite_probe_keys);
-        const overwrite_probe_values = try self.alloc.alloc(?[]const u8, effective_req.writes.len);
-        defer self.alloc.free(overwrite_probe_values);
+        const overwrite_probe_keys = try preparation_alloc.alloc([]const u8, effective_req.writes.len);
+        defer preparation_alloc.free(overwrite_probe_keys);
+        const overwrite_probe_values = try preparation_alloc.alloc(?[]const u8, effective_req.writes.len);
+        defer preparation_alloc.free(overwrite_probe_values);
         var semantic_noop_store_keys = std.StringHashMapUnmanaged(void).empty;
-        defer semantic_noop_store_keys.deinit(self.alloc);
+        defer semantic_noop_store_keys.deinit(preparation_alloc);
         const can_elide_primary_noops = if (request_schema_view) |view|
             view.storageMode() == .document
         else
             true;
         if (can_elide_primary_noops) {
             try semantic_noop_store_keys.ensureTotalCapacity(
-                self.alloc,
+                preparation_alloc,
                 std.math.cast(u32, effective_req.writes.len) orelse return error.InvalidBatchRequest,
             );
         }
@@ -9345,11 +9367,11 @@ pub const DB = struct {
             self.core.hasGeneratedEnrichmentTargets();
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
-        defer precomputed_generated.deinit(self.alloc);
+        defer precomputed_generated.deinit(preparation_alloc);
         var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
         defer {
-            for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
-            remote_child_range_dispatches.deinit(self.alloc);
+            for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(preparation_alloc);
+            remote_child_range_dispatches.deinit(preparation_alloc);
         }
         var owned_child_range_outbox_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -9369,6 +9391,7 @@ pub const DB = struct {
             } else {
                 precomputed_generated = try prepareGeneratedEnrichments(
                     self,
+                    preparation_alloc,
                     effective_req,
                     extracted[0..extracted_initialized],
                     generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
@@ -9379,7 +9402,7 @@ pub const DB = struct {
             }
 
             if (opts.document_child_range_dispatcher != null) {
-                try partitionRemoteDocumentChildRangeGeneratedBatch(self, &precomputed_generated, &remote_child_range_dispatches);
+                try partitionRemoteDocumentChildRangeGeneratedBatch(self, preparation_alloc, &precomputed_generated, &remote_child_range_dispatches);
             }
 
             for (precomputed_generated.artifact_writes) |write| {
@@ -9417,7 +9440,7 @@ pub const DB = struct {
         defer sync_targets.deinit(self.alloc);
         var split_shadow_ticket: ?u64 = null;
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
-        defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
+        defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(preparation_alloc, materialized_batch);
         var materialized_deleted_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer materialized_deleted_artifact_keys.deinit(self.alloc);
         if (!use_thin_replay_fast_path) {
@@ -9555,23 +9578,25 @@ pub const DB = struct {
             )
         else blk: {
             materialized_derived_batch = try buildDerivedBatch(
-                self.alloc,
+                preparation_alloc,
                 effective_req,
                 extracted[0..extracted_initialized],
                 materialized_deleted_artifact_keys.items,
                 changed_graph_artifact_keys.items,
             );
-            for (materialized_derived_batch.?.overwritten_doc_keys) |key| self.alloc.free(@constCast(key));
-            if (materialized_derived_batch.?.overwritten_doc_keys.len > 0) self.alloc.free(materialized_derived_batch.?.overwritten_doc_keys);
-            materialized_derived_batch.?.overwritten_doc_keys = try buildOverwrittenDocKeys(self.alloc, effective_req.writes, overwritten_flags);
-            materialized_derived_batch.?.documents = try takeOwnedSlice(derived_types.DerivedDocument, self.alloc, materialized_derived_batch.?.documents, &precomputed_generated.documents);
-            materialized_derived_batch.?.dense_embeddings = try takeOwnedSlice(derived_types.DerivedDenseEmbeddingWrite, self.alloc, materialized_derived_batch.?.dense_embeddings, &precomputed_generated.dense_embeddings);
-            materialized_derived_batch.?.sparse_embeddings = try takeOwnedSlice(derived_types.DerivedSparseEmbeddingWrite, self.alloc, materialized_derived_batch.?.sparse_embeddings, &precomputed_generated.sparse_embeddings);
+            for (materialized_derived_batch.?.overwritten_doc_keys) |key| preparation_alloc.free(@constCast(key));
+            if (materialized_derived_batch.?.overwritten_doc_keys.len > 0) preparation_alloc.free(materialized_derived_batch.?.overwritten_doc_keys);
+            materialized_derived_batch.?.overwritten_doc_keys = &.{};
+            materialized_derived_batch.?.overwritten_doc_keys = try buildOverwrittenDocKeys(preparation_alloc, effective_req.writes, overwritten_flags);
+            materialized_derived_batch.?.documents = try takeOwnedSlice(derived_types.DerivedDocument, preparation_alloc, materialized_derived_batch.?.documents, &precomputed_generated.documents);
+            materialized_derived_batch.?.dense_embeddings = try takeOwnedSlice(derived_types.DerivedDenseEmbeddingWrite, preparation_alloc, materialized_derived_batch.?.dense_embeddings, &precomputed_generated.dense_embeddings);
+            materialized_derived_batch.?.sparse_embeddings = try takeOwnedSlice(derived_types.DerivedSparseEmbeddingWrite, preparation_alloc, materialized_derived_batch.?.sparse_embeddings, &precomputed_generated.sparse_embeddings);
             materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
             precomputed_generated.generated_enrichment_refs = &.{};
             materialized_derived_batch.?.sequence = sequence;
             const payload = try encodeChangeRecordPayload(&self.batchContext(), materialized_derived_batch.?, sequence);
-            try attachPreparedUpsertDocumentProjections(self.alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
+            errdefer self.alloc.free(payload);
+            try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
             const collect_sync_targets_start_ns = monotonicTimeNs();
             sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, materialized_derived_batch.?);
@@ -9747,10 +9772,8 @@ pub const DB = struct {
         if (opts.transaction_resolution) |resolution| if (!opts.bypass_ha_write_gate) {
             if (self.ha_async_batch_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
                 const payload = preencoded_ha_batch_payload orelse return error.HAMirrorUnavailable;
-                // Transfer the preencoded buffer to the committed outbox; its
-                // owner list now controls lifetime through the HA wait below.
-                try owned_store_values.append(self.alloc, payload);
-                preencoded_ha_batch_payload = null;
+                // The outbox borrows the request-owned buffer through commit
+                // and the HA wait; keep its original budgeted owner intact.
                 const key_array = transactions_mod.makeTransactionHABatchOutboxKey(resolution.txn_id);
                 const key = try self.alloc.dupe(u8, &key_array);
                 try owned_store_keys.append(self.alloc, key);
@@ -11220,29 +11243,30 @@ pub const DB = struct {
 
     fn captureTransformReadSnapshot(
         self: *DB,
+        alloc: Allocator,
         comptime T: type,
         writes: []const T,
         deletes: []const []const u8,
         transforms: []const types.DocumentTransform,
     ) !TransformReadSnapshot {
         var result = TransformReadSnapshot{};
-        errdefer result.deinit(self.alloc);
+        errdefer result.deinit(alloc);
         if (transforms.len == 0) return result;
 
         // Only transforms whose first base comes from storage need a read-set
         // predicate. Writes/deletes and an earlier transform establish an
         // entirely request-local base.
         var request_keys = std.StringHashMapUnmanaged(void).empty;
-        defer request_keys.deinit(self.alloc);
-        for (writes) |write| try request_keys.put(self.alloc, write.key, {});
-        for (deletes) |key| try request_keys.put(self.alloc, key, {});
+        defer request_keys.deinit(alloc);
+        for (writes) |write| try request_keys.put(alloc, write.key, {});
+        for (deletes) |key| try request_keys.put(alloc, key, {});
 
         var keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer keys.deinit(self.alloc);
+        defer keys.deinit(alloc);
         for (transforms) |transform| {
             if (request_keys.contains(transform.key)) continue;
-            try request_keys.put(self.alloc, transform.key, {});
-            try keys.append(self.alloc, transform.key);
+            try request_keys.put(alloc, transform.key, {});
+            try keys.append(alloc, transform.key);
         }
         if (keys.items.len == 0) return result;
 
@@ -11253,24 +11277,24 @@ pub const DB = struct {
         defer read_txn.abort();
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
-        const entries = try self.alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
+        const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
         var initialized: usize = 0;
         errdefer {
-            for (entries[0..initialized]) |entry| if (entry.value) |value| self.alloc.free(value);
-            self.alloc.free(entries);
+            for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
+            alloc.free(entries);
         }
-        try result.positions.ensureTotalCapacity(self.alloc, std.math.cast(u32, keys.items.len) orelse
+        try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
             return error.InvalidBatchRequest);
         for (keys.items, 0..) |key, index| {
-            const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, self.alloc, key, schema_view);
-            defer self.alloc.free(store_key);
+            const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
+            defer alloc.free(store_key);
             const raw = read_txn.get(store_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             const value = if (raw) |stored| blk: {
                 if (!internal_keys.isRelationalRowKey(store_key))
-                    break :blk try self.alloc.dupe(u8, stored);
+                    break :blk try alloc.dupe(u8, stored);
                 const version = try relational_store.rowSchemaVersion(stored);
                 if (schema_view) |view| if (view.version() == version) {
                     const row = if (self.core.store.valuesAreAuthenticated())
@@ -11285,7 +11309,7 @@ pub const DB = struct {
                             view.tableSchema().*,
                             view.physicalLayout(),
                         );
-                    break :blk try row.reconstructValueAlloc(self.alloc);
+                    break :blk try row.reconstructValueAlloc(alloc);
                 };
                 var historical = (try self.core.acquireSchemaVersionView(version)) orelse
                     return error.UnknownSchemaVersion;
@@ -11302,14 +11326,14 @@ pub const DB = struct {
                         historical.tableSchema().*,
                         historical.physicalLayout(),
                     );
-                break :blk try row.reconstructValueAlloc(self.alloc);
+                break :blk try row.reconstructValueAlloc(alloc);
             } else null;
-            errdefer if (value) |owned| self.alloc.free(owned);
+            errdefer if (value) |owned| alloc.free(owned);
             const expected_version = if (internal_keys.isInternalUserKey(key))
                 0
             else blk: {
-                const timestamp_key = try makeTimestampKey(self.alloc, key);
-                defer self.alloc.free(timestamp_key);
+                const timestamp_key = try makeTimestampKey(alloc, key);
+                defer alloc.free(timestamp_key);
                 const timestamp = read_txn.get(timestamp_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
@@ -11370,14 +11394,14 @@ pub const DB = struct {
     }
 
     fn appendGraphTransformWrite(
-        self: *DB,
+        alloc: Allocator,
         writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
         deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
         source: []const u8,
         path: transform_mod.GraphProjectionPath,
         value_json: []const u8,
     ) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidGraphEdges;
 
@@ -11398,18 +11422,18 @@ pub const DB = struct {
             // array values before they become durable artifacts rather than
             // allowing a later response to violate the object contract.
             if (metadata != .object) return error.InvalidGraphEdges;
-            break :blk try std.json.Stringify.valueAlloc(self.alloc, metadata, .{});
+            break :blk try std.json.Stringify.valueAlloc(alloc, metadata, .{});
         } else "";
-        errdefer if (metadata_json.len > 0) self.alloc.free(@constCast(metadata_json));
+        errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
 
-        const index_name = try self.alloc.dupe(u8, path.index_name);
-        errdefer self.alloc.free(index_name);
-        const owned_source = try self.alloc.dupe(u8, source);
-        errdefer self.alloc.free(owned_source);
-        const target = try self.alloc.dupe(u8, target_value.string);
-        errdefer self.alloc.free(target);
-        const edge_type = try self.alloc.dupe(u8, path.edge_type);
-        errdefer self.alloc.free(edge_type);
+        const index_name = try alloc.dupe(u8, path.index_name);
+        errdefer alloc.free(index_name);
+        const owned_source = try alloc.dupe(u8, source);
+        errdefer alloc.free(owned_source);
+        const target = try alloc.dupe(u8, target_value.string);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, path.edge_type);
+        errdefer alloc.free(edge_type);
 
         // Transform operations are ordered. Since the storage batch carries
         // graph writes and deletes in separate slices (deletes execute first),
@@ -11426,10 +11450,10 @@ pub const DB = struct {
                 .edge_type = edge_type,
             })) continue;
             var removed = deletes.orderedRemove(delete_index);
-            deinitOwnedGraphEdgeDelete(self.alloc, &removed);
+            deinitOwnedGraphEdgeDelete(alloc, &removed);
         }
 
-        try writes.append(self.alloc, .{
+        try writes.append(alloc, .{
             .index_name = index_name,
             .source = owned_source,
             .target = target,
@@ -11440,27 +11464,27 @@ pub const DB = struct {
     }
 
     fn appendGraphTransformDelete(
-        self: *DB,
+        alloc: Allocator,
         writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
         deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
         source: []const u8,
         path: transform_mod.GraphProjectionPath,
         value_json: []const u8,
     ) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidGraphEdges;
         const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
         if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
 
-        const index_name = try self.alloc.dupe(u8, path.index_name);
-        errdefer self.alloc.free(index_name);
-        const owned_source = try self.alloc.dupe(u8, source);
-        errdefer self.alloc.free(owned_source);
-        const target = try self.alloc.dupe(u8, target_value.string);
-        errdefer self.alloc.free(target);
-        const edge_type = try self.alloc.dupe(u8, path.edge_type);
-        errdefer self.alloc.free(edge_type);
+        const index_name = try alloc.dupe(u8, path.index_name);
+        errdefer alloc.free(index_name);
+        const owned_source = try alloc.dupe(u8, source);
+        errdefer alloc.free(owned_source);
+        const target = try alloc.dupe(u8, target_value.string);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, path.edge_type);
+        errdefer alloc.free(edge_type);
 
         // A later pull overrides every earlier projected write for the same
         // physical relationship before the split graph mutation batch is built.
@@ -11475,9 +11499,9 @@ pub const DB = struct {
                 .edge_type = edge_type,
             })) continue;
             var removed = writes.orderedRemove(write_index);
-            deinitOwnedGraphEdgeWrite(self.alloc, &removed);
+            deinitOwnedGraphEdgeWrite(alloc, &removed);
         }
-        try deletes.append(self.alloc, .{
+        try deletes.append(alloc, .{
             .index_name = index_name,
             .source = owned_source,
             .target = target,
@@ -11730,6 +11754,7 @@ pub const DB = struct {
             entry.key = try alloc.dupe(u8, key);
             entry.owned_key = true;
         }
+        if (entry.owned_value) alloc.free(@constCast(entry.value.?));
         entry.value = value;
         entry.kind = .write;
         entry.owned_value = true;
@@ -11737,6 +11762,7 @@ pub const DB = struct {
 
     fn coalesceKeyValueRequest(
         self: *DB,
+        alloc: Allocator,
         comptime T: type,
         writes: []const T,
         deletes: []const []const u8,
@@ -11745,25 +11771,26 @@ pub const DB = struct {
     ) !CoalescedKeyValueRequest(T) {
         var result = CoalescedKeyValueRequest(T){};
         var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
-        defer order.deinit(self.alloc);
-        var entries_transferred = false;
+        defer order.deinit(alloc);
         errdefer {
-            if (!entries_transferred) {
-                result.entries = order.items;
-                order.items = &.{};
-                order.capacity = 0;
+            // Before toOwnedSlice, the list still owns its full capacity.
+            // Release fields here and let order.deinit free that exact backing
+            // allocation; never pass the shorter items slice to alloc.free.
+            for (order.items) |entry| {
+                if (entry.owned_key) alloc.free(@constCast(entry.key));
+                if (entry.owned_value) alloc.free(@constCast(entry.value.?));
             }
-            result.deinit(self.alloc);
+            result.deinit(alloc);
         }
 
         var positions = std.StringHashMapUnmanaged(usize){};
-        defer positions.deinit(self.alloc);
+        defer positions.deinit(alloc);
 
         for (writes) |write| {
-            const gop = try positions.getOrPut(self.alloc, write.key);
+            const gop = try positions.getOrPut(alloc, write.key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = order.items.len;
-                try order.append(self.alloc, .{
+                try order.append(alloc, .{
                     .key = write.key,
                     .value = write.value,
                     .kind = .write,
@@ -11771,23 +11798,23 @@ pub const DB = struct {
                 continue;
             }
             const entry = &order.items[gop.value_ptr.*];
-            if (entry.owned_value) self.alloc.free(@constCast(entry.value.?));
-            if (entry.owned_key) self.alloc.free(@constCast(entry.key));
+            if (entry.owned_value) alloc.free(@constCast(entry.value.?));
+            if (entry.owned_key) alloc.free(@constCast(entry.key));
             setCoalescedEntryToBorrowedWrite(T, entry, write);
         }
 
         for (deletes) |key| {
-            const gop = try positions.getOrPut(self.alloc, key);
+            const gop = try positions.getOrPut(alloc, key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = order.items.len;
-                try order.append(self.alloc, .{
+                try order.append(alloc, .{
                     .key = key,
                     .kind = .delete,
                 });
                 continue;
             }
             const entry = &order.items[gop.value_ptr.*];
-            if (entry.owned_value) self.alloc.free(@constCast(entry.value.?));
+            if (entry.owned_value) alloc.free(@constCast(entry.value.?));
             entry.owned_value = false;
             resetCoalescedEntryToDelete(T, entry);
         }
@@ -11800,20 +11827,20 @@ pub const DB = struct {
                     break :blk if (entry.kind == .write) entry.value.? else null;
                 }
                 if (transform_snapshot) |read_snapshot| break :blk read_snapshot.valueFor(transform.key);
-                break :blk try self.get(self.alloc, transform.key);
+                break :blk try self.get(alloc, transform.key);
             };
             defer if (maybe_index == null and transform_snapshot == null) {
-                if (base_json) |body| self.alloc.free(body);
+                if (base_json) |body| alloc.free(body);
             };
 
             var document_operations = std.ArrayListUnmanaged(types.TransformOp).empty;
-            defer document_operations.deinit(self.alloc);
+            defer document_operations.deinit(alloc);
             var graph_operations = std.ArrayListUnmanaged(struct {
                 op: types.TransformOpType,
                 path: transform_mod.GraphProjectionPath,
                 value_json: []const u8,
             }).empty;
-            defer graph_operations.deinit(self.alloc);
+            defer graph_operations.deinit(alloc);
             for (transform.operations) |operation| {
                 const graph_path = try transform_mod.graphProjectionPath(operation.path);
                 if (graph_path) |path| {
@@ -11821,13 +11848,13 @@ pub const DB = struct {
                         .push, .pull, .add_to_set => {},
                         else => return error.UnsupportedTransformOperation,
                     }
-                    try graph_operations.append(self.alloc, .{
+                    try graph_operations.append(alloc, .{
                         .op = operation.op,
                         .path = path,
                         .value_json = operation.value_json orelse return error.InvalidArgument,
                     });
                 } else {
-                    try document_operations.append(self.alloc, operation);
+                    try document_operations.append(alloc, operation);
                 }
             }
 
@@ -11835,14 +11862,16 @@ pub const DB = struct {
             const graph_deletes_start = result.graph_deletes.items.len;
             for (graph_operations.items) |operation| {
                 switch (operation.op) {
-                    .push, .add_to_set => try self.appendGraphTransformWrite(
+                    .push, .add_to_set => try appendGraphTransformWrite(
+                        alloc,
                         &result.graph_writes,
                         &result.graph_deletes,
                         transform.key,
                         operation.path,
                         operation.value_json,
                     ),
-                    .pull => try self.appendGraphTransformDelete(
+                    .pull => try appendGraphTransformDelete(
+                        alloc,
                         &result.graph_writes,
                         &result.graph_deletes,
                         transform.key,
@@ -11864,13 +11893,13 @@ pub const DB = struct {
             // errors independent of state. Graph operands were validated while
             // constructing their pending deltas above.
             if (base_json == null and !transform.upsert) {
-                try transform_mod.validateDocumentTransform(self.alloc, document_transform);
+                try transform_mod.validateDocumentTransform(alloc, document_transform);
                 for (result.graph_writes.items[graph_writes_start..]) |*write| {
-                    deinitOwnedGraphEdgeWrite(self.alloc, write);
+                    deinitOwnedGraphEdgeWrite(alloc, write);
                 }
                 result.graph_writes.shrinkRetainingCapacity(graph_writes_start);
                 for (result.graph_deletes.items[graph_deletes_start..]) |*delete| {
-                    deinitOwnedGraphEdgeDelete(self.alloc, delete);
+                    deinitOwnedGraphEdgeDelete(alloc, delete);
                 }
                 result.graph_deletes.shrinkRetainingCapacity(graph_deletes_start);
                 continue;
@@ -11881,17 +11910,19 @@ pub const DB = struct {
             // while applying the projected edge as a delta. The mapper sees
             // the unchanged stripped document and therefore does not clear
             // the graph generation.
-            const resolved = try transform_mod.resolveDocumentTransform(self.alloc, base_json, document_transform);
+            const resolved = try transform_mod.resolveDocumentTransform(alloc, base_json, document_transform);
 
             const resolved_document = resolved orelse continue;
             var resolved_document_owned = true;
-            defer if (resolved_document_owned) self.alloc.free(resolved_document);
+            defer if (resolved_document_owned) alloc.free(resolved_document);
 
-            const gop = try positions.getOrPut(self.alloc, transform.key);
+            const gop = try positions.getOrPut(alloc, transform.key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = order.items.len;
-                try order.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, transform.key),
+                const owned_key = try alloc.dupe(u8, transform.key);
+                errdefer alloc.free(owned_key);
+                try order.append(alloc, .{
+                    .key = owned_key,
                     .value = resolved_document,
                     .kind = .write,
                     .owned_key = true,
@@ -11902,8 +11933,7 @@ pub const DB = struct {
             }
 
             const entry = &order.items[gop.value_ptr.*];
-            if (entry.owned_value) self.alloc.free(@constCast(entry.value.?));
-            try setCoalescedEntryToOwnedWrite(T, self.alloc, entry, transform.key, resolved_document);
+            try setCoalescedEntryToOwnedWrite(T, alloc, entry, transform.key, resolved_document);
             resolved_document_owned = false;
         }
 
@@ -11916,11 +11946,10 @@ pub const DB = struct {
             }
         }
 
-        const final_entries = try order.toOwnedSlice(self.alloc);
+        const final_entries = try order.toOwnedSlice(alloc);
         result.entries = final_entries;
-        entries_transferred = true;
-        if (write_count > 0) result.writes = try self.alloc.alloc(T, write_count);
-        if (delete_count > 0) result.deletes = try self.alloc.alloc([]const u8, delete_count);
+        if (write_count > 0) result.writes = try alloc.alloc(T, write_count);
+        if (delete_count > 0) result.deletes = try alloc.alloc([]const u8, delete_count);
 
         var write_index: usize = 0;
         var delete_index: usize = 0;
@@ -22864,16 +22893,19 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         raft_entry: ?RaftAppliedEntryIdentity,
     ) !void {
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, raft_entry) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator()) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
                     continue;
                 },
-                else => return err,
+                else => return preparation.mapError(err),
             };
             return;
         }
@@ -22884,27 +22916,30 @@ pub const DB = struct {
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         raft_entry: ?RaftAppliedEntryIdentity,
+        preparation_alloc: Allocator,
     ) !void {
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
         // validates both that read set and the immutable schema epoch.
         var transform_snapshot = try self.captureTransformReadSnapshot(
+            preparation_alloc,
             types.TransactionWrite,
             req.writes,
             req.deletes,
             req.transforms,
         );
-        defer transform_snapshot.deinit(self.alloc);
+        defer transform_snapshot.deinit(preparation_alloc);
 
         var effective_ops = try coalesceKeyValueRequest(
             self,
+            preparation_alloc,
             types.TransactionWrite,
             req.writes,
             req.deletes,
             req.transforms,
             &transform_snapshot,
         );
-        defer effective_ops.deinit(self.alloc);
+        defer effective_ops.deinit(preparation_alloc);
         // Graph projections are maintained as artifact deltas, while the
         // transaction intent format currently carries only primary key/value
         // rows. Refuse this combination rather than acknowledging a transform
@@ -22913,39 +22948,39 @@ pub const DB = struct {
             return error.UnsupportedTransformOperation;
 
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
-        defer intents.deinit(self.alloc);
+        defer intents.deinit(preparation_alloc);
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
-        defer predicates.deinit(self.alloc);
+        defer predicates.deinit(preparation_alloc);
 
         for (effective_ops.writes) |write| {
-            try intents.append(self.alloc, .{
+            try intents.append(preparation_alloc, .{
                 .key = write.key,
                 .value = write.value,
             });
         }
         for (effective_ops.deletes) |key| {
-            try intents.append(self.alloc, .{
+            try intents.append(preparation_alloc, .{
                 .key = key,
                 .value = null,
             });
         }
         for (req.predicates) |predicate| {
-            try predicates.append(self.alloc, .{
+            try predicates.append(preparation_alloc, .{
                 .key = predicate.key,
                 .expected_version = predicate.expected_version,
             });
         }
 
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer identity_upsert_keys.deinit(self.alloc);
+        defer identity_upsert_keys.deinit(preparation_alloc);
         for (intents.items) |intent| {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
-            try identity_upsert_keys.append(self.alloc, intent.key);
+            try identity_upsert_keys.append(preparation_alloc, intent.key);
         }
 
         var prepared_schema_view = self.core.acquireSchemaView();
         defer if (prepared_schema_view) |*view| view.release();
-        try self.validateRelationalWritesWithSchemaView(effective_ops.writes, prepared_schema_view);
+        try validateRelationalWritesWithSchemaView(preparation_alloc, effective_ops.writes, prepared_schema_view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -22959,7 +22994,7 @@ pub const DB = struct {
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         if (raft_entry) |identity| {
-            switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
                 .apply => {},
             }
@@ -22994,11 +23029,11 @@ pub const DB = struct {
     fn validateRelationalWritesLocked(self: *DB, writes: anytype) !void {
         var schema_view = self.core.acquireSchemaView();
         defer if (schema_view) |*view| view.release();
-        return try self.validateRelationalWritesWithSchemaView(writes, schema_view);
+        return try validateRelationalWritesWithSchemaView(self.alloc, writes, schema_view);
     }
 
     fn validateRelationalWritesWithSchemaView(
-        self: *DB,
+        alloc: Allocator,
         writes: anytype,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
@@ -23008,17 +23043,17 @@ pub const DB = struct {
             var metadata_count: usize = 0;
             for (writes) |write| metadata_count += @intFromBool(isMetadataKey(write.key));
             if (metadata_count == 0) {
-                try validator.validateWrites(self.alloc, writes);
+                try validator.validateWrites(alloc, writes);
                 return;
             }
             var document_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-            defer document_writes.deinit(self.alloc);
-            try document_writes.ensureTotalCapacity(self.alloc, writes.len - metadata_count);
+            defer document_writes.deinit(alloc);
+            try document_writes.ensureTotalCapacity(alloc, writes.len - metadata_count);
             for (writes) |write| {
                 if (isMetadataKey(write.key)) continue;
                 document_writes.appendAssumeCapacity(.{ .key = write.key, .value = write.value });
             }
-            try validator.validateWrites(self.alloc, document_writes.items);
+            try validator.validateWrites(alloc, document_writes.items);
             return;
         }
 
@@ -23026,8 +23061,8 @@ pub const DB = struct {
         // Still validate through the sole schema-bound AROW v2 encoder.
         for (writes) |write| {
             if (isMetadataKey(write.key)) continue;
-            const encoded = try relational_store.encodeValueForSchemaAlloc(self.alloc, write.value, view.tableSchema().*);
-            self.alloc.free(encoded);
+            const encoded = try relational_store.encodeValueForSchemaAlloc(alloc, write.value, view.tableSchema().*);
+            alloc.free(encoded);
         }
     }
 
@@ -40991,7 +41026,7 @@ fn extractAssetSourceValue(
 ) !?[]u8 {
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         errdefer alloc.free(rendered);
@@ -42668,7 +42703,7 @@ fn computeDenseRequestImpl(
 
     const source_text = if (request.source_template.len > 0)
         renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
     else
@@ -42690,18 +42725,19 @@ fn computeDenseRequestImpl(
     var uncached_vector: ?[]f32 = null;
     defer if (uncached_vector) |owned| alloc.free(owned);
     const vector: []const f32 = if (memo) |cache_memo|
-        cache_memo.dense.get(memo_key) orelse try cache_memo.adoptDense(
-            memo_key,
-            try enrichment_runtime_mod.embedDenseTracked(
+        cache_memo.dense.get(memo_key) orelse blk: {
+            const computed = try enrichment_runtime_mod.embedDenseTracked(
                 runtime,
                 consumer_indexes,
-                alloc,
+                cache_memo.alloc,
                 dense_embedder,
                 embedding_name,
                 source_text.?,
                 request.expected_dims,
-            ),
-        )
+            );
+            errdefer cache_memo.alloc.free(computed);
+            break :blk try cache_memo.adoptDense(memo_key, computed);
+        }
     else blk: {
         uncached_vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, source_text.?, request.expected_dims);
         break :blk uncached_vector.?;
@@ -42848,7 +42884,7 @@ fn computeSparseRequestDerived(
 
     const source_text = if (request.source_template.len > 0)
         renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
     else
@@ -42871,7 +42907,8 @@ fn computeSparseRequestDerived(
     defer if (uncached_sparse) |*owned| owned.deinit(alloc);
     const sparse = if (memo) |cache_memo|
         cache_memo.sparse.get(memo_key) orelse blk: {
-            const computed = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, alloc, sparse_embedder, embedding_name, source_text.?);
+            var computed = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, cache_memo.alloc, sparse_embedder, embedding_name, source_text.?);
+            errdefer computed.deinit(cache_memo.alloc);
             break :blk try cache_memo.adoptSparse(memo_key, computed);
         }
     else blk: {
@@ -42998,6 +43035,7 @@ fn appendPrecomputedCoverageCandidate(
 
 fn appendPrecomputedEmbeddingCoverageOutcomes(
     db: *DB,
+    alloc: Allocator,
     out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: []const types.BatchWrite,
@@ -43008,13 +43046,13 @@ fn appendPrecomputedEmbeddingCoverageOutcomes(
         .asset, .chunk_text => return true,
     };
 
-    const outcome = try precomputedEmbeddingCoverageOutcome(db, request, artifact_writes, produced) orelse return false;
+    const outcome = try precomputedEmbeddingCoverageOutcome(db, alloc, request, artifact_writes, produced) orelse return false;
     for (consumer_indexes) |index_name| {
-        const owned_index_name = try db.alloc.dupe(u8, index_name);
-        errdefer db.alloc.free(owned_index_name);
-        const owned_doc_key = try db.alloc.dupe(u8, request.doc_key);
-        errdefer db.alloc.free(owned_doc_key);
-        try out.append(db.alloc, .{
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index_name);
+        const owned_doc_key = try alloc.dupe(u8, request.doc_key);
+        errdefer alloc.free(owned_doc_key);
+        try out.append(alloc, .{
             .index_name = owned_index_name,
             .doc_key = owned_doc_key,
             .outcome = outcome,
@@ -43028,6 +43066,7 @@ fn appendPrecomputedEmbeddingCoverageOutcomes(
 /// upstream manifest proves intentional no-output or terminal failure.
 fn precomputedEmbeddingCoverageOutcome(
     db: *DB,
+    alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: []const types.BatchWrite,
     produced: bool,
@@ -43039,15 +43078,15 @@ fn precomputedEmbeddingCoverageOutcome(
         request.upstream_artifact_name.len == 0) return .skipped;
 
     const manifest_key = try internal_keys.artifactNamedPrefixAlloc(
-        db.alloc,
+        alloc,
         request.doc_key,
         "asset",
         request.upstream_artifact_name,
     );
-    defer db.alloc.free(manifest_key);
+    defer alloc.free(manifest_key);
     var manifest: ?[]const u8 = null;
     var owned_manifest: ?[]u8 = null;
-    defer if (owned_manifest) |value| db.alloc.free(value);
+    defer if (owned_manifest) |value| alloc.free(value);
     var i = artifact_writes.len;
     while (i > 0) {
         i -= 1;
@@ -43058,13 +43097,13 @@ fn precomputedEmbeddingCoverageOutcome(
         }
     }
     if (manifest == null) {
-        owned_manifest = db.core.store.get(db.alloc, manifest_key) catch |err| switch (err) {
+        owned_manifest = db.core.store.get(alloc, manifest_key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
         manifest = owned_manifest.?;
     }
-    return if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(db.alloc, manifest.?))
+    return if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest.?))
         .terminal_failed
     else
         .skipped;
@@ -43083,26 +43122,26 @@ const GeneratedBatchWritePlan = struct {
 };
 
 fn planGeneratedEnrichmentsForRows(
-    self: *DB,
+    alloc: Allocator,
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     write_plan: index_manager_mod.IndexManager.WritePlanSnapshot,
 ) !GeneratedBatchWritePlan {
     if (req.writes.len != extracted.len) return error.InvalidArgument;
-    const rows = try self.alloc.alloc(
+    const rows = try alloc.alloc(
         index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
         req.writes.len,
     );
-    var plan = GeneratedBatchWritePlan{ .alloc = self.alloc, .rows = rows };
+    var plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = rows };
     errdefer plan.deinit();
     for (req.writes, extracted) |write, row| {
         if (row.cleaned_value == null) {
-            rows[plan.initialized] = .{ .alloc = self.alloc, .requests = &.{} };
+            rows[plan.initialized] = .{ .alloc = alloc, .requests = &.{} };
             plan.initialized += 1;
             continue;
         }
         rows[plan.initialized] = try write_plan.planGeneratedEnrichmentsForRowBorrowed(
-            self.alloc,
+            alloc,
             write.key,
             row,
         );
@@ -43134,23 +43173,23 @@ fn flushGeneratedDenseMemoJobs(
     jobs: *std.ArrayListUnmanaged(GeneratedDenseMemoJob),
 ) !void {
     if (jobs.items.len == 0) return;
-    defer clearGeneratedDenseMemoJobs(self.alloc, jobs);
+    defer clearGeneratedDenseMemoJobs(memo.alloc, jobs);
     const runtime = self.enrichment_runtime orelse return;
     const embedder = runtime.config.dense_embedder orelse return;
-    const texts = try self.alloc.alloc([]const u8, jobs.items.len);
-    defer self.alloc.free(texts);
+    const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
+    defer memo.alloc.free(texts);
     for (jobs.items, texts) |job, *text| text.* = job.text;
     const first = jobs.items[0].request;
     const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(
         runtime,
         first.consumer_indexes,
-        self.alloc,
+        memo.alloc,
         embedder,
         requestEmbeddingName(first),
         texts,
         first.expected_dims,
     );
-    defer embedder_mod.freeDenseEmbeddingBatch(self.alloc, vectors);
+    defer embedder_mod.freeDenseEmbeddingBatch(memo.alloc, vectors);
     for (jobs.items, vectors) |job, vector| try memo.putDenseCopy(job.key, vector);
 }
 
@@ -43169,11 +43208,11 @@ fn prewarmGeneratedDenseMemo(
     const embedder = runtime.config.dense_embedder orelse return;
     var jobs = std.ArrayListUnmanaged(GeneratedDenseMemoJob).empty;
     defer {
-        clearGeneratedDenseMemoJobs(self.alloc, &jobs);
-        jobs.deinit(self.alloc);
+        clearGeneratedDenseMemoJobs(memo.alloc, &jobs);
+        jobs.deinit(memo.alloc);
     }
     var pending = std.AutoHashMapUnmanaged(GeneratedEmbeddingMemo.Key, void).empty;
-    defer pending.deinit(self.alloc);
+    defer pending.deinit(memo.alloc);
     var batch_bytes: usize = 0;
     const max_items = generatedEmbedBatchItems();
     const max_bytes = generatedEmbedBatchBytes();
@@ -43185,19 +43224,19 @@ fn prewarmGeneratedDenseMemo(
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
             if (request.source_template.len > 0 and embedder.supportsParts()) continue;
             const source_text = if (request.source_template.len > 0)
-                renderSourceTemplateText(self.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                    error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
+                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
-                try extractStringField(self.alloc, cleaned, request.source_field);
+                try extractStringField(memo.alloc, cleaned, request.source_field);
             const text = source_text orelse continue;
             if (text.len == 0) {
-                self.alloc.free(text);
+                memo.alloc.free(text);
                 continue;
             }
             var text_owned = true;
-            errdefer if (text_owned) self.alloc.free(text);
+            errdefer if (text_owned) memo.alloc.free(text);
             const key_value = GeneratedEmbeddingMemo.key(
                 .dense_embedding,
                 requestEmbeddingName(request),
@@ -43207,7 +43246,7 @@ fn prewarmGeneratedDenseMemo(
                 text,
             );
             if (memo.dense.contains(key_value) or pending.contains(key_value)) {
-                self.alloc.free(text);
+                memo.alloc.free(text);
                 text_owned = false;
                 continue;
             }
@@ -43226,8 +43265,8 @@ fn prewarmGeneratedDenseMemo(
                 pending.clearRetainingCapacity();
                 batch_bytes = 0;
             }
-            try pending.put(self.alloc, key_value, {});
-            try jobs.append(self.alloc, .{ .key = key_value, .text = text, .request = request });
+            try pending.put(memo.alloc, key_value, {});
+            try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
             text_owned = false;
             batch_bytes += text.len;
             if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -43257,22 +43296,22 @@ fn flushGeneratedSparseMemoJobs(
     jobs: *std.ArrayListUnmanaged(GeneratedSparseMemoJob),
 ) !void {
     if (jobs.items.len == 0) return;
-    defer clearGeneratedSparseMemoJobs(self.alloc, jobs);
+    defer clearGeneratedSparseMemoJobs(memo.alloc, jobs);
     const runtime = self.enrichment_runtime orelse return;
     const embedder = runtime.config.sparse_embedder orelse return;
-    const texts = try self.alloc.alloc([]const u8, jobs.items.len);
-    defer self.alloc.free(texts);
+    const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
+    defer memo.alloc.free(texts);
     for (jobs.items, texts) |job, *text| text.* = job.text;
     const first = jobs.items[0].request;
     const vectors = try enrichment_runtime_mod.embedSparseBatchTracked(
         runtime,
         first.consumer_indexes,
-        self.alloc,
+        memo.alloc,
         embedder,
         requestEmbeddingName(first),
         texts,
     );
-    defer embedder_mod.freeSparseEmbeddingBatch(self.alloc, vectors);
+    defer embedder_mod.freeSparseEmbeddingBatch(memo.alloc, vectors);
     for (jobs.items, vectors) |job, vector| try memo.putSparseCopy(job.key, vector);
 }
 
@@ -43287,11 +43326,11 @@ fn prewarmGeneratedSparseMemo(
     if (self.enrichment_runtime == null or self.enrichment_runtime.?.config.sparse_embedder == null) return;
     var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
     defer {
-        clearGeneratedSparseMemoJobs(self.alloc, &jobs);
-        jobs.deinit(self.alloc);
+        clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
+        jobs.deinit(memo.alloc);
     }
     var pending = std.AutoHashMapUnmanaged(GeneratedEmbeddingMemo.Key, void).empty;
-    defer pending.deinit(self.alloc);
+    defer pending.deinit(memo.alloc);
     var batch_bytes: usize = 0;
     const max_items = generatedEmbedBatchItems();
     const max_bytes = generatedEmbedBatchBytes();
@@ -43302,19 +43341,19 @@ fn prewarmGeneratedSparseMemo(
             if (request.kind != .sparse_embedding or request.input_kind != .document) continue;
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
             const source_text = if (request.source_template.len > 0)
-                renderSourceTemplateText(self.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                    error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
+                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
-                try extractStringField(self.alloc, cleaned, request.source_field);
+                try extractStringField(memo.alloc, cleaned, request.source_field);
             const text = source_text orelse continue;
             if (text.len == 0) {
-                self.alloc.free(text);
+                memo.alloc.free(text);
                 continue;
             }
             var text_owned = true;
-            errdefer if (text_owned) self.alloc.free(text);
+            errdefer if (text_owned) memo.alloc.free(text);
             const key_value = GeneratedEmbeddingMemo.key(
                 .sparse_embedding,
                 requestEmbeddingName(request),
@@ -43324,7 +43363,7 @@ fn prewarmGeneratedSparseMemo(
                 text,
             );
             if (memo.sparse.contains(key_value) or pending.contains(key_value)) {
-                self.alloc.free(text);
+                memo.alloc.free(text);
                 text_owned = false;
                 continue;
             }
@@ -43342,8 +43381,8 @@ fn prewarmGeneratedSparseMemo(
                 pending.clearRetainingCapacity();
                 batch_bytes = 0;
             }
-            try pending.put(self.alloc, key_value, {});
-            try jobs.append(self.alloc, .{ .key = key_value, .text = text, .request = request });
+            try pending.put(memo.alloc, key_value, {});
+            try jobs.append(memo.alloc, .{ .key = key_value, .text = text, .request = request });
             text_owned = false;
             batch_bytes += text.len;
             if (jobs.items.len >= max_items or batch_bytes >= max_bytes) {
@@ -43358,6 +43397,7 @@ fn prewarmGeneratedSparseMemo(
 
 fn prepareGeneratedEnrichments(
     self: *DB,
+    alloc: Allocator,
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     precompute_mode: GeneratedPrecomputeMode,
@@ -43380,54 +43420,54 @@ fn prepareGeneratedEnrichments(
     var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     errdefer {
         for (artifact_writes.items) |write| {
-            self.alloc.free(@constCast(write.key));
-            self.alloc.free(@constCast(write.value));
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
         }
-        artifact_writes.deinit(self.alloc);
+        artifact_writes.deinit(alloc);
     }
     var artifact_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (artifact_delete_keys.items) |key| self.alloc.free(@constCast(key));
-        artifact_delete_keys.deinit(self.alloc);
+        for (artifact_delete_keys.items) |key| alloc.free(@constCast(key));
+        artifact_delete_keys.deinit(alloc);
     }
     var documents = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
     // ArrayList.items may be shorter than its backing allocation. Release
     // owned fields item-by-item, then let the list free its exact capacity.
     errdefer {
-        for (documents.items) |doc| derived_types.deinitDerivedDocument(self.alloc, doc);
-        documents.deinit(self.alloc);
+        for (documents.items) |doc| derived_types.deinitDerivedDocument(alloc, doc);
+        documents.deinit(alloc);
     }
     var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
         for (dense_embeddings.items) |embedding|
-            derived_types.deinitDerivedDenseEmbedding(self.alloc, embedding);
-        dense_embeddings.deinit(self.alloc);
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
+        dense_embeddings.deinit(alloc);
     }
     var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
         for (sparse_embeddings.items) |embedding|
-            derived_types.deinitDerivedSparseEmbedding(self.alloc, embedding);
-        sparse_embeddings.deinit(self.alloc);
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
+        sparse_embeddings.deinit(alloc);
     }
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
     errdefer {
-        for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
-        planned.deinit(self.alloc);
+        for (planned.items) |request| enrichment_types.freeGeneratedRef(alloc, request);
+        planned.deinit(alloc);
     }
     var coverage_outcomes = std.ArrayListUnmanaged(PrecomputedCoverageOutcome).empty;
     errdefer {
-        for (coverage_outcomes.items) |outcome| outcome.deinit(self.alloc);
-        coverage_outcomes.deinit(self.alloc);
+        for (coverage_outcomes.items) |outcome| outcome.deinit(alloc);
+        coverage_outcomes.deinit(alloc);
     }
     var coverage_candidates = std.ArrayListUnmanaged(PrecomputedCoverageCandidate).empty;
     defer {
-        for (coverage_candidates.items) |candidate| candidate.deinit(self.alloc);
-        coverage_candidates.deinit(self.alloc);
+        for (coverage_candidates.items) |candidate| candidate.deinit(alloc);
+        coverage_candidates.deinit(alloc);
     }
     var deferred_asset_producer_items = std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem).empty;
     defer {
-        clearPrecomputeAssetProducerBatchItems(self.alloc, &deferred_asset_producer_items);
-        deferred_asset_producer_items.deinit(self.alloc);
+        clearPrecomputeAssetProducerBatchItems(alloc, &deferred_asset_producer_items);
+        deferred_asset_producer_items.deinit(alloc);
     }
 
     for (req.writes, 0..) |_, i| {
@@ -43438,7 +43478,7 @@ fn prepareGeneratedEnrichments(
             plan.rows[i].requests
         else blk: {
             owned_row_plan = try planGeneratedEnrichmentsForRows(
-                self,
+                alloc,
                 .{ .writes = req.writes[i .. i + 1] },
                 extracted[i .. i + 1],
                 fallback_write_plan.?.plan().*,
@@ -43449,21 +43489,21 @@ fn prepareGeneratedEnrichments(
         var chunk_cache = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
         defer {
             for (chunk_cache.items) |entry| {
-                self.alloc.free(entry.key);
-                chunker_mod.freeChunks(self.alloc, entry.chunks);
+                alloc.free(entry.key);
+                chunker_mod.freeChunks(alloc, entry.chunks);
             }
-            chunk_cache.deinit(self.alloc);
+            chunk_cache.deinit(alloc);
         }
 
         for (generated) |request| {
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
-                try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
+                try appendGeneratedEnrichmentRef(alloc, &planned, request);
                 continue;
             }
 
             switch (request.kind) {
                 .asset => try computeAssetRequestDerived(
-                    self.alloc,
+                    alloc,
                     self,
                     cleaned,
                     request,
@@ -43476,7 +43516,7 @@ fn prepareGeneratedEnrichments(
                     containsName(force_generated_artifact_names, requestArtifactName(request)),
                 ),
                 .chunk_text => try computeChunkRequestDerived(
-                    self.alloc,
+                    alloc,
                     self,
                     cleaned,
                     request,
@@ -43487,15 +43527,15 @@ fn prepareGeneratedEnrichments(
                 ),
                 .dense_embedding => {
                     const before = dense_embeddings.items.len;
-                    computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
+                    computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
                         error.MissingDenseEmbedder => {
-                            try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
+                            try appendGeneratedEnrichmentRef(alloc, &planned, request);
                             continue;
                         },
                         else => return err,
                     };
                     try appendPrecomputedCoverageCandidate(
-                        self.alloc,
+                        alloc,
                         &coverage_candidates,
                         request,
                         dense_embeddings.items.len > before,
@@ -43503,15 +43543,15 @@ fn prepareGeneratedEnrichments(
                 },
                 .sparse_embedding => {
                     const before = sparse_embeddings.items.len;
-                    computeSparseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &sparse_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
+                    computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &sparse_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
                         error.MissingSparseEmbedder => {
-                            try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
+                            try appendGeneratedEnrichmentRef(alloc, &planned, request);
                             continue;
                         },
                         else => return err,
                     };
                     try appendPrecomputedCoverageCandidate(
-                        self.alloc,
+                        alloc,
                         &coverage_candidates,
                         request,
                         sparse_embeddings.items.len > before,
@@ -43521,7 +43561,7 @@ fn prepareGeneratedEnrichments(
         }
     }
 
-    try flushPrecomputeAssetProducerBatch(self.alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
+    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
 
     // Resolve coverage only after every deferred producer has contributed its
     // manifest. This keeps terminal outcomes in the same primary commit while
@@ -43529,22 +43569,23 @@ fn prepareGeneratedEnrichments(
     for (coverage_candidates.items) |candidate| {
         if (!try appendPrecomputedEmbeddingCoverageOutcomes(
             self,
+            alloc,
             &coverage_outcomes,
             candidate.request,
             artifact_writes.items,
             candidate.produced,
-        )) try appendGeneratedEnrichmentRef(self.alloc, &planned, candidate.request);
+        )) try appendGeneratedEnrichmentRef(alloc, &planned, candidate.request);
     }
 
     var result = PrecomputedGeneratedBatch{};
-    errdefer result.deinit(self.alloc);
-    result.artifact_writes = try artifact_writes.toOwnedSlice(self.alloc);
-    result.artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(self.alloc);
-    result.documents = try documents.toOwnedSlice(self.alloc);
-    result.dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc);
-    result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc);
-    result.generated_enrichment_refs = try planned.toOwnedSlice(self.alloc);
-    result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(self.alloc);
+    errdefer result.deinit(alloc);
+    result.artifact_writes = try artifact_writes.toOwnedSlice(alloc);
+    result.artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(alloc);
+    result.documents = try documents.toOwnedSlice(alloc);
+    result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
+    result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
+    result.generated_enrichment_refs = try planned.toOwnedSlice(alloc);
+    result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(alloc);
     return result;
 }
 
@@ -43557,7 +43598,7 @@ fn renderSourceParts(
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = renderSourceTemplateParts(alloc, db, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
-        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+        error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
         else => return null,
     };
     if (parts.len == 0) {
@@ -43692,7 +43733,9 @@ const GeneratedEmbeddingMemo = struct {
 
     fn putDenseCopy(self: *@This(), key_value: Key, vector: []const f32) !void {
         if (self.dense.contains(key_value)) return;
-        _ = try self.adoptDense(key_value, try self.alloc.dupe(f32, vector));
+        const owned = try self.alloc.dupe(f32, vector);
+        errdefer self.alloc.free(owned);
+        _ = try self.adoptDense(key_value, owned);
     }
 
     fn adoptSparse(
@@ -43865,70 +43908,72 @@ const DocumentChildRangeRoute = struct {
 
 fn partitionRemoteDocumentChildRangeGeneratedBatch(
     self: *DB,
+    alloc: Allocator,
     generated: *PrecomputedGeneratedBatch,
     out: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
     var snapshots = std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot).empty;
     defer {
-        for (snapshots.items) |*snapshot| snapshot.deinit(self.alloc);
-        snapshots.deinit(self.alloc);
+        for (snapshots.items) |*snapshot| snapshot.deinit(alloc);
+        snapshots.deinit(alloc);
     }
-    try collectDocumentChildRangeRoutingSnapshots(self, generated.*, &snapshots);
+    try collectDocumentChildRangeRoutingSnapshots(self, alloc, generated.*, &snapshots);
     if (snapshots.items.len == 0) return;
 
-    try partitionRemoteArtifactWrites(self.alloc, snapshots.items, &generated.artifact_writes, out);
-    try partitionRemoteArtifactDeletes(self.alloc, snapshots.items, &generated.artifact_delete_keys, out);
-    try partitionRemoteDerivedDocuments(self.alloc, snapshots.items, &generated.documents, out);
-    try partitionRemoteDenseEmbeddings(self.alloc, snapshots.items, &generated.dense_embeddings, out);
-    try partitionRemoteSparseEmbeddings(self.alloc, snapshots.items, &generated.sparse_embeddings, out);
+    try partitionRemoteArtifactWrites(alloc, snapshots.items, &generated.artifact_writes, out);
+    try partitionRemoteArtifactDeletes(alloc, snapshots.items, &generated.artifact_delete_keys, out);
+    try partitionRemoteDerivedDocuments(alloc, snapshots.items, &generated.documents, out);
+    try partitionRemoteDenseEmbeddings(alloc, snapshots.items, &generated.dense_embeddings, out);
+    try partitionRemoteSparseEmbeddings(alloc, snapshots.items, &generated.sparse_embeddings, out);
 }
 
 fn collectDocumentChildRangeRoutingSnapshots(
     self: *DB,
+    alloc: Allocator,
     generated: PrecomputedGeneratedBatch,
     out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
 ) !void {
     for (generated.artifact_writes) |write| {
-        try appendDocumentChildRangeRoutingSnapshotFromValue(self, write.key, write.value, out);
+        try appendDocumentChildRangeRoutingSnapshotFromValue(alloc, write.key, write.value, out);
     }
     for (generated.artifact_delete_keys) |key| {
-        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse continue;
-        defer artifact_ref.deinit(self.alloc);
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse continue;
+        defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
-        const existing = self.core.getStoreValue(self.alloc, key) catch |err| switch (err) {
+        const existing = self.core.getStoreValue(alloc, key) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
-        defer if (existing) |value| self.alloc.free(value);
-        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(self, key, value, out);
+        defer if (existing) |value| alloc.free(value);
+        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(alloc, key, value, out);
     }
 }
 
 fn appendDocumentChildRangeRoutingSnapshotFromValue(
-    self: *DB,
+    alloc: Allocator,
     key: []const u8,
     value: []const u8,
     out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
 ) !void {
     if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
-    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse return;
-    defer artifact_ref.deinit(self.alloc);
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return;
+    defer artifact_ref.deinit(alloc);
     if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
 
-    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(self.alloc, value) catch |err| switch (err) {
+    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(alloc, value) catch |err| switch (err) {
         error.InvalidDocumentExtractionManifest => return,
         else => return err,
     };
-    errdefer freeDocumentArtifactChildRanges(self.alloc, ranges);
+    errdefer freeDocumentArtifactChildRanges(alloc, ranges);
     if (ranges.len == 0) {
-        freeDocumentArtifactChildRanges(self.alloc, ranges);
+        freeDocumentArtifactChildRanges(alloc, ranges);
         return;
     }
-    const doc_key = try self.alloc.dupe(u8, artifact_ref.document_id);
-    errdefer self.alloc.free(doc_key);
-    const manifest_artifact_name = try self.alloc.dupe(u8, artifact_ref.name);
-    errdefer self.alloc.free(manifest_artifact_name);
-    try out.append(self.alloc, .{
+    const doc_key = try alloc.dupe(u8, artifact_ref.document_id);
+    errdefer alloc.free(doc_key);
+    const manifest_artifact_name = try alloc.dupe(u8, artifact_ref.name);
+    errdefer alloc.free(manifest_artifact_name);
+    try out.append(alloc, .{
         .doc_key = doc_key,
         .manifest_artifact_name = manifest_artifact_name,
         .child_ranges = ranges,
@@ -61146,6 +61191,78 @@ test "relational preparation budget rejects contention before commit and release
     try std.testing.expectEqualStrings("{\"id\":\"ok\"}", stored);
 }
 
+test "relational preparation budget includes expanded transform snapshots" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .string, .required = true }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const content = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(content);
+    @memset(content, 'x');
+    const document = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{content});
+    defer alloc.free(document);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = document }}, .sync_level = .write });
+    const hard_limit = manager.sliceStats(.relational_preparation_working_set).hard_limit_bytes;
+    var competing = try manager.reserve(.relational_preparation_working_set, hard_limit - 64 * 1024);
+    defer competing.release();
+    const request: types.BatchRequest = .{ .transforms = &.{.{
+        .key = "row",
+        .operations = &.{.{ .op = .set, .path = "id", .value_json = "\"small\"" }},
+    }}, .sync_level = .write };
+    // The final row is tiny: rejection must happen while reconstructing the
+    // large base, before any prepared-row allocation or durable mutation.
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.batch(request));
+    try std.testing.expectEqual(hard_limit - 64 * 1024, manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    const unchanged = (try db.get(alloc, "row")).?;
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(document, unchanged);
+    competing.release();
+    try db.batch(request);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    const changed = (try db.get(alloc, "row")).?;
+    defer alloc.free(changed);
+    try std.testing.expectEqualStrings("{\"id\":\"small\"}", changed);
+}
+
+test "relational transform preparation releases every failed allocation" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            // An explicit empty snapshot supplies absent durable bases. This
+            // pure coalescing path must not touch DB state or its allocator.
+            var db: DB = undefined;
+            const snapshot: DB.TransformReadSnapshot = .{};
+            var prepared = try db.coalesceKeyValueRequest(alloc, types.BatchWrite, &.{.{ .key = "existing", .value = "{\"count\":1}" }}, &.{}, &.{
+                .{ .key = "new", .upsert = true, .operations = &.{.{ .op = .set, .path = "count", .value_json = "2" }} },
+                .{ .key = "existing", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} },
+                .{ .key = "existing", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} },
+            }, &snapshot);
+            defer prepared.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), prepared.writes.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "generated embedding memo releases failed insertion allocations" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var memo = GeneratedEmbeddingMemo.init(alloc);
+            defer memo.deinit();
+            const key = [_]u8{1} ** 32;
+            try memo.putDenseCopy(key, &.{ 1, 2, 3 });
+            try memo.putDenseCopy(key, &.{ 1, 2, 3 });
+            try memo.putSparseCopy(key, .{ .indices = @constCast(&[_]u32{1}), .values = @constCast(&[_]f32{2}) });
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "prepared relational batch uses bounded parallel workers safely" {
     const alloc = std.testing.allocator;
     const columns = [_]schema_mod.RelationalColumn{
@@ -70499,6 +70616,8 @@ test "db batch marks generated enrichment replay for generator-enabled dense ind
 
 test "db full_index precomputes generated enrichments into the committed batch" {
     const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -70507,6 +70626,7 @@ test "db full_index precomputes generated enrichments into the committed batch" 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .resource_manager = &manager,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),
@@ -70537,6 +70657,8 @@ test "db full_index precomputes generated enrichments into the committed batch" 
         },
         .sync_level = .full_index,
     });
+
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
 
     var text_result = try db.search(alloc, .{
         .index_name = "ft_chunks",
@@ -76243,7 +76365,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     const second_value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}";
     var extracted = [_]mapper.ExtractedWrite{try mapper.extractWrite(alloc, "doc:a", second_value)};
     defer extracted[0].deinit(alloc);
-    var precomputed = try prepareGeneratedEnrichments(&db, .{
+    var precomputed = try prepareGeneratedEnrichments(&db, alloc, .{
         .writes = &.{.{ .key = "doc:a", .value = second_value }},
     }, &extracted, .all, &.{}, null, null);
     defer precomputed.deinit(alloc);
@@ -106332,6 +106454,7 @@ test "transform preparation fences durable bases before commit" {
         .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
     }};
     var read_snapshot = try db.captureTransformReadSnapshot(
+        alloc,
         types.BatchWrite,
         &.{},
         &.{},
@@ -106339,6 +106462,7 @@ test "transform preparation fences durable bases before commit" {
     );
     defer read_snapshot.deinit(alloc);
     var prepared = try db.coalesceKeyValueRequest(
+        alloc,
         types.BatchWrite,
         &.{},
         &.{},

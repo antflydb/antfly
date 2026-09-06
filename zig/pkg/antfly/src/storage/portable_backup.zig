@@ -2335,6 +2335,21 @@ fn validatePortableDocumentEntryAgainstArchive(
     const row_version = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
     const layout = (try archive.layoutForVersion(row_version)) orelse return error.InvalidBackupRequest;
     if (try archive.validatorForVersion(row_version)) |validator| {
+        if (!validator.restore.full_root) {
+            // Canonical decoding discharges required/null/type constraints and
+            // authenticates the logical hash. Archive finish verifies the
+            // public/runtime schema binding before staging can be published.
+            relational_store.validateCanonicalValueForSchemaAndLayout(alloc, entry.value, layout.schema.*, layout.physical) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            const row = try relational_row_codec.ordinalRowViewTrusted(entry.value, layout.schema.*, layout.physical);
+            validator.validateRelationalRestoreFields(alloc, row) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            return;
+        }
         var logical = relational_store.validateCanonicalAndMaterializeRootForSchemaAndLayoutAlloc(
             alloc,
             entry.value,
@@ -3292,6 +3307,59 @@ test "portable restore validates historical rows with their public schema epoch"
     try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(alloc, entry, &archive));
     try archive.public_validators.put(alloc, 1, try archive.retainSchema(alloc, schema_v1_json));
     try validatePortableDocumentEntryAgainstArchive(alloc, entry, &archive);
+}
+
+test "relational restore plans avoid scalar materialization and retain residual validation" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var validator = try public_table_schema.CompiledTableValidator.init(alloc, schema_json);
+    defer validator.deinit(alloc);
+    try std.testing.expect(!validator.restore.full_root);
+    try std.testing.expectEqual(@as(usize, 0), validator.restore.properties.len);
+    const runtime = try public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema);
+    defer storage_schema.freeSchema(alloc, runtime);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, runtime);
+    defer layout.deinit();
+    const bytes = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"large scalar strings need no owned copy\",\"count\":7,\"active\":true}", runtime);
+    defer alloc.free(bytes);
+    try relational_store.validateCanonicalValueForSchemaAndLayout(alloc, bytes, runtime, &layout);
+    const row = try relational_row_codec.ordinalRowViewTrusted(bytes, runtime, &layout);
+    var no_allocations = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try validator.validateRelationalRestoreFields(no_allocations.allocator(), row);
+    try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+
+    const residual_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer","minimum":5},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var residual = try public_table_schema.CompiledTableValidator.init(alloc, residual_json);
+    defer residual.deinit(alloc);
+    try std.testing.expect(!residual.restore.full_root);
+    try std.testing.expectEqualSlices(usize, &.{1}, residual.restore.properties);
+    try residual.validateRelationalRestoreFields(alloc, row);
+    const invalid = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\",\"count\":4}", runtime);
+    defer alloc.free(invalid);
+    try relational_store.validateCanonicalValueForSchemaAndLayout(alloc, invalid, runtime, &layout);
+    try std.testing.expectError(error.InvalidBatchRequest, residual.validateRelationalRestoreFields(alloc, try relational_row_codec.ordinalRowViewTrusted(invalid, runtime, &layout)));
+}
+
+test "relational restore plans retain root-sensitive validation" {
+    const alloc = std.testing.allocator;
+    const keywords = [_][]const u8{
+        "\"minProperties\":1",
+        "\"maxProperties\":1",
+        "\"propertyNames\":{\"pattern\":\"^[ab]$\"}",
+    };
+    for (keywords) |keyword| {
+        const json = try std.fmt.allocPrint(alloc,
+            \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"a":{{"type":"string"}},"b":{{"type":"string"}}}},"additionalProperties":false,{s}}}}}}}}}
+        , .{keyword});
+        defer alloc.free(json);
+        var validator = try public_table_schema.CompiledTableValidator.init(alloc, json);
+        defer validator.deinit(alloc);
+        try std.testing.expect(validator.restore.full_root);
+    }
 }
 
 test "complete relational database image requires its public schema contract" {

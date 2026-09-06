@@ -2694,6 +2694,43 @@ test "prepared pattern filters own source JSON" {
     ));
 }
 
+test "prepared pattern filters address large authenticated payloads without scratch allocations" {
+    const alloc = std.testing.allocator;
+    const json = try alloc.alloc(u8, 1024 * 1024 + 2);
+    defer alloc.free(json);
+    @memset(json, 'x');
+    json[0] = '"';
+    json[json.len - 1] = '"';
+    const vector = try alloc.alloc(u8, 4096 * 4);
+    defer alloc.free(vector);
+    @memset(vector, 0);
+    std.mem.writeInt(u32, vector[vector.len - 4 ..][0..4], @bitCast(@as(f32, 7)), .little);
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .ordinal = 0, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = json } },
+        .{ .ordinal = 1, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = vector } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, &layout);
+    const queries = [_][]const u8{ "{\"exists\":{\"field\":\"payload\"}}", "{\"term\":{\"embedding.4095\":7}}" };
+    for (queries) |query| {
+        var filter = try PreparedPatternFilter.init(alloc, query);
+        defer filter.deinit();
+        var bound = try PreparedOrdinalPatternFilter.init(alloc, &filter, schema, &layout);
+        defer bound.deinit();
+        var no_allocations = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        for (0..100) |_| try std.testing.expect((try bound.matches(no_allocations.allocator(), "row", row)).?);
+        try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+    }
+}
+
 test "prepared pattern filters preserve dense vector logical array semantics" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{
@@ -2729,6 +2766,8 @@ test "prepared pattern filters preserve dense vector logical array semantics" {
         const expected = try filter.matchesStored(alloc, "row", logical);
         try std.testing.expectEqual(expected, (try filter.matchesOrdinal(alloc, "row", row)).?);
         try std.testing.expectEqual(expected, (try bound.matches(alloc, "row", row)).?);
+        const trusted = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, &layout);
+        try std.testing.expectEqual(expected, (try bound.matches(alloc, "row", trusted)).?);
     }
     var allocating = try PreparedPatternFilter.init(alloc, "{\"numeric_range\":{\"field\":\"embedding\",\"min\":1.5}}");
     defer allocating.deinit();

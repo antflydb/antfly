@@ -35779,7 +35779,7 @@ test "bound table write source validates transforms against same-batch writes" {
 
     var source = BoundTableWriteSource.init("docs", &db);
     var req = tables_api.CreateTableRequest{
-        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"keyword\"}}}}}}"),
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}}}}}}"),
     };
     defer req.deinit(alloc);
     _ = try source.source().createTable(alloc, "docs", req);

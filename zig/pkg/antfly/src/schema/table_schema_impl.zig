@@ -696,6 +696,89 @@ pub fn validateDocumentValueWithPhysicalFields(
     return validateDocumentValueWithPlan(alloc, schema, value, physical_fields, null);
 }
 
+/// Residual public-schema checks after strict canonical physical validation.
+/// Root-sensitive schemas retain the general validator. Field-local schemas
+/// need only their constrained columns materialized, one at a time.
+pub const RelationalRestorePlan = struct {
+    full_root: bool = true,
+    properties: []usize = &.{},
+
+    pub fn init(alloc: std.mem.Allocator, schema: TableSchema, physical_fields: []const PhysicalFieldValidation) !RelationalRestorePlan {
+        if (schema.storage_mode != .relational or !schema.enforce_types or
+            schema.document_schemas.len != 1 or schema.ttl_duration_ns != 0 or
+            schema.dynamic_templates.len != 0 or physical_fields.len != 0) return .{};
+        const document = schema.document_schemas[0];
+        const defaults = DocumentSchema{ .name = "" };
+        // Explicitly account for each root keyword we can discharge through
+        // the closed physical layout. New keywords default to full validation.
+        inline for (std.meta.fields(DocumentSchema)) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "name") and
+                !std.mem.eql(u8, field.name, "properties") and
+                !std.mem.eql(u8, field.name, "required_fields") and
+                !std.mem.eql(u8, field.name, "include_in_all_fields") and
+                !std.mem.eql(u8, field.name, "additional_properties_allowed"))
+            {
+                if (!restoreFieldIsDefault(@field(document, field.name), @field(defaults, field.name))) return .{};
+            }
+        }
+        for (document.properties) |property| {
+            if (std.mem.eql(u8, property.name, "_type") or relationalPropertyContainsRootRef(property)) return .{};
+        }
+        var residual = std.ArrayListUnmanaged(usize).empty;
+        errdefer residual.deinit(alloc);
+        for (document.properties, 0..) |property, index| {
+            if (!physicalLayoutDischargesProperty(property)) try residual.append(alloc, index);
+        }
+        return .{ .full_root = false, .properties = try residual.toOwnedSlice(alloc) };
+    }
+
+    pub fn deinit(self: *RelationalRestorePlan, alloc: std.mem.Allocator) void {
+        alloc.free(self.properties);
+        self.* = undefined;
+    }
+};
+
+fn restoreFieldIsDefault(value: anytype, default: @TypeOf(value)) bool {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .pointer => |pointer| if (pointer.size == .slice) value.len == 0 else std.meta.eql(value, default),
+        else => std.meta.eql(value, default),
+    };
+}
+
+fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
+    const kind = property.field_type orelse return false;
+    const physical_scalar = std.mem.eql(u8, kind, "string") or std.mem.eql(u8, kind, "keyword") or
+        std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "link") or
+        std.mem.eql(u8, kind, "html") or std.mem.eql(u8, kind, "search_as_you_type") or
+        std.mem.eql(u8, kind, "boolean") or std.mem.eql(u8, kind, "integer") or
+        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric");
+    if (!physical_scalar) return false;
+    if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
+    const defaults = DocumentProperty{ .name = "" };
+    inline for (std.meta.fields(DocumentProperty)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "name") and
+            !std.mem.eql(u8, field.name, "field_type") and
+            !std.mem.eql(u8, field.name, "integer_only") and
+            !std.mem.eql(u8, field.name, "allows_null"))
+        {
+            if (!restoreFieldIsDefault(@field(property, field.name), @field(defaults, field.name))) return false;
+        }
+    }
+    return true;
+}
+
+pub fn validateRelationalRestoreProperty(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    property_index: usize,
+    value: *const std.json.Value,
+    compiled: *const CompiledValidationPlan,
+) !void {
+    var context = RuntimeValidationContext{ .alloc = alloc, .compiled = compiled, .require_physical_encoding = true };
+    defer context.deinit();
+    try validateDocumentFieldValueWithContext(&context, schema.document_schemas[0].properties[property_index], value, schema.enforce_types);
+}
+
 pub fn validateDocumentValueWithPlan(
     alloc: std.mem.Allocator,
     schema: TableSchema,

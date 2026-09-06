@@ -3082,6 +3082,7 @@ pub fn build(b: *std.Build) void {
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
             "ordinal rows bind layout support projection checksum and canonical bytes",
+            "relational restore plans",
             "export and import chunk artifacts round trip with public artifact ids",
             "export and import asset artifacts round trip with public artifact ids",
             "export and import resolution artifacts round trip with public artifact ids",
