@@ -359,17 +359,7 @@ pub const LoadedReader = union(enum) {
             .vlm => |*reader| reader.readBatch(image_datas, options),
             .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
         };
-        errdefer {
-            for (results) |*result| result.deinit();
-            allocator.free(results);
-        }
-        for (results) |*result| try sanitizeResultUtf8(result);
-        if (options.execution_control) |control| control.check() catch |err| {
-            for (results) |*result| result.deinit();
-            allocator.free(results);
-            return err;
-        };
-        return results;
+        return finishReadBatch(allocator, results, options.execution_control);
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {
@@ -378,6 +368,46 @@ pub const LoadedReader = union(enum) {
         };
     }
 };
+
+/// Takes ownership of the batch, transferring it to the caller only after all
+/// fallible publication work succeeds. Every error has the same cleanup owner.
+fn finishReadBatch(allocator: std.mem.Allocator, results: []Result, control: ?InferenceExecutionControl) ![]Result {
+    errdefer {
+        for (results) |*result| result.deinit();
+        allocator.free(results);
+    }
+    for (results) |*result| try sanitizeResultUtf8(result);
+    if (control) |active| try active.check();
+    return results;
+}
+
+test "batch publication owns cleanup on cancellation and timeout" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]InferenceExecutionControl{
+        .{ .check_fn = Cancel.check },
+        .{ .deadline_ns = 0 },
+    }, [_]anyerror{ error.Cancelled, error.Timeout }) |control, expected| {
+        const results = try std.testing.allocator.alloc(Result, 2);
+        for (results) |*result| result.* = .{
+            .text = try std.testing.allocator.dupe(u8, "finished"),
+            .allocator = std.testing.allocator,
+        };
+        try std.testing.expectError(expected, finishReadBatch(std.testing.allocator, results, control));
+    }
+}
+
+test "batch publication transfers successful results to caller" {
+    const results = try std.testing.allocator.alloc(Result, 1);
+    results[0] = .{ .text = try std.testing.allocator.dupe(u8, "finished"), .allocator = std.testing.allocator };
+    const published = try finishReadBatch(std.testing.allocator, results, .{});
+    defer std.testing.allocator.free(published);
+    defer published[0].deinit();
+    try std.testing.expectEqualStrings("finished", published[0].text);
+}
 
 fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: []const []const u8, options: ReadOptions) ![]Result {
     const allocator = reader.allocator;

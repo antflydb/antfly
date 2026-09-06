@@ -487,8 +487,6 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         return error.MissingInferenceListener;
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
-        if (!platform.inference_process_supervisor.supervisedWorkerParentAlive())
-            return error.InferenceSupervisorExited;
         if (listener_task.runtimeFailure()) |err|
             return supervisor.fail("inference", "public-http", err);
         io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {

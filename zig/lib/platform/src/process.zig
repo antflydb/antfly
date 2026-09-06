@@ -27,11 +27,6 @@ pub fn currentId() ?u32 {
     return @intCast(std.posix.system.getpid());
 }
 
-pub fn parentId() ?u32 {
-    if (!hasPosixProcessApi()) return null;
-    return @intCast(std.posix.system.getppid());
-}
-
 pub fn alive(pid: u32) bool {
     if (pid == 0) return false;
     if (!hasPosixProcessApi()) return true;

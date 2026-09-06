@@ -8211,6 +8211,9 @@ fn loadSessionForPreferredBackends(
         };
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+        // This attempt owns admission until the successful result explicitly
+        // takes it. Includes cancellation, guard-arm failure, and fallback.
+        defer if (resource_lease) |*lease| lease.release();
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
@@ -8262,10 +8265,6 @@ fn loadSessionForPreferredBackends(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            if (control) |active| active.check() catch |err| {
-                if (resource_lease) |*lease| lease.release();
-                return err;
-            };
         }
         if (control) |active| try active.check();
         var hard_cancellation = if (control) |active|
@@ -8276,14 +8275,12 @@ fn loadSessionForPreferredBackends(
         if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
             if (control) |active| active.check() catch |err| {
                 loaded_session.close();
-                if (resource_lease) |*lease| lease.release();
                 return err;
             };
             var session = loaded_session;
             if (resource_lease) |*lease| {
                 lease.retain(resident_amounts) catch |err| {
                     session.close();
-                    lease.release();
                     return err;
                 };
             }
@@ -8302,13 +8299,13 @@ fn loadSessionForPreferredBackends(
                     &man,
                 ) catch |err| {
                     session.close();
-                    if (resource_lease) |*lease| lease.release();
                     return err;
                 };
             }
-            return .{ .session = session, .resource_lease = resource_lease };
+            const result = LoadedSessionPlan{ .session = session, .resource_lease = resource_lease };
+            resource_lease = null;
+            return result;
         } else |err| {
-            if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
             rememberPreferredLoadError(&first_err, err);
         }
@@ -8326,6 +8323,62 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+test "preferred load attempt releases admission on cancellation and guard failure" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // Admission only needs artifact bytes. These cases must fail before any
+    // backend constructor sees the deliberately invalid artifact.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "weights.bin", .data = "weights" });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "weights.bin" });
+    defer allocator.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator, .onnx_path = path };
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.required_backend = null;
+    sessions.required_backend_invalid = false;
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024, .backend_limit_bytes = 1024 });
+    try manager.ensureResourceOwnerReady();
+
+    const Hooks = struct {
+        fn cancelAfterAdmission(raw: ?*anyopaque) !void {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw.?));
+            if (owner.admissionController().snapshot().host_weight_bytes > 0) return error.Timeout;
+        }
+        fn failArm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw));
+            try std.testing.expect(owner.admissionController().snapshot().host_weight_bytes > 0);
+            return error.OutOfMemory;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed arm must not be disarmed");
+        }
+    };
+    const controls = [_]InferenceExecutionControl{
+        .{},
+        .{ .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
+        .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
+    };
+    const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
+    // Metal and CPU ONNX have the same process-required construction contract;
+    // use Metal's runtime descriptor so this test needs no optional ORT install.
+    for (0..3) |_| for (controls, errors) |control, expected| {
+        try std.testing.expectError(expected, loadSessionForPreferredBackends(
+            &manager,
+            &.{.metal},
+            root,
+            man,
+            &sessions,
+            control,
+        ));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    };
 }
 
 fn loadErrorPriority(err: anyerror) u2 {

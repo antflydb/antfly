@@ -13,11 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const env = @import("env.zig");
-const process = @import("process.zig");
-
 pub const worker_env = "ANTFLY_INFERENCE_SUPERVISED_WORKER";
-pub const parent_pid_env = "ANTFLY_INFERENCE_SUPERVISOR_PID";
+const lifeline_env = "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE";
 /// Reserved exit code by which a worker asks its supervisor for a fresh
 /// generation. Ordinary startup/configuration failures must use other codes.
 pub const restart_exit_code: u8 = 86;
@@ -26,13 +23,34 @@ pub fn restartWorker() noreturn {
     std.process.exit(restart_exit_code);
 }
 
-pub fn supervisedWorkerParentAlive() bool {
-    if (!env.getenvBool(worker_env)) return true;
-    const raw = env.getenv(parent_pid_env) orelse return true;
-    const expected = std.fmt.parseUnsigned(u32, raw, 10) catch return false;
-    const actual = process.parentId() orelse return true;
-    return actual == expected;
-}
+/// The server command reserves stdin as a supervisor-owned lifeline (it does
+/// not accept request input on stdin). EOF means the owner has gone away,
+/// including SIGKILL, so stop without attempting potentially stuck teardown.
+/// Install before model startup and keep alive through all worker teardown.
+/// A concurrent task guarantees progress even while the main task is in a
+/// blocking native call; all pipe I/O and cancellation are portable std.Io.
+pub const WorkerLifetime = struct {
+    group: std.Io.Group = .init,
+
+    pub fn deinit(self: *WorkerLifetime, io: std.Io) void {
+        self.group.cancel(io);
+    }
+
+    fn start(self: *WorkerLifetime, io: std.Io) !void {
+        try self.group.concurrent(io, watchLifeline, .{io});
+    }
+
+    fn watchLifeline(io: std.Io) std.Io.Cancelable!void {
+        var byte: [1]u8 = undefined;
+        const count = std.Io.File.stdin().readStreaming(io, &.{&byte}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => std.process.exit(1),
+        };
+        // No data is legal on this private channel. EOF is an intentional
+        // owner-loss shutdown, not a watchdog restart request.
+        std.process.exit(if (count == 0) 0 else 1);
+    }
+};
 
 fn isHelp(value: []const u8) bool {
     return std.mem.eql(u8, value, "--help") or std.mem.eql(u8, value, "-h") or
@@ -70,8 +88,14 @@ fn shouldRestart(term: std.process.Child.Term) !bool {
 ///
 /// Returns true in the parent after a clean worker exit; false in the worker or
 /// for non-server inference commands.
-pub fn runIfNeeded(init: std.process.Init, command_index: usize) !bool {
-    if (init.environ_map.get(worker_env) != null) return false;
+pub fn runIfNeeded(init: std.process.Init, command_index: usize, lifetime: *WorkerLifetime) !bool {
+    if (init.environ_map.get(worker_env)) |marker| {
+        if (!std.mem.eql(u8, marker, "1") or
+            !std.mem.eql(u8, init.environ_map.get(lifeline_env) orelse "", "stdin-v1"))
+            return error.InvalidInferenceWorkerEnvironment;
+        try lifetime.start(init.io);
+        return false;
+    }
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
@@ -83,22 +107,28 @@ pub fn runIfNeeded(init: std.process.Init, command_index: usize) !bool {
     var child_environment = try init.environ_map.clone(init.gpa);
     defer child_environment.deinit();
     try child_environment.put(worker_env, "1");
-    var parent_pid_buf: [32]u8 = undefined;
-    if (process.currentId()) |pid| {
-        const parent_pid = try std.fmt.bufPrint(&parent_pid_buf, "{d}", .{pid});
-        try child_environment.put(parent_pid_env, parent_pid);
-    }
+    try child_environment.put(lifeline_env, "stdin-v1");
 
     var restarts: u32 = 0;
     while (true) {
         var child = try std.process.spawn(init.io, .{
             .argv = argv.items,
             .environ_map = &child_environment,
-            .stdin = .inherit,
+            .stdin = .pipe,
             .stdout = .inherit,
             .stderr = .inherit,
         });
-        const term = try child.wait(init.io);
+        // wait consumes the child's handles on success. On cancellation or
+        // error this scope still owns and reaps the child before returning.
+        defer child.kill(init.io);
+        const child_id = child.id;
+        const term = child.wait(init.io) catch |err| {
+            // Zig 0.16's POSIX wait clears id (and closes pipes) even when
+            // canceled before waitpid reaps the process. Retain ownership so
+            // the deferred kill still reaps it. Windows retains its handle.
+            if (comptime @import("builtin").os.tag != .windows) child.id = child_id;
+            return err;
+        };
         // Argument/configuration/startup errors use an ordinary exit code and
         // must be returned to the operator, not hidden in an infinite restart
         // loop. The watchdog uses the reserved restart code; native crashes
@@ -110,7 +140,7 @@ pub fn runIfNeeded(init: std.process.Init, command_index: usize) !bool {
             "inference worker stopped unexpectedly; restarting generation={d} delay_ms={d} term={any}",
             .{ restarts + 1, delay_ms, term },
         );
-        try init.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake);
+        try init.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
     }
 }
 

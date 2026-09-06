@@ -267,7 +267,9 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
 }
 
 pub fn main(init: std.process.Init) !void {
-    if (try platform.inference_process_supervisor.runIfNeeded(init, 1)) return;
+    var worker_lifetime = platform.inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (try platform.inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);

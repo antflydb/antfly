@@ -46,8 +46,10 @@ pub fn main(init: std.process.Init) void {
 fn mainImpl(init: std.process.Init) anyerror!void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
+    var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
     if (comptime role_options.role == .inference) {
-        if (try inference_process_supervisor.runIfNeeded(init, 1)) return;
+        if (try inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
     }
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);

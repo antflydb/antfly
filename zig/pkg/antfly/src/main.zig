@@ -75,7 +75,9 @@ fn mainImpl(init: std.process.Init) !void {
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
         .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
         .inference => {
-            if (try inference_process_supervisor.runIfNeeded(init, 2)) return;
+            var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+            defer worker_lifetime.deinit(init.io);
+            if (try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
             return runRuntimeUnit(.inference, subcommand, init, &args);
         },
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
