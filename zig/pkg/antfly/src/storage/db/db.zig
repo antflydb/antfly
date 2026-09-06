@@ -437,7 +437,7 @@ fn validateDocumentExtractionInlineSourcesSnapshotParsed(
     db: *DB,
     plan: index_manager_mod.IndexManager.WritePlanSnapshot,
     value: std.json.Value,
-    doc_value: []const u8,
+    document: mapper.ExtractedWrite,
 ) !void {
     if (value != .object) return;
     for (plan.generated_templates) |request| {
@@ -447,7 +447,7 @@ fn validateDocumentExtractionInlineSourcesSnapshotParsed(
         if (producer_cfg.type != .document_extraction) continue;
 
         if (request.source_template.len > 0) {
-            const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
+            const rendered = renderSourceTemplateText(alloc, db, request.source_template, (try document.logicalJson()).?) catch |err| switch (err) {
                 error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => continue,
             };
@@ -2556,6 +2556,37 @@ fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool
     return split_shadow or (has_text_consumers and (sync_level == .full_text or sync_level == .full_index));
 }
 
+fn requireRelationalConsumerFields(prepared: *mapper.PreparedRelationalWrite, schema: schema_mod.TableSchema, plan: ?index_manager_mod.IndexManager.WritePlanSnapshot, retain_text: bool) !void {
+    if (prepared.extracted.logical_source == null) return;
+    if (retain_text) {
+        if (plan) |snapshot| {
+            if (snapshot.text_requires_root or !snapshot.has_text_consumers) {
+                try prepared.requireLogicalRoot();
+            } else for (snapshot.text_fields) |field| {
+                // Preserve both literal dotted keys and nested-path roots;
+                // the established text selector decides their semantics.
+                try prepared.requireLogicalField(field);
+                if (std.mem.indexOfScalar(u8, field, '.')) |dot| try prepared.requireLogicalField(field[0..dot]);
+            }
+        } else try prepared.requireLogicalRoot();
+    }
+    if (schema.ttl_duration_ns != 0) try prepared.requireLogicalField(schema.ttl_field);
+    if (plan) |snapshot| {
+        for (snapshot.graph_fields) |graph_field| for (graph_field.edges) |edge| try prepared.requireLogicalField(edge.field_name);
+        for (snapshot.sparse_fields) |field| try prepared.requireLogicalField(field.field_name);
+        for (snapshot.dense_fields) |field| {
+            const row = prepared.extracted.logical_source.?.row;
+            if (row.ordinalForName(field.field_name)) |ordinal| if (try row.findCell(ordinal)) |cell| if (cell.is_null or cell.is_dense_vector) continue;
+            try prepared.requireLogicalField(field.field_name);
+        }
+        for (snapshot.generated_templates) |request| if (request.kind == .asset and request.source_template.len == 0) try prepared.requireLogicalField(request.source_field);
+    }
+    if (retain_text) {
+        prepared.extracted.prepared_text_root = prepared.parsedValue();
+        prepared.extracted.prepared_text_source_bytes = mapper.estimateJsonValueRetainedBytes(prepared.parsedValue());
+    }
+}
+
 fn prepareRelationalRows(
     allocator_guard: *PreparedRowAllocator,
     io: ?std.Io,
@@ -2627,6 +2658,20 @@ fn prepareRelationalRows(
                 };
                 const owner_alloc = if (ctx.db) |owner_db| owner_db.alloc else ctx.scratch_child;
                 const row_alloc = prepared.preparationAllocator(owner_alloc);
+                requireRelationalConsumerFields(&prepared, ctx.table_schema, ctx.write_plan, ctx.retain_text_roots) catch |err| {
+                    prepared.deinit(owner_alloc);
+                    ctx.fail(err);
+                    return;
+                };
+                if (ctx.db) |owner_db| if (splitShadowRequiresMaterializedDerivedBatch(owner_db)) {
+                    prepared.requireLogicalRoot() catch |err| {
+                        prepared.deinit(owner_alloc);
+                        ctx.fail(err);
+                        return;
+                    };
+                    prepared.extracted.prepared_text_root = prepared.parsedValue();
+                    prepared.extracted.prepared_text_source_bytes = mapper.estimateJsonValueRetainedBytes(prepared.parsedValue());
+                };
                 if (ctx.write_plan) |pinned_write_plan| {
                     if (ctx.retain_text_roots) {
                         prepared.extracted.prepared_schema_version = ctx.table_schema.version;
@@ -2659,14 +2704,14 @@ fn prepareRelationalRows(
                         return;
                     };
                 }
-                if (prepared.extracted.cleaned_value) |cleaned| {
+                if (prepared.extracted.hasDocument()) {
                     if (ctx.db) |owner_db| if (ctx.write_plan) |pinned_write_plan|
                         validateDocumentExtractionInlineSourcesSnapshotParsed(
                             scratch_arena.allocator(),
                             owner_db,
                             pinned_write_plan,
                             prepared.parsedValue(),
-                            cleaned,
+                            prepared.extracted,
                         ) catch |err| {
                             prepared.deinit(owner_alloc);
                             ctx.fail(err);
@@ -5003,7 +5048,6 @@ pub const DB = struct {
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
-    relational_columns_observed_sequence: u64 = 0,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -8740,7 +8784,7 @@ pub const DB = struct {
                     for (effective_req.writes, rows, effects) |write, *maybe_row, *effect| {
                         if (maybe_row.*) |*row| {
                             row.extracted.artifact_keys_owned_individually = false;
-                            if (row.extracted.cleaned_value != null) {
+                            if (row.extracted.hasDocument()) {
                                 effect.store_key = try encodeStoreLookupKeyAlloc(self, effects_alloc, write.key);
                                 if (shouldWriteTimestamp(write.key)) {
                                     const write_timestamp_ns = try relational_row_codec.rowWriteTimestampNsTrusted(row.packed_row);
@@ -9155,6 +9199,9 @@ pub const DB = struct {
             else
                 null;
             defer if (prepared_relational) |*prepared| prepared.deinit(self.alloc);
+            var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try self.core.index_manager.acquireWritePlanSnapshot() else null;
+            defer if (fallback_consumer_plan) |*plan| plan.release();
+            if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);
             if (!use_preprepared_rows) if (prepared_relational) |prepared| if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.relational_prepare_ns, relational_prepare_start_ns);
                 active_profile.relational_rows_prepared += 1;
@@ -9243,7 +9290,10 @@ pub const DB = struct {
                 }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
-            if (extracted[i].cleaned_value) |cleaned| {
+            if (extracted[i].hasDocument()) {
+                // Only the document-mode branch consumes JSON here. Relational
+                // persistence and timestamps use the prepared typed authority.
+                const cleaned = if (prepared_relational == null) extracted[i].cleaned_value.? else "";
                 const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                     if (prepared_relational) |*prepared|
                         try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
@@ -9255,7 +9305,7 @@ pub const DB = struct {
                     try prepared.finalizeMetadata(resolved_write_timestamp_ns orelse 0);
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
-                        try validateDocumentExtractionInlineSourcesParsed(self, prepared.parsedValue(), cleaned)
+                        try validateDocumentExtractionInlineSourcesSnapshotParsed(self.alloc, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
                     else
                         try validateDocumentExtractionInlineSources(self, cleaned);
                 }
@@ -9708,7 +9758,8 @@ pub const DB = struct {
             materialized_derived_batch.?.sequence = sequence;
             const payload = try encodeChangeRecordPayload(&self.batchContext(), materialized_derived_batch.?, sequence);
             errdefer self.alloc.free(payload);
-            try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
+            if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
+                try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
             const collect_sync_targets_start_ns = monotonicTimeNs();
             sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, materialized_derived_batch.?);
@@ -26551,12 +26602,12 @@ pub const DB = struct {
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                 continue;
             };
-            // Wait for a quiet maintenance interval instead of repeatedly
-            // rewriting disposable generations during continuous ingestion.
-            const sequence = self.core.store.lastReplaySequence(0);
-            if (sequence == self.relational_columns_observed_sequence)
-                _ = self.rebuildRelationalColumns() catch {};
-            self.relational_columns_observed_sequence = sequence;
+            // A pass compacts one bounded dirty range. Unchanged blocks remain
+            // readable throughout ingestion; no table-wide quiet period.
+            _ = self.rebuildRelationalColumns() catch |err| switch (err) {
+                error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
+                else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
+            };
         }
     }
 
@@ -26564,6 +26615,7 @@ pub const DB = struct {
     /// lock. The store's atomic primary-mutation fence governs publication.
     pub fn rebuildRelationalColumns(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        if (self.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
         var view = self.core.acquireSchemaView() orelse return false;
         defer view.release();
         if (view.storageMode() != .relational) return false;
@@ -26574,7 +26626,13 @@ pub const DB = struct {
         defer preparation.deinit();
         const force = self.relational_columns_rebuild_requested.swap(false, .acq_rel);
         errdefer if (force) self.relational_columns_rebuild_requested.store(true, .release);
-        return relational_columns.rebuild(self, preparation.guard.allocator(), force) catch |err| return preparation.mapError(err);
+        return relational_columns.rebuild(self, preparation.guard.allocator(), force) catch |err| {
+            switch (err) {
+                error.InvalidColumnSegment, error.InvalidData, error.NotFound => self.relational_columns_rebuild_requested.store(true, .release),
+                else => {},
+            }
+            return preparation.mapError(err);
+        };
     }
 
     fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
@@ -37497,9 +37555,9 @@ fn encodeThinReplayRecordPayload(
     for (req.writes, 0..) |write, i| {
         if (!derived_changed_flags[i]) continue;
         const extracted_write = extracted[i];
-        if (extracted_write.cleaned_value != null or include_generated_enrichment_hint) {
+        if (extracted_write.hasDocument() or include_generated_enrichment_hint) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
-            if (extracted_write.cleaned_value != null) {
+            if (extracted_write.hasDocument()) {
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
             }
@@ -37520,7 +37578,7 @@ fn encodeThinReplayRecordPayload(
             try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         }
-        if (overwritten_flags[i] and extracted_write.cleaned_value != null) {
+        if (overwritten_flags[i] and extracted_write.hasDocument()) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &overwritten_doc_keys, &overwritten_doc_key_set, write.key);
             saw_overwritten = true;
         }
@@ -37776,7 +37834,7 @@ fn augmentExtractedWriteWithGraphFieldEdges(
     doc_value: []const u8,
     extracted: *mapper.ExtractedWrite,
 ) !void {
-    if (!self.core.hasGraphIndexes() or extracted.cleaned_value == null) return;
+    if (!self.core.hasGraphIndexes() or !extracted.hasDocument()) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
     defer parsed.deinit();
@@ -37790,7 +37848,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesParsed(
     root: std.json.Value,
     extracted: *mapper.ExtractedWrite,
 ) !void {
-    if (!self.core.hasGraphIndexes() or extracted.cleaned_value == null or root != .object) return;
+    if (!self.core.hasGraphIndexes() or !extracted.hasDocument() or root != .object) return;
 
     var extra_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -37869,7 +37927,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(
     root: std.json.Value,
     extracted: *mapper.ExtractedWrite,
 ) !void {
-    if (plan.graph_fields.len == 0 or extracted.cleaned_value == null or root != .object) return;
+    if (plan.graph_fields.len == 0 or !extracted.hasDocument() or root != .object) return;
 
     var extra_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -43571,7 +43629,7 @@ fn planGeneratedEnrichmentsForRows(
     var plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = rows };
     errdefer plan.deinit();
     for (req.writes, extracted) |write, row| {
-        if (row.cleaned_value == null) {
+        if (!row.hasDocument()) {
             rows[plan.initialized] = .{ .alloc = alloc, .requests = &.{} };
             plan.initialized += 1;
             continue;
@@ -43654,11 +43712,11 @@ fn prewarmGeneratedDenseMemo(
     const max_bytes = generatedEmbedBatchBytes();
 
     for (req.writes, 0..) |_, row_index| {
-        const cleaned = extracted[row_index].cleaned_value orelse continue;
         for (plan.rows[row_index].requests) |request| {
             if (request.kind != .dense_embedding or request.input_kind != .document) continue;
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
             if (request.source_template.len > 0 and embedder.supportsParts()) continue;
+            const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
                     error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
@@ -43772,10 +43830,10 @@ fn prewarmGeneratedSparseMemo(
     const max_bytes = generatedEmbedBatchBytes();
 
     for (req.writes, 0..) |_, row_index| {
-        const cleaned = extracted[row_index].cleaned_value orelse continue;
         for (plan.rows[row_index].requests) |request| {
             if (request.kind != .sparse_embedding or request.input_kind != .document) continue;
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
+            const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
                     error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
@@ -43907,7 +43965,7 @@ fn prepareGeneratedEnrichments(
     }
 
     for (req.writes, 0..) |_, i| {
-        const cleaned = extracted[i].cleaned_value orelse continue;
+        if (!extracted[i].hasDocument()) continue;
         var owned_row_plan: ?GeneratedBatchWritePlan = null;
         defer if (owned_row_plan) |*plan| plan.deinit();
         const generated = if (preplanned) |plan|
@@ -43921,6 +43979,7 @@ fn prepareGeneratedEnrichments(
             );
             break :blk owned_row_plan.?.rows[0].requests;
         };
+        if (generated.len == 0) continue;
 
         var chunk_cache = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
         defer {
@@ -43936,6 +43995,15 @@ fn prepareGeneratedEnrichments(
                 try appendGeneratedEnrichmentRef(alloc, &planned, request);
                 continue;
             }
+
+            // Templates may inspect arbitrary root data; document extraction
+            // also consumes configured source-metadata fields. Plain field
+            // consumers render only their requested ordinal, never a vector
+            // or JSON payload belonging to another consumer.
+            const cleaned = (if (request.source_template.len > 0 or request.kind == .asset)
+                try extracted[i].logicalJson()
+            else
+                try extracted[i].logicalJsonForField(request.source_field)).?;
 
             switch (request.kind) {
                 .asset => try computeAssetRequestDerived(
@@ -45918,7 +45986,7 @@ fn buildDerivedBatch(
         defer targets.deinit(alloc);
         errdefer for (targets.items) |target| alloc.free(target.index_name);
 
-        if (extracted[i].cleaned_value != null) {
+        if (extracted[i].hasDocument()) {
             try appendDerivedTargetRefAlloc(alloc, &targets, .full_text, "*");
         }
         for (extracted[i].dense_embeddings) |embedding| {
@@ -45941,7 +46009,7 @@ fn buildDerivedBatch(
         const owned_targets = try targets.toOwnedSlice(alloc);
         documents[i] = .{
             .key = key,
-            .action = if (extracted[i].cleaned_value == null) .preserve_base_document else .upsert,
+            .action = if (!extracted[i].hasDocument()) .preserve_base_document else .upsert,
             .cleaned_value = null,
             .targets = owned_targets,
         };
@@ -45967,7 +46035,7 @@ fn buildDerivedBatch(
     defer overwritten_doc_keys_list.deinit(alloc);
     errdefer for (overwritten_doc_keys_list.items) |key| alloc.free(@constCast(key));
     for (req.writes, 0..) |write, i| {
-        if (extracted[i].cleaned_value != null) {
+        if (extracted[i].hasDocument()) {
             try appendOwnedConstBytes(alloc, &overwritten_doc_keys_list, write.key);
         }
     }
@@ -46138,7 +46206,7 @@ fn appendGeneratedEnrichments(
     }
 
     for (req.writes, 0..) |write, i| {
-        const cleaned = extracted[i].cleaned_value orelse continue;
+        const cleaned = (try extracted[i].logicalJson()) orelse continue;
         var explicit_dense = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
         defer {
             for (explicit_dense.items) |*embedding| embedding.deinit(self.alloc);
@@ -52651,7 +52719,7 @@ fn attachPreparedUpsertDocumentProjections(
     extracted: []const mapper.ExtractedWrite,
 ) !void {
     const PreparedProjection = struct {
-        cleaned: []const u8,
+        cleaned: ?[]const u8,
         root: ?std.json.Value,
         source_bytes: usize,
         schema_version: u32,
@@ -52661,7 +52729,8 @@ fn attachPreparedUpsertDocumentProjections(
     defer prepared_by_key.deinit(alloc);
 
     for (req.writes, 0..) |write, i| {
-        const cleaned = extracted[i].cleaned_value orelse continue;
+        if (!extracted[i].hasDocument()) continue;
+        const cleaned = if (extracted[i].prepared_text_root == null) try extracted[i].logicalJson() else extracted[i].cleaned_value;
         try prepared_by_key.put(alloc, write.key, .{
             .cleaned = cleaned,
             .root = extracted[i].prepared_text_root,
@@ -52677,12 +52746,12 @@ fn attachPreparedUpsertDocumentProjections(
         const prepared = prepared_by_key.get(doc.key) orelse continue;
         if (prepared.root) |root| {
             doc.prepared_text_root = root;
-            doc.prepared_text_source_bytes = if (prepared.source_bytes != 0) prepared.source_bytes else prepared.cleaned.len;
+            doc.prepared_text_source_bytes = if (prepared.source_bytes != 0) prepared.source_bytes else if (prepared.cleaned) |bytes| bytes.len else 1;
             doc.prepared_schema_version = prepared.schema_version;
             doc.prepared_write_plan_generation = prepared.write_plan_generation;
         } else {
             // Document-mode and fallback rows have no retained typed root.
-            doc.cleaned_value = try alloc.dupe(u8, prepared.cleaned);
+            doc.cleaned_value = try alloc.dupe(u8, prepared.cleaned.?);
         }
     }
 }
@@ -62589,7 +62658,7 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
     try std.testing.expectEqual(@as(u8, 0), db.schema_index_reconcile_state.load(.acquire));
 }
 
-test "relational columnar generations preserve scans and invalidate on primary mutations" {
+test "relational columnar generations preserve scans and compact dirty ranges" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -62650,6 +62719,19 @@ test "relational columnar generations preserve scans and invalidate on primary m
         try std.testing.expectEqualDeep(results[i].documents, result.documents);
         try std.testing.expectEqualDeep(results[i].hashes, result.hashes);
     }
+    for ([_][]const u8{
+        "\x00\x00__columnar__:blocks:0000000000000001:r:",
+        "\x00\x00__columnar__:blocks:0000000000000001:r:row:0255",
+        "\x00\x00__columnar__:blocks:0000000000000001:r:row:0511",
+    }) |directory_key| {
+        const directory_value = try db.core.store.get(alloc, directory_key);
+        defer alloc.free(directory_value);
+        try db.core.store.delete(directory_key);
+        var missing_range = try db.scan(alloc, "row:0000", "row:0599", .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "tag" }, .inclusive_from = false, .exclusive_to = false });
+        defer missing_range.deinit(alloc);
+        try std.testing.expectEqualDeep(results[0].documents, missing_range.documents);
+        try db.core.store.put(directory_key, directory_value);
+    }
     const broken_column = "\x00\x00__columnar__:blocks:0000000000000001:0000000000000001:c00000000";
     const corrupt = try db.core.store.get(alloc, broken_column);
     defer alloc.free(corrupt);
@@ -62681,7 +62763,15 @@ test "relational columnar generations preserve scans and invalidate on primary m
     defer snapshot.abort();
     _ = try snapshot.get(internal_keys.relational_columnar_manifest_key);
     try db.batch(.{ .writes = &.{.{ .key = "row:0000", .value = "{\"n\":900}" }}, .deletes = &.{"row:0001"} });
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key));
+    const retained_manifest = try db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key);
+    defer alloc.free(retained_manifest);
+    var dirty_stats: types.ColumnarScanStats = .{};
+    var dirty_scan = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":800}}", .columnar_stats = &dirty_stats });
+    defer dirty_scan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), dirty_scan.documents.len);
+    try std.testing.expectEqualStrings("{\"n\":900}", dirty_scan.documents[0].json);
+    try std.testing.expectEqual(@as(u64, 1), dirty_stats.dirty_ranges_read);
+    try std.testing.expectEqual(@as(u64, 2), dirty_stats.blocks_read);
     // Readers that already pinned the old generation keep its manifest and rows.
     _ = try snapshot.get(internal_keys.relational_columnar_manifest_key);
     try std.testing.expect(try db.rebuildRelationalColumns());
@@ -62699,12 +62789,210 @@ test "relational columnar generations preserve scans and invalidate on primary m
     };
     relational_columns.test_before_publish = .{ .context = &db, .run = Race.mutate };
     defer relational_columns.test_before_publish = null;
-    try std.testing.expect(!try db.rebuildRelationalColumns());
+    try std.testing.expect(try db.rebuildRelationalColumns());
     relational_columns.test_before_publish = null;
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key));
+    var raced = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":901}}" });
+    defer raced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), raced.documents.len);
+    try std.testing.expectEqualStrings("{\"n\":901}", raced.documents[0].json);
     db.artifact_repair_metadata_stop.store(true, .release);
     try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
     db.artifact_repair_metadata_stop.store(false, .release);
+    try std.testing.expect(try db.rebuildRelationalColumns());
+}
+
+test "relational durable preparation materializes only requested consumer ordinals" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"embedding":{"type":"embedding"},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    const txn = try db.beginTransaction(100);
+    try db.writeIntents(txn, &.{.{ .key = "row", .value = "{\"n\":7,\"embedding\":[1,2,3],\"payload\":{\"large\":[1,2,3]}}" }}, &.{});
+    var intents = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer intents.deinit(alloc);
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var prepared = try mapper.PreparedRelationalWrite.initFromIntent(alloc, "row", intents.writes[0].value, view.validator(), view.tableSchema().*, view.physicalLayout(), intents.prepared_rows[0]);
+    defer prepared.deinit(alloc);
+    try requireRelationalConsumerFields(&prepared, view.tableSchema().*, plan.plan().*, false);
+    try std.testing.expect(prepared.extracted.hasDocument());
+    try std.testing.expect(prepared.extracted.cleaned_value == null);
+    try std.testing.expect(prepared.extracted.logical_source.?.json == null);
+    try std.testing.expectEqual(@as(usize, 0), prepared.parsedValue().object.count());
+    try prepared.requireLogicalField("n");
+    try std.testing.expectEqual(@as(usize, 1), prepared.parsedValue().object.count());
+    try std.testing.expectEqual(@as(i64, 7), prepared.parsedValue().object.get("n").?.integer);
+    try std.testing.expect(prepared.extracted.logical_source.?.json == null);
+    var selected_fields = [_][]u8{@constCast("n")};
+    var selected_plan = plan.plan().*;
+    selected_plan.has_text_consumers = true;
+    selected_plan.text_requires_root = false;
+    selected_plan.text_fields = &selected_fields;
+    try requireRelationalConsumerFields(&prepared, view.tableSchema().*, selected_plan, true);
+    try std.testing.expectEqual(@as(usize, 1), prepared.extracted.prepared_text_root.?.object.count());
+    try std.testing.expect(!prepared.parsedValue().object.contains("embedding"));
+    const field_json = (try prepared.extracted.logicalJsonForField("n")).?;
+    try std.testing.expectEqualStrings("{\"n\":7}", field_json);
+    try std.testing.expect(prepared.extracted.logical_source.?.json == null);
+    const first = (try prepared.extracted.logicalJson()).?;
+    const second = (try prepared.extracted.logicalJson()).?;
+    try std.testing.expect(first.ptr == second.ptr);
+    var decoded = try std.json.parseFromSlice(std.json.Value, alloc, first, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), decoded.value.object.count());
+    var cloned = try prepared.extracted.clone(alloc);
+    defer cloned.deinit(alloc);
+    try std.testing.expect(cloned.logical_source == null);
+    try std.testing.expectEqualStrings(first, cloned.cleaned_value.?);
+    try db.commitTransaction(txn, 200);
+    const stored = (try db.get(alloc, "row")).?;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(first, stored);
+}
+
+test "relational columnar typed masks avoid vector expansion and eliminated columns" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"embedding":{"type":"embedding"},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{
+        .{ .key = "", .value = "{\"n\":1,\"embedding\":[1,2,3],\"payload\":[1,2]}" },
+        .{ .key = "a", .value = "{\"n\":2,\"embedding\":[4,5,6],\"payload\":[3]}" },
+        .{ .key = "b", .value = "{\"n\":3}" },
+    } });
+    const filters = [_][]const u8{
+        "{\"exists\":{\"field\":\"embedding\"}}",
+        "{\"term\":{\"embedding\":5}}",
+        "{\"conjuncts\":[{\"term\":{\"embedding\":5}},{\"numeric_range\":{\"field\":\"n\",\"min\":100}}]}",
+        "{\"bool\":{\"must\":[{\"term\":{\"payload\":2}},{\"numeric_range\":{\"field\":\"n\",\"min\":100}}]}}",
+        "{\"disjuncts\":[{\"exists\":{\"field\":\"n\"}},{\"term\":{\"payload\":2}}]}",
+        "{\"bool\":{\"should\":[{\"term\":{\"embedding\":5}},{\"term\":{\"n\":2}}],\"minimum_should_match\":2}}",
+    };
+    var baseline: [filters.len]types.ScanResult = undefined;
+    var initialized: usize = 0;
+    defer for (baseline[0..initialized]) |*result| result.deinit(alloc);
+    for (filters, 0..) |filter, i| {
+        baseline[i] = try db.scan(alloc, "", "", .{ .filter_query_json = filter });
+        initialized += 1;
+    }
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    for (filters, 0..) |filter, i| {
+        var stats: types.ColumnarScanStats = .{};
+        var actual = try db.scan(alloc, "", "", .{ .filter_query_json = filter, .columnar_stats = &stats });
+        defer actual.deinit(alloc);
+        try std.testing.expectEqualDeep(baseline[i].hashes, actual.hashes);
+        try std.testing.expect(stats.used);
+        try std.testing.expectEqual(@as(u64, 0), stats.values_materialized);
+        if (i == 2 or i == 3) try std.testing.expectEqual(@as(u64, 0), stats.columns_read);
+        if (i == 4) try std.testing.expectEqual(@as(u64, 1), stats.columns_read);
+    }
+}
+
+test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(types.BatchWrite, 800);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"n\":1}" };
+    try db.batch(.{ .writes = writes });
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    const unchanged_key = "\x00\x00__columnar__:blocks:0000000000000001:0000000000000002:c00000000";
+    const unchanged = try db.core.store.get(alloc, unchanged_key);
+    defer alloc.free(unchanged);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k0001:{d:0>4}", .{i}), .value = "{\"n\":2}" };
+    try db.batch(.{ .writes = writes });
+    try db.batch(.{ .writes = &.{ .{ .key = "", .value = "{\"n\":3}" }, .{ .key = "\x00x", .value = "{\"n\":4}" } } });
+    relational_columns.test_compaction_block_limit = 2;
+    defer relational_columns.test_compaction_block_limit = null;
+    var passes: usize = 0;
+    while (try db.rebuildRelationalColumns()) {
+        passes += 1;
+        try std.testing.expect(passes < 20);
+        var primary = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = true });
+        defer primary.deinit(alloc);
+        var covered = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
+        defer covered.deinit(alloc);
+        try std.testing.expectEqualDeep(primary.documents, covered.documents);
+    }
+    try std.testing.expect(passes >= 2);
+    const still_unchanged = try db.core.store.get(alloc, unchanged_key);
+    defer alloc.free(still_unchanged);
+    try std.testing.expectEqualSlices(u8, unchanged, still_unchanged);
+
+    try db.batch(.{ .writes = &.{.{ .key = "k0700", .value = "{\"n\":9}" }} });
+    const RawRace = struct {
+        fn run(ptr: *anyopaque) anyerror!void {
+            const owner: *DB = @ptrCast(@alignCast(ptr));
+            var view = owner.core.acquireSchemaView().?;
+            defer view.release();
+            var row = try mapper.PreparedRelationalWrite.init(owner.alloc, "k0700", "{\"n\":10}", view.validator(), view.tableSchema().*, view.physicalLayout());
+            defer row.deinit(owner.alloc);
+            try row.finalizeMetadata(100);
+            const key = try internal_keys.relationalRowKeyAlloc(owner.alloc, "k0700");
+            defer owner.alloc.free(key);
+            // Recovery-style mutation: no apply lock or replay append.
+            try owner.core.store.put(key, row.packed_row);
+        }
+    };
+    relational_columns.test_before_publish = .{ .context = &db, .run = RawRace.run };
+    defer relational_columns.test_before_publish = null;
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    relational_columns.test_before_publish = null;
+    var raced_stats: types.ColumnarScanStats = .{};
+    var raced = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"term\":{\"n\":10}}", .columnar_stats = &raced_stats });
+    defer raced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), raced.documents.len);
+    try std.testing.expectEqual(@as(u64, 1), raced_stats.dirty_ranges_read);
+    const Cancel = struct {
+        fn run(ptr: *anyopaque) anyerror!void {
+            const owner: *DB = @ptrCast(@alignCast(ptr));
+            owner.artifact_repair_metadata_stop.store(true, .release);
+        }
+    };
+    relational_columns.test_before_publish = .{ .context = &db, .run = Cancel.run };
+    try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
+    relational_columns.test_before_publish = null;
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expect(!try db.rebuildRelationalColumns());
+
+    // Retire all rows, including entire directory ranges and its first range.
+    var all = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = true });
+    defer all.deinit(alloc);
+    const deletes = try scratch.alloc([]const u8, all.documents.len);
+    for (deletes, all.documents) |*key, row| key.* = row.id;
+    try db.batch(.{ .deletes = deletes });
+    passes = 0;
+    while (try db.rebuildRelationalColumns()) {
+        passes += 1;
+        try std.testing.expect(passes < 30);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "", .value = "{\"n\":42}" }} });
+    var inserted = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
+    defer inserted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), inserted.documents.len);
+    try std.testing.expectEqualStrings("{\"n\":42}", inserted.documents[0].json);
     try std.testing.expect(try db.rebuildRelationalColumns());
 }
 

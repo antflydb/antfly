@@ -25,10 +25,29 @@ pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
+pub const relational_columnar_dirty_prefix = "\x00\x00__columnar__:dirty:";
+
+pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
+    const raw = (try decodeStoredDocumentRowKeyAlloc(alloc, row_key)) orelse return error.InvalidInternalUserKey;
+    defer alloc.free(raw);
+    return std.mem.concat(alloc, u8, &.{ relational_columnar_dirty_prefix, raw });
+}
+
+/// Exact-image token for compare-and-clear compaction. A put/delete/put ABA
+/// with identical bytes is safe: the base snapshot contains that same image.
+pub fn relationalColumnarDirtyToken(value: ?[]const u8) [33]u8 {
+    var token: [33]u8 = @splat(0);
+    if (value) |bytes| {
+        token[0] = 1;
+        std.crypto.hash.Blake3.hash(bytes, token[1..33], .{});
+    }
+    return token;
+}
 
 pub fn invalidatesRelationalColumns(key: []const u8) bool {
-    return isRelationalRowKey(key) or std.mem.eql(u8, key, "\x00\x00__metadata__:table_catalog") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:schema");
+    // Row-count catalog updates do not alter a layout. Schema publication
+    // writes this key atomically with its catalog and invalidates the epoch.
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema");
 }
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;

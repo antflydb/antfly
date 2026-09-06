@@ -181,6 +181,9 @@ pub const Capabilities = struct {
     reverse_ranges: bool = false,
     cursors: bool = true,
     ordered_append_puts: bool = false,
+    /// Bulk append accepts interleaved key ranges and repeated keys with
+    /// last-write-wins semantics, without per-entry sorted insertion.
+    unordered_bulk_append_puts: bool = false,
     native_namespaces: bool = false,
     duplicate_values: bool = false,
     nested_write_transactions: bool = false,

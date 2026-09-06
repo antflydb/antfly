@@ -3359,6 +3359,8 @@ pub const IndexManager = struct {
         generation: u64,
         /// Artifact-only text indexes consume generated records, not base rows.
         has_text_consumers: bool = false,
+        text_requires_root: bool = true,
+        text_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
@@ -3372,6 +3374,8 @@ pub const IndexManager = struct {
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            for (self.text_fields) |field| self.alloc.free(field);
+            if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
             for (self.dense_fields) |field| {
                 self.alloc.free(field.index_name);
                 self.alloc.free(field.field_name);
@@ -3689,6 +3693,32 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
+        var text_fields = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (text_fields.items) |field| alloc.free(field);
+            text_fields.deinit(alloc);
+        }
+        var text_requires_root = false;
+        for (self.text_indexes.items) |*entry| {
+            if (textEntryHasExplicitArtifactSources(entry)) continue;
+            if (entry.selected_field) |field| {
+                if (std.mem.indexOfAny(u8, field, "*[]/") != null) {
+                    text_requires_root = true;
+                    continue;
+                }
+                var found = false;
+                for (text_fields.items) |existing| if (std.mem.eql(u8, existing, field)) {
+                    found = true;
+                    break;
+                };
+                if (!found) {
+                    const owned = try alloc.dupe(u8, field);
+                    errdefer alloc.free(owned);
+                    try text_fields.append(alloc, owned);
+                }
+            } else text_requires_root = true;
+        }
+
         const dense_fields = try alloc.alloc(DenseFieldWritePlan, self.dense_indexes.items.len);
         var dense_initialized: usize = 0;
         errdefer {
@@ -3783,6 +3813,8 @@ pub const IndexManager = struct {
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
             .chunk_dependents = chunk_dependents,
+            .text_requires_root = text_requires_root,
+            .text_fields = try text_fields.toOwnedSlice(alloc),
         };
     }
 

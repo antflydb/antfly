@@ -352,20 +352,30 @@ covered by unit tests.
 primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
-alongside a null bitmap; no JSON projection or reparsing belongs in this build path. The typed
-value stream identifies present values, the null bitmap identifies explicit
-nulls, and membership in neither means the column was absent.
+alongside presence and null bitmaps; no JSON projection or reparsing belongs in
+this build path. Presence distinguishes absent values from explicit nulls and
+lets existence predicates avoid decoding the value stream entirely.
 
 Column segments carry schema epochs, null state, and numeric min/max summaries.
-A manifest records generation and covered replay sequence. Every primary-row
-or schema/catalog mutation atomically invalidates that manifest, including raw
-recovery mutations that do not append replay. Background maintenance waits for
-a quiet replay interval, then stages a replacement generation; a racing write
-stops the build at a block boundary or rejects final publication. Publication
-uses an atomic write transaction and is also fenced against whole-store
-namespace replacement. Until publication, reads fall back to AROW. Retired and
-abandoned generations are reclaimed in bounded batches without invalidating
-already-pinned MVCC readers. This keeps one row authority,
+A manifest records the schema-bound generation and its initial replay coverage.
+Each primary put/delete atomically records a dirty-key image token, including
+raw recovery writes that do not append replay. A snapshot reader uses column
+blocks for clean ranges and AROW for dirty ranges; it never combines old base
+values with current primary values for the same range. Ordinary row-count
+updates leave the accelerator live. Schema changes invalidate the generation.
+Bulk-capable backends append dirty tokens in the same ingest arena as primary
+rows, preserving direct ingestion without per-row sorted-map insertion.
+
+Maintenance compacts one dirty range at a time, staging at most 64 replacement
+blocks per pass. Large insertion bursts split into bounded passes while the
+uncovered suffix retains its old block and dirty markers. Publication replaces
+the affected directory entries and retires old blocks atomically. Compare-and-
+clear removes only dirty images represented by the published snapshot: a
+racing write keeps its marker. A durable build token fences concurrent builders
+and makes canceled/crashed staging reclaimable on restart. Whole-store namespace
+replacement is fenced separately. Retired blocks remain available to pinned
+MVCC readers. Only initial creation, schema replacement, or corrupt-derived-data
+repair requires a full generation build. This keeps one row authority,
 makes schema changes and crash recovery explicit, and prevents a user-visible
 index configuration from controlling SQL/relational scan performance.
 
@@ -405,13 +415,31 @@ numeric ranges using block summaries, and fetch projection columns only for
 blocks with surviving rows. A sparse row-key directory lets resumed and bounded
 scans seek directly to their starting block. Positive top-level projections and hash-only scans
 avoid primary-row reads. Nested/special/full-document selections retain AROW
-fallback. Block and manifest checksums protect derived bytes; corruption resumes
+fallback. Checked directory boundary links detect missing range entries; block
+and manifest checksums protect derived bytes. Corruption resumes
 the same snapshot's primary scan after the last delivered key and requests a
 rebuild. Request-local `ColumnarScanStats` exposes blocks read/pruned, columns and
-encoded bytes read, and selected rows. The current publication unit is a whole
-generation: sustained-write workloads use AROW until a quiet build completes;
-incremental dirty-block replay and dedicated columnar aggregate/sort kernels
-remain further optimizations, not prerequisites for correctness.
+encoded bytes read, selected rows, dirty ranges read, and logical values
+materialized. Typed scalar kernels and direct vector membership do not build
+JSON trees. Candidate masks short-circuit resolved blocks/rows, inexpensive
+predicates precede composite payloads, and projected values are materialized
+only for surviving rows. JSON composite values are cached per block/row.
+
+Durable intent application keeps AROW as the logical authority. The immutable
+write plan requests only the graph/sparse/TTL/text fields actually consumed;
+direct vectors use binary ordinals. Selected-field text indexes retain only
+their required roots. JSON-only consumers opt into a request-owned lazy source:
+field-based enrichment inputs project their own ordinal, while root templates,
+document-extraction metadata, and whole-document text consumers explicitly
+request broader materialization. Renderings are cached, and merely persisting a
+typed row never forces JSON reconstruction. Dedicated columnar aggregate/sort
+operators remain separate query-engine work, not part of scan publication.
+
+Relational JSON, special-field, and physical validation failures are normalized
+at the input boundary. Raft records `InvalidBatchRequest` and the durable
+`TransactionTooLarge` policy rejection as terminal command outcomes, then
+advances to later entries. Corruption and local resource pressure remain
+execution failures rather than being silently converted into rejected writes.
 
 API-bound and Raft portable restores select the unpublished, one-pass importer.
 The request's semantic cancellation token reaches the block loop, and bound

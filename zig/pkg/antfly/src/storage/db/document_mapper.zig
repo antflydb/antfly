@@ -90,6 +90,9 @@ pub const ExtractedWrite = struct {
     /// Prepared relational writes may borrow the request body when no reserved
     /// fields were stripped. The request owns that memory through commit.
     cleaned_value_owned: bool = true,
+    /// A typed base document is independent of whether any consumer requested
+    /// its JSON representation. Owned by the same row region as this write.
+    logical_source: ?*LazyLogicalSource = null,
     graph_writes: []types.GraphEdgeWrite,
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
@@ -110,6 +113,51 @@ pub const ExtractedWrite = struct {
     prepared_region: ?*PreparedRowRegion = null,
     artifact_keys_owned_individually: bool = true,
 
+    pub const LazyLogicalSource = struct {
+        alloc: Allocator,
+        row: relational_row_codec.OrdinalRowView,
+        json: ?[]u8 = null,
+        field_json: std.StringHashMapUnmanaged([]u8) = .empty,
+
+        fn value(self: *@This()) ![]const u8 {
+            if (self.json) |bytes| return bytes;
+            var root = try self.row.materializeRootAlloc(self.alloc);
+            defer root.deinit(self.alloc);
+            self.json = try std.json.Stringify.valueAlloc(self.alloc, root.root, .{});
+            return self.json.?;
+        }
+
+        fn fieldValue(self: *@This(), name: []const u8) ![]const u8 {
+            if (self.field_json.get(name)) |bytes| return bytes;
+            var plan = try relational_row_codec.OrdinalProjectionPlan.init(self.alloc, self.row.table_schema, self.row.layout, &.{name});
+            defer plan.deinit();
+            const bytes = try self.row.projectAlloc(self.alloc, plan);
+            errdefer self.alloc.free(bytes);
+            const key = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(key);
+            try self.field_json.put(self.alloc, key, bytes);
+            return bytes;
+        }
+    };
+
+    pub fn hasDocument(self: ExtractedWrite) bool {
+        return self.cleaned_value != null or self.logical_source != null;
+    }
+
+    /// Legacy JSON consumers opt in explicitly. Typed consumers never call
+    /// this; repeated JSON consumers share one request-owned rendering.
+    pub fn logicalJson(self: ExtractedWrite) !?[]const u8 {
+        if (self.cleaned_value) |bytes| return bytes;
+        if (self.logical_source) |source| return try source.value();
+        return null;
+    }
+
+    pub fn logicalJsonForField(self: ExtractedWrite, name: []const u8) !?[]const u8 {
+        if (self.cleaned_value) |bytes| return bytes;
+        if (self.logical_source) |source| return try source.fieldValue(name);
+        return null;
+    }
+
     pub fn clone(self: ExtractedWrite, alloc: Allocator) !ExtractedWrite {
         var out: ExtractedWrite = .{
             .cleaned_value = null,
@@ -125,8 +173,9 @@ pub const ExtractedWrite = struct {
             .prepared_text_source_bytes = self.prepared_text_source_bytes,
         };
         errdefer out.deinit(alloc);
-        if (self.cleaned_value) |value| {
-            out.cleaned_value = if (self.cleaned_value_owned) try alloc.dupe(u8, value) else @constCast(value);
+        if (try self.logicalJson()) |value| {
+            out.cleaned_value = if (self.cleaned_value_owned or self.logical_source != null) try alloc.dupe(u8, value) else @constCast(value);
+            out.cleaned_value_owned = self.cleaned_value_owned or self.logical_source != null;
         }
         out.graph_writes = try alloc.alloc(types.GraphEdgeWrite, self.graph_writes.len);
         var graph_initialized: usize = 0;
@@ -221,6 +270,16 @@ pub const ExtractedWrite = struct {
             return;
         }
         if (self.cleaned_value_owned) if (self.cleaned_value) |value| alloc.free(value);
+        if (self.logical_source) |source| {
+            if (source.json) |value| source.alloc.free(value);
+            var fields = source.field_json.iterator();
+            while (fields.next()) |field| {
+                source.alloc.free(field.key_ptr.*);
+                source.alloc.free(field.value_ptr.*);
+            }
+            source.field_json.deinit(source.alloc);
+            source.alloc.destroy(source);
+        }
         for (self.graph_writes) |graph_write| {
             alloc.free(@constCast(graph_write.index_name));
             alloc.free(@constCast(graph_write.source));
@@ -356,37 +415,43 @@ pub const PreparedRelationalWrite = struct {
         var parsed = if (durable_row) |bytes| blk: {
             if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
             intent_digest = try relational_row_codec.rowSemanticHash(bytes);
-            const row = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
-            var logical = try row.materializeRootAlloc(parse_alloc);
-            errdefer logical.deinit(parse_alloc);
-            // Only API-only special fields accompany the authoritative typed
-            // row. Ordinary columns are never persisted or parsed as JSON a
-            // second time. JSON-typed columns retain their own JSON semantics.
-            const special = try std.json.parseFromSliceLeaky(std.json.Value, logical.root_arena.allocator(), document_json, .{ .parse_numbers = false });
-            if (special != .object) return error.InvalidTxnRecord;
-            var fields = special.object.iterator();
+            _ = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
+            var special = try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
+            errdefer special.deinit();
+            if (special.value != .object) return error.InvalidTxnRecord;
+            var fields = special.value.object.iterator();
             while (fields.next()) |field| {
                 if (!isSpecialField(field.key_ptr.*)) return error.InvalidTxnRecord;
-                try logical.root.object.put(logical.root_arena.allocator(), field.key_ptr.*, field.value_ptr.*);
             }
-            break :blk std.json.Parsed(std.json.Value){ .arena = logical.root_arena, .value = logical.root };
-        } else try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
+            break :blk special;
+        } else std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
         errdefer parsed.deinit();
         if (durable_row == null) if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
 
-        var extracted = try extractWriteFromParsedPrepared(
+        var extracted = extractWriteFromParsedPrepared(
             alloc,
             key,
             document_json,
             parsed.value,
             null,
             true,
-        );
+        ) catch |err| switch (@as(anyerror, err)) {
+            error.InvalidGraphEdges,
+            error.InvalidEmbeddingField,
+            error.InvalidVectorDimensions,
+            error.InvalidVectorValue,
+            error.InvalidSparseVector,
+            error.UnsupportedReservedField,
+            error.InvalidCharacter,
+            error.Overflow,
+            error.InvalidNumber,
+            => return if (durable_row == null) error.InvalidBatchRequest else error.InvalidTxnRecord,
+            else => return err,
+        };
         errdefer extracted.deinit(alloc);
-        if (durable_row != null and !parsed.value.object.contains("_edges") and !parsed.value.object.contains("_embeddings")) {
-            extracted.cleaned_value = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
-            extracted.cleaned_value_owned = true;
-        }
         // This recursive retained-size estimate is used only to budget a parsed
         // tree that survives into full-text publication. Most relational writes
         // do not target a text index, so keep their preparation to validation,
@@ -398,10 +463,19 @@ pub const PreparedRelationalWrite = struct {
         // Verify their checksum and identity, but do not validate, hash, or
         // encode their logical content again during commit/recovery.
         if (durable_row) |bytes| {
+            const packed_bytes = try alloc.dupe(u8, bytes);
+            errdefer alloc.free(packed_bytes);
+            const source = try alloc.create(ExtractedWrite.LazyLogicalSource);
+            errdefer alloc.destroy(source);
+            source.* = .{ .alloc = alloc, .row = try relational_row_codec.ordinalRowViewTrusted(packed_bytes, table_schema, physical_layout) };
+            if (extracted.cleaned_value_owned) if (extracted.cleaned_value) |value| alloc.free(value);
+            extracted.cleaned_value = null;
+            extracted.cleaned_value_owned = false;
+            extracted.logical_source = source;
             return .{
                 .parsed = parsed,
                 .extracted = extracted,
-                .packed_row = try alloc.dupe(u8, bytes),
+                .packed_row = packed_bytes,
                 .semantic_hash = intent_digest.?,
                 .schema_version = table_schema.version,
             };
@@ -547,6 +621,24 @@ pub const PreparedRelationalWrite = struct {
         return self.parsed.?.value;
     }
 
+    /// Materialize only a consumer's named top-level field. Direct vector
+    /// consumers instead read the ordinal payload and never call this method.
+    pub fn requireLogicalField(self: *PreparedRelationalWrite, name: []const u8) !void {
+        const source = self.extracted.logical_source orelse return;
+        if (self.parsed.?.value.object.contains(name)) return;
+        const ordinal = source.row.ordinalForName(name) orelse return;
+        const cell = (try source.row.findCell(ordinal)) orelse return;
+        const alloc = self.parsed.?.arena.allocator();
+        const value = try relational_row_codec.ownedJsonValueFromCellAlloc(alloc, source.row.table_schema.relational_columns[ordinal], cell);
+        try self.parsed.?.value.object.put(alloc, try alloc.dupe(u8, name), value);
+    }
+
+    pub fn requireLogicalRoot(self: *PreparedRelationalWrite) !void {
+        const source = self.extracted.logical_source orelse return;
+        var iterator = relational_row_codec.OrdinalCellIterator{ .parsed = source.row.parsed, .table_schema = source.row.table_schema };
+        while (try iterator.next()) |cell| try self.requireLogicalField(source.row.table_schema.relational_columns[cell.ordinal].name);
+    }
+
     pub fn releaseParsed(self: *PreparedRelationalWrite) void {
         if (self.parsed) |*parsed| parsed.deinit();
         self.parsed = null;
@@ -580,7 +672,7 @@ pub const PreparedRelationalWrite = struct {
     }
 };
 
-fn estimateJsonValueRetainedBytes(value: std.json.Value) usize {
+pub fn estimateJsonValueRetainedBytes(value: std.json.Value) usize {
     var total: usize = @sizeOf(std.json.Value);
     switch (value) {
         .string => |text| total +|= text.len,

@@ -3009,6 +3009,34 @@ pub const CompiledPatternFilter = union(enum) {
                 .geo_shape => |value| try jsonValuesContainGeoShape(alloc, values, value),
             };
         }
+
+        /// Shared typed leaf kernel. Scalars borrow their payload; existence
+        /// and vector membership do not construct logical composite values.
+        pub fn matchesCell(self: FieldPredicate, alloc: Allocator, column: @import("../../schema.zig").RelationalColumn, cell: ?relational_row_codec.Cell) !bool {
+            const value = cell orelse return self.matches(alloc, &.{});
+            if (self == .exists) return true;
+            if (value.is_null) return self.matches(alloc, &.{.null});
+            if (value.is_dense_vector and (self == .term or self == .terms)) {
+                const bytes = value.value.bytes_val;
+                if (bytes.len % 4 != 0) return error.InvalidData;
+                var pos: usize = 0;
+                while (pos < bytes.len) : (pos += 4) {
+                    const number: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+                    if (try self.matches(alloc, &.{.{ .float = number }})) return true;
+                }
+                return false;
+            }
+            var number_buf: [32]u8 = undefined;
+            const logical: std.json.Value = switch (value.value) {
+                .i64_val => |n| .{ .integer = n },
+                .u64_val => |n| if (n <= std.math.maxInt(i64)) .{ .integer = @intCast(n) } else .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{n}) },
+                .f64_val => |n| .{ .float = n },
+                .bool_val => |v| .{ .bool = v },
+                .bytes_val => |bytes| if (!value.is_json and !value.is_dense_vector) .{ .string = bytes } else try relational_row_codec.ownedJsonValueFromCellAlloc(alloc, column, value),
+                else => try relational_row_codec.ownedJsonValueFromCellAlloc(alloc, column, value),
+            };
+            return self.matches(alloc, &.{logical});
+        }
     };
 
     pub const CompiledFuzzy = struct {

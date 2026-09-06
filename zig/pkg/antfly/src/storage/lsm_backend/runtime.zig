@@ -365,6 +365,7 @@ pub fn BoundStore(comptime BackendType: type) type {
                 .reverse_ranges = true,
                 .cursors = true,
                 .ordered_append_puts = true,
+                .unordered_bulk_append_puts = true,
                 .native_namespaces = false,
                 .write_batches = .atomic,
                 .single_writer = true,

@@ -1126,6 +1126,8 @@ pub const ColumnarScanStats = struct {
     columns_read: u64 = 0,
     encoded_bytes_read: u64 = 0,
     rows_selected: u64 = 0,
+    values_materialized: u64 = 0,
+    dirty_ranges_read: u64 = 0,
 };
 
 pub const ScanOptions = struct {

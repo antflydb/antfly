@@ -528,6 +528,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.markColumnarDirty(key, value);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
@@ -539,6 +540,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
@@ -547,6 +549,14 @@ pub const DocStore = struct {
                 }
             }
             try self.write.?.delete(key);
+        }
+
+        fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
+            if (!internal_keys.isRelationalRowKey(key)) return;
+            const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+            defer self.alloc.free(dirty);
+            const token = internal_keys.relationalColumnarDirtyToken(value);
+            try self.put(dirty, &token);
         }
 
         fn invalidateColumns(self: *Txn, key: []const u8) anyerror!void {
@@ -596,6 +606,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         alloc: Allocator,
         columns_invalidated: bool = false,
+        unordered_bulk_append_puts: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
         runtime: ?backend_erased.Batch = null,
@@ -603,6 +614,7 @@ pub const DocStore = struct {
         pub const BatchTxn = struct {
             alloc: Allocator,
             columns_invalidated: *bool,
+            unordered_bulk_append_puts: bool = false,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
             runtime: ?*backend_erased.Batch = null,
@@ -632,6 +644,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
@@ -643,6 +656,17 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
+                    // Keep auxiliary records in the bulk arena too. A regular
+                    // put drains that arena into a sorted mutable map, causing
+                    // quadratic insertion when dirty keys precede every row.
+                    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                    defer self.alloc.free(dirty);
+                    const token = internal_keys.relationalColumnarDirtyToken(value);
+                    try self.runtime.?.appendPut(dirty, &token);
+                } else {
+                    try self.markColumnarDirty(key, value);
+                }
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw != null) return error.Unsupported;
@@ -651,6 +675,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
@@ -659,6 +684,14 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+            }
+
+            fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
+                if (!internal_keys.isRelationalRowKey(key)) return;
+                const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                defer self.alloc.free(dirty);
+                const token = internal_keys.relationalColumnarDirtyToken(value);
+                try self.put(dirty, &token);
             }
 
             fn invalidateColumns(self: @This(), key: []const u8) anyerror!void {
@@ -725,6 +758,7 @@ pub const DocStore = struct {
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
                 .columns_invalidated = &self.columns_invalidated,
+                .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
             };
@@ -1089,6 +1123,7 @@ pub const DocStore = struct {
             .runtime => .{
                 .alloc = self.alloc,
                 .runtime = try self.runtime_store.beginBatchWithOptions(options),
+                .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
             },
         };
     }
@@ -3184,6 +3219,72 @@ test "docstore indexes replay rows by hint and truncates them" {
         alloc.free(after);
     }
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try std.testing.expect(txn.unordered_bulk_append_puts);
+        for (0..256) |i| {
+            var id_buf: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+            const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+            defer alloc.free(key);
+            try txn.appendPut(key, id);
+        }
+        try batch.commit();
+    }
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    for (0..256) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+        const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        const value = try store.get(alloc, key);
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings(id, value);
+        const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+        defer alloc.free(dirty);
+        const token = try store.get(alloc, dirty);
+        defer alloc.free(token);
+        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyToken(id), token);
+    }
+    const key = try internal_keys.relationalRowKeyAlloc(alloc, "row:0000");
+    defer alloc.free(key);
+    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+    defer alloc.free(dirty);
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try txn.appendPut(key, "first");
+        try txn.appendPut(key, "last");
+        try batch.commit();
+    }
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        defer batch.abort();
+        try batch.asTxn().appendPut(key, "aborted");
+    }
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("last", value);
+    const token = try store.get(alloc, dirty);
+    defer alloc.free(token);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyToken("last"), token);
 }
 
 test "docstore runtime point get does not clone mutable snapshot" {

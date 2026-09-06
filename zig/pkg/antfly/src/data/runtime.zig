@@ -1450,6 +1450,7 @@ const RaftTableApplyStateMachine = struct {
         decision_conflict,
         txn_not_found,
         transaction_too_large,
+        invalid_batch_request,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             return switch (err) {
@@ -1458,6 +1459,10 @@ const RaftTableApplyStateMachine = struct {
                 error.DecisionConflict => .decision_conflict,
                 error.TxnNotFound => .txn_not_found,
                 error.TransactionTooLarge => .transaction_too_large,
+                // Public/physical schema validation is a deterministic result
+                // of the replicated command. Retrying it cannot repair input.
+                // Storage corruption and resource pressure remain retryable.
+                error.InvalidBatchRequest => .invalid_batch_request,
                 else => null,
             };
         }
@@ -1469,6 +1474,7 @@ const RaftTableApplyStateMachine = struct {
                 .decision_conflict => error.DecisionConflict,
                 .txn_not_found => error.TxnNotFound,
                 .transaction_too_large => error.TransactionTooLarge,
+                .invalid_batch_request => error.InvalidBatchRequest,
             };
         }
     };
@@ -23111,6 +23117,7 @@ test "data raft apply records transaction conflicts without stopping replica pro
                     .table_id = 7,
                     .name = "docs",
                     .placement_role = "data",
+                    .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"keyword\"},\"embedding\":{\"type\":\"embedding\"}},\"additionalProperties\":false}}}}",
                 }})[0..]),
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
                     .group_id = group_id,
@@ -23327,6 +23334,32 @@ test "data raft apply records transaction conflicts without stopping replica pro
     try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
+
+    // Physical validation can reject input after proposal (f64 JSON fits the
+    // public embedding contract but overflows its canonical f32 encoding).
+    // It must report a rejection and let both abort and subsequent work pass.
+    const invalid = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:invalid", .value = "{\"embedding\":[1e100]}" }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_a, .topology_epoch = 1 } },
+    });
+    defer alloc.free(invalid);
+    const abort_invalid = try data_raft_batch.encode(alloc, "docs", .{
+        .transaction = .{ .resolve = .{ .txn_id = txn_a, .status = .aborted, .commit_version = 201 } },
+    });
+    defer alloc.free(abort_invalid);
+    const after_validation = [_]raft_engine.core.Entry{
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = invalid },
+        .{ .term = 2, .index = 14, .entry_type = .normal, .data = abort_invalid },
+        .{ .term = 2, .index = 15, .entry_type = .normal, .data = write_e },
+    };
+    for (13..16) |index| try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_validation, &.{});
+    try std.testing.expectEqual(@as(u64, 15), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(error.InvalidBatchRequest, apply_sm.takeApplyOutcome(group_id, 13).?.failed.toError());
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 14).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 15).?);
+    try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ResourceBudgetExceeded));
+    try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
 }
 
 test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
