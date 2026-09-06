@@ -2975,7 +2975,21 @@ pub const CompiledPatternFilter = union(enum) {
         geo_bbox: std.json.Value,
         geo_shape: std.json.Value,
 
-        fn matches(self: FieldPredicate, alloc: Allocator, values: []const std.json.Value) !bool {
+        /// Conservative zone-map test in the same numeric domain as the row
+        /// predicate. Equality is retained at exclusive boundaries so pruning
+        /// can never remove a matching row through floating-point rounding.
+        pub fn mayMatchNumericBounds(self: FieldPredicate, minimum: f64, maximum: f64) !bool {
+            if (self != .numeric_range) return true;
+            const range = self.numeric_range;
+            _ = try jsonValuesContainNumericRange(&.{}, range);
+            if (range.object.get("min")) |value|
+                if (maximum < try jsonNumberFromValue(value)) return false;
+            if (range.object.get("max")) |value|
+                if (minimum > try jsonNumberFromValue(value)) return false;
+            return true;
+        }
+
+        pub fn matches(self: FieldPredicate, alloc: Allocator, values: []const std.json.Value) !bool {
             return switch (self) {
                 .term => |value| jsonValuesContainTerm(values, value),
                 .terms => |terms| jsonValuesContainAnyTerm(values, terms),

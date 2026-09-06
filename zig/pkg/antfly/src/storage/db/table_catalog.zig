@@ -17,9 +17,10 @@ const schema_mod = @import("../schema.zig");
 const row_codec = @import("algebraic/relational_row_codec.zig");
 
 pub const key = "\x00\x00__metadata__:table_catalog";
-pub const encoded_len: usize = 40;
+pub const encoded_len: usize = 48;
 const magic = "ATBL";
-const format_version: u32 = 1;
+const format_version: u32 = 2;
+pub const default_transaction_admission_bytes: u64 = 128 * 1024 * 1024;
 
 pub const IndexState = enum(u8) {
     none = 0,
@@ -44,6 +45,9 @@ pub const Catalog = struct {
     generation: u64 = 0,
     index_state: IndexState = .none,
     reconciled: bool = false,
+    /// Logical command policy, replicated with the table rather than inferred
+    /// from a replica's local memory envelope. Local pressure only delays apply.
+    transaction_admission_bytes: u64 = default_transaction_admission_bytes,
 
     pub fn encode(self: Catalog) [encoded_len]u8 {
         var out: [encoded_len]u8 = @splat(0);
@@ -58,6 +62,7 @@ pub const Catalog = struct {
         std.mem.writeInt(u32, out[20..24], self.row_format_version, .little);
         std.mem.writeInt(u64, out[24..32], self.row_count, .little);
         std.mem.writeInt(u64, out[32..40], self.generation, .little);
+        std.mem.writeInt(u64, out[40..48], self.transaction_admission_bytes, .little);
         return out;
     }
 
@@ -78,7 +83,9 @@ pub const Catalog = struct {
             .row_format_version = std.mem.readInt(u32, data[20..24], .little),
             .row_count = row_count,
             .generation = std.mem.readInt(u64, data[32..40], .little),
+            .transaction_admission_bytes = std.mem.readInt(u64, data[40..48], .little),
         };
+        if (catalog.transaction_admission_bytes == 0) return error.InvalidTableCatalog;
         if (catalog.schema_format_version != schema_mod.storage_format_version or
             catalog.row_format_version != row_codec.ordinal_version)
             return error.UnsupportedTableCapabilityVersion;

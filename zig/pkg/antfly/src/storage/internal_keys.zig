@@ -24,6 +24,12 @@ pub const replay_all_kind: u8 = 0xfe;
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
+pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
+
+pub fn invalidatesRelationalColumns(key: []const u8) bool {
+    return isRelationalRowKey(key) or std.mem.eql(u8, key, "\x00\x00__metadata__:table_catalog") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:schema");
+}
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;

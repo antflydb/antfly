@@ -1119,7 +1119,18 @@ pub const LookupResult = struct {
     }
 };
 
+pub const ColumnarScanStats = struct {
+    used: bool = false,
+    blocks_read: u64 = 0,
+    blocks_pruned: u64 = 0,
+    columns_read: u64 = 0,
+    encoded_bytes_read: u64 = 0,
+    rows_selected: u64 = 0,
+};
+
 pub const ScanOptions = struct {
+    /// Optional request-local instrumentation; never part of the wire format.
+    columnar_stats: ?*ColumnarScanStats = null,
     inclusive_from: bool = false,
     exclusive_to: bool = false,
     include_documents: bool = false,

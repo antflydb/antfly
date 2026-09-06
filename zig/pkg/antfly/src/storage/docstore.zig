@@ -428,6 +428,7 @@ pub const DocStore = struct {
         current_scan: ?backend_erased.CurrentScanTxn = null,
         write: ?backend_erased.WriteTxn = null,
         portable_import_reader_owner: ?*DocStore = null,
+        columns_invalidated: bool = false,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -527,6 +528,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.put(self.dbi, key, value, .{});
@@ -537,6 +539,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.delete(self.dbi, key);
@@ -544,6 +547,15 @@ pub const DocStore = struct {
                 }
             }
             try self.write.?.delete(key);
+        }
+
+        fn invalidateColumns(self: *Txn, key: []const u8) anyerror!void {
+            if (self.columns_invalidated or !internal_keys.invalidatesRelationalColumns(key)) return;
+            self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.columns_invalidated = true;
         }
 
         pub fn cursor(self: *Txn) !LmdbCursor {
@@ -583,12 +595,14 @@ pub const DocStore = struct {
 
     pub const Batch = struct {
         alloc: Allocator,
+        columns_invalidated: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
             alloc: Allocator,
+            columns_invalidated: *bool,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
             runtime: ?*backend_erased.Batch = null,
@@ -618,6 +632,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.put(self.dbi, key, value, .{});
@@ -628,6 +643,7 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw != null) return error.Unsupported;
                 }
@@ -635,6 +651,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.delete(self.dbi, key);
@@ -642,6 +659,15 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+            }
+
+            fn invalidateColumns(self: @This(), key: []const u8) anyerror!void {
+                if (self.columns_invalidated.* or !internal_keys.invalidatesRelationalColumns(key)) return;
+                self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.columns_invalidated.* = true;
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
@@ -698,6 +724,7 @@ pub const DocStore = struct {
             return .{
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
+                .columns_invalidated = &self.columns_invalidated,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
             };

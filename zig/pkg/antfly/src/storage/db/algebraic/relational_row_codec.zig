@@ -760,7 +760,7 @@ pub fn materializeOrdinalDocumentWithLayoutAlloc(
     return .{ .json = try out.toOwnedSlice(alloc), .root = root, .root_arena = root_arena };
 }
 
-fn ownedJsonValueFromCellAlloc(
+pub fn ownedJsonValueFromCellAlloc(
     alloc: Allocator,
     column: runtime_schema.RelationalColumn,
     cell: Cell,

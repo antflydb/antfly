@@ -1868,19 +1868,11 @@ pub const DBCore = struct {
         predicates: []const transactions_mod.VersionPredicate,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !void {
-        var manager = try self.initTxnManager();
+        var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
         defer manager.deinit();
         var bound = extra_batch;
-        if (bound.max_intent_admission_bytes == 0) {
-            const capacity = if (self.index_manager.resource_manager) |resources|
-                resources.memoryHardLimitForSlice(.relational_preparation_working_set)
-            else
-                256 * 1024 * 1024;
-            // Leave half the slice for immutable schema compilation, replay,
-            // and effects selected by the current index plan. Zero is the
-            // ResourceManager convention for an unlimited slice.
-            bound.max_intent_admission_bytes = @max(1, if (capacity == 0) 128 * 1024 * 1024 else capacity / 2);
-        }
+        if (bound.max_intent_admission_bytes == 0)
+            bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
         try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);

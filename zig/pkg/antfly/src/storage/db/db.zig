@@ -244,6 +244,7 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
+const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -5000,6 +5001,9 @@ pub const DB = struct {
     quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    relational_columns_building: std.atomic.Value(bool) = .init(false),
+    relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
+    relational_columns_observed_sequence: u64 = 0,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -9139,13 +9143,14 @@ pub const DB = struct {
                 preprepared_rows.?[i] = null;
                 break :blk prepared;
             } else if (apply_schema_view) |view|
-                try mapper.PreparedRelationalWrite.init(
+                try mapper.PreparedRelationalWrite.initFromIntent(
                     self.alloc,
                     write.key,
                     write.value,
                     view.validator(),
                     view.tableSchema().*,
                     view.physicalLayout(),
+                    if (opts.durable_rows) |durable| durable.get(write.key) else null,
                 )
             else
                 null;
@@ -23101,7 +23106,7 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
-        try prepareTransactionRows(preparation_alloc, prepared_intents, view);
+        try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -23109,6 +23114,7 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, predicates, .{
+            .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
         });
     }
@@ -23227,7 +23233,7 @@ pub const DB = struct {
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
         defer freePreparedIntentRows(preparation_alloc, intents.items);
-        try prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -23246,10 +23252,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null } },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
             });
         }
@@ -23274,24 +23281,75 @@ pub const DB = struct {
     }
 
     fn freePreparedIntentRows(alloc: Allocator, intents: []const transactions_mod.WriteIntent) void {
-        for (intents) |intent| if (intent.prepared_row) |row| alloc.free(@constCast(row));
+        for (intents) |intent| if (intent.prepared_row) |row| {
+            alloc.free(@constCast(row));
+            alloc.free(@constCast(intent.value.?));
+        };
     }
 
     fn prepareTransactionRows(
+        self: *DB,
         alloc: Allocator,
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
         const view = schema_view orelse return;
         if (view.storageMode() != .relational) return;
-        for (intents) |*intent| {
-            if (isMetadataKey(intent.key)) continue;
-            const value = intent.value orelse continue;
-            var row = try mapper.PreparedRelationalWrite.init(alloc, intent.key, value, view.validator(), view.tableSchema().*, view.physicalLayout());
-            defer row.deinit(alloc);
-            try row.finalizeMetadata(0);
-            intent.prepared_row = row.takePackedRow();
-        }
+        const Context = struct {
+            alloc: Allocator,
+            intents: []transactions_mod.WriteIntent,
+            view: schema_registry_mod.SchemaView,
+            io: std.Io,
+            next: std.atomic.Value(usize) = .init(0),
+            failed: std.atomic.Value(bool) = .init(false),
+            mutex: std.Io.Mutex = .init,
+            failure: ?anyerror = null,
+
+            fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
+                if (isMetadataKey(intent.key)) return;
+                const value = intent.value orelse return;
+                var row = try mapper.PreparedRelationalWrite.initWithTransientParse(ctx.alloc, scratch, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout());
+                defer row.deinit(ctx.alloc);
+                try row.finalizeMetadata(0);
+                var specials = std.json.ObjectMap.empty;
+                defer specials.deinit(scratch);
+                const root = row.parsedValue();
+                for ([_][]const u8{ "_edges", "_embeddings" }) |field|
+                    if (root.object.get(field)) |special| try specials.put(scratch, field, special);
+                const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
+                intent.prepared_row = row.takePackedRow();
+                intent.value = sidecar;
+            }
+
+            fn run(ctx: *@This()) void {
+                var scratch = std.heap.ArenaAllocator.init(ctx.alloc);
+                defer scratch.deinit();
+                while (!ctx.failed.load(.acquire)) {
+                    const index = ctx.next.fetchAdd(1, .monotonic);
+                    if (index >= ctx.intents.len) return;
+                    ctx.prepare(scratch.allocator(), &ctx.intents[index]) catch |err| {
+                        ctx.mutex.lockUncancelable(ctx.io);
+                        defer ctx.mutex.unlock(ctx.io);
+                        if (ctx.failure == null) ctx.failure = err;
+                        ctx.failed.store(true, .release);
+                        return;
+                    };
+                    _ = scratch.reset(.retain_capacity);
+                }
+            }
+        };
+        const io = self.backend_runtime.io();
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse std.Options.debug_io };
+        var input_bytes: usize = 0;
+        for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
+        const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
+        if (io != null and workers > 1) {
+            var group: std.Io.Group = .init;
+            for (1..workers) |_| group.async(io.?, Context.run, .{&ctx});
+            ctx.run();
+            try group.await(io.?);
+        } else ctx.run();
+        if (ctx.failure) |err| return err;
     }
 
     // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned
@@ -26493,7 +26551,30 @@ pub const DB = struct {
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                 continue;
             };
+            // Wait for a quiet maintenance interval instead of repeatedly
+            // rewriting disposable generations during continuous ingestion.
+            const sequence = self.core.store.lastReplaySequence(0);
+            if (sequence == self.relational_columns_observed_sequence)
+                _ = self.rebuildRelationalColumns() catch {};
+            self.relational_columns_observed_sequence = sequence;
         }
+    }
+
+    /// Build disposable table-owned column blocks without holding the apply
+    /// lock. The store's atomic primary-mutation fence governs publication.
+    pub fn rebuildRelationalColumns(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        var view = self.core.acquireSchemaView() orelse return false;
+        defer view.release();
+        if (view.storageMode() != .relational) return false;
+        if (self.relational_columns_building.swap(true, .acq_rel)) return false;
+        defer self.relational_columns_building.store(false, .release);
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        const force = self.relational_columns_rebuild_requested.swap(false, .acq_rel);
+        errdefer if (force) self.relational_columns_rebuild_requested.store(true, .release);
+        return relational_columns.rebuild(self, preparation.guard.allocator(), force) catch |err| return preparation.mapError(err);
     }
 
     fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
@@ -32184,6 +32265,23 @@ pub const DB = struct {
             .artifact_catalog = if (artifact_catalog) |*artifact_snapshot| artifact_snapshot else null,
         };
 
+        var columnar_progress: relational_columns.Progress = .{};
+        defer columnar_progress.last_key.deinit(alloc);
+        const accelerated = if (schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null) catch |err| switch (err) {
+            error.InvalidColumnSegment, error.InvalidData, error.NotFound => blk: {
+                if (columnar_progress.callback_failed) return err;
+                // Disposable derived corruption never makes valid primary rows
+                // unreadable. Resume in the same snapshot after the last row
+                // actually delivered, preserving limits and avoiding duplicates.
+                self.relational_columns_rebuild_requested.store(true, .release);
+                break :blk false;
+            },
+            else => return err,
+        } else false;
+        if (accelerated) return;
+        var fallback_opts = opts;
+        if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
+
         const ScanState = struct {
             const max_resident_schema_plans = 32;
             const SchemaPlan = struct {
@@ -32223,6 +32321,7 @@ pub const DB = struct {
             transient_schema_plan: ?SchemaPlan = null,
             visitor: types.ScanVisitor,
             count: u32 = 0,
+            resume_after_key: ?[]const u8 = null,
 
             fn deinit(state: *@This()) void {
                 if (state.transient_schema_plan) |*plan| plan.deinit();
@@ -32335,6 +32434,8 @@ pub const DB = struct {
                     store_key,
                 )) orelse
                     return .@"continue";
+
+                if (state.resume_after_key) |key| if (std.mem.order(u8, raw_key, key) != .gt) return .@"continue";
 
                 if (!state.byte_range.contains(raw_key)) return .@"continue";
                 if (state.from_key.len > 0 and !state.opts.inclusive_from and std.mem.eql(u8, raw_key, state.from_key))
@@ -32457,9 +32558,9 @@ pub const DB = struct {
             .db = self,
             .alloc = alloc,
             .byte_range = byte_range,
-            .from_key = from_key,
+            .from_key = if (columnar_progress.delivered != 0) columnar_progress.last_key.items else from_key,
             .to_key = to_key,
-            .opts = opts,
+            .opts = fallback_opts,
             .ttl_duration_ns = ttl_duration_ns,
             .now_ns = scan_now_ns,
             .filter = if (prepared_filter) |*filter| filter else null,
@@ -32468,12 +32569,16 @@ pub const DB = struct {
             .projection_context = &projection_context,
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
             .visitor = visitor,
+            .count = columnar_progress.delivered,
+            .resume_after_key = if (columnar_progress.delivered != 0) columnar_progress.last_key.items else null,
         };
         defer state.deinit();
         try state.checkActive();
+        const resume_lower = if (columnar_progress.delivered != 0) try self.core.documentRangeLowerAlloc(columnar_progress.last_key.items) else null;
+        defer if (resume_lower) |key| self.core.alloc.free(key);
         try self.core.store.scanReadTxnWithContext(
             &read_txn,
-            lower,
+            resume_lower orelse lower,
             if (upper) |buf| buf else "",
             .{},
             &state,
@@ -62062,6 +62167,9 @@ test "relational cumulative prepares remain committable within the preparation e
     defer db.close();
     const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
     try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    // Admission is table policy, deliberately independent of this process's
+    // working-set budget. This fixture chooses a small logical transaction cap.
+    db.core.table_catalog.transaction_admission_bytes = 1024 * 1024;
     const payload: [1024]u8 = @splat('x');
     const document = try std.fmt.allocPrint(alloc, "{{\"body\":\"{s}\"}}", .{payload});
     defer alloc.free(document);
@@ -62081,6 +62189,42 @@ test "relational cumulative prepares remain committable within the preparation e
     try std.testing.expectEqual(admitted, snapshot.writes.len);
     try db.commitTransaction(txn, 200);
     try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
+}
+
+test "relational replicated admission is identical across local memory envelopes" {
+    const alloc = std.testing.allocator;
+    for ([_]u64{ 256 * 1024, 4 * 1024 * 1024 }) |capacity| {
+        var options = resource_manager_mod.Options{ .identity_allocator = alloc };
+        options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
+        var resources = resource_manager_mod.ResourceManager.init(options);
+        defer resources.deinit(alloc);
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        db.core.table_catalog.transaction_admission_bytes = 12 * 1024;
+        const catalog = db.core.table_catalog.encode();
+        try db.core.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &catalog }}, &.{});
+        const txn = try db.beginTransaction(100);
+        try db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
+        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        var intents = try db.core.collectTransactionIntentBatch(alloc, txn);
+        defer intents.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), intents.writes.len);
+        // The logical row is stored once, as AROW. Only API-only special
+        // fields remain in the sidecar; ordinary JSON is not duplicated.
+        try std.testing.expectEqualStrings("{}", intents.writes[0].value);
+        try std.testing.expect(intents.prepared_rows[0] != null);
+        try db.commitTransaction(txn, 200);
+        const row = (try db.get(alloc, "a")).?;
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings("{\"n\":1}", row);
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
+    }
 }
 
 test "relational direct intents share preparation admission before the apply fence" {
@@ -62443,6 +62587,125 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
 
     try std.testing.expectEqual(table_catalog_mod.IndexState.ready, db.core.table_catalog.index_state);
     try std.testing.expectEqual(@as(u8, 0), db.schema_index_reconcile_state.load(.acquire));
+}
+
+test "relational columnar generations preserve scans and invalidate on primary mutations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .integer },
+        .{ .name = "tag", .path = "tag", .column_type = .string, .allows_null = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(types.BatchWrite, 601);
+    writes[0] = .{ .key = "", .value = "{\"n\":-1}" };
+    for (writes[1..], 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "row:{d:0>4}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d}{s}}}", .{ i, switch (i % 3) {
+            0 => ",\"tag\":null",
+            1 => ",\"tag\":\"yes\"",
+            else => "",
+        } }),
+    };
+    try db.batch(.{ .writes = writes, .timestamp_ns = 100 });
+    const filters = [_][]const u8{
+        "",                                                                                                                      "{\"numeric_range\":{\"field\":\"n\",\"min\":597}}",
+        "{\"term\":{\"tag\":\"yes\"}}",                                                                                          "{\"term\":{\"tag\":null}}",
+        "{\"bool\":{\"must\":[{\"numeric_range\":{\"field\":\"n\",\"min\":250}}],\"must_not\":[{\"term\":{\"tag\":\"yes\"}}]}}",
+    };
+    const results = try alloc.alloc(types.ScanResult, filters.len);
+    defer alloc.free(results);
+    var initialized: usize = 0;
+    defer for (results[0..initialized]) |*result| result.deinit(alloc);
+    for (filters, 0..) |filter, i| {
+        results[i] = try db.scan(alloc, "row:0000", "row:0599", .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "tag" }, .filter_query_json = filter, .inclusive_from = false, .exclusive_to = false });
+        initialized += 1;
+    }
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expect(!try db.rebuildRelationalColumns());
+    var columnar_stats: types.ColumnarScanStats = .{};
+    var pruned = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":597}}", .columnar_stats = &columnar_stats });
+    defer pruned.deinit(alloc);
+    try std.testing.expect(columnar_stats.used);
+    try std.testing.expectEqual(@as(u64, 3), columnar_stats.blocks_read);
+    try std.testing.expectEqual(@as(u64, 2), columnar_stats.blocks_pruned);
+    try std.testing.expectEqual(@as(u64, 1), columnar_stats.columns_read);
+    try std.testing.expectEqual(@as(u64, 3), columnar_stats.rows_selected);
+    var resumed_stats: types.ColumnarScanStats = .{};
+    var resumed = try db.scan(alloc, "row:0597", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .columnar_stats = &resumed_stats });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.documents.len);
+    try std.testing.expect(resumed_stats.used);
+    try std.testing.expectEqual(@as(u64, 1), resumed_stats.blocks_read);
+    for (filters, 0..) |filter, i| {
+        var result = try db.scan(alloc, "row:0000", "row:0599", .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "tag" }, .filter_query_json = filter, .inclusive_from = false, .exclusive_to = false });
+        defer result.deinit(alloc);
+        try std.testing.expectEqualDeep(results[i].documents, result.documents);
+        try std.testing.expectEqualDeep(results[i].hashes, result.hashes);
+    }
+    const broken_column = "\x00\x00__columnar__:blocks:0000000000000001:0000000000000001:c00000000";
+    const corrupt = try db.core.store.get(alloc, broken_column);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try db.core.store.put(broken_column, corrupt);
+    var empty_key_scan = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"term\":{\"n\":-1}}" });
+    defer empty_key_scan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), empty_key_scan.documents.len);
+    try std.testing.expectEqualStrings("", empty_key_scan.documents[0].id);
+    var recovered_scan = try db.scan(alloc, "row:0000", "row:0599", .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "tag" }, .inclusive_from = false, .exclusive_to = false });
+    defer recovered_scan.deinit(alloc);
+    // Failure occurs after block zero was delivered. Fallback must resume,
+    // not duplicate that prefix or lose rows at the block boundary.
+    try std.testing.expectEqualDeep(results[0].documents, recovered_scan.documents);
+    try std.testing.expect(db.relational_columns_rebuild_requested.load(.acquire));
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    const Callback = struct {
+        calls: usize = 0,
+        fn visit(ptr: ?*anyopaque, _: types.ScanVisitEntry) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            return error.NotFound;
+        }
+    };
+    var callback: Callback = .{};
+    try std.testing.expectError(error.NotFound, db.scanVisit(alloc, "", "", .{}, .{ .context = &callback, .visit = Callback.visit }));
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    var snapshot = try db.core.store.beginReadTxn();
+    defer snapshot.abort();
+    _ = try snapshot.get(internal_keys.relational_columnar_manifest_key);
+    try db.batch(.{ .writes = &.{.{ .key = "row:0000", .value = "{\"n\":900}" }}, .deletes = &.{"row:0001"} });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key));
+    // Readers that already pinned the old generation keep its manifest and rows.
+    _ = try snapshot.get(internal_keys.relational_columnar_manifest_key);
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    var updated = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":800}}" });
+    defer updated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), updated.documents.len);
+    try std.testing.expectEqualStrings("{\"n\":900}", updated.documents[0].json);
+    try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key));
+    const Race = struct {
+        fn mutate(ptr: *anyopaque) anyerror!void {
+            const owner: *DB = @ptrCast(@alignCast(ptr));
+            try owner.batch(.{ .writes = &.{.{ .key = "row:0000", .value = "{\"n\":901}" }} });
+        }
+    };
+    relational_columns.test_before_publish = .{ .context = &db, .run = Race.mutate };
+    defer relational_columns.test_before_publish = null;
+    try std.testing.expect(!try db.rebuildRelationalColumns());
+    relational_columns.test_before_publish = null;
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.relational_columnar_manifest_key));
+    db.artifact_repair_metadata_stop.store(true, .release);
+    try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
+    db.artifact_repair_metadata_stop.store(false, .release);
+    try std.testing.expect(try db.rebuildRelationalColumns());
 }
 
 test "db relational mode stores authoritative packed rows across reopen scan and delete" {

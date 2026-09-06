@@ -216,12 +216,16 @@ relational commit retires only the known intent/lock keys without rereading
 payloads. Schema and index generation checks still apply to ordinary writes;
 index-plan checks also apply to transactions pinned to an older schema.
 
-Prepare persists the canonical AROW alongside the original logical request in
-a tagged intent envelope. Physical representability (including finite f32
-embeddings) is checked before the durable vote. Commit reuses that row instead
+Prepare persists the canonical AROW alongside a sidecar containing only
+API-only `_edges`/`_embeddings` fields in a tagged intent envelope. Ordinary
+columns are stored once, not duplicated as JSON. Physical representability
+(including finite f32 embeddings) is checked before the durable vote. Commit reuses that row instead
 of repeating schema validation, semantic hashing, and physical encoding. The
-JSON is retained only for effects selected by the current index plan; it is
-not a second authoritative document. Recovery copies the verified AROW and
+commit root comes directly from typed cells; only JSON-typed columns and the
+special-field sidecar require JSON parsing. Legacy index consumers receive a
+logical rendering, while ordinal consumers use the typed view. Transaction
+preparation uses bounded `std.Io` tasks and resettable worker scratch. Recovery
+copies the verified AROW and
 finalizes its timestamp without parsing JSON. Both paths own a single intent
 snapshot through revision-fenced resolution and charge the same resource slice.
 The recovery-context mutex uses `std.Io` and protects only a short context copy,
@@ -235,17 +239,22 @@ not double-charge. This removes whole-manifest rewrites across incremental
 prepares. Released document transactions with the previous manifest pay one
 conversion pass; there is no compatibility format for earlier PR-only rows.
 
-Credits conservatively allow 64 bytes of working space per retained JSON/AROW
-byte, 16 per key byte, and 4096 per row. The transaction ceiling is half the
-smaller configured node/preparation hard limit (128 MiB of credits when neither
-is configured), leaving headroom for schemas and commit effects. Admission
-uses configured capacity, not transient free memory. Oversized additions fail
+Credits conservatively allow 64 bytes of working space per retained sidecar/AROW
+byte, 16 per key byte, and 4096 per row. The logical ceiling is persisted in the
+table catalog (128 MiB of credits by default), independent of each replica's
+memory configuration. Replacements and duplicate keys are coalesced before
+payload envelopes are allocated, and those allocations share the request's
+tracked preparation budget. Oversized additions fail
 before voting with `TransactionTooLarge` (HTTP 413); shrinking and identical
 retries remain allowed after a limit reduction. Temporary contention still
-returns retryable `ResourceBudgetExceeded`. These are conservative admission
+returns retryable `ResourceBudgetExceeded`; it cannot change the replicated
+transaction decision. Raft records `TransactionTooLarge` as a command result
+and continues applying subsequent entries, including the coordinator's abort.
+These are conservative admission
 credits, not a guarantee against arbitrary generated-index expansion or a
 subsequent reduction of the node memory limit. Larger transactions require a
-larger resource envelope; spillable atomic commit remains future work.
+larger execution envelope within the catalog's logical ceiling; spillable atomic
+commit remains future work.
 
 Field-backed dense indexes consume the prepared row's typed ordinal view.
 Decimal vector elements round directly to f32 once, so foreground indexing,
@@ -339,20 +348,24 @@ the canonical decimal domain without a floating-point tolerance.
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
-**Columnar-index integration seam:** `TypedDocValuesWriter` is a segment-level
-accumulator (all rows in a segment → one `build()`), not a per-document store.
-The accelerator must therefore be table-owned hidden derived state, rather than
-being duplicated into whichever user text index happens to exist. Prepared rows
-feed per-column writers directly from their typed ordinal cells, alongside a
-null bitmap; no JSON projection or reparsing belongs in this path. The typed
+**Table-owned column accelerator:** `relational_columns.zig` streams a pinned
+primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
+1 MiB of source rows (an individual large row remains subject to the request
+budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
+alongside a null bitmap; no JSON projection or reparsing belongs in this build path. The typed
 value stream identifies present values, the null bitmap identifies explicit
 nulls, and membership in neither means the column was absent.
 
-Column segments are bound to the table generation, schema layout version, and a
-covered primary-store sequence. Insert/update/delete publication uses the same
-durable replay boundary as the other derived families. A replacement generation
-is built in the background and becomes readable only after its coverage fence
-is durable; until then, reads fall back to AROW. This keeps one row authority,
+Column segments carry schema epochs, null state, and numeric min/max summaries.
+A manifest records generation and covered replay sequence. Every primary-row
+or schema/catalog mutation atomically invalidates that manifest, including raw
+recovery mutations that do not append replay. Background maintenance waits for
+a quiet replay interval, then stages a replacement generation; a racing write
+stops the build at a block boundary or rejects final publication. Publication
+uses an atomic write transaction and is also fenced against whole-store
+namespace replacement. Until publication, reads fall back to AROW. Retired and
+abandoned generations are reclaimed in bounded batches without invalidating
+already-pinned MVCC readers. This keeps one row authority,
 makes schema changes and crash recovery explicit, and prevents a user-visible
 index configuration from controlling SQL/relational scan performance.
 
@@ -386,6 +399,19 @@ executors that do not implement streaming retain the bounded row-paged fallback.
 Table-owned `typed_doc_values` remain a complementary accelerator for broad
 range scans and aggregations. They are not required for direct AROW projection
 or filtering and never become a second row authority.
+
+Covered scans evaluate flat-field predicates column-at-a-time, prune disjoint
+numeric ranges using block summaries, and fetch projection columns only for
+blocks with surviving rows. A sparse row-key directory lets resumed and bounded
+scans seek directly to their starting block. Positive top-level projections and hash-only scans
+avoid primary-row reads. Nested/special/full-document selections retain AROW
+fallback. Block and manifest checksums protect derived bytes; corruption resumes
+the same snapshot's primary scan after the last delivered key and requests a
+rebuild. Request-local `ColumnarScanStats` exposes blocks read/pruned, columns and
+encoded bytes read, and selected rows. The current publication unit is a whole
+generation: sustained-write workloads use AROW until a quiet build completes;
+incremental dirty-block replay and dedicated columnar aggregate/sort kernels
+remain further optimizations, not prerequisites for correctness.
 
 API-bound and Raft portable restores select the unpublished, one-pass importer.
 The request's semantic cancellation token reaches the block loop, and bound
@@ -444,16 +470,14 @@ physical representation and backfill plan are compatible.
 - **Phase 3 — ordinal execution (complete).** Compiled predicate/projection
   plans, physical-header TTL, and direct-ordinal vector extraction avoid full
   document reconstruction on the relational hot paths.
-- **Phase 4 — table-owned typed-column persistence (optional accelerator).**
-  Feed per-column `TypedDocValuesWriter` accumulation from `PreparedRow` cells,
-  persist null bitmaps and coverage metadata, and publish through a durable
-  generation state machine (see "Columnar-index integration seam" above).
-- **Phase 5 — segment columnar scan + predicate pushdown.** Table-scan operator over
-  `typed_doc_values`; route typed-column predicates to it; columnar projection
-  on read.
-- **Phase 6 — unified columnar reads.** Serve projections from segment columns
-  when available and fall back to the authoritative packed base row. There is
-  no retained whole-document JSON blob for relational rows today.
+- **Phase 4 — table-owned typed-column persistence (implemented).** Bounded,
+  staged generations, null bitmaps, checksums, coverage fences, and reclamation.
+- **Phase 5 — columnar scan and predicate pushdown (implemented for flat fields).**
+  Column-at-a-time evaluation, numeric zone maps, and late projection loading.
+- **Phase 6 — unified reads (implemented for positive top-level projections).**
+  Covered scans use columns; unsupported selections and uncovered generations
+  use authoritative AROW. Incremental maintenance and specialized aggregate/sort
+  execution can extend this without introducing another row authority.
 
 ## Related docs
 

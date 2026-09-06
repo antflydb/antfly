@@ -321,6 +321,20 @@ pub const PreparedRelationalWrite = struct {
         );
     }
 
+    /// Transaction preparation consumes the parsed root before resetting its
+    /// worker arena; only the packed row and extracted side effects survive.
+    pub fn initWithTransientParse(
+        alloc: Allocator,
+        scratch: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null);
+    }
+
     /// Split transient parse ownership from retained row ownership. Batch
     /// workers parse into their resettable scratch arena while the packed row
     /// and extracted effects land in the worker's retained output region. The
@@ -338,7 +352,25 @@ pub const PreparedRelationalWrite = struct {
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
     ) !PreparedRelationalWrite {
-        var parsed = try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
+        var intent_digest: ?document_content_hash.Digest = null;
+        var parsed = if (durable_row) |bytes| blk: {
+            if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
+            intent_digest = try relational_row_codec.rowSemanticHash(bytes);
+            const row = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
+            var logical = try row.materializeRootAlloc(parse_alloc);
+            errdefer logical.deinit(parse_alloc);
+            // Only API-only special fields accompany the authoritative typed
+            // row. Ordinary columns are never persisted or parsed as JSON a
+            // second time. JSON-typed columns retain their own JSON semantics.
+            const special = try std.json.parseFromSliceLeaky(std.json.Value, logical.root_arena.allocator(), document_json, .{ .parse_numbers = false });
+            if (special != .object) return error.InvalidTxnRecord;
+            var fields = special.object.iterator();
+            while (fields.next()) |field| {
+                if (!isSpecialField(field.key_ptr.*)) return error.InvalidTxnRecord;
+                try logical.root.object.put(logical.root_arena.allocator(), field.key_ptr.*, field.value_ptr.*);
+            }
+            break :blk std.json.Parsed(std.json.Value){ .arena = logical.root_arena, .value = logical.root };
+        } else try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
         errdefer parsed.deinit();
         if (durable_row == null) if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
 
@@ -351,6 +383,10 @@ pub const PreparedRelationalWrite = struct {
             true,
         );
         errdefer extracted.deinit(alloc);
+        if (durable_row != null and !parsed.value.object.contains("_edges") and !parsed.value.object.contains("_embeddings")) {
+            extracted.cleaned_value = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+            extracted.cleaned_value_owned = true;
+        }
         // This recursive retained-size estimate is used only to budget a parsed
         // tree that survives into full-text publication. Most relational writes
         // do not target a text index, so keep their preparation to validation,
@@ -362,14 +398,11 @@ pub const PreparedRelationalWrite = struct {
         // Verify their checksum and identity, but do not validate, hash, or
         // encode their logical content again during commit/recovery.
         if (durable_row) |bytes| {
-            if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
-            const digest = try relational_row_codec.rowSemanticHash(bytes);
-            _ = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
             return .{
                 .parsed = parsed,
                 .extracted = extracted,
                 .packed_row = try alloc.dupe(u8, bytes),
-                .semantic_hash = digest,
+                .semantic_hash = intent_digest.?,
                 .schema_version = table_schema.version,
             };
         }

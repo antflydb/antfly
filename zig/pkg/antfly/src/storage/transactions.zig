@@ -79,7 +79,7 @@ pub const WriteIntent = struct {
     key: []const u8,
     value: ?[]const u8, // null for deletes
     /// Schema-bound canonical AROW produced before voting prepared. The API
-    /// JSON remains available for index effects that are selected at commit.
+    /// sidecar retains only API-only special fields needed by commit effects.
     prepared_row: ?[]const u8 = null,
 };
 
@@ -223,8 +223,9 @@ pub const MutationExtraBatch = struct {
     /// Generic transaction-manager callers cannot infer a table's schema.
     schema_binding: ?SchemaBinding = null,
     /// Zero disables admission only for low-level transaction-manager users.
-    /// DB callers supply the available preparation capacity, with headroom.
+    /// DB callers supply the replicated catalog policy, never local capacity.
     max_intent_admission_bytes: u64 = 0,
+    preparation_allocator: ?Allocator = null,
 };
 
 pub const SchemaBinding = struct {
@@ -576,6 +577,8 @@ pub const TxnManager = struct {
         var admission = previous_admission orelse IntentAdmission{};
         var pending_costs = std.StringHashMapUnmanaged(u64).empty;
         defer pending_costs.deinit(self.alloc);
+        var last_intents = std.StringHashMapUnmanaged(usize).empty;
+        defer last_intents.deinit(self.alloc);
 
         // Write all intents — collect keys and values, free after putBatch
         var write_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -616,9 +619,11 @@ pub const TxnManager = struct {
             for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], std.mem.readInt(u64, write.value[0..8], .little));
         }
 
-        for (intents) |intent| {
+        // Compute the final replacement-aware ledger before allocating any
+        // payload envelopes. Repeated keys retain only their final mutation.
+        for (intents, 0..) |intent, index| {
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
-            try appendOwnedBytes(self.alloc, &write_keys, member_key);
+            defer self.alloc.free(member_key);
             const prior = if (pending_costs.get(intent.key)) |cost| cost else blk: {
                 const raw = self.getAlloc(self.alloc, member_key) catch |err| switch (err) {
                     error.NotFound => break :blk null,
@@ -636,8 +641,18 @@ pub const TxnManager = struct {
             }
             admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
             try pending_costs.put(self.alloc, intent.key, cost);
+            try last_intents.put(self.alloc, intent.key, index);
+        }
+        if (extra_batch.max_intent_admission_bytes != 0 and admission.bytes > extra_batch.max_intent_admission_bytes and
+            admission.bytes > (if (previous_admission) |previous| previous.bytes else 0))
+            return error.TransactionTooLarge;
+
+        for (intents, 0..) |intent, index| {
+            if (last_intents.get(intent.key).? != index) continue;
+            const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
+            try appendOwnedBytes(self.alloc, &write_keys, member_key);
             const member_value = try self.alloc.alloc(u8, 8);
-            std.mem.writeInt(u64, member_value[0..8], cost, .little);
+            std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
@@ -672,10 +687,6 @@ pub const TxnManager = struct {
             try appendOwnedBytes(self.alloc, &write_vals, owner);
             try writes.append(self.alloc, .{ .key = lock_key, .value = owner });
         }
-        if (extra_batch.max_intent_admission_bytes != 0 and admission.bytes > extra_batch.max_intent_admission_bytes and
-            admission.bytes > (if (previous_admission) |previous| previous.bytes else 0))
-            return error.TransactionTooLarge;
-
         record.intent_revision = std.math.add(u64, record.intent_revision, 1) catch return error.TransactionRevisionOverflow;
         // Publish the prepare vote in the same backend batch as the intents.
         // Recovery can therefore never observe intents without the durable
@@ -1131,6 +1142,9 @@ pub const TxnManager = struct {
             const intent = try IntentValue.decode(entry.value);
             var owned_value: ?[]u8 = if (intent.value) |value| try alloc.dupe(u8, value) else null;
             errdefer if (owned_value) |value| alloc.free(value);
+            // A typed intent's value is a special-field sidecar, not a logical
+            // document. Callers must use the schema-aware IntentBatch path.
+            if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
             try out.append(alloc, .{ .key = owned_key.?, .value = owned_value });
             owned_key = null;
             owned_value = null;
@@ -2454,6 +2468,32 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     const member_key = try TxnManager.makeIntentMemberKey(alloc, txn, "a");
     defer alloc.free(member_key);
     try std.testing.expectError(error.NotFound, mgr.getAlloc(alloc, member_key));
+}
+
+test "transaction admission rejects before copying payloads and coalesces duplicate keys" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const txn: TxnId = .{29} ** 16;
+    try manager.initTransaction(txn, 100);
+    const payload = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    var buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    manager.alloc = fixed.allocator();
+    defer manager.alloc = alloc;
+    const limit: MutationExtraBatch = .{ .max_intent_admission_bytes = 8192 };
+    try std.testing.expectError(error.TransactionTooLarge, manager.writeIntentsExtraBatch(txn, &.{.{ .key = "a", .value = payload }}, &.{}, limit));
+    try manager.writeIntentsExtraBatch(txn, &.{ .{ .key = "a", .value = payload }, .{ .key = "a", .value = "small" } }, &.{}, limit);
+    var snapshot = try manager.collectIntentBatch(alloc, txn);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.writes.len);
+    try std.testing.expectEqualStrings("small", snapshot.writes[0].value);
 }
 
 test "transaction intent admission releases failed allocations before voting" {

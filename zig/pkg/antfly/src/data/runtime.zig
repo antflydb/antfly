@@ -1449,6 +1449,7 @@ const RaftTableApplyStateMachine = struct {
         version_conflict,
         decision_conflict,
         txn_not_found,
+        transaction_too_large,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             return switch (err) {
@@ -1456,6 +1457,7 @@ const RaftTableApplyStateMachine = struct {
                 error.VersionConflict => .version_conflict,
                 error.DecisionConflict => .decision_conflict,
                 error.TxnNotFound => .txn_not_found,
+                error.TransactionTooLarge => .transaction_too_large,
                 else => null,
             };
         }
@@ -1466,6 +1468,7 @@ const RaftTableApplyStateMachine = struct {
                 .version_conflict => error.VersionConflict,
                 .decision_conflict => error.DecisionConflict,
                 .txn_not_found => error.TxnNotFound,
+                .transaction_too_large => error.TransactionTooLarge,
             };
         }
     };
@@ -23295,6 +23298,35 @@ test "data raft apply records transaction conflicts without stopping replica pro
     try std.testing.expectEqual(@as(u64, 9), apply_sm.appliedIndex(group_id));
     const replacement_outcome = apply_sm.takeApplyOutcome(group_id, 9) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(.unknown, replacement_outcome);
+
+    // A durable size rejection must not wedge the shard behind the rejected
+    // entry (or prevent the coordinator's later abort from applying).
+    const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    const oversized_json = try std.json.Stringify.valueAlloc(alloc, .{ .title = payload }, .{});
+    defer alloc.free(oversized_json);
+    const oversized = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:oversized", .value = oversized_json }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
+    });
+    defer alloc.free(oversized);
+    const abort = try data_raft_batch.encode(alloc, "docs", .{
+        .transaction = .{ .resolve = .{ .txn_id = txn_version, .status = .aborted, .commit_version = 200 } },
+    });
+    defer alloc.free(abort);
+    const after_limit = [_]raft_engine.core.Entry{
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = oversized },
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = abort },
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = write_e },
+    };
+    for (10..13) |index| try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_limit, &.{});
+    try std.testing.expectEqual(@as(u64, 12), apply_sm.appliedIndex(group_id));
+    const rejected = apply_sm.takeApplyOutcome(group_id, 10).?;
+    try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
 }
 
 test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
