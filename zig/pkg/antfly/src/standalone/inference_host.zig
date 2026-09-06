@@ -341,16 +341,8 @@ const RerankTextsRequest = struct {
     documents: []const []const u8,
 };
 
-const GenerateTextRequest = struct {
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-};
-
-const GenerateMessagesRequest = struct {
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-};
+const GenerateTextRequest = antfly.inference.types.GenerateTextRequest;
+const GenerateMessagesRequest = antfly.inference.types.GenerateMessagesRequest;
 
 const GenerateMessagesWithAttachmentsRequest = struct {
     model: []const u8,
@@ -958,7 +950,15 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .generate, parsed.value.contents, 0, 0, 0);
-            const result = try state.node.generateTextDirectWithControl(alloc, parsed.value.model, parsed.value.roles, parsed.value.contents, execution_control);
+            const outcome = try state.node.generateTextDirectForProvider(
+                alloc,
+                parsed.value.model,
+                parsed.value.roles,
+                parsed.value.contents,
+                parsed.value.options.max_tokens,
+                execution_control,
+            );
+            const result = try providerGenerationContent(outcome);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -971,6 +971,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parsed.value.messages,
+                parsed.value.options,
                 execution_control,
             );
             defer alloc.free(result);
@@ -1399,6 +1400,14 @@ fn checkProviderInvokeControls(context: *const inference_bridge.ProviderInvokeCo
     if (context.cancellation.requested()) return error.Canceled;
     if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
         return error.Timeout;
+}
+
+fn providerGenerationContent(outcome: inference.server.ProviderGenerationOutcome) ![]u8 {
+    return switch (outcome) {
+        .content => |content| content,
+        .incompatible_model => error.IncompatibleModel,
+        .unsupported_generator_provider => error.UnsupportedGeneratorProvider,
+    };
 }
 
 pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
@@ -2087,14 +2096,20 @@ fn localAntflyGenerateMessages(
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
+    options: antfly.inference.GenerationOptions,
     control: inference.InferenceExecutionControl,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
     const capabilities = try localModelCapabilities(node, io, model, .generate);
     const preflight = try preflightLocalGenerateMessagesInternal(messages, null, capabilities);
-    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
-    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        0,
+        std.math.cast(usize, options.max_tokens) orelse return error.InvalidGeneratorConfig,
+    );
+    var admission = try node.beginDirectGenerateAdmission(preflight, options.max_tokens);
     admission.execution_control = control;
     defer admission.deinit();
 
@@ -2104,8 +2119,15 @@ fn localAntflyGenerateMessages(
         capabilities,
         preflight,
         try localGenerateDecodedPixels(converted.messages),
+        std.math.cast(usize, options.max_tokens) orelse return error.InvalidGeneratorConfig,
     );
-    return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
+    const outcome = try node.generateMessagesDirectAdmittedForProvider(
+        alloc,
+        model,
+        converted.messages,
+        &admission,
+    );
+    return try providerGenerationContent(outcome);
 }
 
 fn localAntflyGenerateMessagesWithAttachments(
@@ -2120,7 +2142,7 @@ fn localAntflyGenerateMessagesWithAttachments(
     if (messages.len == 0) return error.InvalidGenerationRequest;
     const capabilities = try localModelCapabilities(node, io, model, .generate);
     const preflight = try preflightLocalGenerateMessagesInternal(messages, attachments, capabilities);
-    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0, 256);
     var admission = try node.beginDirectGenerateAdmission(preflight, 256);
     defer admission.deinit();
 
@@ -2130,6 +2152,7 @@ fn localAntflyGenerateMessagesWithAttachments(
         capabilities,
         preflight,
         try localGenerateDecodedPixels(converted.messages),
+        256,
     );
     return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
@@ -2138,6 +2161,7 @@ fn validateLocalGenerateCapabilities(
     capabilities: antfly.inference.work.InferenceCapabilities,
     preflight: inference.server.Node.DirectGeneratePreflight,
     decoded_pixels: u64,
+    requested_output_tokens: usize,
 ) !void {
     try capabilities.validateInvocation(.generate, .{
         .item_count = 1,
@@ -2151,7 +2175,7 @@ fn validateLocalGenerateCapabilities(
         .max_media_parts_per_item = preflight.media_count,
         .text_bytes = preflight.text_bytes,
         .max_text_bytes_per_item = preflight.text_bytes,
-        .requested_output_tokens_per_item = 256,
+        .requested_output_tokens_per_item = requested_output_tokens,
     });
 }
 
@@ -2952,7 +2976,7 @@ test "linked generator validates concrete MIME and decoded pixels" {
 
     capabilities.accepted_mime_types = .{ .text_plain = true, .image_png = true };
     const preflight = try preflightLocalGenerateMessagesInternal(&messages, null, capabilities);
-    try validateLocalGenerateCapabilities(capabilities, preflight, 0);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0, 256);
     var converted = try convertLocalGenerateMessages(
         std.testing.allocator,
         &messages,
@@ -2962,7 +2986,7 @@ test "linked generator validates concrete MIME and decoded pixels" {
     try std.testing.expectEqual(@as(u64, 6), try localGenerateDecodedPixels(converted.messages));
     try std.testing.expectError(
         error.InferenceDecodedPixelsExceeded,
-        validateLocalGenerateCapabilities(capabilities, preflight, 6),
+        validateLocalGenerateCapabilities(capabilities, preflight, 6, 256),
     );
 }
 

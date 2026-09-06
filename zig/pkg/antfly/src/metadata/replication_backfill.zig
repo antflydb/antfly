@@ -16,6 +16,7 @@ const std = @import("std");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const platform_time = @import("antfly_platform").time;
 const foreign_mod = @import("../foreign/mod.zig");
+const table_catalog_api = @import("../api/table_catalog.zig");
 const table_writes_api = @import("../api/table_writes.zig");
 const metadata_api = @import("api.zig");
 const metadata_mod = @import("domain.zig");
@@ -6599,7 +6600,13 @@ test "metadata http service live snapshot and later streaming insert through hos
             },
         },
     });
-    defer server.deinit();
+    var local_cdc_write_source: ?table_writes_api.ProvisionedTableWriteSource = null;
+    defer {
+        // The server drains its CDC jobs while the borrowed write source is
+        // still alive; only then may the fixture release the source itself.
+        server.deinit();
+        if (local_cdc_write_source) |*source| source.deinit();
+    }
     try server.start();
 
     _ = try server.svc.ensureMetadataReplica(.{
@@ -6685,11 +6692,36 @@ test "metadata http service live snapshot and later streaming insert through hos
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root, group_id);
     defer alloc.free(db_path);
 
+    // This focused hosted-service fixture has no separate data runtime to
+    // consume placement intents. Install the catalog-authorized local replica
+    // explicitly, then publish its leadership before asking CDC to route.
+    _ = try server.svc.ensureLocalReplica(.{
+        .group_id = group_id,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+    try server.campaignLocalGroup(group_id);
+    try server.runRaftRoundOnly();
+    try server.runControlRoundOnly();
+    try server.svc.refreshLocalStoreStatus();
+
+    // Hosted production CDC intentionally routes through a data service, even
+    // when the leader is co-located. This focused fixture does not start that
+    // HTTP service, so inject the equivalent catalog-authorized local executor
+    // rather than weakening production ownership checks with a path fallback.
+    local_cdc_write_source = table_writes_api.ProvisionedTableWriteSource.init(
+        replica_root,
+        table_catalog_api.CatalogSource.fromMetadataHttpService(server.svc),
+    );
+    const write_source = &local_cdc_write_source.?;
+    write_source.backend_runtime = try server.svc.ensureBackendRuntime();
+    server.setCdcWriteSource(write_source.source());
+
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         server.svc.cdc_next_round_at_ms = 0;
         try server.runRound();
-
         var check_db = try db_mod.DB.open(alloc, db_path, .{
             .open_mode = .query_readonly,
         });

@@ -6421,15 +6421,30 @@ pub const MetadataHttpService = struct {
 
     pub fn ensureMetadataReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
         if (record.group_id != self.metadata_group_id) return error.InvalidMetadataGroupId;
+        return try self.ensureLocalReplica(record);
+    }
+
+    /// Installs any metadata- or data-group replica in the service-owned
+    /// multi-Raft host. Standalone bootstrap uses this for co-located groups;
+    /// callers remain responsible for supplying a catalog-authorized record.
+    pub fn ensureLocalReplica(self: *MetadataHttpService, record: raft_catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
         self.lockRuntime();
         defer self.unlockRuntime();
         return try self.raft.host.http_host.ensureReplica(record);
     }
 
     pub fn campaignMetadataGroup(self: *MetadataHttpService) !void {
+        try self.campaignLocalGroup(self.metadata_group_id);
+    }
+
+    /// Starts an election for a resident group through the service-owned Raft
+    /// synchronization boundary. Bootstrap orchestration and deterministic
+    /// hosted tests use this after provisioning a new single-node data group;
+    /// steady-state groups continue to rely on normal Raft election timers.
+    pub fn campaignLocalGroup(self: *MetadataHttpService, group_id: u64) !void {
         self.lockRuntime();
         defer self.unlockRuntime();
-        try self.raft.host.http_host.campaignGroup(self.metadata_group_id);
+        try self.raft.host.http_host.campaignGroup(group_id);
     }
 
     pub fn ensureLocalTableMutationAuthority(self: *MetadataHttpService) !void {
@@ -9804,7 +9819,11 @@ pub const MetadataHttpService = struct {
         self.last_local_schema_progress_refresh_at_ms = nowMs();
     }
 
-    fn refreshLocalStoreStatus(self: *MetadataHttpService) !void {
+    /// Publishes the current resident data-group status immediately. Normal
+    /// operation uses the bounded periodic refresh; bootstrap orchestration
+    /// may call this after provisioning/campaigning so routed work does not
+    /// wait for the next heartbeat interval.
+    pub fn refreshLocalStoreStatus(self: *MetadataHttpService) !void {
         try self.refreshLocalStoreStatusWithBackfillMarkers(null, true);
     }
 

@@ -477,6 +477,10 @@ pub const MetadataServer = struct {
         try self.svc.campaignMetadataGroup();
     }
 
+    pub fn campaignLocalGroup(self: *MetadataServer, group_id: u64) !void {
+        try self.svc.campaignLocalGroup(group_id);
+    }
+
     pub fn runRound(self: *MetadataServer) !void {
         try self.svc.runRound();
     }

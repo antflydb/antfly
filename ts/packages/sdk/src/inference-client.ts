@@ -28,9 +28,8 @@ import type {
   TransientCapacityError,
 } from "./inference-types.js";
 import type { paths } from "./public-api.js";
+import { parseSSEFrames } from "./sse.js";
 
-const MAX_GENERATION_SSE_LINE_BYTES = 16 << 20;
-const MAX_GENERATION_SSE_EVENT_CHARS = 16 << 20;
 const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
 const MAX_GENERATION_RESPONSE_BYTES = MAX_INFERENCE_JSON_RESPONSE_BYTES;
 const MAX_INFERENCE_ERROR_BYTES = 1 << 20;
@@ -754,102 +753,6 @@ function denseEmbeddingsFromJSON(bytes: Uint8Array): number[][] {
     embeddings.push(embedding as number[]);
   }
   return embeddings;
-}
-
-interface SSEFrame {
-  event: string;
-  data: string;
-}
-
-async function* parseSSEFrames(
-  body: ReadableStream<Uint8Array>
-): AsyncGenerator<SSEFrame, void, void> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let buffer = "";
-  let event = "";
-  let data: string[] = [];
-  let dataChars = 0;
-  let lineBytes = 0;
-  let complete = false;
-
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (!result.done && result.value.byteLength > MAX_GENERATION_SSE_LINE_BYTES) {
-        throw new Error(`Generation SSE chunk exceeded ${MAX_GENERATION_SSE_LINE_BYTES} bytes`);
-      }
-      if (!result.done) {
-        for (const byte of result.value) {
-          if (byte === 0x0a) {
-            lineBytes = 0;
-          } else {
-            lineBytes += 1;
-            if (lineBytes > MAX_GENERATION_SSE_LINE_BYTES) {
-              throw new Error(
-                `Generation SSE line exceeded ${MAX_GENERATION_SSE_LINE_BYTES} bytes`
-              );
-            }
-          }
-        }
-      }
-      try {
-        buffer += result.done ? decoder.decode() : decoder.decode(result.value, { stream: true });
-      } catch {
-        throw new Error("Generation stream contained invalid UTF-8");
-      }
-      if (result.done) buffer += "\n\n";
-
-      let newline = buffer.indexOf("\n");
-      while (newline !== -1) {
-        let line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-
-        if (line === "") {
-          if (data.length > 0) yield { event, data: data.join("\n") };
-          event = "";
-          data = [];
-          dataChars = 0;
-        } else if (!line.startsWith(":")) {
-          const colon = line.indexOf(":");
-          const field = colon === -1 ? line : line.slice(0, colon);
-          let value = colon === -1 ? "" : line.slice(colon + 1);
-          if (value.startsWith(" ")) value = value.slice(1);
-          if (field === "event") event = value;
-          if (field === "data") {
-            dataChars += (data.length > 0 ? 1 : 0) + value.length;
-            if (dataChars > MAX_GENERATION_SSE_EVENT_CHARS) {
-              throw new Error(
-                `Generation SSE event exceeded ${MAX_GENERATION_SSE_EVENT_CHARS} characters`
-              );
-            }
-            data.push(value);
-          }
-        }
-        newline = buffer.indexOf("\n");
-      }
-
-      if (buffer.length > MAX_GENERATION_SSE_EVENT_CHARS) {
-        throw new Error(
-          `Generation SSE line exceeded ${MAX_GENERATION_SSE_EVENT_CHARS} characters`
-        );
-      }
-      if (result.done) {
-        complete = true;
-        return;
-      }
-    }
-  } finally {
-    if (!complete) {
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the parse, consumer, or abort error that ended iteration.
-      }
-    }
-    reader.releaseLock();
-  }
 }
 
 function structureSchema(schema: Record<string, string[]>) {
