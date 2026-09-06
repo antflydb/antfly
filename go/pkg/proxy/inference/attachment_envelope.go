@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"mime"
 	"strings"
 )
@@ -31,6 +32,70 @@ const (
 	proxyAttachmentMaxCount            = 1024
 	proxyAttachmentMaxMIMEBytes        = 1024
 )
+
+func proxyUsesAttachmentEnvelope(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && strings.EqualFold(mediaType, proxyAttachmentEnvelopeContentType)
+}
+
+// readProxyAttachmentRoutingPrefix reads only the fixed envelope table and
+// JSON metadata needed for routing. Attachment payload bytes remain on the
+// incoming stream and can be forwarded or spooled without a heap-sized copy.
+// Framed transport deliberately requires Content-Length: v1 descriptors make
+// the exact wire length knowable, and rejecting ambiguous chunked bodies keeps
+// descriptor/length validation deterministic at the proxy boundary.
+func readProxyAttachmentRoutingPrefix(reader io.Reader, contentLength, maxBytes int64) ([]byte, []byte, error) {
+	if contentLength < 0 || contentLength > maxBytes {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	header := make([]byte, proxyAttachmentEnvelopeHeaderBytes)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	if !bytes.Equal(header[:8], []byte(proxyAttachmentEnvelopeMagic)) {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	if binary.LittleEndian.Uint32(header[20:24]) != 0 {
+		return nil, nil, errUnsupportedProxyAttachmentEnvelope
+	}
+	metadataBytes := binary.LittleEndian.Uint64(header[8:16])
+	attachmentCount := binary.LittleEndian.Uint32(header[16:20])
+	if metadataBytes > proxyAttachmentMaxMetadataBytes || attachmentCount > proxyAttachmentMaxCount {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	descriptorBytes := uint64(attachmentCount) * proxyAttachmentDescriptorBytes
+	prefixBytes := uint64(proxyAttachmentEnvelopeHeaderBytes) + descriptorBytes + metadataBytes
+	if prefixBytes > uint64(contentLength) || prefixBytes > uint64(maxBytes) || prefixBytes > uint64(^uint(0)>>1) {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	prefix := make([]byte, int(prefixBytes))
+	copy(prefix, header)
+	if _, err := io.ReadFull(reader, prefix[proxyAttachmentEnvelopeHeaderBytes:]); err != nil {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+
+	totalBytes := prefixBytes
+	for index := uint32(0); index < attachmentCount; index++ {
+		descriptorOffset := proxyAttachmentEnvelopeHeaderBytes + int(index)*proxyAttachmentDescriptorBytes
+		if binary.LittleEndian.Uint32(prefix[descriptorOffset+4:descriptorOffset+8]) != 0 {
+			return nil, nil, errUnsupportedProxyAttachmentEnvelope
+		}
+		mimeBytes := binary.LittleEndian.Uint32(prefix[descriptorOffset : descriptorOffset+4])
+		dataBytes := binary.LittleEndian.Uint64(prefix[descriptorOffset+8 : descriptorOffset+16])
+		if mimeBytes == 0 || mimeBytes > proxyAttachmentMaxMIMEBytes || dataBytes == 0 {
+			return nil, nil, errInvalidProxyAttachmentEnvelope
+		}
+		if dataBytes > ^uint64(0)-uint64(mimeBytes)-totalBytes {
+			return nil, nil, errInvalidProxyAttachmentEnvelope
+		}
+		totalBytes += uint64(mimeBytes) + dataBytes
+	}
+	if totalBytes != uint64(contentLength) || totalBytes > uint64(maxBytes) {
+		return nil, nil, errInvalidProxyAttachmentEnvelope
+	}
+	metadataStart := proxyAttachmentEnvelopeHeaderBytes + int(descriptorBytes)
+	return prefix, prefix[metadataStart:], nil
+}
 
 var (
 	errInvalidProxyAttachmentEnvelope     = errors.New("invalid attachment envelope")
@@ -85,8 +150,7 @@ func proxyAttachmentEnvelopeMetadata(body []byte) ([]byte, error) {
 // proxyRoutingPayload returns the JSON bytes used only for routing. Binary
 // attachment envelopes are validated before their metadata is exposed.
 func proxyRoutingPayload(body []byte, contentType string) ([]byte, bool, error) {
-	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil || !strings.EqualFold(mediaType, proxyAttachmentEnvelopeContentType) {
+	if !proxyUsesAttachmentEnvelope(contentType) {
 		return body, false, nil
 	}
 	metadata, err := proxyAttachmentEnvelopeMetadata(body)

@@ -622,8 +622,8 @@ const AntflyReaderState = struct {
             .max_tokens = req.max_tokens orelse self.max_tokens,
         });
         defer alloc.free(metadata);
-        const body = try httpx.attachment_envelope.encodeAlloc(alloc, metadata, attachments);
-        defer alloc.free(body);
+        var body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
+        defer body.deinit();
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
@@ -648,7 +648,7 @@ const AntflyReaderState = struct {
         header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
         var resp = try self.http.post(url, .{
-            .borrowed_body = body,
+            .borrowed_body_segments = body.segments,
             .headers = header_buf[0..header_count],
             .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,

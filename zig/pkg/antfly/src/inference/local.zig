@@ -198,13 +198,24 @@ fn embedPartsRequestJsonAlloc(
     return body;
 }
 
+const SegmentedAttachmentBody = struct {
+    metadata: []u8,
+    envelope: httpx.attachment_envelope.EncodedSegments,
+
+    fn deinit(self: *SegmentedAttachmentBody, alloc: std.mem.Allocator) void {
+        self.envelope.deinit();
+        alloc.free(self.metadata);
+        self.* = undefined;
+    }
+};
+
 fn embedPartsAttachmentEnvelopeAlloc(
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const template_mod.ContentPart,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
-) ![]u8 {
+) !SegmentedAttachmentBody {
     var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
     defer attachments.deinit(alloc);
     var metadata: std.Io.Writer.Allocating = .init(alloc);
@@ -259,7 +270,16 @@ fn embedPartsAttachmentEnvelopeAlloc(
         try stringify.write(value);
     }
     try stringify.endObject();
-    return httpx.attachment_envelope.encodeAlloc(alloc, metadata.written(), attachments.items);
+    const metadata_bytes = try metadata.toOwnedSlice();
+    errdefer alloc.free(metadata_bytes);
+    return .{
+        .metadata = metadata_bytes,
+        .envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(
+            alloc,
+            metadata_bytes,
+            attachments.items,
+        ),
+    };
 }
 
 fn hasBinaryPart(parts: []const template_mod.ContentPart) bool {
@@ -409,9 +429,9 @@ pub const Provider = struct {
         };
     }
 
-    fn controlledBodyRequest(
+    fn controlledSegmentedBodyRequest(
         self: *Provider,
-        body: []const u8,
+        body_segments: []const []const u8,
         content_type_value: []const u8,
         fallback_timeout_ms: ?u64,
     ) httpx.RequestOptions {
@@ -419,7 +439,7 @@ pub const Provider = struct {
         const count = if (base_headers) |headers| headers.len else 0;
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
-            .borrowed_body = body,
+            .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
             .max_response_size = self.max_response_bytes,
@@ -573,11 +593,15 @@ pub const Provider = struct {
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
         if (self.framed_attachments and hasBinaryPart(parts)) {
-            const body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction);
-            defer alloc.free(body);
+            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction);
+            defer body.deinit(alloc);
             return try self.embedBody(
                 alloc,
-                self.controlledBodyRequest(body, httpx.attachment_envelope.content_type, null),
+                self.controlledSegmentedBodyRequest(
+                    body.envelope.segments,
+                    httpx.attachment_envelope.content_type,
+                    null,
+                ),
             );
         }
         const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);

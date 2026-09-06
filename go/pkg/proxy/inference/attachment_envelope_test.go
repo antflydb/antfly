@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 )
@@ -22,6 +23,28 @@ import (
 type testProxyAttachment struct {
 	mime string
 	data []byte
+}
+
+func TestProxyAttachmentRoutingPrefixLeavesMediaOnStream(t *testing.T) {
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: []byte{1, 2, 3}})
+	reader := bytes.NewReader(body)
+	prefix, routing, err := readProxyAttachmentRoutingPrefix(reader, int64(len(body)), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(routing) != string(metadata) {
+		t.Fatalf("routing metadata = %q, want %q", routing, metadata)
+	}
+	if len(prefix)+reader.Len() != len(body) {
+		t.Fatalf("prefix=%d remaining=%d total=%d", len(prefix), reader.Len(), len(body))
+	}
+	if reader.Len() != len("image/png")+3 {
+		t.Fatalf("media tail was materialized while routing: remaining=%d", reader.Len())
+	}
+	if _, _, err := readProxyAttachmentRoutingPrefix(bytes.NewReader(body), -1, int64(len(body))); err == nil {
+		t.Fatal("chunked v1 attachment body was accepted")
+	}
 }
 
 func testProxyAttachmentEnvelope(metadata []byte, attachments ...testProxyAttachment) []byte {

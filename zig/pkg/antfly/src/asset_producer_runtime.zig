@@ -1777,8 +1777,8 @@ pub const Runtime = struct {
             const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
             try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
-            const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, chunk, attachment_transport);
-            defer alloc.free(body);
+            var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
+            defer body.deinit(alloc);
             var request_options = httpx.RequestOptions{
                 .headers = headers,
                 .timeout_ms = try self.execution.remainingTimeoutMs(
@@ -1797,9 +1797,9 @@ pub const Runtime = struct {
                 @memcpy(framed_headers[0..headers.len], headers);
                 framed_headers[headers.len] = .{ "Content-Type", httpx.attachment_envelope.content_type };
                 request_options.headers = framed_headers[0 .. headers.len + 1];
-                request_options.borrowed_body = body;
+                request_options.borrowed_body_segments = body.envelope.?.segments;
             } else {
-                request_options.json = body;
+                request_options.json = body.metadata_or_json;
             }
             var resp = try self.http.post(batch_url, request_options);
             defer resp.deinit();
@@ -4510,12 +4510,23 @@ fn trimRightSlash(value: []const u8) []const u8 {
     return value[0..end];
 }
 
-fn antflyGenerateBatchRequestJsonAlloc(
+const AntflyGenerateBatchRequest = struct {
+    metadata_or_json: []u8,
+    envelope: ?httpx.attachment_envelope.EncodedSegments = null,
+
+    fn deinit(self: *AntflyGenerateBatchRequest, alloc: Allocator) void {
+        if (self.envelope) |*envelope| envelope.deinit();
+        alloc.free(self.metadata_or_json);
+        self.* = undefined;
+    }
+};
+
+fn antflyGenerateBatchRequestAlloc(
     alloc: Allocator,
     cfg: generating_runtime.GeneratorConfig,
     requests: []const asset_producer.Request,
     attachment_transport: inference_work.AttachmentTransport,
-) ![]u8 {
+) !AntflyGenerateBatchRequest {
     const ContentMetadata = struct {
         elements_size: usize,
         element_count: usize,
@@ -4717,9 +4728,12 @@ fn antflyGenerateBatchRequestJsonAlloc(
     const body = output.writer.buffer;
     output.writer.buffer = &.{};
     output.writer.end = 0;
-    if (!framed) return body;
-    defer alloc.free(body);
-    return try httpx.attachment_envelope.encodeAlloc(alloc, body, attachments.items);
+    if (!framed) return .{ .metadata_or_json = body };
+    errdefer alloc.free(body);
+    return .{
+        .metadata_or_json = body,
+        .envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, body, attachments.items),
+    };
 }
 
 fn appendBatchI64Field(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
@@ -4756,15 +4770,15 @@ test "remote generator batch streams attachments into one exact JSON body" {
                     .source_text = "line\nquoted \"text\"",
                 },
             };
-            const body = try antflyGenerateBatchRequestJsonAlloc(alloc, .{
+            var body = try antflyGenerateBatchRequestAlloc(alloc, .{
                 .provider = .antfly,
                 .model = "gemma\"4",
                 .url = "http://inference.invalid",
                 .max_tokens = 32,
                 .temperature = 0.25,
             }, &requests, .base64_payload);
-            defer alloc.free(body);
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer body.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.metadata_or_json, .{});
             defer parsed.deinit();
             const batch = parsed.value.object.get("requests").?.array.items;
             try std.testing.expectEqual(@as(usize, 2), batch.len);
@@ -4772,18 +4786,18 @@ test "remote generator batch streams attachments into one exact JSON body" {
             try std.testing.expectEqual(@as(usize, 2), content.len);
             try std.testing.expectEqualStrings("AQID", content[1].object.get("data").?.string);
 
-            const framed_body = try antflyGenerateBatchRequestJsonAlloc(alloc, .{
+            var framed_body = try antflyGenerateBatchRequestAlloc(alloc, .{
                 .provider = .antfly,
                 .model = "gemma4",
                 .url = "http://inference.invalid",
                 .max_tokens = 32,
             }, &requests, .framed_binary);
-            defer alloc.free(framed_body);
-            var envelope = try httpx.attachment_envelope.parseAlloc(alloc, framed_body, .{});
-            defer envelope.deinit();
-            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
-            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, envelope.attachments[0].data);
-            var framed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, envelope.metadata, .{});
+            defer framed_body.deinit(alloc);
+            const envelope = framed_body.envelope orelse return error.MissingAttachmentEnvelope;
+            try std.testing.expectEqual(@as(usize, 4), envelope.segments.len);
+            try std.testing.expectEqualStrings("image/png", envelope.segments[2]);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, envelope.segments[3]);
+            var framed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, framed_body.metadata_or_json, .{});
             defer framed_metadata.deinit();
             const framed_content = framed_metadata.value.object.get("requests").?.array.items[0].object.get("body").?.object.get("messages").?.array.items[0].object.get("content").?.array.items;
             try std.testing.expectEqualStrings("attachment:0", framed_content[1].object.get("data").?.string);

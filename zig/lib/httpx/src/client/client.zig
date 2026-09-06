@@ -126,8 +126,12 @@ pub const RequestOptions = struct {
     /// Body borrowed only until the synchronous request call returns. Unlike
     /// `body`, this is not duplicated into Request-owned storage. It is suited
     /// to already-owned large envelopes whose lifetime spans redirects and
-    /// retries. At most one of body, borrowed_body, and json may be set.
+    /// retries. At most one body representation may be set.
     borrowed_body: ?[]const u8 = null,
+    /// Replayable borrowed body segments. The outer slice and all segment
+    /// bytes must remain valid until the synchronous request returns. At most
+    /// one body representation may be set.
+    borrowed_body_segments: ?[]const []const u8 = null,
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
@@ -141,6 +145,57 @@ pub const RequestOptions = struct {
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
 };
+
+const RequestHeadSerializer = struct {
+    request: *const Request,
+
+    pub fn serialize(self: *const @This(), writer: anytype) !void {
+        try self.request.serializeHead(writer);
+    }
+};
+
+fn serializeRequestHeadAlloc(allocator: Allocator, request: *const Request) ![]u8 {
+    const serializer = RequestHeadSerializer{ .request = request };
+    return serializeToSlice(allocator, &serializer);
+}
+
+fn nonEmptySegmentCount(segments: []const []const u8) usize {
+    var count: usize = 0;
+    for (segments) |segment| count += @intFromBool(segment.len > 0);
+    return count;
+}
+
+fn writeRequestBodyH2Blocking(
+    h2: *H2Connection,
+    writer: anytype,
+    stream_id: u31,
+    request: *const Request,
+) !void {
+    if (request.body) |body| return h2.writeDataBlocking(writer, stream_id, body, true);
+    const segments = request.body_segments orelse return;
+    var remaining = nonEmptySegmentCount(segments);
+    for (segments) |segment| {
+        if (segment.len == 0) continue;
+        remaining -= 1;
+        try h2.writeDataBlocking(writer, stream_id, segment, remaining == 0);
+    }
+}
+
+fn writeRequestBodyH2(
+    h2: *H2Connection,
+    writer: anytype,
+    stream_id: u31,
+    request: *const Request,
+) !void {
+    if (request.body) |body| return h2.writeData(writer, stream_id, body, true);
+    const segments = request.body_segments orelse return;
+    var remaining = nonEmptySegmentCount(segments);
+    for (segments) |segment| {
+        if (segment.len == 0) continue;
+        remaining -= 1;
+        try h2.writeData(writer, stream_id, segment, remaining == 0);
+    }
+}
 
 fn requestCookiesEnabled(config: ClientConfig, options: RequestOptions) bool {
     return options.cookies_enabled orelse config.cookies_enabled;
@@ -723,6 +778,7 @@ pub const Client = struct {
 
         if (@intFromBool(reqOpts.body != null) +
             @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.borrowed_body_segments != null) +
             @intFromBool(reqOpts.json != null) > 1)
             return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
@@ -731,6 +787,10 @@ pub const Client = struct {
 
         if (reqOpts.borrowed_body) |body| {
             try req.setBorrowedBody(body);
+        }
+
+        if (reqOpts.borrowed_body_segments) |segments| {
+            try req.setBorrowedBodySegments(segments);
         }
 
         if (reqOpts.json) |json_body| {
@@ -827,6 +887,7 @@ pub const Client = struct {
 
         if (@intFromBool(reqOpts.body != null) +
             @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.borrowed_body_segments != null) +
             @intFromBool(reqOpts.json != null) > 1)
             return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
@@ -835,6 +896,10 @@ pub const Client = struct {
 
         if (reqOpts.borrowed_body) |body| {
             try req.setBorrowedBody(body);
+        }
+
+        if (reqOpts.borrowed_body_segments) |segments| {
+            try req.setBorrowedBodySegments(segments);
         }
 
         if (reqOpts.json) |json_body| {
@@ -1585,9 +1650,10 @@ pub const Client = struct {
     /// Sends request and reads response over a plain TCP socket.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
-        const bytes = try serializeToSlice(self.allocator, req);
-        defer self.allocator.free(bytes);
-        try socket.sendAll(bytes);
+        const request_head = try serializeRequestHeadAlloc(self.allocator, req);
+        defer self.allocator.free(request_head);
+        try socket.sendAll(request_head);
+        try req.writeBody(socket);
         const result = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = result.reusable;
@@ -1604,9 +1670,10 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
-        const bytes = try serializeToSlice(self.allocator, req);
-        defer self.allocator.free(bytes);
-        try socket.sendAll(bytes);
+        const request_head = try serializeRequestHeadAlloc(self.allocator, req);
+        defer self.allocator.free(request_head);
+        try socket.sendAll(request_head);
+        try req.writeBody(socket);
         const result = try self.readResponseToWriter(
             socket,
             req.method,
@@ -1624,10 +1691,11 @@ pub const Client = struct {
     /// Sends request and reads response over an established TLS session.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
-        const bytes = try serializeToSlice(self.allocator, req);
-        defer self.allocator.free(bytes);
+        const request_head = try serializeRequestHeadAlloc(self.allocator, req);
+        defer self.allocator.free(request_head);
         const w = try session.getWriter();
-        try w.writeAll(bytes);
+        try w.writeAll(request_head);
+        try req.writeBody(w);
         try session.flush();
         const result = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
@@ -1645,10 +1713,11 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
-        const bytes = try serializeToSlice(self.allocator, req);
-        defer self.allocator.free(bytes);
+        const request_head = try serializeRequestHeadAlloc(self.allocator, req);
+        defer self.allocator.free(request_head);
         const w = try session.getWriter();
-        try w.writeAll(bytes);
+        try w.writeAll(request_head);
+        try req.writeBody(w);
         try session.flush();
         const result = try self.readResponseToWriter(
             session,
@@ -2036,7 +2105,7 @@ pub const Client = struct {
         );
         defer self.allocator.free(h2_headers);
 
-        const has_body = req.body != null;
+        const has_body = req.hasBody();
 
         if (entry.recv_running) {
             // Multiplexed mode: the background fiber pumps frames while this
@@ -2067,14 +2136,14 @@ pub const Client = struct {
             // cancellation owns a live stream.
             interrupt.publishH2(entry, stream_id, self.io);
 
-            if (req.body) |body| {
+            if (has_body) {
                 h2.write_mutex.lockUncancelable(self.io);
                 defer h2.write_mutex.unlock(self.io);
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
-                    try h2.writeDataBlocking(w, stream_id, body, true);
+                    try writeRequestBodyH2Blocking(h2, w, stream_id, req);
                 } else {
-                    try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
+                    try writeRequestBodyH2Blocking(h2, &entry.socket, stream_id, req);
                 }
             }
 
@@ -2088,10 +2157,10 @@ pub const Client = struct {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
-                if (req.body) |body| {
+                if (has_body) {
                     h2.write_mutex.lockUncancelable(self.io);
                     defer h2.write_mutex.unlock(self.io);
-                    try h2.writeData(w, stream_id, body, true);
+                    try writeRequestBodyH2(h2, w, stream_id, req);
                 }
                 h2.awaitStreamComplete(r, w, stream_id) catch |err| {
                     if (interrupt.isCancellationRequested()) return error.Cancelled;
@@ -2100,10 +2169,10 @@ pub const Client = struct {
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
-                if (req.body) |body| {
+                if (has_body) {
                     h2.write_mutex.lockUncancelable(self.io);
                     defer h2.write_mutex.unlock(self.io);
-                    try h2.writeData(&entry.socket, stream_id, body, true);
+                    try writeRequestBodyH2(h2, &entry.socket, stream_id, req);
                 }
                 h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id) catch |err| {
                     if (interrupt.isCancellationRequested()) return error.Cancelled;
@@ -2375,7 +2444,7 @@ pub const Client = struct {
         );
         defer self.allocator.free(h2_headers);
 
-        const has_body = req.body != null;
+        const has_body = req.hasBody();
 
         // Send request frames under write mutex.
         {
@@ -2392,11 +2461,11 @@ pub const Client = struct {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 headers_sent = true;
-                if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
+                if (has_body) try writeRequestBodyH2Blocking(h2, w, stream_id, req);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 headers_sent = true;
-                if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
+                if (has_body) try writeRequestBodyH2Blocking(h2, &entry.socket, stream_id, req);
             }
         }
 

@@ -2919,6 +2919,44 @@ The hardening above follows these long-term rules:
     bytes remain charged once. The encoded-reader result builder also releases
     its first allocation if the companion assignment table cannot be created,
     so allocator failure cannot strand an uninitialized result slice.
+139. **Implemented after SDK-generation review:** repeated `allOf` chunking
+    fields now carry byte-for-byte equivalent numeric constraints. In
+    particular, both `max_chunks` declarations accept zero as the documented
+    default sentinel and cap explicit values at 4096. This preserves the
+    shallow repetition required by weaker generators without asking schema
+    mergers to reconcile contradictory ranges.
+140. **Implemented after distributed-copy review:** HTTPX request bodies may be
+    replayable borrowed segments. The v1 attachment encoder owns only its
+    fixed header/descriptor table and segment index while borrowing JSON,
+    MIME, and media slices. HTTP/1 serializes only the small request head before
+    writing segments; HTTP/2 emits each segment as DATA frames and places
+    END_STREAM on the final nonempty segment. Readers, generators, embedders,
+    extractors, chunkers, rerankers, and transcribers therefore share the same
+    copy-free client transport contract across redirects and retries.
+141. **Implemented after distributed-proxy residency review:** the Go proxy
+    reads only the bounded v1 descriptor/metadata prefix needed for model
+    resolution. A one-attempt route streams the untouched attachment tail
+    directly to the inference node. A retry-enabled route first copies the
+    bounded body into a process-admitted temporary replay file, then opens an
+    independent section reader per attempt. Framed v1 requires its exact
+    descriptor-derived `Content-Length`; descriptor/length mismatches and
+    ambiguous chunked framing fail before routing, while the HTTP transport
+    rejects a physically truncated tail. Request retry spills share
+    the proxy's existing process-wide spool admission and configured spool
+    directory.
+142. **Implemented after Florence patch-embedding review:** tensor-native CUDA
+    and Metal vision paths upload normalized NCHW pixels once, execute the
+    stage-zero convolution on device, transpose NCHW output to NHWC on device,
+    reshape to token-major storage, and apply the first patch normalization
+    without downloading. At the default 768px geometry this removes roughly
+    36 MiB of device-to-host-to-device traffic per page before the first vision
+    block.
+143. **Implemented after LM-head telemetry review:** `batch_fused_argmax` is
+    reserved for CUDA's genuine fused projection/reduction kernel. Metal's
+    current device-resident row projection followed by argmax reports
+    `batch_projected_argmax`; compatibility paths keep their existing labels.
+    A future Metal multi-row fused kernel may claim the fused label only after
+    it supports the production dense and quantized LM-head formats.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3773,12 +3811,13 @@ fused kernel/provider operation may advertise `native`.
 
 The post-implementation performance review resulted in these concrete changes:
 
-- Florence's ordinary greedy batch decoder fuses the LM-head projection and
-  row-wise argmax on capable Metal/CUDA backends, returning only one token id
-  per active row. It therefore avoids creating the `batch * vocabulary` logits
-  tensor on every output-token step. Full logits remain only for a non-zero
-  final-logits bias, no-repeat-ngram filtering, or a backend without the fused
-  primitive.
+- Florence's ordinary greedy batch decoder uses CUDA's fused LM-head/argmax
+  reduction when available, returning only one token id per active row. Metal
+  retains device-resident projection and argmax but currently materializes one
+  logits row at a time for small OCR batches; telemetry calls that path
+  `batch_projected_argmax`, never fused. Full host-visible logits remain only
+  for a non-zero final-logits bias, no-repeat-ngram filtering, or a backend
+  without device selection.
 - CUDA Florence batches keep the final vision stage, positional/temporal
   source expansion, image projection, and image normalization device-resident
   for every admitted batch size. The underlying kernel was already batch-aware;
@@ -3889,11 +3928,12 @@ shortcuts:
 
 - The shipped distributed attachment envelope is bounded, authenticated by the
   existing route lease, cancellation-aware at the request boundary, and exact
-  in reference cardinality. Very large or incrementally produced media would
-  need a streaming successor with checksums, flow control, per-frame
-  cancellation, and provenance in the wire descriptors. Until that version is
-  negotiated, v1 intentionally retains one bounded envelope body. A proxy must
-  not infer either version from logical model modalities.
+  in reference cardinality. V1 can now be produced and transported as
+  replayable borrowed segments, and a single-attempt proxy streams its payload
+  without whole-body heap materialization. Incrementally produced or
+  independently retryable media still needs a successor with checksums, flow
+  control, per-frame cancellation, and provenance in the wire descriptors. A
+  proxy must not infer either version from logical model modalities.
 - Logical render-lane reader/font caches now remove repeated initialization
   across joined waves within a render batch even when fixed-executor arena
   scratch resets after each callback. Each reader uses a private, freeing lane

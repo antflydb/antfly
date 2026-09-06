@@ -382,8 +382,8 @@ const HttpExtractorState = struct {
         defer alloc.free(metadata);
         const use_framed_transport = self.cfg.provider == .antfly and
             self.cfg.framed_attachments and req.attachments.len > 0;
-        var framed_body: ?[]u8 = null;
-        defer if (framed_body) |body| alloc.free(body);
+        var framed_body: ?httpx.attachment_envelope.EncodedSegments = null;
+        defer if (framed_body) |*body| body.deinit();
         if (use_framed_transport) {
             const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, req.attachments.len);
             defer alloc.free(attachments);
@@ -399,7 +399,7 @@ const HttpExtractorState = struct {
                 }
             }
             std.debug.assert(attachment_index == attachments.len);
-            framed_body = try httpx.attachment_envelope.encodeAlloc(alloc, metadata, attachments);
+            framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
         }
 
         const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
@@ -432,7 +432,7 @@ const HttpExtractorState = struct {
             try headers.append(alloc, .{ "Content-Type", httpx.attachment_envelope.content_type });
         var resp = try self.http.post(url, .{
             .json = if (use_framed_transport) null else metadata,
-            .borrowed_body = framed_body,
+            .borrowed_body_segments = if (framed_body) |body| body.segments else null,
             .headers = headers.items,
             .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,

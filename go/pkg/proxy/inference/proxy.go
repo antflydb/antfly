@@ -1873,10 +1873,10 @@ type Proxy struct {
 	maxRequestBodyBytes    int64
 	maxBatchResponseBytes  int64
 	maxResponseHeaderBytes int64
-	batchResponseSpoolDir  string
+	spoolDir               string
 	bodyAdmission          *byteAdmission
 	batchResponseAdmission *byteAdmission
-	batchSpoolAdmission    *byteAdmission
+	spoolAdmission         *byteAdmission
 	catalogAdmission       *byteAdmission
 	refreshWake            chan struct{}
 	capabilityLeaseMu      sync.Mutex
@@ -1952,8 +1952,10 @@ type Config struct {
 	MaxRetainedBodyBytes           int64                  // Optional authoritative process-wide body+decode working-set ceiling; defaults to 768 MiB
 	MaxBatchResponseBytes          int64                  // Optional mixed-batch aggregate response ceiling; defaults to 256 MiB and is reduced when required to fit MaxRetainedBatchResponseBytes
 	MaxRetainedBatchResponseBytes  int64                  // Optional authoritative process-wide mixed-batch capture+decode+metadata ceiling; defaults to 1 GiB
-	MaxSpooledBatchResponseBytes   int64                  // Optional process-wide mixed-batch spill ceiling; defaults to 2 GiB
-	BatchResponseSpoolDir          string                 // Optional spill directory; defaults to the operating-system temporary directory
+	MaxSpooledBytes                int64                  // Optional process-wide request-replay and response-spill ceiling; defaults to 2 GiB
+	SpoolDir                       string                 // Optional inference spill directory; defaults to the operating-system temporary directory
+	MaxSpooledBatchResponseBytes   int64                  // Deprecated: use MaxSpooledBytes
+	BatchResponseSpoolDir          string                 // Deprecated: use SpoolDir
 	MaxUpstreamResponseHeaderBytes int64                  // Optional per-upstream-response header ceiling; defaults to 64 KiB
 	UpstreamTransport              http.RoundTripper      // Optional base transport; *http.Transport values are cloned before applying limits
 	MaxRetainedCatalogBytes        int64                  // Optional process-wide model-catalog ceiling; defaults to 256 MiB
@@ -1980,6 +1982,10 @@ func NewProxy(cfg Config) *Proxy {
 		logger, _ = zap.NewProduction()
 	}
 
+	spoolDir := cfg.SpoolDir
+	if spoolDir == "" {
+		spoolDir = cfg.BatchResponseSpoolDir
+	}
 	p := &Proxy{
 		registry:               registry,
 		router:                 router,
@@ -1991,7 +1997,7 @@ func NewProxy(cfg Config) *Proxy {
 		capabilityLeaseByID:    make(map[[sha256.Size]byte]string),
 		verifiedSource:         cfg.VerifiedSourceResolver,
 		maxResponseHeaderBytes: maxResponseHeaderBytes,
-		batchResponseSpoolDir:  cfg.BatchResponseSpoolDir,
+		spoolDir:               spoolDir,
 	}
 	p.maxRequestBodyBytes = cfg.MaxRequestBodyBytes
 	if p.maxRequestBodyBytes <= 0 {
@@ -2025,18 +2031,21 @@ func NewProxy(cfg Config) *Proxy {
 		p.maxBatchResponseBytes = effective
 	}
 	p.batchResponseAdmission = newByteAdmission(maxRetainedBatchResponseBytes)
-	maxSpooledBatchResponseBytes := cfg.MaxSpooledBatchResponseBytes
-	if maxSpooledBatchResponseBytes <= 0 {
-		maxSpooledBatchResponseBytes = defaultMaxProxySpooledBatchResponseBytes
+	maxSpooledBytes := cfg.MaxSpooledBytes
+	if maxSpooledBytes <= 0 {
+		maxSpooledBytes = cfg.MaxSpooledBatchResponseBytes
 	}
-	if effective := proxyBatchSpoolBytesForResponse(maxSpooledBatchResponseBytes, maxConcurrentGenerateBatchPartitions); p.maxBatchResponseBytes > effective {
+	if maxSpooledBytes <= 0 {
+		maxSpooledBytes = defaultMaxProxySpooledBatchResponseBytes
+	}
+	if effective := proxyBatchSpoolBytesForResponse(maxSpooledBytes, maxConcurrentGenerateBatchPartitions); p.maxBatchResponseBytes > effective {
 		logger.Warn("reducing inference batch response limit to fit process-wide spill ceiling",
 			zap.Int64("configured_batch_response_bytes", p.maxBatchResponseBytes),
 			zap.Int64("effective_batch_response_bytes", effective),
-			zap.Int64("spooled_batch_response_bytes", maxSpooledBatchResponseBytes))
+			zap.Int64("spooled_bytes", maxSpooledBytes))
 		p.maxBatchResponseBytes = effective
 	}
-	p.batchSpoolAdmission = newByteAdmission(maxSpooledBatchResponseBytes)
+	p.spoolAdmission = newByteAdmission(maxSpooledBytes)
 	maxRetainedCatalogBytes := cfg.MaxRetainedCatalogBytes
 	if maxRetainedCatalogBytes <= 0 {
 		maxRetainedCatalogBytes = defaultMaxProxyRetainedCatalogBytes
@@ -2259,6 +2268,10 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if proxyUsesAttachmentEnvelope(r.Header.Get("Content-Type")) {
+		p.proxyFramedRequest(w, r, "generate.batch", start, routing)
+		return
+	}
 	retainedBodyBytes := p.maxRequestBodyBytes
 	if r.ContentLength >= 0 {
 		retainedBodyBytes = r.ContentLength
@@ -2324,11 +2337,11 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 	}
 	workerCount := min(len(groups), maxConcurrentGenerateBatchPartitions)
 	spoolAdmissionBytes := proxyBatchSpoolAdmissionBytes(p.maxBatchResponseBytes, workerCount)
-	if err := p.batchSpoolAdmission.Acquire(r.Context(), spoolAdmissionBytes); err != nil {
+	if err := p.spoolAdmission.Acquire(r.Context(), spoolAdmissionBytes); err != nil {
 		http.Error(w, "request canceled while waiting for inference response spill admission", http.StatusRequestTimeout)
 		return
 	}
-	defer p.batchSpoolAdmission.Release(spoolAdmissionBytes)
+	defer p.spoolAdmission.Release(spoolAdmissionBytes)
 	responseAdmissionBytes := proxyBatchResponseAdmissionBytesForWorkers(p.maxBatchResponseBytes, workerCount, p.maxResponseHeaderBytes)
 	if err := p.batchResponseAdmission.Acquire(r.Context(), responseAdmissionBytes); err != nil {
 		http.Error(w, "request canceled while waiting for inference response admission", http.StatusRequestTimeout)
@@ -2387,7 +2400,7 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 				groupRouting := routing
 				groupRouting.Headers = requestHeaderMap(groupRequest.Header)
 				groupRouting.Timestamp = time.Now()
-				capture := newBoundedProxyResponseWriterWithSpool(p.maxBatchResponseBytes, p.batchResponseSpoolDir)
+				capture := newBoundedProxyResponseWriterWithSpool(p.maxBatchResponseBytes, p.spoolDir)
 				p.proxyRequestWithBody(capture, groupRequest, "generate.batch", time.Now(), groupRouting, groupBody)
 				outcomeChannel <- groupOutcome{index: job.index, capture: capture}
 			}
@@ -4210,6 +4223,10 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		http.Error(w, "inference request body is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if proxyUsesAttachmentEnvelope(r.Header.Get("Content-Type")) {
+		p.proxyFramedRequest(w, r, operation, start, routing)
+		return
+	}
 	// The body remains replayable for retries while model extraction decodes a
 	// second representation. Unknown-length requests initially reserve the hard
 	// bound while streaming, then promptly return unused admission once their
@@ -4241,6 +4258,121 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 	p.proxyRequestWithBody(w, r, operation, start, routing, body)
 }
 
+type proxyReplayBody interface {
+	Prepare(attempts int) error
+	Open() (io.ReadCloser, error)
+	Len() int64
+	Close() error
+}
+
+type proxyMemoryReplayBody struct {
+	body []byte
+}
+
+func (b *proxyMemoryReplayBody) Prepare(int) error { return nil }
+func (b *proxyMemoryReplayBody) Len() int64        { return int64(len(b.body)) }
+func (b *proxyMemoryReplayBody) Close() error      { return nil }
+func (b *proxyMemoryReplayBody) Open() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(b.body)), nil
+}
+
+type proxyStreamingReplayBody struct {
+	prefix    []byte
+	tail      io.Reader
+	total     int64
+	spillDir  string
+	opened    bool
+	spill     *os.File
+	spillPath string
+}
+
+func (b *proxyStreamingReplayBody) Len() int64 { return b.total }
+
+func (b *proxyStreamingReplayBody) Prepare(attempts int) error {
+	if attempts <= 1 {
+		return nil
+	}
+	spill, err := os.CreateTemp(b.spillDir, "antfly-inference-request-*")
+	if err != nil {
+		return err
+	}
+	b.spill = spill
+	b.spillPath = spill.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = b.Close()
+		}
+	}()
+	if _, err := spill.Write(b.prefix); err != nil {
+		return err
+	}
+	remaining := b.total - int64(len(b.prefix))
+	if remaining < 0 {
+		return errInvalidProxyAttachmentEnvelope
+	}
+	if _, err := io.CopyN(spill, b.tail, remaining); err != nil {
+		return errInvalidProxyAttachmentEnvelope
+	}
+	cleanup = false
+	return nil
+}
+
+func (b *proxyStreamingReplayBody) Open() (io.ReadCloser, error) {
+	if b.spill != nil {
+		return io.NopCloser(io.NewSectionReader(b.spill, 0, b.total)), nil
+	}
+	if b.opened {
+		return nil, errors.New("streaming request body is not replayable")
+	}
+	b.opened = true
+	remaining := b.total - int64(len(b.prefix))
+	return io.NopCloser(io.MultiReader(bytes.NewReader(b.prefix), io.LimitReader(b.tail, remaining))), nil
+}
+
+func (b *proxyStreamingReplayBody) Close() error {
+	var closeErr error
+	if b.spill != nil {
+		closeErr = b.spill.Close()
+		b.spill = nil
+	}
+	if b.spillPath != "" {
+		if err := os.Remove(b.spillPath); err != nil && !errors.Is(err, os.ErrNotExist) && closeErr == nil {
+			closeErr = err
+		}
+		b.spillPath = ""
+	}
+	return closeErr
+}
+
+func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext) {
+	// The bounded metadata prefix is the only request-sized allocation retained
+	// by the routing proxy. Media stays on the socket for a single attempt; a
+	// retry-enabled route uses a bounded temporary replay file.
+	maxRoutingPrefix := int64(proxyAttachmentEnvelopeHeaderBytes +
+		proxyAttachmentMaxCount*proxyAttachmentDescriptorBytes + proxyAttachmentMaxMetadataBytes)
+	routingBytes := min(r.ContentLength, maxRoutingPrefix)
+	routingReservation := proxyBodyAdmissionBytes(routingBytes)
+	if err := p.bodyAdmission.Acquire(r.Context(), routingReservation); err != nil {
+		http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
+		return
+	}
+	defer p.bodyAdmission.Release(routingReservation)
+	prefix, routingPayload, err := readProxyAttachmentRoutingPrefix(r.Body, r.ContentLength, p.maxRequestBodyBytes)
+	if err != nil {
+		http.Error(w, "invalid inference attachment envelope: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	replay := &proxyStreamingReplayBody{
+		prefix:   prefix,
+		tail:     r.Body,
+		total:    r.ContentLength,
+		spillDir: p.spoolDir,
+	}
+	defer replay.Close()
+	p.proxyRequestWithReplayBody(w, r, operation, start, routing, routingPayload, replay)
+}
+
 // proxyRequestWithBody owns routing, admission, retries, and forwarding for an
 // already bounded request body. The generate-batch coordinator uses this same
 // path for each homogeneous partition so direct and fan-out execution retain
@@ -4251,6 +4383,11 @@ func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, ope
 		http.Error(w, "invalid inference attachment envelope: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	replay := &proxyMemoryReplayBody{body: body}
+	p.proxyRequestWithReplayBody(w, r, operation, start, routing, routingPayload, replay)
+}
+
+func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext, routingPayload []byte, replay proxyReplayBody) {
 	model, err := proxyRequestModel(routingPayload, operation)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
@@ -4291,6 +4428,23 @@ func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, ope
 	if matchedRoute != nil && matchedRoute.RetryAttempts > 1 {
 		attempts = int(matchedRoute.RetryAttempts)
 	}
+	spillReservation := int64(0)
+	if attempts > 1 {
+		if _, streams := replay.(*proxyStreamingReplayBody); streams {
+			spillReservation = replay.Len()
+			if err := p.spoolAdmission.Acquire(r.Context(), spillReservation); err != nil {
+				lease.Release()
+				http.Error(w, "request canceled while waiting for inference replay admission", http.StatusRequestTimeout)
+				return
+			}
+			defer p.spoolAdmission.Release(spillReservation)
+		}
+	}
+	if err := replay.Prepare(attempts); err != nil {
+		lease.Release()
+		http.Error(w, "failed to prepare replayable inference request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	var lastErr error
 	var lastResp *http.Response
@@ -4315,7 +4469,7 @@ func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, ope
 		}
 
 		forwardingLease := lease.BeginForwarding()
-		resp, reqErr := p.forwardRequest(r, body, endpoint, matchedRoute)
+		resp, reqErr := p.forwardRequest(r, replay, endpoint, matchedRoute)
 		if reqErr != nil {
 			forwardingLease.Finish()
 			lastErr = reqErr
@@ -5432,7 +5586,7 @@ func (p *Proxy) UnregisterEndpoint(address string) {
 	p.registry.UnregisterEndpoint(address)
 }
 
-func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint, route *Route) (*http.Response, error) {
+func (p *Proxy) forwardRequest(r *http.Request, replay proxyReplayBody, endpoint *Endpoint, route *Route) (*http.Response, error) {
 	attemptCtx := r.Context()
 	var cancel context.CancelFunc
 	if route != nil && route.RetryTimeout > 0 {
@@ -5453,13 +5607,22 @@ func (p *Proxy) forwardRequest(r *http.Request, body []byte, endpoint *Endpoint,
 	})
 	outReq.Host = targetURL.Host
 	outReq.RequestURI = ""
-	outReq.Body = io.NopCloser(bytes.NewReader(body))
-	outReq.ContentLength = int64(len(body))
+	body, err := replay.Open()
+	if err != nil {
+		return nil, err
+	}
+	outReq.Body = body
+	outReq.GetBody = nil
+	outReq.ContentLength = replay.Len()
 	if authorization := p.upstreamAuthorizationForRequest(r); authorization != "" {
 		outReq.Header.Set("Authorization", authorization)
 	}
 
-	return p.registry.client.Do(outReq)
+	resp, err := p.registry.client.Do(outReq)
+	if err != nil {
+		_ = body.Close()
+	}
+	return resp, err
 }
 
 // Use one authorization policy for both model discovery and execution. A

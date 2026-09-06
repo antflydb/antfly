@@ -469,10 +469,10 @@ const AntflyTranscriberState = struct {
             header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
             header_count += 1;
         }
-        var framed_body: ?[]u8 = null;
-        defer if (framed_body) |value| alloc.free(value);
+        var framed_body: ?httpx.attachment_envelope.EncodedSegments = null;
+        defer if (framed_body) |*value| value.deinit();
         if (self.framed_attachments) {
-            framed_body = try httpx.attachment_envelope.encodeAlloc(alloc, body, &.{.{
+            framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, body, &.{.{
                 .mime_type = audio_content.content_type,
                 .data = audio_content.data,
             }});
@@ -482,7 +482,7 @@ const AntflyTranscriberState = struct {
         const headers = header_buf[0..header_count];
         var resp = try self.http.post(url, .{
             .json = if (self.framed_attachments) null else body,
-            .borrowed_body = framed_body,
+            .borrowed_body_segments = if (framed_body) |value| value.segments else null,
             .headers = headers,
             .timeout_ms = self.timeout_ms,
             .max_response_size = self.max_response_bytes,

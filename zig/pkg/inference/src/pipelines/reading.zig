@@ -701,8 +701,17 @@ pub const ReadingPipeline = struct {
                             step_tokens[0..active_count],
                         );
                         selected_on_device = true;
-                        if (last_read_telemetry.lm_head_path == null)
-                            last_read_telemetry.lm_head_path = "batch_fused_argmax";
+                        if (last_read_telemetry.lm_head_path == null) {
+                            // CUDA implements a true fused projection/reduction
+                            // kernel. Metal currently keeps the operation on
+                            // device but projects rows before argmax; report
+                            // that distinction so telemetry never overstates
+                            // the backend capability.
+                            last_read_telemetry.lm_head_path = if (cb.kind() == .cuda)
+                                "batch_fused_argmax"
+                            else
+                                "batch_projected_argmax";
+                        }
                     }
                 }
                 if (!selected_on_device) {

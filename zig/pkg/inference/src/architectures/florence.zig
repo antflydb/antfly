@@ -1097,7 +1097,15 @@ fn visionEncoderForward(
     for (0..Config.stage_count) |stage| {
         const stage_start = nowNs();
         var hidden_for_stage: ?CT = null;
-        if (useTensorNativeVision(cb) and stage_hidden != null) {
+        if (useTensorNativeVision(cb) and stage == 0) {
+            if (debug_cuda_session) std.log.info("florence: stage 0 device conv embed start h={d} w={d}", .{ stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbedImageTensor(cb, config, batch, pixel_values, stage_h, stage_w);
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed_device", stage, conv_start);
+            hidden_for_stage = embedded.tensor;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        } else if (useTensorNativeVision(cb) and stage_hidden != null) {
             if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
             const conv_start = nowNs();
             const embedded = try convEmbedTensor(cb, allocator, config, stage, batch, stage_hidden.?, stage_h, stage_w);
@@ -1238,8 +1246,6 @@ fn visionEncoderForwardTensorTail(
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     const profile = readProfileEnabled();
     if (debug_cuda_session) std.log.info("florence: device vision tail start backend={s}", .{@tagName(cb.kind())});
-    var stage_tokens: ?[]f32 = null;
-    errdefer if (stage_tokens) |tokens| allocator.free(tokens);
     var stage_hidden: ?CT = null;
     errdefer if (stage_hidden) |hidden| cb.free(hidden);
     var stage_h: usize = config.image_size;
@@ -1248,7 +1254,15 @@ fn visionEncoderForwardTensorTail(
     for (0..Config.stage_count) |stage| {
         const stage_start = nowNs();
         var hidden_for_stage: ?CT = null;
-        if (stage_hidden != null) {
+        if (stage == 0) {
+            if (debug_cuda_session) std.log.info("florence: stage 0 device conv embed start h={d} w={d}", .{ stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbedImageTensor(cb, config, batch, pixel_values, stage_h, stage_w);
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed_device", stage, conv_start);
+            hidden_for_stage = embedded.tensor;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        } else if (stage_hidden != null) {
             if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
             const conv_start = nowNs();
             const embedded = try convEmbedTensor(cb, allocator, config, stage, batch, stage_hidden.?, stage_h, stage_w);
@@ -1259,29 +1273,10 @@ fn visionEncoderForwardTensorTail(
             hidden_for_stage = embedded.tensor;
             stage_h = embedded.height;
             stage_w = embedded.width;
-        } else {
-            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
-            const conv_start = nowNs();
-            const embedded = try convEmbed(cb, allocator, config, stage, batch, pixel_values, stage_tokens, stage_h, stage_w);
-            if (profile) logFlorenceProfileStage("vision_stage_conv_embed", stage, conv_start);
-            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed done h={d} w={d}", .{ stage, embedded.height, embedded.width });
-            if (stage_tokens) |old| allocator.free(old);
-            stage_tokens = embedded.tokens;
-            stage_h = embedded.height;
-            stage_w = embedded.width;
-        }
+        } else return error.MissingInputs;
 
         const depth: usize = config.depths[stage];
-        var hidden = if (hidden_for_stage) |tensor| tensor else blk: {
-            if (debug_cuda_session) std.log.info("florence: stage {d} tensor upload start depth={d}", .{ stage, depth });
-            const upload_start = nowNs();
-            const stage_shape = [_]i32{ @intCast(batch * stage_h * stage_w), @intCast(config.dim_embed[stage]) };
-            const tensor = try cb.fromFloat32Shape(stage_tokens.?, &stage_shape);
-            if (profile) logFlorenceProfileStage("vision_stage_upload", stage, upload_start);
-            allocator.free(stage_tokens.?);
-            stage_tokens = null;
-            break :blk tensor;
-        };
+        var hidden = hidden_for_stage orelse return error.MissingInputs;
         var hidden_owned = true;
         errdefer if (hidden_owned) cb.free(hidden);
 
@@ -1853,6 +1848,83 @@ fn convEmbedTensor(
         tokens = normed;
     }
 
+    return .{ .tensor = tokens, .height = out_h, .width = out_w };
+}
+
+/// Stage-zero patch embedding for the device-resident vision path. The
+/// normalized NCHW pixels are uploaded once; convolution output is reordered
+/// to token-major form on the backend and never materialized as a host f32
+/// array. At Florence's default 768px input this avoids a ~36 MiB host round
+/// trip per page before the first vision block.
+fn convEmbedImageTensor(
+    cb: *const ComputeBackend,
+    config: Config,
+    batch: usize,
+    pixel_values: []const f32,
+    input_h: usize,
+    input_w: usize,
+) !ConvEmbedTensorResult {
+    const stage: usize = 0;
+    const in_channels: usize = 3;
+    const out_channels: usize = config.dim_embed[stage];
+    const patch: usize = config.patch_size[stage];
+    const stride: usize = config.patch_stride[stage];
+    const padding: usize = config.patch_padding[stage];
+    const out_h = (input_h + 2 * padding - patch) / stride + 1;
+    const out_w = (input_w + 2 * padding - patch) / stride + 1;
+
+    const input_shape = [_]i32{
+        @intCast(batch),
+        @intCast(in_channels),
+        @intCast(input_h),
+        @intCast(input_w),
+    };
+    const input = try cb.fromFloat32Shape(pixel_values, &input_shape);
+    defer cb.free(input);
+    const conv = try cb.conv2d(
+        input,
+        try cb.getWeight("vision_tower.convs.0.proj.weight"),
+        try cb.getWeight("vision_tower.convs.0.proj.bias"),
+        batch,
+        in_channels,
+        out_channels,
+        input_h,
+        input_w,
+        patch,
+        patch,
+        stride,
+        stride,
+        padding,
+        padding,
+        1,
+    );
+    defer cb.free(conv);
+
+    const conv_shape = [_]i64{
+        @intCast(batch),
+        @intCast(out_channels),
+        @intCast(out_h),
+        @intCast(out_w),
+    };
+    const nhwc = try cb.primTranspose(conv, &.{ 0, 2, 3, 1 }, &conv_shape);
+    defer cb.free(nhwc);
+    const token_shape = [_]i64{
+        @intCast(batch * out_h * out_w),
+        @intCast(out_channels),
+    };
+    var tokens = try cb.primReshape(nhwc, &token_shape);
+    errdefer cb.free(tokens);
+    if (!config.patch_prenorm[stage]) {
+        const normed = try cb.layerNorm(
+            tokens,
+            try cb.getWeight("vision_tower.convs.0.norm.weight"),
+            try cb.getWeight("vision_tower.convs.0.norm.bias"),
+            out_channels,
+            1e-5,
+        );
+        cb.free(tokens);
+        tokens = normed;
+    }
     return .{ .tensor = tokens, .height = out_h, .width = out_w };
 }
 

@@ -210,8 +210,8 @@ pub fn chunkInputWithProvider(
     const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{endpoint});
     defer alloc.free(url);
 
-    const body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
-    defer alloc.free(body);
+    var body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
+    defer body.deinit(alloc);
 
     var header_storage: [4][2][]const u8 = undefined;
     var header_count: usize = 0;
@@ -232,8 +232,8 @@ pub fn chunkInputWithProvider(
         header_count += 1;
     }
     var resp = try http.post(url, .{
-        .json = if (attachment_transport == .framed_binary) null else body,
-        .borrowed_body = if (attachment_transport == .framed_binary) body else null,
+        .json = if (attachment_transport == .framed_binary) null else body.metadata_or_json,
+        .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
         .headers = header_storage[0..header_count],
         .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
         .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
@@ -312,12 +312,23 @@ pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
     alloc.free(chunks);
 }
 
+const EncodedChunkRequest = struct {
+    metadata_or_json: []u8,
+    envelope: ?httpx.attachment_envelope.EncodedSegments = null,
+
+    fn deinit(self: *EncodedChunkRequest, alloc: Allocator) void {
+        if (self.envelope) |*envelope| envelope.deinit();
+        alloc.free(self.metadata_or_json);
+        self.* = undefined;
+    }
+};
+
 fn encodeChunkRequest(
     alloc: Allocator,
     cfg: chunking_types.Config,
     input: RemoteInput,
     attachment_transport: inference_work.AttachmentTransport,
-) ![]u8 {
+) !EncodedChunkRequest {
     const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
@@ -339,7 +350,7 @@ fn encodeChunkRequest(
                 .input = .{ .string = text },
                 .config = config,
             };
-            return try httpx.json.Json.stringify(alloc, request);
+            return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
         .binary => |binary| {
             const framed = attachment_transport == .framed_binary;
@@ -360,13 +371,16 @@ fn encodeChunkRequest(
                 .config = config,
             };
             const metadata = try httpx.json.Json.stringify(alloc, request);
-            if (!framed) return metadata;
-            defer alloc.free(metadata);
+            if (!framed) return .{ .metadata_or_json = metadata };
+            errdefer alloc.free(metadata);
             const attachments = [_]httpx.attachment_envelope.Attachment{.{
                 .mime_type = binary.mime_type,
                 .data = binary.data,
             }};
-            return try httpx.attachment_envelope.encodeAlloc(alloc, metadata, &attachments);
+            return .{
+                .metadata_or_json = metadata,
+                .envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, &attachments),
+            };
         },
     }
 }
@@ -452,19 +466,18 @@ test "antfly chunker compiles" {
 test "antfly chunk request frames borrowed binary input without base64" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
-            const body = try encodeChunkRequest(
+            var body = try encodeChunkRequest(
                 alloc,
                 .{ .provider = .antfly, .model = "fixed" },
                 .{ .binary = .{ .mime_type = "image/gif", .data = "GIF89a" } },
                 .framed_binary,
             );
-            defer alloc.free(body);
-            var envelope = try httpx.attachment_envelope.parseAlloc(alloc, body, .{ .max_attachments = 1 });
-            defer envelope.deinit();
-            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
-            try std.testing.expectEqualStrings("image/gif", envelope.attachments[0].mime_type);
-            try std.testing.expectEqualStrings("GIF89a", envelope.attachments[0].data);
-            var metadata = try std.json.parseFromSlice(std.json.Value, alloc, envelope.metadata, .{});
+            defer body.deinit(alloc);
+            const envelope = body.envelope orelse return error.MissingAttachmentEnvelope;
+            try std.testing.expectEqual(@as(usize, 4), envelope.segments.len);
+            try std.testing.expectEqualStrings("image/gif", envelope.segments[2]);
+            try std.testing.expectEqualStrings("GIF89a", envelope.segments[3]);
+            var metadata = try std.json.parseFromSlice(std.json.Value, alloc, body.metadata_or_json, .{});
             defer metadata.deinit();
             const input = metadata.value.object.get("input").?.object;
             try std.testing.expectEqualStrings("attachment:0", input.get("data").?.string);

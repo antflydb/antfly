@@ -39,6 +39,22 @@ pub const Envelope = struct {
     }
 };
 
+/// An encoded envelope whose large metadata and attachment payloads remain
+/// borrowed. Only the fixed header/descriptor table and segment index are
+/// owned, so the body can be replayed without copying media bytes.
+pub const EncodedSegments = struct {
+    allocator: std.mem.Allocator,
+    prefix: []u8,
+    segments: [][]const u8,
+    total_len: usize,
+
+    pub fn deinit(self: *EncodedSegments) void {
+        self.allocator.free(self.prefix);
+        self.allocator.free(self.segments);
+        self.* = undefined;
+    }
+};
+
 fn addSize(total: *usize, amount: usize) !void {
     total.* = std.math.add(usize, total.*, amount) catch
         return error.AttachmentEnvelopeTooLarge;
@@ -91,6 +107,57 @@ pub fn encodeAlloc(
     }
     std.debug.assert(payload_offset == out.len);
     return out;
+}
+
+pub fn encodeSegmentsAlloc(
+    allocator: std.mem.Allocator,
+    metadata: []const u8,
+    attachments: []const Attachment,
+) !EncodedSegments {
+    const total_len = try encodedSize(metadata, attachments);
+    const prefix_len = std.math.add(
+        usize,
+        header_len,
+        std.math.mul(usize, attachments.len, descriptor_len) catch
+            return error.AttachmentEnvelopeTooLarge,
+    ) catch return error.AttachmentEnvelopeTooLarge;
+    const prefix = try allocator.alloc(u8, prefix_len);
+    errdefer allocator.free(prefix);
+
+    @memcpy(prefix[0..magic.len], magic);
+    std.mem.writeInt(u64, prefix[8..16], @intCast(metadata.len), .little);
+    std.mem.writeInt(u32, prefix[16..20], @intCast(attachments.len), .little);
+    @memset(prefix[20..24], 0);
+    var descriptor_offset = header_len;
+    for (attachments) |attachment| {
+        std.mem.writeInt(u32, prefix[descriptor_offset..][0..4], @intCast(attachment.mime_type.len), .little);
+        @memset(prefix[descriptor_offset + 4 .. descriptor_offset + 8], 0);
+        std.mem.writeInt(u64, prefix[descriptor_offset + 8 ..][0..8], @intCast(attachment.data.len), .little);
+        descriptor_offset += descriptor_len;
+    }
+
+    const segment_count = std.math.add(
+        usize,
+        2,
+        std.math.mul(usize, attachments.len, 2) catch
+            return error.AttachmentEnvelopeTooLarge,
+    ) catch return error.AttachmentEnvelopeTooLarge;
+    const segments = try allocator.alloc([]const u8, segment_count);
+    errdefer allocator.free(segments);
+    segments[0] = prefix;
+    segments[1] = metadata;
+    var segment_index: usize = 2;
+    for (attachments) |attachment| {
+        segments[segment_index] = attachment.mime_type;
+        segments[segment_index + 1] = attachment.data;
+        segment_index += 2;
+    }
+    return .{
+        .allocator = allocator,
+        .prefix = prefix,
+        .segments = segments,
+        .total_len = total_len,
+    };
 }
 
 pub fn parseAlloc(
@@ -165,6 +232,27 @@ test "attachment envelope round trips borrowed payloads" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, parsed.attachments[0].data);
     try std.testing.expectEqualStrings("audio/wav", parsed.attachments[1].mime_type);
     try std.testing.expectEqualSlices(u8, &.{ 4, 5 }, parsed.attachments[1].data);
+}
+
+test "segmented attachment envelope preserves the v1 wire format" {
+    const attachments = [_]Attachment{
+        .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } },
+        .{ .mime_type = "audio/wav", .data = &.{ 4, 5 } },
+    };
+    const contiguous = try encodeAlloc(std.testing.allocator, "{\"task\":\"embed\"}", &attachments);
+    defer std.testing.allocator.free(contiguous);
+    var segmented = try encodeSegmentsAlloc(std.testing.allocator, "{\"task\":\"embed\"}", &attachments);
+    defer segmented.deinit();
+
+    var joined = std.ArrayListUnmanaged(u8).empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segmented.segments) |segment| try joined.appendSlice(std.testing.allocator, segment);
+    try std.testing.expectEqual(contiguous.len, segmented.total_len);
+    try std.testing.expectEqualSlices(u8, contiguous, joined.items);
+    try std.testing.expectEqual(
+        @intFromPtr(attachments[0].data.ptr),
+        @intFromPtr(segmented.segments[3].ptr),
+    );
 }
 
 test "attachment envelope rejects trailing and over-budget data" {

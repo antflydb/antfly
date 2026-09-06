@@ -28,6 +28,12 @@ pub const Request = struct {
     version: types.Version = .HTTP_1_1,
     headers: Headers,
     body: ?[]const u8 = null,
+    /// Replayable, borrowed body segments. The outer slice and every segment
+    /// must remain alive until synchronous execution (including redirects and
+    /// retries) returns. Keeping large media as segments avoids materializing
+    /// a second contiguous request body solely for transport.
+    body_segments: ?[]const []const u8 = null,
+    body_segments_len: usize = 0,
     body_owned: bool = false,
     /// Full allocation backing an owned body when its capacity is larger than
     /// the visible body length. This lets body-transform middleware retain a
@@ -108,13 +114,16 @@ pub const Request = struct {
     }
 
     fn freeOwnedBody(self: *Self) void {
-        if (!self.body_owned) return;
-        if (self.body_allocation) |allocation| {
-            self.allocator.free(allocation);
-        } else if (self.body) |body| {
-            self.allocator.free(body);
+        if (self.body_owned) {
+            if (self.body_allocation) |allocation| {
+                self.allocator.free(allocation);
+            } else if (self.body) |body| {
+                self.allocator.free(body);
+            }
         }
         self.body = null;
+        self.body_segments = null;
+        self.body_segments_len = 0;
         self.body_owned = false;
         self.body_allocation = null;
     }
@@ -153,6 +162,30 @@ pub const Request = struct {
         self.body_owned = false;
         self.body_allocation = null;
         try self.headers.setContentLength(body.len);
+    }
+
+    /// Borrows a replayable sequence of body segments. This has the same
+    /// synchronous lifetime contract as `setBorrowedBody`, but permits HTTP/1
+    /// and HTTP/2 transports to write each segment directly.
+    pub fn setBorrowedBodySegments(self: *Self, segments: []const []const u8) !void {
+        var total: usize = 0;
+        for (segments) |segment| {
+            total = std.math.add(usize, total, segment.len) catch
+                return error.RequestBodyTooLarge;
+        }
+        self.freeOwnedBody();
+        self.body_segments = segments;
+        self.body_segments_len = total;
+        try self.headers.setContentLength(total);
+    }
+
+    pub fn bodyLen(self: *const Self) usize {
+        if (self.body) |body| return body.len;
+        return self.body_segments_len;
+    }
+
+    pub fn hasBody(self: *const Self) bool {
+        return self.bodyLen() > 0;
     }
 
     /// Sets the request body as JSON with appropriate headers.
@@ -219,8 +252,8 @@ pub const Request = struct {
         return self.uri.isTls();
     }
 
-    /// Serializes the request to HTTP/1.1 wire format.
-    pub fn serialize(self: *const Self, writer: anytype) !void {
+    /// Serializes only the HTTP/1.1 request line and headers.
+    pub fn serializeHead(self: *const Self, writer: anytype) !void {
         const method_str = if (self.method == .CUSTOM)
             self.custom_method orelse "CUSTOM"
         else
@@ -242,10 +275,21 @@ pub const Request = struct {
 
         try self.headers.serialize(writer);
         try writer.writeAll("\r\n");
+    }
 
+    /// Writes the body without joining borrowed segments.
+    pub fn writeBody(self: *const Self, writer: anytype) !void {
         if (self.body) |body| {
             try writer.writeAll(body);
+        } else if (self.body_segments) |segments| {
+            for (segments) |segment| try writer.writeAll(segment);
         }
+    }
+
+    /// Serializes the request to HTTP/1.1 wire format.
+    pub fn serialize(self: *const Self, writer: anytype) !void {
+        try self.serializeHead(writer);
+        try self.writeBody(writer);
     }
 
     /// Serializes to an allocated buffer.
@@ -362,6 +406,22 @@ test "Request can borrow an already-owned body without copying it" {
     try std.testing.expect(!request.body_owned);
     try std.testing.expectEqual(@intFromPtr(body[0..].ptr), @intFromPtr(request.body.?.ptr));
     try std.testing.expectEqualStrings("4", request.headers.get(HeaderName.CONTENT_LENGTH).?);
+}
+
+test "Request can replay borrowed body segments" {
+    const allocator = std.testing.allocator;
+    var request = try Request.init(allocator, .POST, "https://example.com/api");
+    defer request.deinit();
+
+    const segments = [_][]const u8{ "meta", "-", "media" };
+    try request.setBorrowedBodySegments(&segments);
+    try std.testing.expect(request.hasBody());
+    try std.testing.expectEqual(@as(usize, 10), request.bodyLen());
+    try std.testing.expectEqualStrings("10", request.headers.get(HeaderName.CONTENT_LENGTH).?);
+
+    const serialized = try request.toSlice(allocator);
+    defer allocator.free(serialized);
+    try std.testing.expect(mem.endsWith(u8, serialized, "\r\n\r\nmeta-media"));
 }
 
 test "Request builder" {

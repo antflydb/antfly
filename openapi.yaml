@@ -18680,7 +18680,9 @@ components:
               example: fixed
             max_chunks:
               type: integer
-              minimum: 1
+              minimum: 0
+              maximum: 4096
+              description: Maximum number of chunks to generate per document. Zero uses the chunker default.
             threshold:
               type: number
               format: float

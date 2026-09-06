@@ -2337,12 +2337,12 @@ func TestProxyMixedModelGenerateBatchAllowsUnevenPartitionResponses(t *testing.T
 	const responseLimit = int64(96 << 10)
 	spoolDirectory := t.TempDir()
 	p := NewProxy(Config{
-		DefaultPool:                  RoutePoolTarget{Pool: "primary"},
-		RefreshInterval:              time.Minute,
-		MaxBatchResponseBytes:        responseLimit,
-		MaxSpooledBatchResponseBytes: maxConcurrentGenerateBatchPartitions * responseLimit,
-		BatchResponseSpoolDir:        spoolDirectory,
-		Logger:                       zap.NewNop(),
+		DefaultPool:           RoutePoolTarget{Pool: "primary"},
+		RefreshInterval:       time.Minute,
+		MaxBatchResponseBytes: responseLimit,
+		MaxSpooledBytes:       maxConcurrentGenerateBatchPartitions * responseLimit,
+		SpoolDir:              spoolDirectory,
+		Logger:                zap.NewNop(),
 	})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requestBody, err := io.ReadAll(req.Body)
@@ -2709,10 +2709,10 @@ func TestProxyMixedModelGenerateBatchCleansSpillsAfterCancellation(t *testing.T)
 	spoolDirectory := t.TempDir()
 	firstWrite := make(chan struct{})
 	p := NewProxy(Config{
-		DefaultPool:           RoutePoolTarget{Pool: "primary"},
-		RefreshInterval:       time.Minute,
-		BatchResponseSpoolDir: spoolDirectory,
-		Logger:                zap.NewNop(),
+		DefaultPool:     RoutePoolTarget{Pool: "primary"},
+		RefreshInterval: time.Minute,
+		SpoolDir:        spoolDirectory,
+		Logger:          zap.NewNop(),
 	})
 	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requestBody, err := io.ReadAll(req.Body)
@@ -2780,7 +2780,7 @@ func TestProxyMixedModelGenerateBatchCleansSpillsAfterCancellation(t *testing.T)
 	if len(entries) != 0 {
 		t.Fatalf("response spill files leaked after cancellation: %v", entries)
 	}
-	if used := p.batchSpoolAdmission.Used(); used != 0 {
+	if used := p.spoolAdmission.Used(); used != 0 {
 		t.Fatalf("batch response spill admission leaked %d bytes", used)
 	}
 }
@@ -4143,6 +4143,67 @@ func TestProxyRoutesFramedReadFromBorrowedMetadataAndForwardsBodyUnchanged(t *te
 	}
 	if !forwarded {
 		t.Fatal("framed read was not forwarded")
+	}
+}
+
+func TestProxyRetriesFramedReadFromBoundedReplayFile(t *testing.T) {
+	t.Parallel()
+	spoolDir := t.TempDir()
+	p := NewProxy(Config{
+		DefaultPool: RoutePoolTarget{Pool: "default"},
+		SpoolDir:    spoolDir,
+		Logger:      zap.NewNop(),
+	})
+	p.registry.RegisterEndpoint("http://reader.internal", "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://reader.internal", "read", "owner/reader")
+	if changed, err := p.Router().RouteManager().UpsertRoute(&Route{
+		Namespace:       "default",
+		Name:            "framed-retry",
+		Operations:      map[OperationType]bool{"read": true},
+		Destinations:    []Destination{{Pool: "primary", Weight: 100}},
+		RetryAttempts:   2,
+		RetryOnStatuses: map[int]bool{http.StatusInternalServerError: true},
+	}); err != nil || !changed {
+		t.Fatalf("install route: changed=%v err=%v", changed, err)
+	}
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: []byte{1, 2, 3, 4}})
+	attempts := 0
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		got, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("attempt %d changed framed body", attempts)
+		}
+		status := http.StatusOK
+		responseBody := `{"object":"list","data":[]}`
+		if attempts == 1 {
+			status = http.StatusInternalServerError
+			responseBody = `{"error":"retry"}`
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(responseBody)),
+			Request:    req,
+		}, nil
+	})}
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/read", bytes.NewReader(body))
+	request.Header.Set("Content-Type", proxyAttachmentEnvelopeContentType)
+	recorder := httptest.NewRecorder()
+	p.handleRead(recorder, request)
+	if recorder.Code != http.StatusOK || attempts != 2 {
+		t.Fatalf("status=%d attempts=%d body=%q", recorder.Code, attempts, recorder.Body.String())
+	}
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("request replay spill leaked: %v", entries)
 	}
 }
 
