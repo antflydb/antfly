@@ -2285,6 +2285,25 @@ pub const GraphMetricStatus = struct {
     last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
     recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
 
+    pub fn cloneAlloc(self: GraphMetricStatus, alloc: Allocator) !GraphMetricStatus {
+        var out = self;
+        out.name = try alloc.dupe(u8, self.name);
+        out.edge_filter = .{};
+        out.build_worker_id = "";
+        out.build_cursor = "";
+        out.build_pages = &.{};
+        out.last_error = "";
+        out.recent_events = &.{};
+        errdefer out.deinit(alloc);
+        out.edge_filter = try self.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = try alloc.dupe(u8, self.build_worker_id);
+        out.build_cursor = try alloc.dupe(u8, self.build_cursor);
+        out.last_error = try alloc.dupe(u8, self.last_error);
+        out.recent_events = try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, self.recent_events);
+        out.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, self.build_pages);
+        return out;
+    }
+
     pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
         alloc.free(self.name);
         self.edge_filter.deinit(alloc);
@@ -2323,6 +2342,39 @@ pub const GraphMetricBuildPageStatus = struct {
 pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
     for (statuses) |*status| status.deinit(alloc);
     if (statuses.len > 0) alloc.free(statuses);
+}
+
+pub fn cloneGraphMetricStatuses(alloc: Allocator, statuses: []const GraphMetricStatus) ![]GraphMetricStatus {
+    const out = try alloc.alloc(GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        out[i] = try status.cloneAlloc(alloc);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneGraphMetricBuildPageStatuses(alloc: Allocator, source: []const GraphMetricBuildPageStatus) ![]GraphMetricBuildPageStatus {
+    const out = try alloc.alloc(GraphMetricBuildPageStatus, source.len);
+    for (out) |*page| page.* = .{};
+    errdefer {
+        for (out) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, out) |original, *page| {
+        page.* = original;
+        page.worker_id = "";
+        page.cursor = "";
+        page.last_error = "";
+        page.worker_id = try alloc.dupe(u8, original.worker_id);
+        page.cursor = try alloc.dupe(u8, original.cursor);
+        page.last_error = try alloc.dupe(u8, original.last_error);
+    }
+    return out;
 }
 pub const GraphAggregateResult = struct {
     name: []u8,

@@ -5164,58 +5164,49 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
     };
 }
 
+test "graph metric cached index stats clone retains owned progress and survives allocation failures" {
+    try testGraphMetricStatsClone(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testGraphMetricStatsClone, .{});
+}
+
+fn testGraphMetricStatsClone(alloc: std.mem.Allocator) !void {
+    var pages = [_]db_mod.types.GraphMetricBuildPageStatus{.{
+        .worker_id = "page-worker",
+        .cursor = "page-cursor",
+        .last_error = "page-error",
+    }};
+    var metrics = [_]db_mod.types.GraphMetricStatus{.{
+        .name = @constCast("pagerank"),
+        .state = .building,
+        .published_generation = 7,
+        .build_worker_id = "worker",
+        .build_cursor = "cursor",
+        .last_error = "diagnostic",
+        .build_pages = &pages,
+    }};
+    var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph_idx", .kind = .graph, .graph_metric_status = &metrics }};
+    const cloned = try cloneDBStats(alloc, .{ .indexes = &indexes, .index_count = 1 });
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqual(@as(usize, 1), cloned.indexes[0].graph_metric_status.len);
+    const status = cloned.indexes[0].graph_metric_status[0];
+    try std.testing.expectEqualStrings("pagerank", status.name);
+    try std.testing.expect(status.name.ptr != metrics[0].name.ptr);
+    try std.testing.expectEqual(@as(u64, 7), status.published_generation);
+    try std.testing.expectEqualStrings("cursor", status.build_cursor);
+    try std.testing.expect(status.build_cursor.ptr != metrics[0].build_cursor.ptr);
+    try std.testing.expectEqualStrings("page-cursor", status.build_pages[0].cursor);
+    try std.testing.expect(status.build_pages[0].cursor.ptr != pages[0].cursor.ptr);
+    try std.testing.expectEqualStrings("page-worker", status.build_pages[0].worker_id);
+    try std.testing.expectEqualStrings("page-error", status.build_pages[0].last_error);
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
     const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
     errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, stats.indexes.len);
     var initialized: usize = 0;
     errdefer {
-        for (indexes[0..initialized]) |item| {
-            alloc.free(item.name);
-            if (item.load_error) |value| alloc.free(value);
-            if (item.index_repair_last_error) |value| alloc.free(value);
-            if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-            if (item.algebraic_last_error_reason) |value| alloc.free(value);
-            if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-            if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-            if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-            if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-            if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-            if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-            if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-            if (item.algebraic_top_candidate) |candidate| {
-                alloc.free(candidate.recommendation);
-                alloc.free(candidate.materialization_id);
-                alloc.free(candidate.lifecycle);
-                alloc.free(candidate.decision);
-            }
-            if (item.algebraic_active_progress) |progress| {
-                alloc.free(progress.recommendation);
-                alloc.free(progress.materialization_id);
-                alloc.free(progress.lifecycle);
-            }
-            for (item.algebraic_candidates) |candidate| {
-                alloc.free(candidate.recommendation);
-                alloc.free(candidate.materialization_id);
-                alloc.free(candidate.lifecycle);
-                alloc.free(candidate.decision);
-            }
-            if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-            for (item.algebraic_candidate_decision_history) |entry| {
-                alloc.free(entry.recommendation);
-                alloc.free(entry.materialization_id);
-                alloc.free(entry.lifecycle);
-                alloc.free(entry.previous_decision);
-                alloc.free(entry.decision);
-            }
-            if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-            for (item.algebraic_progress) |progress| {
-                alloc.free(progress.recommendation);
-                alloc.free(progress.materialization_id);
-                alloc.free(progress.lifecycle);
-            }
-            if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-        }
+        for (indexes[0..initialized]) |item| db_mod.types.freeDBIndexStatsItem(alloc, item);
         alloc.free(indexes);
     }
 
@@ -5316,7 +5307,10 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         errdefer freeAlgebraicCandidateDecisionStatuses(alloc, algebraic_candidate_decision_history);
         const algebraic_progress = try cloneAlgebraicProgressStatuses(alloc, item.algebraic_progress);
         errdefer freeAlgebraicProgressStatuses(alloc, algebraic_progress);
+        const graph_metric_status = try db_mod.types.cloneGraphMetricStatuses(alloc, item.graph_metric_status);
+        errdefer db_mod.types.freeGraphMetricStatuses(alloc, graph_metric_status);
         indexes[i] = .{
+            .graph_metric_status = graph_metric_status,
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
             .runtime_observation_stale = item.runtime_observation_stale,

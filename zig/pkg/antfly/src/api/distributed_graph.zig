@@ -12101,110 +12101,21 @@ fn cloneGraphMetricStatuses(
     alloc: std.mem.Allocator,
     statuses: []const db_mod.types.GraphMetricStatus,
 ) ![]db_mod.types.GraphMetricStatus {
-    if (statuses.len == 0) return @constCast((&[_]db_mod.types.GraphMetricStatus{})[0..]);
-    const out = try alloc.alloc(db_mod.types.GraphMetricStatus, statuses.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*status| status.deinit(alloc);
-        alloc.free(out);
-    }
-    for (statuses, 0..) |status, i| {
-        out[i] = try cloneGraphMetricStatus(alloc, status);
-        initialized += 1;
-    }
-    return out;
+    return db_mod.types.cloneGraphMetricStatuses(alloc, statuses);
 }
 
 fn cloneGraphMetricStatus(
     alloc: std.mem.Allocator,
     source: db_mod.types.GraphMetricStatus,
 ) !db_mod.types.GraphMetricStatus {
-    const name = try alloc.dupe(u8, source.name);
-    errdefer alloc.free(name);
-    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
-    errdefer edge_filter.deinit(alloc);
-    const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
-    errdefer if (build_worker_id.len > 0) alloc.free(build_worker_id);
-    const build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
-    errdefer if (build_cursor.len > 0) alloc.free(build_cursor);
-    const build_pages = try cloneGraphMetricBuildPageStatuses(alloc, source.build_pages);
-    errdefer {
-        for (build_pages) |*page| page.deinit(alloc);
-        if (build_pages.len > 0) alloc.free(build_pages);
-    }
-    const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
-    errdefer if (last_error.len > 0) alloc.free(last_error);
-    const recent_events = if (source.recent_events.len > 0)
-        try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
-    else
-        @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
-    errdefer if (recent_events.len > 0) alloc.free(recent_events);
-
-    return .{
-        .name = name,
-        .state = source.state,
-        .phase = source.phase,
-        .edge_filter = edge_filter,
-        .metadata_version = source.metadata_version,
-        .config_fingerprint = source.config_fingerprint,
-        .maintenance_paused = source.maintenance_paused,
-        .build_queued = source.build_queued,
-        .published_generation = source.published_generation,
-        .edge_generation = source.edge_generation,
-        .target_edge_generation = source.target_edge_generation,
-        .queued_generation = source.queued_generation,
-        .building_generation = source.building_generation,
-        .build_job_id = source.build_job_id,
-        .build_started_at_ms = source.build_started_at_ms,
-        .build_iteration = source.build_iteration,
-        .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
-        .build_worker_id = build_worker_id,
-        .build_cursor = build_cursor,
-        .build_completed_units = source.build_completed_units,
-        .build_total_units = source.build_total_units,
-        .build_pages = build_pages,
-        .build_pages_truncated = source.build_pages_truncated,
-        .retry_count = source.retry_count,
-        .last_error = last_error,
-        .progress = source.progress,
-        .converged = source.converged,
-        .iterations_completed = source.iterations_completed,
-        .delta = source.delta,
-        .computed_at_ms = source.computed_at_ms,
-        .last_event = source.last_event,
-        .recent_events = recent_events,
-    };
+    return source.cloneAlloc(alloc);
 }
 
 fn cloneGraphMetricBuildPageStatuses(
     alloc: std.mem.Allocator,
     source: []const db_mod.types.GraphMetricBuildPageStatus,
 ) ![]db_mod.types.GraphMetricBuildPageStatus {
-    if (source.len == 0) return @constCast((&[_]db_mod.types.GraphMetricBuildPageStatus{})[0..]);
-    const out = try alloc.alloc(db_mod.types.GraphMetricBuildPageStatus, source.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*page| page.deinit(alloc);
-        alloc.free(out);
-    }
-    for (source, 0..) |page, i| {
-        out[i] = .{
-            .phase = page.phase,
-            .iteration = page.iteration,
-            .page_id = page.page_id,
-            .state = page.state,
-            .range_kind = page.range_kind,
-            .worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "",
-            .lease_expires_at_ms = page.lease_expires_at_ms,
-            .attempt = page.attempt,
-            .cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "",
-            .completed_units = page.completed_units,
-            .total_units = page.total_units,
-            .last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "",
-        };
-        initialized += 1;
-    }
-    return out;
+    return db_mod.types.cloneGraphMetricBuildPageStatuses(alloc, source);
 }
 
 fn mergeGraphMetricStatuses(
