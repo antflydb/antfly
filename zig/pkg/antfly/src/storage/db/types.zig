@@ -3073,6 +3073,11 @@ pub const DBIndexStats = struct {
     // This is deliberately independent of serving authority and is never
     // persisted or exposed as a separate public field.
     runtime_target_observation_complete: bool = true,
+    // Cache-local replay witnesses belonging to the retained serving and
+    // coverage payloads, not the potentially newer replay progress overlay.
+    // Null on a raw owner observation; never serialized or persisted.
+    runtime_serving_applied_sequence: ?u64 = null,
+    runtime_coverage_applied_sequence: ?u64 = null,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,

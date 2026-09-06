@@ -127,10 +127,19 @@ Dense keeps its HBC-specific begin/finish implementation, but bounded catch-up
 scheduling is no longer dense-only.
 
 Generated replay also bounds source preparation separately from its larger
-derived-record window. By default it prepares at most 64 deferred provider
-requests, executes full provider batches, publishes that partial output
+derived-record window. By default it closes preparation at a source-document
+boundary once 64 deferred provider requests have been queued, executes full
+provider batches, publishes that partial output
 durably, and releases the request/chunk caches before inspecting more source
 documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+Deferred asset work retains lightweight request references, not materialized
+documents or provider payloads. The execution lane materializes compatible
+batches bounded by both item count and retained bytes (including raw documents,
+source parts, and state). It may inspect one additional candidate to determine
+its size; an oversized source executes alone before the next is materialized.
+Retryable batch failures retain their request identity while independent asset
+and dense batches continue, so byte-bound flushing does not reintroduce
+provider head-of-line blocking.
 The separate bound keeps provider batching efficient while making memory and
 time to the first queryable publication independent of corpus size. On restart,
 a clean partial publication remains searchable from its incarnation-scoped
@@ -217,6 +226,20 @@ or acquire its writer-cache mutex. While convergence is awaiting the next owner
 publication, the last safe incarnation and counts remain visible and
 queryable; `complete` is blocked by `target_observation` in addition to any
 coverage/publication debt.
+
+Observing an accepted target is distinct from applying its deletion or source
+replacement. The status cache retains the last exact reducing commit watermark
+across subsequent additive commits. Serving and coverage payloads each carry
+their own cache-local applied-replay witness; retaining an older payload must
+also retain its witness even if the replay progress overlay advances. Counts
+may decrease when the corresponding payload applies that reducing commit, not
+merely because an observer discovers its target. Once applied, the watermark
+cannot authorize a second regression without another reducing commit.
+
+Full-text publication and cleanup share the same source-consumption predicate,
+including chunks implicitly routed through `full_text_index`. Internal control
+records remain excluded; deleting a consumed chunk schedules the same exact
+index through both live and replay target discovery.
 
 Initial materialization and corruption recovery share a crash-resumable,
 bounded generation scheduler, but remain distinct durable work classes. A

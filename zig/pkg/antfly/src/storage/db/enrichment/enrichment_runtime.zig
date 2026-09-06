@@ -3063,11 +3063,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         defer deferred_plain_dense.deinit(self.alloc);
         var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         defer deferred_chunked_dense.deinit(self.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
-        defer {
-            clearAssetProducerBatchItems(self.alloc, &deferred_assets);
-            deferred_assets.deinit(self.alloc);
-        }
+        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_assets.deinit(self.alloc);
         var window = GeneratedReplayWindow{ .alloc = self.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
@@ -5061,11 +5058,8 @@ fn runForegroundCatchUpPassOwned(
         defer deferred_plain_dense.deinit(runtime.alloc);
         var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         defer deferred_chunked_dense.deinit(runtime.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
-        defer {
-            clearAssetProducerBatchItems(runtime.alloc, &deferred_assets);
-            deferred_assets.deinit(runtime.alloc);
-        }
+        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_assets.deinit(runtime.alloc);
         var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
@@ -5172,7 +5166,7 @@ fn processPendingDocumentGroup(
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     window: *GeneratedReplayWindow,
     processed_request_count: *u64,
     guard: ForegroundCatchUpGuard,
@@ -5198,7 +5192,7 @@ fn processPendingDocumentGroup(
         }
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
         switch (request.kind) {
-            .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
+            .asset => processAssetOrDefer(runtime, request, deferred_assets, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
@@ -5232,18 +5226,19 @@ fn flushDeferredGeneratedWork(
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     window: *GeneratedReplayWindow,
 ) !void {
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     var deferred_retry_error: ?anyerror = null;
     var deferred_retry_fingerprint: u64 = 0;
-    flushAssetProducerBatch(runtime, deferred_assets, window) catch |err| {
+    processDeferredAssets(runtime, deferred_assets.items, window) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
             return err;
         deferred_retry_error = err;
         deferred_retry_fingerprint = runtime.active_failure_fingerprint;
     };
+    deferred_assets.clearRetainingCapacity();
     // Each producer class is an independent availability domain. Publish a
     // completed class before invoking the next provider so a retryable outage
     // cannot discard useful sibling output accumulated in this replay
@@ -5284,7 +5279,7 @@ fn flushDeferredGeneratedWork(
 fn processAsset(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *PreparedAssetBatch,
     window: *GeneratedReplayWindow,
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
@@ -5385,7 +5380,7 @@ fn processAsset(
     var config_json_owned = true;
     errdefer if (config_json_owned and config_json.len > 0) runtime.alloc.free(config_json);
 
-    try appendAssetProducerBatchItem(runtime, deferred_assets, .{
+    try deferred_assets.append(runtime, window, .{
         .request = request,
         .producer_type = producer_cfg.type,
         .config_json = @constCast(config_json),
@@ -5405,12 +5400,106 @@ fn processAsset(
     state_value_owned = false;
 }
 
-fn appendAssetProducerBatchItem(
+// Planning retains only borrowed requests. Materialization owns at most one
+// byte-bounded provider batch plus the candidate currently being inspected.
+// A single oversized source is dispatched alone; it cannot accumulate with
+// the next source. Retryable failures are remembered while sibling work runs.
+const PreparedAssetBatch = struct {
+    items: std.ArrayListUnmanaged(AssetProducerBatchItem) = .empty,
+    retained_bytes: usize = 0,
+    retry_error: ?anyerror = null,
+    retry_fingerprint: u64 = 0,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        clearAssetProducerBatchItems(alloc, &self.items);
+        self.items.deinit(alloc);
+    }
+
+    fn retainRetry(self: *@This(), runtime: *EnrichmentRuntime, err: anyerror) !void {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+        if (self.retry_error == null) {
+            self.retry_error = err;
+            self.retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+    }
+
+    fn flush(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow) !void {
+        defer self.retained_bytes = 0;
+        flushAssetProducerBatch(runtime, &self.items, window) catch |err| try self.retainRetry(runtime, err);
+        try flushGeneratedReplayWindow(runtime, window);
+    }
+
+    fn append(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem) !void {
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, item.request);
+        const item_bytes = assetProducerRetainedBytes(item);
+        if (self.items.items.len > 0 and
+            (!sameAssetProducerBatchKey(self.items.items[0], item) or
+                self.items.items.len >= policy.max_items or
+                addUsizeSaturating(self.retained_bytes, item_bytes) > policy.max_bytes))
+            try self.flush(runtime, window);
+        try self.items.append(runtime.alloc, item);
+        self.retained_bytes = addUsizeSaturating(self.retained_bytes, item_bytes);
+    }
+
+    fn flushIfFull(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow) !void {
+        if (self.items.items.len == 0) return;
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, self.items.items[0].request);
+        if (self.items.items.len >= policy.max_items or self.retained_bytes >= policy.max_bytes)
+            try self.flush(runtime, window);
+    }
+};
+
+fn assetProducerRetainedBytes(item: AssetProducerBatchItem) usize {
+    var bytes = assetProducerBatchItemBytes(item);
+    for ([_][]const u8{ item.raw_doc, item.artifact_key, item.state_key, item.state_value }) |part|
+        bytes = addUsizeSaturating(bytes, part.len);
+    return bytes;
+}
+
+fn processAssetOrDefer(
     runtime: *EnrichmentRuntime,
-    items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
-    item: AssetProducerBatchItem,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    deferred: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    window: *GeneratedReplayWindow,
 ) !void {
-    try items.append(runtime.alloc, item);
+    var config = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer config.deinit(runtime.alloc);
+    if (config.type != .copy and config.type != .document_extraction) {
+        try deferred.append(runtime.alloc, request);
+        return;
+    }
+    // Copy/extraction establish dependencies for subsequent requests and own
+    // their existing bounded execution paths; they do not queue provider input.
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(runtime.alloc);
+    try processAsset(runtime, request, &batch, window);
+    std.debug.assert(batch.items.items.len == 0);
+}
+
+fn processDeferredAssets(
+    runtime: *EnrichmentRuntime,
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
+) !void {
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(runtime.alloc);
+    for (requests) |request| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
+        processAsset(runtime, request, &batch, window) catch |err| {
+            if (shouldYieldRequestError(runtime, err)) {
+                try batch.retainRetry(runtime, err);
+            } else {
+                try recordIsolatedRequestError(runtime, window, request, err);
+            }
+        };
+        try batch.flushIfFull(runtime, window);
+    }
+    try batch.flush(runtime, window);
+    if (batch.retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, batch.retry_fingerprint);
+        return err;
+    }
 }
 
 fn flushAssetProducerBatch(
@@ -5422,10 +5511,8 @@ fn flushAssetProducerBatch(
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
-    // Planning remains provider-I/O free: retain bounded items until the
-    // preparation quantum closes, then partition them into compatible native
-    // batches. This prevents an early asset-provider outage from stopping
-    // later dense requests before their availability lane is even queued.
+    // The materializer bounds retained bytes before dispatch. Partition any
+    // callers' mixed inputs into compatible provider batches as well.
     var deferred_retry_error: ?anyerror = null;
     var deferred_retry_fingerprint: u64 = 0;
     var start: usize = 0;
@@ -15273,6 +15360,127 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
     const second = try storeGetAlloc(&runtime, "artifact:two");
     defer alloc.free(second);
     try std.testing.expectEqualStrings("ok:two", second);
+}
+
+test "asset preparation is lazy and byte bounded across retryable provider batches" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        publications: u64 = 0,
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (std.mem.eql(u8, request.source_text, "blocked")) return error.EmbedRateLimited;
+            return try a.dupe(u8, "generated");
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn write(ptr: *anyopaque, _: derived_types.DerivedBatch, _: []const []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return self.publications;
+        }
+        fn notify(_: *anyopaque, _: u64) void {}
+        fn item(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, source: []const u8) !AssetProducerBatchItem {
+            return .{
+                .request = request,
+                .producer_type = .generator,
+                .config_json = try a.dupe(u8, "{}"),
+                .raw_doc = try a.dupe(u8, "{\"body\":\"large retained document\"}"),
+                .source_text = try a.dupe(u8, source),
+                .source_parts_json = try a.dupe(u8, "[]"),
+                .artifact_key = try a.dupe(u8, request.doc_key),
+                .state_key = try std.fmt.allocPrint(a, "state:{s}", .{request.doc_key}),
+                .state_value = try a.dupe(u8, "state"),
+            };
+        }
+    };
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer manager.deinit();
+    var harness = Harness{};
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = &harness,
+        .write_fn = Harness.write,
+        .notify_ctx = &harness,
+        .notify_fn = Harness.notify,
+        .config = .{ .asset_producer = .{ .ptr = &harness, .vtable = &.{ .produce = Harness.produce, .can_produce_batch = Harness.canBatch } }, .inline_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+    defer clearPublishedGeneratedArtifacts(&runtime);
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    var queued = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+    defer queued.deinit(alloc);
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .asset,
+        .index_name = "asset_idx",
+        .artifact_name = "generated",
+        .doc_key = "blocked",
+        .source_field = "body",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
+        .sequence = 7,
+    };
+    // There is deliberately no document in the store. Planning must retain
+    // the request, not read/materialize it or invoke the provider.
+    try processAssetOrDefer(&runtime, request, &queued, &window);
+    try std.testing.expectEqual(@as(usize, 1), queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(alloc);
+    for ([_][]const u8{ "blocked", "healthy-a", "healthy-b" }) |source| {
+        var next = request;
+        next.doc_key = source;
+        const item = try Harness.item(alloc, next, source);
+        try std.testing.expect(assetProducerRetainedBytes(item) > assetProducerBatchItemBytes(item));
+        try batch.append(&runtime, &window, item);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+        try batch.flushIfFull(&runtime, &window);
+        try std.testing.expectEqual(@as(usize, 0), batch.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), batch.retained_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(@as(u64, 2), harness.publications);
+    try std.testing.expectEqual(error.EmbedRateLimited, batch.retry_error.?);
+    try std.testing.expectEqual(requestFailureFingerprint(request), batch.retry_fingerprint);
+    // Two individually admissible items must flush at the byte boundary even
+    // though the item-count limit allows eight. Account for raw/state bytes,
+    // not just the much smaller text sent to the provider.
+    for ([_][]const u8{ "bounded-a", "bounded-b" }, 0..) |source, i| {
+        var next = request;
+        next.doc_key = source;
+        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128}";
+        const item = try Harness.item(alloc, next, source);
+        try std.testing.expect(assetProducerRetainedBytes(item) < 128);
+        try std.testing.expect(assetProducerRetainedBytes(item) * 2 > 128);
+        try batch.append(&runtime, &window, item);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+        try std.testing.expectEqual(@as(usize, 3) + i, harness.calls);
+        try std.testing.expect(batch.retained_bytes < 128);
+    }
+    try batch.flush(&runtime, &window);
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqual(@as(u64, 4), harness.publications);
 }
 
 test "asset batch fallback keeps the logical request retry budget" {

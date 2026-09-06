@@ -878,6 +878,40 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     hits = result["responses"][0]["hits"]["hits"]
     assert hits[0]["_id"] == "doc:a"
 
+    # Serving counts are monotonic only without reducing source mutations.
+    # Poll during async deletion, then require exact lower counts and matching
+    # query results in the same incarnation, including the valid empty index.
+    incarnation = ready["incarnation"]
+    for deleted, remaining in ((["doc:a", "doc:b"], {"doc:c"}), (["doc:c"], set())):
+        stateful_api.batch_write(table_name, deletes=deleted, sync_level="write")
+        latest = {}
+
+        def deletion_published():
+            nonlocal latest
+            latest = stateful_api.get_index(table_name, index_name)
+            status = ready_index_status(
+                latest, until="complete", require_query_fresh=True
+            )
+            if status is None or status.get("searchable_vectors") != len(remaining):
+                return None
+            assert status["incarnation"] == incarnation
+            return status
+
+        assert wait_until(deletion_published, timeout_s=30.0, interval_s=0.05), (
+            json.dumps(latest, indent=2, sort_keys=True)
+        )
+        after_delete = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: _pack_f32_le([1.0, 0.0, 0.0])},
+                "indexes": [index_name],
+                "limit": 3,
+            },
+        )
+        assert {
+            hit["_id"] for hit in after_delete["responses"][0]["hits"]["hits"]
+        } == remaining
+
 
 def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(
     stateful_api,

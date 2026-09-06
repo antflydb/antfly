@@ -60663,6 +60663,44 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expect(hook_ctx.saw_graph);
 }
 
+test "db generated downstream indexes are exact convergence targets at source commit including implicit chunk deletion" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "default", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+        .full_text_index = true,
+    });
+    const key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks", 0);
+    defer alloc.free(key);
+    var context = try db.core.index_manager.acquireTextPublicationContext(alloc, "default");
+    defer context.deinit();
+    try std.testing.expect(try db.core.index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked("default", context, key));
+    const batch: derived_types.DerivedBatch = .{ .deleted_keys = &.{key} };
+    var targets = try collectManagedSyncTargets(alloc, db.core.index_manager, batch);
+    defer targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), targets.all_indexes.len);
+    try std.testing.expectEqualStrings("default", targets.all_indexes[0]);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, targets.target_identities[0].serving_set_effect);
+    var replay_targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{ .sequence = 7, .deleted_doc_keys = &.{key} });
+    defer replay_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay_targets.all_indexes.len);
+    const deletes = try collectTextReplayDeleteKeys(alloc, db.core.index_manager, batch, "default", context);
+    defer alloc.free(deletes);
+    try std.testing.expectEqual(@as(usize, 1), deletes.len);
+    try std.testing.expectEqualStrings(key, deletes[0]);
+}
+
 test "db full-text index and search survive reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 

@@ -117,6 +117,10 @@ pub const LocalTableRuntimeStatus = struct {
     pub fn replaceMetadata(self: *@This(), metadata: RuntimeStatusMetadata) void {
         self.metadata = metadata;
         for (self.stats.indexes) |*item| {
+            if (item.runtime_serving_applied_sequence == null)
+                item.runtime_serving_applied_sequence = item.replay_applied_sequence;
+            if (item.runtime_coverage_applied_sequence == null)
+                item.runtime_coverage_applied_sequence = item.replay_applied_sequence;
             item.runtime_observation_serviceable = false;
             item.runtime_observation_targeted_sibling = false;
         }
@@ -263,11 +267,11 @@ const TargetedIndexAuthority = struct {
         // Durable per-index target ordering. The runtime row must prove that
         // its replay target includes this source commit.
         source_target_sequence: u64,
-        // Serving and convergence are independent authorities. Additive work
-        // may make completion stale, but it cannot authorize a lower serving
-        // cardinality for the same incarnation. Reduction authority is kept
-        // until an owner observation covers the coalesced requirement.
-        serving_set_may_reduce: bool,
+        // Keep the last reducing commit independently of target observation.
+        // Additive commits cannot erase it; each retained payload acknowledges
+        // it only through its own applied replay witness. One watermark keeps
+        // this bounded regardless of coalesced writes or observation gaps.
+        reducing_source_sequence: u64,
     };
 
     const TerminalFailure = struct {
@@ -2905,7 +2909,7 @@ pub const TableRuntimeSnapshotCache = struct {
             authority = state.index_authorities.getPtr(owned_name).?;
         }
 
-        var serving_set_may_reduce =
+        const serving_set_may_reduce =
             if (@hasField(@TypeOf(identity), "serving_set_effect"))
                 switch (identity.serving_set_effect) {
                     .additive_only => false,
@@ -2913,26 +2917,19 @@ pub const TableRuntimeSnapshotCache = struct {
                 }
             else
                 true;
+        var reducing_source_sequence = if (serving_set_may_reduce) source_target_sequence else 0;
         if (authority.?.convergence_requirements.get(group_id)) |required| {
             if (source_target_sequence < required.source_target_sequence) return .no_change;
-            const previous_still_pending = if (current_status) |status|
-                if (current_position) |position|
-                    !status.stats.indexes[position].runtime_target_observation_complete
-                else
-                    true
-            else
-                true;
-            if (previous_still_pending and required.serving_set_may_reduce)
-                serving_set_may_reduce = true;
+            reducing_source_sequence = @max(reducing_source_sequence, required.reducing_source_sequence);
             if (source_target_sequence == required.source_target_sequence and
-                serving_set_may_reduce == required.serving_set_may_reduce)
+                reducing_source_sequence == required.reducing_source_sequence)
                 return .no_change;
         }
         self.advanceTargetObservationRevisionLocked();
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
             .event_revision = self.target_observation_revision,
             .source_target_sequence = source_target_sequence,
-            .serving_set_may_reduce = serving_set_may_reduce,
+            .reducing_source_sequence = reducing_source_sequence,
         }) catch {
             // Exact-scope bookkeeping failed, so conservatively widen this
             // one event to the established group-wide convergence fence.
@@ -3704,6 +3701,10 @@ pub const TableRuntimeSnapshotCache = struct {
             observed_revision >= required.event_revision and
             status.metadata.target_observation_revision >= required.source_target_sequence;
         for (status.stats.indexes) |*item| {
+            if (item.runtime_serving_applied_sequence == null)
+                item.runtime_serving_applied_sequence = item.replay_applied_sequence;
+            if (item.runtime_coverage_applied_sequence == null)
+                item.runtime_coverage_applied_sequence = item.replay_applied_sequence;
             item.runtime_target_observation_complete = true;
             const authority = state.index_authorities.get(item.name) orelse continue;
             if (!targetAuthorityAcceptsIdentity(authority, item.*)) continue;
@@ -4076,7 +4077,8 @@ fn preserveArtifactVisibilityUsingLookup(
             dst.coverage_config_hash != 0 and
                 dst.coverage_config_hash == cached.coverage_config_hash;
         const same_projection_identity = same_runtime_root and
-            (if (derived_index) same_derived_incarnation else same_projection_config);
+            (if (derived_index) same_derived_incarnation else same_projection_config and
+                dst.coverage_generation == cached.coverage_generation);
         const cached_serving_owner = if (cached.serving_snapshot_owner_id != 0)
             cached.serving_snapshot_owner_id
         else
@@ -4090,35 +4092,30 @@ fn preserveArtifactVisibilityUsingLookup(
         const serving_revision_not_newer = same_serving_owner and
             same_projection_identity and
             dst.serving_snapshot_revision <= cached.serving_snapshot_revision;
-        // Serving revisions are process-local, so they cannot order snapshots
-        // across owner replacement. The durable replay target supplies the
-        // cross-owner ordering boundary: for one root, incarnation, and
-        // accepted source target, publication and coverage are monotonic.
-        // A source update/delete advances that target before a lower
-        // cardinality can become authoritative.
-        // The storage replay cursor is deliberately conservative and can
-        // advance across a journal record which does not affect this index.
-        // Exact commit-time target authority is the semantic boundary for an
-        // index projection: the cached row is marked incomplete synchronously
-        // whenever a relevant source target advances. If it is still
-        // complete, a larger broad replay cursor cannot authorize a serving
-        // cardinality regression for this incarnation.
-        const exact_source_target_cannot_reduce_cached = if (index_authorities) |authorities|
+        // Observing a target is not applying it. Retain the exact reducing
+        // watermark across additive commits and compare it to the replay
+        // witness attached to each payload, never the observation bit or a
+        // newer replay overlay retained alongside an older serving snapshot.
+        const exact_requirement: ?TargetedIndexAuthority.ConvergenceRequirement = if (index_authorities) |authorities|
             if (authorities.get(dst.name)) |authority|
-                targetAuthorityAcceptsIdentity(authority, cached.*) and
-                    targetAuthorityAcceptsIdentity(authority, dst.*) and
-                    (if (authority.convergence_requirements.get(incoming.group_id)) |required|
-                        cached.runtime_target_observation_complete or
-                            !required.serving_set_may_reduce
-                    else
-                        false)
+                if (targetAuthorityAcceptsIdentity(authority, cached.*) and
+                    targetAuthorityAcceptsIdentity(authority, dst.*))
+                    authority.convergence_requirements.get(incoming.group_id)
+                else
+                    null
             else
-                false
+                null
         else
-            false;
-        const same_accepted_source_target = same_projection_identity and
-            (dst.replay_target_sequence == cached.replay_target_sequence or
-                exact_source_target_cannot_reduce_cached);
+            null;
+        const reducing_sequence = if (exact_requirement) |required| required.reducing_source_sequence else 0;
+        const serving_can_reduce = reducing_sequence > (cached.runtime_serving_applied_sequence orelse cached.replay_applied_sequence) and
+            (dst.runtime_serving_applied_sequence orelse dst.replay_applied_sequence) >= reducing_sequence;
+        const coverage_can_reduce = reducing_sequence > (cached.runtime_coverage_applied_sequence orelse cached.replay_applied_sequence) and
+            (dst.runtime_coverage_applied_sequence orelse dst.replay_applied_sequence) >= reducing_sequence;
+        const same_accepted_source_target = same_projection_identity and !serving_can_reduce and
+            (dst.replay_target_sequence == cached.replay_target_sequence or exact_requirement != null);
+        const same_accepted_coverage_target = same_projection_identity and !coverage_can_reduce and
+            (dst.replay_target_sequence == cached.replay_target_sequence or exact_requirement != null);
         const serving_cardinality_regressed =
             (dst.doc_count < cached.doc_count or
                 dst.node_count < cached.node_count or
@@ -4141,10 +4138,9 @@ fn preserveArtifactVisibilityUsingLookup(
         // serving cardinality. A late replay/status snapshot can retain the
         // published vectors while forgetting already classified skipped or
         // failed sources. Under the same exact accepted target, that cannot be
-        // a legitimate regression. A real source mutation first clears the
-        // exact target observation and therefore still admits deletes and
-        // reclassification work.
-        const coverage_settlement_regressed = same_accepted_source_target and
+        // a legitimate regression. Applying a real reducing source mutation
+        // permits reclassification independently of serving publication.
+        const coverage_settlement_regressed = same_accepted_coverage_target and
             cached.coverage_summary_ready and
             (!dst.coverage_summary_ready or
                 incoming_coverage_settled < cached_coverage_settled or
@@ -4264,6 +4260,7 @@ fn preserveIndexCoverageSettlement(
     dst: *db_mod.types.DBIndexStats,
     cached: db_mod.types.DBIndexStats,
 ) void {
+    dst.runtime_coverage_applied_sequence = cached.runtime_coverage_applied_sequence orelse cached.replay_applied_sequence;
     dst.coverage_produced_count = cached.coverage_produced_count;
     dst.coverage_skipped_count = cached.coverage_skipped_count;
     dst.coverage_terminal_failed_count = cached.coverage_terminal_failed_count;
@@ -4757,6 +4754,7 @@ fn markTargetObservationStaleLocked(
 }
 
 fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
+    dst.runtime_serving_applied_sequence = cached.runtime_serving_applied_sequence orelse cached.replay_applied_sequence;
     dst.doc_count = cached.doc_count;
     dst.term_count = cached.term_count;
     dst.edge_count = cached.edge_count;
@@ -5290,6 +5288,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .runtime_observation_serviceable = item.runtime_observation_serviceable,
             .runtime_observation_targeted_sibling = item.runtime_observation_targeted_sibling,
             .runtime_target_observation_complete = item.runtime_target_observation_complete,
+            .runtime_serving_applied_sequence = item.runtime_serving_applied_sequence,
+            .runtime_coverage_applied_sequence = item.runtime_coverage_applied_sequence,
             .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
@@ -9505,6 +9505,48 @@ test "irrelevant broad replay cursor cannot regress exact index serving or cover
     try std.testing.expectEqual(@as(u64, 8), observed.stats.indexes[0].serving_snapshot_revision);
 }
 
+test "owner replacement cannot regress serving facts but a new non-vector incarnation may reset them" {
+    const alloc = std.testing.allocator;
+    for ([_]db_mod.types.IndexKind{ .full_text, .graph, .algebraic }) |kind| {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        var indexes = [_]db_mod.types.DBIndexStats{.{
+            .name = "projection",
+            .kind = kind,
+            .doc_count = 20,
+            .node_count = 3,
+            .coverage_generation = 41,
+            .coverage_config_hash = 99,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .coverage_produced_count = 20,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+        }};
+        const first = try cache.capturePublicationToken("docs");
+        _ = try cache.publishGroup(first, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+        });
+        indexes[0].coverage_generation = 42;
+        indexes[0].doc_count = 0;
+        indexes[0].node_count = 0;
+        indexes[0].coverage_produced_count = 0;
+        const replacement = try cache.capturePublicationToken("docs");
+        _ = try cache.publishGroup(replacement, "docs", .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .runtime_owner_id = 88, .index_count = 1, .indexes = indexes[0..] },
+        });
+        var snapshot = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 42), snapshot.stats.indexes[0].coverage_generation);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.stats.indexes[0].doc_count);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.stats.indexes[0].coverage_produced_count);
+    }
+}
+
 test "exact additive target advance preserves serving facts while delete authority permits reduction" {
     const alloc = std.testing.allocator;
     var cache = TableRuntimeSnapshotCache.init(alloc);
@@ -9598,6 +9640,24 @@ test "exact additive target advance preserves serving facts while delete authori
         .serving_set_effect = .may_reduce,
     }};
     cache.markIndexTargetsObservationPending("docs", 7, reducing[0..], 12);
+    // Observing the target before applying it cannot retire reduction authority.
+    indexes[0].doc_count = 20;
+    indexes[0].node_count = 3;
+    indexes[0].publication_target_count = 20;
+    indexes[0].coverage_produced_count = 10;
+    indexes[0].replay_target_sequence = 12;
+    const target_only = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(target_only, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9, .target_observation_revision = 12 },
+        .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+    });
+    {
+        var snapshot = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer snapshot.deinit(alloc);
+        try std.testing.expect(snapshot.stats.indexes[0].runtime_target_observation_complete);
+        try std.testing.expectEqual(@as(u64, 20), snapshot.stats.indexes[0].doc_count);
+    }
     // A later additive commit can coalesce before the owner publishes. It
     // must not erase the still-pending permission established by the delete.
     cache.markIndexTargetsObservationPending("docs", 7, additive[0..], 13);
@@ -9608,6 +9668,23 @@ test "exact additive target advance preserves serving facts while delete authori
     indexes[0].coverage_produced_count = 6;
     indexes[0].replay_applied_sequence = 13;
     indexes[0].replay_target_sequence = 13;
+    // A mixed observation may advance replay while retaining an old serving
+    // revision. Its replay overlay must not acknowledge the retained payload.
+    indexes[0].serving_snapshot_revision = 7;
+    const mixed = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(mixed, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9, .target_observation_revision = 13 },
+        .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+    });
+    {
+        var snapshot = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 20), snapshot.stats.indexes[0].doc_count);
+        try std.testing.expectEqual(@as(u64, 13), snapshot.stats.indexes[0].replay_applied_sequence);
+        try std.testing.expectEqual(@as(?u64, 7), snapshot.stats.indexes[0].runtime_serving_applied_sequence);
+    }
+    indexes[0].serving_snapshot_revision = 8;
     const reducing_observation = try cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
         TableRuntimeSnapshotCache.PublishResult.published,
@@ -9628,6 +9705,19 @@ test "exact additive target advance preserves serving facts while delete authori
     try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].publication_target_count);
     try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].coverage_produced_count);
+    try std.testing.expectEqual(@as(?u64, 13), observed.stats.indexes[0].runtime_serving_applied_sequence);
+    // Once the serving payload applies the delete, a later owner cannot use
+    // the retained watermark to lower this incarnation again without a write.
+    indexes[0].doc_count = 0;
+    const late = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9, .target_observation_revision = 13 },
+        .stats = .{ .runtime_owner_id = 88, .index_count = 1, .indexes = indexes[0..] },
+    });
+    var stable = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer stable.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 6), stable.stats.indexes[0].doc_count);
 }
 
 test "table runtime snapshot cache batch preserves newer group observations" {

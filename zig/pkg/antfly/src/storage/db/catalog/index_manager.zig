@@ -9474,13 +9474,11 @@ pub const IndexManager = struct {
     /// artifacts owned by sibling pipelines are deliberately excluded.
     pub fn textIndexAcceptsArtifactKey(self: *IndexManager, index_name: []const u8, key: []const u8) bool {
         const entry = self.textIndexEntry(index_name) orelse return false;
-        if (entry.chunk_name) |artifact_name| {
-            return textArtifactSourceMatches(self, key, artifact_name);
-        }
-        for (entry.source_artifact_names) |artifact_name| {
-            if (textArtifactSourceMatches(self, key, artifact_name)) return true;
-        }
-        return false;
+        if (!internal_keys.isInternalUserKey(key) or internal_keys.isPrimaryDocumentKey(key)) return false;
+        // Use the publication predicate, including implicit full-text chunk
+        // routing. A failed dependency inspection must conservatively schedule
+        // replay, which will surface the error, never silently skip a delete.
+        return textIndexShouldConsumeDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
