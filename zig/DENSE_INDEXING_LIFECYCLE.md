@@ -43,6 +43,14 @@ Implemented in the current tree:
   advance. Allocation failure is logged, counted, scheduler-backed off, and
   leaves the cursor on the same route instead of silently degrading exact debt
   notification into a full fallback rotation
+- progressive, queryable generations wait on source progress with a bounded
+  audit deadline. Each selected audit grant carries the durable intent revision
+  and is consumed by an expected-revision checkpoint transition under the
+  repair control mutex. Owner handoff, pause/resume, replay, and retry mutations
+  invalidate an older grant; successful consumption advances the revision and
+  clears the resident token. This durable write occurs only on the audit path,
+  while ordinary deferred scheduling remains process-local. An audit still
+  respects the producer-completion fence before starting reconstruction
 - large dense candidate scans and pre-activation replay catch-up are
   cooperatively time-sliced by the `BackendRuntime` owner. Scan slices use
   streaming publication and checkpoint the source-store cursor; catch-up

@@ -2332,6 +2332,9 @@ pub const KernelModule = struct {
     gqa_attention_decode_splitk_online_sm89_hd512_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_splitk_online_workspace: buffer_mod.DeviceBuffer = .{},
     gqa_decode_profile: GqaDecodeProfile = .off,
+    /// Model-scoped opt-in for Qwen3-VL automatic prefill routes. Explicit
+    /// operator-selected profiles remain available to every architecture.
+    qwen3vl_automatic_prefill: bool = false,
     gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -4298,6 +4301,7 @@ pub const KernelModule = struct {
             self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
             self.gqa_prefill_profile = .automatic;
+            self.qwen3vl_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
             for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
@@ -10160,7 +10164,9 @@ pub const KernelModule = struct {
         // intentionally reachable only from launchGqaAttentionDecodeScalarsF32.
         // This host-scalar entry point must keep its normal decode topology.
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
-            if (fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+            if ((self.gqa_prefill_profile != .automatic or self.qwen3vl_automatic_prefill) and
+                fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+            {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
                 try ctx.makeCurrent();
@@ -11068,7 +11074,8 @@ pub const KernelModule = struct {
                     }
                 },
                 .automatic => {
-                    if (ctx.driver.fns.cuFuncSetAttribute != null and
+                    if (self.qwen3vl_automatic_prefill and
+                        ctx.driver.fns.cuFuncSetAttribute != null and
                         mmaM32GqaPrefillEnabled() and
                         qwen3VlAutomaticM32GqaPrefillEligible(
                             ctx.info.compute_major,
@@ -20289,6 +20296,7 @@ pub fn smokeQwen3VlPrimitives(allocator: std.mem.Allocator) !void {
     try smokeQ8TensorCorePack(&ctx, &module);
     try smokeQwen3VlMropeF32(allocator, &ctx, &module);
     try smokeQwen3VlVisionRopeF32(allocator, &ctx, &module);
+    try smokeQwen3VlVisionAttention(allocator, &ctx, &module);
 }
 
 fn smokeQ8TensorCorePack(ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -20313,6 +20321,115 @@ fn smokeQ8TensorCorePack(ctx: *context_mod.CudaContext, module: *KernelModule) !
     try output_device.copyToHost(ctx, &actual);
     try ctx.synchronize();
     try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+fn roundToBf16F32(value: f32) f32 {
+    const bits: u32 = @bitCast(value);
+    const rounded = bits + 0x7fff + ((bits >> 16) & 1);
+    return @bitCast(rounded & 0xffff0000);
+}
+
+fn smokeQwen3VlVisionAttention(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    // The tensor-core implementation is selected only on SM80+. Older
+    // devices exercise the generic attention fallback instead.
+    if (ctx.info.compute_major < 8) return;
+    if (module.qwen3vl_vision_attention_tc_bf16_m32n16 == null)
+        return error.CudaKernelUnavailable;
+
+    const batch: usize = 2;
+    // Cross both the 16-key and 32-query tile boundaries so the smoke checks
+    // online-softmax accumulation as well as partial-tile indexing.
+    const seq_len: usize = 33;
+    const num_heads: usize = 2;
+    const head_dim: usize = 64;
+    const hidden = num_heads * head_dim;
+    const count = batch * seq_len * hidden;
+    const q = try allocator.alloc(f32, count);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, count);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, count);
+    defer allocator.free(v);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    for (0..count) |index| {
+        const q_value: i32 = @intCast(index % 13);
+        const k_value: i32 = @intCast((index * 3 + 1) % 17);
+        const v_value: i32 = @intCast((index * 5 + 2) % 19);
+        q[index] = roundToBf16F32(@as(f32, @floatFromInt(q_value - 6)) / 16.0);
+        k[index] = roundToBf16F32(@as(f32, @floatFromInt(k_value - 8)) / 16.0);
+        v[index] = roundToBf16F32(@as(f32, @floatFromInt(v_value - 9)) / 8.0);
+    }
+
+    for (0..batch) |batch_index| {
+        for (0..num_heads) |head| {
+            for (0..seq_len) |query| {
+                var scores: [seq_len]f32 = undefined;
+                var max_score = -std.math.inf(f32);
+                for (0..seq_len) |key| {
+                    var dot: f32 = 0;
+                    for (0..head_dim) |dimension| {
+                        const query_index = (batch_index * seq_len + query) * hidden + head * head_dim + dimension;
+                        const key_index = (batch_index * seq_len + key) * hidden + head * head_dim + dimension;
+                        dot += q[query_index] * k[key_index];
+                    }
+                    scores[key] = dot * 0.125;
+                    max_score = @max(max_score, scores[key]);
+                }
+                var denominator: f32 = 0;
+                var probabilities: [seq_len]f32 = undefined;
+                for (0..seq_len) |key| {
+                    const probability = @exp(scores[key] - max_score);
+                    denominator += probability;
+                    probabilities[key] = roundToBf16F32(probability);
+                }
+                for (0..head_dim) |dimension| {
+                    var sum: f32 = 0;
+                    for (0..seq_len) |key| {
+                        const value_index = (batch_index * seq_len + key) * hidden + head * head_dim + dimension;
+                        sum += probabilities[key] * v[value_index];
+                    }
+                    const output_index = (batch_index * seq_len + query) * hidden + head * head_dim + dimension;
+                    expected[output_index] = sum / denominator;
+                }
+            }
+        }
+    }
+
+    var q_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer q_device.free(ctx);
+    var k_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer k_device.free(ctx);
+    var v_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer v_device.free(ctx);
+    var output_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer output_device.free(ctx);
+    try q_device.copyFromHost(ctx, std.mem.sliceAsBytes(q));
+    try k_device.copyFromHost(ctx, std.mem.sliceAsBytes(k));
+    try v_device.copyFromHost(ctx, std.mem.sliceAsBytes(v));
+    const launched = try module.launchQwen3VlVisionAttentionTcBf16M32N16(
+        ctx,
+        output_device,
+        q_device,
+        k_device,
+        v_device,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    if (!launched) return error.CudaKernelUnavailable;
+    try ctx.synchronize();
+
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    try output_device.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+    try ctx.synchronize();
+    try expectApproxSlice(actual, expected, 0.005);
 }
 
 fn smokeGemma4A4BResidentQ4_0(

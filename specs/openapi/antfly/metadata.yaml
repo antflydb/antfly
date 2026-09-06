@@ -9122,6 +9122,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationConflict:
+      description: The index mutation conflicts with current state, or its commit outcome could not be proven.
+      headers:
+        X-Antfly-Raft-Mutation-Outcome:
+          required: false
+          description: Present with value `unknown-v1` only when the mutation may already have committed and must not be blindly retried.
+          schema:
+            type: string
+            enum: [unknown-v1]
+      content:
+        application/json:
+          schema:
+            $ref: "indexes.yaml#/components/schemas/IndexMutationConflictError"
     MethodNotAllowed:
       description: Method not allowed for this resource
       content:
@@ -12110,7 +12123,7 @@ paths:
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/IndexMutationConflict"
         "422":
           description: Graph resolver destinations cannot be bound to this credential type
           content:
@@ -12133,6 +12146,12 @@ paths:
           description: Index dropped successfully
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
     get:

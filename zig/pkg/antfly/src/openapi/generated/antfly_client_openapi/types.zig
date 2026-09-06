@@ -17172,6 +17172,13 @@ pub const IndexMilestones = struct {
     complete: IndexMilestoneStatus,
 };
 
+/// An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation.
+pub const IndexMutationConflictError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
 pub const IndexMutationServiceUnavailableError = struct {
     @"error": []const u8,

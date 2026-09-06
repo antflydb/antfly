@@ -110,6 +110,7 @@ pub const Routes = struct {
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
+    pub const group_db_index_activation_suffix = "/db/index-activation";
     pub const shard_ops_observe_split_suffix = "/shard-ops/observe-split";
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
@@ -1300,6 +1301,10 @@ pub const Routes = struct {
 
     pub fn matchGroupDbMedianKey(path: []const u8) ?GroupShardOp {
         return matchGroupShardPath(path, group_db_median_key_suffix);
+    }
+
+    pub fn matchGroupDbIndexActivation(path: []const u8) ?GroupShardOp {
+        return matchGroupShardPath(path, group_db_index_activation_suffix);
     }
 
     pub fn matchGroupShardObserveMerge(path: []const u8) ?GroupShardOp {
