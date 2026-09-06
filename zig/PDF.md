@@ -109,6 +109,24 @@ Only documents with another compatible text consumer enroll; resource denial
 disables this optional cache and falls back to ordinary bounded extraction.
 Recovery markers and attempt cleanup cover these records too, without
 retaining all page text in memory or rerendering pages to recover metadata.
+The optional write buffer is admitted by actual allocated capacity, not by a
+full replay-segment reservation. A nonblocking reclaimer may discard its
+unpublished rows when required work needs that memory; published rows remain
+valid. The collector flushes and releases this buffer at its actual generated
+work boundary, including short document tails and byte-limited batches.
+This prevents a second consumer's optimization from starving the first
+consumer's render/inference window. During a sequential scan, the first absent
+record marks the end of the cached prefix, so cold documents do not pay a
+storage transaction and temporary read admission for every remaining page.
+
+Consumer byte fingerprints compose the prepared source and locator SHA-256
+digests with length-framed extraction parameters. Fingerprint composition no
+longer rescans downloaded bytes or large inline data URLs for each consumer;
+source-cache lookup and JSON materialization remain separate costs. The v2
+fingerprint domain intentionally invalidates legacy
+byte fingerprints once; metadata-based fingerprints retain their existing
+contract. This is identity preparation shared across typed executors, not a
+change to model inputs or outputs.
 
 ### Compatibility-first queues and shared render windows
 

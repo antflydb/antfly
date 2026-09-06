@@ -6542,7 +6542,7 @@ const SharedPdfWindowScheduler = struct {
             var borrowed = try cache.lookup(source_url, if (config.credentials.len > 0) config.credentials else null) orelse return false;
             defer borrowed.deinit();
             const downloaded = borrowed.entry().content;
-            break :blk try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded.content_type, downloaded.data);
+            break :blk try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
         return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest));
@@ -6959,9 +6959,66 @@ const RuntimePdfPageTextSpool = struct {
     hits: usize = 0,
     stores: usize = 0,
     flush_items: usize = 32,
-    segment: ?*RuntimeDocumentReplaySegmentLease = null,
+    segment: ?*WriteBuffer = null,
     writes: std.ArrayListUnmanaged(KVPair) = .empty,
     pending_bytes: usize = 0,
+    first_missing_page: ?usize = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    reclaimer_id: u64 = 0,
+    reclaimer_manager: ?*resource_manager_mod.ResourceManager = null,
+
+    // Writes are retained across page inspection, unlike the short-lived read
+    // segment. Charge actual capacity and let required work reclaim the whole
+    // optional buffer; reserving a full replay segment here pins ~12 MiB even
+    // for one empty scanned page.
+    const WriteBuffer = struct {
+        owner: Allocator,
+        budgeted: ?resource_manager_mod.BudgetedAllocator,
+        limit: ReservedWorkingSetAllocator,
+
+        fn create(owner: Allocator, resource_manager: ?*resource_manager_mod.ResourceManager) !*@This() {
+            const self = try owner.create(@This());
+            self.* = .{
+                .owner = owner,
+                .budgeted = if (resource_manager) |m| resource_manager_mod.BudgetedAllocator.init(m, .document_extraction_working_set, owner, 1) else null,
+                .limit = ReservedWorkingSetAllocator.init(owner, runtime_document_replay_segment_memory_bytes),
+            };
+            if (self.budgeted) |*budgeted| self.limit.backing = budgeted.allocator();
+            return self;
+        }
+
+        fn allocator(self: *@This()) Allocator {
+            return self.limit.allocator();
+        }
+
+        fn destroy(self: *@This()) void {
+            const owner = self.owner;
+            std.debug.assert(self.limit.live_bytes == 0);
+            if (self.budgeted) |*budgeted| budgeted.deinit();
+            owner.destroy(self);
+        }
+    };
+
+    fn manager(self: *@This()) ?*resource_manager_mod.ResourceManager {
+        return self.scheduler.runtime.config.resource_manager orelse self.scheduler.runtime.index_manager.resource_manager;
+    }
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn reclaim(raw: *anyopaque, _: u64) u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Never enter storage or interrupt serialization/publication. A
+        // callback may originate in this object's own allocator operation.
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        const segment = self.segment orelse return 0;
+        const bytes = if (segment.budgeted) |*budgeted| budgeted.reservation.bytes else 0;
+        self.enabled = false;
+        self.clearPending();
+        return bytes;
+    }
 
     fn cache(self: *@This()) document_extraction_mod.PdfPageTextCache {
         return .{ .ptr = self, .load_fn = load, .store_fn = put };
@@ -6983,7 +7040,10 @@ const RuntimePdfPageTextSpool = struct {
 
     fn load(raw: *anyopaque, alloc: Allocator, page: usize) !?document_extraction_mod.PdfPageText {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
         if (!self.enabled) return null;
+        if (self.first_missing_page) |missing| if (page >= missing) return null;
         return self.loadPage(alloc, page) catch |err| {
             try self.optionalError(err);
             return null;
@@ -6993,7 +7053,10 @@ const RuntimePdfPageTextSpool = struct {
     fn loadPage(self: *@This(), alloc: Allocator, page: usize) !?document_extraction_mod.PdfPageText {
         // Nothing has been published yet: avoid admission and a store read on
         // the first page of a fresh attempt.
-        if (!self.scheduler.spool_registered) return null;
+        if (!self.scheduler.spool_registered) {
+            self.first_missing_page = page;
+            return null;
+        }
         const runtime = self.scheduler.runtime;
         const segment = try RuntimeDocumentReplaySegmentLease.create(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager);
         defer segment.destroy();
@@ -7011,7 +7074,13 @@ const RuntimePdfPageTextSpool = struct {
         };
         var reader = Reader{ .runtime = runtime, .alloc = scratch };
         const value = readAllocWithRetry(&reader, key, Reader.read) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => {
+                // Neutral rows are published in page order. A first miss is
+                // the end of the cached prefix, not a reason to open one read
+                // transaction for every subsequently inspected page.
+                self.first_missing_page = page;
+                return null;
+            },
             else => return err,
         };
         defer scratch.free(value);
@@ -7024,13 +7093,20 @@ const RuntimePdfPageTextSpool = struct {
 
     fn put(raw: *anyopaque, page: usize, value: document_extraction_mod.PdfPageText) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
         if (!self.enabled) return;
         self.putPage(page, value) catch |err| try self.optionalError(err);
     }
 
     fn putPage(self: *@This(), page: usize, value: document_extraction_mod.PdfPageText) !void {
-        const runtime = self.scheduler.runtime;
-        if (self.segment == null) self.segment = try RuntimeDocumentReplaySegmentLease.create(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager);
+        if (self.reclaimer_id == 0) if (self.manager()) |m| {
+            self.reclaimer_id = try m.registerReclaimer(.document_extraction_working_set, self, reclaim);
+            self.reclaimer_manager = m;
+        };
+        // An unrelated executor may reclaim this buffer. Neither its payloads
+        // nor its control object may borrow a task-confined backing allocator.
+        if (self.segment == null) self.segment = try WriteBuffer.create(std.heap.smp_allocator, self.manager());
         const alloc = self.segment.?.allocator();
         {
             const key = try self.keyAlloc(alloc, page);
@@ -7051,6 +7127,8 @@ const RuntimePdfPageTextSpool = struct {
     }
 
     fn finish(self: *@This()) !void {
+        self.lock();
+        defer self.mutex.unlock();
         self.flush() catch |err| try self.optionalError(err);
     }
 
@@ -7069,6 +7147,11 @@ const RuntimePdfPageTextSpool = struct {
     }
 
     fn deinit(self: *@This()) void {
+        // Retire callbacks before taking the buffer lock or releasing their
+        // stack-owned context. Reclaimers never perform durable writes.
+        if (self.reclaimer_manager) |m| m.unregisterReclaimer(self.reclaimer_id);
+        self.lock();
+        defer self.mutex.unlock();
         self.clearPending();
     }
 };
@@ -7461,6 +7544,59 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     neutral.digest[0] ^= 1;
     try std.testing.expect(try cached_text.load_fn(cached_text.ptr, alloc, 1) == null);
     try scheduler.cleanupSpool();
+
+    {
+        // A single neutral record must not pin an entire 12-MiB replay
+        // segment, and its optional storage must yield to mandatory admission.
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        const limit = 1024 * 1024;
+        budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
+        var cache_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer cache_resources.deinit(alloc);
+        const previous_manager = runtime.config.resource_manager;
+        runtime.config.resource_manager = &cache_resources;
+        defer runtime.config.resource_manager = previous_manager;
+        var optional = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .flush_items = 8 };
+        defer optional.deinit();
+        const cache = optional.cache();
+        try cache.store_fn(cache.ptr, 1, sample);
+        try std.testing.expect(optional.segment != null);
+        try std.testing.expect(cache_resources.sliceStats(.document_extraction_working_set).used_bytes < limit / 2);
+        {
+            optional.lock();
+            defer optional.mutex.unlock();
+            try std.testing.expectError(error.ResourceBudgetExceeded, cache_resources.reserve(.document_extraction_working_set, limit));
+            try std.testing.expect(optional.enabled);
+            try std.testing.expect(optional.segment != null);
+        }
+        var mandatory = try cache_resources.reserve(.document_extraction_working_set, limit);
+        try std.testing.expect(!optional.enabled);
+        try std.testing.expect(optional.segment == null);
+        try std.testing.expect(!scheduler.spool_registered);
+        mandatory.release();
+        try std.testing.expectEqual(@as(u64, 0), cache_resources.sliceStats(.document_extraction_working_set).used_bytes);
+
+        var tail = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .flush_items = 8 };
+        defer tail.deinit();
+        const tail_cache = tail.cache();
+        try std.testing.expect(try tail_cache.load_fn(tail_cache.ptr, alloc, 1) == null);
+        try tail_cache.store_fn(tail_cache.ptr, 1, sample);
+        // Short documents flush through onEnd before generated work. With no
+        // pending generated units, this path touches only these three fields.
+        var collection: RuntimeDocumentExtractionCollectContext = undefined;
+        collection.page_text_spool = &tail;
+        collection.pending_generated_units = .empty;
+        collection.pdf_coordinator = null;
+        try RuntimeDocumentExtractionCollectContext.onEnd(&collection);
+        try std.testing.expect(tail.segment == null);
+        try std.testing.expect(scheduler.spool_registered);
+        try std.testing.expectEqual(@as(u64, 0), cache_resources.sliceStats(.document_extraction_working_set).used_bytes);
+        // The first miss establishes the end of a cached prefix. A cold scan
+        // skips later read admission even after publishing its own first batch.
+        try std.testing.expect(try tail_cache.load_fn(tail_cache.ptr, alloc, 2) == null);
+        try std.testing.expect(tail.enabled);
+        try scheduler.cleanupSpool();
+    }
 
     if (text_session) |session| {
         const Sink = struct {
@@ -9316,7 +9452,7 @@ fn processDocumentExtractionAsset(
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
     const byte_source_fingerprint = if (metadata_fingerprint == null)
-        try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded.content_type, downloaded.data)
+        try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
@@ -9472,6 +9608,7 @@ fn processDocumentExtractionAsset(
         .resource_tracker = &resource_tracker,
         .generated_units = &generated_units,
         .unit_spool = if (unit_spool) |*spool| spool else null,
+        .page_text_spool = if (page_text_spool) |*spool| spool else null,
         .pdf_inspection_reserved = source_is_pdf,
         .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
     };
@@ -13437,6 +13574,9 @@ const RuntimeDocumentExtractionCollectContext = struct {
     /// Optional attempt-private replay log. It receives only final units,
     /// after OCR/transcription selection and character offsets are resolved.
     unit_spool: ?*RuntimeDocumentUnitSpool = null,
+    /// Optional neutral metadata must yield its retained buffer at the actual
+    /// execution boundary, including short tails and byte-limited batches.
+    page_text_spool: ?*RuntimePdfPageTextSpool = null,
     /// Borrowed PDF units are already backed by the bounded inspection
     /// allocator whose complete ceiling is atomically reserved.
     pdf_inspection_reserved: bool = false,
@@ -13550,6 +13690,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     }
 
     fn flushPendingGeneratedText(self: *@This()) !void {
+        if (self.page_text_spool) |spool| try spool.finish();
         if (self.pending_generated_units.items.len == 0) return;
         var generated_count: usize = 0;
         for (self.pending_generated_mask.items) |generated| if (generated) {
@@ -20218,13 +20359,62 @@ fn documentExtractionFingerprintAlloc(
     downloaded_content_type: []const u8,
     data: []const u8,
 ) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
+    return documentExtractionFingerprintFromDigestAlloc(alloc, &identity, config_json, configured_content_type, configured_filename, downloaded_content_type, &digest);
+}
+
+test "shared PDF consumer fingerprints reuse a framed content digest" {
+    const alloc = std.testing.allocator;
+    const source = "%PDF-test-content";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const identity = PreparedDocumentSourceCache.sourceIdentity("url");
+    const direct = try documentExtractionFingerprintAlloc(alloc, "url", "{}", "application/pdf", "file.pdf", "application/pdf", source);
+    defer alloc.free(direct);
+    const prepared = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "application/pdf", "file.pdf", "application/pdf", &digest);
+    defer alloc.free(prepared);
+    try std.testing.expectEqualStrings(direct, prepared);
+    const left = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "ab", "c", "pdf", &digest);
+    defer alloc.free(left);
+    const right = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "a", "bc", "pdf", &digest);
+    defer alloc.free(right);
+    try std.testing.expect(!std.mem.eql(u8, left, right));
+    digest[0] ^= 1;
+    const changed = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", "application/pdf", "file.pdf", "application/pdf", &digest);
+    defer alloc.free(changed);
+    try std.testing.expect(!std.mem.eql(u8, prepared, changed));
+    var legacy_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("url{}application/pdffile.pdfapplication/pdf" ++ source, &legacy_hash, .{});
+    const legacy = try hexBytesAlloc(alloc, &legacy_hash);
+    defer alloc.free(legacy);
+    try std.testing.expect(!std.mem.eql(u8, legacy, prepared));
+}
+
+/// Preparation computes the content digest once. Consumer identity composes
+/// that digest with length-framed extraction parameters instead of rescanning
+/// a potentially large download for every consumer and completed-state probe.
+/// The domain tag intentionally invalidates legacy concatenation fingerprints.
+fn documentExtractionFingerprintFromDigestAlloc(
+    alloc: Allocator,
+    source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    config_json: []const u8,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(source_url);
-    hasher.update(config_json);
-    hasher.update(configured_content_type);
-    hasher.update(configured_filename);
-    hasher.update(downloaded_content_type);
-    hasher.update(data);
+    hasher.update("antfly.document-extraction.fingerprint.v2\x00");
+    hasher.update(source_identity);
+    for ([_][]const u8{ config_json, configured_content_type, configured_filename, downloaded_content_type }) |field| {
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, @intCast(field.len), .little);
+        hasher.update(&size);
+        hasher.update(field);
+    }
+    hasher.update(content_digest);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try hexBytesAlloc(alloc, &digest);
