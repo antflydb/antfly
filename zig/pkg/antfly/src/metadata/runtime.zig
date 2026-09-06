@@ -39,7 +39,13 @@ const internal_service_issuer_key = "antfly.internal_service.issuer";
 const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 
 fn isExpectedControlRoundError(err: anyerror) bool {
-    return antfly.metadata.authority.isRetryableError(err);
+    // Control-round reconciliation is idempotent and is re-driven from the
+    // authoritative store on the next tick. A post-admission authority loss
+    // is deliberately *not* a generally retryable client mutation, but it is
+    // a safe control-loop deferral: the admitted command may already have
+    // committed and the next round will observe or supersede it.
+    return antfly.metadata.authority.isRetryableError(err) or
+        err == error.MetadataMutationOutcomeUnknown;
 }
 
 const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
@@ -2114,10 +2120,16 @@ test "metadata runtime retries authority loss from control rounds" {
         error.MetadataLinearizableReadTimeout,
         error.MetadataSnapshotHeadMismatch,
         error.ReconcileLeaseNotHeld,
+        error.MetadataMutationOutcomeUnknown,
     };
     for (expected_errors) |err| {
         try std.testing.expect(isExpectedControlRoundError(err));
     }
+    // Preserve the intentional distinction between an idempotent background
+    // re-drive and a client mutation whose admission outcome is unknown.
+    try std.testing.expect(!antfly.metadata.authority.isRetryableError(
+        error.MetadataMutationOutcomeUnknown,
+    ));
     try std.testing.expect(!isExpectedControlRoundError(error.OutOfMemory));
     try std.testing.expect(!isExpectedControlRoundError(error.Corrupted));
 }

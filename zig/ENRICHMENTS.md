@@ -127,10 +127,19 @@ Dense keeps its HBC-specific begin/finish implementation, but bounded catch-up
 scheduling is no longer dense-only.
 
 Generated replay also bounds source preparation separately from its larger
-derived-record window. By default it prepares at most 64 deferred provider
-requests, executes full provider batches, publishes that partial output
+derived-record window. By default it closes preparation at a source-document
+boundary once 64 deferred provider requests have been queued, executes full
+provider batches, publishes that partial output
 durably, and releases the request/chunk caches before inspecting more source
 documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+Deferred asset work retains lightweight request references, not materialized
+documents or provider payloads. The execution lane materializes compatible
+batches bounded by both item count and retained bytes (including raw documents,
+source parts, and state). It may inspect one additional candidate to determine
+its size; an oversized source executes alone before the next is materialized.
+Retryable batch failures retain their request identity while independent asset
+and dense batches continue, so byte-bound flushing does not reintroduce
+provider head-of-line blocking.
 The separate bound keeps provider batching efficient while making memory and
 time to the first queryable publication independent of corpus size. On restart,
 a clean partial publication remains searchable from its incarnation-scoped
@@ -217,6 +226,21 @@ or acquire its writer-cache mutex. While convergence is awaiting the next owner
 publication, the last safe incarnation and counts remain visible and
 queryable; `complete` is blocked by `target_observation` in addition to any
 coverage/publication debt.
+
+Observing an accepted target is distinct from applying its deletion or source
+replacement. Target and reducing commit watermarks merge independently, including
+out-of-order notifications. Serving and coverage carry separate owner-issued
+publication stamps and applied prefixes; retaining a payload retains its stamp
+even if the replay progress overlay advances. A newer authoritative publication
+can decrease counts, including intermediate progress before the latest accepted
+delete is applied. The cache does not use cardinality maxima or callback timing
+to order stamped observations. Unknown/status-only observations cannot fabricate
+owner authority. See `STATUS.md` for successor recovery and reporter fencing.
+
+Full-text publication and cleanup share the same source-consumption predicate,
+including chunks implicitly routed through `full_text_index`. Internal control
+records remain excluded; deleting a consumed chunk schedules the same exact
+index through both live and replay target discovery.
 
 Initial materialization and corruption recovery share a crash-resumable,
 bounded generation scheduler, but remain distinct durable work classes. A

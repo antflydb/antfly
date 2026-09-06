@@ -14,9 +14,11 @@
 
 const std = @import("std");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const table_catalog_api = @import("../api/table_catalog.zig");
+const table_router_api = @import("../api/table_router.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const foreign_mod = @import("../foreign/mod.zig");
-const table_catalog_api = @import("../api/table_catalog.zig");
 const table_writes_api = @import("../api/table_writes.zig");
 const metadata_api = @import("api.zig");
 const metadata_mod = @import("domain.zig");
@@ -6504,7 +6506,7 @@ test "metadata replication live snapshot and later streaming insert through runn
     try std.testing.expect(std.mem.indexOf(u8, user_two.json, "\"silver\"") != null);
 }
 
-test "metadata http service live snapshot and later streaming insert through hosted rounds" {
+test "metadata http service live snapshot and later streaming insert through injected hosted data owner" {
     const raft_engine = @import("raft_engine");
     const raft_host_mod = @import("../raft/host.zig");
     const alloc = std.testing.allocator;
@@ -6600,14 +6602,42 @@ test "metadata http service live snapshot and later streaming insert through hos
             },
         },
     });
-    var local_cdc_write_source: ?table_writes_api.ProvisionedTableWriteSource = null;
-    defer {
-        // The server drains its CDC jobs while the borrowed write source is
-        // still alive; only then may the fixture release the source itself.
-        server.deinit();
-        if (local_cdc_write_source) |*source| source.deinit();
-    }
+    defer server.deinit();
     try server.start();
+
+    // This unit owns metadata and a data root in one process. Inject an exact
+    // local data-plane owner so the test exercises asynchronous CDC scheduling
+    // without reviving the unsafe durable-path fallback. Multi-process routed
+    // forwarding is covered by the Python lifecycle E2E suite.
+    const LocalDataRouter = struct {
+        fn iface(self: *@This()) table_router_api.HostedGroupRouter {
+            return .{ .ptr = self, .vtable = &.{
+                .local_node_id = localNodeId,
+                .local_status = localStatus,
+                .node_base_uri = nodeBaseUri,
+            } };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+    var local_data_router = LocalDataRouter{};
+    var local_data_owner = table_writes_api.HostedProvisionedTableWriteSource.init(
+        replica_root,
+        table_catalog_api.CatalogSource.fromMetadataHttpService(server.svc),
+        local_data_router.iface(),
+        server.svc.raft.host.http_host.request_executor,
+    );
+    server.setCdcWriteSource(local_data_owner.source());
 
     _ = try server.svc.ensureMetadataReplica(.{
         .group_id = 2012,
@@ -6692,34 +6722,9 @@ test "metadata http service live snapshot and later streaming insert through hos
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root, group_id);
     defer alloc.free(db_path);
 
-    // This focused hosted-service fixture has no separate data runtime to
-    // consume placement intents. Install the catalog-authorized local replica
-    // explicitly, then publish its leadership before asking CDC to route.
-    _ = try server.svc.ensureLocalReplica(.{
-        .group_id = group_id,
-        .replica_id = 1,
-        .local_node_id = 1,
-        .bootstrap_mode = .empty,
-    });
-    try server.campaignLocalGroup(group_id);
-    try server.runRaftRoundOnly();
-    try server.runControlRoundOnly();
-    try server.svc.refreshLocalStoreStatus();
-
-    // Hosted production CDC intentionally routes through a data service, even
-    // when the leader is co-located. This focused fixture does not start that
-    // HTTP service, so inject the equivalent catalog-authorized local executor
-    // rather than weakening production ownership checks with a path fallback.
-    local_cdc_write_source = table_writes_api.ProvisionedTableWriteSource.init(
-        replica_root,
-        table_catalog_api.CatalogSource.fromMetadataHttpService(server.svc),
-    );
-    const write_source = &local_cdc_write_source.?;
-    write_source.backend_runtime = try server.svc.ensureBackendRuntime();
-    server.setCdcWriteSource(write_source.source());
-
-    var rounds: usize = 0;
-    while (rounds < 64) : (rounds += 1) {
+    const initial_snapshot_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var initial_snapshot_observed = false;
+    while (platform_time.monotonicNs() < initial_snapshot_deadline_ns) {
         server.svc.cdc_next_round_at_ms = 0;
         try server.runRound();
         var check_db = try db_mod.DB.open(alloc, db_path, .{
@@ -6730,27 +6735,46 @@ test "metadata http service live snapshot and later streaming insert through hos
             var user_one = found;
             defer user_one.deinit(alloc);
             try std.testing.expect(std.mem.indexOf(u8, user_one.json, "\"Alice\"") != null);
+            initial_snapshot_observed = true;
             break;
         }
+        // Hosted reconciliation owns asynchronous structural work. Give that
+        // owner a scheduling opportunity instead of treating a tight number
+        // of metadata rounds as a readiness deadline.
+        platform_clock.Clock.real().sleepMs(5);
     }
-    try std.testing.expect(rounds < 64);
+    try std.testing.expect(initial_snapshot_observed);
 
-    rounds = 0;
-    while (rounds < 64) : (rounds += 1) {
+    const cutover_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var cutover_ready = false;
+    while (platform_time.monotonicNs() < cutover_deadline_ns) {
         server.svc.cdc_next_round_at_ms = 0;
         try server.runRound();
 
         const statuses = try server.svc.listProjectedReplicationSourceStatuses(alloc);
         defer server.svc.freeProjectedReplicationSourceStatuses(alloc, statuses);
-        if (statuses.len == 0) continue;
-        if (std.mem.eql(u8, statuses[0].phase, "cutover_prepared")) break;
+        if (statuses.len == 0) {
+            platform_clock.Clock.real().sleepMs(5);
+            continue;
+        }
+        // A hosted round may durably prepare cutover and immediately consume
+        // that authority to enter streaming. Both observations prove the
+        // stream boundary is installed; requiring the transient intermediate
+        // phase makes this coverage scheduler-timing dependent.
+        if (std.mem.eql(u8, statuses[0].phase, "cutover_prepared") or
+            std.mem.eql(u8, statuses[0].phase, "streaming"))
+        {
+            cutover_ready = true;
+            break;
+        }
+        platform_clock.Clock.real().sleepMs(5);
     }
-    try std.testing.expect(rounds < 64);
+    try std.testing.expect(cutover_ready);
 
     try execPsqlCommand(alloc, dsn, insert_sql);
 
-    rounds = 0;
-    while (rounds < 64) : (rounds += 1) {
+    const streaming_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (platform_time.monotonicNs() < streaming_deadline_ns) {
         server.svc.cdc_next_round_at_ms = 0;
         try server.runRound();
 
@@ -6765,6 +6789,7 @@ test "metadata http service live snapshot and later streaming insert through hos
             try std.testing.expect(std.mem.indexOf(u8, user_two.json, "\"silver\"") != null);
             return;
         }
+        platform_clock.Clock.real().sleepMs(5);
     }
     return error.TestExpectedEqual;
 }

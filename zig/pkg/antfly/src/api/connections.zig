@@ -402,9 +402,12 @@ pub const Sources = struct {
     /// Live secret source used to resolve external-I/O credential references
     /// immediately before a probe.
     secret_store: ?*common_secrets.FileStore = null,
-    /// Shared server runtime for bounded connection discovery fanout. Tests
-    /// and embedded callers without a runtime fall back to sequential work.
-    io: ?std.Io = null,
+    /// Shared server network authority for bounded discovery fanout and
+    /// provider/object-store HTTP transport.
+    network_io: ?std.Io = null,
+    /// Native filesystem authority for local connection probes and dynamic
+    /// credential files. It is never substituted as remote transport.
+    filesystem_io: ?std.Io = null,
 };
 
 pub const BuildOptions = struct {
@@ -634,7 +637,16 @@ pub fn buildConnectionsResponse(
     if (sources.node_config) |node_config| {
         try appendConfiguredConnections(arena, &connections, sources, cache, effective_opts, kinds, node_config);
         if (effective_opts.probe and kinds.contains(.external_io)) {
-            try resolveExternalIoProbes(arena, &connections, node_config, cache, effective_opts, sources.io, sources.secret_store);
+            try resolveExternalIoProbes(
+                arena,
+                &connections,
+                node_config,
+                cache,
+                effective_opts,
+                sources.network_io,
+                sources.filesystem_io,
+                sources.secret_store,
+            );
         }
     }
 
@@ -1137,7 +1149,7 @@ fn resolveModels(
             .request_started_ns = now_ns,
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
-            .io = sources.io,
+            .io = sources.network_io,
         };
         try pending.append(arena, .{ .index = i, .job = job });
     }
@@ -1150,7 +1162,7 @@ fn resolveModels(
     var offset: usize = 0;
     while (offset < pending.items.len) {
         const end = @min(pending.items.len, offset + max_workers);
-        if (sources.io) |io| {
+        if (sources.network_io) |io| {
             var group: std.Io.Group = .init;
             for (pending.items[offset..end]) |item| {
                 group.concurrent(io, ModelsJob.run, .{item.job}) catch |err| {
@@ -1219,10 +1231,11 @@ const ObjectProbeJob = struct {
     ttl_ns: u64 = 0,
     refresh: bool = false,
     cached_err_name: ?[]const u8 = null,
-    io: ?std.Io = null,
+    network_io: ?std.Io = null,
+    filesystem_io: ?std.Io = null,
 
     fn run(job: *ObjectProbeJob) std.Io.Cancelable!void {
-        const key_lock = if (job.io) |io|
+        const key_lock = if (job.network_io) |io|
             if (job.cache) |cache| .{ .lock = cache.keyLock(job.cache_key), .io = io } else null
         else
             null;
@@ -1240,7 +1253,14 @@ const ObjectProbeJob = struct {
                 }
             }
         }
-        probeObjectBuckets(job.arena_state.allocator(), job.cfg, job.timeout_ms, &job.failed_bucket, job.io) catch |err| {
+        probeObjectBuckets(
+            job.arena_state.allocator(),
+            job.cfg,
+            job.timeout_ms,
+            &job.failed_bucket,
+            job.network_io,
+            job.filesystem_io,
+        ) catch |err| {
             job.err = err;
             if (job.cache) |cache| cache.store(job.cache_key, .{
                 .captured_at_ns = platform_time.monotonicNs(),
@@ -1265,7 +1285,8 @@ fn resolveExternalIoProbes(
     node_config: *const common_config.Config,
     cache: ?*Cache,
     opts: BuildOptions,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
     secret_store: ?*common_secrets.FileStore,
 ) !void {
     const Pending = struct {
@@ -1283,7 +1304,7 @@ fn resolveExternalIoProbes(
         if (protocol == .filesystem) {
             const configured = node_config.connections.get(connection.id) orelse return error.InvalidConfig;
             const cfg = configured.external_io orelse return error.InvalidConfig;
-            probeFilesystemRoot(cfg.root orelse "", io) catch |err| {
+            probeFilesystemRoot(cfg.root orelse "", filesystem_io) catch |err| {
                 connection.status = .@"error";
                 connection.@"error" = @errorName(err);
                 continue;
@@ -1330,7 +1351,8 @@ fn resolveExternalIoProbes(
             .request_started_ns = now_ns,
             .ttl_ns = opts.ttl_ns,
             .refresh = opts.refresh,
-            .io = io,
+            .network_io = network_io,
+            .filesystem_io = filesystem_io,
         };
         try pending.append(arena, .{ .connection_index = connection_index, .cache_key = cache_key, .job = job });
     }
@@ -1339,7 +1361,7 @@ fn resolveExternalIoProbes(
     var offset: usize = 0;
     while (offset < pending.items.len) {
         const end = @min(pending.items.len, offset + max_workers);
-        if (io) |runtime_io| {
+        if (network_io) |runtime_io| {
             var group: std.Io.Group = .init;
             for (pending.items[offset..end]) |item| {
                 group.concurrent(runtime_io, ObjectProbeJob.run, .{item.job}) catch |err| {
@@ -1436,15 +1458,16 @@ fn probeS3Buckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
-    shared_io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !void {
     var dynamic_credentials: ?bedrock.Credentials = null;
     defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
 
     if (cfg.credentials.source != .static) {
-        var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(arena, .{}) else null;
+        var io_impl: ?std.Io.Threaded = if (network_io == null) std.Io.Threaded.init(arena, .{}) else null;
         defer if (io_impl) |*owned| owned.deinit();
-        var http = httpx.Client.initWithConfig(arena, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
+        var http = httpx.Client.initWithConfig(arena, network_io orelse io_impl.?.io(), .{ .timeouts = .{
             .connect_ms = timeout_ms,
             .read_ms = timeout_ms,
             .write_ms = timeout_ms,
@@ -1467,7 +1490,21 @@ fn probeS3Buckets(
                 .sts_endpoint = cfg.credentials.sts_endpoint,
             } },
         };
-        dynamic_credentials = try credential_cache.getForSource(arena, &http, cfg.region orelse "us-east-1", source);
+        var lease = try credential_cache.getLeaseForSourceWithIo(
+            arena,
+            &http,
+            filesystem_io,
+            cfg.region orelse "us-east-1",
+            source,
+        );
+        defer lease.release();
+        const credentials = lease.credentials();
+        dynamic_credentials = .{
+            .access_key_id = try arena.dupe(u8, credentials.access_key_id),
+            .secret_access_key = try arena.dupe(u8, credentials.secret_access_key),
+            .session_token = if (credentials.session_token) |value| try arena.dupe(u8, value) else null,
+            .expires_at_unix = credentials.expires_at_unix,
+        };
     }
 
     const access_key_id = if (dynamic_credentials) |credentials| credentials.access_key_id else cfg.credentials.access_key_id orelse return error.InvalidConnectionCredentials;
@@ -1487,7 +1524,7 @@ fn probeS3Buckets(
         },
     );
     s3_config.request_timeout_ms = timeout_ms;
-    s3_config.io = shared_io;
+    s3_config.io = network_io;
     var s3_client = try objectstore.s3.Client.init(arena, s3_config);
     var client = s3_client.client();
     defer client.deinit();
@@ -1508,11 +1545,12 @@ fn probeObjectBuckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !void {
     return switch (cfg.protocol) {
-        .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket, io),
-        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket, io),
+        .s3 => probeS3Buckets(arena, cfg, timeout_ms, failed_bucket, network_io, filesystem_io),
+        .gcs => probeGcsBuckets(arena, cfg, timeout_ms, failed_bucket, network_io, filesystem_io),
         else => error.InvalidConfig,
     };
 }
@@ -1522,9 +1560,10 @@ fn probeGcsBuckets(
     cfg: common_config.Config.ExternalIoConnectionConfig,
     timeout_ms: u64,
     failed_bucket: *?usize,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !void {
-    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg, io);
+    var gcs_cfg = try backups_api.gcsConfigForConnection(arena, cfg, network_io, filesystem_io);
     gcs_cfg.request_timeout_ms = timeout_ms;
     var gcs = try objectstore.Gcs.JsonApiClient.init(arena, gcs_cfg);
     var client = gcs.client();
@@ -1571,6 +1610,47 @@ test "object probe cache identity covers every bucket and credential source" {
     const credential_key = try objectProbeCacheKeyAlloc(alloc, "archive", first);
     defer alloc.free(credential_key);
     try std.testing.expect(!std.mem.eql(u8, bucket_key, credential_key));
+}
+
+test "connection filesystem probes use the explicit filesystem authority" {
+    const alloc = std.testing.allocator;
+    var network_impl = std.Io.Threaded.init(alloc, .{});
+    defer network_impl.deinit();
+    const NetworkOnly = struct {
+        fn rejectDirectory(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+            return error.AccessDenied;
+        }
+    };
+    var network_vtable = network_impl.io().vtable.*;
+    network_vtable.dirOpenDir = NetworkOnly.rejectDirectory;
+    const network_io: std.Io = .{ .userdata = network_impl.io().userdata, .vtable = &network_vtable };
+    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    defer filesystem_impl.deinit();
+    const filesystem_io = filesystem_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(filesystem_io, ".", alloc);
+    defer alloc.free(root);
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"connections":{{"local":{{"kind":"external_io","capabilities":["backup.write"],"external_io":{{"protocol":"filesystem","root":"{s}"}}}}}}}}
+    , .{root});
+    defer alloc.free(json);
+    var config = try common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const response = try buildConnectionsResponse(
+        arena_state.allocator(),
+        .{
+            .node_config = &config,
+            .network_io = network_io,
+            .filesystem_io = filesystem_io,
+        },
+        null,
+        .{ .types_filter = "external_io", .probe = true },
+    );
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    try std.testing.expectEqual(ConnectionStatus.connected, response.connections[0].status);
 }
 
 test "connection cache remains valid across every allocation failure" {

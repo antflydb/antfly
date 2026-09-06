@@ -152,7 +152,9 @@ export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/antfly-pycache}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/antfly-ci-uv-cache}"
 export ANTFLY_E2E_PHASE_TIMINGS="${ANTFLY_E2E_PHASE_TIMINGS:-1}"
 export ANTFLY_E2E_NATIVE_STACKS="${ANTFLY_E2E_NATIVE_STACKS:-1}"
-export ANTFLY_LSM_OPEN_DEBUG="${ANTFLY_LSM_OPEN_DEBUG:-1}"
+# Preserve open-phase metrics by default; enable ANTFLY_LSM_OPEN_DEBUG only
+# for a focused startup/open investigation because it emits every successful
+# nested WAL and index open.
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 
 failures=0

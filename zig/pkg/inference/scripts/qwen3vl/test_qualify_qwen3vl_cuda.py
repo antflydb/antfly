@@ -25,13 +25,11 @@ def write_json(path: Path, value: object) -> None:
 class ManagedBundleTests(unittest.TestCase):
     def make_bundle(self, root: Path) -> None:
         files = {
-            "decoder.gguf": b"decoder",
-            "projector.gguf": b"projector",
+            "model.safetensors": b"weights",
             "antfly_inference_bundle.json": json.dumps(
                 {
-                    "family": "qwen3_vl_gguf_bundle/v1",
-                    "decoder": "decoder.gguf",
-                    "projector": "projector.gguf",
+                    "family": "qwen3_vl_safetensors_bundle/v1",
+                    "model": "model.safetensors",
                 }
             ).encode(),
         }
@@ -56,15 +54,15 @@ class ManagedBundleTests(unittest.TestCase):
             self.make_bundle(root)
             evidence = qualify.validate_managed_bundle(root)
             self.assertEqual(
-                str(root.resolve() / "decoder.gguf"), evidence["decoder_path"]
+                str(root.resolve() / "model.safetensors"), evidence["model_path"]
             )
-            self.assertEqual(3, len(evidence["artifacts"]))
+            self.assertEqual(2, len(evidence["artifacts"]))
 
     def test_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             self.make_bundle(root)
-            (root / "decoder.gguf").write_bytes(b"tampered")
+            (root / "model.safetensors").write_bytes(b"tampered")
             with self.assertRaisesRegex(qualify.QualificationError, "size mismatch"):
                 qualify.validate_managed_bundle(root)
 
@@ -78,62 +76,20 @@ class ManagedBundleTests(unittest.TestCase):
             ):
                 qualify.validate_managed_bundle(root)
 
-    def test_reranker_requires_exact_nested_contract_artifacts(self) -> None:
+    def test_split_gguf_source_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            files = {
-                "model.safetensors": b"weights",
-                "additional_chat_templates/reranker.jinja": b"template",
-                "1_LogitScore/config.json": b"score",
-                "antfly_inference_bundle.json": json.dumps(
-                    {
-                        "family": "qwen3_vl_reranker_safetensors_bundle/v1",
-                        "model": "model.safetensors",
-                    }
-                ).encode(),
-                "model_manifest.json": b'{"type":"reranker"}',
+            self.make_bundle(root)
+            receipt_path = root / qualify.RECEIPT_NAME
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["source"] = {
+                "owner": "Qwen",
+                "name": "Qwen3-VL-2B-Instruct-GGUF",
+                "variant": "q4-k-m-bundle-v1",
             }
-            expected = {
-                path: (len(data), hashlib.sha256(data).hexdigest())
-                for path, data in files.items()
-                if path not in ("antfly_inference_bundle.json", "model_manifest.json")
-            }
-            artifacts = []
-            for name, data in files.items():
-                path = root / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-                artifact = {"path": name, "size": len(data)}
-                if name not in ("antfly_inference_bundle.json", "model_manifest.json"):
-                    artifact["sha256"] = hashlib.sha256(data).hexdigest()
-                artifacts.append(artifact)
-            write_json(
-                root / qualify.RECEIPT_NAME,
-                {
-                    "version": 2,
-                    "source": qualify.RERANKER_EXPECTED_SOURCE,
-                    "artifacts": artifacts,
-                },
-            )
-            original = qualify.RERANKER_EXPECTED_ARTIFACTS
-            original_generated = qualify.RERANKER_GENERATED_ARTIFACTS
-            qualify.RERANKER_EXPECTED_ARTIFACTS = expected
-            qualify.RERANKER_GENERATED_ARTIFACTS = {
-                path: (len(data), hashlib.sha256(data).hexdigest())
-                for path, data in files.items()
-                if path in ("antfly_inference_bundle.json", "model_manifest.json")
-            }
-            try:
-                evidence = qualify.validate_managed_reranker_bundle(root)
-                self.assertEqual(
-                    str(root.resolve() / "model.safetensors"), evidence["model_path"]
-                )
-                (root / "1_LogitScore/config.json").write_bytes(b"wrong")
-                with self.assertRaises(qualify.QualificationError):
-                    qualify.validate_managed_reranker_bundle(root)
-            finally:
-                qualify.RERANKER_EXPECTED_ARTIFACTS = original
-                qualify.RERANKER_GENERATED_ARTIFACTS = original_generated
+            write_json(receipt_path, receipt)
+            with self.assertRaisesRegex(qualify.QualificationError, "source mismatch"):
+                qualify.validate_managed_bundle(root)
 
 
 class ParserAndMetricTests(unittest.TestCase):
@@ -201,15 +157,15 @@ class ParserAndMetricTests(unittest.TestCase):
         passing = {
             "size_match": True,
             "finite": True,
-            "cosine_similarity": 0.97,
-            "pearson_correlation": 0.96,
-            "mean_abs": 0.8,
-            "rmse": 1.1,
-            "max_abs": 5.0,
-            "top_k_overlap": 8,
+            "cosine_similarity": 0.999,
+            "pearson_correlation": 0.999,
+            "mean_abs": 0.1,
+            "rmse": 0.2,
+            "max_abs": 1.0,
+            "top_k_overlap": 10,
         }
         self.assertTrue(qualify.logit_quality_pass(passing))
-        self.assertFalse(qualify.logit_quality_pass({**passing, "rmse": 1.3}))
+        self.assertFalse(qualify.logit_quality_pass({**passing, "rmse": 0.5}))
         self.assertFalse(qualify.logit_quality_pass({**passing, "finite": False}))
 
     def test_vm_stat_uses_reported_page_size(self) -> None:

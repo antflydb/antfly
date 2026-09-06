@@ -13,6 +13,9 @@ Matryoshka truncation to 32-1024 dims).
   (including the single tokenizer-appended trailing EOS `151643`), applied
   instruction per case, and embeddings at dims 1024/256/32 (reduced dims are
   truncate-then-renormalize of the 1024 vector).
+- `qualify_qwen3_embedding_common.py` — implements the backend-neutral request
+  and numerical gates used by the thin Metal and CUDA qualification entry
+  points.
 - `qualify_qwen3_embedding_metal.py` — replays the oracle cases against a
   running Antfly server's `/ai/v1/embeddings` endpoint and gates cosine
   parity per precision tier, batch-vs-single equivalence, `dimensions`
@@ -98,10 +101,13 @@ After the server reports `selected backend cuda` and `listening`, run:
 ```bash
 python3 qualify_qwen3_embedding_cuda.py \
   --oracle /tmp/qwen3_embedding_oracle.json \
-  --model MODEL_ID \
-  --tier q8_0
-# Use --tier bf16 for the safetensors bundle.
+  --base-url http://127.0.0.1:8080 \
+  --model MODEL_ID
 ```
+
+`MODEL_ID` must be a promoted Q8_0 or BF16 CUDA reference (or its friendly
+alias). The qualifier derives the numerical tier from that reference instead
+of accepting a separately supplied label.
 
 For CUDA throughput measurements, run the pretokenized E2E benchmark (model
 loading and tokenization remain outside the timed region):
