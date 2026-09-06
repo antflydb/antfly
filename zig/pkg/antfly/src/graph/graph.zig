@@ -11,6 +11,7 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
+
 //! KV-based graph index with backend-selectable reverse edge storage.
 //!
 //! Matches Go antfly's graph_index.go pattern:
@@ -1267,7 +1268,7 @@ pub const GraphIndex = struct {
         return entries;
     }
 
-    fn aggregatePackedAttemptContributionForNode(
+    fn ordinalAttemptContributionForNodeForTest(
         self: *GraphIndex,
         txn: anytype,
         metric_name: []const u8,
@@ -6917,8 +6918,8 @@ pub const GraphIndex = struct {
         total_units: u64 = 0,
     };
 
-    // v5 adds immutable ordinal topology/shuffle blocks and replay-safe,
-    // bounded consumer-barrier retirement. Older in-flight jobs must restart.
+    // v7 uses direct attempt-tagged ordinal shards and bounded summary leaves
+    // for every iterative build, independent of node count.
     // Older in-flight jobs must restart; published score layout is unchanged.
     const graph_metric_build_execution_schema_version: u64 = 7;
 
@@ -17440,7 +17441,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
 
         const adopted_contribution = try graphMetricOrdinalValueForTest(&graph, &txn, "pagerank", active_job.job_id, .iterate_contributions, 0, "doc-b");
         try std.testing.expectApproxEqAbs(@as(f64, 0.0), adopted_contribution, 0.0);
-        try std.testing.expectApproxEqAbs(@as(f64, 0.85 * (1.0 / 3.0)), try graph.aggregatePackedAttemptContributionForNode(&txn, "pagerank", active_job.job_id, .iterate_contributions, 0, 3, first_claim.attempt, "doc-b"), 0.0000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.85 * (1.0 / 3.0)), try graph.ordinalAttemptContributionForNodeForTest(&txn, "pagerank", active_job.job_id, .iterate_contributions, 0, 3, first_claim.attempt, "doc-b"), 0.0000001);
     }
     graph.close();
 
@@ -17464,7 +17465,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
 
         try std.testing.expectApproxEqAbs(@as(f64, 2.0 * 0.85 * (1.0 / 3.0)), try graphMetricOrdinalValueForTest(&graph, &txn, "pagerank", active_job.job_id, .iterate_contributions, 0, "doc-b"), 0.0000001);
-        try std.testing.expectApproxEqAbs(@as(f64, 2.0 * 0.85 / 3.0), try graph.aggregatePackedAttemptContributionForNode(&txn, "pagerank", active_job.job_id, .iterate_contributions, 0, 3, first_claim.attempt, "doc-b"), 0.0000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0 * 0.85 / 3.0), try graph.ordinalAttemptContributionForNodeForTest(&txn, "pagerank", active_job.job_id, .iterate_contributions, 0, 3, first_claim.attempt, "doc-b"), 0.0000001);
     }
 
     try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 0);
@@ -24558,11 +24559,10 @@ fn drainGraphMetricBuildToPublishForTest(
         while (true) {
             const step = try graph.runGraphMetricPlannedWorkerStep(metric_name, cfg, worker_id);
             try std.testing.expectEqual(expected_phase, step.phase);
-            try std.testing.expect(step.claimed_page);
-            try std.testing.expect(step.completed_page);
+            try std.testing.expect(!step.failed_build);
             page_steps += 1;
             if (step.advanced_phase) break;
-            if (page_steps > graph_metric_build_max_partition_pages + 1)
+            if (page_steps > (2 * graph_metric_build_max_partition_pages + 1) * 64)
                 return error.TestGraphMetricBuildDidNotAdvance;
         }
     }
@@ -25766,7 +25766,7 @@ test "graph eigenvector contribution and reduce pages resume from durable cursor
         try std.testing.expect(page.cursor.len > 0);
         const partial = try graphMetricOrdinalValueForTest(&graph, &txn, "eigenvector", active_job.job_id, .iterate_contributions, 0, "doc-b");
         try std.testing.expectApproxEqAbs(@as(f64, 0.0), partial, 0.0);
-        try std.testing.expectApproxEqAbs(1.0 / @sqrt(@as(f64, 3.0)), try graph.aggregatePackedAttemptContributionForNode(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, contribution_claim.attempt, "doc-b"), 0.0000001);
+        try std.testing.expectApproxEqAbs(1.0 / @sqrt(@as(f64, 3.0)), try graph.ordinalAttemptContributionForNodeForTest(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, contribution_claim.attempt, "doc-b"), 0.0000001);
     }
     graph.close();
 
@@ -27176,7 +27176,7 @@ test "graph hits contribution and reduce pages resume from durable cursor after 
         try std.testing.expect(page.cursor.len > 0);
         const partial = try graphMetricOrdinalValueForTest(&graph, &txn, "hits_authority", active_job.job_id, .iterate_contributions, 0, "doc-authority");
         try std.testing.expectApproxEqAbs(@as(f64, 0.0), partial, 0.0);
-        try std.testing.expectApproxEqAbs(1.0 / @sqrt(@as(f64, 3.0)), try graph.aggregatePackedAttemptContributionForNode(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, contribution_claim.attempt, "doc-authority"), 0.0000001);
+        try std.testing.expectApproxEqAbs(1.0 / @sqrt(@as(f64, 3.0)), try graph.ordinalAttemptContributionForNodeForTest(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, contribution_claim.attempt, "doc-authority"), 0.0000001);
     }
     graph.close();
 
@@ -27324,10 +27324,6 @@ test "graph hits hub contribution and hub reduce pages resume from durable curso
     }
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
-    const hub_reduce_summary = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, "worker-summary", 5000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.summary, hub_reduce_summary.range_kind);
-    _ = try graph.executeGraphMetricReduceSummaryBuildPage("hits_authority", metrics[0], active_job, hub_reduce_summary);
-    try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
     const hub_reduce_claim = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, "worker-hr", 5001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, hub_reduce_claim.range_kind);
     _ = try graph.executeHitsHubReduceBuildPageWithLimit("hits_authority", metrics[0], active_job, hub_reduce_claim, 1);
@@ -27421,15 +27417,6 @@ test "graph hits reduce pages only write their planned node range" {
             if (step.advanced_phase) break;
         }
     }
-
-    try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 0);
-    const reduce_summary = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .reduce_ranks, 0, "worker-summary", 3000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(@as(u64, 0), reduce_summary.page_id);
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.summary, reduce_summary.range_kind);
-    try std.testing.expectEqual(graph_metric_build_target_reduce_page_units, try graph.executeGraphMetricReduceSummaryBuildPage("hits_authority", metrics[0], active_job, reduce_summary));
-    try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 0);
-    const final_summary = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .reduce_ranks, 0, "worker-summary", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expect((try graph.executeGraphMetricReduceSummaryBuildPage("hits_authority", metrics[0], active_job, final_summary)) > 0);
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 0);
     const first_reduce = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .reduce_ranks, 0, "worker-r1", 3002) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -27535,24 +27522,10 @@ test "graph hits reduce pages only write their planned node range" {
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
-        try std.testing.expect((try graph.readHitsHubRawForNode(&txn, "hits_authority", active_job.job_id, 0, first_page_node)) > 0.0);
-        try std.testing.expect((try graph.readHitsHubRawForNode(&txn, "hits_authority", active_job.job_id, 0, second_page_node)) > 0.0);
+        try std.testing.expect((try graphMetricOrdinalValueForTest(&graph, &txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 0, first_page_node)) > 0.0);
+        try std.testing.expect((try graphMetricOrdinalValueForTest(&graph, &txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 0, second_page_node)) > 0.0);
         const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.hits_hub_reduce_ranks, job.phase);
-    }
-
-    try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
-    const hub_reduce_summary = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, "worker-summary", 4000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.summary, hub_reduce_summary.range_kind);
-    var hub_summary_steps: usize = 0;
-    while (true) {
-        hub_summary_steps += 1;
-        try std.testing.expect(hub_summary_steps <= 64);
-        _ = try graph.executeGraphMetricReduceSummaryBuildPage("hits_authority", metrics[0], active_job, hub_reduce_summary);
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const persisted = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, hub_reduce_summary.page_id) orelse return error.TestExpectedGraphMetricBuildPage;
-        if (persisted.state == .complete) break;
     }
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
@@ -27586,7 +27559,7 @@ test "graph hits reduce pages only write their planned node range" {
         for (nodes.items) |node| {
             if (first_reduce_range_lower.len > 0 and std.mem.order(u8, node, first_reduce_range_lower) == .lt) continue;
             if (first_reduce_range_upper.len > 0 and std.mem.order(u8, node, first_reduce_range_upper) != .lt) continue;
-            const raw_hub = try graph.readHitsHubRawForNode(&txn, "hits_authority", active_job.job_id, 0, node);
+            const raw_hub = try graphMetricOrdinalValueForTest(&graph, &txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 0, node);
             const hub_key = graphMetricVectorSlotForTest(&graph, "hits_authority", active_job.job_id, "hub", 1, node);
             const hub = try hub_key.read(&txn);
             first_hub_reduce_raw_sum += raw_hub;
