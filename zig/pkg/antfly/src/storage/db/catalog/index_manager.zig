@@ -3792,7 +3792,10 @@ pub const IndexManager = struct {
                 .acq_rel,
                 .acquire,
             ) != null) {
-                std.Thread.yield() catch {};
+                // This path can execute on an std.Io fiber. Yield through the
+                // injected runtime so a cold-plan single-flight never parks an
+                // executor thread behind the builder.
+                self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
                 continue;
             }
             defer self.write_plan_build_generation.store(0, .release);

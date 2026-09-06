@@ -1125,7 +1125,7 @@ pub const DocStore = struct {
     /// Enter the short reader-visible publication fence. DB's exclusive apply
     /// lock serializes publishers and ordinary writers; this atomic closes the
     /// remaining lock-free read path without penalizing reads with a mutex.
-    pub fn beginPortableImportPublication(self: *DocStore) !void {
+    pub fn beginPortableImportPublication(self: *DocStore, io: std.Io) !void {
         try self.ensurePortableImportOperational();
         var state = self.portable_import_reader_state.load(.acquire);
         while (true) {
@@ -1138,11 +1138,10 @@ pub const DocStore = struct {
             ) orelse break;
         }
         while (self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0) {
-            if (builtin.single_threaded or builtin.os.tag == .freestanding) {
-                std.atomic.spinLoopHint();
-            } else {
-                std.Thread.yield() catch {};
-            }
+            // Publication is rare, but an admitted reader may be an std.Io
+            // fiber. Yield through that same scheduler rather than blocking an
+            // executor thread while the reader drains.
+            io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 

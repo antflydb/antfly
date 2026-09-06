@@ -30254,7 +30254,9 @@ pub const DB = struct {
         var apply_locked = true;
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
-        try self.core.store.beginPortableImportPublication();
+        try self.core.store.beginPortableImportPublication(
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
+        );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
         const publication = try adopt(context);
@@ -30302,7 +30304,9 @@ pub const DB = struct {
         var apply_locked = true;
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
-        try self.core.store.beginPortableImportPublication();
+        try self.core.store.beginPortableImportPublication(
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
+        );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
         try stage.publish(self.core.store);
@@ -61522,7 +61526,7 @@ test "db portable publication fence blocks lock-free point reads" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.beginPortableImportPublication();
+    try db.core.store.beginPortableImportPublication(std.Options.debug_io);
     var fenced = true;
     defer if (fenced) db.core.store.finishPortableImportPublication();
 
@@ -61582,12 +61586,13 @@ test "db portable publication waits for admitted readers and rejects new ones" {
 
     const Publisher = struct {
         store: *docstore_mod.DocStore,
+        io: std.Io,
         returned: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.store.beginPortableImportPublication() catch |err| {
+            self.store.beginPortableImportPublication(self.io) catch |err| {
                 self.err = err;
                 self.returned.store(true, .release);
                 return;
@@ -61597,7 +61602,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
             self.store.finishPortableImportPublication();
         }
     };
-    var publisher = Publisher{ .store = db.core.store };
+    var publisher = Publisher{ .store = db.core.store, .io = std.Options.debug_io };
     const thread = try std.Thread.spawn(.{}, Publisher.run, .{&publisher});
     var joined = false;
     defer if (!joined) {
