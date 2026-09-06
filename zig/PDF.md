@@ -79,6 +79,37 @@ after all consumers of that window finish. A future transform cache is keyed by
 source fingerprint, page, renderer version, DPI, pixel/dimension limits, and
 render profile; it must never be keyed by URL alone.
 
+Persistent preparation and planning memory participates in the same
+`document_extraction_working_set` admission as rendered windows. Coordinator
+state, page descriptors, stage identities, and publication lookup tables use
+budgeted allocators; moving a key into a bounded replay window explicitly
+copies ownership to that window's allocator. Retaining a parse or a plan does
+not silently bypass the renderer's process budget.
+
+The prepared-source cache is pressure-reclaimable, not pinned for the complete
+document group. A source lease pins downloaded bytes; a PDF lease pins both
+its parse variant and its source. Idle sources and unused parse variants can
+be evicted on cache allocation pressure or another executor's ResourceManager
+admission request. Reclamation never waits on a cache lock held by the caller,
+and shutdown retires the registered reclaimer before destroying its context.
+Active preparations retain their source lease through publication.
+ResourceManager resolves slice-local pressure from that slice's reclaimers
+before considering aggregate pressure, rather than evicting unrelated caches
+that cannot satisfy the local limit. Reclaiming preparation also returns
+unused amortized allocator credit, while preserving live allocations and
+explicit invocation pins.
+
+Compatible text consumers additionally share task-neutral embedded text,
+regions, geometry, and extraction warnings. The first traversal stores these
+records in bounded, batched, attempt-private storage keyed by content digest,
+decode limits, and page. Later consumers load the neutral record before any
+page-text extraction and apply their own OCR mode, quality policy, offsets,
+and prompting. Records are separate from finalized model-specific OCR units.
+Only documents with another compatible text consumer enroll; resource denial
+disables this optional cache and falls back to ordinary bounded extraction.
+Recovery markers and attempt cleanup cover these records too, without
+retaining all page text in memory or rerendering pages to recover metadata.
+
 ### Compatibility-first queues and shared render windows
 
 The bounded deferred-asset queue is partitioned by execution compatibility
@@ -96,12 +127,48 @@ compatibility includes source identity and credentials, DPI, pixel/dimension
 limits, preferred image geometry, encoded-output allowance, representation,
 and decode limits. Model names, prompts, and result types are not render keys.
 
+- Enrollment checks completed OCR state using the same metadata/byte
+  fingerprint and navigation-readiness gate as ordinary document extraction,
+  before capability discovery or inference. The ordered request loop reuses
+  that completed decision instead of rereading state and hashing the source
+  again. Byte checks borrow the prepared source; enrollment never downloads it
+  again. Speculative discovery failures leave the consumer on its ordinary
+  path, where completed-state skips and normal error handling remain
+  authoritative.
 - Each consumer partitions the borrowed window by its own item, byte, and
-  pixel limits and acquires incremental transport/inference/result admission.
-  The owner continues to account for the page buffers; consumers do not copy
-  them or retain their allocator.
+  pixel limits. Admission follows the window's physical lifetime: after all
+  render waves join and their lane Readers/heaps are destroyed, scratch credit
+  is returned. Pooled executor threads do not retain those per-window heaps.
+  Media and the owner's output/inference allowance remain pinned continuously.
+  Synchronous consumers borrow the idle part of that allowance, reserving only
+  any excess transport/inference/result peak. Nested OCR result-segment and
+  invocation scopes claim disjoint credit. The owner's allocator cannot grow
+  while credit is lent; scopes must free all allocations before returning it.
+  Failed admission leaves the owner's grant unchanged, and owner inference
+  never has to reacquire its baseline credit. Consumers neither copy the page
+  buffers nor retain their allocator.
+- Sharing must preserve batching, not merely reduce rendering. A partial
+  window is declined for the consumer's remaining traversal unless it fills
+  a whole number of that consumer's item windows. Thus a singleton owner cannot
+  turn a sixteen-item consumer into synchronous singleton calls. A whole short
+  document can still be shared. This conservative admission rule may forgo
+  sharing when pixels/bytes would independently force small batches; it keeps
+  the normal bounded traversal and does not retain images across windows or
+  reorder dependency-establishing requests. Any future joint-window planner
+  must admit the complete shared media window and each executor's incremental
+  peak before widening windows, and retain this independent fallback.
 - Page embedders stage vectors in their existing source-hashed, lease-epoch
   namespace. Final or staged matching vectors are skipped before inference.
+  Pending page descriptors are compacted before byte/pixel/item partitioning,
+  preserving page identities and borrowing the original buffers. Alternating
+  cached/pending pages therefore produce full batches instead of singleton
+  calls. If filtering leaves an item-count tail in a partial document window,
+  sharing is declined before staging so the independent traversal can fill
+  the batch from later pages; whole short documents remain shareable.
+  Both owner and shared-consumer paths checkpoint successful page vectors
+  before returning a sibling page failure. Retries invoke only missing pages;
+  final publication, stale cleanup, and coverage still require a complete
+  document. Invalid result identities are rejected before owner-stage writes.
   The v2 page identity includes the resolved model's target geometry, resize
   mode, and resampling policy, so a changed preprocessing contract invalidates
   old vectors even when the configured model name is unchanged.
@@ -116,12 +183,24 @@ and decode limits. Model names, prompts, and result types are not render keys.
   publication and coverage boundary. An unavailable optional memory lease
   falls back to its normal traversal; a consumer failure does not mutate the
   owner's units or prevent other compatible consumers from using the window.
-  Private OCR rows are scavenged at the next document-group entry, including
-  after reconfiguration removes their original consumer, and are removed when
-  their active group finishes. They never participate in public artifact scans.
+  Private OCR rows are removed when their active group finishes. The first
+  result transaction also registers the outstanding attempt; cleanup removes
+  that marker only after every result row has been deleted. The single-flight,
+  lease-owning replay pass scavenges the bounded registry before starting any
+  document groups, including attempts whose consumers or source documents
+  were removed. Ordinary text documents incur no per-document PDF cursor or
+  cleanup transaction. Both rows and registry are store-local metadata outside
+  document ranges, so shard range transfer cannot separate temporary results
+  from their recovery metadata. They never participate in public artifact scans.
 - Fan-out is synchronous on the enrichment thread, before prefetch. Renderer
   workers never enter enrichment state or concurrently use another consumer's
   PDF session. There is no document-sized rendered-image cache.
+
+Owned key collections retain their allocator extent: growing lists free their
+elements and deinitialize the list by capacity; exact owned slices use slice
+cleanup. This applies to normal publication and failure cleanup, including
+embedding-stage, stale-artifact, and chunk-key collectors. Allocation-failure
+regressions exercise partial list construction with a checked allocator.
 
 Typed asset batch failures consume the failing item's durable retry budget,
 not the identity of whichever item happened to lead the batch. Successful
@@ -4209,12 +4288,13 @@ unadmitted per-worker scratch allocator escape.
 
 Status: complete within one pending document group. A credential-scoped source
 cache owns the download and one prepared reader, lends immutable metadata to
-task-private render forks, and survives extraction long enough for page-image
-embedding to reuse it. A bounded attempt spool prevents materialization and
-publication from walking the PDF again.
+task-private render forks, and retains idle preparation for page-image
+embedding to reuse unless process pressure requires eviction. A bounded
+attempt spool prevents publication from walking the PDF again; neutral page
+text records let compatible consumers avoid repeating text inspection.
 
-- Parse and transform a PDF once per credential-scoped source in a pending
-  document group.
+- Reuse one preparation per credential-scoped source and decode envelope in a
+  pending document group; permit recomputation after pressure eviction.
 - Keep the prepared handle document-group-scoped, never process-global.
 - Replay resolved typed units from bounded attempt storage, then clean that
   private keyspace.
@@ -4232,6 +4312,11 @@ The implemented baseline satisfies these criteria:
   exceed the process-wide aggregate thread ceiling.
 - Aggregate pixels and working bytes are admitted before concurrent work, and
   every worker also has a hard live-allocation ceiling.
+- Persistent coordinator and planner allocations remain admitted independently
+  of render windows; source-cache eviction cannot invalidate an active lease.
+- Native integration verifies a second consumer reuses every neutral page-text
+  record while applying a different OCR policy without changing geometry or
+  text-region metadata.
 - Page order and artifact identity are stable across concurrency levels.
 - A permanent page failure does not prevent valid siblings from completing.
 - A systemic cancellation or allocator failure joins the render wave and

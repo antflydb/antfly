@@ -46,8 +46,13 @@ pub const pdf_page_embedding_stage_kind: u8 = 0x40;
 /// Keeping the spool in its own kind prevents it from being mistaken for a
 /// user-visible artifact or from participating in artifact source indexes.
 pub const document_extraction_unit_spool_kind: u8 = 0x41;
-/// Private typed results produced by consumers of a shared PDF render window.
+/// Store-local typed results produced by consumers of a shared PDF window.
+/// These attempts and their registry must stay outside document ranges: shard
+/// transfer must not copy temporary rows without their recovery metadata.
 pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
+/// of document existence and the current enrichment configuration.
+pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
@@ -390,9 +395,19 @@ pub fn documentExtractionUnitSpoolRootPrefixAlloc(
 pub fn sharedPdfConsumerRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
-    try appendDocumentPrefix(&list, alloc, doc_key);
-    try list.append(alloc, shared_pdf_consumer_kind);
+    try list.appendSlice(alloc, &.{ replay_namespace, 0xff, shared_pdf_consumer_kind });
+    try appendEncodedComponent(&list, alloc, doc_key);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerAttemptKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ &shared_pdf_consumer_attempt_prefix, doc_key });
+}
+
+pub fn sharedPdfConsumerAttemptDocumentKey(key: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, key, &shared_pdf_consumer_attempt_prefix))
+        return error.InvalidSharedPdfAttemptKey;
+    return key[shared_pdf_consumer_attempt_prefix.len..];
 }
 
 pub fn documentExtractionUnitSpoolKeyAlloc(

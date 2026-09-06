@@ -2207,7 +2207,64 @@ pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession,
     return extractParsedPdfStreaming(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink);
 }
 
+/// Task-neutral text inspection. OCR selection, offsets, prompts and output
+/// are intentionally absent; each consumer applies its own policy afterward.
+pub const PdfPageText = struct {
+    text: []u8,
+    text_regions: []TextRegion = &.{},
+    warning: ?[]u8 = null,
+    bbox: @FieldType(Unit, "page_bbox") = null,
+    rotation: @FieldType(Unit, "page_rotation") = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.text_regions);
+        if (self.warning) |warning| alloc.free(warning);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: *const @This(), alloc: Allocator) !@This() {
+        const text = try alloc.dupe(u8, self.text);
+        errdefer alloc.free(text);
+        const regions = try alloc.dupe(TextRegion, self.text_regions);
+        errdefer alloc.free(regions);
+        return .{ .text = text, .text_regions = regions, .warning = if (self.warning) |w| try alloc.dupe(u8, w) else null, .bbox = self.bbox, .rotation = self.rotation };
+    }
+};
+
+pub const PdfPageTextCache = struct {
+    ptr: *anyopaque,
+    load_fn: *const fn (*anyopaque, Allocator, usize) anyerror!?PdfPageText,
+    store_fn: *const fn (*anyopaque, usize, PdfPageText) anyerror!void,
+};
+
+pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink, cache);
+}
+
+fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, cache: ?PdfPageTextCache) !PdfPageText {
+    if (cache) |c| if (try c.load_fn(c.ptr, alloc, page_num)) |page| return page;
+    const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
+    const analysis = candidate.analysis;
+    defer {
+        for (analysis.runs) |*run| run.deinit(alloc);
+        if (analysis.runs.len > 0) alloc.free(analysis.runs);
+    }
+    var result = PdfPageText{ .text = analysis.text, .warning = candidate.warning };
+    errdefer result.deinit(alloc);
+    result.text_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, result.text);
+    const box = parsed.extractPageBox(page_num) catch null;
+    result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
+    result.rotation = parsed.extractPageRotation(page_num) catch null;
+    if (cache) |c| try c.store_fn(c.ptr, page_num, result);
+    return result;
+}
+
 fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, ocr_mode, quality_config, sink, null);
+}
+
+fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -2217,21 +2274,18 @@ fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, conte
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
-        const analysis = candidate.analysis;
-        defer {
-            for (analysis.runs) |*run| run.deinit(alloc);
-            if (analysis.runs.len > 0) alloc.free(analysis.runs);
-        }
-        var text = analysis.text;
+        var page = try inspectPdfPageText(alloc, parsed, page_num, cache);
+        defer page.deinit(alloc);
+        var text = page.text;
+        page.text = &.{};
         errdefer alloc.free(text);
-        var text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
+        var text_regions = page.text_regions;
+        page.text_regions = &.{};
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
-        var extraction_warning: ?[]u8 = candidate.warning;
+        var extraction_warning = page.warning;
+        page.warning = null;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_text_len = text.len;
-        const page_box = parsed.extractPageBox(page_num) catch null;
-        const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
         const quality = assessOcrQuality(text, quality_config);
@@ -2260,8 +2314,8 @@ fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, conte
             .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
-            .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
-            .page_rotation = page_rotation,
+            .page_bbox = page.bbox,
+            .page_rotation = page.rotation,
             .text_regions = text_regions,
             .char_start = char_start,
             .char_end = char_end,
@@ -2315,6 +2369,25 @@ fn extractPdfTextRegionsFromRunsAlloc(
 
 test "PDF text regions use reconstructed output spans" {
     const alloc = std.testing.allocator;
+    const CloneCheck = struct {
+        fn run(a: Allocator) !void {
+            const page = PdfPageText{
+                .text = @constCast("Text"),
+                .text_regions = @constCast(&[_]TextRegion{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 } }}),
+                .warning = @constCast("partial extraction"),
+                .bbox = .{ 0, 0, 400, 500 },
+                .rotation = 90,
+            };
+            var cloned = try page.clone(a);
+            defer cloned.deinit(a);
+            try std.testing.expectEqualStrings(page.text, cloned.text);
+            try std.testing.expectEqualStrings(page.warning.?, cloned.warning.?);
+            try std.testing.expectEqualSlices(TextRegion, page.text_regions, cloned.text_regions);
+            try std.testing.expectEqual(page.bbox, cloned.bbox);
+            try std.testing.expectEqual(page.rotation, cloned.rotation);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, CloneCheck.run, .{});
     const runs = [_]pdf.reader.TextRun{
         .{
             .text = "Heading ",

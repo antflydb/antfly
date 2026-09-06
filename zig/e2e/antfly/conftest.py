@@ -62,6 +62,38 @@ pytest_plugins = ("e2e_scheduler",)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+
+
+def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30.0):
+    """Resolve a committed create by observation, never by replaying its POST."""
+    created = api._check(response)
+    api._created_tables.add(table_name)
+    if response.status_code != 202:
+        return created
+    status = created.get("status")
+    if status not in ("committed_visibility_pending", "committed_repair_required"):
+        raise AssertionError(
+            f"Table create needs intervention: {table_name}: {created}"
+        )
+    deadline = time.monotonic() + timeout_s
+    last = created
+    while time.monotonic() < deadline:
+        observed = api._request("GET", f"/tables/{table_name}")
+        if observed.status_code == 200:
+            last = api._check(observed)
+            if (last.get("name") or last.get("table_name")) == table_name:
+                return last
+        elif observed.status_code not in (404, 500, 503):
+            api._check(observed)
+            raise AssertionError(
+                f"Unexpected table observation: {observed.status_code}"
+            )
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Committed table create did not become visible: {table_name}: {last}"
+    )
+
+
 E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
@@ -2863,9 +2895,7 @@ def stateful_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -3423,9 +3453,7 @@ def backup_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
