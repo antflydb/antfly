@@ -1291,6 +1291,7 @@ fn addOpenApiRegenRun(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", package_name });
     codegen.addArgs(&.{ "--generate", generate_what });
+    codegen.addArgs(&.{ "--import-mapping", "../shared/provider.yaml=antfly_provider_openapi", "--import-mapping", "./provider.yaml=antfly_provider_openapi", "--import-mapping", "specs/openapi/shared/provider.yaml=antfly_provider_openapi" });
     for (import_mappings) |mapping| {
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
@@ -1309,6 +1310,7 @@ fn addOpenApiRegenStep(
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
@@ -1563,9 +1565,15 @@ pub fn build(b: *std.Build) void {
     const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
     const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
     const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
+    const provider_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi");
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
     const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -3482,7 +3490,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{ "generating backend", "asset producer runtime", "provider quotas" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");

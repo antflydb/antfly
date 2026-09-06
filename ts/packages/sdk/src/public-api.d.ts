@@ -3464,6 +3464,7 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
              * @description Declare that this model supports non-text content (images, audio, video, PDFs),
@@ -9240,6 +9241,35 @@ export interface components {
             retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /**
+         * @description Outbound provider limits shared within one Antfly process by effective
+         *     endpoint, operation, model, credential source, project and region/location.
+         *     Conflicting policies for an active scope are rejected. These limits do
+         *     not coordinate across replicas or infer the provider's account quota.
+         */
+        RateLimitConfig: {
+            /** Format: int64 */
+            requests_per_minute?: number;
+            /**
+             * Format: int64
+             * @default 1
+             */
+            burst?: number;
+            /**
+             * Format: int64
+             * @description Conservative text budget: each HTTP attempt reserves its serialized
+             *     UTF-8 body byte count plus the configured generation output cap.
+             *     Reservations are not refunded. A request larger than this budget
+             *     is rejected. This is not provider billing token accounting; media
+             *     requests are not supported with this limit.
+             */
+            tokens_per_minute?: number;
+            /**
+             * Format: int64
+             * @description Maximum in-flight HTTP attempts, held through response completion.
+             */
+            max_concurrency?: number;
+        };
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -9738,6 +9768,7 @@ export interface components {
          *     }
          */
         GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
         /** @description Configuration for a specific edge type */
@@ -12477,6 +12508,7 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;

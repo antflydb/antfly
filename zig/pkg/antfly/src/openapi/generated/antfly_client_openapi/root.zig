@@ -541,6 +541,7 @@ pub const QueryStrategy = types.QueryStrategy;
 pub const QueryStringQuery = types.QueryStringQuery;
 pub const QueryTemporarilyUnavailableError = types.QueryTemporarilyUnavailableError;
 pub const QueryUnprocessableError = types.QueryUnprocessableError;
+pub const RateLimitConfig = types.RateLimitConfig;
 pub const RawQuery = types.RawQuery;
 pub const RegexpQuery = types.RegexpQuery;
 pub const RepairIssueListRequest = types.RepairIssueListRequest;

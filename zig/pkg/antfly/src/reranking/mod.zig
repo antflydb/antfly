@@ -23,6 +23,8 @@ const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
 const request_admission = @import("../common/request_admission.zig");
 const common_cancellation = @import("../common/cancellation.zig");
+const provider_limits = @import("../common/provider_limits.zig");
+const credential_identity = @import("../common/credential_source_identity.zig");
 const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
@@ -34,6 +36,7 @@ pub const max_candidate_count = lib.max_candidate_count;
 /// Long-lived resources shared by reranking requests. This keeps HTTP
 /// connections warm and lets ADC refresh single-flight per credential/scope.
 pub const Runtime = struct {
+    limits: *provider_limits.Registry = &provider_limits.process_registry,
     io: std.Io,
     http: httpx.Client,
     credentials: google_auth.CredentialManager,
@@ -124,7 +127,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.Canceled,
         error.Cancelled,
         => error.Cancelled,
-        error.QueueFull => error.RerankRateLimited,
+        error.QueueFull, error.ProviderQuotaRegistryFull => error.RerankRateLimited,
         error.RerankRequestFailed,
         error.EmptyResponse,
         error.InvalidRerankerResponse,
@@ -152,6 +155,7 @@ pub fn statusError(status: u16) anyerror {
 }
 
 test "reranking runtime failures use stable query dependency classes" {
+    try std.testing.expectEqual(error.RerankRateLimited, normalizeOperationalError(error.ProviderQuotaRegistryFull));
     try std.testing.expectEqual(error.RerankRateLimited, statusError(429));
     try std.testing.expectEqual(error.RerankTransientFailure, statusError(503));
     try std.testing.expectEqual(error.Timeout, statusError(504));
@@ -217,6 +221,7 @@ pub const Options = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     runtime: ?*Runtime = null,
+    limits: *provider_limits.Registry = &provider_limits.process_registry,
     execution_context: ?inference_request_context.RequestContext = null,
 };
 
@@ -231,21 +236,24 @@ pub fn rerankDocumentsWithOptions(
     try cfg.validate();
     if (options.execution_context) |context| try context.check();
     const capabilities = providerCapabilities(cfg.provider);
-    const configured_secret = switch (capabilities.credential_kind) {
+    var configured_secret = switch (capabilities.credential_kind) {
         .api_key => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
         .none, .google_adc => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
     };
-    const api_key = if (configured_secret) |secret_value| blk: {
-        var owned_secret = secret_value;
-        defer owned_secret.deinit(alloc);
-        break :blk try owned_secret.resolveOwned(alloc, options.secret_store);
-    } else null;
+    defer if (configured_secret) |*secret| secret.deinit(alloc);
+    const api_key = if (configured_secret) |secret_value| try secret_value.resolveOwned(alloc, options.secret_store) else null;
     defer if (api_key) |value| alloc.free(value);
+    const source = if (cfg.provider == .vertex and configured_secret == null)
+        credential_identity.CredentialSourceIdentity.googleAdc(if (cfg.credentials_path.len > 0) cfg.credentials_path else null)
+    else
+        credential_identity.fromSecretValue(configured_secret);
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
 
     switch (cfg.provider) {
         .antfly => {
             if (cfg.url.len == 0) {
                 if (options.antfly_provider) |local| {
+                    if (policy.enabled()) return error.UnsupportedLocalRateLimit;
                     if (options.execution_context) |context| {
                         if (local.rerank_texts_with_context) |rerank| {
                             const scores = try rerank(local.ptr, alloc, cfg.model, query, documents, context);
@@ -262,6 +270,9 @@ pub fn rerankDocumentsWithOptions(
             }
             var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
             defer provider.deinit();
+            var quota = try acquireQuota(cfg, options, source, "", "", policy);
+            defer quota.release();
+            provider.attempt_observer = quota.limiter().observer(0);
             if (options.execution_context) |context| {
                 provider.setRequestCancellation(context.cancellation);
                 provider.setRequestTimeoutMs(try context.remainingTimeoutMs());
@@ -273,7 +284,9 @@ pub fn rerankDocumentsWithOptions(
         },
         .cohere => {
             const token = api_key orelse return error.InvalidRerankerConfig;
-            const scores = try rerankCohere(alloc, http, cfg, token, options.execution_context, query, documents);
+            var quota = try acquireQuota(cfg, options, source, "", "", policy);
+            defer quota.release();
+            const scores = try rerankCohere(alloc, http, cfg, token, options.execution_context, quota.limiter().observer(0), query, documents);
             errdefer alloc.free(scores);
             if (options.execution_context) |context| try context.check();
             return scores;
@@ -294,6 +307,9 @@ pub fn rerankDocumentsWithOptions(
                 .token_source = token_source,
             });
             defer provider.deinit();
+            var quota = try acquireQuota(cfg, options, source, provider.project_id, "global", policy);
+            defer quota.release();
+            provider.attempt_observer = quota.limiter().observer(0);
             const scores = try provider.rerank(alloc, cfg.model, query, documents, .{
                 .timeout_ms = if (options.execution_context) |context| try context.remainingTimeoutMs() else null,
                 .cancellation = httpCancellation(if (options.execution_context) |context| context.cancellation else null),
@@ -305,12 +321,25 @@ pub fn rerankDocumentsWithOptions(
     }
 }
 
+fn acquireQuota(cfg: Config, options: Options, source: credential_identity.CredentialSourceIdentity, project: []const u8, location: []const u8, policy: provider_limits.Policy) !provider_limits.Handle {
+    const registry = if (options.runtime) |runtime| runtime.limits else options.limits;
+    return registry.acquire(.{ .operation = .reranking, .endpoint = .{
+        .provider = std.meta.stringToEnum(provider_limits.Provider, @tagName(cfg.provider)).?,
+        .endpoint = cfg.defaultedUrl(),
+        .model = cfg.model,
+        .project = project,
+        .location = location,
+        .credentials = source,
+    } }, policy);
+}
+
 fn rerankCohere(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     cfg: Config,
     api_key: []const u8,
     execution_context: ?inference_request_context.RequestContext,
+    observer: httpx.AttemptObserver,
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
@@ -330,6 +359,7 @@ fn rerankCohere(
     defer alloc.free(authorization);
     const headers = [_][2][]const u8{.{ "Authorization", authorization }};
     var response = try http.post(url, .{
+        .attempt_observer = observer,
         .json = body,
         .headers = &headers,
         .timeout_ms = if (execution_context) |context| try context.remainingTimeoutMs() else null,
@@ -367,6 +397,19 @@ fn scoresByIndexAlloc(alloc: std.mem.Allocator, count: usize, results: anytype) 
     }
     for (seen) |present| if (!present) return error.InvalidRerankerResponse;
     return scores;
+}
+
+test "reranking runtime validates policies and rejects oversized text before dispatch" {
+    const alloc = std.testing.allocator;
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var cfg = Config{ .provider = .cohere, .model = "rerank-v4.0-pro", .url = "http://127.0.0.1:1", .api_key = "test", .field = "body", .rate_limit = .{ .requests_per_minute = 0 } };
+    const options = Options{ .limits = &registry };
+    try std.testing.expectError(error.InvalidRateLimitPolicy, rerankDocumentsWithOptions(alloc, &client, cfg, options, "query", &.{"document"}));
+    cfg.rate_limit = .{ .tokens_per_minute = 1 };
+    try std.testing.expectError(error.ProviderTokenBudgetExceeded, rerankDocumentsWithOptions(alloc, &client, cfg, options, "query", &.{"document"}));
 }
 
 test "reranking runtime maps Cohere scores back to input order" {

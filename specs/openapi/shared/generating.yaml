@@ -5,6 +5,8 @@ info:
   version: "0.0.1"
 components:
   schemas:
+    RateLimitConfig:
+      $ref: "./provider.yaml#/components/schemas/RateLimitConfig"
     GeneratorProvider:
       type: string
       enum:
@@ -26,6 +28,8 @@ components:
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/OpenAIGeneratorConfig"
         - properties:
+            rate_limit:
+              $ref: "./provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/GeneratorProvider"
           required:

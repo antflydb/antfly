@@ -5,6 +5,8 @@ info:
   version: "0.0.1"
 components:
   schemas:
+    RateLimitConfig:
+      $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
     RerankerProvider:
       type: string
       enum:
@@ -112,6 +114,8 @@ components:
       allOf:
         - type: object
           properties:
+            rate_limit:
+              $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/RerankerProvider"
             field:

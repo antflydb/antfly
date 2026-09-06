@@ -1,0 +1,42 @@
+openapi: 3.0.3
+info:
+  title: Provider execution policy
+  version: "0.0.1"
+components:
+  schemas:
+    RateLimitConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Outbound provider limits shared within one Antfly process by effective
+        endpoint, operation, model, credential source, project and region/location.
+        Conflicting policies for an active scope are rejected. These limits do
+        not coordinate across replicas or infer the provider's account quota.
+      properties:
+        requests_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+        burst:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          default: 1
+        tokens_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Conservative text budget: each HTTP attempt reserves its serialized
+            UTF-8 body byte count plus the configured generation output cap.
+            Reservations are not refunded. A request larger than this budget
+            is rejected. This is not provider billing token accounting; media
+            requests are not supported with this limit.
+        max_concurrency:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          description: Maximum in-flight HTTP attempts, held through response completion.

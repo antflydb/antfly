@@ -2,6 +2,7 @@
 // Package: antfly_reranking_openapi
 
 const std = @import("std");
+const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
@@ -81,8 +82,11 @@ pub const CohereRerankerConfig = struct {
     }
 };
 
+pub const RateLimitConfig = antfly_provider_openapi.RateLimitConfig;
+
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
+    rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
     field: ?[]const u8 = null,
@@ -105,6 +109,7 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "rate_limit", "rate_limit", false },
         .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
@@ -127,6 +132,13 @@ pub const RerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("rate_limit");
+            try jw.write(@as(?u8, null));
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         if (self.field) |value| {

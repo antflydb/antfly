@@ -79,6 +79,7 @@ test "bedrock provider request helpers" {
 }
 
 test "embedding provider request helpers" {
+    try @import("../common/provider_limits.zig").testProviderQuotas();
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
     try google_auth.testCredentialSourceCacheKeys();

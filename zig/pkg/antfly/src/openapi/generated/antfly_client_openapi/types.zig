@@ -8421,6 +8421,7 @@ pub const EmbedderConfig = struct {
     batch_size: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    rate_limit: ?RateLimitConfig = null,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
     /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
@@ -8449,6 +8450,7 @@ pub const EmbedderConfig = struct {
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
+        .{ "rate_limit", "rate_limit", true },
         .{ "multimodal", "multimodal", true },
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
@@ -8531,6 +8533,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
             try jw.write(value);
         }
         if (self.multimodal) |value| {
@@ -12405,6 +12411,7 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
+    rate_limit: ?RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12423,6 +12430,7 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
+        .{ "rate_limit", "rate_limit", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12493,6 +12501,10 @@ pub const GeneratorConfig = struct {
         }
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
             try jw.write(value);
         }
         try jw.endObject();
@@ -26062,6 +26074,53 @@ pub const QueryUnprocessableError = union(enum) {
     }
 };
 
+/// Outbound provider limits shared within one Antfly process by effective endpoint, operation, model, credential source, project and region/location. Conflicting policies for an active scope are rejected. These limits do not coordinate across replicas or infer the provider's account quota.
+pub const RateLimitConfig = struct {
+    requests_per_minute: ?i64 = null,
+    burst: ?i64 = null,
+    /// Conservative text budget: each HTTP attempt reserves its serialized UTF-8 body byte count plus the configured generation output cap. Reservations are not refunded. A request larger than this budget is rejected. This is not provider billing token accounting; media requests are not supported with this limit.
+    tokens_per_minute: ?i64 = null,
+    /// Maximum in-flight HTTP attempts, held through response completion.
+    max_concurrency: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requests_per_minute", "requests_per_minute", true },
+        .{ "burst", "burst", true },
+        .{ "tokens_per_minute", "tokens_per_minute", true },
+        .{ "max_concurrency", "max_concurrency", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.requests_per_minute) |value| {
+            try jw.objectField("requests_per_minute");
+            try jw.write(value);
+        }
+        if (self.burst) |value| {
+            try jw.objectField("burst");
+            try jw.write(value);
+        }
+        if (self.tokens_per_minute) |value| {
+            try jw.objectField("tokens_per_minute");
+            try jw.write(value);
+        }
+        if (self.max_concurrency) |value| {
+            try jw.objectField("max_concurrency");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
 
@@ -26649,6 +26708,7 @@ pub const RerankerCandidateLimitExceededError = struct {
 
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
+    rate_limit: ?RateLimitConfig = null,
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
     field: ?[]const u8 = null,
@@ -26671,6 +26731,7 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "rate_limit", "rate_limit", true },
         .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
@@ -26693,6 +26754,10 @@ pub const RerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         if (self.field) |value| {

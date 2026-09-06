@@ -801,6 +801,7 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
@@ -1798,6 +1799,7 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "RateLimitConfig",
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
