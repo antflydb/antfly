@@ -77,9 +77,13 @@ pub const GraphMetricReadBudget = struct {
     }
 
     pub fn chargeRange(self: *@This(), bytes: usize) !void {
+        return self.reserveRanges(1, bytes);
+    }
+
+    pub fn reserveRanges(self: *@This(), requests: usize, bytes: usize) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const next_requests = try checkedCharge(self.range_requests, 1, self.limits.max_range_requests);
+        const next_requests = try checkedCharge(self.range_requests, @intCast(requests), self.limits.max_range_requests);
         const next_bytes = try checkedCharge(self.range_bytes, @intCast(bytes), self.limits.max_range_bytes);
         self.range_requests = next_requests;
         self.range_bytes = next_bytes;
@@ -133,6 +137,19 @@ test "serverless graph metric request budget composes reads and rejects charges 
     try budget.chargeRetained(10);
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRetained(1));
     try std.testing.expectEqual(@as(u64, 10), budget.retained_bytes);
+}
+
+test "serverless graph metric score-plan reservation is atomic across ranges and bytes" {
+    var budget = GraphMetricReadBudget{ .limits = .{ .max_range_requests = 3, .max_range_bytes = 10 } };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(2, 11));
+    try std.testing.expectEqual(@as(u64, 0), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 0), budget.range_bytes);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(4, 5));
+    try std.testing.expectEqual(@as(u64, 3), budget.remainingRequests());
+    try budget.reserveRanges(3, 10);
+    try std.testing.expectEqual(@as(u64, 0), budget.remainingRequests());
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.range_bytes);
 }
 
 pub const QueryRuntime = struct {
@@ -260,8 +277,6 @@ pub const QuerySession = struct {
     owns_graph_metric_specs: bool = true,
     graph_metric_read_budget: GraphMetricReadBudget = .{},
     graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
-    /// Deterministic column share; the shared budget remains authoritative.
-    graph_metric_range_allowance: ?u64 = null,
 
     pub fn deinit(self: *QuerySession) void {
         if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
@@ -336,7 +351,6 @@ pub const QuerySession = struct {
             .graph_metric_specs = self.graph_metric_specs,
             .owns_graph_metric_specs = false,
             .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
-            .graph_metric_range_allowance = self.graph_metric_range_allowance,
         };
     }
 
@@ -363,7 +377,12 @@ pub const QuerySession = struct {
     }
 
     pub fn graphMetricRangeAllowance(self: *QuerySession) u64 {
-        return self.graph_metric_range_allowance orelse self.effectiveGraphMetricReadBudget().remainingRequests();
+        return self.effectiveGraphMetricReadBudget().remainingRequests();
+    }
+
+    pub fn reserveGraphMetricRanges(self: *QuerySession, requests: usize, bytes: usize) !void {
+        try self.checkCancellation();
+        return self.effectiveGraphMetricReadBudget().reserveRanges(requests, bytes);
     }
 
     pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {
@@ -538,6 +557,20 @@ pub const QuerySession = struct {
         return result;
     }
 
+    pub fn readCachedAuthenticatedBlockAlloc(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?[]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        const cache = self.cache orelse return null;
+        return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation);
+    }
+
+    pub fn cacheAuthenticatedBlock(self: *QuerySession, index: usize, block_id: []const u8, offset: u64, bytes: []const u8, checksum: *const [32]u8) !void {
+        const cache = self.cache orelse return;
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try cache.publishAuthenticatedBlock(artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, bytes.len, bytes, self.cancellation);
+    }
+
     /// Fetches a bounded range and authenticates every byte against digests
     /// rooted in the published manifest or an already-authenticated routing
     /// footer. Subranges must exactly and contiguously cover the response.
@@ -548,6 +581,14 @@ pub const QuerySession = struct {
         len: usize,
         subranges: []const AuthenticatedSubrange,
     ) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, true);
+    }
+
+    pub fn fetchArtifactAuthenticatedRangeUncachedAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, false);
+    }
+
+    fn fetchAuthenticatedRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange, retain_range: bool) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
@@ -560,7 +601,7 @@ pub const QuerySession = struct {
         }
         if (covered != len) return error.InvalidArtifactRange;
 
-        if (self.cache) |cache| {
+        if (if (retain_range) self.cache else null) |cache| {
             const result = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,

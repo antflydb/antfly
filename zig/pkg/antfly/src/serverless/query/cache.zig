@@ -727,6 +727,25 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        if (try self.readAuthenticatedBlockIfPresentAlloc(result_alloc, artifact_id, block_id, expected_byte_len, expected_checksum, block_checksum, offset, len, cancellation)) |cached| return cached;
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        errdefer result_alloc.free(contents);
+        try self.publishAuthenticatedBlock(artifact_id, block_id, expected_byte_len, expected_checksum, block_checksum, offset, len, contents, cancellation);
+        return contents;
+    }
+
+    pub fn readAuthenticatedBlockIfPresentAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) !?[]u8 {
         try cancellation.check();
         try validateExpectedRange(artifact_id, .{
             .byte_len = expected_byte_len,
@@ -758,15 +777,26 @@ pub const QueryCache = struct {
             try removeCorruptCacheEntry(self, block_path, cancellation);
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(
-            result_alloc,
-            artifact_id,
-            offset,
-            len,
-            cancellation,
-        );
-        errdefer result_alloc.free(contents);
-        if (contents.len != len) {
+        return null;
+    }
+
+    /// Publish a canonical logical block after a coalesced transport read.
+    /// Authentication remains mandatory; transport shape is never cache identity.
+    pub fn publishAuthenticatedBlock(
+        self: *QueryCache,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        contents: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        try cancellation.check();
+        try validateExpectedRange(artifact_id, .{ .byte_len = expected_byte_len, .checksum = expected_checksum }, offset, len);
+        if (len == 0 or contents.len != len) {
             recordIntegrityFailure(self);
             return error.ArtifactIntegrityMismatch;
         }
@@ -776,12 +806,15 @@ pub const QueryCache = struct {
             recordIntegrityFailure(self);
             return error.ArtifactIntegrityMismatch;
         }
-        const published = try publishCacheEntry(self, block_path, contents, switch (block_class) {
+        const block_class = classifyBlockId(block_id);
+        const payload_block_class = classifyPayloadBlockId(block_id);
+        const path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
+        defer self.alloc.free(path);
+        const published = try publishCacheEntry(self, path, contents, switch (block_class) {
             .routing => .routing_block,
             .payload => .payload_block,
         }, cancellation);
         recordBlockMiss(self, block_class, payload_block_class, published);
-        return contents;
     }
 
     fn getBlockOrFetchRangeImplAlloc(

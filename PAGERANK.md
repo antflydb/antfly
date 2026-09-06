@@ -666,13 +666,16 @@ one routing page, whose entries authenticate score blocks. Point reads load
 only selected pages, with global block ordinals preserving score-cache identity.
 Indexes fitting in one routing page or a 64 KiB footer retain a single footer fetch and decoded
 cache lease, avoiding extra network round trips for small metrics.
-Selected contiguous pages coalesce into authenticated ranges; independent runs
+Only missing contiguous pages coalesce into authenticated ranges; independent runs
 use the same bounded parallel executor as score ranges (per column: eight reads and 32 MiB
-in flight, with each coalesced range capped at 8 MiB). Column plans divide the
-remaining shared request allowance deterministically, reserving control, root,
-directory and selected routing ranges before planning scores. Paging therefore
-cannot silently add requests beyond a score-only allowance. The shared budget
-remains authoritative across all metric surfaces of the pinned query.
+in flight, with each coalesced range capped at 8 MiB). A query prepares every
+column's control and routing before admitting any score reads. Exact score plans
+share the remaining request budget without per-column quotas; when coalescing is
+necessary, bounded windows compete across columns by overfetch bytes per saved
+request. The complete score request and byte totals are reserved atomically before
+bounded parallel execution. An uneven query therefore does not fail merely because
+one column needs more than an equal share. The shared budget remains authoritative
+across all metric surfaces of the pinned query.
 Top-K reads fetch only the root (at most 1,872 bytes) and requested ranked blocks,
 never the point directory or pages. The root also binds primary vector extents
 and the complete point-index digest for full-artifact/warm-start validation.
@@ -701,6 +704,11 @@ does not create another unbounded cache: fill registrations have fixed capacity,
 and every consuming query applies its retained-memory admission to the lease.
 Routing pages use the authenticated block cache and are decoded only for selected
 pages, so a large primary index cannot repeatedly bypass the decoded-index cache.
+Each page has a canonical cache identity using its global block ordinal and exact
+extent, independent of the candidate set or transport batch. Readers probe those
+pages before planning transport, authenticate the entire coalesced response before
+publishing any page, and never retain candidate-specific combined routing ranges.
+Overlapping candidate sets therefore reuse already-fetched pages.
 Parallel range payloads use a thread-safe allocator and transfer ownership
 explicitly, independently of the allocator owning returned scores or per-request
 routing arrays.
@@ -723,6 +731,18 @@ reclaimed-attempt replacement stay deterministic. Serverless is unreleased and
 accepts no compatibility readers for discarded graph-metric prototypes;
 native in-flight attempt changes still require an explicit rolling-upgrade
 bridge.
+
+Native durable cross-job topology reuse remains a benchmark-gated follow-up, not
+an implicit extension of the compute-family sharing above. Measure repeated
+compatible metric jobs against the current job-scoped packed topology, including
+cold/warm wall time, edge-scan bytes, topology bytes written, peak RSS, and cleanup
+cost at representative graph sizes. A shared artifact must identify the exact
+edge generation, filter, orientation, and ordinal/layout version; publish only
+complete immutable data; and acquire durable job pins atomically with attachment.
+Concurrent builders, failed publication, restart recovery, and last-pin garbage
+collection need fault-injection coverage before replacing job-scoped ownership.
+Sharing ordinal arrays by metric configuration alone is not safe. No durable
+cross-job cache or measured speedup is claimed by this PR.
 
 ## Query Integration
 

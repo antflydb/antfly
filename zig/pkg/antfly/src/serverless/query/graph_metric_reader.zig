@@ -175,7 +175,7 @@ const ScoreFetchWindow = struct {
     }
 };
 // Default used by isolated planner tests. Production derives this from the
-// column's whole-request share after reserving control and routing reads.
+// whole query's remaining budget after preparing every column's routing.
 const max_score_range_requests: usize = 60;
 const max_top_score_range_requests: usize = 64;
 const max_parallel_metric_range_requests: usize = 8;
@@ -236,28 +236,31 @@ fn pointScoresResultAlloc(
     };
 }
 
+const ColumnPass = enum { prepare, execute };
+
 fn scoreColumnWorker(
     child: *runtime_mod.QuerySession,
     graph_index_name: []const u8,
     metric_name: []const u8,
     node_ids: []const []const u8,
     scores: []?f64,
-    output: *?PointScoresMetadata,
+    plan: *?PointScorePlan,
+    pass: ColumnPass,
     failure: *?anyerror,
     cancel_siblings: *std.atomic.Value(bool),
 ) void {
-    output.* = scoresInto(
-        std.heap.smp_allocator,
-        child,
-        graph_index_name,
-        metric_name,
-        node_ids,
-        scores,
-    ) catch |err| {
-        failure.* = err;
-        cancel_siblings.store(true, .release);
-        return;
-    };
+    if (pass == .prepare) {
+        plan.* = preparePointScoresAlloc(std.heap.smp_allocator, child, graph_index_name, metric_name, node_ids, scores) catch |err| {
+            failure.* = err;
+            cancel_siblings.store(true, .release);
+            return;
+        };
+    } else {
+        executePointScores(child, &plan.*.?, node_ids, scores) catch |err| {
+            failure.* = err;
+            cancel_siblings.store(true, .release);
+        };
+    }
 }
 
 const CombinedColumnCancellation = struct {
@@ -288,109 +291,61 @@ pub fn scoreColumnsAlloc(
     metric_names: []const []const u8,
     node_ids: []const []const u8,
 ) !PointScoreColumnsResult {
-    if (metric_names.len > max_point_score_columns) return error.GraphMetricQueryBudgetExceeded;
+    if (metric_names.len > max_point_score_columns or node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     if (metric_names.len == 0) return .{ .columns = try alloc.alloc(PointScoresResult, 0) };
-    // Parse request-owned configuration before forking: QuerySession's lazy
-    // cache is deliberately not synchronized, while the parsed slice is
-    // immutable and safe for child sessions to borrow.
     _ = try session.graphMetricSpecs();
-    const column_allowance = session.graphMetricRangeAllowance() / metric_names.len;
-
     const columns = try alloc.alloc(PointScoresResult, metric_names.len);
     var initialized_columns: usize = 0;
     errdefer {
         for (columns[0..initialized_columns]) |*column| column.deinit(alloc);
         alloc.free(columns);
     }
-    if (session.io == null) {
-        for (metric_names, 0..) |metric_name, index| {
-            var child = session.forkGraphMetricRead(alloc);
-            defer child.deinit();
-            child.graph_metric_range_allowance = column_allowance;
-            child.setDiagnostics(session.diagnostics);
-            columns[index] = try scoresAlloc(alloc, &child, graph_index_name, metric_name, node_ids);
-            initialized_columns += 1;
-        }
-        return .{ .columns = columns };
-    }
+    var plans: [max_point_score_columns]?PointScorePlan = @splat(null);
+    defer for (plans[0..metric_names.len]) |*plan| if (plan.*) |*value| value.deinit();
+    var buffers: [max_point_score_columns]?[]?f64 = @splat(null);
+    defer for (buffers[0..metric_names.len]) |buffer| if (buffer) |value| alloc.free(value);
+    for (buffers[0..metric_names.len]) |*buffer| buffer.* = try alloc.alloc(?f64, node_ids.len);
 
-    var start: usize = 0;
-    while (start < metric_names.len) {
-        const end = @min(start + max_parallel_point_score_columns, metric_names.len);
-        const count = end - start;
-        var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
-        var child_diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
-        var score_buffers: [max_parallel_point_score_columns]?[]?f64 = @splat(null);
-        var temporary: [max_parallel_point_score_columns]?PointScoresMetadata = @splat(null);
-        var failures: [max_parallel_point_score_columns]?anyerror = @splat(null);
-        var sibling_failure = std.atomic.Value(bool).init(false);
-        var combined_cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
-        defer for (score_buffers[0..count]) |maybe_scores| if (maybe_scores) |scores| alloc.free(scores);
-
-        // Complete every fallible preparation step before the first worker is
-        // scheduled. Once group.async has observed the stack-backed child
-        // state, returning before group.await would let error cleanup release
-        // result buffers while a worker can still write through them.
-        for (0..count) |relative_index| {
-            score_buffers[relative_index] = try alloc.alloc(?f64, node_ids.len);
-        }
-
-        const io = session.io.?;
-        var group: std.Io.Group = .init;
-        for (metric_names[start..end], 0..) |metric_name, relative_index| {
-            children[relative_index] = session.forkGraphMetricRead(std.heap.smp_allocator);
-            children[relative_index].graph_metric_range_allowance = column_allowance;
-            combined_cancellations[relative_index] = .{
-                .parent = session.cancellation,
-                .sibling_failure = &sibling_failure,
+    for ([_]ColumnPass{ .prepare, .execute }) |pass| {
+        if (pass == .execute) try admitPointPlans(alloc, session, plans[0..metric_names.len]);
+        var start: usize = 0;
+        while (start < metric_names.len) {
+            const end = @min(start + max_parallel_point_score_columns, metric_names.len);
+            const count = end - start;
+            var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
+            var diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
+            var failures: [max_parallel_point_score_columns]?anyerror = @splat(null);
+            var sibling_failure = std.atomic.Value(bool).init(false);
+            var cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
+            var group: std.Io.Group = .init;
+            // Every fallible allocation happened before launching these workers.
+            for (metric_names[start..end], 0..) |metric_name, i| {
+                children[i] = session.forkGraphMetricRead(std.heap.smp_allocator);
+                cancellations[i] = .{ .parent = session.cancellation, .sibling_failure = &sibling_failure };
+                children[i].cancellation = cancellations[i].token();
+                if (session.diagnostics != null) children[i].setDiagnostics(&diagnostics[i]);
+                const args = .{ &children[i], graph_index_name, metric_name, node_ids, buffers[start + i].?, &plans[start + i], pass, &failures[i], &sibling_failure };
+                if (session.io) |io| group.async(io, scoreColumnWorker, args) else @call(.auto, scoreColumnWorker, args);
+            }
+            const joined = if (session.io) |io| group.await(io) else {};
+            for (children[0..count]) |*child| child.deinit();
+            try joined;
+            for (diagnostics[0..count]) |diagnostic| {
+                const rejection = diagnostic.graph_metric_rejection orelse continue;
+                session.recordGraphMetricRejection(rejection.graphIndexName(), rejection.metricName(), rejection.materializer_fingerprint);
+                break;
+            }
+            for (failures[0..count]) |failure| if (failure) |err| {
+                if (err != error.Canceled) return err;
             };
-            children[relative_index].cancellation = combined_cancellations[relative_index].token();
-            if (session.diagnostics != null) children[relative_index].setDiagnostics(&child_diagnostics[relative_index]);
-            group.async(io, scoreColumnWorker, .{
-                &children[relative_index],
-                graph_index_name,
-                metric_name,
-                node_ids,
-                score_buffers[relative_index].?,
-                &temporary[relative_index],
-                &failures[relative_index],
-                &sibling_failure,
-            });
+            for (failures[0..count]) |failure| if (failure) |err| return err;
+            start = end;
         }
-        const await_result = group.await(io);
-        for (children[0..count]) |*child| child.deinit();
-        try await_result;
-        for (child_diagnostics[0..count]) |diagnostics| {
-            const rejection = diagnostics.graph_metric_rejection orelse continue;
-            session.recordGraphMetricRejection(
-                rejection.graphIndexName(),
-                rejection.metricName(),
-                rejection.materializer_fingerprint,
-            );
-            break;
-        }
-        // A sibling may observe the local cancellation before the originating
-        // failure is joined. Preserve the actionable root cause instead of
-        // returning that derived cancellation based on array order.
-        for (failures[0..count]) |failure| if (failure) |err| {
-            if (err != error.Canceled) return err;
-        };
-        for (failures[0..count]) |failure| if (failure) |err| return err;
-
-        for (temporary[0..count], 0..) |maybe_metadata, relative_index| {
-            const metadata = maybe_metadata orelse return error.InvalidGraphMetricSegment;
-            columns[start + relative_index] = try pointScoresResultAlloc(
-                alloc,
-                session,
-                graph_index_name,
-                metric_names[start + relative_index],
-                score_buffers[relative_index].?,
-                metadata,
-            );
-            initialized_columns += 1;
-            score_buffers[relative_index] = null;
-        }
-        start = end;
+    }
+    for (metric_names, 0..) |name, i| {
+        columns[i] = try pointScoresResultAlloc(alloc, session, graph_index_name, name, buffers[i].?, plans[i].?.metadata);
+        initialized_columns += 1;
+        buffers[i] = null;
     }
     return .{ .columns = columns };
 }
@@ -410,19 +365,60 @@ pub fn scoresAlloc(
     return try pointScoresResultAlloc(alloc, session, graph_index_name, metric_name, values, metadata);
 }
 
-/// Resolves scores directly into caller-owned storage. Parallel column reads
-/// allocate their final buffers once on the request allocator while workers
-/// use a thread-safe allocator only for transient I/O and decode state.
-fn scoresInto(
+const PendingNode = struct {
+    block_index: usize,
+    node_index: usize,
+
+    fn lessThan(_: void, left: @This(), right: @This()) bool {
+        return left.block_index < right.block_index or
+            (left.block_index == right.block_index and left.node_index < right.node_index);
+    }
+};
+const TouchedBlock = struct {
+    block_index: usize,
+    first_pending: usize,
+    pending_count: usize,
+};
+
+const PointScorePlan = struct {
+    alloc: Allocator,
+    range_alloc: Allocator,
+    metadata: PointScoresMetadata,
+    metric_index: usize,
+    score_count: usize,
+    score_data_offset: u64,
+    point_routing: ?PointRouting = null,
+    pending_nodes: []PendingNode = &.{},
+    touched_blocks: []TouchedBlock = &.{},
+    ranges: []ScoreFetchRange = &.{},
+
+    fn deinit(self: *@This()) void {
+        if (self.point_routing) |*routing| routing.deinit();
+        self.alloc.free(self.pending_nodes);
+        self.alloc.free(self.touched_blocks);
+        self.range_alloc.free(self.ranges);
+    }
+};
+
+/// Resolves scores directly into caller-owned storage using the same admission
+/// and execution phases as a multi-column query.
+fn scoresInto(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_ids: []const []const u8, values: []?f64) !PointScoresMetadata {
+    var plans = [_]?PointScorePlan{try preparePointScoresAlloc(alloc, session, graph_index_name, metric_name, node_ids, values)};
+    defer plans[0].?.deinit();
+    try admitPointPlans(alloc, session, &plans);
+    try executePointScores(session, &plans[0].?, node_ids, values);
+    return plans[0].?.metadata;
+}
+
+fn preparePointScoresAlloc(
     alloc: Allocator,
     session: *runtime_mod.QuerySession,
     graph_index_name: []const u8,
     metric_name: []const u8,
     node_ids: []const []const u8,
     values: []?f64,
-) !PointScoresMetadata {
+) !PointScorePlan {
     try session.checkCancellation();
-    const range_allowance = std.math.cast(usize, session.graphMetricRangeAllowance()) orelse std.math.maxInt(usize);
     if (values.len != node_ids.len) return error.InvalidGraphMetricSegment;
     if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     const retained_score_bytes = std.math.mul(usize, node_ids.len, @sizeOf(?f64)) catch return error.GraphMetricQueryBudgetExceeded;
@@ -455,28 +451,24 @@ fn scoresInto(
         recordRejectionDiagnostic(session, graph_index_name, metric_name, control.header.materializer_fingerprint);
         return error.GraphMetricMaterializationRejected;
     }
-    // Status/control is still authenticated for an empty result set, but no
-    // score can be observed. Avoid fetching the routing footer (up to 16 MiB)
-    // merely to return an empty column.
-    if (node_ids.len == 0) {
-        return .{
-            .config_fingerprint = control.header.config_fingerprint,
-            .converged = control.header.converged,
-            .iterations_completed = control.header.iterations_completed,
-            .delta = control.header.delta,
-            .metadata_version = control.header.version,
-            .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
-            .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
-            .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
-        };
-    }
+    const metadata = PointScoresMetadata{
+        .config_fingerprint = control.header.config_fingerprint,
+        .converged = control.header.converged,
+        .iterations_completed = control.header.iterations_completed,
+        .delta = control.header.delta,
+        .metadata_version = control.header.version,
+        .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
+        .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
+        .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+    };
+    if (node_ids.len == 0) return .{ .alloc = alloc, .range_alloc = alloc, .metadata = metadata, .metric_index = metric_index, .score_count = control.score_count, .score_data_offset = control.score_data_offset };
 
     const footer_len = try routingFooterLen(metric_artifact, control.header.version);
     const footer_offset = metric_artifact.byte_len - footer_len;
     const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
         @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
-    var point_routing = try loadPointRouting(alloc, session, metric_index, metric_artifact, control, footer_offset, expected_blocks, node_ids, range_allowance);
-    defer point_routing.deinit();
+    var point_routing = try loadPointRouting(alloc, session, metric_index, metric_artifact, control, footer_offset, expected_blocks, node_ids);
+    errdefer point_routing.deinit();
     const routing = point_routing.routing;
 
     @memset(values, null);
@@ -484,22 +476,8 @@ fn scoresInto(
     // Keep request planning proportional to requested nodes/touched blocks,
     // rather than allocating and clearing three arrays sized to every block in
     // the artifact for a one-node lookup.
-    const PendingNode = struct {
-        block_index: usize,
-        node_index: usize,
-
-        fn lessThan(_: void, left: @This(), right: @This()) bool {
-            return left.block_index < right.block_index or
-                (left.block_index == right.block_index and left.node_index < right.node_index);
-        }
-    };
-    const TouchedBlock = struct {
-        block_index: usize,
-        first_pending: usize,
-        pending_count: usize,
-    };
     var pending_nodes = std.ArrayListUnmanaged(PendingNode).empty;
-    defer pending_nodes.deinit(alloc);
+    errdefer pending_nodes.deinit(alloc);
     try pending_nodes.ensureTotalCapacity(alloc, node_ids.len);
     for (node_ids, 0..) |node_id, node_index| {
         const block_index = routing.findIndex(node_id) orelse continue;
@@ -507,7 +485,7 @@ fn scoresInto(
     }
     std.mem.sort(PendingNode, pending_nodes.items, {}, PendingNode.lessThan);
     var touched_blocks = std.ArrayListUnmanaged(TouchedBlock).empty;
-    defer touched_blocks.deinit(alloc);
+    errdefer touched_blocks.deinit(alloc);
     var pending_start: usize = 0;
     while (pending_start < pending_nodes.items.len) {
         const block_index = pending_nodes.items[pending_start].block_index;
@@ -521,8 +499,18 @@ fn scoresInto(
         pending_start = pending_end;
     }
 
-    const fetch_ranges = try planSparseScoreFetchRangesAlloc(alloc, routing.entries, touched_blocks.items, control.score_data_offset, point_routing.score_range_allowance);
-    defer alloc.free(fetch_ranges);
+    const pending = try pending_nodes.toOwnedSlice(alloc);
+    errdefer alloc.free(pending);
+    const touched = try touched_blocks.toOwnedSlice(alloc);
+    return .{ .alloc = alloc, .range_alloc = alloc, .metadata = metadata, .metric_index = metric_index, .score_count = control.score_count, .score_data_offset = control.score_data_offset, .point_routing = point_routing, .pending_nodes = pending, .touched_blocks = touched };
+}
+
+fn executePointScores(session: *runtime_mod.QuerySession, plan: *const PointScorePlan, node_ids: []const []const u8, values: []?f64) !void {
+    const point_routing = plan.point_routing orelse return;
+    const routing = point_routing.routing;
+    const alloc = plan.alloc;
+    const metric_index = plan.metric_index;
+    const fetch_ranges = plan.ranges;
     var fetch_start: usize = 0;
     while (fetch_start < fetch_ranges.len) {
         const fetch_end = metricRangeBatchEnd(fetch_ranges, fetch_start);
@@ -531,22 +519,22 @@ fn scoresInto(
             alloc,
             session,
             metric_index,
-            control.header.version,
+            plan.metadata.metadata_version,
             routing.entries,
             range_batch,
-            .score,
+            .reserved_score,
         );
         defer fetched_ranges.deinit(alloc);
 
         for (range_batch, fetched_ranges.payloads) |range, payload| {
             try session.checkCancellation();
-            var touched_index = std.sort.lowerBound(TouchedBlock, touched_blocks.items, range.first_block, struct {
+            var touched_index = std.sort.lowerBound(TouchedBlock, plan.touched_blocks, range.first_block, struct {
                 fn order(block_index: usize, touched: TouchedBlock) std.math.Order {
                     return std.math.order(block_index, touched.block_index);
                 }
             }.order);
-            while (touched_index < touched_blocks.items.len and touched_blocks.items[touched_index].block_index <= range.last_block) : (touched_index += 1) {
-                const touched = touched_blocks.items[touched_index];
+            while (touched_index < plan.touched_blocks.len and plan.touched_blocks[touched_index].block_index <= range.last_block) : (touched_index += 1) {
+                const touched = plan.touched_blocks[touched_index];
                 const block_index = touched.block_index;
                 const entry = routing.entries[block_index];
                 if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;
@@ -554,14 +542,14 @@ fn scoresInto(
                 const relative_end = std.math.add(usize, relative_offset, entry.len) catch return error.InvalidGraphMetricSegment;
                 if (relative_end > payload.len) return error.InvalidGraphMetricSegment;
                 const decoded_block = try metric_segment.decodeScoreBlockWithCancellation(payload[relative_offset..relative_end], session.cancellation);
-                const expected_score_count = @min(metric_segment.score_block_entries, @as(usize, control.score_count) - entry.block_index * metric_segment.score_block_entries);
+                const expected_score_count = @min(metric_segment.score_block_entries, @as(usize, plan.score_count) - entry.block_index * metric_segment.score_block_entries);
                 try session.chargeGraphMetricDecode(1, expected_score_count);
                 if (decoded_block.len != expected_score_count or
                     !decoded_block.scores[0].eqlNode(decoded_block.node_prefix, entry.first_node_id))
                 {
                     return error.InvalidGraphMetricSegment;
                 }
-                for (pending_nodes.items[touched.first_pending..][0..touched.pending_count]) |pending| {
+                for (plan.pending_nodes[touched.first_pending..][0..touched.pending_count]) |pending| {
                     const node_index = pending.node_index;
                     values[node_index] = decoded_block.score(node_ids[node_index]);
                 }
@@ -569,16 +557,47 @@ fn scoresInto(
         }
         fetch_start = fetch_end;
     }
-    return .{
-        .config_fingerprint = control.header.config_fingerprint,
-        .converged = control.header.converged,
-        .iterations_completed = control.header.iterations_completed,
-        .delta = control.header.delta,
-        .metadata_version = control.header.version,
-        .published_generation = if (metric_artifact.published_generation != 0) metric_artifact.published_generation else session.manifest.version,
-        .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
-        .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
+}
+
+fn admitPointPlans(alloc: Allocator, session: *runtime_mod.QuerySession, plans: []?PointScorePlan) !void {
+    const allowance = std.math.cast(usize, session.graphMetricRangeAllowance()) orelse std.math.maxInt(usize);
+    var requests: usize = 0;
+    for (plans) |*maybe_plan| {
+        const plan = &maybe_plan.*.?;
+        plan.range_alloc = alloc;
+        const routing = plan.point_routing orelse continue;
+        plan.ranges = try planSparseScoreFetchRangesAlloc(alloc, routing.routing.entries, plan.touched_blocks, plan.score_data_offset, std.math.maxInt(usize));
+        requests = std.math.add(usize, requests, plan.ranges.len) catch return error.GraphMetricQueryBudgetExceeded;
+    }
+    if (requests > allowance) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const inputs = try temp.alloc(RangePlanningColumn, plans.len);
+        for (plans, inputs) |*maybe_plan, *input| {
+            const plan = &maybe_plan.*.?;
+            const entries = if (plan.point_routing) |routing| routing.routing.entries else &.{};
+            const counts = try temp.alloc(usize, entries.len);
+            @memset(counts, 0);
+            for (plan.touched_blocks) |block| counts[block.block_index] = block.pending_count;
+            input.* = .{ .entries = entries, .counts = counts, .score_data_offset = plan.score_data_offset };
+        }
+        const ranges = try planScoreColumnsRangesAlloc(alloc, inputs, allowance);
+        defer alloc.free(ranges);
+        for (plans, ranges) |*maybe_plan, planned| {
+            const plan = &maybe_plan.*.?;
+            alloc.free(plan.ranges);
+            plan.ranges = planned;
+        }
+    }
+    requests = 0;
+    var bytes: usize = 0;
+    for (plans) |maybe_plan| for (maybe_plan.?.ranges) |range| {
+        requests = std.math.add(usize, requests, 1) catch return error.GraphMetricQueryBudgetExceeded;
+        bytes = std.math.add(usize, bytes, range.len) catch return error.GraphMetricQueryBudgetExceeded;
     };
+    // Reserve the complete score plan atomically before any score I/O starts.
+    try session.reserveGraphMetricRanges(requests, bytes);
 }
 
 fn planSparseScoreFetchRangesAlloc(
@@ -617,33 +636,21 @@ fn planSparseScoreFetchRangesAlloc(
     return try planScoreFetchRangesAlloc(alloc, entries, block_counts, score_data_offset, request_limit);
 }
 
-fn planScoreFetchRangesAlloc(
-    alloc: Allocator,
+const RangePlanningColumn = struct {
     entries: []const metric_segment.codec.RoutingEntry,
-    block_counts: []const usize,
+    counts: []const usize,
     score_data_offset: u64,
-    request_limit: usize,
-) ![]ScoreFetchRange {
-    if (entries.len != block_counts.len) return error.InvalidGraphMetricSegment;
-    var ranges = std.ArrayListUnmanaged(ScoreFetchRange).empty;
-    errdefer ranges.deinit(alloc);
-    var touched_blocks: usize = 0;
-    for (block_counts) |count| touched_blocks += @intFromBool(count != 0);
-    if (touched_blocks <= request_limit) {
-        for (entries, block_counts, 0..) |entry, count, block_index| {
-            if (count == 0) continue;
-            try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
-        }
-        return try ranges.toOwnedSlice(alloc);
-    }
+};
 
-    // Exact blocks are the preferred cache and transfer unit. When the request
-    // count would exceed its per-column share, select only the fixed immutable
-    // windows that buy the most requests for the least overfetch. This avoids a
-    // count-triggered all-or-nothing jump to 8 MiB reads while preserving cache
-    // identity across candidate sets.
+fn planScoreFetchRangesAlloc(alloc: Allocator, entries: []const metric_segment.codec.RoutingEntry, counts: []const usize, score_data_offset: u64, request_limit: usize) ![]ScoreFetchRange {
+    const columns = try planScoreColumnsRangesAlloc(alloc, &.{.{ .entries = entries, .counts = counts, .score_data_offset = score_data_offset }}, request_limit);
+    defer alloc.free(columns);
+    return columns[0];
+}
+
+fn scoreFetchWindowsAlloc(alloc: Allocator, entries: []const metric_segment.codec.RoutingEntry, block_counts: []const usize, score_data_offset: u64) ![]ScoreFetchWindow {
     var windows = std.ArrayListUnmanaged(ScoreFetchWindow).empty;
-    defer windows.deinit(alloc);
+    errdefer windows.deinit(alloc);
     var first_block: usize = 0;
     while (first_block < entries.len) {
         const first = entries[first_block];
@@ -684,46 +691,82 @@ fn planScoreFetchRangesAlloc(
         first_block = last_block + 1;
     }
 
-    var planned_requests = touched_blocks;
-    while (planned_requests > request_limit) {
-        var best: ?usize = null;
-        for (windows.items, 0..) |window, index| {
-            if (window.selected or window.savedRequests() == 0) continue;
-            if (best) |best_index| {
-                const current = windows.items[best_index];
-                const left = @as(u128, window.overfetchBytes()) * current.savedRequests();
-                const right = @as(u128, current.overfetchBytes()) * window.savedRequests();
-                if (left > right or (left == right and window.offset >= current.offset)) continue;
-            }
-            best = index;
-        }
-        const selected = best orelse return error.GraphMetricQueryBudgetExceeded;
-        windows.items[selected].selected = true;
-        planned_requests -= windows.items[selected].savedRequests();
-    }
+    return windows.toOwnedSlice(alloc);
+}
 
-    for (windows.items) |window| {
-        if (window.selected) {
-            try ranges.append(alloc, .{
-                .first_block = window.first_block,
-                .last_block = window.last_block,
-                .offset = window.offset,
-                .len = window.len,
-            });
-            continue;
-        }
-        for (entries[window.first_block .. window.last_block + 1], block_counts[window.first_block .. window.last_block + 1], window.first_block..) |entry, count, block_index| {
-            if (count == 0) continue;
-            try ranges.append(alloc, .{
-                .first_block = block_index,
-                .last_block = block_index,
-                .offset = entry.offset,
-                .len = entry.len,
-            });
-        }
+/// Jointly select immutable windows by saved requests per overfetch byte.
+/// Columns have no artificial quota; independent byte/work budgets still apply.
+fn planScoreColumnsRangesAlloc(alloc: Allocator, columns: []const RangePlanningColumn, request_limit: usize) ![][]ScoreFetchRange {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var requests: usize = 0;
+    for (columns) |column| {
+        if (column.entries.len != column.counts.len) return error.InvalidGraphMetricSegment;
+        for (column.counts) |count| requests = std.math.add(usize, requests, @intFromBool(count != 0)) catch return error.GraphMetricQueryBudgetExceeded;
     }
-    if (ranges.items.len > request_limit) return error.GraphMetricQueryBudgetExceeded;
-    return try ranges.toOwnedSlice(alloc);
+    const windows = try temp.alloc([]ScoreFetchWindow, columns.len);
+    const Choice = struct {
+        column: usize,
+        window: usize,
+        saved: usize,
+        overfetch: usize,
+        offset: u64,
+        fn lessThan(_: void, a: @This(), b: @This()) bool {
+            const left = @as(u128, a.overfetch) * b.saved;
+            const right = @as(u128, b.overfetch) * a.saved;
+            if (left != right) return left < right;
+            return a.column < b.column or (a.column == b.column and a.offset < b.offset);
+        }
+    };
+    var choices = std.ArrayListUnmanaged(Choice).empty;
+    const coalesce = requests > request_limit;
+    if (coalesce) {
+        for (columns, windows, 0..) |column, *column_windows, i| {
+            column_windows.* = try scoreFetchWindowsAlloc(temp, column.entries, column.counts, column.score_data_offset);
+            for (column_windows.*, 0..) |window, j| {
+                if (window.savedRequests() == 0) continue;
+                try choices.append(temp, .{ .column = i, .window = j, .saved = window.savedRequests(), .overfetch = window.overfetchBytes(), .offset = window.offset });
+            }
+        }
+        std.mem.sort(Choice, choices.items, {}, Choice.lessThan);
+        for (choices.items) |choice| {
+            if (requests <= request_limit) break;
+            windows[choice.column][choice.window].selected = true;
+            requests -= choice.saved;
+        }
+        if (requests > request_limit) return error.GraphMetricQueryBudgetExceeded;
+    }
+    const results = try alloc.alloc([]ScoreFetchRange, columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |ranges| alloc.free(ranges);
+        alloc.free(results);
+    }
+    for (columns, 0..) |column, i| {
+        var ranges = std.ArrayListUnmanaged(ScoreFetchRange).empty;
+        errdefer ranges.deinit(alloc);
+        if (coalesce) {
+            for (windows[i]) |window| {
+                if (window.selected) {
+                    try ranges.append(alloc, .{ .first_block = window.first_block, .last_block = window.last_block, .offset = window.offset, .len = window.len });
+                } else {
+                    for (window.first_block..window.last_block + 1) |j| {
+                        if (column.counts[j] == 0) continue;
+                        const entry = column.entries[j];
+                        try ranges.append(alloc, .{ .first_block = j, .last_block = j, .offset = entry.offset, .len = entry.len });
+                    }
+                }
+            }
+        } else {
+            for (column.entries, column.counts, 0..) |entry, count, j| {
+                if (count != 0) try ranges.append(alloc, .{ .first_block = j, .last_block = j, .offset = entry.offset, .len = entry.len });
+            }
+        }
+        results[i] = try ranges.toOwnedSlice(alloc);
+        initialized += 1;
+    }
+    return results;
 }
 
 fn fetchControlAlloc(
@@ -800,7 +843,6 @@ const PointRouting = struct {
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     routing: metric_segment.codec.RoutingIndex,
     lease: ?routing_cache.Lease = null,
-    score_range_allowance: usize,
 
     fn deinit(self: *@This()) void {
         if (self.lease) |*lease| lease.deinit() else self.routing.deinit(self.alloc);
@@ -809,7 +851,7 @@ const PointRouting = struct {
     }
 };
 
-fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric_index: usize, artifact: manifest_mod.ArtifactRef, control: metric_segment.codec.Control, footer_offset: u64, block_count: usize, node_ids: []const []const u8, range_allowance: usize) !PointRouting {
+fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric_index: usize, artifact: manifest_mod.ArtifactRef, control: metric_segment.codec.Control, footer_offset: u64, block_count: usize, node_ids: []const []const u8) !PointRouting {
     const codec = metric_segment.codec;
     const root_len = codec.routingRootLen(control.score_count);
     if (root_len > artifact.graph_metric_routing_footer_len) return error.InvalidGraphMetricSegment;
@@ -820,7 +862,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         errdefer lease.deinit();
         const routing = lease.entry.routing;
         if (routing.entries.len != block_count or routing.footer_offset != footer_offset or routing.primary_data_offset != control.score_data_offset) return error.InvalidGraphMetricSegment;
-        return .{ .alloc = alloc, .payload_alloc = session.alloc, .routing = routing, .lease = lease, .score_range_allowance = range_allowance -| 2 };
+        return .{ .alloc = alloc, .payload_alloc = session.alloc, .routing = routing, .lease = lease };
     }
     var root_lease = try acquireRouting(session, metric_index, artifact, control.header.version, artifact.byte_len - root_len, root_len, 40, root_len, true, null);
     defer root_lease.deinit();
@@ -844,6 +886,13 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         if (directory.findIndex(node_id)) |i| try selected.append(alloc, i);
     }
     std.mem.sort(usize, selected.items, {}, std.sort.asc(usize));
+    var selected_count: usize = 0;
+    for (selected.items) |i| {
+        if (selected_count != 0 and selected.items[selected_count - 1] == i) continue;
+        selected.items[selected_count] = i;
+        selected_count += 1;
+    }
+    selected.items = selected.items[0..selected_count];
     var entries = std.ArrayListUnmanaged(codec.RoutingEntry).empty;
     errdefer entries.deinit(alloc);
     const payload_alloc = std.heap.smp_allocator;
@@ -852,34 +901,62 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         for (payloads.items) |payload| payload_alloc.free(payload);
         payloads.deinit(alloc);
     }
-    const ranges = try planRoutingPageRangesAlloc(alloc, directory.entries, selected.items);
+    // Cache units are authenticated pages, independent of transport grouping.
+    // Keep scratch state proportional to selected pages, not the full index.
+    try session.chargeGraphMetricRetained(std.math.mul(usize, selected.items.len, @sizeOf(?[]const u8)) catch return error.GraphMetricQueryBudgetExceeded);
+    const page_views = try alloc.alloc(?[]const u8, selected.items.len);
+    defer alloc.free(page_views);
+    @memset(page_views, null);
+    var misses = std.ArrayListUnmanaged(usize).empty;
+    defer misses.deinit(alloc);
+    for (selected.items, 0..) |i, view_index| {
+        const page = directory.entries[i];
+        const count = @min(codec.routing_page_entries, block_count - page.block_index);
+        try session.chargeGraphMetricDecode(1, count);
+        try session.chargeGraphMetricRetained(page.len + count * @sizeOf(codec.RoutingEntry) * 3 + 2 * @sizeOf([]u8));
+        var id_buf: [64]u8 = undefined;
+        const id = try metricBlockId(&id_buf, .routing, page.block_index);
+        if (try session.readCachedAuthenticatedBlockAlloc(payload_alloc, metric_index, id, page.offset, page.len, &page.checksum)) |bytes| {
+            payloads.append(alloc, bytes) catch |err| {
+                payload_alloc.free(bytes);
+                return err;
+            };
+            page_views[view_index] = bytes;
+        } else try misses.append(alloc, i);
+    }
+    const ranges = try planRoutingPageRangesAlloc(alloc, directory.entries, misses.items);
     defer alloc.free(ranges);
-    const routing_allowance = range_allowance -| 3;
-    if (ranges.len > routing_allowance or (ranges.len != 0 and ranges.len == routing_allowance)) return error.GraphMetricQueryBudgetExceeded;
     var start: usize = 0;
     while (start < ranges.len) {
         const end = metricRangeBatchEnd(ranges, start);
-        for (ranges[start..end]) |range| {
-            const count = @min(block_count, directory.entries[range.last_block].block_index + codec.routing_page_entries) - directory.entries[range.first_block].block_index;
-            try session.chargeGraphMetricDecode(range.last_block - range.first_block + 1, count);
-            try session.chargeGraphMetricRetained(range.len + count * @sizeOf(codec.RoutingEntry) * 3 + 2 * @sizeOf([]u8));
-        }
         var fetched = try fetchMetricRangeBatchAlloc(alloc, session, metric_index, control.header.version, directory.entries, ranges[start..end], .routing);
         defer fetched.deinit(alloc);
         for (ranges[start..end], fetched.payloads) |range, *payload| {
             try payloads.append(alloc, payload.*);
             const bytes = payload.*;
             payload.* = @constCast((&[_]u8{})[0..]);
+            const first_view = std.sort.lowerBound(usize, selected.items, range.first_block, struct {
+                fn order(needle: usize, item: usize) std.math.Order {
+                    return std.math.order(needle, item);
+                }
+            }.order);
             for (range.first_block..range.last_block + 1) |i| {
                 const page = directory.entries[i];
                 const offset: usize = @intCast(page.offset - range.offset);
-                const decoded = try codec.decodePointPageAlloc(alloc, bytes[offset..][0..page.len], page, block_count, root.primary_data_offset, root.primary_data_end, session.cancellation);
-                defer alloc.free(decoded);
-                if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
-                try entries.appendSlice(alloc, decoded);
+                const view_index = first_view + i - range.first_block;
+                std.debug.assert(selected.items[view_index] == i);
+                page_views[view_index] = bytes[offset..][0..page.len];
             }
         }
         start = end;
+    }
+    for (selected.items, 0..) |i, view_index| {
+        const page = directory.entries[i];
+        const bytes = page_views[view_index] orelse return error.InvalidGraphMetricSegment;
+        const decoded = try codec.decodePointPageAlloc(alloc, bytes, page, block_count, root.primary_data_offset, root.primary_data_end, session.cancellation);
+        defer alloc.free(decoded);
+        if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
+        try entries.appendSlice(alloc, decoded);
     }
     const owned_entries = try entries.toOwnedSlice(alloc);
     errdefer alloc.free(owned_entries);
@@ -887,7 +964,6 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         .alloc = alloc,
         .payload_alloc = payload_alloc,
         .payloads = payloads,
-        .score_range_allowance = routing_allowance - ranges.len,
         .routing = .{
             .entries = owned_entries,
             .ranked_entries = try alloc.alloc(codec.RankedRoutingEntry, 0),
@@ -1044,7 +1120,11 @@ fn acquireRouting(
     return .{ .entry = entry };
 }
 
-const MetricRangeKind = enum { score, routing };
+const MetricRangeKind = enum { score, reserved_score, routing };
+
+fn metricBlockId(buf: []u8, kind: MetricRangeKind, block_index: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "graph-metric-{s}-{d}-exact", .{ if (kind == .routing) "routing" else "score", block_index });
+}
 
 fn fetchMetricRangeAlloc(
     alloc: Allocator,
@@ -1055,14 +1135,14 @@ fn fetchMetricRangeAlloc(
     range: ScoreFetchRange,
     kind: MetricRangeKind,
 ) ![]u8 {
-    try session.chargeGraphMetricRange(range.len);
+    if (kind != .reserved_score) try session.chargeGraphMetricRange(range.len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
     if (range.first_block > range.last_block or range.last_block >= entries.len) return error.InvalidGraphMetricSegment;
     if (range.first_block == range.last_block) {
         const entry = entries[range.first_block];
         if (entry.offset != range.offset or entry.len != range.len) return error.InvalidGraphMetricSegment;
         var block_id_buf: [64]u8 = undefined;
-        const block_id = std.fmt.bufPrint(&block_id_buf, "graph-metric-{s}-{d}-exact", .{ @tagName(kind), entry.block_index }) catch
+        const block_id = metricBlockId(&block_id_buf, kind, entry.block_index) catch
             return error.InvalidGraphMetricSegment;
         return session.fetchArtifactAuthenticatedBlockAlloc(
             metric_index,
@@ -1090,6 +1170,20 @@ fn fetchMetricRangeAlloc(
         covered = std.math.add(usize, covered, entry.len) catch return error.InvalidGraphMetricSegment;
     }
     if (covered != range.len) return error.InvalidGraphMetricSegment;
+    if (kind == .routing) {
+        const bytes = session.fetchArtifactAuthenticatedRangeUncachedAlloc(metric_index, range.offset, range.len, subranges) catch |err| switch (err) {
+            error.ArtifactIntegrityMismatch => return error.InvalidGraphMetricSegment,
+            else => return err,
+        };
+        errdefer session.alloc.free(bytes);
+        // The entire response is authenticated before publishing any page.
+        for (entries[range.first_block .. range.last_block + 1], subranges) |entry, subrange| {
+            var id_buf: [64]u8 = undefined;
+            const id = try metricBlockId(&id_buf, .routing, entry.block_index);
+            try session.cacheAuthenticatedBlock(metric_index, id, entry.offset, bytes[subrange.relative_offset..][0..entry.len], &entry.checksum);
+        }
+        return bytes;
+    }
     return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, range.offset, range.len, subranges) catch |err| switch (err) {
         error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
         else => |other| other,
@@ -1510,6 +1604,64 @@ test "serverless graph metric routing batches coalesce selected pages within byt
     try std.testing.expectError(error.InvalidGraphMetricSegment, planRoutingPageRangesAlloc(alloc, &entries, &.{0}));
 }
 
+test "serverless graph metric joint admission gives uneven columns their actual request costs" {
+    const alloc = std.testing.allocator;
+    var heavy: [8]metric_segment.codec.RoutingEntry = undefined;
+    for (&heavy, 0..) |*entry, i| entry.* = .{ .first_node_id = "node", .block_index = i * 128, .offset = i * 16 * 1024 * 1024, .len = 1024 };
+    const counts: [8]usize = @splat(1);
+    var inputs: [8]RangePlanningColumn = undefined;
+    inputs[0] = .{ .entries = &heavy, .counts = &counts, .score_data_offset = 0 };
+    for (inputs[1..]) |*input| input.* = .{ .entries = heavy[0..1], .counts = counts[0..1], .score_data_offset = 0 };
+    // Metadata/routing cost 25, scores cost 15: forty requests total.
+    // No column quota may reject the eight disconnected exact score ranges.
+    const ranges = try planScoreColumnsRangesAlloc(alloc, &inputs, 15);
+    defer {
+        for (ranges) |column| alloc.free(column);
+        alloc.free(ranges);
+    }
+    try std.testing.expectEqual(@as(usize, 8), ranges[0].len);
+    for (ranges[1..]) |column| try std.testing.expectEqual(@as(usize, 1), column.len);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, planScoreColumnsRangesAlloc(alloc, &inputs, 14));
+    const Runner = struct {
+        fn run(a: Allocator, columns: []const RangePlanningColumn) !void {
+            const result = try planScoreColumnsRangesAlloc(a, columns, 15);
+            defer a.free(result);
+            for (result) |column| a.free(column);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
+}
+
+test "serverless graph metric joint coalescing spends overfetch only where it saves most" {
+    const alloc = std.testing.allocator;
+    var expensive: [4]metric_segment.codec.RoutingEntry = undefined;
+    var cheap: [4]metric_segment.codec.RoutingEntry = undefined;
+    for (&expensive, &cheap, 0..) |*large, *small, i| {
+        large.* = .{ .first_node_id = "node", .offset = i * 1024 * 1024, .len = 1024 * 1024 };
+        small.* = .{ .first_node_id = "node", .offset = i * 1024, .len = 1024 };
+    }
+    const inputs = [_]RangePlanningColumn{
+        .{ .entries = &expensive, .counts = &.{ 1, 0, 0, 1 }, .score_data_offset = 0 },
+        .{ .entries = &cheap, .counts = &.{ 1, 1, 1, 1 }, .score_data_offset = 0 },
+    };
+    const ranges = try planScoreColumnsRangesAlloc(alloc, &inputs, 3);
+    defer {
+        for (ranges) |column| alloc.free(column);
+        alloc.free(ranges);
+    }
+    try std.testing.expectEqual(@as(usize, 2), ranges[0].len);
+    try std.testing.expectEqual(@as(usize, 1), ranges[1].len);
+    try std.testing.expectEqual(@as(usize, 4096), ranges[1][0].len);
+    const Runner = struct {
+        fn run(a: Allocator, columns: []const RangePlanningColumn) !void {
+            const result = try planScoreColumnsRangesAlloc(a, columns, 3);
+            defer a.free(result);
+            for (result) |column| a.free(column);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
+}
+
 test "serverless graph metric range planning caps broad point batches" {
     const alloc = std.testing.allocator;
     var entries: [128]metric_segment.codec.RoutingEntry = undefined;
@@ -1753,6 +1905,8 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         footer_offset: usize,
         root_offset: usize,
         range_calls: std.atomic.Value(usize) = .init(0),
+        control_calls: std.atomic.Value(usize) = .init(0),
+        required_controls_before_scores: usize = 0,
         verify_calls: std.atomic.Value(usize) = .init(0),
         corrupt_score_reads: bool = false,
         reject_point_index_reads: bool = false,
@@ -1773,6 +1927,9 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
             const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
             if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
             const touches_point_index = start < self.root_offset and start + len > self.footer_offset;
+            if (start == 0) _ = self.control_calls.fetchAdd(1, .monotonic);
+            if (start >= self.control_len and start < self.footer_offset and
+                self.control_calls.load(.monotonic) < self.required_controls_before_scores) return error.ScoreReadBeforeWholeQueryPrepared;
             if (self.reject_point_index_reads and touches_point_index) return error.UnexpectedPointIndexRead;
             const out = try result_alloc.dupe(u8, self.payload[start..][0..len]);
             if (self.corrupt_point_index and touches_point_index) out[@max(start, self.footer_offset) - start] ^= 1;
@@ -1899,10 +2056,26 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         session.graph_metric_read_budget = .{};
     }
     const column_names = [_][]const u8{ "rank", "rank", "rank" };
+    state.control_calls.store(0, .monotonic);
+    state.required_controls_before_scores = column_names.len;
     var columns = try scoreColumnsAlloc(alloc, &session, "graph_idx", &column_names, &node_ids);
+    state.required_controls_before_scores = 0;
     defer columns.deinit(alloc);
     try std.testing.expectEqual(@as(usize, column_names.len), columns.columns.len);
     for (columns.columns) |column| try std.testing.expectEqual(@as(?f64, last_value), column.scores[0]);
+
+    // All routing fits, but the complete score plan does not. Admission must
+    // reject before any column starts score I/O, including earlier cohorts.
+    const metadata_requests: u64 = column_names.len * @as(u64, if (paged) 4 else 2);
+    session.graph_metric_read_budget = .{ .limits = .{ .max_range_requests = metadata_requests } };
+    state.range_calls.store(0, .monotonic);
+    state.control_calls.store(0, .monotonic);
+    state.required_controls_before_scores = column_names.len;
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, scoreColumnsAlloc(alloc, &session, "graph_idx", &column_names, &node_ids));
+    state.required_controls_before_scores = 0;
+    try std.testing.expectEqual(column_names.len, state.control_calls.load(.monotonic));
+    try std.testing.expectEqual(metadata_requests, state.range_calls.load(.monotonic));
+    session.graph_metric_read_budget = .{};
 
     const AllocationRunner = struct {
         fn run(failing_alloc: Allocator, active_session: *runtime_mod.QuerySession, lookup_id: []const u8) !void {
@@ -1998,6 +2171,25 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     try std.testing.expectEqual(@as(?f64, last_value), second_cached.scores[0]);
     try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), cache.graph_metric_routing.hits);
     try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), session.graph_metric_read_budget.decoded_blocks);
+    if (paged) {
+        session.graph_metric_read_budget = .{};
+        state.range_calls.store(0, .monotonic);
+        const adjacent = [_][]const u8{ metric.scores[0].node_id, metric.scores[64 * metric_segment.score_block_entries].node_id };
+        var pair = try scoresAlloc(alloc, &session, "graph_idx", "rank", &adjacent);
+        defer pair.deinit(alloc);
+        // One coalesced routing miss plus two exact score misses.
+        try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
+        session.graph_metric_read_budget = .{};
+        state.range_calls.store(0, .monotonic);
+        const overlap = [_][]const u8{ adjacent[1], last_id };
+        var overlapping = try scoresAlloc(alloc, &session, "graph_idx", "rank", &overlap);
+        defer overlapping.deinit(alloc);
+        try std.testing.expectEqualSlices(?f64, &.{ @floatFromInt(64 * metric_segment.score_block_entries), last_value }, overlapping.scores);
+        var single = try scoresAlloc(alloc, &session, "graph_idx", "rank", adjacent[1..]);
+        defer single.deinit(alloc);
+        // Coalesced [0,1], overlapping [1,2], and exact [1] share pages.
+        try std.testing.expectEqual(@as(usize, 0), state.range_calls.load(.monotonic));
+    }
 }
 
 test "serverless graph metric ranked blocks reject cross-boundary inversions and duplicates" {
