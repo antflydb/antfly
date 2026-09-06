@@ -434,6 +434,14 @@ publication: an owner may publish intermediate progress before the newest
 accepted delete is applied. Physical topology and coverage bucket counts are
 not generally monotonic, even in the absence of source deletes.
 
+Chunk retirement is reducing work for each vector projection bound to that
+chunk source, even when surviving chunks reuse cached embeddings and emit no
+new vectors. Replay eligibility and delete-key collection use the same source
+scope. Generated projections delete chunk identities; multi-source projections
+delete their configured embedding-artifact identities. Those identities are
+derived from catalog bindings, not from already-deleted artifact rows, and
+unrelated source projections remain untouched.
+
 Distributed publication has two released profiles: v12 for v0.2.0 peers and
 v15 for current admission/restore safety facts. V13 and v14 were development
 artifacts and are rejected rather than negotiated. During rolling upgrades,

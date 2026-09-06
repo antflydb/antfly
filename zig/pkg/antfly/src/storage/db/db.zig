@@ -46705,6 +46705,37 @@ const ManagedIndexBatchApplicability = enum {
     missing_dependency,
 };
 
+fn vectorIndexConsumesChunkKey(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    key: []const u8,
+) bool {
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name, const embedding_names = switch (index_ref.kind) {
+        .dense_vector => blk: {
+            const entry = index_manager.denseIndex(index_ref.name) orelse return false;
+            break :blk .{ entry.chunk_name, entry.embedding_names };
+        },
+        .sparse_vector => blk: {
+            const entry = index_manager.sparseIndex(index_ref.name) orelse return false;
+            break :blk .{ entry.chunk_name, entry.embedding_names };
+        },
+        else => return false,
+    };
+    if (chunk_name) |name| {
+        if (internal_keys.matchesChunkArtifactName(key, name)) return true;
+    }
+    // Multi-source indexes cache only their first source's chunk name. Resolve
+    // the remaining configured producers, without inspecting artifact storage:
+    // the chunk and its embedding rows may already have been deleted.
+    for (embedding_names) |name| {
+        const producer = index_manager.getEnrichment(.embedding, name) orelse continue;
+        if (producer.source_artifact_name.len > 0 and
+            internal_keys.matchesChunkArtifactName(key, producer.source_artifact_name)) return true;
+    }
+    return false;
+}
+
 fn managedIndexDeleteKeyAffectsProjection(
     index_manager: *index_manager_mod.IndexManager,
     index_ref: index_manager_mod.ManagedIndexRef,
@@ -46721,7 +46752,9 @@ fn managedIndexDeleteKeyAffectsProjection(
     // authority; manifests, retry state, and sibling artifacts are no-ops.
     return switch (index_ref.kind) {
         .full_text => index_manager.textIndexAcceptsArtifactKey(index_ref.name, key),
-        .dense_vector, .sparse_vector => batchHasEmbeddingArtifactForManagedIndex(
+        // Chunk retirement removes its logical members even when the surviving
+        // embeddings are cache hits and publish no replacement writes.
+        .dense_vector, .sparse_vector => vectorIndexConsumesChunkKey(index_manager, index_ref, key) or batchHasEmbeddingArtifactForManagedIndex(
             index_manager,
             index_ref,
             &.{key},
@@ -47737,9 +47770,28 @@ fn collectVectorReplayDeleteKeys(
     }
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
+    const embedding_names: []const []const u8 = switch (index_ref.kind) {
+        .dense_vector => if (index_manager.denseIndex(index_ref.name)) |entry| entry.embedding_names else &.{},
+        .sparse_vector => if (index_manager.sparseIndex(index_ref.name)) |entry| entry.embedding_names else &.{},
+        else => unreachable,
+    };
 
     for (deleted_keys) |key| {
         if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+            if (!managedIndexDeleteKeyAffectsProjection(index_manager, index_ref, key)) continue;
+            if (embedding_names.len > 0 and internal_keys.isChunkArtifactRecordKey(key)) {
+                // Multi-source projections key members by embedding artifact,
+                // not by chunk. Derive the retired identities from the bound
+                // producers; the source rows no longer exist at replay time.
+                for (embedding_names) |name| {
+                    const producer = index_manager.getEnrichment(.embedding, name) orelse continue;
+                    if (!internal_keys.matchesChunkArtifactName(key, producer.source_artifact_name)) continue;
+                    const member_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, key, name);
+                    defer alloc.free(member_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, member_key);
+                }
+                continue;
+            }
             try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, key);
             continue;
         }
@@ -47750,7 +47802,7 @@ fn collectVectorReplayDeleteKeys(
         } orelse continue;
         defer identity.deinit(alloc);
         if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) continue;
-        try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, identity.doc_key);
+        try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, if (embedding_names.len > 0) key else identity.doc_key);
     }
     return try keys.toOwnedSlice(alloc);
 }
@@ -75589,6 +75641,152 @@ test "artifact text replay deletes only keys owned by its source projection" {
 
     try std.testing.expectEqual(@as(usize, 1), keys.len);
     try std.testing.expectEqualStrings(body_key, keys[0]);
+}
+
+test "db chunk retirement removes dense and sparse members from generated and artifact projections" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var dense = embedder_mod.DeterministicDenseEmbedder{};
+    var sparse = embedder_mod.DeterministicSparseEmbedder{};
+    const options: OpenOptions = .{
+        .enrichment = .{ .owner_id = "chunk-retirement", .dense_embedder = dense.interface(), .sparse_embedder = sparse.interface() },
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"dense_chunks\"}}",
+        });
+        try db.addIndex(.{
+            .name = "sparse",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"sparse_chunks\"}}",
+        });
+        try db.addIndex(.{
+            .name = "dense_artifacts",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"dense_chunks\"}]}",
+        });
+        try db.addIndex(.{
+            .name = "sparse_artifacts",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"sparse_chunks\"}]}",
+        });
+        const bodies = [_][]const u8{ "abcdefghijklmno", "abcdefgh", "xyzuvw", "" };
+        for (bodies, [_]u64{ 3, 1, 1, 0 }) |body, count| {
+            const value = try std.json.Stringify.valueAlloc(alloc, .{ .body = body }, .{});
+            defer alloc.free(value);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .write });
+            try db.runUntilIdle();
+            for ([_][]const u8{ "dense", "dense_artifacts" }) |name|
+                try std.testing.expectEqual(count, db.core.index_manager.denseIndex(name).?.index.metadata.active_count);
+            for ([_][]const u8{ "sparse", "sparse_artifacts" }) |name|
+                try std.testing.expectEqual(count, db.core.index_manager.sparseIndex(name).?.index.stats().doc_count);
+        }
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), options);
+    defer reopened.close();
+    try reopened.runUntilIdle();
+    for ([_][]const u8{ "dense", "dense_artifacts" }) |name|
+        try std.testing.expectEqual(@as(u64, 0), reopened.core.index_manager.denseIndex(name).?.index.metadata.active_count);
+    for ([_][]const u8{ "sparse", "sparse_artifacts" }) |name|
+        try std.testing.expectEqual(@as(u64, 0), reopened.core.index_manager.sparseIndex(name).?.index.stats().doc_count);
+}
+
+test "db chunk deletion replay targets only matching vector sources" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    for ([_][]const u8{ "body", "notes" }) |source| {
+        const name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
+        defer alloc.free(name);
+        try db.addEnrichment(.{ .name = name, .kind = .chunk, .field = source, .chunk_size = 64 });
+    }
+    for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_][]const u8{ "body", "notes" }) |source| {
+            const name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ @tagName(kind), source });
+            defer alloc.free(name);
+            const chunk_name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
+            defer alloc.free(chunk_name);
+            try db.addEnrichment(.{
+                .name = name,
+                .kind = .embedding,
+                .field = source,
+                .source_artifact_name = chunk_name,
+                .expected_dims = if (kind == .dense_vector) 3 else 0,
+                .producer_json = if (kind == .dense_vector)
+                    "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-test\",\"dimensions\":3}"
+                else
+                    "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}",
+            });
+            const config = try std.fmt.allocPrint(
+                alloc,
+                "{{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"{s}\"}}",
+                .{name},
+            );
+            defer alloc.free(config);
+            try db.addIndex(.{ .name = name, .kind = kind, .config_json = config });
+        }
+    }
+    const body = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "body_chunks", 1);
+    defer alloc.free(body);
+    const notes = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc-a", "notes_chunks", "page:1", 1);
+    defer alloc.free(notes);
+    const unrelated = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "unrelated", 1);
+    defer alloc.free(unrelated);
+
+    for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_][]const u8{ "body", "notes" }, [_][]const u8{ body, notes }) |source, owned_key| {
+            const name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ @tagName(kind), source });
+            defer alloc.free(name);
+            const ref = index_manager_mod.ManagedIndexRef{ .name = name, .kind = kind };
+            const sibling = if (std.mem.eql(u8, source, "body")) notes else body;
+            for ([_][]const u8{ sibling, unrelated }) |foreign| {
+                try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexBatchApplicability(db.core.index_manager, .{ .deleted_keys = &.{foreign} }, ref));
+                try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .deleted_doc_keys = &.{foreign} }, ref));
+            }
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexBatchApplicability(db.core.index_manager, .{ .deleted_keys = &.{owned_key} }, ref));
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .deleted_doc_keys = &.{owned_key} }, ref));
+            const keys = try collectVectorReplayDeleteKeys(alloc, db.core.index_manager, ref, &.{ sibling, owned_key, unrelated, owned_key });
+            defer freeOwnedKeySlice(alloc, keys);
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings(owned_key, keys[0]);
+        }
+        const name = try std.fmt.allocPrint(alloc, "{s}_multi", .{@tagName(kind)});
+        defer alloc.free(name);
+        const config = try std.fmt.allocPrint(
+            alloc,
+            "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}_body\"}},{{\"artifact\":\"{s}_notes\"}}]}}",
+            .{ @tagName(kind), @tagName(kind) },
+        );
+        defer alloc.free(config);
+        try db.addIndex(.{ .name = name, .kind = kind, .config_json = config });
+        const ref = index_manager_mod.ManagedIndexRef{ .name = name, .kind = kind };
+        try std.testing.expect(vectorIndexConsumesChunkKey(db.core.index_manager, ref, body));
+        try std.testing.expect(vectorIndexConsumesChunkKey(db.core.index_manager, ref, notes));
+        try std.testing.expect(!vectorIndexConsumesChunkKey(db.core.index_manager, ref, unrelated));
+        const body_name = try std.fmt.allocPrint(alloc, "{s}_body", .{@tagName(kind)});
+        defer alloc.free(body_name);
+        const notes_name = try std.fmt.allocPrint(alloc, "{s}_notes", .{@tagName(kind)});
+        defer alloc.free(notes_name);
+        const body_member = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, body, body_name);
+        defer alloc.free(body_member);
+        const notes_member = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, notes, notes_name);
+        defer alloc.free(notes_member);
+        const keys = try collectVectorReplayDeleteKeys(alloc, db.core.index_manager, ref, &.{ body, notes, unrelated, body_member, notes_member });
+        defer freeOwnedKeySlice(alloc, keys);
+        try std.testing.expectEqual(@as(usize, 2), keys.len);
+        try std.testing.expectEqualStrings(body_member, keys[0]);
+        try std.testing.expectEqualStrings(notes_member, keys[1]);
+    }
 }
 
 test "embedding artifact replay deletes only the consuming vector projection" {
