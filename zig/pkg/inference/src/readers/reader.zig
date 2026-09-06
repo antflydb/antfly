@@ -390,24 +390,24 @@ pub const LoadedReader = union(enum) {
 
     /// Acquire the minimum lifetime fence needed for safe read microbatching.
     /// Split-component and multistage readers do not yet expose one immutable
-    /// aggregate generation, so they bypass cross-request coalescing.
+    /// aggregate generation, so they bypass cross-request coalescing. The
+    /// loaded session is the authority here: repeating path-name and sidecar
+    /// probes on every request is both racy with publication and unnecessary.
     pub fn acquireExecutionFence(
-        allocator: std.mem.Allocator,
         model_path: []const u8,
         model_manager: *model_manager_mod.ModelManager,
     ) !?ExecutionFence {
-        if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return null;
-        if (try detectParserKind(allocator, model_path) != .florence) return null;
-        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
-            allocator.free(paths.encoder);
-            allocator.free(paths.decoder);
-            return null;
-        } else |_| {}
-
-        var handle = try model_manager.acquireFromDir(model_path);
+        var handle = model_manager.acquireFromDir(model_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // The direct typed loader remains responsible for reporting model
+            // layout and publication failures. Broker eligibility is optional.
+            else => return null,
+        };
         errdefer handle.release();
-        if (session_factory.getFlorenceConfig(handle.get().session) == null)
-            return error.InvalidModelForReading;
+        if (session_factory.getFlorenceConfig(handle.get().session) == null) {
+            handle.release();
+            return null;
+        }
         return .{ .handle = handle };
     }
 

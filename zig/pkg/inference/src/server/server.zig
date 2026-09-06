@@ -1380,6 +1380,9 @@ pub const max_generate_batch_items: usize = 128;
 pub const max_serial_family_batch_items: usize = 128;
 pub const max_read_batch_images: usize = 64;
 pub const max_generate_media_parts_per_item: usize = 8;
+const max_chunk_results = lib_chunker.max_chunk_results;
+const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
+const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
@@ -5614,17 +5617,13 @@ pub const Node = struct {
         broker_deadline: ?std.Io.Clock.Timestamp,
         cancellation: ExecutorCancellation,
     ) !?readers_api.BatchResult {
-        // This manifest is provisional. The acquired immutable generation is
-        // the sole authority for grouping identity and execution limits.
-        var provisional_manifest = try manifest_mod.loadFromDir(allocator, model_path);
-        defer provisional_manifest.deinit();
-        const provisional_contract = try resolvedInferenceExecutorContract(self, "read", &provisional_manifest);
-        if (provisional_contract.batch.mode != .native or provisional_contract.batch.max_items <= 1)
-            return null;
         for (request.images) |image| try validateEncodedImageMime(image.mime_type, image.bytes);
 
+        // The loaded immutable generation is the sole authority for broker
+        // eligibility and grouping. Avoid reparsing a provisional sidecar on
+        // every request; unsupported readers immediately continue through the
+        // same direct typed loader they would have reached after that parse.
         const acquired_fence = try readers_mod.LoadedReader.acquireExecutionFence(
-            allocator,
             model_path,
             &self.model_manager,
         ) orelse return null;
@@ -5667,15 +5666,12 @@ pub const Node = struct {
             std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
         else
             std.math.maxInt(usize);
-        // A request can spill across two full broker groups which execute on
-        // different leaders. Multi-item results therefore use a thread-safe
-        // temporary domain and transfer only after every ticket joins. A
-        // singleton cannot spill and keeps the direct caller-allocator path.
-        const broker_results_need_clone = request.images.len > 1;
-        const broker_result_allocator = if (broker_results_need_clone)
-            std.heap.smp_allocator
-        else
-            allocator;
+        // A compatible ticket may execute on another request's leader thread,
+        // including for a singleton submission. Never invoke an unknown
+        // caller allocator from that thread. Materialize the small structured
+        // result in the process-wide thread-safe domain and transfer it only
+        // after this caller rejoins.
+        const broker_result_allocator = std.heap.smp_allocator;
         const broker_results = try self.executorMicrobatchBroker().submitBatchControlled(
             ReadMicrobatchPayload,
             readers_api.Result,
@@ -5709,63 +5705,11 @@ pub const Node = struct {
         );
         defer broker_result_allocator.free(broker_results);
 
-        var broker_values_owned = true;
-        defer if (broker_values_owned) {
-            for (broker_results) |*result| switch (result.result) {
-                .value => |*value| readers_api.deinitResult(broker_result_allocator, value),
-                .item_error => {},
-            };
-        };
-        var first_error: ?anyerror = null;
-        for (broker_results) |result| switch (result.result) {
-            .item_error => |failure| if (first_error == null) {
-                first_error = failure.cause;
-            },
-            .value => {},
-        };
-        if (first_error) |failure| return failure;
-
-        var native_execution_ids = std.AutoHashMapUnmanaged(u64, void).empty;
-        defer native_execution_ids.deinit(allocator);
-        const result_capacity = std.math.cast(u32, broker_results.len) orelse
-            return error.InvalidReadResultCount;
-        try native_execution_ids.ensureTotalCapacity(allocator, result_capacity);
-        for (broker_results) |result| if (result.execution == .native_batch) {
-            if (result.execution_id == 0) return error.InvalidReadExecutionReport;
-            native_execution_ids.putAssumeCapacity(result.execution_id, {});
-        };
-        const items = try allocator.alloc(readers_api.Result, broker_results.len);
-        var transferred: usize = 0;
-        errdefer {
-            for (items[0..transferred]) |*item| readers_api.deinitResult(allocator, item);
-            allocator.free(items);
-        }
-        var execution = readers_api.BatchExecution{ .requested_items = items.len };
-        for (broker_results, items) |result, *item| {
-            const value = switch (result.result) {
-                .value => |owned| owned,
-                .item_error => unreachable,
-            };
-            item.* = if (broker_results_need_clone)
-                try cloneReaderApiResult(allocator, value)
-            else
-                value;
-            transferred += 1;
-            switch (result.execution) {
-                .native_batch => execution.native_items += 1,
-                .serial => execution.serial_items += 1,
-                .fallback => {
-                    execution.serial_items += 1;
-                    execution.fallback_items += 1;
-                },
-            }
-        }
-        execution.native_batches = native_execution_ids.count();
-        if (execution.fallback_items > 0)
-            execution.fallback_reason = "native reader microbatch fallback";
-        if (!broker_results_need_clone) broker_values_owned = false;
-        try execution.validate(items.len);
-        return .{ .items = items, .execution = execution };
+        return try collectReadMicrobatchResults(
+            allocator,
+            broker_result_allocator,
+            broker_results,
+        );
     }
 
     fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
@@ -5807,6 +5751,25 @@ pub const Node = struct {
         model_name: []const u8,
         request: readers_api.RasterRequest,
     ) !readers_api.BatchResult {
+        return self.readRasterImagesReportedDirectWithContext(
+            allocator,
+            model_name,
+            request,
+            null,
+            .{},
+        );
+    }
+
+    pub fn readRasterImagesReportedDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.RasterRequest,
+        deadline_ns: ?u64,
+        cancellation: ExecutorCancellation,
+    ) !readers_api.BatchResult {
+        if (cancellation.isCancelled()) return error.Canceled;
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try readers_api.validateRasterRequest(request);
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
@@ -5831,9 +5794,6 @@ pub const Node = struct {
             security.max_image_dimension,
         );
         admission.units = @max(admission.units, estimateReadAdmissionUnits(request.images.len, max_tokens));
-        try self.acquireAdmissionUnits(admission.units);
-        var reserved_units = admission.units;
-        defer self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("read.local.raster");
         defer self.metrics.decActive();
 
@@ -5841,21 +5801,154 @@ pub const Node = struct {
         decoded_budget.addPixels(std.math.cast(usize, decoded_pixels) orelse return error.ReadBatchTooLarge) catch
             return error.ReadBatchTooLarge;
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        try self.growAdmissionUnits(reserved_units, required_units);
-        reserved_units = required_units;
 
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
+        const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
-        return self.runReadRasterBatchReportedDirect(
+
+        // Keep renderer-owned raster bytes borrowed while compatible pages
+        // from this and other documents fill one native model invocation. The
+        // synchronous broker contract keeps every source window alive until
+        // all of its tickets complete.
+        if (try self.tryReadRasterImagesViaBroker(
+            allocator,
+            io,
+            model_path,
+            request,
+            max_tokens,
+            broker_deadline,
+            cancellation,
+        )) |broker_batch| return broker_batch;
+
+        try self.acquireAdmissionUnits(required_units);
+        defer self.releaseAdmissionUnits(required_units);
+        var batch = try self.runReadRasterBatchReportedDirect(
             allocator,
             model_path,
             request.images,
             request.prompt,
             max_tokens,
             request.source_fingerprint,
+            null,
+            null,
+        );
+        errdefer batch.deinit(allocator);
+        if (cancellation.isCancelled()) return error.Canceled;
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return batch;
+    }
+
+    const ReadRasterMicrobatchPayload = struct {
+        model_path: []const u8,
+        fence: *const readers_mod.ExecutionFence,
+        raster: readers_api.RasterImage,
+        prompt: ?[]const u8,
+        max_tokens: ?usize,
+        profile_source_fingerprint: ?[]const u8,
+    };
+
+    fn tryReadRasterImagesViaBroker(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model_path: []const u8,
+        request: readers_api.RasterRequest,
+        max_tokens: ?usize,
+        broker_deadline: ?std.Io.Clock.Timestamp,
+        cancellation: ExecutorCancellation,
+    ) !?readers_api.BatchResult {
+        // Eligibility comes from the immutable loaded generation. A
+        // provisional filesystem manifest would duplicate request-hot-path
+        // work and could race artifact publication.
+        const acquired_fence = try readers_mod.LoadedReader.acquireExecutionFence(
+            model_path,
+            &self.model_manager,
+        ) orelse return null;
+        var broker_fence = acquired_fence;
+        defer broker_fence.deinit();
+        const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_fence.manifest());
+        if (!broker_contract.accepts_borrowed_rasters or
+            broker_contract.batch.mode != .native or
+            broker_contract.batch.max_items <= 1)
+        {
+            return null;
+        }
+
+        const payloads = try allocator.alloc(ReadRasterMicrobatchPayload, request.images.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, request.images.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, request.images.len);
+        defer allocator.free(identities);
+        const normalized_prompt = normalizeReadPrompt(request.prompt);
+        for (request.images, 0..) |raster, index| {
+            payloads[index] = .{
+                .model_path = model_path,
+                .fence = &broker_fence,
+                .raster = raster,
+                .prompt = normalized_prompt,
+                .max_tokens = max_tokens,
+                .profile_source_fingerprint = request.source_fingerprint,
+            };
+            shapes[index] = .{
+                .pixels = try raster.pixels(),
+                .tokens = max_tokens orelse 0,
+            };
+            identities[index] = .{
+                .item_id = raster.item_id,
+                .source_fingerprint = raster.source_fingerprint,
+                .page_number = raster.page_number,
+            };
+        }
+        const max_batch_tokens = if (broker_contract.batch.max_output_tokens_per_item) |limit|
+            std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
+        // Broker leaders are request-independent threads. Keep their writes
+        // out of an unknown caller allocator even for singleton submissions.
+        const broker_result_allocator = std.heap.smp_allocator;
+        const broker_results = try self.executorMicrobatchBroker().submitBatchControlled(
+            ReadRasterMicrobatchPayload,
+            readers_api.Result,
+            io,
+            broker_result_allocator,
+            .{
+                .model = model_path,
+                .generation = broker_fence.generationIdentity(),
+                .task = .read,
+                .prompt = normalized_prompt orelse "",
+                .transform = "borrowed-raster",
+                .option_key = max_tokens orelse 0,
+                .resource_class = executorMicrobatchResourceClass(broker_fence.backend()),
+            },
+            .{
+                .mode = .native,
+                .preferred_items = broker_contract.batch.preferred_items,
+                .max_items = broker_contract.batch.max_items,
+                // Raw raster bytes are resident memory, not encoded media.
+                // Pixel limits and fused admission constrain the invocation.
+                .max_bytes = std.math.maxInt(usize),
+                .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
+                .max_tokens = max_batch_tokens,
+                .max_wait_us = self.config.executor_microbatch_max_wait_us,
+            },
+            shapes,
+            identities,
+            broker_deadline,
+            cancellation,
+            payloads,
+            self,
+            executeReadRasterMicrobatch,
+        );
+        defer broker_result_allocator.free(broker_results);
+
+        return try collectReadMicrobatchResults(
+            allocator,
+            broker_result_allocator,
+            broker_results,
         );
     }
 
@@ -5971,6 +6064,160 @@ pub const Node = struct {
             item.slot.setValue(readers_api.Result, result, execution);
     }
 
+    fn executeReadRasterMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        if (items.len == 0) return;
+        const allocator = self.allocator;
+        const rasters = allocator.alloc(readers_api.RasterImage, items.len) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(rasters);
+        const result_allocators = allocator.alloc(std.mem.Allocator, items.len) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(result_allocators);
+        const first = items[0].payloadAs(ReadRasterMicrobatchPayload);
+        const security = effectiveRequestContentSecurity(self);
+        var raster_bytes: usize = 0;
+        var decoded_pixels: u64 = 0;
+        var common_profile_source = first.profile_source_fingerprint;
+        for (items, 0..) |item, index| {
+            const payload = item.payloadAs(ReadRasterMicrobatchPayload);
+            raster_bytes = std.math.add(usize, raster_bytes, payload.raster.bytes.len) catch {
+                for (items) |failed| failed.slot.fail(error.ReadBatchTooLarge);
+                return;
+            };
+            decoded_pixels = std.math.add(u64, decoded_pixels, payload.raster.pixels() catch |err| {
+                for (items) |failed| failed.slot.fail(err);
+                return;
+            }) catch {
+                for (items) |failed| failed.slot.fail(error.ReadBatchTooLarge);
+                return;
+            };
+            rasters[index] = payload.raster;
+            result_allocators[index] = item.allocator;
+            if (!optionalBytesEql(common_profile_source, payload.profile_source_fingerprint))
+                common_profile_source = null;
+        }
+
+        var admission = readResidentEncodedAdmissionForLimits(
+            items.len,
+            raster_bytes,
+            self.inference_admission.capacity,
+            security.max_image_dimension,
+        );
+        admission.units = @max(admission.units, estimateReadAdmissionUnits(items.len, first.max_tokens));
+        var decoded_budget = ReadDecodedImageBudget.init(admission, security.max_image_dimension);
+        decoded_budget.addPixels(std.math.cast(usize, decoded_pixels) orelse {
+            for (items) |item| item.slot.fail(error.ReadBatchTooLarge);
+            return;
+        }) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        self.acquireAdmissionUnits(required_units) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer self.releaseAdmissionUnits(required_units);
+
+        const batch = self.runReadRasterBatchReportedDirect(
+            allocator,
+            first.model_path,
+            rasters,
+            first.prompt,
+            first.max_tokens,
+            common_profile_source,
+            first.fence,
+            result_allocators,
+        ) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer allocator.free(batch.items);
+        if (batch.items.len != items.len) {
+            for (batch.items, 0..) |*result, index| {
+                const result_allocator = if (index < result_allocators.len)
+                    result_allocators[index]
+                else
+                    allocator;
+                readers_api.deinitResult(result_allocator, result);
+            }
+            for (items) |item| item.slot.fail(error.InvalidReadResultCount);
+            return;
+        }
+        const execution: executor_microbatch.Execution = if (batch.execution.fallback_items > 0)
+            .fallback
+        else if (batch.execution.native_items > 0)
+            .native_batch
+        else
+            .serial;
+        for (items, batch.items) |item, result|
+            item.slot.setValue(readers_api.Result, result, execution);
+    }
+
+    fn collectReadMicrobatchResults(
+        allocator: std.mem.Allocator,
+        broker_result_allocator: std.mem.Allocator,
+        broker_results: []executor_microbatch.ItemResult(readers_api.Result),
+    ) !readers_api.BatchResult {
+        defer {
+            for (broker_results) |*result| switch (result.result) {
+                .value => |*value| readers_api.deinitResult(broker_result_allocator, value),
+                .item_error => {},
+            };
+        }
+        var first_error: ?anyerror = null;
+        for (broker_results) |result| switch (result.result) {
+            .item_error => |failure| if (first_error == null) {
+                first_error = failure.cause;
+            },
+            .value => {},
+        };
+        if (first_error) |failure| return failure;
+
+        var native_execution_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer native_execution_ids.deinit(allocator);
+        const result_capacity = std.math.cast(u32, broker_results.len) orelse
+            return error.InvalidReadResultCount;
+        try native_execution_ids.ensureTotalCapacity(allocator, result_capacity);
+        for (broker_results) |result| if (result.execution == .native_batch) {
+            if (result.execution_id == 0) return error.InvalidReadExecutionReport;
+            native_execution_ids.putAssumeCapacity(result.execution_id, {});
+        };
+        const items = try allocator.alloc(readers_api.Result, broker_results.len);
+        var transferred: usize = 0;
+        errdefer {
+            for (items[0..transferred]) |*item| readers_api.deinitResult(allocator, item);
+            allocator.free(items);
+        }
+        var execution = readers_api.BatchExecution{ .requested_items = items.len };
+        for (broker_results, items) |result, *item| {
+            const value = switch (result.result) {
+                .value => |owned| owned,
+                .item_error => unreachable,
+            };
+            item.* = try cloneReaderApiResult(allocator, value);
+            transferred += 1;
+            switch (result.execution) {
+                .native_batch => execution.native_items += 1,
+                .serial => execution.serial_items += 1,
+                .fallback => {
+                    execution.serial_items += 1;
+                    execution.fallback_items += 1;
+                },
+            }
+        }
+        execution.native_batches = native_execution_ids.count();
+        if (execution.fallback_items > 0)
+            execution.fallback_reason = "native reader microbatch fallback";
+        try execution.validate(items.len);
+        return .{ .items = items, .execution = execution };
+    }
+
     fn runReadImageBatchDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -6001,10 +6248,21 @@ pub const Node = struct {
         prompt: ?[]const u8,
         max_tokens: ?usize,
         source_fingerprint: ?[]const u8,
+        execution_fence: ?*const readers_mod.ExecutionFence,
+        result_allocators: ?[]const std.mem.Allocator,
     ) !readers_api.BatchResult {
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
-        defer admission_manifest.deinit();
-        const executor_contract = try resolvedInferenceExecutorContract(self, "read", &admission_manifest);
+        if (result_allocators) |allocators| {
+            if (allocators.len != rasters.len) return error.InvalidReadResultCount;
+        }
+        var owned_admission_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (owned_admission_manifest) |*manifest| manifest.deinit();
+        const admission_manifest: *const manifest_mod.ModelManifest = if (execution_fence) |fence|
+            fence.manifest()
+        else blk: {
+            owned_admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+            break :blk &owned_admission_manifest.?;
+        };
+        const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
         if (!executor_contract.accepts_borrowed_rasters)
             return error.BorrowedRasterUnsupported;
         const normalized_prompt = normalizeReadPrompt(prompt);
@@ -6026,12 +6284,15 @@ pub const Node = struct {
             .has_image = true,
         });
 
-        var reader = try readers_mod.LoadedReader.loadFromDir(
-            allocator,
-            model_path,
-            &self.session_manager,
-            &self.model_manager,
-        );
+        var reader = if (execution_fence) |fence|
+            try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
+        else
+            try readers_mod.LoadedReader.loadFromDir(
+                allocator,
+                model_path,
+                &self.session_manager,
+                &self.model_manager,
+            );
         defer reader.deinit();
         const exact_prompt_tokens = try reader.inputTokenCount(.{
             .prompt = normalized_prompt,
@@ -6066,16 +6327,20 @@ pub const Node = struct {
         const out = try allocator.alloc(readers_api.Result, rasters.len);
         var initialized: usize = 0;
         errdefer {
-            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+            for (out[0..initialized], 0..) |*result, index| {
+                const result_allocator = if (result_allocators) |allocators| allocators[index] else allocator;
+                readers_api.deinitResult(result_allocator, result);
+            }
             allocator.free(out);
         }
-        for (results, rasters, out) |result, raster, *item| {
-            item.* = .{ .text = try allocator.dupe(u8, result.text) };
-            errdefer readers_api.deinitResult(allocator, item);
-            item.fields_json = try readerFieldsJsonAlloc(allocator, result.fields);
-            item.regions_json = try readerRegionsJsonAlloc(allocator, result.regions);
-            item.item_id = if (raster.item_id.len > 0) try allocator.dupe(u8, raster.item_id) else "";
-            item.source_fingerprint = if (raster.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+        for (results, rasters, out, 0..) |result, raster, *item, index| {
+            const result_allocator = if (result_allocators) |allocators| allocators[index] else allocator;
+            item.* = .{ .text = try result_allocator.dupe(u8, result.text) };
+            errdefer readers_api.deinitResult(result_allocator, item);
+            item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
+            item.regions_json = try readerRegionsJsonAlloc(result_allocator, result.regions);
+            item.item_id = if (raster.item_id.len > 0) try result_allocator.dupe(u8, raster.item_id) else "";
+            item.source_fingerprint = if (raster.source_fingerprint) |value| try result_allocator.dupe(u8, value) else null;
             item.page_number = raster.page_number;
             initialized += 1;
         }
@@ -7842,40 +8107,71 @@ pub const Node = struct {
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (ctx.parseJson(api.ChunkRequest) catch |err|
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachments = 1,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.ChunkRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid chunk request",
+                });
+        } else (ctx.parseJson(api.ChunkRequest) catch |err|
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkRequestParseErrorMessage(err) })) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
-        defer self.releaseSlotUnits(admission_units);
+        var reserved_units = admission_units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
-        const input = parseChunkRequestInput(ctx.allocator, body.input) catch |err|
+        var input = parseChunkRequestInputWithAttachments(
+            ctx.allocator,
+            body.input,
+            if (attachment_envelope) |envelope| envelope.attachments else &.{},
+        ) catch |err|
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkInputParseErrorMessage(err) });
-        defer deinitChunkRequestInput(ctx.allocator, input);
+        defer input.deinit(ctx.allocator);
 
         var config = lib_chunker.FixedChunkConfig{};
         if (body.config) |cfg| {
-            if (cfg.model) |model| config.model = canonicalFixedChunkModel(model) orelse
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "unsupported chunking model" });
-            if (cfg.max_chunks) |max_chunks| config.max_chunks = @intCast(max_chunks);
-            config.threshold = cfg.threshold;
-            if (cfg.text) |text_cfg| {
-                if (text_cfg.target_tokens) |tt| config.text.target_tokens = @intCast(tt);
-                if (text_cfg.overlap_tokens) |ot| config.text.overlap_tokens = @intCast(ot);
-                if (text_cfg.separator) |separator| config.text.separator = separator;
-            }
-            if (cfg.audio) |audio_cfg| {
-                if (audio_cfg.window_duration_ms) |window| config.audio.window_duration_ms = @intCast(window);
-                if (audio_cfg.overlap_duration_ms) |overlap| config.audio.overlap_duration_ms = @intCast(overlap);
-            }
+            applyFixedChunkConfig(&config, cfg) catch |err|
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = fixedChunkConfigErrorMessage(err) });
         }
 
-        const chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = internalErrorMessage("CHUNKING_FAILED", err) });
+        const chunk_admission = chunkInputWorkingAdmission(self, input, config, admission_units) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "chunk media is malformed or exceeds image limits" });
+        if (chunk_admission.units > reserved_units) {
+            if (try self.growSlotUnits(ctx, reserved_units, chunk_admission.units)) |resp| return resp;
+            reserved_units = chunk_admission.units;
+        }
+
+        const chunks = lib_chunker.fixed_multimodal.chunkInputBounded(
+            ctx.allocator,
+            input.value,
+            config,
+            chunk_admission.max_owned_output_bytes,
+        ) catch |err| switch (err) {
+            error.ChunkOutputTooLarge => return ctx.status(413).json(.{
+                .@"error" = "CHUNK_OUTPUT_TOO_LARGE",
+                .message = "chunked binary output exceeds the admitted response limit",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = internalErrorMessage("CHUNKING_FAILED", err) }),
+        };
         defer lib_chunker.types.freeChunks(ctx.allocator, chunks);
 
         const api_chunks = try ctx.allocator.alloc(api.ChunkObject, chunks.len);
@@ -7915,7 +8211,7 @@ pub const Node = struct {
             };
         }
 
-        const prompt_tokens = switch (input) {
+        const prompt_tokens = switch (input.value) {
             .text => |text| estimateTextTokens(text),
             .binary => 0,
         };
@@ -7966,11 +8262,39 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed_body = (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed_body = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.RerankMultimodalRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid multimodal rerank request",
+                });
+        } else (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
         const body = parsed_body.value;
-        const media_shape = multimodalRerankRequestMediaShape(body);
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        validateMultimodalRerankAttachmentReferences(ctx.allocator, body, attachments.len) catch |err|
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedAttachmentReferenceErrorMessage(err),
+            });
+        const media_shape = multimodalRerankRequestMediaShapeWithAttachments(body, attachments);
         const media_admission = requestMediaAdmission(self, media_shape);
         if (try self.acquireSlotUnits(ctx, media_admission.units)) |resp| return resp;
         var reserved_units = media_admission.units;
@@ -8017,7 +8341,13 @@ pub const Node = struct {
         var decoded_pixels: u64 = 0;
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.documents) |doc| {
-            const parsed = parseChatMessageContentToTextAndImagesWithBudget(self, ctx.allocator, doc.content, &media_budget) catch |err| switch (err) {
+            const parsed = parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
+                self,
+                ctx.allocator,
+                doc.content,
+                &media_budget,
+                attachments,
+            ) catch |err| switch (err) {
                 error.InvalidImageDataUri => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid image data URI" }),
                 error.RemoteContentTooLarge,
                 error.RemoteContentNotAllowed,
@@ -8324,6 +8654,20 @@ pub const Node = struct {
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        if (uses_attachment_envelope) {
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+        }
+        const request_json = if (attachment_envelope) |envelope| envelope.metadata else raw_body;
         // Single JSON parse per request: only bodies that can carry
         // chat_template_kwargs (substring pre-gate, false positives harmless)
         // are parsed as an untyped Value, which then doubles as the kwargs
@@ -8331,8 +8675,8 @@ pub const Node = struct {
         // back to the raw typed parse so their errors stay identical.
         var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
         defer if (parsed_body_value) |*owned| owned.deinit();
-        if (std.mem.indexOf(u8, raw_body, "chat_template_kwargs") != null) {
-            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch null;
+        if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null) {
+            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{}) catch null;
         }
         if (parsed_body_value) |owned| {
             if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
@@ -8345,10 +8689,19 @@ pub const Node = struct {
         var parsed = if (parsed_body_value) |owned|
             try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
         else
-            (try ctx.parseJson(api.GenerateRequest)) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        validateGenerateAttachmentReferences(ctx.allocator, body, attachments.len) catch |err|
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedAttachmentReferenceErrorMessage(err),
+            });
         if (body.prompt_cache_key) |key| {
             if (key.len > runtime.kv.prompt_cache.max_namespace_bytes) {
                 return ctx.status(400).json(.{
@@ -8383,7 +8736,7 @@ pub const Node = struct {
 
         // Admission precedes model resolution and media decoding so rejected
         // requests cannot consume model or download work first.
-        const media_shape = generateRequestMediaShape(body);
+        const media_shape = generateRequestMediaShapeWithAttachments(body, attachments);
         const media_admission = requestMediaAdmission(self, media_shape);
         const admission_units = @max(estimateGenerateRequestAdmissionUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -8431,7 +8784,7 @@ pub const Node = struct {
         var draft_model_path_storage: ?[]const u8 = null;
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
-        var owned_messages = self.parseGenerateMessagesWithBudget(ctx.allocator, body, &media_budget) catch |err| {
+        var owned_messages = self.parseGenerateMessagesWithBudgetAndAttachments(ctx.allocator, body, &media_budget, attachments) catch |err| {
             if (remoteContentRequestFailure(err) == null and err != error.OutOfMemory) {
                 const failure = generateBatchMessageParseError(err).?;
                 return ctx.status(400).json(.{
@@ -9869,8 +10222,10 @@ pub const Node = struct {
     const OwnedGenerateMessages = struct {
         allocator: std.mem.Allocator,
         messages: []generation.Message = &.{},
-        decoded_images: [][]u8 = &.{},
-        decoded_audio: [][]u8 = &.{},
+        decoded_images: [][]const u8 = &.{},
+        decoded_image_owned: []bool = &.{},
+        decoded_audio: [][]const u8 = &.{},
+        decoded_audio_owned: []bool = &.{},
         image_slices: [][]const []const u8 = &.{},
         audio_slices: [][]const []const u8 = &.{},
         content_parts: [][]const generation.Message.ContentPart = &.{},
@@ -9878,10 +10233,12 @@ pub const Node = struct {
         fn deinit(self: *OwnedGenerateMessages) void {
             for (self.messages) |msg| self.allocator.free(msg.content);
             self.allocator.free(self.messages);
-            for (self.decoded_images) |img| self.allocator.free(img);
+            for (self.decoded_images, self.decoded_image_owned) |img, owned| if (owned) self.allocator.free(img);
             self.allocator.free(self.decoded_images);
-            for (self.decoded_audio) |clip| self.allocator.free(clip);
+            self.allocator.free(self.decoded_image_owned);
+            for (self.decoded_audio, self.decoded_audio_owned) |clip, owned| if (owned) self.allocator.free(clip);
             self.allocator.free(self.decoded_audio);
+            self.allocator.free(self.decoded_audio_owned);
             for (self.image_slices) |slice| self.allocator.free(slice);
             self.allocator.free(self.image_slices);
             for (self.audio_slices) |slice| self.allocator.free(slice);
@@ -9891,6 +10248,36 @@ pub const Node = struct {
             self.* = .{ .allocator = self.allocator };
         }
     };
+
+    const OwnedMediaSlices = struct {
+        bytes: [][]const u8,
+        owned: []bool,
+    };
+
+    /// Transfer parallel media and ownership lists as one logical operation.
+    ///
+    /// ArrayList.toOwnedSlice empties its source on success. Calling it once for
+    /// each list makes the pair observably inconsistent if the second allocation
+    /// fails, which in turn makes both cleanup and ownership unknowable. Duplicate
+    /// both lists first, then empty their builders only after both allocations have
+    /// succeeded. On failure the caller's errdefer still sees the original pair.
+    fn takeOwnedMediaSlices(
+        allocator: std.mem.Allocator,
+        media: *std.ArrayListUnmanaged([]const u8),
+        ownership: *std.ArrayListUnmanaged(bool),
+    ) !OwnedMediaSlices {
+        std.debug.assert(media.items.len == ownership.items.len);
+
+        const bytes = try allocator.dupe([]const u8, media.items);
+        errdefer allocator.free(bytes);
+        const owned = try allocator.dupe(bool, ownership.items);
+
+        media.deinit(allocator);
+        media.* = .empty;
+        ownership.deinit(allocator);
+        ownership.* = .empty;
+        return .{ .bytes = bytes, .owned = owned };
+    }
 
     fn parseGenerateMessages(self: *Node, allocator: std.mem.Allocator, body: api.GenerateRequest) !OwnedGenerateMessages {
         var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
@@ -9903,20 +10290,34 @@ pub const Node = struct {
         body: api.GenerateRequest,
         media_budget: *RequestMediaBudget,
     ) !OwnedGenerateMessages {
+        return self.parseGenerateMessagesWithBudgetAndAttachments(allocator, body, media_budget, &.{});
+    }
+
+    fn parseGenerateMessagesWithBudgetAndAttachments(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+        attachments: []const httpx.attachment_envelope.Attachment,
+    ) !OwnedGenerateMessages {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         errdefer {
             for (messages.items) |msg| allocator.free(msg.content);
             messages.deinit(allocator);
         }
-        var decoded_images = std.ArrayListUnmanaged([]u8).empty;
+        var decoded_images = std.ArrayListUnmanaged([]const u8).empty;
+        var decoded_image_owned = std.ArrayListUnmanaged(bool).empty;
         errdefer {
-            for (decoded_images.items) |img| allocator.free(img);
+            for (decoded_images.items, decoded_image_owned.items) |img, owned| if (owned) allocator.free(img);
             decoded_images.deinit(allocator);
+            decoded_image_owned.deinit(allocator);
         }
-        var decoded_audio = std.ArrayListUnmanaged([]u8).empty;
+        var decoded_audio = std.ArrayListUnmanaged([]const u8).empty;
+        var decoded_audio_owned = std.ArrayListUnmanaged(bool).empty;
         errdefer {
-            for (decoded_audio.items) |clip| allocator.free(clip);
+            for (decoded_audio.items, decoded_audio_owned.items) |clip, owned| if (owned) allocator.free(clip);
             decoded_audio.deinit(allocator);
+            decoded_audio_owned.deinit(allocator);
         }
         var image_slices = std.ArrayListUnmanaged([]const []const u8).empty;
         errdefer {
@@ -9987,7 +10388,10 @@ pub const Node = struct {
                                 errdefer if (owns_downloaded_data) allocator.free(downloaded.data);
                                 if (data_uri_mod.hasScheme(url_str))
                                     try validateEncodedImageMime(downloaded.content_type, downloaded.data);
-                                try decoded_images.append(allocator, downloaded.data);
+                                try decoded_images.ensureUnusedCapacity(allocator, 1);
+                                try decoded_image_owned.ensureUnusedCapacity(allocator, 1);
+                                decoded_images.appendAssumeCapacity(downloaded.data);
+                                decoded_image_owned.appendAssumeCapacity(true);
                                 owns_downloaded_data = false;
                                 try msg_images.append(allocator, downloaded.data);
                                 try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
@@ -10000,6 +10404,37 @@ pub const Node = struct {
                                 const mime_value = obj.get("mime_type") orelse return error.GenerateMediaContentPartMissingMimeType;
                                 if (mime_value != .string) return error.GenerateMediaContentPartMissingMimeType;
 
+                                if (try parseAttachmentUrl(data_value.string)) |attachment_index| {
+                                    if (attachment_index >= attachments.len) return error.AttachmentIndexOutOfBounds;
+                                    const attachment = attachments[attachment_index];
+                                    const declared_essence = data_uri_mod.mediaTypeEssence(mime_value.string) catch
+                                        return error.GenerateMediaDataMimeTypeMismatch;
+                                    const attached_essence = data_uri_mod.mediaTypeEssence(attachment.mime_type) catch
+                                        return error.GenerateMediaDataMimeTypeMismatch;
+                                    if (!std.ascii.eqlIgnoreCase(declared_essence, attached_essence))
+                                        return error.GenerateMediaDataMimeTypeMismatch;
+                                    try media_budget.add(attachment.data.len);
+                                    if (std.ascii.startsWithIgnoreCase(declared_essence, "image/")) {
+                                        try validateEncodedImageMime(mime_value.string, attachment.data);
+                                        try decoded_images.ensureUnusedCapacity(allocator, 1);
+                                        try decoded_image_owned.ensureUnusedCapacity(allocator, 1);
+                                        decoded_images.appendAssumeCapacity(attachment.data);
+                                        decoded_image_owned.appendAssumeCapacity(false);
+                                        try msg_images.append(allocator, attachment.data);
+                                        try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
+                                    } else if (std.ascii.startsWithIgnoreCase(declared_essence, "audio/")) {
+                                        try decoded_audio.ensureUnusedCapacity(allocator, 1);
+                                        try decoded_audio_owned.ensureUnusedCapacity(allocator, 1);
+                                        decoded_audio.appendAssumeCapacity(attachment.data);
+                                        decoded_audio_owned.appendAssumeCapacity(false);
+                                        try msg_audio.append(allocator, attachment.data);
+                                        try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
+                                    } else {
+                                        return error.UnsupportedGenerateMediaMimeType;
+                                    }
+                                    continue;
+                                }
+
                                 const decoded_payload = decodeMediaDataWithBudget(allocator, data_value.string, media_budget) catch |err| switch (err) {
                                     error.OutOfMemory, error.RemoteContentTooLarge => return err,
                                     else => return error.InvalidGenerateMediaBase64,
@@ -10011,12 +10446,18 @@ pub const Node = struct {
                                     return error.GenerateMediaDataMimeTypeMismatch;
                                 if (std.ascii.startsWithIgnoreCase(mime_value.string, "image/")) {
                                     try validateEncodedImageMime(mime_value.string, decoded_payload.data);
-                                    try decoded_images.append(allocator, decoded_payload.data);
+                                    try decoded_images.ensureUnusedCapacity(allocator, 1);
+                                    try decoded_image_owned.ensureUnusedCapacity(allocator, 1);
+                                    decoded_images.appendAssumeCapacity(decoded_payload.data);
+                                    decoded_image_owned.appendAssumeCapacity(true);
                                     owns_decoded_data = false;
                                     try msg_images.append(allocator, decoded_payload.data);
                                     try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
                                 } else if (std.ascii.startsWithIgnoreCase(mime_value.string, "audio/")) {
-                                    try decoded_audio.append(allocator, decoded_payload.data);
+                                    try decoded_audio.ensureUnusedCapacity(allocator, 1);
+                                    try decoded_audio_owned.ensureUnusedCapacity(allocator, 1);
+                                    decoded_audio.appendAssumeCapacity(decoded_payload.data);
+                                    decoded_audio_owned.appendAssumeCapacity(true);
                                     owns_decoded_data = false;
                                     try msg_audio.append(allocator, decoded_payload.data);
                                     try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
@@ -10081,15 +10522,17 @@ pub const Node = struct {
             for (owned_messages) |msg| allocator.free(msg.content);
             allocator.free(owned_messages);
         }
-        const owned_decoded_images = try decoded_images.toOwnedSlice(allocator);
+        const owned_image_media = try takeOwnedMediaSlices(allocator, &decoded_images, &decoded_image_owned);
         errdefer {
-            for (owned_decoded_images) |img| allocator.free(img);
-            allocator.free(owned_decoded_images);
+            for (owned_image_media.bytes, owned_image_media.owned) |img, owned| if (owned) allocator.free(img);
+            allocator.free(owned_image_media.bytes);
+            allocator.free(owned_image_media.owned);
         }
-        const owned_decoded_audio = try decoded_audio.toOwnedSlice(allocator);
+        const owned_audio_media = try takeOwnedMediaSlices(allocator, &decoded_audio, &decoded_audio_owned);
         errdefer {
-            for (owned_decoded_audio) |clip| allocator.free(clip);
-            allocator.free(owned_decoded_audio);
+            for (owned_audio_media.bytes, owned_audio_media.owned) |clip, owned| if (owned) allocator.free(clip);
+            allocator.free(owned_audio_media.bytes);
+            allocator.free(owned_audio_media.owned);
         }
         const owned_image_slices = try image_slices.toOwnedSlice(allocator);
         errdefer {
@@ -10105,8 +10548,10 @@ pub const Node = struct {
         return .{
             .allocator = allocator,
             .messages = owned_messages,
-            .decoded_images = owned_decoded_images,
-            .decoded_audio = owned_decoded_audio,
+            .decoded_images = owned_image_media.bytes,
+            .decoded_image_owned = owned_image_media.owned,
+            .decoded_audio = owned_audio_media.bytes,
+            .decoded_audio_owned = owned_audio_media.owned,
             .image_slices = owned_image_slices,
             .audio_slices = owned_audio_slices,
             .content_parts = owned_content_parts,
@@ -10574,16 +11019,39 @@ pub const Node = struct {
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, true)) {
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        if (uses_attachment_envelope) {
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+        }
+        const request_json = if (attachment_envelope) |envelope| envelope.metadata else raw_body;
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, request_json, true)) {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
             });
         }
-        var parsed = (try ctx.parseJson(api.GenerateBatchRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        var parsed = std.json.parseFromSlice(api.GenerateBatchRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation batch request" });
         defer parsed.deinit();
         const body = parsed.value;
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        validateGenerateBatchAttachmentReferences(ctx.allocator, body, attachments.len) catch |err|
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedAttachmentReferenceErrorMessage(err),
+            });
         if (body.mode) |mode| {
             if (mode != .sync) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "only mode=sync is supported" });
         }
@@ -10639,7 +11107,7 @@ pub const Node = struct {
             };
             owned_messages[idx] = .{ .allocator = ctx.allocator };
             pending[idx] = true;
-            media_shapes[idx] = generateRequestMediaShape(item.body);
+            media_shapes[idx] = generateRequestMediaShapeWithAttachments(item.body, attachments);
             if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
                 results[idx].@"error" = batch_err;
                 pending[idx] = false;
@@ -10807,7 +11275,7 @@ pub const Node = struct {
             for (materialized_indices) |idx| {
                 const item = body.requests[idx];
                 const prior_media_bytes = media_budget.used_bytes;
-                owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
+                owned_messages[idx] = parseGenerateMessagesWithBudgetAndAttachments(self, ctx.allocator, item.body, &media_budget, attachments) catch |err| blk: {
                     if (err == error.OutOfMemory) return err;
                     results[idx].@"error" = generateBatchMessageParseError(err).?;
                     break :blk .{ .allocator = ctx.allocator };
@@ -11719,12 +12187,14 @@ pub const Node = struct {
         /// content-part position. ColQwen continues to consume `text`.
         qwen_content: []u8,
         images: [][]const u8,
+        image_owned: []bool,
 
         fn deinit(self: *ParsedMultimodalRerankDocument) void {
             self.allocator.free(self.text);
             self.allocator.free(self.qwen_content);
-            for (self.images) |img| self.allocator.free(img);
+            for (self.images, self.image_owned) |img, owned| if (owned) self.allocator.free(img);
             self.allocator.free(self.images);
+            self.allocator.free(self.image_owned);
         }
     };
 
@@ -11796,14 +12266,31 @@ pub const Node = struct {
         content: api.ChatMessageContent,
         media_budget: *RequestMediaBudget,
     ) !ParsedMultimodalRerankDocument {
+        return self.parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
+            allocator,
+            content,
+            media_budget,
+            &.{},
+        );
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+        attachments: []const httpx.attachment_envelope.Attachment,
+    ) !ParsedMultimodalRerankDocument {
         var text_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer text_buf.deinit(allocator);
         var qwen_content_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer qwen_content_buf.deinit(allocator);
         var images = std.ArrayListUnmanaged([]const u8).empty;
+        var image_owned = std.ArrayListUnmanaged(bool).empty;
         errdefer {
-            for (images.items) |img| allocator.free(img);
+            for (images.items, image_owned.items) |img, owned| if (owned) allocator.free(img);
             images.deinit(allocator);
+            image_owned.deinit(allocator);
         }
 
         switch (content) {
@@ -11841,19 +12328,38 @@ pub const Node = struct {
                             defer if (decoded.mime_type) |mime_type| allocator.free(mime_type);
                             errdefer allocator.free(decoded.data);
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
-                            try images.append(allocator, decoded.data);
+                            try images.ensureUnusedCapacity(allocator, 1);
+                            try image_owned.ensureUnusedCapacity(allocator, 1);
+                            images.appendAssumeCapacity(decoded.data);
+                            image_owned.appendAssumeCapacity(true);
                         } else {
                             const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
                             defer allocator.free(downloaded.content_type);
                             errdefer allocator.free(downloaded.data);
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
-                            try images.append(allocator, downloaded.data);
+                            try images.ensureUnusedCapacity(allocator, 1);
+                            try image_owned.ensureUnusedCapacity(allocator, 1);
+                            images.appendAssumeCapacity(downloaded.data);
+                            image_owned.appendAssumeCapacity(true);
                         }
                     } else if (std.mem.eql(u8, ptype, "media")) {
                         const data_val = obj.get("data") orelse return error.UnsupportedContentPartType;
                         const mime_val = obj.get("mime_type") orelse return error.UnsupportedContentPartType;
                         if (data_val != .string or mime_val != .string) return error.UnsupportedContentPartType;
                         if (!std.ascii.startsWithIgnoreCase(mime_val.string, "image/")) return error.UnsupportedContentPartType;
+                        if (try parseAttachmentUrl(data_val.string)) |attachment_index| {
+                            if (attachment_index >= attachments.len) return error.InvalidAttachmentReference;
+                            const attachment = attachments[attachment_index];
+                            if (!scraping.data_uri.mediaTypesCompatible(mime_val.string, attachment.mime_type))
+                                return error.UnsupportedContentPartType;
+                            try media_budget.add(attachment.data.len);
+                            try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
+                            try images.ensureUnusedCapacity(allocator, 1);
+                            try image_owned.ensureUnusedCapacity(allocator, 1);
+                            images.appendAssumeCapacity(attachment.data);
+                            image_owned.appendAssumeCapacity(false);
+                            continue;
+                        }
                         const decoded_payload = decodeMediaDataWithBudget(allocator, data_val.string, media_budget) catch |err| switch (err) {
                             error.OutOfMemory, error.RemoteContentTooLarge => return err,
                             else => return error.UnsupportedContentPartType,
@@ -11863,7 +12369,10 @@ pub const Node = struct {
                         errdefer allocator.free(decoded);
                         if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.UnsupportedContentPartType;
                         try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
-                        try images.append(allocator, decoded);
+                        try images.ensureUnusedCapacity(allocator, 1);
+                        try image_owned.ensureUnusedCapacity(allocator, 1);
+                        images.appendAssumeCapacity(decoded);
+                        image_owned.appendAssumeCapacity(true);
                     } else {
                         return error.UnsupportedContentPartType;
                     }
@@ -11876,12 +12385,18 @@ pub const Node = struct {
         errdefer allocator.free(owned_text);
         const owned_qwen_content = try qwen_content_buf.toOwnedSlice(allocator);
         errdefer allocator.free(owned_qwen_content);
-        const owned_images = try images.toOwnedSlice(allocator);
+        const owned_image_media = try takeOwnedMediaSlices(allocator, &images, &image_owned);
+        errdefer {
+            for (owned_image_media.bytes, owned_image_media.owned) |image, owned| if (owned) allocator.free(image);
+            allocator.free(owned_image_media.bytes);
+            allocator.free(owned_image_media.owned);
+        }
         return .{
             .allocator = allocator,
             .text = owned_text,
             .qwen_content = owned_qwen_content,
-            .images = owned_images,
+            .images = owned_image_media.bytes,
+            .image_owned = owned_image_media.owned,
         };
     }
 
@@ -13297,7 +13812,26 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ReadRequest)) orelse
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.ReadRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid read request",
+                });
+        } else (try ctx.parseJson(api.ReadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -13310,6 +13844,40 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        const attachment_indexes = try ctx.allocator.alloc(?usize, body.images.len);
+        defer ctx.allocator.free(attachment_indexes);
+        const attachment_seen = try ctx.allocator.alloc(bool, attachments.len);
+        defer ctx.allocator.free(attachment_seen);
+        @memset(attachment_seen, false);
+        for (body.images, attachment_indexes) |image, *attachment_index| {
+            attachment_index.* = parseAttachmentUrl(image.url) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "invalid framed attachment reference",
+                });
+            if (attachment_index.*) |index| {
+                if (!uses_attachment_envelope)
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "attachment references require the framed attachment transport",
+                    });
+                if (index >= attachments.len or attachment_seen[index])
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "every framed attachment must be referenced exactly once",
+                    });
+                attachment_seen[index] = true;
+            }
+        }
+        for (attachment_seen) |seen| if (!seen)
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "every framed attachment must be referenced exactly once",
+            });
         const max_tokens = validateReadMaxTokens(body.max_tokens) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -13317,12 +13885,25 @@ pub const Node = struct {
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
-        for (body.images) |image| {
-            inline_source_bytes = addReadInlineSourceBytes(inline_source_bytes, image.url, inline_source_cap) catch
-                return ctx.status(413).json(.{
-                    .@"error" = "BATCH_TOO_LARGE",
-                    .message = "total inline image source bytes exceed server capacity",
-                });
+        for (body.images, attachment_indexes) |image, attachment_index| {
+            if (attachment_index) |index| {
+                inline_source_bytes = std.math.add(usize, inline_source_bytes, attachments[index].data.len) catch
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = "total attached image bytes exceed server capacity",
+                    });
+                if (inline_source_bytes > inline_source_cap)
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = "total attached image bytes exceed server capacity",
+                    });
+            } else {
+                inline_source_bytes = addReadInlineSourceBytes(inline_source_bytes, image.url, inline_source_cap) catch
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = "total inline image source bytes exceed server capacity",
+                    });
+            }
         }
         const admission = readRequestAdmission(self, body.images.len, inline_source_bytes, max_tokens);
         if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
@@ -13376,7 +13957,30 @@ pub const Node = struct {
         const batch_byte_cap = admission.byte_cap;
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
-        for (body.images, 0..) |img_url, i| {
+        for (body.images, attachment_indexes, 0..) |img_url, attachment_index, i| {
+            if (attachment_index) |index| {
+                const attachment = attachments[index];
+                batch_bytes = std.math.add(usize, batch_bytes, attachment.data.len) catch
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = "total attached image bytes exceed server capacity",
+                    });
+                if (batch_bytes > batch_byte_cap)
+                    return ctx.status(413).json(.{
+                        .@"error" = "BATCH_TOO_LARGE",
+                        .message = try std.fmt.allocPrint(ctx.allocator, "total attached image bytes must be at most {d}", .{batch_byte_cap}),
+                    });
+                decoded_budget.addImage(attachment.data) catch |err|
+                    return readImageErrorResponse(ctx, err);
+                const physical_mime = image_pipeline.mimeEssenceForEncoded(attachment.data) orelse
+                    return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia);
+                validateEncodedImageMime(attachment.mime_type, attachment.data) catch |err|
+                    return inferenceExecutorContractFailureResponse(ctx, err);
+                if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+                    return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
+                image_datas[i] = attachment.data;
+                continue;
+            }
             var item = downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
                 error.ReadBatchTooLarge => return ctx.status(413).json(.{
                     .@"error" = "BATCH_TOO_LARGE",
@@ -13400,9 +14004,12 @@ pub const Node = struct {
                 return inferenceExecutorContractFailureResponse(ctx, err);
             if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
                 return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
-            downloaded[i] = item;
+            // Attached and fetched images may be interleaved. Keep owned
+            // downloads dense so prefix cleanup never touches an uninitialized
+            // slot, while image_datas preserves request order separately.
+            downloaded[downloaded_count] = item;
+            image_datas[i] = downloaded[downloaded_count].data;
             downloaded_count += 1;
-            image_datas[i] = downloaded[i].data;
             item_owned = false;
         }
 
@@ -13573,7 +14180,27 @@ pub const Node = struct {
     }
 
     pub fn transcribeAudio(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.TranscribeRequest)) orelse
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachments = 1,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.TranscribeRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid transcription request",
+                });
+        } else (try ctx.parseJson(api.TranscribeRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -13582,16 +14209,42 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
 
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        const audio_attachment_index = parseAttachmentUrl(body.audio) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid framed attachment reference" });
+        var framed_audio_mime: ?[]const u8 = null;
+        if (uses_attachment_envelope) {
+            if (attachments.len != 1 or audio_attachment_index == null or audio_attachment_index.? != 0)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "transcription requires exactly one referenced attachment" });
+            framed_audio_mime = canonicalAudioMimeForBytes(
+                attachments[0].mime_type,
+                attachments[0].data,
+            ) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = if (err == error.InvalidInferenceMedia)
+                    "transcription attachment MIME type does not match its bytes"
+                else
+                    "unsupported audio attachment MIME type",
+            });
+        } else if (audio_attachment_index != null) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "attachment references require the framed attachment transport" });
+        }
+
         var media_shape: RequestMediaAdmissionShape = .{};
-        media_shape.addInline(body.audio.len, false);
+        if (uses_attachment_envelope)
+            media_shape.addBorrowed(attachments[0].data.len, false)
+        else
+            media_shape.addInline(body.audio.len, false);
         const media_admission = requestMediaAdmission(self, media_shape);
         // The encoded JSON value and decoded compressed payload coexist with
         // PCM decode, so reserve both before allocating either decoded form.
-        const resident_bytes = std.math.add(
-            usize,
-            media_admission.byte_cap,
-            media_admission.byte_cap,
-        ) catch std.math.maxInt(usize);
+        const resident_bytes = if (uses_attachment_envelope)
+            media_admission.byte_cap
+        else
+            std.math.add(usize, media_admission.byte_cap, media_admission.byte_cap) catch std.math.maxInt(usize);
         const audio_admission = audioDecodeAdmission(self, resident_bytes);
         const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), audio_admission.units);
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
@@ -13601,20 +14254,28 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        const decoded_audio = decodeMediaDataWithBudget(ctx.allocator, body.audio, &media_budget) catch |err| switch (err) {
-            error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
-            error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = if (data_uri_mod.hasScheme(body.audio)) "invalid audio data URI" else "invalid base64 audio data",
-            }),
-            error.OutOfMemory => return err,
-        };
-        defer decoded_audio.deinit(ctx.allocator);
+        var decoded_audio_owned: ?DecodedDataUri = null;
+        defer if (decoded_audio_owned) |decoded_audio| decoded_audio.deinit(ctx.allocator);
+        if (uses_attachment_envelope) {
+            media_budget.add(attachments[0].data.len) catch |err|
+                return remoteContentErrorResponse(ctx, err);
+        } else {
+            decoded_audio_owned = decodeMediaDataWithBudget(ctx.allocator, body.audio, &media_budget) catch |err| switch (err) {
+                error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
+                error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = if (data_uri_mod.hasScheme(body.audio)) "invalid audio data URI" else "invalid base64 audio data",
+                }),
+                error.OutOfMemory => return err,
+            };
+        }
+        const decoded_audio_data = if (uses_attachment_envelope) attachments[0].data else decoded_audio_owned.?.data;
+        const decoded_audio_mime: ?[]const u8 = if (uses_attachment_envelope) framed_audio_mime else decoded_audio_owned.?.mime_type;
 
-        const decode_options = audio_mod.DecodeOptions{ .mime_hint = decoded_audio.mime_type };
+        const decode_options = audio_mod.DecodeOptions{ .mime_hint = decoded_audio_mime };
         var decoded = audio_mod.decodeBounded(
             ctx.allocator,
-            decoded_audio.data,
+            decoded_audio_data,
             decode_options,
             audio_admission.max_decode_working_bytes,
         ) catch |err| switch (err) {
@@ -13633,7 +14294,7 @@ pub const Node = struct {
         defer admission_manifest.deinit();
         const executor_contract = resolvedInferenceExecutorContract(self, "transcribe", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
-        if (decoded_audio.mime_type) |declared_mime| {
+        if (decoded_audio_mime) |declared_mime| {
             const essence = data_uri_mod.mediaTypeEssence(declared_mime) catch
                 return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
             if (!manifestAcceptsExecutorMime(&admission_manifest, essence))
@@ -13764,7 +14425,26 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            const raw_body = (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(extraction_api.ExtractionRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid extraction request",
+                });
+        } else (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -13778,6 +14458,22 @@ pub const Node = struct {
             error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
             error.MixedExtractionOperations => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" }),
         };
+        const envelope_attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        const extraction_attachments = extractionAttachmentsFromEnvelope(
+            ctx.allocator,
+            body.inputs,
+            envelope_attachments,
+            uses_attachment_envelope,
+        ) catch |err| return ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = @errorName(err),
+        });
+        defer ctx.allocator.free(extraction_attachments);
+        if (operation != .structures and extraction_attachments.len > 0)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "media attachments require structure extraction" });
         const schema_contract_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
         defer ctx.allocator.free(schema_contract_json);
         if (body.schema.entities) |labels| {
@@ -13800,6 +14496,7 @@ pub const Node = struct {
                 .inputs = inputs,
                 .schema_json = schema_json,
                 .options_json = options_json,
+                .attachments = extraction_attachments,
             }, .http_route) catch |err| return extractionDirectFailureResponse(ctx, err);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
@@ -14240,11 +14937,11 @@ pub const Node = struct {
                         a,
                         "chunker",
                         "",
-                        &.{},
-                        &.{"text"},
+                        &.{"inference.mime_type=image/gif"},
+                        &.{ "text", "image", "audio" },
                         false,
-                        false,
-                        false,
+                        true,
+                        true,
                         false,
                         task,
                         requestMediaMaxBytes(self),
@@ -14259,6 +14956,10 @@ pub const Node = struct {
 
             // Add discovered models matching this task
             for (discovered_listings.items) |*listing| {
+                // The public chunk executor currently implements only the
+                // built-in fixed multimodal chunker above. A manifest task is
+                // not proof that a model-backed chunk execution path exists.
+                if (std.mem.eql(u8, task, "chunkers")) continue;
                 const entry = discovered[listing.entry_index];
                 if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
 
@@ -14326,6 +15027,7 @@ pub const Node = struct {
             // snapshot keeps them alive, and each listing has already been
             // canonicalized to a safe request identifier outside the lock.
             for (loaded_listings.items) |listing| {
+                if (std.mem.eql(u8, task, "chunkers")) continue;
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
                 if (!taskMatchesModelListing(
@@ -14970,7 +15672,8 @@ fn addDirectExtractionContentMediaShape(
             if (part.object.get("url")) |url| {
                 shape.addImageUrl(url);
             } else if (part.object.get("data")) |data| {
-                if (data == .string) shape.addInline(data.string.len, true);
+                if (data == .string and (parseAttachmentUrl(data.string) catch null) == null)
+                    shape.addInline(data.string.len, true);
             }
         }
     }
@@ -14991,6 +15694,49 @@ fn canonicalExtractingInputs(allocator: std.mem.Allocator, inputs: []const extra
         initialized += 1;
     }
     return out;
+}
+
+fn extractionAttachmentsFromEnvelope(
+    allocator: std.mem.Allocator,
+    inputs: []const extraction_api.ExtractionInput,
+    attachments: []const httpx.attachment_envelope.Attachment,
+    uses_attachment_envelope: bool,
+) ![]extracting_api.Attachment {
+    const seen = try allocator.alloc(bool, attachments.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    const resolved = try allocator.alloc(extracting_api.Attachment, attachments.len);
+    errdefer allocator.free(resolved);
+    var resolved_count: usize = 0;
+
+    for (inputs, 0..) |input, input_index| {
+        if (input.content != .array) continue;
+        for (input.content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string or !std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            if (data != .string) continue;
+            const attachment_index = (try parseAttachmentUrl(data.string)) orelse continue;
+            if (!uses_attachment_envelope) return error.AttachmentReferenceRequiresEnvelope;
+            if (attachment_index >= attachments.len or seen[attachment_index])
+                return error.InvalidAttachmentReferenceCardinality;
+            const declared_mime = part.object.get("mime_type") orelse
+                return error.MissingAttachmentMimeType;
+            if (declared_mime != .string or
+                !scraping.data_uri.mediaTypesCompatible(declared_mime.string, attachments[attachment_index].mime_type))
+                return error.AttachmentMimeTypeMismatch;
+            seen[attachment_index] = true;
+            resolved[resolved_count] = .{
+                .input_index = input_index,
+                .bytes = attachments[attachment_index].data,
+                .mime_type = attachments[attachment_index].mime_type,
+            };
+            resolved_count += 1;
+        }
+    }
+    if (resolved_count != attachments.len) return error.InvalidAttachmentReferenceCardinality;
+    return resolved;
 }
 
 fn validateExtractionInputKinds(text_count: usize, image_count: usize) !void {
@@ -15362,6 +16108,12 @@ fn appendDirectExtractionContent(
                         saw_media = true;
                     }
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
+                    if (part.object.get("data")) |data_value| {
+                        if (data_value == .string and (try parseAttachmentUrl(data_value.string)) != null) {
+                            if (!has_borrowed_media) return error.AttachmentReferenceRequiresEnvelope;
+                            continue;
+                        }
+                    }
                     if (saw_media) return error.InferenceMediaPartLimitExceeded;
                     if (part.object.get("url")) |url_value| {
                         if (url_value == .string) {
@@ -16337,8 +17089,12 @@ pub fn resolvedExecutorModalities(
         .text = manifest_text,
         .image = manifest_image,
     };
-    if (std.mem.eql(u8, resolved_task, "chunk") or
-        std.mem.eql(u8, resolved_task, "rewrite")) return .{ .text = manifest_text };
+    if (std.mem.eql(u8, resolved_task, "chunk")) return .{
+        .text = manifest_text,
+        .image = manifest_image,
+        .audio = manifest_audio,
+    };
+    if (std.mem.eql(u8, resolved_task, "rewrite")) return .{ .text = manifest_text };
     if (std.mem.eql(u8, resolved_task, "transcribe")) return .{ .audio = manifest_audio };
     return .{};
 }
@@ -16370,6 +17126,42 @@ test "executor capability resolution never advertises raw documents" {
     try std.testing.expect(extract.text and extract.image and !extract.audio);
     const transcribe = resolvedExecutorModalities("transcribe", true, true, true, true);
     try std.testing.expect(transcribe.audio and !transcribe.text and !transcribe.image);
+    const chunk = resolvedExecutorModalities("chunk", true, true, true, true);
+    try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
+}
+
+test "fixed chunk catalog advertises its multimodal transport truth" {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try appendModelInfo(
+        &body,
+        std.testing.allocator,
+        "chunker",
+        "",
+        &.{"inference.mime_type=image/gif"},
+        &.{ "text", "image", "audio" },
+        false,
+        true,
+        true,
+        false,
+        "chunkers",
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        false,
+        "compatible",
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
+    defer parsed.deinit();
+    const capabilities = parsed.value.object.get("inference_capabilities").?.object;
+    try std.testing.expect(capabilities.get("framed_attachments").?.bool);
+    const modalities = capabilities.get("input_modalities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), modalities.len);
+    const mime_types = capabilities.get("accepted_mime_types").?.array.items;
+    var found_gif = false;
+    for (mime_types) |mime_type| {
+        if (mime_type == .string and std.mem.eql(u8, mime_type.string, "image/gif")) found_gif = true;
+    }
+    try std.testing.expect(found_gif);
 }
 
 fn appendResolvedInferenceCapabilities(
@@ -16425,6 +17217,14 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_image, "image/webp" },
         .{ accepts_audio and audio_mod.canDecodeMime("audio/wav"), "audio/wav" },
         .{ accepts_audio and audio_mod.canDecodeMime("audio/mpeg"), "audio/mpeg" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/aac"), "audio/aac" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/mp4"), "audio/mp4" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/ogg"), "audio/ogg" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/opus"), "audio/opus" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/flac"), "audio/flac" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/aiff"), "audio/aiff" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/caf"), "audio/caf" },
+        .{ accepts_audio and audio_mod.canDecodeMime("audio/basic"), "audio/basic" },
         .{ accepts_document, "application/pdf" },
     }) |mime| {
         if (!mime[0]) continue;
@@ -16452,7 +17252,11 @@ fn appendResolvedInferenceCapabilities(
             std.mem.eql(u8, value, "text/plain") or std.mem.eql(u8, value, "application/json") or
             std.mem.eql(u8, value, "application/pdf") or std.mem.eql(u8, value, "image/png") or
             std.mem.eql(u8, value, "image/jpeg") or std.mem.eql(u8, value, "image/webp") or
-            std.mem.eql(u8, value, "audio/wav") or std.mem.eql(u8, value, "audio/mpeg")) continue;
+            std.mem.eql(u8, value, "audio/wav") or std.mem.eql(u8, value, "audio/mpeg") or
+            std.mem.eql(u8, value, "audio/aac") or std.mem.eql(u8, value, "audio/mp4") or
+            std.mem.eql(u8, value, "audio/ogg") or std.mem.eql(u8, value, "audio/opus") or
+            std.mem.eql(u8, value, "audio/flac") or std.mem.eql(u8, value, "audio/aiff") or
+            std.mem.eql(u8, value, "audio/caf") or std.mem.eql(u8, value, "audio/basic")) continue;
         if (extension_mime_count == max_additional_inference_mime_types)
             return error.InvalidInferenceCapabilities;
         if (mime_index > 0) try buf.append(allocator, ',');
@@ -16471,7 +17275,13 @@ fn appendResolvedInferenceCapabilities(
     try buf.appendSlice(allocator, ",\"prompt_policy\":");
     try jsonEncodeString(buf, allocator, resolvedTaskPromptPolicy(resolved_task));
     try buf.appendSlice(allocator, ",\"borrowed_attachments\":false,\"framed_attachments\":");
-    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or
+        std.mem.eql(u8, resolved_task, "read") or
+        std.mem.eql(u8, resolved_task, "generate") or
+        std.mem.eql(u8, resolved_task, "extract") or
+        std.mem.eql(u8, resolved_task, "chunk") or
+        std.mem.eql(u8, resolved_task, "transcribe") or
+        std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     try buf.appendSlice(allocator, ",\"task_limits\":{");
     inline for ([_]struct { name: []const u8, value: ?usize }{
         .{ .name = "max_text_bytes_per_item", .value = resolved.max_text_bytes_per_item },
@@ -16844,8 +17654,7 @@ fn manifestAcceptsExecutorMime(
         std.mem.eql(u8, mime_type, "image/jpeg") or
         std.mem.eql(u8, mime_type, "image/webp")) and
         image_pipeline.supportsMimeEssence(mime_type)) return true;
-    if ((std.mem.eql(u8, mime_type, "audio/wav") or
-        std.mem.eql(u8, mime_type, "audio/mpeg")) and
+    if (std.mem.startsWith(u8, mime_type, "audio/") and
         audio_mod.canDecodeMime(mime_type)) return true;
     for (manifest.capabilities) |capability| {
         const prefix = "inference.mime_type=";
@@ -16860,6 +17669,56 @@ fn manifestAcceptsExecutorMime(
         }
     }
     return false;
+}
+
+fn canonicalAudioMimeForBytes(declared_mime: []const u8, bytes: []const u8) ![]const u8 {
+    const declared_essence = data_uri_mod.mediaTypeEssence(declared_mime) catch
+        return error.UnsupportedInferenceMimeType;
+    const declared_format = audio_mod.detectFormatFromMime(declared_essence);
+    const detected_format = audio_mod.detectFormat(bytes);
+    if (declared_format) |declared| {
+        if (detected_format) |detected| {
+            if (detected != declared) return error.InvalidInferenceMedia;
+        }
+        if (!audio_mod.canDecodeFormat(declared)) return error.UnsupportedInferenceMimeType;
+        return canonicalAudioMime(declared);
+    }
+    if (!std.ascii.eqlIgnoreCase(declared_essence, "application/octet-stream"))
+        return error.UnsupportedInferenceMimeType;
+    const detected = detected_format orelse return error.InvalidInferenceMedia;
+    if (!audio_mod.canDecodeFormat(detected)) return error.UnsupportedInferenceMimeType;
+    return canonicalAudioMime(detected);
+}
+
+fn canonicalAudioMime(format: audio_mod.EncodedFormat) []const u8 {
+    return switch (format) {
+        .wav => "audio/wav",
+        .mp3 => "audio/mpeg",
+        .aac => "audio/aac",
+        .mp4 => "audio/mp4",
+        .ogg => "audio/ogg",
+        .opus => "audio/opus",
+        .flac => "audio/flac",
+        .aiff => "audio/aiff",
+        .caf => "audio/caf",
+        .au => "audio/basic",
+    };
+}
+
+test "framed transcription canonicalizes generic audio MIME from physical bytes" {
+    const wav = "RIFF\x04\x00\x00\x00WAVE";
+    try std.testing.expectEqualStrings(
+        "audio/wav",
+        try canonicalAudioMimeForBytes("application/octet-stream", wav),
+    );
+    try std.testing.expectEqualStrings(
+        "audio/wav",
+        try canonicalAudioMimeForBytes("audio/x-wav; charset=binary", wav),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceMedia,
+        canonicalAudioMimeForBytes("audio/flac", wav),
+    );
 }
 
 fn validateEncodedImageMime(declared_mime_type: []const u8, bytes: []const u8) !void {
@@ -17229,7 +18088,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 4), resolved.object.get("version").?.integer);
     try std.testing.expectEqualStrings("read", resolved.object.get("task").?.string);
-    try std.testing.expect(!resolved.object.get("framed_attachments").?.bool);
+    try std.testing.expect(resolved.object.get("framed_attachments").?.bool);
     try std.testing.expectEqualStrings(
         if (expected_native) "native" else "serial_compatibility",
         resolved.object.get("batch").?.object.get("mode").?.string,
@@ -18382,6 +19241,102 @@ test "generate parser consumes generic image and audio media parts strictly" {
         error.InvalidInferenceMedia,
         node.parseGenerateMessagesWithBudget(alloc, mismatched.value, &mismatched_budget),
     );
+}
+
+test "generate parser borrows framed media without copying" {
+    const allocator = std.testing.allocator;
+    var png = [_]u8{0} ** 24;
+    png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    std.mem.writeInt(u32, png[16..20], 1, .big);
+    std.mem.writeInt(u32, png[20..24], 1, .big);
+    const request_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/png","data":"attachment:0"}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, allocator, request_json, .{});
+    defer parsed.deinit();
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/png",
+        .data = &png,
+    }};
+    try validateGenerateAttachmentReferences(allocator, parsed.value, attachments.len);
+    var node: Node = undefined;
+    node.config = .{};
+    var budget = RequestMediaBudget.init(128);
+    var messages = try node.parseGenerateMessagesWithBudgetAndAttachments(
+        allocator,
+        parsed.value,
+        &budget,
+        &attachments,
+    );
+    defer messages.deinit();
+    try std.testing.expectEqual(@as(usize, png.len), budget.used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), messages.decoded_images.len);
+    try std.testing.expect(!messages.decoded_image_owned[0]);
+    try std.testing.expect(messages.decoded_images[0].ptr == png[0..].ptr);
+}
+
+test "generate parser releases mixed owned and borrowed media on every allocation failure" {
+    const backing_allocator = std.testing.allocator;
+    const request_json =
+        \\{"model":"m","messages":[{"role":"user","content":[
+        \\  {"type":"media","mime_type":"image/png","data":"attachment:0"},
+        \\  {"type":"media","mime_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}
+        \\]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, request_json, .{});
+    defer parsed.deinit();
+    var png = [_]u8{0} ** 24;
+    png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    std.mem.writeInt(u32, png[16..20], 1, .big);
+    std.mem.writeInt(u32, png[20..24], 1, .big);
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/png",
+        .data = &png,
+    }};
+    var node: Node = undefined;
+    node.config = .{};
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            target: *Node,
+            body: api.GenerateRequest,
+            media: []const httpx.attachment_envelope.Attachment,
+        ) !void {
+            var budget = RequestMediaBudget.init(128);
+            var messages = try target.parseGenerateMessagesWithBudgetAndAttachments(
+                allocator,
+                body,
+                &budget,
+                media,
+            );
+            defer messages.deinit();
+            try std.testing.expectEqual(@as(usize, 2), messages.decoded_images.len);
+            try std.testing.expect(!messages.decoded_image_owned[0]);
+            try std.testing.expect(messages.decoded_image_owned[1]);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &node, parsed.value, &attachments) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
 }
 
 test "generate batch isolates native execution and serializes stateful GPU backends" {
@@ -19555,6 +20510,31 @@ test "direct extraction media shape reserves remote and cumulative inline source
     try std.testing.expectEqual(@as(usize, 1), text_admission.units);
 
     try std.testing.expectError(error.UnexpectedEndOfInput, addDirectExtractionContentMediaShape(allocator, &text_shape, "{"));
+}
+
+test "extraction framed attachments preserve input identity and borrowed bytes" {
+    const allocator = std.testing.allocator;
+    const request_json =
+        \\{"model":"m","inputs":[{"id":"page-1","content":[{"type":"text","text":"ocr"},{"type":"media","mime_type":"image/png","data":"attachment:0"}]}],"schema":{"structures":{"page":{"fields":{"text":{"type":"str"}}}}}}
+    ;
+    var parsed = try std.json.parseFromSlice(extraction_api.ExtractionRequest, allocator, request_json, .{});
+    defer parsed.deinit();
+    const bytes = [_]u8{ 1, 2, 3 };
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/png",
+        .data = &bytes,
+    }};
+    const resolved = try extractionAttachmentsFromEnvelope(
+        allocator,
+        parsed.value.inputs,
+        &attachments,
+        true,
+    );
+    defer allocator.free(resolved);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved[0].input_index);
+    try std.testing.expect(resolved[0].bytes.ptr == bytes[0..].ptr);
+    try std.testing.expectEqualStrings("image/png", resolved[0].mime_type);
 }
 
 test "read image preflight maps malformed dimension and aggregate errors before model load" {
@@ -21816,6 +22796,43 @@ test "chunk request input parser accepts valid text and media" {
     try std.testing.expectEqualStrings("hello", media_input.binary.data);
 }
 
+test "chunk request input parser borrows exactly one framed attachment" {
+    var media_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/gif\"}",
+        .{},
+    );
+    defer media_parsed.deinit();
+    const bytes = "GIF89a";
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/gif",
+        .data = bytes,
+    }};
+    var input = try parseChunkRequestInputWithAttachments(
+        std.testing.allocator,
+        media_parsed.value,
+        &attachments,
+    );
+    defer input.deinit(std.testing.allocator);
+    try std.testing.expect(!input.owns_binary);
+    try std.testing.expectEqual(@intFromPtr(bytes.ptr), @intFromPtr(input.value.binary.data.ptr));
+    try std.testing.expectEqualStrings(bytes, input.value.binary.data);
+
+    const mismatched = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/png",
+        .data = bytes,
+    }};
+    try std.testing.expectError(
+        error.ChunkMediaDataMimeTypeMismatch,
+        parseChunkRequestInputWithAttachments(std.testing.allocator, media_parsed.value, &mismatched),
+    );
+    try std.testing.expectError(
+        error.UnexpectedAttachmentReference,
+        parseChunkRequestInputWithAttachments(std.testing.allocator, media_parsed.value, &.{}),
+    );
+}
+
 fn dirContainsModel(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
     inline for ([_][]const u8{ "/tokenizer.json", "/config.json", "/genai_config.json", "/model.onnx", "/model_i8.onnx", "/onnx/model.onnx" }) |suffix| {
@@ -21890,11 +22907,119 @@ fn jsonBytesResponse(ctx: *httpx.Context, body: []const u8) !httpx.Response {
     return ctx.response.build();
 }
 
-fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !lib_chunker.Input {
+const ParsedChunkRequestInput = struct {
+    value: lib_chunker.Input,
+    owns_binary: bool = false,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        if (self.owns_binary) switch (self.value) {
+            .binary => |binary| allocator.free(binary.data),
+            .text => {},
+        };
+        self.* = undefined;
+    }
+};
+
+const ChunkInputAdmission = struct {
+    units: usize,
+    max_owned_output_bytes: usize,
+};
+
+fn chunkInputWorkingAdmission(
+    self: *const Node,
+    input: ParsedChunkRequestInput,
+    config: lib_chunker.FixedChunkConfig,
+    base_units: usize,
+) !ChunkInputAdmission {
+    const binary = switch (input.value) {
+        .text => return .{
+            .units = base_units,
+            .max_owned_output_bytes = lib_chunker.default_max_chunk_owned_output_bytes,
+        },
+        .binary => |value| value,
+    };
+    var additional_bytes: usize = if (input.owns_binary) binary.data.len else 0;
+    var max_owned_output_bytes: usize = 0;
+    var response_binary_bytes: usize = binary.data.len;
+    const mime_type = data_uri_mod.mediaTypeEssence(binary.mime_type) catch
+        return error.InvalidMediaType;
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/gif")) {
+        const info = try image_pipeline.inspectEncodedForInference(
+            binary.data,
+            effectiveRequestContentSecurity(self).max_image_dimension,
+        );
+        const frame_pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
+            return error.ImageTooLarge;
+        const max_frames = if (config.max_chunks > 0) config.max_chunks else (lib_chunker.FixedChunkConfig{}).max_chunks;
+        const potential_pixels = std.math.mul(usize, frame_pixels, max_frames) catch
+            std.math.maxInt(usize);
+        const admitted_pixels = @min(
+            potential_pixels,
+            default_max_read_decoded_working_bytes / read_decoded_working_bytes_per_pixel,
+        );
+        const pixel_output_bytes = std.math.mul(usize, potential_pixels, 5) catch
+            std.math.maxInt(usize);
+        const frame_overhead_bytes = std.math.mul(usize, max_frames, 128) catch
+            std.math.maxInt(usize);
+        max_owned_output_bytes = @min(
+            std.math.add(usize, pixel_output_bytes, frame_overhead_bytes) catch std.math.maxInt(usize),
+            lib_chunker.default_max_chunk_owned_output_bytes,
+        );
+        response_binary_bytes = max_owned_output_bytes;
+        additional_bytes = std.math.add(
+            usize,
+            additional_bytes,
+            std.math.mul(usize, admitted_pixels, read_decoded_working_bytes_per_pixel) catch
+                std.math.maxInt(usize),
+        ) catch std.math.maxInt(usize);
+    } else if (std.ascii.eqlIgnoreCase(mime_type, "audio/wav") or
+        std.ascii.eqlIgnoreCase(mime_type, "audio/x-wav"))
+    {
+        const audio_working_bytes = @min(
+            std.math.mul(usize, binary.data.len, 8) catch std.math.maxInt(usize),
+            default_max_audio_decode_working_bytes,
+        );
+        max_owned_output_bytes = @min(
+            audio_working_bytes,
+            lib_chunker.default_max_chunk_owned_output_bytes,
+        );
+        response_binary_bytes = max_owned_output_bytes;
+        additional_bytes = std.math.add(usize, additional_bytes, audio_working_bytes) catch
+            std.math.maxInt(usize);
+    }
+    // Binary JSON responses retain the transformed/pass-through bytes, their
+    // base64 field, and the final serialized response body concurrently. The
+    // input envelope is already represented by base_units.
+    const encoded_response_bytes = std.base64.standard.Encoder.calcSize(response_binary_bytes);
+    additional_bytes = std.math.add(
+        usize,
+        additional_bytes,
+        std.math.mul(usize, encoded_response_bytes, 2) catch std.math.maxInt(usize),
+    ) catch std.math.maxInt(usize);
+    const units = std.math.add(
+        usize,
+        base_units,
+        admissionUnitsFor(additional_bytes, read_admission_bytes_per_unit),
+    ) catch std.math.maxInt(usize);
+    return .{
+        .units = units,
+        .max_owned_output_bytes = if (max_owned_output_bytes > 0)
+            max_owned_output_bytes
+        else
+            lib_chunker.default_max_chunk_owned_output_bytes,
+    };
+}
+
+fn parseChunkRequestInputWithAttachments(
+    allocator: std.mem.Allocator,
+    input: std.json.Value,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) !ParsedChunkRequestInput {
     return switch (input) {
         .string => |s| blk: {
             if (s.len == 0) return error.ChunkInputRequired;
-            break :blk .{ .text = s };
+            if (attachments.len != 0) return error.AttachmentReferenceRequired;
+            break :blk .{ .value = .{ .text = s } };
         },
         .object => |obj| blk: {
             const type_val = obj.get("type") orelse return error.UnsupportedChunkInputContentPartType;
@@ -21902,7 +23027,8 @@ fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !
             if (std.mem.eql(u8, type_val.string, "text")) {
                 const text_val = obj.get("text") orelse return error.ChunkTextContentPartMissingText;
                 if (text_val != .string or text_val.string.len == 0) return error.ChunkTextContentPartMissingText;
-                break :blk .{ .text = text_val.string };
+                if (attachments.len != 0) return error.AttachmentReferenceRequired;
+                break :blk .{ .value = .{ .text = text_val.string } };
             }
             if (!std.mem.eql(u8, type_val.string, "media")) return error.UnsupportedChunkInputContentPartType;
 
@@ -21913,6 +23039,20 @@ fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !
             if (mime_val != .string) return error.ChunkMediaMimeTypeMustBeString;
             if (std.mem.trim(u8, mime_val.string, &std.ascii.whitespace).len == 0) return error.ChunkMediaContentPartMissingMimeType;
 
+            if (try parseAttachmentUrl(data_val.string)) |attachment_index| {
+                if (attachments.len == 0) return error.UnexpectedAttachmentReference;
+                if (attachment_index >= attachments.len) return error.AttachmentIndexOutOfBounds;
+                if (attachments.len != 1) return error.AttachmentReferenceRequired;
+                const attachment = attachments[attachment_index];
+                if (!mediaMimeMatches(mime_val.string, attachment.mime_type))
+                    return error.ChunkMediaDataMimeTypeMismatch;
+                break :blk .{ .value = .{ .binary = .{
+                    .mime_type = mime_val.string,
+                    .data = attachment.data,
+                } } };
+            }
+            if (attachments.len != 0) return error.AttachmentReferenceRequired;
+
             var decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.ChunkInvalidBase64Data;
             const decoded = decoded_payload.data;
             errdefer decoded_payload.deinit(allocator);
@@ -21921,13 +23061,18 @@ fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !
             if (decoded_payload.mime_type) |mime_type| allocator.free(mime_type);
             decoded_payload.mime_type = null;
             decoded_payload.data = &.{};
-            break :blk .{ .binary = .{
+            break :blk .{ .value = .{ .binary = .{
                 .mime_type = mime_val.string,
                 .data = decoded,
-            } };
+            } }, .owns_binary = true };
         },
         else => error.ChunkInputMustBeStringOrContentPartObject,
     };
+}
+
+fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !lib_chunker.Input {
+    const parsed = try parseChunkRequestInputWithAttachments(allocator, input, &.{});
+    return parsed.value;
 }
 
 fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
@@ -21949,11 +23094,97 @@ fn canonicalFixedChunkModel(raw: []const u8) ?[]const u8 {
     return null;
 }
 
+fn applyFixedChunkConfig(config: *lib_chunker.FixedChunkConfig, raw: api.ChunkConfig) !void {
+    var candidate = config.*;
+    if (raw.model) |model| candidate.model = canonicalFixedChunkModel(model) orelse
+        return error.UnsupportedChunkingModel;
+    if (raw.max_chunks) |value| {
+        if (value < 0 or value > max_chunk_results) return error.InvalidMaxChunks;
+        if (value > 0) candidate.max_chunks = @intCast(value);
+    }
+    if (raw.threshold) |value| {
+        if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidChunkThreshold;
+        candidate.threshold = value;
+    }
+    if (raw.text) |text| {
+        if (text.target_tokens) |value| {
+            if (value < 0 or value > max_chunk_target_tokens) return error.InvalidChunkTargetTokens;
+            if (value > 0) candidate.text.target_tokens = @intCast(value);
+        }
+        if (text.overlap_tokens) |value| {
+            if (value < 0 or value > max_chunk_target_tokens) return error.InvalidChunkOverlapTokens;
+            candidate.text.overlap_tokens = @intCast(value);
+        }
+        if (text.separator) |separator| candidate.text.separator = separator;
+    }
+    if (candidate.text.overlap_tokens >= candidate.text.target_tokens)
+        return error.InvalidChunkOverlapTokens;
+    if (raw.audio) |audio| {
+        if (audio.window_duration_ms) |value| {
+            if (value < 0 or value > max_chunk_audio_window_ms) return error.InvalidChunkAudioWindow;
+            if (value > 0) candidate.audio.window_duration_ms = @intCast(value);
+        }
+        if (audio.overlap_duration_ms) |value| {
+            if (value < 0 or value > max_chunk_audio_window_ms) return error.InvalidChunkAudioOverlap;
+            candidate.audio.overlap_duration_ms = @intCast(value);
+        }
+    }
+    if (candidate.audio.overlap_duration_ms >= candidate.audio.window_duration_ms)
+        return error.InvalidChunkAudioOverlap;
+    try candidate.validate();
+    config.* = candidate;
+}
+
+fn fixedChunkConfigErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnsupportedChunkingModel => "unsupported chunking model",
+        error.InvalidMaxChunks => "max_chunks must be between 0 and 4096",
+        error.InvalidChunkThreshold => "threshold must be finite and between 0 and 1",
+        error.InvalidChunkTargetTokens => "text.target_tokens is outside the supported range",
+        error.InvalidChunkOverlapTokens => "text.overlap_tokens must be non-negative and less than target_tokens",
+        error.InvalidChunkAudioWindow => "audio.window_duration_ms is outside the supported range",
+        error.InvalidChunkAudioOverlap => "audio.overlap_duration_ms must be non-negative and less than window_duration_ms",
+        else => "invalid chunking config",
+    };
+}
+
 test "fixed chunk model aliases canonicalize and semantic models fail closed" {
     for ([_][]const u8{ "", "fixed", "fixed_bert", "fixed_bpe", "fixed-bert-tokenizer" }) |alias| {
         try std.testing.expectEqualStrings("fixed", canonicalFixedChunkModel(alias).?);
     }
     try std.testing.expect(canonicalFixedChunkModel("owner/semantic-chunker") == null);
+}
+
+test "fixed chunk config rejects signed traps and unbounded work" {
+    var config = lib_chunker.FixedChunkConfig{};
+    try std.testing.expectError(
+        error.InvalidMaxChunks,
+        applyFixedChunkConfig(&config, .{ .max_chunks = -1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidMaxChunks,
+        applyFixedChunkConfig(&config, .{ .max_chunks = max_chunk_results + 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidChunkOverlapTokens,
+        applyFixedChunkConfig(&config, .{ .text = .{ .target_tokens = 10, .overlap_tokens = 10 } }),
+    );
+    try std.testing.expectError(
+        error.InvalidChunkAudioOverlap,
+        applyFixedChunkConfig(&config, .{ .audio = .{ .window_duration_ms = 100, .overlap_duration_ms = 100 } }),
+    );
+
+    config = .{};
+    try applyFixedChunkConfig(&config, .{
+        .max_chunks = 8,
+        .threshold = 0.5,
+        .text = .{ .target_tokens = 32, .overlap_tokens = 4 },
+        .audio = .{ .window_duration_ms = 1000, .overlap_duration_ms = 100 },
+    });
+    try std.testing.expectEqual(@as(usize, 8), config.max_chunks);
+    try std.testing.expectEqual(@as(usize, 32), config.text.target_tokens);
+    try std.testing.expectEqual(@as(usize, 4), config.text.overlap_tokens);
+    try std.testing.expectEqual(@as(usize, 1000), config.audio.window_duration_ms);
 }
 
 fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
@@ -21968,6 +23199,10 @@ fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
         error.ChunkMediaMimeTypeMustBeString => "media 'mime_type' must be a string",
         error.ChunkInvalidBase64Data => "invalid base64 data",
         error.ChunkMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+        error.AttachmentReferenceRequired => "every framed chunk attachment must be referenced exactly once",
+        error.AttachmentIndexOutOfBounds => "attachment index is outside the framed attachment table",
+        error.UnexpectedAttachmentReference => "attachment content parts require the framed attachment transport",
+        error.InvalidAttachmentReference => "invalid framed attachment reference",
         error.ChunkInputMustBeStringOrContentPartObject => "'input' must be a string or content part object",
         else => "invalid chunk input",
     };
@@ -22220,6 +23455,120 @@ fn attachmentEnvelopeErrorMessage(err: anyerror) []const u8 {
         error.UnsupportedAttachmentEnvelope => "unsupported attachment envelope version or flags",
         else => "malformed attachment envelope",
     };
+}
+
+fn requestUsesAttachmentEnvelope(ctx: *httpx.Context) bool {
+    const content_type = ctx.header("Content-Type") orelse return false;
+    const separator = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    return std.ascii.eqlIgnoreCase(
+        std.mem.trim(u8, content_type[0..separator], " \t"),
+        httpx.attachment_envelope.content_type,
+    );
+}
+
+fn parseAttachmentUrl(url: []const u8) !?usize {
+    const prefix = "attachment:";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    const digits = url[prefix.len..];
+    if (digits.len == 0) return error.InvalidAttachmentReference;
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidAttachmentReference;
+    if (digits.len > 1 and digits[0] == '0') return error.InvalidAttachmentReference;
+    return std.fmt.parseUnsigned(usize, digits, 10) catch error.InvalidAttachmentReference;
+}
+
+test "framed read attachment URLs are canonical and bounded integers" {
+    try std.testing.expect((try parseAttachmentUrl("https://example.com/page.png")) == null);
+    try std.testing.expectEqual(@as(?usize, 0), try parseAttachmentUrl("attachment:0"));
+    try std.testing.expectEqual(@as(?usize, 42), try parseAttachmentUrl("attachment:42"));
+    try std.testing.expectError(error.InvalidAttachmentReference, parseAttachmentUrl("attachment:"));
+    try std.testing.expectError(error.InvalidAttachmentReference, parseAttachmentUrl("attachment:01"));
+    try std.testing.expectError(error.InvalidAttachmentReference, parseAttachmentUrl("attachment:-1"));
+}
+
+fn validateGenerateBatchAttachmentReferences(
+    allocator: std.mem.Allocator,
+    body: api.GenerateBatchRequest,
+    attachment_count: usize,
+) !void {
+    const seen = try allocator.alloc(bool, attachment_count);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var reference_count: usize = 0;
+    for (body.requests) |request| for (request.body.messages) |message| {
+        const content = message.content orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string or !std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            if (data != .string) continue;
+            const attachment_index = (try parseAttachmentUrl(data.string)) orelse continue;
+            if (attachment_count == 0) return error.UnexpectedAttachmentReference;
+            if (attachment_index >= attachment_count) return error.AttachmentIndexOutOfBounds;
+            if (seen[attachment_index]) return error.DuplicateAttachmentReference;
+            seen[attachment_index] = true;
+            reference_count += 1;
+        }
+    };
+    if (reference_count != attachment_count) return error.AttachmentReferenceRequired;
+}
+
+fn validateGenerateAttachmentReferences(
+    allocator: std.mem.Allocator,
+    body: api.GenerateRequest,
+    attachment_count: usize,
+) !void {
+    const seen = try allocator.alloc(bool, attachment_count);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var reference_count: usize = 0;
+    for (body.messages) |message| {
+        const content = message.content orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string or !std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            if (data != .string) continue;
+            const attachment_index = (try parseAttachmentUrl(data.string)) orelse continue;
+            if (attachment_count == 0) return error.UnexpectedAttachmentReference;
+            if (attachment_index >= attachment_count) return error.AttachmentIndexOutOfBounds;
+            if (seen[attachment_index]) return error.DuplicateAttachmentReference;
+            seen[attachment_index] = true;
+            reference_count += 1;
+        }
+    }
+    if (reference_count != attachment_count) return error.AttachmentReferenceRequired;
+}
+
+fn validateMultimodalRerankAttachmentReferences(
+    allocator: std.mem.Allocator,
+    body: api.RerankMultimodalRequest,
+    attachment_count: usize,
+) !void {
+    const seen = try allocator.alloc(bool, attachment_count);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var reference_count: usize = 0;
+    for (body.documents) |document| {
+        if (document.content != .array) continue;
+        for (document.content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string or !std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            if (data != .string) continue;
+            const attachment_index = (try parseAttachmentUrl(data.string)) orelse continue;
+            if (attachment_count == 0) return error.UnexpectedAttachmentReference;
+            if (attachment_index >= attachment_count) return error.AttachmentIndexOutOfBounds;
+            if (seen[attachment_index]) return error.DuplicateAttachmentReference;
+            seen[attachment_index] = true;
+            reference_count += 1;
+        }
+    }
+    if (reference_count != attachment_count) return error.AttachmentReferenceRequired;
 }
 
 fn embedAttachmentReferenceErrorMessage(err: anyerror) []const u8 {
@@ -24460,6 +25809,36 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
     try std.testing.expectEqual(@as(u8, 1), doc.images[1][0]);
 }
 
+test "multimodal rerank parser borrows framed image attachments" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"m","query":"q","documents":[{"content":[{"type":"media","mime_type":"image/png","data":"attachment:0"}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, allocator, body, .{});
+    defer parsed.deinit();
+    var png = [_]u8{0} ** 24;
+    png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{
+        .mime_type = "image/png",
+        .data = &png,
+    }};
+    try validateMultimodalRerankAttachmentReferences(allocator, parsed.value, attachments.len);
+    var node: Node = undefined;
+    node.config = .{};
+    var budget = RequestMediaBudget.init(128);
+    var document = try node.parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
+        allocator,
+        parsed.value.documents[0].content,
+        &budget,
+        &attachments,
+    );
+    defer document.deinit();
+    try std.testing.expectEqual(@as(usize, png.len), budget.used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), document.images.len);
+    try std.testing.expect(!document.image_owned[0]);
+    try std.testing.expect(document.images[0].ptr == png[0..].ptr);
+}
+
 test "Qwen3-VL multimodal reranker reserves projector scratch before execution" {
     var png = [_]u8{0} ** 24;
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
@@ -24467,11 +25846,13 @@ test "Qwen3-VL multimodal reranker reserves projector scratch before execution" 
     std.mem.writeInt(u32, png[16..20], 227, .big);
     std.mem.writeInt(u32, png[20..24], 149, .big);
     var images = [_][]const u8{png[0..]};
+    var image_owned = [_]bool{false};
     const documents = [_]Node.ParsedMultimodalRerankDocument{.{
         .allocator = std.testing.allocator,
         .text = &.{},
         .qwen_content = &.{},
         .images = images[0..],
+        .image_owned = image_owned[0..],
     }};
     const config = gpt_model_mod.Config{
         .family = .qwen3_vl,
@@ -24808,6 +26189,13 @@ fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDe
 }
 
 fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionShape {
+    return generateRequestMediaShapeWithAttachments(body, &.{});
+}
+
+fn generateRequestMediaShapeWithAttachments(
+    body: api.GenerateRequest,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
     for (body.messages) |message| {
         const content = message.content orelse continue;
@@ -24826,6 +26214,13 @@ fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionSha
             const mime = part.object.get("mime_type") orelse continue;
             if (data != .string or mime != .string) continue;
             const is_image = std.ascii.startsWithIgnoreCase(mime.string, "image/");
+            if (parseAttachmentUrl(data.string) catch null) |attachment_index| {
+                if (attachment_index < attachments.len) {
+                    shape.addBorrowed(attachments[attachment_index].data.len, is_image);
+                    shape.has_audio = shape.has_audio or std.ascii.startsWithIgnoreCase(mime.string, "audio/");
+                    continue;
+                }
+            }
             shape.addEncodedInline(data.string, is_image);
             shape.has_audio = shape.has_audio or std.ascii.startsWithIgnoreCase(mime.string, "audio/");
         }
@@ -24945,9 +26340,20 @@ fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestM
             const data = part.object.get("data") orelse continue;
             const mime = part.object.get("mime_type") orelse continue;
             if (data != .string or mime != .string or !std.ascii.startsWithIgnoreCase(mime.string, "image/")) continue;
+            if ((parseAttachmentUrl(data.string) catch null) != null) continue;
             shape.addInline(data.string.len, true);
         }
     }
+    return shape;
+}
+
+fn multimodalRerankRequestMediaShapeWithAttachments(
+    body: api.RerankMultimodalRequest,
+    attachments: []const httpx.attachment_envelope.Attachment,
+) RequestMediaAdmissionShape {
+    var shape = multimodalRerankRequestMediaShape(body);
+    for (attachments) |attachment|
+        shape.addBorrowed(attachment.data.len, std.ascii.startsWithIgnoreCase(attachment.mime_type, "image/"));
     return shape;
 }
 

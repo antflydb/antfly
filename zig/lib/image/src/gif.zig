@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const test_support = @import("test_support.zig");
+const DecodeLimits = @import("limits.zig").DecodeLimits;
 
 const Allocator = std.mem.Allocator;
 
@@ -89,19 +90,42 @@ const Parser = struct {
 };
 
 pub fn decodeFramesAlloc(alloc: Allocator, gif_bytes: []const u8) ![]Frame {
-    return decodeFramesAllocLimited(alloc, gif_bytes, null);
+    return decodeFramesAllocLimited(alloc, gif_bytes, null, null);
+}
+
+/// Decode at most `max_frames` while bounding the aggregate retained RGBA
+/// payload. The parser stops as soon as the requested output window is full,
+/// so callers do not pay to decode frames they will discard.
+pub fn decodeFramesAllocBounded(
+    alloc: Allocator,
+    gif_bytes: []const u8,
+    max_frames: usize,
+    max_total_rgba_bytes: usize,
+) ![]Frame {
+    if (max_frames == 0 or max_total_rgba_bytes == 0) return error.ImageTooLarge;
+    return decodeFramesAllocLimited(alloc, gif_bytes, max_frames, max_total_rgba_bytes);
 }
 
 /// Decode only the first rendered frame. Inference consumes a still image, so
 /// retaining every animation frame only multiplies untrusted working memory.
 pub fn decodeFirstFrameAlloc(alloc: Allocator, gif_bytes: []const u8) !Frame {
-    const frames = try decodeFramesAllocLimited(alloc, gif_bytes, 1);
+    const frames = try decodeFramesAllocLimited(
+        alloc,
+        gif_bytes,
+        1,
+        DecodeLimits.inference_default.max_rgba_bytes,
+    );
     defer alloc.free(frames);
     if (frames.len == 0) return error.GifDecodeFailed;
     return frames[0];
 }
 
-fn decodeFramesAllocLimited(alloc: Allocator, gif_bytes: []const u8, max_frames: ?usize) ![]Frame {
+fn decodeFramesAllocLimited(
+    alloc: Allocator,
+    gif_bytes: []const u8,
+    max_frames: ?usize,
+    max_total_rgba_bytes: ?usize,
+) ![]Frame {
     var parser = Parser{ .bytes = gif_bytes };
 
     const header = try parser.readSlice(6);
@@ -110,6 +134,8 @@ fn decodeFramesAllocLimited(alloc: Allocator, gif_bytes: []const u8, max_frames:
     const screen_width = try parser.readU16();
     const screen_height = try parser.readU16();
     if (screen_width == 0 or screen_height == 0) return error.GifDecodeFailed;
+    if (max_total_rgba_bytes != null)
+        try DecodeLimits.inference_default.validate(screen_width, screen_height);
 
     const packed_fields = try parser.readByte();
     const global_color_table_flag = (packed_fields & 0x80) != 0;
@@ -130,6 +156,7 @@ fn decodeFramesAllocLimited(alloc: Allocator, gif_bytes: []const u8, max_frames:
     }
 
     const canvas_len = @as(usize, screen_width) * @as(usize, screen_height) * 4;
+    if (max_total_rgba_bytes) |limit| if (canvas_len > limit) return error.ImageTooLarge;
     const canvas = try alloc.alloc(u8, canvas_len);
     defer alloc.free(canvas);
     fillCanvas(canvas, background_rgba);
@@ -195,6 +222,11 @@ fn decodeFramesAllocLimited(alloc: Allocator, gif_bytes: []const u8, max_frames:
                 @memcpy(previous_canvas, canvas);
                 try drawFrame(canvas, screen_width, screen_height, descriptor, indices, &palette);
 
+                if (max_total_rgba_bytes) |limit| {
+                    const retained_bytes = std.math.mul(usize, frames.items.len, canvas_len) catch
+                        return error.ImageTooLarge;
+                    if (canvas_len > limit -| retained_bytes) return error.ImageTooLarge;
+                }
                 const rgba = try alloc.dupe(u8, canvas);
                 try frames.append(alloc, .{
                     .rgba = rgba,

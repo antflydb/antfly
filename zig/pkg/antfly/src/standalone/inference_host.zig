@@ -1074,6 +1074,16 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .max_tokens = decoded.metadata.value.max_tokens,
                 .source_fingerprint = decoded.metadata.value.source_fingerprint,
             };
+            const ReadCancellation = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
+                    return view.requested();
+                }
+            };
+            const executor_cancellation = inference.server.ExecutorCancellation{
+                .ptr = &context.cancellation,
+                .is_cancelled_fn = ReadCancellation.requested,
+            };
             if (state.read_raster_images_override == null) {
                 const capabilities = try localModelCapabilities(
                     &state.node,
@@ -1103,10 +1113,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var batch = if (state.read_raster_images_override) |handler|
                 try handler.read(alloc, decoded.metadata.value.model, raster_request)
             else
-                try state.node.readRasterImagesReportedDirect(
+                try state.node.readRasterImagesReportedDirectWithContext(
                     alloc,
                     decoded.metadata.value.model,
                     raster_request,
+                    deadline_ns,
+                    executor_cancellation,
                 );
             defer batch.deinit(alloc);
             if (batch.items.len != raster_request.images.len)
@@ -2228,21 +2240,31 @@ fn localModelCapabilitiesInScope(
             std.mem.eql(u8, model, "fixed_bpe") or
             std.mem.eql(u8, model, "fixed-bert-tokenizer")))
     {
+        var accepted_mime_types = antfly.inference.work.MimeTypes{
+            .text_plain = true,
+            .image_png = true,
+            .image_jpeg = true,
+            .image_webp = true,
+            .audio_wav = true,
+        };
+        try accepted_mime_types.add("image/gif");
         return .{
             .task = .chunk,
-            .input_modalities = .{ .text = true },
-            .accepted_mime_types = .{ .text_plain = true },
+            .input_modalities = .{ .text = true, .image = true, .audio = true },
+            .accepted_mime_types = accepted_mime_types,
             .input_granularity = .item,
             .batch = .{
                 .mode = .none,
                 .preferred_items = 1,
                 .max_items = 1,
-                .max_encoded_media_bytes = 0,
+                .max_encoded_media_bytes = inference.server.requestMediaMaxBytes(node),
+                .max_decoded_pixels = inference.server.requestMediaMaxDecodedPixels(node, 1),
+                .max_media_parts_per_item = 1,
             },
             .output = .chunks,
             .result_cardinality = .one_per_request,
             .prompt_policy = .model_default,
-            .borrowed_attachments = false,
+            .borrowed_attachments = true,
         };
     }
     const scope = scope_override orelse switch (task) {

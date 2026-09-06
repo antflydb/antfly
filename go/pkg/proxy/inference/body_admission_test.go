@@ -60,7 +60,7 @@ func TestByteAdmissionWakesBlockedWaiterAfterRelease(t *testing.T) {
 	}
 }
 
-func TestByteAdmissionDoesNotStarveOlderLargeWaiter(t *testing.T) {
+func TestByteAdmissionUsesSlackWithoutStarvingOlderLargeWaiter(t *testing.T) {
 	admission := newByteAdmission(10)
 	if err := admission.Acquire(context.Background(), 6); err != nil {
 		t.Fatal(err)
@@ -72,12 +72,10 @@ func TestByteAdmissionDoesNotStarveOlderLargeWaiter(t *testing.T) {
 
 	small := make(chan error, 1)
 	go func() { small <- admission.Acquire(context.Background(), 4) }()
-	waitForAdmissionWaiters(t, admission, 2)
-	select {
-	case err := <-small:
-		t.Fatalf("newer small waiter bypassed queue with error %v", err)
-	default:
+	if err := receiveAdmission(t, small); err != nil {
+		t.Fatal(err)
 	}
+	admission.Release(4)
 
 	admission.Release(6)
 	if err := receiveAdmission(t, large); err != nil {
@@ -86,17 +84,46 @@ func TestByteAdmissionDoesNotStarveOlderLargeWaiter(t *testing.T) {
 	if got := admission.Used(); got != 8 {
 		t.Fatalf("used = %d after large grant, want 8", got)
 	}
+	admission.Release(8)
+}
+
+func TestByteAdmissionBoundsBypassOfOlderLargeWaiter(t *testing.T) {
+	admission := newByteAdmission(10)
+	if err := admission.Acquire(context.Background(), 6); err != nil {
+		t.Fatal(err)
+	}
+
+	large := make(chan error, 1)
+	go func() { large <- admission.Acquire(context.Background(), 8) }()
+	waitForAdmissionWaiters(t, admission, 1)
+
+	for i := 0; i < maxByteAdmissionBypasses; i++ {
+		small := make(chan error, 1)
+		go func() { small <- admission.Acquire(context.Background(), 1) }()
+		if err := receiveAdmission(t, small); err != nil {
+			t.Fatal(err)
+		}
+		admission.Release(1)
+	}
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- admission.Acquire(context.Background(), 1) }()
+	waitForAdmissionWaiters(t, admission, 2)
 	select {
-	case err := <-small:
-		t.Fatalf("small waiter acquired before large release with error %v", err)
+	case err := <-blocked:
+		t.Fatalf("small waiter exceeded bounded bypass with error %v", err)
 	default:
 	}
 
-	admission.Release(8)
-	if err := receiveAdmission(t, small); err != nil {
+	admission.Release(6)
+	if err := receiveAdmission(t, large); err != nil {
 		t.Fatal(err)
 	}
-	admission.Release(4)
+	admission.Release(8)
+	if err := receiveAdmission(t, blocked); err != nil {
+		t.Fatal(err)
+	}
+	admission.Release(1)
 }
 
 func TestByteAdmissionCancellationRemovesQueueHead(t *testing.T) {

@@ -160,6 +160,14 @@ pub const MimeTypes = struct {
     image_webp: bool = false,
     audio_wav: bool = false,
     audio_mpeg: bool = false,
+    audio_aac: bool = false,
+    audio_mp4: bool = false,
+    audio_ogg: bool = false,
+    audio_opus: bool = false,
+    audio_flac: bool = false,
+    audio_aiff: bool = false,
+    audio_caf: bool = false,
+    audio_basic: bool = false,
     additional_count: u8 = 0,
     additional: [max_additional_mime_types]StoredMimeEssence = [_]StoredMimeEssence{.{}} ** max_additional_mime_types,
 
@@ -208,6 +216,14 @@ pub const MimeTypes = struct {
         if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return self.image_webp;
         if (std.ascii.eqlIgnoreCase(essence, "audio/wav") or std.ascii.eqlIgnoreCase(essence, "audio/x-wav")) return self.audio_wav;
         if (std.ascii.eqlIgnoreCase(essence, "audio/mpeg")) return self.audio_mpeg;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/aac")) return self.audio_aac;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/mp4")) return self.audio_mp4;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/ogg")) return self.audio_ogg;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/opus")) return self.audio_opus;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/flac")) return self.audio_flac;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/aiff")) return self.audio_aiff;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/caf")) return self.audio_caf;
+        if (std.ascii.eqlIgnoreCase(essence, "audio/basic")) return self.audio_basic;
         for (self.additional[0..self.additional_count]) |*stored| {
             if (std.ascii.eqlIgnoreCase(stored.slice(), essence)) return true;
         }
@@ -245,6 +261,14 @@ const known_mime_fields = [_]KnownMimeField{
     .{ .field = "image_webp", .value = "image/webp" },
     .{ .field = "audio_wav", .value = "audio/wav" },
     .{ .field = "audio_mpeg", .value = "audio/mpeg" },
+    .{ .field = "audio_aac", .value = "audio/aac" },
+    .{ .field = "audio_mp4", .value = "audio/mp4" },
+    .{ .field = "audio_ogg", .value = "audio/ogg" },
+    .{ .field = "audio_opus", .value = "audio/opus" },
+    .{ .field = "audio_flac", .value = "audio/flac" },
+    .{ .field = "audio_aiff", .value = "audio/aiff" },
+    .{ .field = "audio_caf", .value = "audio/caf" },
+    .{ .field = "audio_basic", .value = "audio/basic" },
 };
 
 fn knownMimeName(essence: []const u8) ?[]const u8 {

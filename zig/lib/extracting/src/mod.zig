@@ -53,6 +53,10 @@ pub const Config = struct {
     bearer_token: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
+    /// Runtime-resolved Antfly transport capability. This is deliberately not
+    /// parsed from user configuration: only a successful capability lease may
+    /// enable the task-neutral binary attachment envelope.
+    framed_attachments: bool = false,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
 
@@ -265,6 +269,7 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .bearer_token = bearer_token,
         .capability_token = null,
         .capability_revision = null,
+        .framed_attachments = false,
         .schema_json = schema_json,
         .options_json = options_json,
     };
@@ -281,6 +286,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .bearer_token = if (cfg.bearer_token) |value| try alloc.dupe(u8, value) else null,
         .capability_token = if (cfg.capability_token) |value| try alloc.dupe(u8, value) else null,
         .capability_revision = if (cfg.capability_revision) |value| try alloc.dupe(u8, value) else null,
+        .framed_attachments = cfg.framed_attachments,
         .schema_json = try alloc.dupe(u8, cfg.schema_json),
         .options_json = try alloc.dupe(u8, cfg.options_json),
     };
@@ -372,8 +378,29 @@ const HttpExtractorState = struct {
 
     fn extract(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
-        const body = try requestJsonAlloc(alloc, self.cfg, req);
-        defer alloc.free(body);
+        const metadata = try requestJsonAlloc(alloc, self.cfg, req);
+        defer alloc.free(metadata);
+        const use_framed_transport = self.cfg.provider == .antfly and
+            self.cfg.framed_attachments and req.attachments.len > 0;
+        var framed_body: ?[]u8 = null;
+        defer if (framed_body) |body| alloc.free(body);
+        if (use_framed_transport) {
+            const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, req.attachments.len);
+            defer alloc.free(attachments);
+            var attachment_index: usize = 0;
+            for (req.inputs, 0..) |_, input_index| {
+                for (req.attachments) |attachment| {
+                    if (attachment.input_index != input_index) continue;
+                    attachments[attachment_index] = .{
+                        .mime_type = attachment.mime_type,
+                        .data = attachment.bytes,
+                    };
+                    attachment_index += 1;
+                }
+            }
+            std.debug.assert(attachment_index == attachments.len);
+            framed_body = try httpx.attachment_envelope.encodeAlloc(alloc, metadata, attachments);
+        }
 
         const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
             .antfly => "http://127.0.0.1:8080",
@@ -401,8 +428,11 @@ const HttpExtractorState = struct {
         if (self.cfg.capability_revision) |revision|
             try headers.append(alloc, .{ "X-Antfly-Capability-Revision", revision });
 
+        if (use_framed_transport)
+            try headers.append(alloc, .{ "Content-Type", httpx.attachment_envelope.content_type });
         var resp = try self.http.post(url, .{
-            .json = body,
+            .json = if (use_framed_transport) null else metadata,
+            .borrowed_body = framed_body,
             .headers = headers.items,
             .timeout_ms = self.timeout_ms,
             .max_response_size = req.max_response_bytes,
@@ -432,6 +462,7 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
     try out.appendSlice(alloc, "{\"model\":");
     try appendJsonString(alloc, &out, cfg.model);
     try out.appendSlice(alloc, ",\"inputs\":[");
+    var attachment_cursor: usize = 0;
     for (req.inputs, 0..) |input, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');
@@ -443,7 +474,14 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
         }
         if (!first) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"content\":");
-        const content_json = try inputContentJsonAlloc(alloc, req, i, input.content_json);
+        const content_json = try inputContentJsonAlloc(
+            alloc,
+            req,
+            i,
+            input.content_json,
+            cfg.provider == .antfly and cfg.framed_attachments,
+            &attachment_cursor,
+        );
         defer alloc.free(content_json);
         try out.appendSlice(alloc, content_json);
         if (input.tokens_json) |tokens_json| {
@@ -473,6 +511,8 @@ fn inputContentJsonAlloc(
     req: Request,
     input_index: usize,
     original: []const u8,
+    framed_attachments: bool,
+    attachment_cursor: *usize,
 ) ![]u8 {
     var attachment_count: usize = 0;
     for (req.attachments) |attachment| {
@@ -503,14 +543,21 @@ fn inputContentJsonAlloc(
     for (req.attachments) |attachment| {
         if (attachment.input_index != input_index) continue;
         if (emitted) try out.append(alloc, ',');
-        const encoded_len = std.base64.standard.Encoder.calcSize(attachment.bytes.len);
-        const encoded = try alloc.alloc(u8, encoded_len);
-        defer alloc.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, attachment.bytes);
         try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
         try appendJsonString(alloc, &out, attachment.mime_type);
         try out.appendSlice(alloc, ",\"data\":");
-        try appendJsonString(alloc, &out, encoded);
+        if (framed_attachments) {
+            const reference = try std.fmt.allocPrint(alloc, "attachment:{d}", .{attachment_cursor.*});
+            defer alloc.free(reference);
+            try appendJsonString(alloc, &out, reference);
+            attachment_cursor.* += 1;
+        } else {
+            const encoded_len = std.base64.standard.Encoder.calcSize(attachment.bytes.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            defer alloc.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, attachment.bytes);
+            try appendJsonString(alloc, &out, encoded);
+        }
         try out.append(alloc, '}');
         emitted = true;
     }
@@ -628,14 +675,32 @@ test "extracting HTTP boundary encodes borrowed media only in final content" {
     const bytes = [_]u8{ 1, 2, 3 };
     const inputs = [_]Input{.{ .content_json = "\"ocr prompt\"" }};
     const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    var attachment_cursor: usize = 0;
     const content = try inputContentJsonAlloc(std.testing.allocator, .{
         .inputs = &inputs,
         .attachments = &attachments,
-    }, 0, inputs[0].content_json);
+    }, 0, inputs[0].content_json, false, &attachment_cursor);
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"mime_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"data\":\"AQID\"") != null);
+}
+
+test "extracting framed boundary uses canonical attachment references" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const inputs = [_]Input{.{ .content_json = "\"ocr prompt\"" }};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    const body = try requestJsonAlloc(std.testing.allocator, .{
+        .provider = .antfly,
+        .model = "extractor",
+        .framed_attachments = true,
+    }, .{
+        .inputs = &inputs,
+        .attachments = &attachments,
+    });
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"attachment:0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "AQID") == null);
 }
 
 test "extracting HTTP boundary rejects attachments without a logical input" {

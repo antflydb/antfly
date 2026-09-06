@@ -1216,10 +1216,11 @@ const RenderWaveControl = struct {
 };
 
 /// Per-batch worker rendezvous. Threads are created once and reused across all
-/// admitted waves in the window. Each task receives a fresh private render
-/// reader. Forks borrow the source's immutable document index, but task-local
-/// font, image, and decode caches are released at the end of every wave so
-/// completed pages cannot consume the budget needed by later pages.
+/// admitted waves in the window. Each lane owns a private render reader. Forks
+/// borrow the source's immutable document index; page-allocator lanes retain
+/// their bounded font cache until the batch ends, while executor-arena lanes
+/// release all reader state at the end of each callback. The shared allocator
+/// remains the hard aggregate cap for both retained caches and page work.
 const RenderBatchThreadControl = struct {
     mutex: std.Io.Mutex = .init,
     wave_ready: std.Io.Condition = .init,
@@ -1315,6 +1316,7 @@ const PageRenderWorker = struct {
     worker_index: usize,
     task_configured: bool = false,
     scratch_initialized: bool = false,
+    scratch_persistent: bool = false,
     compatibility_session: ?*CompatibilityRenderSession = null,
 
     fn initBase(self: *PageRenderWorker, thread_control: *RenderBatchThreadControl, worker_index: usize) void {
@@ -1333,7 +1335,6 @@ const PageRenderWorker = struct {
 
     fn configure(self: *PageRenderWorker, fork_template: *const reader.RenderForkTemplate, prepared: PreparedRenderPage, profile: RenderProfile, output_kind: RenderBatchOutputKind, wave_control: *RenderWaveControl, shared_budget: *RenderBatchBudget, output_allocator: ?Allocator, max_retained_output_bytes: usize, compatibility_session: ?*CompatibilityRenderSession) void {
         std.debug.assert(!self.task_configured);
-        std.debug.assert(self.parsed == null);
         self.request = prepared.request;
         self.profile = profile;
         self.output_kind = output_kind;
@@ -1364,7 +1365,7 @@ const PageRenderWorker = struct {
     }
 
     fn deinitTask(self: *PageRenderWorker) void {
-        self.deinitScratch();
+        if (!self.scratch_persistent) self.deinitScratch();
         if (self.task_configured) {
             if (self.rendered_png) |*rendered| rendered.deinit(self.output_budget.allocator());
             if (self.rendered_raster) |*rendered| rendered.deinit(self.output_budget.allocator());
@@ -1376,6 +1377,7 @@ const PageRenderWorker = struct {
 
     fn deinitLane(self: *PageRenderWorker) void {
         self.deinitTask();
+        self.deinitScratch();
     }
 
     fn threadMain(self: *PageRenderWorker) void {
@@ -1401,20 +1403,32 @@ const PageRenderWorker = struct {
 
     fn runWithScratch(self: *PageRenderWorker, scratch: Allocator, cumulative_accounting: bool) void {
         std.debug.assert(self.task_configured);
-        std.debug.assert(!self.scratch_initialized);
-        self.scratch_budget = .{
-            .backing = scratch,
-            .shared = self.shared_budget,
-            .max_live_bytes = self.shared_budget.max_live_bytes,
-            .account_frees = !cumulative_accounting,
-        };
-        self.parsed = self.fork_template.instantiate(self.scratch_budget.allocator(), self.wave_control.probe()) catch |err| {
-            self.recordRenderFailure(err);
-            if (cumulative_accounting) self.scratch_budget.releaseAllCharges();
-            return;
-        };
-        self.scratch_initialized = true;
-        defer self.deinitScratch();
+        if (!self.scratch_initialized) {
+            self.scratch_budget = .{
+                .backing = scratch,
+                .shared = self.shared_budget,
+                .max_live_bytes = self.shared_budget.max_live_bytes,
+                .account_frees = !cumulative_accounting,
+            };
+            self.parsed = self.fork_template.instantiate(self.scratch_budget.allocator(), self.wave_control.probe()) catch |err| {
+                self.recordRenderFailure(err);
+                if (cumulative_accounting) self.scratch_budget.releaseAllCharges();
+                return;
+            };
+            self.scratch_initialized = true;
+            // Page-allocator lanes live for the entire render batch and can
+            // safely retain immutable parsed-font work between their pages.
+            // Executor scratch is arena-scoped to one callback and must not
+            // escape it.
+            self.scratch_persistent = !cumulative_accounting;
+        } else {
+            std.debug.assert(self.scratch_persistent and !cumulative_accounting);
+            std.debug.assert(self.scratch_budget.backing.ptr == scratch.ptr and
+                self.scratch_budget.backing.vtable == scratch.vtable);
+            self.parsed.?.setCancellationProbe(self.wave_control.probe());
+            self.scratch_budget.limit_exceeded = false;
+        }
+        defer if (cumulative_accounting) self.deinitScratch();
         self.wave_control.probe().check() catch {
             self.failure = error.Canceled;
             return;
@@ -1438,6 +1452,7 @@ const PageRenderWorker = struct {
         self.parsed = null;
         if (!self.scratch_budget.account_frees) self.scratch_budget.releaseAllCharges();
         self.scratch_initialized = false;
+        self.scratch_persistent = false;
     }
 
     fn recordRenderFailure(self: *PageRenderWorker, err: anyerror) void {

@@ -2284,7 +2284,12 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 		reservedAdmissionBytes = actualAdmissionBytes
 	}
 
-	plan, err := parseProxyGenerateBatchPlan(body)
+	routingPayload, usesAttachmentEnvelope, err := proxyRoutingPayload(body, r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, "invalid inference attachment envelope: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	plan, err := parseProxyGenerateBatchPlan(routingPayload)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
 			http.Error(w, "invalid inference request: "+err.Error(), http.StatusRequestEntityTooLarge)
@@ -2295,6 +2300,15 @@ func (p *Proxy) proxyGenerateBatchRequest(w http.ResponseWriter, r *http.Request
 	}
 	if !plan.mixed {
 		p.proxyRequestWithBody(w, r, "generate.batch", start, routing, body)
+		return
+	}
+	// A capability lease and its framing contract belong to one resolved model.
+	// Partitioning a framed mixed-model request would require copying large
+	// attachments into new request bodies and would make one outer capability
+	// token ambiguously authorize several backends. Keep the wire invariant
+	// explicit: producers group framed work by model before transport.
+	if usesAttachmentEnvelope {
+		http.Error(w, "invalid inference request: framed generate batches must contain one model", http.StatusBadRequest)
 		return
 	}
 	groups := make([]proxyGenerateBatchGroup, 0, len(plan.items))
@@ -4232,7 +4246,12 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 // path for each homogeneous partition so direct and fan-out execution retain
 // identical route and capability-lease behavior.
 func (p *Proxy) proxyRequestWithBody(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext, body []byte) {
-	model, err := proxyRequestModel(body, operation)
+	routingPayload, _, err := proxyRoutingPayload(body, r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, "invalid inference attachment envelope: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	model, err := proxyRequestModel(routingPayload, operation)
 	if err != nil {
 		if errors.Is(err, errProxyGenerateBatchTooLarge) {
 			http.Error(w, "invalid inference request: "+err.Error(), http.StatusRequestEntityTooLarge)

@@ -327,10 +327,11 @@ extractors/classifiers, chunkers, rewriters, and transcribers.
 
 ### Generic attachment transport ABI
 
-Reader, generator, embedder, and extractor invocations use one versioned
-borrowed attachment representation. The same representation is available to
-future multimodal rerankers, classifiers, rewriters, transcribers, or other
-task families without changing document preparation:
+Reader, generator, embedder, extractor, multimodal reranker, chunker, and
+transcriber invocations use one versioned borrowed attachment representation.
+Text-only classifiers, rewriters, and rerankers need no binary attachment, but
+can adopt the same representation if a future executor accepts media without
+changing document preparation:
 
 ```zig
 const Attachment = extern struct {
@@ -352,20 +353,21 @@ pointer/count consistency, indexes, MIME types, byte limits, and per-item
 cardinality before borrowing memory. Unsupported remote transports perform
 base64 or multipart adaptation only at their final provider boundary.
 
-Distributed Antfly-to-Antfly embedding traffic now negotiates a versioned
-binary envelope containing bounded JSON metadata, attachment descriptors, MIME
-essences, and raw attachment bytes. The receiver validates reserved fields,
-declared lengths, aggregate limits, trailing data, attachment indexes, and exact
-reference cardinality before preprocessing. `framed_attachments` is an additive
-v4 capability bit: older clients ignore it, newer clients default it to false
-for older nodes, and the leased concrete route remains the sole transport
-authority. External providers and unconverted task endpoints retain their
-admitted JSON/data-URI representation. The envelope codec is task-neutral, but
-reader, generator, reranker, extractor, chunker, rewriter, and transcriber
-endpoints must each adopt and advertise it only when their parser and admission
-path consume the raw attachments; model capability alone never implies wire
-support. A later streaming variant may add per-frame checksums and flow control
-without changing the logical borrowed-attachment contract.
+Distributed Antfly-to-Antfly read, generation, embedding, extraction,
+multimodal-reranking, chunking, and transcription traffic now negotiates a
+versioned binary envelope containing bounded JSON metadata, attachment
+descriptors, MIME essences, and raw attachment bytes. The receiver validates reserved fields,
+declared lengths, aggregate limits, trailing data, attachment indexes, MIME
+agreement, and exact reference cardinality before preprocessing.
+`framed_attachments` is an additive v4 capability bit: older clients ignore it,
+newer clients default it to false for older nodes, and the leased concrete route
+remains the sole transport authority. External providers retain their admitted
+JSON/data-URI or multipart representation. The envelope codec is task-neutral,
+but each endpoint advertises it only after its parser and admission path consume
+the raw attachments; model capability alone never implies wire support. The
+current request-bounded v1 envelope is deliberately synchronous. A later
+streaming variant may add per-frame checksums and flow control without changing
+the logical borrowed-attachment contract.
 
 Per-item identity removes the current need to split otherwise compatible local
 batches at document boundaries solely for profiling. Cross-document batching
@@ -2128,8 +2130,10 @@ The hardening above follows these long-term rules:
     embedding acquires an operation-scoped native scratch reservation and
     allocator-owned output credit before constructing its render coordinator.
 39. **Implemented after proxy-admission review:** retained-body admission is a
-    cancellation-aware FIFO weighted semaphore with impossible-weight
-    rejection and regression coverage for large-request starvation.
+    cancellation-aware aging weighted semaphore with impossible-weight
+    rejection. A small request may consume otherwise idle slack behind an
+    oversized head only a bounded number of times; the aged head then becomes
+    a barrier, preserving utilization without large-request starvation.
 40. **Implemented after distributed TOCTOU review:** operation-scoped routing
     is eligible only from a current endpoint catalog; bootstrap pool fallback is
     task-unscoped and cannot execute any model-family request.
@@ -2317,7 +2321,10 @@ The hardening above follows these long-term rules:
     semaphore with allowance for capture growth, JSON decoding, ordered result
     retention, and final encoding, so neither model fanout nor concurrent mixed
     requests can multiply memory. Homogeneous batches retain the direct
-    streaming proxy path.
+    streaming proxy path. Framed attachment batches are intentionally
+    homogeneous: a capability lease belongs to one model, and partitioning a
+    binary body would copy large attachments and ambiguously apply one lease to
+    multiple backends. Producers group framed work by model before transport.
 64. **Implemented after exact-operation lease review:** singleton generation
     discovers, caches, validates, carries, and invalidates only the `.generate`
     capability lease it executes. Batch planning continues to use the distinct
@@ -2798,9 +2805,120 @@ The hardening above follows these long-term rules:
     path, so PDF pages can coalesce with compatible work from other documents
     under the exact immutable model generation instead of bypassing the broker
     merely because the caller already supplied more than one image. Multi-item
-    results use a thread-safe temporary allocation domain because one request
-    may span concurrently executing groups; transfer to the caller allocator
-    occurs only after every borrowed ticket has joined.
+    results always use a thread-safe temporary allocation domain because even a
+    singleton ticket may execute on another request's leader thread; transfer
+    to the caller allocator occurs only after every borrowed ticket has joined.
+122. **Implemented after borrowed-raster batching review:** PDF raster reader
+    windows now submit the same per-page broker tickets as encoded images.
+    Compatible pages from independent documents share one fenced native model
+    invocation; the leader admits aggregate decoded pixels and output-token
+    work only after the batch is realized. Window buffers remain borrowed until
+    every synchronous ticket completes. The linked raster ABI forwards its
+    original deadline and cancellation view into broker submission and checks
+    both again before returning late results.
+123. **Implemented after proxy-admission fairness review:** byte admission may
+    use slack behind an oversized head waiter, but only for eight bounded
+    bypasses. The aged head then becomes a barrier until enough capacity is
+    available. This retains utilization for mixed small/large requests without
+    allowing a stream of page-sized requests to starve a large document body.
+124. **Implemented after renderer-cache performance review:** each fixed PDF
+    render lane retains its private mutable reader/font cache across joined
+    pages and waves of one render batch. Executor scratch is still reset after
+    every callback, image caches remain render-scope bounded, cancellation is
+    refreshed per page, and no mutable reader crosses worker lanes. This
+    removes repeated font initialization while preserving thread confinement
+    and the existing aggregate byte budget.
+125. **Implemented after model-eligibility hot-path review:** reader broker
+    admission acquires the authoritative model generation and asks the loaded
+    session for its concrete Florence configuration. It no longer reparses
+    sidecars, guesses model families from paths, or searches encoder/decoder
+    files on every request. Non-Florence readers retain their typed direct
+    loader and honest serial-compatibility report.
+126. **Implemented after distributed-family transport review:** read,
+    generation, embedding, extraction, multimodal reranking, chunking, and
+    transcription endpoints consume the task-neutral framed attachment envelope and advertise
+    support only from their resolved endpoint descriptor. Clients retain
+    admitted base64/multipart fallback for older Antfly nodes and external
+    providers. Every framed parser enforces canonical indexes, single-use exact
+    cardinality, MIME agreement, and aggregate byte limits before model work.
+127. **Implemented after framed-media ownership review:** generation,
+    multimodal reranking, extraction, reading, embedding, chunking, and transcription
+    borrow attachment slices directly from the synchronous request envelope.
+    Mixed inline/downloaded/framed parsers track ownership per media item, so
+    cleanup frees only materialized buffers. This removes the inference-node
+    attachment copy as well as base64 expansion while retaining allocation-
+    failure safety.
+128. **Implemented after distributed-envelope routing review:** the Go inference
+    proxy validates the complete v1 attachment envelope, borrows only its JSON
+    metadata to resolve the model, and forwards the admitted binary body
+    unchanged. Framed requests therefore work through independently deployed
+    inference nodes without base64 rematerialization at the routing tier.
+    Mixed-model framed generation is rejected before dispatch; homogeneous
+    model groups are the lease-safe, zero-copy unit.
+129. **Implemented after broker allocator-threading review:** reader broker
+    leaders never allocate results through an unknown request allocator.
+    Encoded and raw-raster tickets materialize small result objects in the
+    process thread-safe domain and clone them into the caller domain after
+    join, including singleton submissions that coalesce cross-request.
+130. **Implemented after mixed-source read ownership review:** HTTP read batches
+    may interleave framed attachments and fetched URLs while retaining request
+    order. Owned downloads are stored in a dense cleanup table separate from
+    the ordered borrowed image view, so every initialized response is freed
+    exactly once and no sparse slot is destroyed.
+131. **Implemented after allocation-failure injection review:** paired media
+    bytes and ownership flags transfer from parser builders transactionally.
+    Both result slices are allocated before either builder is consumed, so a
+    failure in the second allocation cannot leave cleanup with unequal arrays
+    or lose the ownership bit needed to release an inline/downloaded payload.
+132. **Implemented after distributed lease-lifetime review:** capability tokens
+    and descriptor revisions used after discovery either borrow through a
+    pointer to the still-live lease field or are copied into request-owned
+    storage. Reader, generator, chunker, and transcriber HTTP headers therefore
+    never retain slices into block-local optional captures; extractor and
+    reusable provider configs retain their existing owned replacement model.
+133. **Implemented after framed-audio compatibility review:** transcription
+    canonicalizes generic `application/octet-stream` attachments from physical
+    audio signatures and rejects declared/physical format mismatches before
+    decode. Resolved transcriber capabilities advertise every canonical codec
+    enabled in the node audio runtime, rather than making framed transport
+    narrower than the preexisting base64 compatibility path.
+134. **Implemented after all-family transport review:** fixed multimodal
+    chunking now negotiates the same framed attachment envelope as other binary
+    task families. The client charges the selected physical representation,
+    emits one canonical attachment reference, and retains base64 fallback for
+    older nodes. The receiver enforces one attachment, exact reference
+    cardinality, MIME agreement, byte limits, and borrowed request lifetime.
+    Its resolved descriptor now truthfully exposes text, image, and audio input
+    instead of making the efficient route unreachable through capability
+    validation.
+135. **Implemented after chunker decode-pressure review:** animated GIF
+    chunking applies `max_chunks` inside the decoder instead of decoding every
+    frame and discarding the suffix. The bounded decoder also caps aggregate
+    retained RGBA bytes and validates inference image dimensions. HTTP
+    admission grows before decode for the possible bounded GIF working set and
+    WAV expansion, while framed inputs avoid charging a fictitious decoded
+    transport copy.
+136. **Implemented after chunk-config boundary review:** signed OpenAPI numeric
+    fields are validated transactionally before conversion to native chunker
+    types. Negative values no longer reach trapping integer casts; output
+    cardinality, token targets, audio windows, thresholds, and overlap
+    invariants are bounded before decode or tokenization. Failed validation
+    leaves the destination config unchanged.
+137. **Implemented after catalog/executor truth review:** the model catalog no
+    longer publishes discovered or merely loaded chunker manifests when the
+    public endpoint has no model-backed chunk executor. The built-in fixed
+    multimodal chunker remains advertised with its real transport and modality
+    contract. A future semantic chunker becomes visible only when its concrete
+    task executor, admission, and typed result path are implemented.
+138. **Implemented after retained-output and allocation-failure review:** fixed
+    media chunking now has a core owned-output ceiling that is checked before
+    each WAV or GIF frame encode. The HTTP executor selects a tighter
+    input-derived ceiling, admits the legacy response's live base64 and JSON
+    copies before execution, and reports output amplification as a bounded 413
+    instead of allocating until process exhaustion. Framed/pass-through input
+    bytes remain charged once. The encoded-reader result builder also releases
+    its first allocation if the companion assignment table cannot be created,
+    so allocator failure cannot strand an uninitialized result slice.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3754,19 +3872,23 @@ closed and outstanding leases have drained.
 
 ### Remaining high-cost boundaries
 
-Two optimizations require explicit protocols rather than local shortcuts:
+Two further optimizations require explicit protocols rather than local
+shortcuts:
 
-- Distributed raw attachments need a versioned framed transport with
-  authentication, per-item attachment indexes and provenance, MIME and length
-  validation, checksums, flow control, cancellation, and strict response
-  cardinality. Until that protocol is negotiated, remote JSON uses admitted
-  base64 and linked execution uses borrowed binary/raster buffers. A proxy must
-  not infer binary support from logical model capabilities.
-- Cross-page font/image reuse needs a byte-bounded immutable resource cache
-  owned by `PreparedDocument`, with worker forks borrowing immutable entries.
-  It must not retain objects in resettable backend-lane scratch or share the
-  current mutable `Reader` caches across threads. The current task-local caches
-  are the safe fallback until corpus benchmarks justify that separate cache.
+- The shipped distributed attachment envelope is bounded, authenticated by the
+  existing route lease, cancellation-aware at the request boundary, and exact
+  in reference cardinality. Very large or incrementally produced media would
+  need a streaming successor with checksums, flow control, per-frame
+  cancellation, and provenance in the wire descriptors. Until that version is
+  negotiated, v1 intentionally retains one bounded envelope body. A proxy must
+  not infer either version from logical model modalities.
+- Worker-affine reader/font caches now remove repeated initialization within a
+  render batch. Reuse across worker lanes or independent preparations would
+  still need a byte-bounded immutable resource cache owned by
+  `PreparedDocument`, with forks borrowing only frozen entries. Mutable reader
+  caches must never cross threads or escape into resettable backend-lane
+  scratch; corpus benchmarks should justify the added immutable cache before it
+  is introduced.
 
 Similarly, Gemma4 multimodal generation stays `serial_compatibility` until its
 resolved generator exposes a genuinely fused image-message batch. The generic
@@ -3966,10 +4088,11 @@ The following remain qualification work rather than architectural blockers:
   additional split must remain beneath the same aggregate ceiling and preserve
   shutdown ordering.
 - Whether the buffered v1 distributed attachment envelope should gain a
-  streaming/checksummed variant, and which additional task endpoints should
-  advertise it after their task-specific parsers and admission paths consume
-  raw attachments. Embedding is implemented; unsupported endpoints, older
-  nodes, and external providers retain JSON/base64 compatibility.
+  streaming/checksummed variant. Reading, batched generation, embedding,
+  extraction, multimodal reranking, chunking, and transcription now consume raw
+  framed attachments; older nodes and external providers retain JSON/base64 or
+  multipart compatibility. A future direct single-generation client path can
+  adopt the same envelope without changing generator result semantics.
 - Whether cross-request broker adapters should be enabled for a model family is
   executor-specific. The task-neutral broker exists, but a family must expose a
   genuinely fused native batch implementation before it may opt in; accepting

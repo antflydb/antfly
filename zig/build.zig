@@ -3524,6 +3524,8 @@ pub fn build(b: *std.Build) void {
             "work identity and execution reports",
             "bounded invocation allocator",
             "remote Antfly",
+            "antfly chunk request frames borrowed binary input",
+            "capability lease HTTP fields own storage",
         },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
@@ -3755,6 +3757,7 @@ pub fn build(b: *std.Build) void {
         "antfly embed parts request sizing is exact for escaped strings",
         "antfly dense JSON response cleanup is allocation-failure safe",
         "remote generator batch streams attachments into one exact JSON body",
+        "capability lease HTTP fields own storage",
         "asset producer runtime rejects empty borrowed media",
         "asset producer runtime derives coherent logical and wire result ceilings",
         "asset producer runtime applies result ceilings to non-model producers",

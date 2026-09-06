@@ -417,6 +417,24 @@ pub fn readWithConfigReported(
     return try reader.readReported(alloc, request);
 }
 
+/// Send trusted encoded image buffers to an Antfly inference node without
+/// materializing data URIs. The attachment envelope is task-neutral; the JSON
+/// metadata retains the public read request shape and uses reserved
+/// `attachment:<index>` URLs to bind each item to its borrowed binary payload.
+pub fn readEncodedWithConfigReported(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    request: EncodedRequest,
+    options: RemoteOptions,
+) !BatchResult {
+    if (cfg.provider != .antfly) return error.UnsupportedReaderProvider;
+    const reader = try AntflyReaderState.init(alloc, http, cfg, options);
+    defer reader.deinit();
+    const state: *AntflyReaderState = @ptrCast(@alignCast(reader.ptr));
+    return try state.readEncodedReported(alloc, request);
+}
+
 const AntflyReaderState = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -542,7 +560,10 @@ const AntflyReaderState = struct {
         if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
 
         const out = try alloc.alloc(Result, req.images.len);
-        const assigned = try alloc.alloc(bool, req.images.len);
+        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
+            alloc.free(out);
+            return err;
+        };
         defer alloc.free(assigned);
         @memset(assigned, false);
         errdefer {
@@ -564,6 +585,130 @@ const AntflyReaderState = struct {
             errdefer deinitResult(alloc, &result);
             if (item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
             if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
+            out[result_index] = result;
+            assigned[result_index] = true;
+            initialized += 1;
+        }
+        if (initialized != req.images.len) return error.InvalidReadResultCount;
+        return .{
+            .items = out,
+            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
+        };
+    }
+
+    fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
+        try validateEncodedRequest(req);
+        const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
+        defer alloc.free(images);
+        const attachment_urls = try alloc.alloc([]u8, req.images.len);
+        var url_count: usize = 0;
+        defer {
+            for (attachment_urls[0..url_count]) |value| alloc.free(value);
+            alloc.free(attachment_urls);
+        }
+        const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, req.images.len);
+        defer alloc.free(attachments);
+        for (req.images, 0..) |image, index| {
+            const attachment_url = try std.fmt.allocPrint(alloc, "attachment:{d}", .{index});
+            attachment_urls[index] = attachment_url;
+            url_count += 1;
+            images[index] = .{ .url = attachment_url };
+            attachments[index] = .{ .mime_type = image.mime_type, .data = image.bytes };
+        }
+        const metadata = try httpx.json.Json.stringify(alloc, inference_api.ReadRequest{
+            .model = self.model,
+            .images = images,
+            .prompt = req.prompt orelse self.prompt,
+            .max_tokens = req.max_tokens orelse self.max_tokens,
+        });
+        defer alloc.free(metadata);
+        const body = try httpx.attachment_envelope.encodeAlloc(alloc, metadata, attachments);
+        defer alloc.free(body);
+
+        const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
+        defer alloc.free(url);
+        var header_buf: [5][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (self.auth_header) |header| {
+            header_buf[header_count] = header;
+            header_count += 1;
+        }
+        if (self.source_table) |source_table| {
+            header_buf[header_count] = .{ "X-Antfly-Source-Table", source_table };
+            header_count += 1;
+        }
+        if (self.capability_token) |token| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Token", token };
+            header_count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
+            header_count += 1;
+        }
+        header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+        header_count += 1;
+        var resp = try self.http.post(url, .{
+            .borrowed_body = body,
+            .headers = header_buf[0..header_count],
+            .timeout_ms = self.timeout_ms,
+            .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
+        });
+        defer resp.deinit();
+        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+
+        const payload = resp.body orelse return error.EmptyResponse;
+        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
+
+        const out = try alloc.alloc(Result, req.images.len);
+        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
+            alloc.free(out);
+            return err;
+        };
+        defer alloc.free(assigned);
+        @memset(assigned, false);
+        errdefer {
+            for (out, assigned) |*item, was_assigned| if (was_assigned) deinitResult(alloc, item);
+            alloc.free(out);
+        }
+        var initialized: usize = 0;
+        for (parsed.value.data) |wire_item| {
+            if (wire_item.index < 0) return error.InvalidReadResultCount;
+            const result_index = std.math.cast(usize, wire_item.index) orelse return error.InvalidReadResultCount;
+            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
+            const text = try alloc.dupe(u8, wire_item.text);
+            var owns_text = true;
+            errdefer if (owns_text) alloc.free(text);
+            const item_id = if (req.images[result_index].item_id.len > 0)
+                try alloc.dupe(u8, req.images[result_index].item_id)
+            else
+                "";
+            var owns_item_id = item_id.len > 0;
+            errdefer if (owns_item_id) alloc.free(@constCast(item_id));
+            const source_fingerprint = if (req.images[result_index].source_fingerprint) |value|
+                try alloc.dupe(u8, value)
+            else
+                null;
+            var owns_source_fingerprint = source_fingerprint != null;
+            errdefer if (owns_source_fingerprint) alloc.free(source_fingerprint.?);
+            var result = Result{
+                .text = text,
+                .fields_json = null,
+                .regions_json = null,
+                .item_id = item_id,
+                .source_fingerprint = source_fingerprint,
+                .page_number = req.images[result_index].page_number,
+            };
+            owns_text = false;
+            owns_item_id = false;
+            owns_source_fingerprint = false;
+            errdefer deinitResult(alloc, &result);
+            if (wire_item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
+            if (wire_item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
             out[result_index] = result;
             assigned[result_index] = true;
             initialized += 1;

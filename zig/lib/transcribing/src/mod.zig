@@ -60,6 +60,8 @@ pub const Config = struct {
     bearer_token: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
+    /// Runtime-resolved Antfly capability; ignored by third-party providers.
+    framed_attachments: bool = false,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
@@ -229,6 +231,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .bearer_token = try dupOpt(alloc, cfg.bearer_token),
         .capability_token = try dupOpt(alloc, cfg.capability_token),
         .capability_revision = try dupOpt(alloc, cfg.capability_revision),
+        .framed_attachments = cfg.framed_attachments,
         .base_url = try dupOpt(alloc, cfg.base_url),
         .url = try dupOpt(alloc, cfg.url),
         .api_url = try dupOpt(alloc, cfg.api_url),
@@ -351,6 +354,7 @@ const AntflyTranscriberState = struct {
     max_response_bytes: ?usize = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
+    framed_attachments: bool = false,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
@@ -387,6 +391,7 @@ const AntflyTranscriberState = struct {
             .max_response_bytes = cfg.max_response_bytes,
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
+            .framed_attachments = cfg.framed_attachments,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -423,25 +428,30 @@ const AntflyTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
-        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
-        defer alloc.free(audio_bytes);
-
-        const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
-        const encoded = try alloc.alloc(u8, encoded_len);
-        defer alloc.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, audio_bytes);
+        var audio_content = try resolveAudioContentAlloc(alloc, req.url);
+        defer audio_content.deinit(alloc);
+        var encoded: ?[]u8 = null;
+        defer if (encoded) |value| alloc.free(value);
+        const audio_field = if (self.framed_attachments)
+            "attachment:0"
+        else blk: {
+            const encoded_len = std.base64.standard.Encoder.calcSize(audio_content.data.len);
+            encoded = try alloc.alloc(u8, encoded_len);
+            _ = std.base64.standard.Encoder.encode(encoded.?, audio_content.data);
+            break :blk encoded.?;
+        };
 
         const url = try std.fmt.allocPrint(alloc, "{s}/transcribe", .{self.api_url});
         defer alloc.free(url);
 
         const body = try httpx.json.Json.stringify(alloc, inference_api.types.TranscribeRequest{
             .model = self.model,
-            .audio = encoded,
+            .audio = audio_field,
             .language = req.language orelse self.language_code,
         });
         defer alloc.free(body);
 
-        var header_buf: [4][2][]const u8 = undefined;
+        var header_buf: [5][2][]const u8 = undefined;
         var header_count: usize = 0;
         if (self.auth_header) |header| {
             header_buf[header_count] = header;
@@ -459,9 +469,20 @@ const AntflyTranscriberState = struct {
             header_buf[header_count] = .{ "X-Antfly-Capability-Revision", revision };
             header_count += 1;
         }
+        var framed_body: ?[]u8 = null;
+        defer if (framed_body) |value| alloc.free(value);
+        if (self.framed_attachments) {
+            framed_body = try httpx.attachment_envelope.encodeAlloc(alloc, body, &.{.{
+                .mime_type = audio_content.content_type,
+                .data = audio_content.data,
+            }});
+            header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+            header_count += 1;
+        }
         const headers = header_buf[0..header_count];
         var resp = try self.http.post(url, .{
-            .json = body,
+            .json = if (self.framed_attachments) null else body,
+            .borrowed_body = framed_body,
             .headers = headers,
             .timeout_ms = self.timeout_ms,
             .max_response_size = self.max_response_bytes,
@@ -811,8 +832,20 @@ fn appendMultipartFile(
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
+    var content = try resolveAudioContentAlloc(alloc, url);
+    alloc.free(content.content_type);
+    const data = content.data;
+    content = undefined;
+    return data;
+}
+
+fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8) !scraping.DownloadedContent {
     if (scraping.data_uri.hasScheme(url)) {
-        return try decodeDataUriAlloc(alloc, url);
+        const parsed = try scraping.data_uri.parseRequired(url);
+        if (!parsed.has_explicit_media_type or
+            !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/"))
+            return error.InvalidDataUri;
+        return try scraping.downloadContentAlloc(alloc, url, &remote_fetch_security, null);
     }
 
     const fetched = try scraping.downloadContentOutcomeAlloc(alloc, url, &remote_fetch_security, null);
@@ -821,26 +854,8 @@ fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
             _ = err_resp;
             return error.RemoteAudioFetchFailed;
         },
-        .ok => |response| {
-            defer {
-                var owned = response;
-                owned.deinit(alloc);
-            }
-            return try alloc.dupe(u8, response.data);
-        },
+        .ok => |response| return response,
     }
-}
-
-fn decodeDataUriAlloc(alloc: Allocator, uri: []const u8) ![]u8 {
-    const parsed = try scraping.data_uri.parseRequired(uri);
-    if (!parsed.has_explicit_media_type or
-        !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/"))
-        return error.InvalidDataUri;
-    var decoded = try scraping.data_uri.decodeAlloc(alloc, uri);
-    alloc.free(decoded.media_type);
-    const data = decoded.data;
-    decoded = undefined;
-    return data;
 }
 
 fn cloneResponse(alloc: Allocator, response: Response) !Response {
@@ -1038,6 +1053,48 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
     try std.testing.expectEqualStrings("en", response.?.language.?);
 }
 
+test "Antfly transcriber sends negotiated framed audio attachments" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(allocator, io, &.{.{
+        .method = .POST,
+        .path = "/transcribe",
+        .assert_request = expectAntflyTranscriberFramed,
+        .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"framed\"}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
+        },
+    }});
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}", .{server.baseUrl()});
+    defer allocator.free(endpoint);
+    var client = httpx.Client.initWithConfig(allocator, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var response: ?Response = null;
+    defer if (response) |*value| deinitResponse(allocator, value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: Allocator, http: *httpx.Client, url: []const u8, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = transcribeWithConfig(a, http, .{
+                .provider = .antfly,
+                .model = "whisper",
+                .url = url,
+                .framed_attachments = true,
+            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==" }, .{}) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ allocator, &client, endpoint, &response, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+    try std.testing.expectEqualStrings("framed", response.?.text.?);
+}
+
 test "transcribing runtime loads openai provider and transcribes data uri input" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -1208,6 +1265,19 @@ fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
 fn expectAntflyTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer antfly-secret", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqualStrings(
+        httpx.attachment_envelope.content_type,
+        req.header("Content-Type") orelse return error.MissingHeader,
+    );
+    var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+    defer envelope.deinit();
+    try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+    try std.testing.expectEqualStrings("audio/wav", envelope.attachments[0].mime_type);
+    try std.testing.expectEqualStrings("fake", envelope.attachments[0].data);
+    try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"audio\":\"attachment:0\"") != null);
 }
 
 fn expectOpenAiTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {

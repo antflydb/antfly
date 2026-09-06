@@ -26,6 +26,7 @@ const PositionedSection = struct {
 };
 
 pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig) ![]types.Chunk {
+    try cfg.validate();
     if (text.len == 0) return try alloc.alloc(types.Chunk, 0);
 
     const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;

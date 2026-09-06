@@ -1186,8 +1186,8 @@ pub const Runtime = struct {
         };
     }
 
-    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
-        if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return;
+    fn bindExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: *extracting.Config) !?inference_work.InferenceCapabilities {
+        if (cfg.provider != .antfly or cfg.resolvedUrl() == null) return null;
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
         var header_storage: [2][2][]const u8 = undefined;
@@ -1208,6 +1208,8 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         try replaceCapabilityLeaseFields(alloc, cfg, lease);
+        cfg.framed_attachments = lease.capabilities != null and lease.capabilities.?.framed_attachments;
+        return lease.capabilities;
     }
 
     fn invalidateExtractorCapabilityLease(self: *Runtime, alloc: Allocator, cfg: extracting.Config) !void {
@@ -1544,7 +1546,7 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
-        const attachment_transport = extractorAttachmentTransport(cfg);
+        const attachment_transport: inference_work.AttachmentTransport = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) .borrowed_binary else if (capabilities.framed_attachments) .framed_binary else .base64_payload;
         try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
@@ -1585,7 +1587,7 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
-        try self.bindExtractorCapabilityLease(alloc, &cfg);
+        _ = try self.bindExtractorCapabilityLease(alloc, &cfg);
 
         const inputs = try alloc.alloc(extracting.Input, requests.len);
         var inputs_filled: usize = 0;
@@ -1732,7 +1734,7 @@ pub const Runtime = struct {
         }
         header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
         const auth_headers = header_storage[0..header_count];
-        const capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
+        var capability_lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
             self.http,
             cfg.url,
             cfg.model,
@@ -1741,11 +1743,11 @@ pub const Runtime = struct {
             self.execution.waitContext(),
         );
         capabilities = capability_lease.capabilities orelse return error.InvalidInferenceCapabilities;
-        if (capability_lease.routing_token) |value| {
+        if (capability_lease.routing_token) |*value| {
             header_storage[header_count] = .{ remote_capabilities.capability_token_header, value.slice() };
             header_count += 1;
         }
-        if (capability_lease.descriptor_revision) |value| {
+        if (capability_lease.descriptor_revision) |*value| {
             header_storage[header_count] = .{ remote_capabilities.capability_revision_header, value.slice() };
             header_count += 1;
         }
@@ -1768,14 +1770,16 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
-            const attachment_transport: inference_work.AttachmentTransport = .base64_payload;
+            const attachment_transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
+                .framed_binary
+            else
+                .base64_payload;
             const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
             try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
-            const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, chunk);
+            const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, chunk, attachment_transport);
             defer alloc.free(body);
-            var resp = try self.http.post(batch_url, .{
-                .json = body,
+            var request_options = httpx.RequestOptions{
                 .headers = headers,
                 .timeout_ms = try self.execution.remainingTimeoutMs(
                     platform.time.monotonicNs(),
@@ -1786,7 +1790,18 @@ pub const Runtime = struct {
                     self.execution.cancellation.ptr,
                     self.execution.cancellation.is_cancelled_fn,
                 ),
-            });
+            };
+            var framed_headers: [5][2][]const u8 = undefined;
+            if (attachment_transport == .framed_binary) {
+                if (headers.len >= framed_headers.len) return error.InvalidGeneratorConfig;
+                @memcpy(framed_headers[0..headers.len], headers);
+                framed_headers[headers.len] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+                request_options.headers = framed_headers[0 .. headers.len + 1];
+                request_options.borrowed_body = body;
+            } else {
+                request_options.json = body;
+            }
+            var resp = try self.http.post(batch_url, request_options);
             defer resp.deinit();
             if (!resp.ok()) {
                 const stale_value = resp.headers.get(remote_capabilities.capability_stale_header);
@@ -1909,6 +1924,9 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        // Transport features are route-leased runtime facts, never trusted
+        // from durable user configuration.
+        cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl()))
             return self.produceRemoteCompatibilityBatch(alloc, requests);
@@ -2156,6 +2174,7 @@ pub const Runtime = struct {
         var cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
+
         const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
             (self.antfly_provider.?.generate_messages_with_attachments_with_context != null or
@@ -2296,6 +2315,7 @@ pub const Runtime = struct {
         var execution_cfg = self.routedReaderConfig(cfg);
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
+        var capability_lease_fields = CapabilityLeaseFields{};
         var capability_auth_value: ?[]u8 = null;
         defer if (capability_auth_value) |value| alloc.free(value);
         var capability_auth_storage: [2][2][]const u8 = undefined;
@@ -2319,8 +2339,8 @@ pub const Runtime = struct {
                 capability_auth_headers,
                 self.execution.waitContext(),
             );
-            if (lease.routing_token) |token| execution_cfg.capability_token = token.slice();
-            if (lease.descriptor_revision) |revision| execution_cfg.capability_revision = revision.slice();
+            capability_lease_fields = CapabilityLeaseFields.init(lease);
+            capability_lease_fields.apply(&execution_cfg);
             break :blk lease.capabilities;
         } else try self.readerCapabilities(alloc, execution_cfg);
         if (discovered_capabilities) |capabilities| {
@@ -2417,17 +2437,55 @@ pub const Runtime = struct {
 
     fn readEncodedImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) !readers.BatchResult {
         try readers.validateEncodedRequest(request);
-        const execution_cfg = self.routedReaderConfig(cfg);
+        var execution_cfg = self.routedReaderConfig(cfg);
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
-        const capabilities = try self.readerCapabilities(alloc, execution_cfg);
+        var capability_lease_fields = CapabilityLeaseFields{};
+        var capability_auth_value: ?[]u8 = null;
+        defer if (capability_auth_value) |value| alloc.free(value);
+        var capability_auth_storage: [2][2][]const u8 = undefined;
+        var capability_auth_count: usize = 0;
+        if (!local_reader and execution_cfg.provider == .antfly and
+            (execution_cfg.bearer_token orelse execution_cfg.api_key) != null)
+        {
+            capability_auth_value = try std.fmt.allocPrint(
+                alloc,
+                "Bearer {s}",
+                .{execution_cfg.bearer_token orelse execution_cfg.api_key.?},
+            );
+            capability_auth_storage[capability_auth_count] = .{ "Authorization", capability_auth_value.? };
+            capability_auth_count += 1;
+        }
+        capability_auth_count = try self.execution.routing.appendHeaders(
+            &capability_auth_storage,
+            capability_auth_count,
+        );
+        const capability_auth_headers = capability_auth_storage[0..capability_auth_count];
+        const capabilities: ?inference_work.InferenceCapabilities = if (!local_reader and execution_cfg.provider == .antfly) blk: {
+            const endpoint = execution_cfg.resolvedUrl() orelse return error.InvalidReaderConfig;
+            const lease = try self.capabilityCache().getOrDiscoverLeaseWithContext(
+                self.http,
+                endpoint,
+                execution_cfg.model orelse "",
+                .read,
+                capability_auth_headers,
+                self.execution.waitContext(),
+            );
+            capability_lease_fields = CapabilityLeaseFields.init(lease);
+            capability_lease_fields.apply(&execution_cfg);
+            break :blk lease.capabilities;
+        } else try self.readerCapabilities(alloc, execution_cfg);
+        var use_framed_transport = false;
         if (capabilities) |resolved| {
             var encoded_bytes: usize = 0;
             var decoded_pixels: u64 = 0;
             const transport: inference_work.AttachmentTransport = if (local_reader)
                 .borrowed_binary
+            else if (resolved.framed_attachments)
+                .framed_binary
             else
                 .data_uri;
+            use_framed_transport = transport == .framed_binary;
             for (request.images) |image| {
                 try resolved.validateMimeType(image.mime_type);
                 const resident = try transport.wireSize(image.bytes.len, image.mime_type.len);
@@ -2499,6 +2557,23 @@ pub const Runtime = struct {
                     .execution = .{ .requested_items = request.images.len, .serial_items = request.images.len },
                 };
             }
+        }
+
+        if (use_framed_transport) {
+            return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, .{
+                .source_table = self.execution.routing.source_table,
+                .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+                .cancellation = httpx.CancellationToken.fromCallback(
+                    self.execution.cancellation.ptr,
+                    self.execution.cancellation.is_cancelled_fn,
+                ),
+            }) catch |err| {
+                if (err == error.InferenceCapabilitiesStale and execution_cfg.provider == .antfly) {
+                    const endpoint = execution_cfg.resolvedUrl() orelse return err;
+                    try self.capabilityCache().invalidate(endpoint, execution_cfg.model orelse "", .read, capability_auth_headers);
+                }
+                return err;
+            };
         }
 
         // Remote providers and older embedded runtimes retain compatibility by
@@ -2615,6 +2690,7 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
@@ -2656,6 +2732,7 @@ pub const Runtime = struct {
         defer if (capability_auth_value) |value| alloc.free(value);
         var capability_auth_storage: [2][2][]const u8 = undefined;
         var capability_auth_count: usize = 0;
+        var capability_lease_fields = CapabilityLeaseFields{};
         if (cfg_parsed.value.provider == .antfly and
             (cfg_parsed.value.bearer_token orelse cfg_parsed.value.api_key) != null)
         {
@@ -2679,14 +2756,16 @@ pub const Runtime = struct {
                 capability_auth_headers,
                 self.execution.waitContext(),
             );
-            if (lease.capabilities) |capabilities| try capabilities.validateInvocation(.transcribe, .{
-                .item_count = 1,
-                .modalities = .{ .audio = true },
-                .max_media_parts_per_item = 1,
-            });
-            if (lease.routing_token) |token| cfg_parsed.value.capability_token = token.slice();
-            if (lease.descriptor_revision) |revision|
-                cfg_parsed.value.capability_revision = revision.slice();
+            if (lease.capabilities) |capabilities| {
+                try capabilities.validateInvocation(.transcribe, .{
+                    .item_count = 1,
+                    .modalities = .{ .audio = true },
+                    .max_media_parts_per_item = 1,
+                });
+                cfg_parsed.value.framed_attachments = capabilities.framed_attachments;
+            }
+            capability_lease_fields = CapabilityLeaseFields.init(lease);
+            capability_lease_fields.apply(&cfg_parsed.value);
         }
 
         var result = transcribing.transcribeWithConfig(
@@ -2729,15 +2808,19 @@ pub const Runtime = struct {
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
 
-        if (try self.extractorCapabilities(alloc, cfg)) |capabilities| {
+        const local_extractor = isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl());
+        const capabilities = if (local_extractor)
+            try self.extractorCapabilities(alloc, cfg)
+        else
+            try self.bindExtractorCapabilityLease(alloc, &cfg);
+        if (capabilities) |resolved| {
             try validateExtractorInvocation(
                 alloc,
-                capabilities,
+                resolved,
                 extractorAttachmentTransport(cfg),
                 &.{request},
             );
         }
-        try self.bindExtractorCapabilityLease(alloc, &cfg);
 
         const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
         defer alloc.free(content_json);
@@ -3029,6 +3112,47 @@ fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+/// Request-owned copies of fixed-size capability lease values. `slice()` on a
+/// RoutingToken or CapabilityRevision points into that struct, so assigning a
+/// slice captured from a block-local lease would leave an HTTP config pointing
+/// at expired stack storage before the request is sent.
+const CapabilityLeaseFields = struct {
+    token: ?remote_capabilities.RoutingToken = null,
+    revision: ?remote_capabilities.CapabilityRevision = null,
+
+    fn init(lease: remote_capabilities.CapabilityLease) CapabilityLeaseFields {
+        return .{
+            .token = lease.routing_token,
+            .revision = lease.descriptor_revision,
+        };
+    }
+
+    fn apply(self: *const CapabilityLeaseFields, cfg: anytype) void {
+        cfg.capability_token = if (self.token) |*value| value.slice() else null;
+        cfg.capability_revision = if (self.revision) |*value| value.slice() else null;
+    }
+};
+
+test "capability lease HTTP fields own storage beyond the lease stack frame" {
+    const lease = remote_capabilities.CapabilityLease{
+        .capabilities = null,
+        .routing_token = try remote_capabilities.RoutingToken.init("route-token"),
+        .descriptor_revision = try remote_capabilities.CapabilityRevision.init(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    };
+    var fields = CapabilityLeaseFields.init(lease);
+    var cfg = readers.Config{ .provider = .antfly };
+    fields.apply(&cfg);
+    try std.testing.expectEqualStrings("route-token", cfg.capability_token.?);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        cfg.capability_revision.?,
+    );
+    try std.testing.expect(cfg.capability_token.?.ptr != lease.routing_token.?.slice().ptr);
+    try std.testing.expect(cfg.capability_revision.?.ptr != lease.descriptor_revision.?.slice().ptr);
+}
+
 fn replaceCapabilityLeaseFields(
     alloc: Allocator,
     cfg: anytype,
@@ -3212,6 +3336,8 @@ fn inlineImagePixelsAlloc(
 fn extractorAttachmentTransport(cfg: extracting.Config) inference_work.AttachmentTransport {
     return if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl()))
         .borrowed_binary
+    else if (cfg.provider == .antfly and cfg.framed_attachments)
+        .framed_binary
     else
         .base64_payload;
 }
@@ -4388,6 +4514,7 @@ fn antflyGenerateBatchRequestJsonAlloc(
     alloc: Allocator,
     cfg: generating_runtime.GeneratorConfig,
     requests: []const asset_producer.Request,
+    attachment_transport: inference_work.AttachmentTransport,
 ) ![]u8 {
     const ContentMetadata = struct {
         elements_size: usize,
@@ -4515,7 +4642,14 @@ fn antflyGenerateBatchRequestJsonAlloc(
     const body_prefix = "\",\"body\":{\"model\":";
     const messages_prefix = ",\"messages\":[{\"role\":\"user\",\"content\":";
     const item_suffix = "}]";
+    const framed = attachment_transport == .framed_binary;
+    var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+    defer attachments.deinit(alloc);
+    if (framed) for (requests) |request| for (request.media) |media| {
+        try attachments.append(alloc, .{ .mime_type = media.mime_type, .data = media.bytes });
+    };
     var exact_size: usize = outer_prefix.len + "]}".len;
+    var attachment_cursor: usize = 0;
     for (requests, 0..) |request, i| {
         const item_metadata = try Helper.metadata(alloc, request);
         if (i > 0) try Helper.addSize(&exact_size, 1);
@@ -4530,8 +4664,13 @@ fn antflyGenerateBatchRequestJsonAlloc(
                 if (emitted > 0) try Helper.addSize(&exact_size, 1);
                 try Helper.addSize(&exact_size, "{\"type\":\"media\",\"mime_type\":".len);
                 try Helper.addSize(&exact_size, try Helper.jsonStringSize(media.mime_type));
-                try Helper.addSize(&exact_size, ",\"data\":\"".len + "\"}".len);
-                try Helper.addSize(&exact_size, std.base64.standard.Encoder.calcSize(media.bytes.len));
+                if (framed) {
+                    try Helper.addSize(&exact_size, ",\"data\":\"attachment:".len + std.fmt.count("{d}", .{attachment_cursor}) + "\"}".len);
+                    attachment_cursor += 1;
+                } else {
+                    try Helper.addSize(&exact_size, ",\"data\":\"".len + "\"}".len);
+                    try Helper.addSize(&exact_size, std.base64.standard.Encoder.calcSize(media.bytes.len));
+                }
                 emitted += 1;
             }
         }
@@ -4541,6 +4680,7 @@ fn antflyGenerateBatchRequestJsonAlloc(
     var output: std.Io.Writer.Allocating = try .initCapacity(alloc, exact_size);
     defer output.deinit();
     try output.writer.writeAll(outer_prefix);
+    attachment_cursor = 0;
     for (requests, 0..) |request, i| {
         if (i > 0) try output.writer.writeByte(',');
         try output.writer.writeAll(item_prefix);
@@ -4558,7 +4698,12 @@ fn antflyGenerateBatchRequestJsonAlloc(
                 try output.writer.writeAll("{\"type\":\"media\",\"mime_type\":");
                 try Helper.writeJsonString(&output.writer, media.mime_type);
                 try output.writer.writeAll(",\"data\":");
-                try Helper.writeBase64String(&output.writer, media.bytes);
+                if (framed) {
+                    try output.writer.print("\"attachment:{d}\"", .{attachment_cursor});
+                    attachment_cursor += 1;
+                } else {
+                    try Helper.writeBase64String(&output.writer, media.bytes);
+                }
                 try output.writer.writeByte('}');
             }
             try output.writer.writeByte(']');
@@ -4572,7 +4717,9 @@ fn antflyGenerateBatchRequestJsonAlloc(
     const body = output.writer.buffer;
     output.writer.buffer = &.{};
     output.writer.end = 0;
-    return body;
+    if (!framed) return body;
+    defer alloc.free(body);
+    return try httpx.attachment_envelope.encodeAlloc(alloc, body, attachments.items);
 }
 
 fn appendBatchI64Field(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
@@ -4615,7 +4762,7 @@ test "remote generator batch streams attachments into one exact JSON body" {
                 .url = "http://inference.invalid",
                 .max_tokens = 32,
                 .temperature = 0.25,
-            }, &requests);
+            }, &requests, .base64_payload);
             defer alloc.free(body);
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
             defer parsed.deinit();
@@ -4624,6 +4771,22 @@ test "remote generator batch streams attachments into one exact JSON body" {
             const content = batch[0].object.get("body").?.object.get("messages").?.array.items[0].object.get("content").?.array.items;
             try std.testing.expectEqual(@as(usize, 2), content.len);
             try std.testing.expectEqualStrings("AQID", content[1].object.get("data").?.string);
+
+            const framed_body = try antflyGenerateBatchRequestJsonAlloc(alloc, .{
+                .provider = .antfly,
+                .model = "gemma4",
+                .url = "http://inference.invalid",
+                .max_tokens = 32,
+            }, &requests, .framed_binary);
+            defer alloc.free(framed_body);
+            var envelope = try httpx.attachment_envelope.parseAlloc(alloc, framed_body, .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, envelope.attachments[0].data);
+            var framed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, envelope.metadata, .{});
+            defer framed_metadata.deinit();
+            const framed_content = framed_metadata.value.object.get("requests").?.array.items[0].object.get("body").?.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+            try std.testing.expectEqualStrings("attachment:0", framed_content[1].object.get("data").?.string);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -6176,7 +6339,11 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             .content_type = "text/plain",
         },
     };
-    try std.testing.expect(!(try producer.canProduceBatch(alloc, &requests)));
+    try std.testing.expect(try producer.canProduceBatch(alloc, &requests));
+    try std.testing.expectEqual(
+        inference_work.BatchMode.serial_compatibility,
+        try producer.batchMode(alloc, &requests),
+    );
 
     const results = try producer.produceBatch(alloc, &requests);
     defer {

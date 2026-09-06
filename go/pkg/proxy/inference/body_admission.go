@@ -18,16 +18,22 @@ import (
 var errByteAdmissionRequestTooLarge = errors.New("byte admission request exceeds capacity")
 
 type byteAdmissionWaiter struct {
-	bytes   int64
-	ready   chan struct{}
-	granted bool
-	element *list.Element
+	bytes    int64
+	ready    chan struct{}
+	granted  bool
+	element  *list.Element
+	bypassed int
 }
 
-// byteAdmission is a cancellation-aware, FIFO weighted semaphore for memory
-// that must remain resident across an inference request. Strict queue order is
-// intentional: allowing a newer small request to bypass an older large one can
-// starve PDF and multimodal bodies indefinitely under sustained small traffic.
+// Bound the amount of work that may pass an older request which cannot yet fit.
+// This keeps otherwise usable memory busy without allowing a stream of small
+// requests to starve a large PDF or multimodal body indefinitely.
+const maxByteAdmissionBypasses = 8
+
+// byteAdmission is a cancellation-aware, aging weighted semaphore for memory
+// that must remain resident across an inference request. Requests are FIFO when
+// the head fits. When it does not, bounded bypass admits later work that fits;
+// after maxByteAdmissionBypasses the head becomes a barrier until it can run.
 type byteAdmission struct {
 	mu      sync.Mutex
 	limit   int64
@@ -82,11 +88,27 @@ func (a *byteAdmission) grantWaitersLocked() {
 		if front == nil {
 			return
 		}
-		waiter := front.Value.(*byteAdmissionWaiter)
-		if waiter.bytes > a.limit-a.used {
-			return
+		available := a.limit - a.used
+		selected := front
+		head := front.Value.(*byteAdmissionWaiter)
+		if head.bytes > available {
+			if head.bypassed >= maxByteAdmissionBypasses {
+				return
+			}
+			selected = nil
+			for candidate := front.Next(); candidate != nil; candidate = candidate.Next() {
+				if candidate.Value.(*byteAdmissionWaiter).bytes <= available {
+					selected = candidate
+					break
+				}
+			}
+			if selected == nil {
+				return
+			}
+			head.bypassed++
 		}
-		a.waiters.Remove(front)
+		waiter := selected.Value.(*byteAdmissionWaiter)
+		a.waiters.Remove(selected)
 		waiter.element = nil
 		waiter.granted = true
 		a.used += waiter.bytes

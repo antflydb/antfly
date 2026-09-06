@@ -172,7 +172,7 @@ pub fn chunkInputWithProvider(
     var routing_header_storage: [1][2][]const u8 = undefined;
     const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
     const routing_headers = routing_header_storage[0..routing_header_count];
-    const capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
+    var capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
         http,
         endpoint,
         model,
@@ -180,7 +180,12 @@ pub fn chunkInputWithProvider(
         routing_headers,
         execution.waitContext(),
     );
+    var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
+        if (capabilities.framed_attachments and switch (input) {
+            .binary => true,
+            .text => false,
+        }) attachment_transport = .framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
             .text => |text| .{
                 .item_count = 1,
@@ -192,7 +197,10 @@ pub fn chunkInputWithProvider(
                 .item_count = 1,
                 .modalities = inference_work.modalityForMimeType(binary.mime_type) orelse
                     return error.UnsupportedChunkMediaType,
-                .encoded_media_bytes = binary.data.len,
+                .encoded_media_bytes = try attachment_transport.wireSize(
+                    binary.data.len,
+                    binary.mime_type.len,
+                ),
                 .max_media_parts_per_item = 1,
             },
         };
@@ -202,25 +210,30 @@ pub fn chunkInputWithProvider(
     const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{endpoint});
     defer alloc.free(url);
 
-    const body = try encodeChunkRequest(alloc, cfg, input);
+    const body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
     defer alloc.free(body);
 
-    var header_storage: [3][2][]const u8 = undefined;
+    var header_storage: [4][2][]const u8 = undefined;
     var header_count: usize = 0;
     for (routing_headers) |header| {
         header_storage[header_count] = header;
         header_count += 1;
     }
-    if (capability_lease.routing_token) |token| {
+    if (capability_lease.routing_token) |*token| {
         header_storage[header_count] = .{ remote_capabilities.capability_token_header, token.slice() };
         header_count += 1;
     }
-    if (capability_lease.descriptor_revision) |revision| {
+    if (capability_lease.descriptor_revision) |*revision| {
         header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
         header_count += 1;
     }
+    if (attachment_transport == .framed_binary) {
+        header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+        header_count += 1;
+    }
     var resp = try http.post(url, .{
-        .json = body,
+        .json = if (attachment_transport == .framed_binary) null else body,
+        .borrowed_body = if (attachment_transport == .framed_binary) body else null,
         .headers = header_storage[0..header_count],
         .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
         .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
@@ -299,7 +312,12 @@ pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
     alloc.free(chunks);
 }
 
-fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]u8 {
+fn encodeChunkRequest(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    input: RemoteInput,
+    attachment_transport: inference_work.AttachmentTransport,
+) ![]u8 {
     const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
@@ -324,20 +342,31 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
             return try httpx.json.Json.stringify(alloc, request);
         },
         .binary => |binary| {
-            const data_b64 = try base64EncodeAlloc(alloc, binary.data);
-            defer alloc.free(data_b64);
+            const framed = attachment_transport == .framed_binary;
+            const data = if (framed)
+                "attachment:0"
+            else
+                try base64EncodeAlloc(alloc, binary.data);
+            defer if (!framed) alloc.free(@constCast(data));
             const request = struct {
                 input: inference_api.MediaContentPart,
                 config: inference_api.ChunkConfig,
             }{
                 .input = .{
                     .type = "media",
-                    .data = data_b64,
+                    .data = data,
                     .mime_type = binary.mime_type,
                 },
                 .config = config,
             };
-            return try httpx.json.Json.stringify(alloc, request);
+            const metadata = try httpx.json.Json.stringify(alloc, request);
+            if (!framed) return metadata;
+            defer alloc.free(metadata);
+            const attachments = [_]httpx.attachment_envelope.Attachment{.{
+                .mime_type = binary.mime_type,
+                .data = binary.data,
+            }};
+            return try httpx.attachment_envelope.encodeAlloc(alloc, metadata, &attachments);
         },
     }
 }
@@ -418,6 +447,30 @@ test "antfly chunker compiles" {
     _ = chunkText;
     _ = chunkInput;
     _ = chunkBinary;
+}
+
+test "antfly chunk request frames borrowed binary input without base64" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const body = try encodeChunkRequest(
+                alloc,
+                .{ .provider = .antfly, .model = "fixed" },
+                .{ .binary = .{ .mime_type = "image/gif", .data = "GIF89a" } },
+                .framed_binary,
+            );
+            defer alloc.free(body);
+            var envelope = try httpx.attachment_envelope.parseAlloc(alloc, body, .{ .max_attachments = 1 });
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings("image/gif", envelope.attachments[0].mime_type);
+            try std.testing.expectEqualStrings("GIF89a", envelope.attachments[0].data);
+            var metadata = try std.json.parseFromSlice(std.json.Value, alloc, envelope.metadata, .{});
+            defer metadata.deinit();
+            const input = metadata.value.object.get("input").?.object;
+            try std.testing.expectEqualStrings("attachment:0", input.get("data").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "antfly chunker text round trip" {

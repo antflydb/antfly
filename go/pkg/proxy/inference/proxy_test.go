@@ -3214,6 +3214,33 @@ func TestProxyBoundsGenerateBatchModelScan(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsMixedModelFramedGenerateBatchWithoutCopyingAttachments(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+	forwarded := false
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwarded = true
+		return nil, errors.New("must not forward")
+	})}
+	metadata := []byte(`{"mode":"sync","requests":[{"custom_id":"a","body":{"model":"model-a","messages":[{"role":"user","content":[{"type":"media","data":"attachment:0"}]}]}},{"custom_id":"b","body":{"model":"model-b","messages":[{"role":"user","content":[{"type":"media","data":"attachment:1"}]}]}}]}`)
+	body := testProxyAttachmentEnvelope(
+		metadata,
+		testProxyAttachment{mime: "image/png", data: []byte{1}},
+		testProxyAttachment{mime: "image/png", data: []byte{2}},
+	)
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/generate/batch", bytes.NewReader(body))
+	request.Header.Set("Content-Type", proxyAttachmentEnvelopeContentType)
+	recorder := httptest.NewRecorder()
+	p.handleGenerateBatch(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+	if forwarded {
+		t.Fatal("mixed-model framed batch was forwarded")
+	}
+}
+
 func TestProxyRejectsOversizedGenerateBatchBeforeForwarding(t *testing.T) {
 	t.Parallel()
 
@@ -4074,6 +4101,48 @@ func TestMultimodalRerankHandlerPreservesConcreteOperation(t *testing.T) {
 	}
 	if forwardedHost != "multimodal.internal" {
 		t.Fatalf("forwarded host = %q, want multimodal.internal", forwardedHost)
+	}
+}
+
+func TestProxyRoutesFramedReadFromBorrowedMetadataAndForwardsBodyUnchanged(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://reader.internal", "cpu", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://reader.internal", "read", "owner/reader")
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: []byte{1, 2, 3}})
+	forwarded := false
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		forwarded = true
+		if req.URL.Host != "reader.internal" {
+			t.Fatalf("forwarded host = %q", req.URL.Host)
+		}
+		if req.Header.Get("Content-Type") != proxyAttachmentEnvelopeContentType {
+			t.Fatalf("content type = %q", req.Header.Get("Content-Type"))
+		}
+		got, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatal("proxy rewrote the framed request body")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"object":"list","data":[]}`)),
+			Request:    req,
+		}, nil
+	})}
+	request := httptest.NewRequest(http.MethodPost, "/ai/v1/read", bytes.NewReader(body))
+	request.Header.Set("Content-Type", proxyAttachmentEnvelopeContentType)
+	recorder := httptest.NewRecorder()
+	p.handleRead(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !forwarded {
+		t.Fatal("framed read was not forwarded")
 	}
 }
 
