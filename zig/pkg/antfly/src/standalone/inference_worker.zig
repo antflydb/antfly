@@ -210,15 +210,13 @@ pub const Client = struct {
         errdefer self.alloc.destroy(worker);
         const executable = try std.process.executablePathAlloc(self.io, self.alloc);
         defer self.alloc.free(executable);
-        var child = try std.process.spawn(self.io, .{
+        const child = try std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
             .environ_map = &self.environment,
         });
-        var endpoint_started = false;
-        errdefer if (!endpoint_started) child.kill(self.io);
         worker.* = .{
             .owner = self,
             .child = child,
@@ -234,8 +232,11 @@ pub const Client = struct {
                 .next_id = 1,
             },
         };
+        // The worker owns the child even during partial startup. start() can
+        // already reap it through on_closed before returning an error; kill
+        // must inspect that same handle, whose ID is then null.
+        errdefer worker.child.kill(self.io);
         try worker.endpoint.start();
-        endpoint_started = true;
         errdefer worker.endpoint.deinit();
         const initialized = try call(&worker.endpoint, .initialize, self.create_json, control);
         self.alloc.free(initialized);
@@ -693,7 +694,7 @@ pub fn runChild(alloc: std.mem.Allocator, io: std.Io) !void {
     try lifetime.wait(io);
 }
 
-test "inference worker retains reservations until reaped cleanup" {
+test "inference worker retains reservations until reaped cleanup and owns partial startup" {
     const Budget = struct {
         leased: bool = false,
         cached: u64 = 0,
@@ -788,6 +789,62 @@ test "inference worker retains reservations until reaped cleanup" {
     worker.releaseResources();
     try std.testing.expect(!budget.leased);
     try std.testing.expectEqual(@as(u64, 0), budget.cached);
+
+    if (@import("builtin").os.tag == .windows) return; // POSIX child fixture.
+    client.create_json = try alloc.dupe(u8, "{}");
+    defer alloc.free(client.create_json);
+    client.environment = std.process.Environ.Map.init(alloc);
+    defer client.environment.deinit();
+    const Fault = struct {
+        var fail_at: usize = 0;
+        var groups: usize = 0;
+        var kills: usize = 0;
+        fn concurrent(raw: ?*anyopaque, group: *std.Io.Group, context: []const u8, alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+            groups += 1;
+            if (groups == fail_at) return error.ConcurrencyUnavailable;
+            return std.testing.io.vtable.groupConcurrent(raw, group, context, alignment, start);
+        }
+        fn spawn(raw: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            var modified = options;
+            modified.argv = &.{"/bin/cat"};
+            modified.environ_map = null;
+            return std.testing.io.vtable.processSpawn(raw, modified);
+        }
+        fn kill(raw: ?*anyopaque, child: *std.process.Child) void {
+            kills += 1;
+            if (kills == 1) {
+                std.testing.io.vtable.childKill(raw, child);
+            } else {
+                // Count a duplicate cleanup without signaling a reused PID or
+                // closing unrelated descriptors if this regression returns.
+                child.id = null;
+                child.stdin = null;
+                child.stdout = null;
+                child.stderr = null;
+            }
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.groupConcurrent = Fault.concurrent;
+    vtable.processSpawn = Fault.spawn;
+    vtable.childKill = Fault.kill;
+    client.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    // Failure before any reader, failure after the reader owns cleanup, and
+    // failure during initialization must all use the same child handle. With
+    // no injected spawn failure, cat echoes our offer as an invalid peer frame.
+    for ([_]usize{ 1, 2, 0 }) |fail_at| {
+        Fault.fail_at = fail_at;
+        Fault.groups = 0;
+        Fault.kills = 0;
+        try std.testing.expectError(
+            if (fail_at == 0) error.ResourceTemporarilyUnavailable else error.ConcurrencyUnavailable,
+            client.ensureWorker(.{}),
+        );
+        try std.testing.expectEqual(@as(usize, 1), Fault.kills);
+        try std.testing.expect(client.worker == null);
+        try std.testing.expectEqual(@as(u64, 0), client.generation);
+        try std.testing.expect(!budget.leased);
+    }
 }
 
 test "inference worker resource replies distinguish denials from ownership uncertainty" {
