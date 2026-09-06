@@ -40,6 +40,7 @@ const EmbedWireRequest = struct {
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
     request_timeout_ms: ?u64 = null,
@@ -152,6 +153,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .cancellation = if (self.cancellation) |token|
@@ -318,6 +320,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .cancellation = if (self.cancellation) |token|
@@ -401,12 +404,13 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .timeout_ms = 300_000,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -468,6 +472,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
             .timeout_ms = self.request_timeout_ms,

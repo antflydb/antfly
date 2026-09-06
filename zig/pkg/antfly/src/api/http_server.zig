@@ -20080,6 +20080,8 @@ fn applyAuthenticatedIdentityToJoinRequest(
 
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
+        error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
+        error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
@@ -23455,6 +23457,8 @@ test "api http server obtains query embedding policy from resource manager" {
 }
 
 test "api http query parsing preserves operational embedding failures" {
+    try std.testing.expectEqual(error.QueryEmbeddingInputTooLarge, normalizePublicQueryParseError(error.ProviderTokenBudgetExceeded));
+    try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.ProviderQuotaRegistryFull));
     try std.testing.expectEqual(error.QueryEmbeddingInputTooLarge, normalizePublicQueryParseError(error.QueryEmbeddingInputTooLarge));
     try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.QueryEmbeddingOverloaded));
     try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));

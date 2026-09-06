@@ -358,6 +358,10 @@ pub fn resolveRequestFormat(model: []const u8, configured: RequestFormat) !Reque
 }
 
 pub const Options = struct {
+    /// Model invocation admission only; credential resolution is a distinct
+    /// upstream operation and must not consume this model's quota.
+    attempt_observer: ?httpx.AttemptObserver = null,
+    credential_source: CredentialSource = .default,
     region: []const u8,
     endpoint: []const u8,
     request_format: RequestFormat = .auto,
@@ -445,7 +449,7 @@ pub const Provider = struct {
 
     fn invokeEmbeddingsJson(self: *Provider, alloc: std.mem.Allocator, model: []const u8, json_body: []const u8) !inference.EmbedResult {
         const cache = self.credential_cache orelse &self.owned_credential_cache;
-        var creds = try cache.get(alloc, self.http, self.options.region);
+        var creds = try cache.getForSource(alloc, self.http, self.options.region, self.options.credential_source);
         defer creds.deinit(alloc);
 
         const endpoint = try endpointBaseAlloc(alloc, self.options.endpoint);
@@ -461,6 +465,7 @@ pub const Provider = struct {
         defer freeHeaderPairs(alloc, signed);
 
         var resp = try self.http.request(.POST, url, .{
+            .attempt_observer = self.options.attempt_observer,
             .headers = signed,
             .body = json_body,
             .cancellation = if (self.options.cancellation) |token|

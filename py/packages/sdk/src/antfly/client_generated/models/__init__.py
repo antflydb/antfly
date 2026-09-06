@@ -803,6 +803,7 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
@@ -816,6 +817,7 @@ from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_source_type import ReplicationSourceType
 from .replication_transform_op import ReplicationTransformOp
+from .request_pacing import RequestPacing
 from .reranker_candidate_limit_exceeded_error import RerankerCandidateLimitExceededError
 from .reranker_candidate_limit_exceeded_error_error import RerankerCandidateLimitExceededErrorError
 from .reranker_candidate_limit_exceeded_error_status import RerankerCandidateLimitExceededErrorStatus
@@ -1802,6 +1804,7 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "RateLimitConfig",
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
@@ -1815,6 +1818,7 @@ __all__ = (
     "ReplicationSourceStatus",
     "ReplicationSourceType",
     "ReplicationTransformOp",
+    "RequestPacing",
     "RerankerCandidateLimitExceededError",
     "RerankerCandidateLimitExceededErrorError",
     "RerankerCandidateLimitExceededErrorStatus",
