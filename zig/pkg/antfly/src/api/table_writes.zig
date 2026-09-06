@@ -30198,8 +30198,14 @@ fn parseStartupConfiguredIndexes(
             .array => value.array.items.len,
             else => return error.InvalidCreateTableRequest,
         }
-    else
-        object.count();
+    else count: {
+        var count: usize = 0;
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) count += 1;
+        }
+        break :count count;
+    };
     const items = try alloc.alloc(StartupConfiguredIndex, index_count);
     errdefer {
         for (items[0..index_count]) |*item| item.deinit(alloc);
@@ -30207,7 +30213,10 @@ fn parseStartupConfiguredIndexes(
     }
     @memset(items, .{});
     var initialized: usize = 0;
-    var has_generated_producers = false;
+    // Producer declarations may live either inside an index definition or in
+    // the reserved table-level enrichment catalog. Detect them from the full
+    // document, independently of the physical-index iterator below.
+    const has_generated_producers = try jsonValueHasGeneratedEnrichment(alloc, parsed.value);
 
     if (array_form) |value| {
         const array_items = switch (value) {
@@ -30225,8 +30234,6 @@ fn parseStartupConfiguredIndexes(
             };
             errdefer configured.deinit(alloc);
             try populateStartupAlgebraicCapability(alloc, &configured, item);
-            has_generated_producers = has_generated_producers or
-                try jsonValueHasGeneratedEnrichment(alloc, item);
             items[initialized] = configured;
             initialized += 1;
         }
@@ -30238,6 +30245,7 @@ fn parseStartupConfiguredIndexes(
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         var configured = StartupConfiguredIndex{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
@@ -30245,8 +30253,6 @@ fn parseStartupConfiguredIndexes(
         };
         errdefer configured.deinit(alloc);
         try populateStartupAlgebraicCapability(alloc, &configured, entry.value_ptr.*);
-        has_generated_producers = has_generated_producers or
-            try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*);
         items[initialized] = configured;
         initialized += 1;
     }
@@ -30254,6 +30260,23 @@ fn parseStartupConfiguredIndexes(
         .items = items,
         .has_generated_producers = has_generated_producers,
     };
+}
+
+test "startup configured indexes separate physical indexes from reserved metadata" {
+    const alloc = std.testing.allocator;
+    var configured = try parseStartupConfiguredIndexes(alloc,
+        \\{
+        \\  "full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},
+        \\  "resolvers":[{"name":"by_slug","source_field":"slug"}],
+        \\  "enrichments":[{"name":"document_chunks_v1","kind":"chunk","field":"text","chunk_size":256}]
+        \\}
+    );
+    defer configured.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), configured.items.len);
+    try std.testing.expectEqualStrings("full_text_index_v0", configured.items[0].name);
+    try std.testing.expectEqual(db_mod.types.IndexKind.full_text, configured.items[0].kind);
+    try std.testing.expect(configured.has_generated_producers);
 }
 
 fn targetedIndexExpectationFromCatalog(

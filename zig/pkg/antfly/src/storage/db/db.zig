@@ -923,10 +923,20 @@ pub const IndexRepairVisibility = struct {
 /// `target_scope_known = false` means the producer could not prove scope and
 /// consumers must conservatively fence the whole group.
 pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
     index_name: []const u8,
     kind: types.IndexKind,
     incarnation: u64,
     config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
 };
 
 pub const QueryVisibilityEvent = struct {
@@ -44057,6 +44067,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     defer batch_ctx.alloc.free(replay_deleted_keys);
     var replay_batch = batch;
     replay_batch.deleted_keys = replay_deleted_keys;
+    var sync_targets = try collectManagedSyncTargets(batch_ctx.alloc, batch_ctx.index_manager, replay_batch);
+    defer sync_targets.deinit(batch_ctx.alloc);
 
     batch_ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
@@ -44099,7 +44111,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(&batch_ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -46356,13 +46368,13 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 batch.deleted_keys,
             );
             defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
-            // A dense upsert is a replacement only inside the index named by
-            // the embedding write. Deriving the delete after per-index
-            // filtering keeps that intent out of the batch-wide delete lane.
-            const replacement_keys = try collectDenseEmbeddingReplacementKeys(ctx.alloc, dense_embeddings.writes);
-            defer if (replacement_keys.len > 0) ctx.alloc.free(replacement_keys);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replay_delete_keys, batch_options);
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replacement_keys, batch_options);
+            // Dense apply is already an exact-member upsert: it retains the
+            // existing vector id, skips identical payloads, and replaces a
+            // changed payload in one HBC mutation batch. A separate pre-delete
+            // would publish an artificial lower-cardinality checkpoint from a
+            // streaming replay session before the upsert restores the member.
+            // Reserve the delete lane for actual source/artifact removals.
             const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
                 entry.chunk_name != null
             else
@@ -46632,6 +46644,58 @@ const ManagedIndexBatchApplicability = enum {
     missing_dependency,
 };
 
+fn managedIndexDeleteKeyAffectsProjection(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    key: []const u8,
+) bool {
+    // Public document identities are carried unencoded in ordinary replay;
+    // primary-store document keys may appear in replicated/internal paths.
+    // Either form can remove a member from every document-backed projection.
+    if (isMetadataKey(key) or internal_keys.isInternalMetadataKey(key)) return false;
+    if (!internal_keys.isInternalUserKey(key) or internal_keys.isPrimaryDocumentKey(key)) return true;
+
+    // Internal cleanup keys are not generic document deletions. Only the
+    // projection that consumes the exact artifact may treat one as reduction
+    // authority; manifests, retry state, and sibling artifacts are no-ops.
+    return switch (index_ref.kind) {
+        .full_text => index_manager.textIndexAcceptsArtifactKey(index_ref.name, key),
+        .dense_vector, .sparse_vector => batchHasEmbeddingArtifactForManagedIndex(
+            index_manager,
+            index_ref,
+            &.{key},
+        ),
+        .algebraic => false,
+        .graph => blk: {
+            if (internal_keys.isGraphEdgeArtifactKey(key)) {
+                const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, key) catch break :blk false) orelse break :blk false;
+                defer {
+                    index_manager.alloc.free(parsed.doc_key);
+                    index_manager.alloc.free(parsed.index_name);
+                    index_manager.alloc.free(parsed.edge_type);
+                    index_manager.alloc.free(parsed.target_doc_key);
+                }
+                if (std.mem.eql(u8, parsed.index_name, index_ref.name)) break :blk true;
+            }
+            for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                if (graphArtifactSourceConsumesArtifactKey(index_manager, source, key)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+fn managedIndexDeleteKeysAffectProjection(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    keys: []const []const u8,
+) bool {
+    for (keys) |key| {
+        if (managedIndexDeleteKeyAffectsProjection(index_manager, index_ref, key)) return true;
+    }
+    return false;
+}
+
 fn managedIndexBatchApplicability(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
@@ -46639,14 +46703,16 @@ fn managedIndexBatchApplicability(
 ) ManagedIndexBatchApplicability {
     switch (index_ref.kind) {
         .full_text, .algebraic => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
                 if (doc.action == .upsert) return .relevant;
             }
             return .irrelevant;
         },
         .dense_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -46663,7 +46729,8 @@ fn managedIndexBatchApplicability(
             return .irrelevant;
         },
         .sparse_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -46680,7 +46747,7 @@ fn managedIndexBatchApplicability(
             return .irrelevant;
         },
         .graph => {
-            if (batch.deleted_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys)) return .relevant;
             for (batch.graph_doc_clears) |clear| {
                 for (clear.index_names) |index_name| {
                     if (std.mem.eql(u8, index_name, index_ref.name)) return .relevant;
@@ -46799,12 +46866,13 @@ fn managedIndexRecordApplicability(
     switch (index_ref.kind) {
         .full_text, .algebraic => {
             if (record.changed_doc_keys.len > 0 or
-                record.deleted_doc_keys.len > 0 or
+                managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
                 record.overwritten_doc_keys.len > 0) return .relevant;
             return .irrelevant;
         },
         .dense_vector => {
-            if (record.deleted_doc_keys.len > 0 or record.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
+                record.overwritten_doc_keys.len > 0) return .relevant;
             // Artifact-backed indexes consume generated artifact records, not
             // the source document record that scheduled enrichment. Treating
             // that source record as perpetually applicable prevents a clean
@@ -46820,13 +46888,13 @@ fn managedIndexRecordApplicability(
         },
         .sparse_vector => {
             if (record.changed_doc_keys.len > 0 or
-                record.deleted_doc_keys.len > 0 or
+                managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
                 record.overwritten_doc_keys.len > 0) return .relevant;
             if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
         .graph => {
-            if (record.deleted_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys)) return .relevant;
             for (record.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
                     for (index_manager.graphArtifactSources(index_ref.name)) |source| {
@@ -47622,21 +47690,6 @@ fn collectVectorReplayDeleteKeys(
         defer identity.deinit(alloc);
         if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) continue;
         try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, identity.doc_key);
-    }
-    return try keys.toOwnedSlice(alloc);
-}
-
-fn collectDenseEmbeddingReplacementKeys(
-    alloc: Allocator,
-    embeddings: []const mapper.DenseEmbeddingWrite,
-) ![]const []const u8 {
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer keys.deinit(alloc);
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(alloc);
-
-    for (embeddings) |embedding| {
-        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, embedding.doc_key);
     }
     return try keys.toOwnedSlice(alloc);
 }
@@ -50289,6 +50342,7 @@ fn collectManagedSyncTargets(
                 alloc,
                 &target_identities,
                 candidate.config,
+                managedIndexBatchServingSetEffect(index_manager, batch, candidate.ref),
                 &target_scope_known,
             );
         }
@@ -50350,6 +50404,7 @@ fn collectManagedSyncTargetsForRecord(
                 alloc,
                 &target_identities,
                 candidate.config,
+                managedIndexRecordServingSetEffect(index_manager, record, candidate.ref),
                 &target_scope_known,
             );
         }
@@ -50402,6 +50457,7 @@ fn appendManagedTargetIdentity(
     alloc: Allocator,
     identities: *std.ArrayListUnmanaged(IndexTargetVisibility),
     cfg: *const types.IndexConfig,
+    serving_set_effect: IndexTargetVisibility.ServingSetEffect,
     scope_known: *bool,
 ) !void {
     if (!scope_known.*) return;
@@ -50419,7 +50475,38 @@ fn appendManagedTargetIdentity(
             cfg.config_json,
         ),
         .config_hash = fingerprint,
+        .serving_set_effect = serving_set_effect,
     });
+}
+
+fn managedIndexBatchServingSetEffect(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) IndexTargetVisibility.ServingSetEffect {
+    if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+        batch.overwritten_doc_keys.len != 0)
+        return .may_reduce;
+    if (index_ref.kind == .graph and
+        (batch.graph_doc_clears.len != 0 or batch.graph_deletes.len != 0))
+        return .may_reduce;
+    return .additive_only;
+}
+
+fn managedIndexRecordServingSetEffect(
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) IndexTargetVisibility.ServingSetEffect {
+    if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
+        record.overwritten_doc_keys.len != 0)
+        return .may_reduce;
+    // The compact replay record intentionally coalesces graph writes and
+    // deletes into changed artifact identities. Without the original batch's
+    // operation tags a relevant graph mutation must remain conservative.
+    if (index_ref.kind == .graph and record.changed_artifact_keys.len != 0)
+        return .may_reduce;
+    return .additive_only;
 }
 
 fn replayRecordHasTargetHint(
@@ -54450,6 +54537,69 @@ const GateDenseEmbedder = struct {
             .blocked_requests = self.blocked_requests.load(.acquire),
             .successful_requests = self.successful_requests.load(.acquire),
         };
+    }
+};
+
+const SelectiveGateDenseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+    blocked_embedding_name: []const u8,
+    blocked: std.atomic.Value(bool) = .init(true),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *SelectiveGateDenseEmbedder = @ptrCast(@alignCast(ptr));
+        if (self.blocked.load(.acquire) and std.mem.eql(u8, embedding_name, self.blocked_embedding_name)) {
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return error.EmbedRateLimited;
+        }
+        _ = self.successful_requests.fetchAdd(1, .monotonic);
+        return try embedder_mod.DeterministicDenseEmbedder.embedDense(
+            &self.deterministic,
+            alloc,
+            embedding_name,
+            text,
+            dims,
+        );
+    }
+
+    fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .deinit_fn = null,
+        };
+    }
+
+    fn allowAll(self: *@This()) void {
+        self.blocked.store(false, .release);
+    }
+};
+
+const GateAssetProducer = struct {
+    blocked: std.atomic.Value(bool) = .init(true),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *GateAssetProducer = @ptrCast(@alignCast(ptr));
+        if (self.blocked.load(.acquire)) {
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return error.EmbedRateLimited;
+        }
+        _ = self.successful_requests.fetchAdd(1, .monotonic);
+        return try std.fmt.allocPrint(alloc, "asset:{s}", .{request.source_text});
+    }
+
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .produce = produce },
+        };
+    }
+
+    fn allowAll(self: *@This()) void {
+        self.blocked.store(false, .release);
     }
 };
 
@@ -60305,6 +60455,7 @@ test "db source commit publishes exact target observation sequence" {
         target_incarnation: u64 = 0,
         target_config_hash: u64 = 0,
         target_name_matches: bool = false,
+        target_effect: ?IndexTargetVisibility.ServingSetEffect = null,
 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -60319,6 +60470,7 @@ test "db source commit publishes exact target observation sequence" {
                 self.target_incarnation = target.incarnation;
                 self.target_config_hash = target.config_hash;
                 self.target_name_matches = std.mem.eql(u8, target.index_name, "full_text_index_v0");
+                self.target_effect = target.serving_set_effect;
             }
         }
     };
@@ -60345,6 +60497,14 @@ test "db source commit publishes exact target observation sequence" {
     try std.testing.expect(hook_ctx.target_name_matches);
     try std.testing.expect(hook_ctx.target_incarnation > 0);
     try std.testing.expect(hook_ctx.target_config_hash > 0);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, hook_ctx.target_effect.?);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replacement\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 2), hook_ctx.target_calls);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, hook_ctx.target_effect.?);
 }
 
 test "db generated downstream indexes are exact convergence targets at source commit" {
@@ -60386,6 +60546,8 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expectEqual(@as(usize, 0), replay_targets.all_indexes.len);
     try std.testing.expect(replay_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
+    for (replay_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
 
     var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
         .documents = &.{.{ .key = "doc:a", .cleaned_value = "{}" }},
@@ -60398,6 +60560,55 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expectEqualStrings("semantic", materialized_targets.all_indexes[0]);
     try std.testing.expect(materialized_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), materialized_targets.target_identities.len);
+    for (materialized_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+
+    var deletion_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{"doc:a"},
+    });
+    defer deletion_targets.deinit(alloc);
+    try std.testing.expect(deletion_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), deletion_targets.target_identities.len);
+    for (deletion_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
+
+    // Internal replay/control cleanup is not a user deletion and must not
+    // grant every index permission to replace a newer serving snapshot with a
+    // lower one. An exact consumed artifact deletion remains reducing.
+    var metadata_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{internal_keys.replay_meta_next_sequence_key[0..]},
+    });
+    defer metadata_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), metadata_delete_targets.target_identities.len);
+
+    var storage_metadata_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{"\x00\x00__metadata__:manifest"},
+    });
+    defer storage_metadata_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), storage_metadata_delete_targets.target_identities.len);
+
+    const unrelated_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "unrelated");
+    defer alloc.free(unrelated_artifact);
+    var unrelated_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{unrelated_artifact},
+        .changed_artifact_keys = &.{unrelated_artifact},
+    });
+    defer unrelated_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), unrelated_delete_targets.all_indexes.len);
+
+    const consumed_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic");
+    defer alloc.free(consumed_artifact);
+    var consumed_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{consumed_artifact},
+        .changed_artifact_keys = &.{consumed_artifact},
+    });
+    defer consumed_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), consumed_delete_targets.target_identities.len);
+    try std.testing.expectEqualStrings("semantic", consumed_delete_targets.target_identities[0].index_name);
+    try std.testing.expectEqual(
+        IndexTargetVisibility.ServingSetEffect.may_reduce,
+        consumed_delete_targets.target_identities[0].serving_set_effect,
+    );
 
     const HookCtx = struct {
         calls: usize = 0,
@@ -70822,6 +71033,176 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try db.runUntilIdle();
+}
+
+test "db retryable chunked producer does not block independent dense publication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = SelectiveGateDenseEmbedder{
+        .blocked_embedding_name = "body_chunk_dense",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // Register the throttled chunked producer first. Request ordering must not
+    // be the mechanism that lets the direct title producer make progress.
+    try db.addIndex(.{
+        .name = "body_chunks",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","chunk_size":8,"chunk_overlap":2,"embedding_name":"body_chunk_dense"}}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"abcdefghijklmno\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    var sibling_published = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        if (gated.blocked_requests.load(.acquire) != 0) {
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+                sibling_published = index_stats.doc_count == 1 and
+                    index_stats.coverage_produced_count == 1 and
+                    index_stats.replay_applied_sequence != 0;
+                break;
+            }
+        }
+        if (sibling_published) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(gated.blocked_requests.load(.acquire) != 0);
+    try std.testing.expect(gated.successful_requests.load(.acquire) != 0);
+    try std.testing.expect(sibling_published);
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+}
+
+test "db retryable asset producer batches do not block independent dense publication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated_asset = GateAssetProducer{};
+    var dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = gated_asset.interface(),
+            .dense_embedder = dense.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // Register the unavailable asset producer first so request ordering cannot
+    // be the mechanism that lets the dense producer make progress.
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    // A distinct producer configuration forces a second native batch. Batch
+    // partitioning must remain deferred so the first outage cannot perform
+    // provider I/O while later producer classes are still being planned.
+    try db.addEnrichment(.{
+        .name = "summary_v2",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock-secondary\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"unavailable summary source\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    var sibling_published = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        if (gated_asset.blocked_requests.load(.acquire) != 0) {
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+                sibling_published = index_stats.doc_count == 1 and
+                    index_stats.coverage_produced_count == 1 and
+                    index_stats.replay_applied_sequence != 0;
+                break;
+            }
+        }
+        if (sibling_published) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(gated_asset.blocked_requests.load(.acquire) >= 2);
+    try std.testing.expect(sibling_published);
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    gated_asset.allowAll();
+    try db.runUntilIdle();
+    try std.testing.expect(gated_asset.successful_requests.load(.acquire) != 0);
 }
 
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {

@@ -546,11 +546,24 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             for line in logs_while_building.splitlines()
             if repair_pass_log in line and f"table={table} " in line
         )
-        # One bounded pass per five-second audit period (plus a boundary race)
-        # is expected; the regression produced hundreds of immediate passes.
-        assert repair_passes_after - repair_passes_before <= 3, (
+        # The group may consume one causal wake for each of the two indexes in
+        # addition to the two five-second level audits. The regression produced
+        # hundreds of no-op passes by promoting every repeated observation to
+        # an immediate wake; keep the assertion on that bounded event budget,
+        # rather than depending on which side of the sampling boundary the two
+        # legitimate activation wakes land.
+        repair_pass_delta = repair_passes_after - repair_passes_before
+        assert repair_pass_delta <= 4, (
             "periodic startup observation repeatedly promoted known repair "
-            "debt to an immediate wake"
+            f"debt to an immediate wake: delta={repair_pass_delta}\n"
+            + "\n".join(
+                line
+                for line in logs_while_building.splitlines()
+                if (
+                    (repair_pass_log in line or "provisioned index repair pass" in line)
+                    and f"table={table} " in line
+                )
+            )
         )
         for name, before_count in rebuild_log_counts.items():
             assert (
@@ -626,6 +639,32 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert completed_image_coverage_status["covered"] == 1
         assert completed_image_coverage_status["skipped"] == 2
         assert completed_image_coverage_status["healthy"] is True
+        # The query advisory reads the table-wide list projection, while the
+        # completion loop above reads the named-index projection. Once the
+        # exact source target is settled, neither route may accept a late
+        # owner snapshot that forgets classified coverage without a source
+        # mutation. Sample several publication cycles to make that authority
+        # boundary deterministic rather than relying on the query timing.
+        for _ in range(8):
+            listed = parse_json(
+                cli("index", "list", "--table", table, "--output", "json").stdout
+            )
+            listed_thumbnail = next(
+                item for item in listed if item["config"]["name"] == "thumbnail"
+            )["status"]
+            listed_coverage = listed_thumbnail["source_coverage"]
+            assert listed_coverage["observation_complete"] is True, json.dumps(
+                listed_thumbnail, indent=2
+            )
+            listed_settled = sum(
+                int(listed_coverage.get(field) or 0)
+                for field in ("covered", "skipped", "failed")
+            )
+            assert listed_settled == 3, json.dumps(listed_thumbnail, indent=2)
+            assert listed_coverage["complete"] is True, json.dumps(
+                listed_thumbnail, indent=2
+            )
+            time.sleep(0.025)
         assert cli_media_server.request_count >= 1, (
             "the image quickstart path did not exercise remoteMedia over HTTP"
         )

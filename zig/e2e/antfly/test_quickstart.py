@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -987,8 +988,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=30.0,
         until="complete",
     )
+    # Each of the ten first-page documents deterministically produces two
+    # chunks with the fixture configuration. Hold the provider immediately
+    # after that first publishable page so sibling activation is exercised at
+    # a stable, non-empty serving boundary instead of depending on host load.
     progressive_openai_embedder.rate_limit_after_next_requests(
-        300, input_substring="progressive publication document"
+        20, input_substring="progressive publication document"
     )
 
     # Match the quickstart's index-before-load ordering. Separate durable write
@@ -1159,10 +1164,20 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     first_incarnation = partial_status["readiness"]["incarnation"]
     first_floor = int(partial_status["searchable_vectors"])
     first_coverage_floor = int(partial_status["source_coverage"]["covered"])
+    first_settled_floor = sum(
+        int(partial_status["source_coverage"].get(field) or 0)
+        for field in ("covered", "skipped", "failed")
+    )
     first_last_artifacts = first_floor
     first_last_covered = first_coverage_floor
+    first_last_settled = first_settled_floor
     first_last_status = partial_status
     first_continuity_samples = 0
+    # The deterministic Zig coverage holds the writer-cache lock and proves
+    # that status does not wait on it. Keep this process-level check as a
+    # bounded liveness assertion, not a sub-second performance benchmark on a
+    # shared CI runner where the client or server process can be descheduled.
+    status_request_bound_s = 5.0
 
     def serving_status_summary(status: dict) -> dict:
         readiness = status.get("readiness") or {}
@@ -1188,12 +1203,13 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         nonlocal \
             first_last_artifacts, \
             first_last_covered, \
+            first_last_settled, \
             first_last_status, \
             first_continuity_samples
         request_started = time.monotonic()
         status = backup_api.get_index(table_name, index_name)["status"]
         request_elapsed = time.monotonic() - request_started
-        assert request_elapsed < 1.0, (
+        assert request_elapsed < status_request_bound_s, (
             f"status request for {index_name} took {request_elapsed:.3f}s"
         )
         readiness = status.get("readiness") or {}
@@ -1201,20 +1217,61 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         assert readiness.get("incarnation") == first_incarnation, status
         assert readiness.get("queryable") is True, status
         searchable = int(status.get("searchable_vectors", 0))
+        regression_query = None
+        if searchable < first_last_artifacts:
+            regression_query = backup_api.query_table(
+                table_name,
+                {
+                    "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                    "indexes": [index_name],
+                    "limit": 1,
+                },
+            )
         assert searchable >= first_last_artifacts, json.dumps(
             {
                 "previous": serving_status_summary(first_last_status),
                 "current": serving_status_summary(status),
+                "query": regression_query,
+                "server_logs": backup_api.debug_logs(),
             },
             indent=2,
             sort_keys=True,
         )
         first_last_artifacts = searchable
-        first_last_status = status
         covered = int((status.get("source_coverage") or {}).get("covered", 0))
         assert covered >= first_last_covered, status
         first_last_covered = covered
+        coverage = status.get("source_coverage") or {}
+        settled = sum(
+            int(coverage.get(field) or 0) for field in ("covered", "skipped", "failed")
+        )
+        assert settled >= first_last_settled, json.dumps(
+            {
+                "previous": serving_status_summary(first_last_status),
+                "current": serving_status_summary(status),
+                "server_logs": backup_api.debug_logs(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        first_last_settled = settled
+        first_last_status = status
         first_continuity_samples += 1
+        if first_continuity_samples % 8 == 0:
+            continuity_query = backup_api.query_table(
+                table_name,
+                {
+                    "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                    "indexes": [index_name],
+                    "limit": 1,
+                },
+            )
+            continuity_hits = continuity_query["responses"][0]["hits"]["hits"]
+            assert continuity_hits, {
+                "status": status,
+                "query": continuity_query,
+            }
+            assert int(continuity_hits[0]["_id"].removeprefix("doc:")) < 10
         return status
 
     assert_first_serving_continuity()
@@ -1263,10 +1320,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     )
     assert __import__("time").monotonic() - activation_started < 5.0
     second_incarnation = activated["readiness"]["incarnation"]
+    second_publication_samples = deque(maxlen=3)
 
     def second_index_has_published_artifact() -> dict | None:
         assert_first_serving_continuity()
         status = backup_api.get_index(table_name, second_index_name)["status"]
+        second_publication_samples.append(status)
         readiness = status.get("readiness") or {}
         pending_reasons = readiness.get("pending_reasons") or []
         assert "runtime_unavailable" not in pending_reasons, json.dumps(
@@ -1287,7 +1346,15 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=30.0,
         interval_s=0.05,
     )
-    assert second_partial is not None
+    assert second_partial is not None, json.dumps(
+        {
+            "activated": activated,
+            "recent_publication_samples": list(second_publication_samples),
+            "server_logs": backup_api.debug_logs(),
+        },
+        indent=2,
+        sort_keys=True,
+    )
     assert (
         backup_api.get_index(table_name, index_name)["status"]["readiness"]["complete"]
         is False
@@ -1317,7 +1384,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             request_started = time.monotonic()
             sampled = backup_api.get_index(table_name, sampled_index)["status"]
             request_elapsed = time.monotonic() - request_started
-            assert request_elapsed < 1.0, (
+            assert request_elapsed < status_request_bound_s, (
                 f"status request for {sampled_index} took {request_elapsed:.3f}s"
             )
             sampled_readiness = sampled.get("readiness") or {}

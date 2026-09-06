@@ -2235,32 +2235,14 @@ test "backend runtime exposes native API filesystem IO separately" {
 
     const api_io = handle.ptr().apiFilesystemIo().?;
     try std.testing.expect(api_io.vtable == handle.ptr().api_io_impl.?.io().vtable);
-    try std.testing.expect(api_io.vtable != handle.ptr().apiIo().?.vtable);
+    try std.testing.expect(api_io.vtable == handle.ptr().apiIo().?.vtable);
+    try std.testing.expect(api_io.vtable != handle.ptr().apiNetworkIo().?.vtable);
     try std.testing.expect(handle.ptr().filesystemIo().?.vtable == handle.ptr().io_impl.?.io().vtable);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(
-        std.testing.allocator,
-        ".zig-cache/tmp/{s}",
-        .{tmp.sub_path},
-    );
-    defer std.testing.allocator.free(root);
-    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(
-        api_io,
-        root,
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(absolute_root);
-    const missing = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/missing",
-        .{absolute_root},
-    );
-    defer std.testing.allocator.free(missing);
-
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.cwd().statFile(api_io, missing, .{}),
+        tmp.dir.statFile(api_io, "missing", .{}),
     );
 }
 

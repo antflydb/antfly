@@ -263,6 +263,11 @@ const TargetedIndexAuthority = struct {
         // Durable per-index target ordering. The runtime row must prove that
         // its replay target includes this source commit.
         source_target_sequence: u64,
+        // Serving and convergence are independent authorities. Additive work
+        // may make completion stale, but it cannot authorize a lower serving
+        // cardinality for the same incarnation. Reduction authority is kept
+        // until an owner observation covers the coalesced requirement.
+        serving_set_may_reduce: bool,
     };
 
     const TerminalFailure = struct {
@@ -1844,6 +1849,26 @@ pub const TableRuntimeSnapshotCache = struct {
         );
     }
 
+    fn validateUniqueRuntimeStatusGroups(
+        self: *@This(),
+        statuses: []const LocalTableRuntimeStatus,
+    ) !void {
+        // Group batches are supplied by topology reconciliation and are not
+        // subject to a small cardinality bound. Validate them once before
+        // acquiring the per-table mutation lane so a large table cannot turn
+        // publication admission into quadratic serialized work.
+        var group_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer group_ids.deinit(self.alloc);
+        try group_ids.ensureTotalCapacity(
+            self.alloc,
+            std.math.cast(u32, statuses.len) orelse return error.OutOfMemory,
+        );
+        for (statuses) |status| {
+            const entry = group_ids.getOrPutAssumeCapacity(status.group_id);
+            if (entry.found_existing) return error.DuplicateRuntimeStatusGroup;
+        }
+    }
+
     fn publishGroupsForStructuralTarget(
         self: *@This(),
         token: PublicationToken,
@@ -1852,13 +1877,9 @@ pub const TableRuntimeSnapshotCache = struct {
         transition_token: ?TargetedIndexTransitionToken,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
+        try self.validateUniqueRuntimeStatusGroups(statuses);
         const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
         defer self.unlockTableMutation(mutation_state);
-        for (statuses, 0..) |status, index| {
-            for (statuses[0..index]) |previous| {
-                if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
-            }
-        }
 
         const transferred = try self.alloc.alloc(bool, statuses.len);
         defer if (transferred.len > 0) self.alloc.free(transferred);
@@ -2119,13 +2140,9 @@ pub const TableRuntimeSnapshotCache = struct {
         table_name: []const u8,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
+        try self.validateUniqueRuntimeStatusGroups(statuses);
         const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
         defer self.unlockTableMutation(mutation_state);
-        for (statuses, 0..) |status, index| {
-            for (statuses[0..index]) |previous| {
-                if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
-            }
-        }
 
         var replacement = std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus).empty;
         var replacement_owned = true;
@@ -2888,13 +2905,34 @@ pub const TableRuntimeSnapshotCache = struct {
             authority = state.index_authorities.getPtr(owned_name).?;
         }
 
+        var serving_set_may_reduce =
+            if (@hasField(@TypeOf(identity), "serving_set_effect"))
+                switch (identity.serving_set_effect) {
+                    .additive_only => false,
+                    .may_reduce => true,
+                }
+            else
+                true;
         if (authority.?.convergence_requirements.get(group_id)) |required| {
-            if (source_target_sequence <= required.source_target_sequence) return .no_change;
+            if (source_target_sequence < required.source_target_sequence) return .no_change;
+            const previous_still_pending = if (current_status) |status|
+                if (current_position) |position|
+                    !status.stats.indexes[position].runtime_target_observation_complete
+                else
+                    true
+            else
+                true;
+            if (previous_still_pending and required.serving_set_may_reduce)
+                serving_set_may_reduce = true;
+            if (source_target_sequence == required.source_target_sequence and
+                serving_set_may_reduce == required.serving_set_may_reduce)
+                return .no_change;
         }
         self.advanceTargetObservationRevisionLocked();
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
             .event_revision = self.target_observation_revision,
             .source_target_sequence = source_target_sequence,
+            .serving_set_may_reduce = serving_set_may_reduce,
         }) catch {
             // Exact-scope bookkeeping failed, so conservatively widen this
             // one event to the established group-wide convergence fence.
@@ -4058,17 +4096,61 @@ fn preserveArtifactVisibilityUsingLookup(
         // accepted source target, publication and coverage are monotonic.
         // A source update/delete advances that target before a lower
         // cardinality can become authoritative.
+        // The storage replay cursor is deliberately conservative and can
+        // advance across a journal record which does not affect this index.
+        // Exact commit-time target authority is the semantic boundary for an
+        // index projection: the cached row is marked incomplete synchronously
+        // whenever a relevant source target advances. If it is still
+        // complete, a larger broad replay cursor cannot authorize a serving
+        // cardinality regression for this incarnation.
+        const exact_source_target_cannot_reduce_cached = if (index_authorities) |authorities|
+            if (authorities.get(dst.name)) |authority|
+                targetAuthorityAcceptsIdentity(authority, cached.*) and
+                    targetAuthorityAcceptsIdentity(authority, dst.*) and
+                    (if (authority.convergence_requirements.get(incoming.group_id)) |required|
+                        cached.runtime_target_observation_complete or
+                            !required.serving_set_may_reduce
+                    else
+                        false)
+            else
+                false
+        else
+            false;
         const same_accepted_source_target = same_projection_identity and
-            dst.replay_target_sequence == cached.replay_target_sequence;
+            (dst.replay_target_sequence == cached.replay_target_sequence or
+                exact_source_target_cannot_reduce_cached);
         const serving_cardinality_regressed =
             (dst.doc_count < cached.doc_count or
                 dst.node_count < cached.node_count or
+                (cached.publication_target_ready and
+                    (!dst.publication_target_ready or
+                        dst.publication_target_count < cached.publication_target_count)) or
                 (!dst.serving_snapshot_ready and cached.serving_snapshot_ready));
         const serving_visibility_regressed = serving_cardinality_regressed and
             (serving_revision_not_newer or
                 (same_accepted_source_target and
                     dst.load_error == null and
                     incoming.metadata.freshness != .failed));
+        const cached_coverage_settled = cached.coverage_produced_count +|
+            cached.coverage_skipped_count +|
+            cached.coverage_terminal_failed_count;
+        const incoming_coverage_settled = dst.coverage_produced_count +|
+            dst.coverage_skipped_count +|
+            dst.coverage_terminal_failed_count;
+        // Coverage settlement is a separate convergence authority from HBC
+        // serving cardinality. A late replay/status snapshot can retain the
+        // published vectors while forgetting already classified skipped or
+        // failed sources. Under the same exact accepted target, that cannot be
+        // a legitimate regression. A real source mutation first clears the
+        // exact target observation and therefore still admits deletes and
+        // reclassification work.
+        const coverage_settlement_regressed = same_accepted_source_target and
+            cached.coverage_summary_ready and
+            (!dst.coverage_summary_ready or
+                incoming_coverage_settled < cached_coverage_settled or
+                dst.coverage_produced_count < cached.coverage_produced_count or
+                dst.coverage_skipped_count < cached.coverage_skipped_count or
+                dst.coverage_terminal_failed_count < cached.coverage_terminal_failed_count);
         const applied_regressed = same_projection_identity and
             dst.replay_applied_sequence < cached.replay_applied_sequence;
         const same_projection = same_projection_identity and
@@ -4133,32 +4215,36 @@ fn preserveArtifactVisibilityUsingLookup(
             target_not_older and
             !indexHasPublishedGenerationVisibility(dst.*) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
-        if (!targeted_sibling_continuity and
-            !serving_visibility_regressed and
-            !applied_regressed and
-            !projection_regressed and
-            !visibility_regressed_without_newer_replay) continue;
-
-        preserveIndexArtifactVisibility(dst, cached.*);
-        if (targeted_sibling_continuity or
+        const artifact_visibility_needs_preservation = targeted_sibling_continuity or
+            serving_visibility_regressed or
+            applied_regressed or
             projection_regressed or
-            visibility_regressed_without_newer_replay or
-            (same_accepted_source_target and serving_cardinality_regressed))
-            try preserveIndexProjectionLifecycle(alloc, dst, cached, transfer_retained_state);
-        dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
-        dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
-        dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
-        dst.catch_up_target_sequence = @max(dst.catch_up_target_sequence, cached.catch_up_target_sequence);
-        dst.replay_catch_up_required = dst.replay_applied_sequence < dst.replay_target_sequence;
-        dst.backfill_active = dst.backfill_active or dst.replay_catch_up_required;
-        if (dst.replay_target_sequence > 0 and dst.replay_applied_sequence < dst.replay_target_sequence) {
-            dst.backfill_progress = @min(
-                1.0,
-                @as(f64, @floatFromInt(dst.replay_applied_sequence)) /
-                    @as(f64, @floatFromInt(dst.replay_target_sequence)),
-            );
+            visibility_regressed_without_newer_replay;
+        if (!artifact_visibility_needs_preservation and !coverage_settlement_regressed) continue;
+
+        if (artifact_visibility_needs_preservation) {
+            preserveIndexArtifactVisibility(dst, cached.*);
+            if (targeted_sibling_continuity or
+                projection_regressed or
+                visibility_regressed_without_newer_replay or
+                (same_accepted_source_target and serving_cardinality_regressed))
+                try preserveIndexProjectionLifecycle(alloc, dst, cached, transfer_retained_state);
+            dst.replay_applied_sequence = @max(dst.replay_applied_sequence, cached.replay_applied_sequence);
+            dst.replay_target_sequence = @max(dst.replay_target_sequence, cached.replay_target_sequence);
+            dst.catch_up_applied_sequence = @max(dst.catch_up_applied_sequence, cached.catch_up_applied_sequence);
+            dst.catch_up_target_sequence = @max(dst.catch_up_target_sequence, cached.catch_up_target_sequence);
+            dst.replay_catch_up_required = dst.replay_applied_sequence < dst.replay_target_sequence;
+            dst.backfill_active = dst.backfill_active or dst.replay_catch_up_required;
+            if (dst.replay_target_sequence > 0 and dst.replay_applied_sequence < dst.replay_target_sequence) {
+                dst.backfill_progress = @min(
+                    1.0,
+                    @as(f64, @floatFromInt(dst.replay_applied_sequence)) /
+                        @as(f64, @floatFromInt(dst.replay_target_sequence)),
+                );
+            }
+            preserved_visibility = true;
         }
-        preserved_visibility = true;
+        if (coverage_settlement_regressed) preserveIndexCoverageSettlement(dst, cached.*);
     }
     if (preserved_visibility and incoming.stats.doc_count < previous.stats.doc_count) {
         incoming.stats.doc_count = previous.stats.doc_count;
@@ -4174,12 +4260,10 @@ fn preserveArtifactVisibilityUsingLookup(
     }
 }
 
-fn preserveIndexProjectionLifecycle(
-    alloc: std.mem.Allocator,
+fn preserveIndexCoverageSettlement(
     dst: *db_mod.types.DBIndexStats,
-    cached: *db_mod.types.DBIndexStats,
-    transfer_retained_state: bool,
-) !void {
+    cached: db_mod.types.DBIndexStats,
+) void {
     dst.coverage_produced_count = cached.coverage_produced_count;
     dst.coverage_skipped_count = cached.coverage_skipped_count;
     dst.coverage_terminal_failed_count = cached.coverage_terminal_failed_count;
@@ -4187,6 +4271,15 @@ fn preserveIndexProjectionLifecycle(
     dst.coverage_summary_ready = cached.coverage_summary_ready;
     dst.coverage_generation = cached.coverage_generation;
     dst.coverage_identity_ready = cached.coverage_identity_ready;
+}
+
+fn preserveIndexProjectionLifecycle(
+    alloc: std.mem.Allocator,
+    dst: *db_mod.types.DBIndexStats,
+    cached: *db_mod.types.DBIndexStats,
+    transfer_retained_state: bool,
+) !void {
+    preserveIndexCoverageSettlement(dst, cached.*);
     // Activity is intentionally not preserved across a stale projection
     // handoff. Motion must come from the current runtime owner, never from the
     // retained serving snapshot.
@@ -9259,6 +9352,284 @@ test "owner replacement cannot regress serving facts at the same accepted source
     try std.testing.expectEqual(@as(u64, 4), observed.stats.indexes[0].replay_target_sequence);
 }
 
+test "irrelevant broad replay cursor cannot regress exact index serving or coverage facts" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var current_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .doc_count = 20,
+        .node_count = 3,
+        .serving_snapshot_ready = true,
+        .serving_snapshot_revision = 6,
+        .coverage_produced_count = 10,
+        .coverage_skipped_count = 2,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 6,
+        .replay_target_sequence = 6,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 6,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = current_indexes[0..] },
+        }),
+    );
+
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+    };
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    const acknowledged = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(acknowledged, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 6,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = current_indexes[0..] },
+        }),
+    );
+
+    // Coverage settlement has independent authority from serving cardinality.
+    // A stale observer may retain the same HBC member count while forgetting
+    // already classified source outcomes.
+    var coverage_only_regression = current_indexes;
+    coverage_only_regression[0].doc_count = 25;
+    coverage_only_regression[0].node_count = 4;
+    coverage_only_regression[0].serving_snapshot_revision = 7;
+    coverage_only_regression[0].coverage_skipped_count = 0;
+    coverage_only_regression[0].replay_applied_sequence = 7;
+    coverage_only_regression[0].replay_target_sequence = 8;
+    const coverage_only = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(coverage_only, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 8,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = coverage_only_regression[0..] },
+        }),
+    );
+    {
+        var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 25), observed.stats.indexes[0].doc_count);
+        try std.testing.expectEqual(@as(u64, 4), observed.stats.indexes[0].node_count);
+        try std.testing.expectEqual(@as(u64, 7), observed.stats.indexes[0].serving_snapshot_revision);
+        try std.testing.expectEqual(@as(u64, 2), observed.stats.indexes[0].coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 8), observed.stats.indexes[0].replay_target_sequence);
+    }
+
+    // A record for a sibling index can advance the broad enrichment replay
+    // cursor. It did not emit an exact target event for this incarnation, so
+    // a cache-only zero must not replace its immutable serving projection.
+    var irrelevant_indexes = current_indexes;
+    irrelevant_indexes[0].doc_count = 0;
+    irrelevant_indexes[0].node_count = 0;
+    irrelevant_indexes[0].serving_snapshot_revision = 7;
+    irrelevant_indexes[0].replay_applied_sequence = 7;
+    irrelevant_indexes[0].replay_target_sequence = 8;
+    const irrelevant = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(irrelevant, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 8,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = irrelevant_indexes[0..] },
+        }),
+    );
+    {
+        var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 25), observed.stats.indexes[0].doc_count);
+        try std.testing.expectEqual(@as(u64, 4), observed.stats.indexes[0].node_count);
+        try std.testing.expectEqual(@as(u64, 10), observed.stats.indexes[0].coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 8), observed.stats.indexes[0].replay_target_sequence);
+    }
+
+    // A real exact target edge clears the cached convergence proof before the
+    // owner publishes its replacement, so a legitimate cardinality decrease
+    // remains observable rather than becoming a permanent high-water mark.
+    cache.markIndexTargetObservationPending("docs", 7, identity, 9);
+    irrelevant_indexes[0].coverage_skipped_count = 0;
+    irrelevant_indexes[0].serving_snapshot_revision = 8;
+    irrelevant_indexes[0].replay_applied_sequence = 9;
+    irrelevant_indexes[0].replay_target_sequence = 9;
+    const relevant = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(relevant, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 9,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = irrelevant_indexes[0..] },
+        }),
+    );
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), observed.stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 0), observed.stats.indexes[0].coverage_skipped_count);
+    try std.testing.expectEqual(@as(u64, 8), observed.stats.indexes[0].serving_snapshot_revision);
+}
+
+test "exact additive target advance preserves serving facts while delete authority permits reduction" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic"),
+        .kind = .dense_vector,
+        .doc_count = 20,
+        .node_count = 3,
+        .publication_target_count = 20,
+        .publication_target_ready = true,
+        .serving_snapshot_ready = true,
+        .serving_snapshot_revision = 4,
+        .coverage_produced_count = 10,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 4,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 4,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+        }),
+    );
+
+    const Effect = enum { additive_only, may_reduce };
+    const Target = struct {
+        index_name: []const u8,
+        kind: db_mod.types.IndexKind,
+        incarnation: u64,
+        config_hash: u64,
+        serving_set_effect: Effect,
+    };
+    const additive = [_]Target{.{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+        .serving_set_effect = .additive_only,
+    }};
+    cache.markIndexTargetsObservationPending("docs", 7, additive[0..], 11);
+
+    indexes[0].doc_count = 8;
+    indexes[0].node_count = 2;
+    indexes[0].publication_target_count = 6;
+    indexes[0].serving_snapshot_revision = 7;
+    indexes[0].coverage_produced_count = 6;
+    indexes[0].replay_applied_sequence = 7;
+    indexes[0].replay_target_sequence = 11;
+    const additive_observation = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(additive_observation, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 11,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+        }),
+    );
+    {
+        var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer observed.deinit(alloc);
+        try std.testing.expect(observed.stats.indexes[0].runtime_target_observation_complete);
+        try std.testing.expectEqual(@as(u64, 20), observed.stats.indexes[0].doc_count);
+        try std.testing.expectEqual(@as(u64, 20), observed.stats.indexes[0].publication_target_count);
+        try std.testing.expectEqual(@as(u64, 10), observed.stats.indexes[0].coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 11), observed.stats.indexes[0].replay_target_sequence);
+    }
+
+    const reducing = [_]Target{.{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+        .serving_set_effect = .may_reduce,
+    }};
+    cache.markIndexTargetsObservationPending("docs", 7, reducing[0..], 12);
+    // A later additive commit can coalesce before the owner publishes. It
+    // must not erase the still-pending permission established by the delete.
+    cache.markIndexTargetsObservationPending("docs", 7, additive[0..], 13);
+    indexes[0].doc_count = 6;
+    indexes[0].node_count = 1;
+    indexes[0].publication_target_count = 6;
+    indexes[0].serving_snapshot_revision = 8;
+    indexes[0].coverage_produced_count = 6;
+    indexes[0].replay_applied_sequence = 13;
+    indexes[0].replay_target_sequence = 13;
+    const reducing_observation = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(reducing_observation, "docs", .{
+            .group_id = 7,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = 9,
+                .target_observation_revision = 13,
+            },
+            .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = indexes[0..] },
+        }),
+    );
+    var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer observed.deinit(alloc);
+    try std.testing.expect(observed.stats.indexes[0].runtime_target_observation_complete);
+    try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].publication_target_count);
+    try std.testing.expectEqual(@as(u64, 6), observed.stats.indexes[0].coverage_produced_count);
+}
+
 test "table runtime snapshot cache batch preserves newer group observations" {
     const alloc = std.testing.allocator;
     var cache = TableRuntimeSnapshotCache.init(alloc);
@@ -9293,6 +9664,31 @@ test "table runtime snapshot cache batch preserves newer group observations" {
         },
         else => return error.UnexpectedRuntimeStatusGroup,
     };
+}
+
+test "runtime status group batches reject duplicate group ids before publication" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const duplicate = [_]LocalTableRuntimeStatus{
+        .{ .group_id = 7, .stats = .{ .doc_count = 10 } },
+        .{ .group_id = 8, .stats = .{ .doc_count = 20 } },
+        .{ .group_id = 7, .stats = .{ .doc_count = 30 } },
+    };
+    const ordinary_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectError(
+        error.DuplicateRuntimeStatusGroup,
+        cache.publishGroups(ordinary_token, "docs", &duplicate),
+    );
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+
+    const lifecycle_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectError(
+        error.DuplicateRuntimeStatusGroup,
+        cache.publishLifecycleTransition(lifecycle_token, "docs", &duplicate),
+    );
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
 }
 
 test "table runtime snapshot cache live publication does not starve structural refresh" {

@@ -2659,12 +2659,6 @@ fn assetProducerBatchItemBytes(item: AssetProducerBatchItem) usize {
     );
 }
 
-fn assetProducerBatchBytes(items: []const AssetProducerBatchItem) usize {
-    var total: usize = 0;
-    for (items) |item| total = addUsizeSaturating(total, assetProducerBatchItemBytes(item));
-    return total;
-}
-
 fn workerChunkCacheKey(
     alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -5242,16 +5236,49 @@ fn flushDeferredGeneratedWork(
     window: *GeneratedReplayWindow,
 ) !void {
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try flushAssetProducerBatch(runtime, deferred_assets, window);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
+    flushAssetProducerBatch(runtime, deferred_assets, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        deferred_retry_error = err;
+        deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+    };
+    // Each producer class is an independent availability domain. Publish a
+    // completed class before invoking the next provider so a retryable outage
+    // cannot discard useful sibling output accumulated in this replay
+    // quantum. The source cursor remains unchanged until every class has been
+    // visited, so the failed request is retried and successful writes remain
+    // crash-idempotent.
+    try flushGeneratedReplayWindow(runtime, window);
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try processPlainDenseWindow(runtime, deferred_plain_dense.items, window);
+    processPlainDenseWindow(runtime, deferred_plain_dense.items, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        if (deferred_retry_error == null) {
+            deferred_retry_error = err;
+            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+    };
     deferred_plain_dense.clearRetainingCapacity();
+    try flushGeneratedReplayWindow(runtime, window);
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window);
+    processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        if (deferred_retry_error == null) {
+            deferred_retry_error = err;
+            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+    };
     deferred_chunked_dense.clearRetainingCapacity();
     try flushGeneratedReplayWindow(runtime, window);
     clearWorkerChunkCache(runtime.alloc, chunk_cache);
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
+    if (deferred_retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
+    }
 }
 
 fn processAsset(
@@ -5358,7 +5385,7 @@ fn processAsset(
     var config_json_owned = true;
     errdefer if (config_json_owned and config_json.len > 0) runtime.alloc.free(config_json);
 
-    try appendAssetProducerBatchItem(runtime, deferred_assets, window, .{
+    try appendAssetProducerBatchItem(runtime, deferred_assets, .{
         .request = request,
         .producer_type = producer_cfg.type,
         .config_json = @constCast(config_json),
@@ -5381,20 +5408,8 @@ fn processAsset(
 fn appendAssetProducerBatchItem(
     runtime: *EnrichmentRuntime,
     items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
-    window: *GeneratedReplayWindow,
     item: AssetProducerBatchItem,
 ) !void {
-    const policy = requestGeneratedTextBatchPolicy(runtime.alloc, item.request);
-    if (items.items.len > 0) {
-        const current_bytes = assetProducerBatchBytes(items.items);
-        const item_bytes = assetProducerBatchItemBytes(item);
-        if (!sameAssetProducerBatchKey(items.items[0], item) or
-            items.items.len >= policy.max_items or
-            addUsizeSaturating(current_bytes, item_bytes) > policy.max_bytes)
-        {
-            try flushAssetProducerBatch(runtime, items, window);
-        }
-    }
     try items.append(runtime.alloc, item);
 }
 
@@ -5405,22 +5420,65 @@ fn flushAssetProducerBatch(
 ) !void {
     if (items.items.len == 0) return;
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
+    // Planning remains provider-I/O free: retain bounded items until the
+    // preparation quantum closes, then partition them into compatible native
+    // batches. This prevents an early asset-provider outage from stopping
+    // later dense requests before their availability lane is even queued.
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
+    var start: usize = 0;
+    while (start < items.items.len) {
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, items.items[start].request);
+        var end = start;
+        var batch_bytes: usize = 0;
+        while (end < items.items.len) : (end += 1) {
+            const item = items.items[end];
+            if (end > start and !sameAssetProducerBatchKey(items.items[start], item)) break;
+            const item_bytes = assetProducerBatchItemBytes(item);
+            if (end > start and
+                (end - start >= policy.max_items or
+                    addUsizeSaturating(batch_bytes, item_bytes) > policy.max_bytes)) break;
+            batch_bytes = addUsizeSaturating(batch_bytes, item_bytes);
+        }
+        std.debug.assert(end > start);
+        flushAssetProducerBatchItems(runtime, items.items[start..end], window) catch |err| {
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                return err;
+            if (deferred_retry_error == null) {
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+            }
+        };
+        start = end;
+    }
+    if (deferred_retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
+    }
+}
+
+fn flushAssetProducerBatchItems(
+    runtime: *EnrichmentRuntime,
+    items: []AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+) !void {
+    std.debug.assert(items.len > 0);
+    setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items));
     yieldToInteractiveGeneration(runtime);
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);
+    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.len);
     defer runtime.alloc.free(requests);
-    for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+    for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     };
     if (!can_batch)
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
 
     var produced = assetProducerProduceBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
@@ -5428,14 +5486,14 @@ fn flushAssetProducerBatch(
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
         // fingerprints across worker passes.
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     };
-    if (produced.len != items.items.len) {
+    if (produced.len != items.len) {
         for (produced) |output| {
             if (output.len > 0) runtime.alloc.free(output);
         }
         runtime.alloc.free(produced);
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     }
 
     defer runtime.alloc.free(produced);
@@ -5445,7 +5503,7 @@ fn flushAssetProducerBatch(
         }
     }
 
-    for (items.items, produced, 0..) |*item, output, idx| {
+    for (items, produced, 0..) |*item, output, idx| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
             runtime.alloc.free(output);
@@ -10186,9 +10244,11 @@ fn processChunkedDenseWindow(
     const processed = try runtime.alloc.alloc(bool, requests.len);
     defer runtime.alloc.free(processed);
     @memset(processed, false);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
 
     var i: usize = 0;
-    while (i < requests.len) : (i += 1) {
+    request_key: while (i < requests.len) : (i += 1) {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
@@ -10229,7 +10289,19 @@ fn processChunkedDenseWindow(
             const chunk_artifact_name = requestArtifactName(request);
             if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
                 processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window) catch |err| {
-                    if (shouldYieldRequestError(runtime, err)) return err;
+                    if (shouldYieldRequestError(runtime, err)) {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    }
                     try recordIsolatedRequestError(runtime, window, request, err);
                 };
                 continue;
@@ -10262,7 +10334,19 @@ fn processChunkedDenseWindow(
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                 {
-                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+                    _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    };
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                 }
@@ -10282,7 +10366,19 @@ fn processChunkedDenseWindow(
                 });
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    };
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                     // The failed batch already parked this logical request.
@@ -10294,8 +10390,25 @@ fn processChunkedDenseWindow(
         }
 
         if (chunk_items.items.len == 0) continue;
-        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+        _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                return err;
+            if (deferred_retry_error == null) {
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+            }
+            var remaining = i + 1;
+            while (remaining < requests.len) : (remaining += 1) {
+                if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+            }
+            continue :request_key;
+        };
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+    }
+    if (deferred_retry_error) |err| {
+        try flushGeneratedReplayWindow(runtime, window);
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
     }
 }
 

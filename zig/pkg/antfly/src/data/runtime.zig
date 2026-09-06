@@ -10159,8 +10159,9 @@ pub const DataServer = struct {
         tables: []const antfly.metadata.table_manager.TableRecord,
         ranges: []const antfly.metadata.table_manager.RangeRecord,
     ) !void {
-        if (self.currentReallocationObservationRequirement() == null) return;
+        const requirement = self.currentReallocationObservationRequirement() orelse return;
         for (reports) |*report| {
+            if (report.observed_reallocation_request_id == requirement.request_id) continue;
             const range = findRangeByGroupId(ranges, report.group_id) orelse continue;
             const table = findTableById(tables, range.table_id) orelse continue;
             const cached = try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(
@@ -10168,8 +10169,25 @@ pub const DataServer = struct {
                 table.name,
                 report.group_id,
             );
-            var status = cached orelse continue;
+            // The causal reallocation barrier owns disk authority, not index
+            // runtime authority. A foreground writer can legitimately prevent
+            // the generic runtime-status publisher from replacing its cached
+            // snapshot for the whole lifetime of a request. Refresh the
+            // independently safe directory observation here, so WriterLocked
+            // cannot strand an otherwise healthy placement at acknowledgement
+            // zero. The request invalidates this per-group cache once; later
+            // reports reuse the post-request observation in O(1).
+            var status = cached orelse runtime_status.LocalTableRuntimeStatus{
+                .group_id = report.group_id,
+                .metadata = .{
+                    .source = .synthetic_config,
+                    .freshness = .missing,
+                    .lsm_root_generation = self.provisioned_storage.visibleRootGenerationForGroup(report.group_id),
+                },
+                .stats = .{ .doc_count = report.doc_count },
+            };
             defer status.deinit(alloc);
+            self.applyRuntimeStatusStorageFactsBestEffort(&status, report.group_id, null);
             self.annotateRuntimeReallocationObservation(report, status);
         }
     }
@@ -24316,9 +24334,20 @@ test "data runtime raft status changes force immediate store status publication"
 test "data runtime reallocation request refreshes group status once per request" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
 
     const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-reallocation-status-refresh", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root_dir);
+    const group_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root_dir, 1);
+    defer std.testing.allocator.free(group_db_path);
+    try fs_paths.createDirPathPortable(io_impl.io(), group_db_path);
+    const disk_marker_path = try std.fs.path.join(std.testing.allocator, &.{ group_db_path, "post-request-disk-marker" });
+    defer std.testing.allocator.free(disk_marker_path);
+    var disk_marker = try std.Io.Dir.cwd().createFile(io_impl.io(), disk_marker_path, .{ .truncate = true });
+    try disk_marker.writeStreamingAll(io_impl.io(), "durable group bytes");
+    try disk_marker.sync(io_impl.io());
+    disk_marker.close(io_impl.io());
 
     var server: DataServer = .{
         .alloc = std.testing.allocator,
@@ -24367,6 +24396,41 @@ test "data runtime reallocation request refreshes group status once per request"
     try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks.load(.acquire));
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(server.runtime_status_force_refresh.swap(false, .acq_rel));
+
+    // A foreground writer can hold the runtime publisher for the lifetime of
+    // the reallocation request. The store-report overlay must obtain fresh
+    // disk authority independently instead of waiting for that stale runtime
+    // snapshot to be replaced.
+    var reports = [_]antfly.metadata.table_manager.GroupStatusReport{.{
+        .group_id = 1,
+        .doc_count = 1,
+        .disk_bytes = 50,
+        .disk_bytes_known = true,
+    }};
+    const tables = [_]antfly.metadata.table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .placement_role = "data",
+    }};
+    const ranges = [_]antfly.metadata.table_manager.RangeRecord{.{
+        .group_id = 1,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    try server.overlayRuntimeReallocationObservations(
+        std.testing.allocator,
+        &reports,
+        &tables,
+        &ranges,
+    );
+    try std.testing.expectEqual(request.request_id, reports[0].observed_reallocation_request_id);
+    try std.testing.expect(reports[0].disk_bytes > 0);
+    const disk_observation = server.runtime_status_disk_usage_cache.get(1).?;
+    try std.testing.expect(
+        disk_observation.observation_generation >
+            server.currentReallocationObservationRequirement().?.disk_observation_fence,
+    );
 
     server.store_status_dirty.store(false, .release);
     server.store_status_ticks.store(0, .release);
@@ -24429,12 +24493,13 @@ test "data runtime reallocation request refreshes group status once per request"
     server.annotateRuntimeReallocationObservation(&recycled_report, recycled_runtime);
     try std.testing.expectEqual(@as(u128, 0), recycled_report.observed_reallocation_request_id);
 
+    const post_request_generation = server.currentReallocationObservationRequirement().?.disk_observation_fence + 1;
     const post_request_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
         runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
         try server.provisioned_storage.runtime_status_cache.publishGroup(post_request_token, "docs", .{
             .group_id = 1,
-            .disk_observation_generation = 2,
+            .disk_observation_generation = post_request_generation,
             .disk_bytes = 200,
             .disk_bytes_known = true,
             .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
