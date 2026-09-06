@@ -106,11 +106,14 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "agents")) return
     \\usage: antfly agents <retrieval|query-builder> [options]
     \\
-    \\  agents retrieval --table <table> (--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
+    \\  agents retrieval --table <table> (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
     \\                            --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
+    \\                            --max-internal-iterations <0..20> (default: 8 for intent; 0 for explicit queries)
     \\  agents query-builder --intent <text> --generator <json> [--table <table>]
+    \\                       [--fields <names>] [--mode <mode>] [--max-internal-iterations <0..20>]
+    \\                       [--execute] [--streaming|--no-streaming] (delegate to the retrieval workflow)
     \\
     ;
     if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";

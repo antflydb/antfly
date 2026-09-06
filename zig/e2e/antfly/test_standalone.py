@@ -829,15 +829,16 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
     assert metrics.status_code == 200
     assert metrics.headers["Content-Type"].startswith("text/plain")
     body = metrics.text
-    # Core raft host metrics written by StandaloneHealthSource.
-    assert "antfly_raft_hosted_groups" in body
-    assert "antfly_raft_reconcile_rounds_total" in body
-    # Managed service metrics.
-    assert "antfly_service_queued_updates" in body
-    assert "antfly_service_applied_updates_total" in body
+    # Standalone composes data-runtime, supervisor, and public admission
+    # metrics. Metadata-node raft-host/service metrics live on that node.
+    assert "antfly_data_server_up 1\n" in body
+    assert "antfly_runtime_supervisor_state 1\n" in body
+    assert "antfly_runtime_supervisor_cancelled 0\n" in body
+    assert "antfly_admission_query_capacity_requests" in body
+    assert "antfly_admission_inference_capacity_requests" in body
     # Prometheus exposition format sanity.
-    assert "# HELP antfly_raft_hosted_groups" in body
-    assert "# TYPE antfly_raft_hosted_groups gauge" in body
+    assert "# HELP antfly_data_server_up" in body
+    assert "# TYPE antfly_data_server_up gauge" in body
 
     unknown = requests.get(f"{health_url}/does-not-exist", timeout=5)
     assert unknown.status_code == 404
@@ -977,6 +978,117 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                 embedded_standalone_api.delete_table(table_name)
             except (requests.RequestException, ValueError):
                 pass
+
+
+def test_standalone_gemma_agent_tools_via_cli(
+    embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime
+):
+    """Qualify real model tools, not a planner's synthetic tool-call counter."""
+    if "gemma-4" not in embedded_standalone_runtime["model"].lower():
+        pytest.skip("requires a Gemma 4 tool-capable generator")
+    table = f"gemma_agent_tools_{time.time_ns()}"
+    # This value is never supplied in a user prompt or a canned tool response.
+    canary = f"AZURE-{time.time_ns()}"
+    embedded_standalone_api.create_table(table, num_shards=1)
+    try:
+        embedded_standalone_api.batch_write(
+            table,
+            inserts={
+                "anatomy": {
+                    "title": "anatomy",
+                    "body": f"The anatomy verification code is {canary}.",
+                },
+                "noise": {
+                    "title": "physics",
+                    "body": "There is no verification code here.",
+                },
+            },
+            sync_level="full_index",
+        )
+        generator = json.dumps(
+            {
+                "provider": "antfly",
+                "model": embedded_standalone_runtime["model"],
+                "max_tokens": 512,
+                "temperature": 0,
+            }
+        )
+        common = (
+            "agents",
+            "query-builder",
+            "--table",
+            table,
+            "--fields",
+            "title,body",
+            "--mode",
+            "full_text",
+            "--intent",
+            "Find the anatomy document and report its verification code.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+        )
+        response = embedded_standalone_api.s.post(
+            f"{embedded_standalone_api.url}/agents/query-builder",
+            json={
+                "table": table,
+                "schema_fields": ["title", "body"],
+                "mode": "full_text",
+                "intent": "Find the anatomy document and report its verification code.",
+                "generator": json.loads(generator),
+                "max_internal_iterations": 4,
+            },
+            timeout=240,
+        )
+        assert response.status_code == 200, response.text
+        api_plan = response.json()
+        assert api_plan["status"] == "completed", response.text
+        assert all(value is not None for value in api_plan["query_request"].values())
+        built = embedded_standalone_cli(*common, timeout_s=240)
+        plan = json.loads(built.stdout)
+        assert plan["status"] == "completed"
+        assert plan["query_request"]["table"] == table
+        assert any(
+            step["name"] == "submit_query" and step["kind"] == "tool_call"
+            for step in plan["steps"]
+        )
+        assert "generation" not in plan
+
+        executed = embedded_standalone_cli(*common, "--execute", "--no-streaming", timeout_s=300)
+        result = json.loads(executed.stdout)
+        assert result["status"] == "completed"
+        assert canary in result["generation"], json.dumps(result)
+        assert "anatomy" in _hit_ids(result)
+        assert any(
+            (step.get("details") or {}).get("selection_source") == "model_tool_call"
+            and (step.get("details") or {}).get("tool_call_id")
+            for step in result["steps"]
+        )
+
+        streamed = embedded_standalone_cli(
+            "agents",
+            "retrieval",
+            "--table",
+            table,
+            "--intent",
+            "Report the anatomy verification code from the database.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+            "--generate",
+            "--streaming",
+            timeout_s=240,
+        )
+        assert "event: error" not in streamed.stdout
+        assert "event: done" in streamed.stdout
+        assert "build_query" in streamed.stdout
+        assert "submit_query" in streamed.stdout
+        assert "model_tool_call" in streamed.stdout
+        assert canary in streamed.stdout
+    finally:
+        embedded_standalone_api.delete_table(table)
 
 
 def test_standalone_retrieval_generation_with_live_inference(

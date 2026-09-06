@@ -5035,6 +5035,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .generate_text_with_context = inferenceProviderGenerateTextWithContext,
         .generate_messages = inferenceProviderGenerateMessages,
         .generate_messages_with_context = inferenceProviderGenerateMessagesWithContext,
+        .generate_json = inferenceProviderGenerateJson,
         .read_images = inferenceProviderReadImages,
         .read_images_with_context = inferenceProviderReadImagesWithContext,
         .transcribe_audio = inferenceProviderTranscribeAudio,
@@ -5507,6 +5508,46 @@ fn inferenceProviderGenerateMessages(
         .messages = messages,
         .options = options,
     }, null);
+}
+
+fn inferenceProviderGenerateJson(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    request: ?antfly.inference.RequestContext,
+) ![]u8 {
+    if (request) |context| try context.check();
+    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(ptr));
+    var guard = try lifetime.acquire();
+    defer guard.deinit();
+    var target = LocalInferenceConnectionContext{ .handle = lifetime.handle };
+    var abi_alloc = inference_connection_abi.Allocator.fromStd(&alloc);
+    var response: inference_connection_abi.InvokeResponse = .{};
+    defer response.deinit(&abi_alloc);
+    try invokeLocalInferenceConnectionFallible(&.{
+        .abi_version = inference_connection_abi.abi_version,
+        .target_context = &target,
+        .allocator = &abi_alloc,
+        .operation = .init("generate"),
+        .body = .init(body),
+        .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+        .cancellation = .{ .context = &request, .is_cancelled = struct {
+            fn cancelled(raw: ?*const anyopaque) callconv(.c) u8 {
+                const source: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
+                const active = source.* orelse return 0;
+                return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
+            }
+        }.cancelled },
+        .out_response = &response,
+    });
+    if (request) |context| try context.check();
+    if (!response.valid()) return error.RuntimeBoundaryFailure;
+    if (response.status >= 300) return switch (response.status) {
+        429 => error.RateLimit,
+        504 => error.Timeout,
+        else => error.GenerateRequestFailed,
+    };
+    return alloc.dupe(u8, response.body.slice());
 }
 
 fn inferenceProviderGenerateMessagesWithContext(
