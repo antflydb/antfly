@@ -1284,6 +1284,13 @@ pub const IndexManager = struct {
     /// fairness while the catalog shared lock keeps the indexed slices stable.
     graph_metric_coordinator_cursor: std.atomic.Value(usize) = .init(0),
     graph_metric_worker_cursor: std.atomic.Value(usize) = .init(0),
+    /// Worker snapshots pin the inline graph-index array after releasing the
+    /// catalog lock. Structural graph catalog mutations wait for these bounded
+    /// page quanta, while unrelated catalog readers and writers no longer wait
+    /// for an entire maintenance drain.
+    graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    graph_metric_schedule_pin_mutex: std.Io.Mutex = .init,
+    graph_metric_schedule_pins_drained: std.Io.Condition = .init,
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -3135,6 +3142,26 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    fn waitForGraphMetricSchedulePins(self: *IndexManager) void {
+        if (self.io) |io| {
+            self.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+            defer self.graph_metric_schedule_pin_mutex.unlock(io);
+            while (self.graph_metric_schedule_pins.load(.acquire) != 0) {
+                self.graph_metric_schedule_pins_drained.waitUncancelable(io, &self.graph_metric_schedule_pin_mutex);
+            }
+            return;
+        }
+        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) {
+            if (self.graph_metric_schedule_pins.load(.acquire) != 0)
+                @panic("cannot drain graph metric schedule pins without an I/O coordinator");
+            return;
+        }
+        // Manually configured managers may not own an executor. Their worker
+        // sweeps are normally synchronous; retain the established teardown
+        // fallback for a structural mutation racing such a sweep.
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
+    }
+
     pub fn deinit(self: *IndexManager) void {
         self.deinitWithBackendDisposition(false);
     }
@@ -3157,6 +3184,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        self.waitForGraphMetricSchedulePins();
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
@@ -5773,6 +5801,67 @@ pub const IndexManager = struct {
         config: *const graph_mod.GraphMetricConfig,
     };
 
+    const GraphMetricWorkerSnapshotEntry = struct {
+        entry: *GraphIndex,
+        metric_name: []const u8,
+        lifecycle_canonical: bool,
+    };
+
+    const GraphMetricWorkerSnapshot = struct {
+        manager: *IndexManager,
+        entries: []GraphMetricWorkerSnapshotEntry,
+        names: []u8,
+
+        fn deinit(self: *@This()) void {
+            self.manager.alloc.free(self.names);
+            self.manager.alloc.free(self.entries);
+            if (self.manager.io) |io| {
+                self.manager.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+                const prior = self.manager.graph_metric_schedule_pins.fetchSub(1, .release);
+                std.debug.assert(prior != 0);
+                if (prior == 1) self.manager.graph_metric_schedule_pins_drained.broadcast(io);
+                self.manager.graph_metric_schedule_pin_mutex.unlock(io);
+            } else {
+                const prior = self.manager.graph_metric_schedule_pins.fetchSub(1, .release);
+                std.debug.assert(prior != 0);
+            }
+            self.* = undefined;
+        }
+    };
+
+    fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry_count = self.graphMetricScheduleEntryCount();
+        const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, entry_count);
+        errdefer self.alloc.free(entries);
+        var names_len: usize = 0;
+        for (self.graph_indexes.items) |entry| {
+            for (entry.metric_configs) |config| names_len = std.math.add(usize, names_len, config.name.len) catch return error.OutOfMemory;
+        }
+        const names = try self.alloc.alloc(u8, names_len);
+        errdefer self.alloc.free(names);
+        if (entry_count != 0) {
+            const start = self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
+            var schedule = GraphMetricScheduleIterator.init(self, start);
+            var names_offset: usize = 0;
+            for (entries) |*snapshot_entry| {
+                const scheduled = schedule.next();
+                const metric_name = names[names_offset..][0..scheduled.config.name.len];
+                @memcpy(metric_name, scheduled.config.name);
+                names_offset += metric_name.len;
+                snapshot_entry.* = .{
+                    .entry = scheduled.entry,
+                    .metric_name = metric_name,
+                    .lifecycle_canonical = graphMetricLifecycleCanonical(scheduled.entry.metric_configs, scheduled.config.*),
+                };
+            }
+            std.debug.assert(names_offset == names.len);
+        }
+        _ = self.graph_metric_schedule_pins.fetchAdd(1, .acq_rel);
+        return .{ .manager = self, .entries = entries, .names = names };
+    }
+
     const GraphMetricScheduleIterator = struct {
         manager: *IndexManager,
         graph_index: usize,
@@ -6293,62 +6382,60 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedWorkerSweepOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        return try self.runGraphMetricPlannedWorkerSweepUnlocked(options);
+        var snapshot = try self.graphMetricWorkerSnapshotAlloc();
+        defer snapshot.deinit();
+        return try self.runGraphMetricPlannedWorkerSweepSnapshot(options, snapshot.entries);
     }
 
-    fn runGraphMetricPlannedWorkerSweepUnlocked(
-        self: *IndexManager,
+    fn runGraphMetricPlannedWorkerSweepSnapshot(
+        _: *IndexManager,
         options: GraphMetricPlannedWorkerSweepOptions,
+        scheduled_entries: []const GraphMetricWorkerSnapshotEntry,
     ) !GraphMetricPlannedSchedulerSweepResult {
         if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
         var result = GraphMetricPlannedSchedulerSweepResult{};
         if (options.max_pages == 0) return result;
 
-        const entry_count = self.graphMetricScheduleEntryCount();
+        const entry_count = scheduled_entries.len;
         if (entry_count == 0) return result;
-        const start = self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
-        var schedule = GraphMetricScheduleIterator.init(self, start);
-        for (0..entry_count) |_| {
-            const scheduled = schedule.next();
+        for (scheduled_entries) |scheduled| {
             const entry = scheduled.entry;
-            const cfg = scheduled.config.*;
+            const metric_name = scheduled.metric_name;
             if (result.worker_steps >= options.max_pages) {
                 result.budget_exhausted = true;
                 return result;
             }
 
-            if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(cfg.name)) {
+            if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(metric_name)) {
                 result.metrics_scanned += 1;
                 result.worker_steps += 1;
                 result.pages_completed += 1;
                 continue;
             }
-            if (try entry.index.cleanupFailedGraphMetricBuildJobPage(cfg.name)) {
+            if (try entry.index.cleanupFailedGraphMetricBuildJobPage(metric_name)) {
                 result.metrics_scanned += 1;
                 result.worker_steps += 1;
                 result.pages_completed += 1;
                 continue;
             }
-            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+            const status = try entry.index.graphMetricSchedulerStatus(metric_name, options.now_ms);
             if (status.maintenance_paused) continue;
-            if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(cfg.name)) {
+            if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(metric_name)) {
                 result.metrics_scanned += 1;
                 result.worker_steps += 1;
                 result.pages_completed += 1;
                 continue;
             }
-            if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+            if (!scheduled.lifecycle_canonical) continue;
             const active = status.state == .building or status.phase == .cleanup_old_generations;
             if (!active) continue;
             result.metrics_scanned += 1;
             result.active_builds += 1;
 
             const step = (if (options.now_ms) |now_ms|
-                entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, options.worker_id, now_ms)
             else
-                entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, options.worker_id)) catch |err| switch (err) {
                 error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
                 // Graph mutations may supersede a snapshot after the
                 // coordinator sweep but before this worker sweep. Treat
@@ -6365,7 +6452,7 @@ pub const IndexManager = struct {
             if (step.completed_page) result.pages_completed += 1;
             if (step.advanced_phase) result.phases_advanced += 1;
             if (result.worker_steps >= options.max_pages) {
-                const after_status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+                const after_status = try entry.index.graphMetricSchedulerStatus(metric_name, options.now_ms);
                 if (after_status.state == .building or after_status.phase == .cleanup_old_generations) {
                     result.budget_exhausted = true;
                 }
@@ -6379,8 +6466,6 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedMaintenanceOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
         return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
     }
 
@@ -6389,8 +6474,6 @@ pub const IndexManager = struct {
         options: GraphMetricPlannedMaintenanceOptions,
         auto_options: GraphMetricPlannedAutoIdleOptions,
     ) !GraphMetricPlannedSchedulerSweepResult {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
         return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
     }
 
@@ -6409,7 +6492,7 @@ pub const IndexManager = struct {
         var rounds: usize = 0;
         while (rounds < options.max_rounds) : (rounds += 1) {
             var round = GraphMetricPlannedSchedulerSweepResult{};
-            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweepUnlocked(.{
+            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweep(.{
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,
@@ -6418,7 +6501,7 @@ pub const IndexManager = struct {
             round.add(coordinator_before);
 
             if (options.worker_ids.len == 0) {
-                const worker = try self.runGraphMetricPlannedWorkerSweepUnlocked(.{
+                const worker = try self.runGraphMetricPlannedWorkerSweep(.{
                     .worker_id = options.worker_id,
                     .max_pages = options.max_pages_per_round,
                     .now_ms = options.now_ms,
@@ -6430,7 +6513,7 @@ pub const IndexManager = struct {
                     var worker_progressed = false;
                     for (options.worker_ids) |worker_id| {
                         if (pages_remaining == 0) break;
-                        const worker = try self.runGraphMetricPlannedWorkerSweepUnlocked(.{
+                        const worker = try self.runGraphMetricPlannedWorkerSweep(.{
                             .worker_id = worker_id,
                             .max_pages = 1,
                             .now_ms = options.now_ms,
@@ -6443,7 +6526,7 @@ pub const IndexManager = struct {
                 }
             }
 
-            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweepUnlocked(.{
+            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweep(.{
                 .max_metrics = options.max_metrics_per_round,
                 .start_background_builds = true,
                 .now_ms = options.now_ms,
@@ -8030,6 +8113,7 @@ pub const IndexManager = struct {
                     name,
                     try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
                 );
+                self.waitForGraphMetricSchedulePins();
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -13594,7 +13678,10 @@ pub const IndexManager = struct {
             },
             .dense_vector => |entry| try self.dense_indexes.append(self.alloc, entry),
             .sparse_vector => |entry| try self.sparse_indexes.append(self.alloc, entry),
-            .graph => |entry| try self.graph_indexes.append(self.alloc, entry),
+            .graph => |entry| {
+                self.waitForGraphMetricSchedulePins();
+                try self.graph_indexes.append(self.alloc, entry);
+            },
             .algebraic => |entry| try self.algebraic_indexes.append(self.alloc, entry),
         }
     }
@@ -15608,6 +15695,7 @@ pub const IndexManager = struct {
         }
         for (self.graph_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
+                self.waitForGraphMetricSchedulePins();
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
@@ -15635,7 +15723,10 @@ pub const IndexManager = struct {
             .full_text => try self.text_indexes.ensureUnusedCapacity(self.alloc, 1),
             .dense_vector => try self.dense_indexes.ensureUnusedCapacity(self.alloc, 1),
             .sparse_vector => try self.sparse_indexes.ensureUnusedCapacity(self.alloc, 1),
-            .graph => try self.graph_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .graph => {
+                self.waitForGraphMetricSchedulePins();
+                try self.graph_indexes.ensureUnusedCapacity(self.alloc, 1);
+            },
             .algebraic => try self.algebraic_indexes.ensureUnusedCapacity(self.alloc, 1),
         }
     }
@@ -15679,6 +15770,7 @@ pub const IndexManager = struct {
         }
         for (self.graph_indexes.items, 0..) |entry, i| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            self.waitForGraphMetricSchedulePins();
             const detached = self.graph_indexes.orderedRemove(i);
             self.dropIndexLoadStateNoLock(name);
             return .{ .graph = detached };

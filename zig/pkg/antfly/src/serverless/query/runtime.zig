@@ -480,6 +480,51 @@ pub const QuerySession = struct {
         return result;
     }
 
+    pub fn fetchArtifactAuthenticatedBlockAlloc(
+        self: *QuerySession,
+        index: usize,
+        block_id: []const u8,
+        offset: u64,
+        len: usize,
+        checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    ) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0) return error.InvalidArtifactRange;
+        const result = if (self.cache) |cache|
+            try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
+        else blk: {
+            const bytes = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                offset,
+                len,
+                self.cancellation,
+            );
+            errdefer self.alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, checksum)) return error.ArtifactIntegrityMismatch;
+            break :blk bytes;
+        };
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
     /// Fetches a bounded range and authenticates every byte against digests
     /// rooted in the published manifest or an already-authenticated routing
     /// footer. Subranges must exactly and contiguously cover the response.

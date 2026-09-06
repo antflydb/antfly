@@ -696,6 +696,81 @@ pub const QueryCache = struct {
         );
     }
 
+    /// Fetches one immutable logical block and authenticates it with the digest
+    /// published in the artifact's routing metadata. Unlike a generic range
+    /// cache entry, the block id is stable across candidate sets, so sparse
+    /// graph-metric reads do not fragment the cache or require large fixed
+    /// windows merely to obtain a reusable identity.
+    pub fn getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        try validateExpectedRange(artifact_id, .{
+            .byte_len = expected_byte_len,
+            .checksum = expected_checksum,
+        }, offset, len);
+        if (len == 0) return error.InvalidRange;
+
+        const block_class = classifyBlockId(block_id);
+        const payload_block_class = classifyPayloadBlockId(block_id);
+        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
+        defer self.alloc.free(block_path);
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, block_path, len, cancellation) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.CacheEntryCorrupt => blk: {
+                try removeCorruptCacheEntry(self, block_path, cancellation);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (cached) |value| {
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
+            if (std.mem.eql(u8, &actual, block_checksum)) {
+                touchFileNow(block_path) catch {};
+                recordBlockHit(self, block_class, payload_block_class);
+                return value;
+            }
+            result_alloc.free(value);
+            try removeCorruptCacheEntry(self, block_path, cancellation);
+        }
+
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(
+            result_alloc,
+            artifact_id,
+            offset,
+            len,
+            cancellation,
+        );
+        errdefer result_alloc.free(contents);
+        if (contents.len != len) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contents, &actual, .{});
+        if (!std.mem.eql(u8, &actual, block_checksum)) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        const published = try publishCacheEntry(self, block_path, contents, switch (block_class) {
+            .routing => .routing_block,
+            .payload => .payload_block,
+        }, cancellation);
+        recordBlockMiss(self, block_class, payload_block_class, published);
+        return contents;
+    }
+
     fn getBlockOrFetchRangeImplAlloc(
         self: *QueryCache,
         result_alloc: Allocator,
@@ -2398,6 +2473,46 @@ test "serverless query cache authenticates ranges before publication and self he
     try std.testing.expectEqualStrings("efgh", healed);
     try std.testing.expectEqual(@as(usize, 4), state.range_calls);
     try std.testing.expectEqual(@as(u64, 2), cache.statsSnapshot().integrity_failures);
+
+    // Logical block identities are independently authenticated. A generic
+    // cache fill cannot poison one, and a healed block is reusable without
+    // another object-store range request.
+    state.corrupt_next = true;
+    const poisoned_block = try cache.getBlockOrFetchRangeAlloc(&artifacts, &artifact_id, "graph-metric-score-0-exact", 0, 4);
+    alloc.free(poisoned_block);
+    const healed_block = try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        "graph-metric-score-0-exact",
+        payload.len,
+        &checksum,
+        &first_digest,
+        0,
+        4,
+        .none,
+    );
+    defer alloc.free(healed_block);
+    try std.testing.expectEqualStrings("abcd", healed_block);
+    try std.testing.expectEqual(@as(usize, 6), state.range_calls);
+    try std.testing.expectEqual(@as(u64, 3), cache.statsSnapshot().integrity_failures);
+
+    state.corrupt_next = true;
+    const cached_block = try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        "graph-metric-score-0-exact",
+        payload.len,
+        &checksum,
+        &first_digest,
+        0,
+        4,
+        .none,
+    );
+    defer alloc.free(cached_block);
+    try std.testing.expectEqualStrings("abcd", cached_block);
+    try std.testing.expectEqual(@as(usize, 6), state.range_calls);
 }
 
 test "serverless query cache rejects unsafe artifact ids before filesystem access" {

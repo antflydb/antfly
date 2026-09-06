@@ -156,7 +156,28 @@ const RankedScoreBoundaryValidator = struct {
     }
 };
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
-const max_score_range_requests: usize = 32;
+const ScoreFetchWindow = struct {
+    first_block: usize,
+    last_block: usize,
+    offset: u64,
+    len: usize,
+    touched_blocks: usize,
+    touched_bytes: usize,
+    selected: bool = false,
+
+    fn savedRequests(self: @This()) usize {
+        return self.touched_blocks -| 1;
+    }
+
+    fn overfetchBytes(self: @This()) usize {
+        return self.len -| self.touched_bytes;
+    }
+};
+// Two point-score columns may run concurrently and share one 128-range request
+// budget. Reserve control/footer reads for both while allowing moderate sparse
+// candidate sets to retain exact block identities beyond the old 32-block
+// coalescing cliff: 2 * (2 + 60) == 124.
+const max_score_range_requests: usize = 60;
 const max_top_score_range_requests: usize = 64;
 const max_parallel_score_range_requests: usize = 8;
 const max_point_score_columns: usize = 16;
@@ -559,38 +580,90 @@ fn planScoreFetchRangesAlloc(
             if (count == 0) continue;
             try ranges.append(alloc, .{ .first_block = block_index, .last_block = block_index, .offset = entry.offset, .len = entry.len });
         }
-    } else {
-        // Cache identity must be independent of the exact candidate set.
-        // Materialize complete immutable block windows whenever any block in
-        // the window is touched so overlapping queries reuse the same
-        // authenticated on-disk record instead of caching overlapping ranges.
-        var first_block: usize = 0;
-        while (first_block < entries.len) {
-            const first = entries[first_block];
-            if (first.offset < score_data_offset) return error.InvalidGraphMetricSegment;
-            if (first.len > coalesced_score_window_bytes) return error.GraphMetricQueryBudgetExceeded;
-            var last_block = first_block;
-            var window_touched = block_counts[first_block] != 0;
-            while (last_block + 1 < entries.len) {
-                const next = entries[last_block + 1];
-                if (next.offset < first.offset) return error.InvalidGraphMetricSegment;
-                const next_end = std.math.add(u64, next.offset, next.len) catch
-                    return error.InvalidGraphMetricSegment;
-                if (next_end - first.offset > coalesced_score_window_bytes) break;
-                last_block += 1;
-                window_touched = window_touched or block_counts[last_block] != 0;
+        return try ranges.toOwnedSlice(alloc);
+    }
+
+    // Exact blocks are the preferred cache and transfer unit. When the request
+    // count would exceed its per-column share, select only the fixed immutable
+    // windows that buy the most requests for the least overfetch. This avoids a
+    // count-triggered all-or-nothing jump to 8 MiB reads while preserving cache
+    // identity across candidate sets.
+    var windows = std.ArrayListUnmanaged(ScoreFetchWindow).empty;
+    defer windows.deinit(alloc);
+    var first_block: usize = 0;
+    while (first_block < entries.len) {
+        const first = entries[first_block];
+        if (first.offset < score_data_offset) return error.InvalidGraphMetricSegment;
+        if (first.len == 0 or first.len > coalesced_score_window_bytes) return error.GraphMetricQueryBudgetExceeded;
+        var last_block = first_block;
+        var window_touched: usize = @intFromBool(block_counts[first_block] != 0);
+        var touched_bytes: usize = if (block_counts[first_block] != 0) first.len else 0;
+        while (last_block + 1 < entries.len) {
+            const prior_end = std.math.add(u64, entries[last_block].offset, entries[last_block].len) catch
+                return error.InvalidGraphMetricSegment;
+            const next = entries[last_block + 1];
+            if (next.offset != prior_end) return error.InvalidGraphMetricSegment;
+            const next_end = std.math.add(u64, next.offset, next.len) catch
+                return error.InvalidGraphMetricSegment;
+            if (next_end - first.offset > coalesced_score_window_bytes) break;
+            last_block += 1;
+            if (block_counts[last_block] != 0) {
+                window_touched += 1;
+                touched_bytes = std.math.add(usize, touched_bytes, entries[last_block].len) catch
+                    return error.GraphMetricQueryBudgetExceeded;
             }
-            if (window_touched) {
-                const last_end = std.math.add(u64, entries[last_block].offset, entries[last_block].len) catch
-                    return error.InvalidGraphMetricSegment;
-                try ranges.append(alloc, .{
-                    .first_block = first_block,
-                    .last_block = last_block,
-                    .offset = first.offset,
-                    .len = std.math.cast(usize, last_end - first.offset) orelse return error.GraphMetricQueryBudgetExceeded,
-                });
+        }
+        if (window_touched != 0) {
+            const last_end = std.math.add(u64, entries[last_block].offset, entries[last_block].len) catch
+                return error.InvalidGraphMetricSegment;
+            try windows.append(alloc, .{
+                .first_block = first_block,
+                .last_block = last_block,
+                .offset = first.offset,
+                .len = std.math.cast(usize, last_end - first.offset) orelse return error.GraphMetricQueryBudgetExceeded,
+                .touched_blocks = window_touched,
+                .touched_bytes = touched_bytes,
+            });
+        }
+        first_block = last_block + 1;
+    }
+
+    var planned_requests = touched_blocks;
+    while (planned_requests > max_score_range_requests) {
+        var best: ?usize = null;
+        for (windows.items, 0..) |window, index| {
+            if (window.selected or window.savedRequests() == 0) continue;
+            if (best) |best_index| {
+                const current = windows.items[best_index];
+                const left = @as(u128, window.overfetchBytes()) * current.savedRequests();
+                const right = @as(u128, current.overfetchBytes()) * window.savedRequests();
+                if (left > right or (left == right and window.offset >= current.offset)) continue;
             }
-            first_block = last_block + 1;
+            best = index;
+        }
+        const selected = best orelse return error.GraphMetricQueryBudgetExceeded;
+        windows.items[selected].selected = true;
+        planned_requests -= windows.items[selected].savedRequests();
+    }
+
+    for (windows.items) |window| {
+        if (window.selected) {
+            try ranges.append(alloc, .{
+                .first_block = window.first_block,
+                .last_block = window.last_block,
+                .offset = window.offset,
+                .len = window.len,
+            });
+            continue;
+        }
+        for (entries[window.first_block .. window.last_block + 1], block_counts[window.first_block .. window.last_block + 1], window.first_block..) |entry, count, block_index| {
+            if (count == 0) continue;
+            try ranges.append(alloc, .{
+                .first_block = block_index,
+                .last_block = block_index,
+                .offset = entry.offset,
+                .len = entry.len,
+            });
         }
     }
     if (ranges.items.len > max_score_range_requests) return error.GraphMetricQueryBudgetExceeded;
@@ -663,6 +736,23 @@ fn fetchScoreRangeAlloc(
     try session.chargeGraphMetricRange(range.len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
     if (range.first_block > range.last_block or range.last_block >= entries.len) return error.InvalidGraphMetricSegment;
+    if (range.first_block == range.last_block) {
+        const entry = entries[range.first_block];
+        if (entry.offset != range.offset or entry.len != range.len) return error.InvalidGraphMetricSegment;
+        var block_id_buf: [64]u8 = undefined;
+        const block_id = std.fmt.bufPrint(&block_id_buf, "graph-metric-score-{d}-exact", .{range.first_block}) catch
+            return error.InvalidGraphMetricSegment;
+        return session.fetchArtifactAuthenticatedBlockAlloc(
+            metric_index,
+            block_id,
+            range.offset,
+            range.len,
+            &entry.checksum,
+        ) catch |err| switch (err) {
+            error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
+            else => |other| other,
+        };
+    }
     const subranges = try alloc.alloc(runtime_mod.AuthenticatedSubrange, range.last_block - range.first_block + 1);
     defer alloc.free(subranges);
     var covered: usize = 0;
@@ -1081,17 +1171,27 @@ test "serverless graph metric top limit cannot exceed the persisted ranked tier"
 
 test "serverless graph metric range planning caps broad point batches" {
     const alloc = std.testing.allocator;
-    var entries: [64]metric_segment.codec.RoutingEntry = undefined;
-    var counts: [64]usize = @splat(1);
+    var entries: [128]metric_segment.codec.RoutingEntry = undefined;
+    var counts: [128]usize = @splat(1);
     for (&entries, 0..) |*entry, index| entry.* = .{
         .first_node_id = "node",
-        .offset = index * (4 * 1024 * 1024),
-        .len = 1024,
+        .offset = index * 64 * 1024,
+        .len = 64 * 1024,
     };
     const broad = try planScoreFetchRangesAlloc(alloc, &entries, &counts, 0);
     defer alloc.free(broad);
-    try std.testing.expectEqual(max_score_range_requests, broad.len);
-    for (broad) |range| try std.testing.expectEqual(@as(usize, 2), range.last_block - range.first_block + 1);
+    try std.testing.expectEqual(@as(usize, 1), broad.len);
+    try std.testing.expectEqual(@as(usize, 128), broad[0].last_block - broad[0].first_block + 1);
+    try std.testing.expectEqual(coalesced_score_window_bytes, broad[0].len);
+
+    // The old threshold was 32 and caused the 33rd touched block to jump from
+    // exact reads to full windows. Moderate point batches now stay exact.
+    @memset(&counts, 0);
+    @memset(counts[0..33], 1);
+    const moderate = try planScoreFetchRangesAlloc(alloc, &entries, &counts, 0);
+    defer alloc.free(moderate);
+    try std.testing.expectEqual(@as(usize, 33), moderate.len);
+    for (moderate) |range| try std.testing.expectEqual(range.first_block, range.last_block);
 
     @memset(&counts, 0);
     counts[0] = 1;
@@ -1099,8 +1199,8 @@ test "serverless graph metric range planning caps broad point batches" {
     const sparse = try planScoreFetchRangesAlloc(alloc, &entries, &counts, 0);
     defer alloc.free(sparse);
     try std.testing.expectEqual(@as(usize, 2), sparse.len);
-    try std.testing.expectEqual(@as(usize, 1024), sparse[0].len);
-    try std.testing.expectEqual(@as(usize, 1024), sparse[1].len);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), sparse[0].len);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), sparse[1].len);
 
     var unused_session: runtime_mod.QuerySession = undefined;
     const oversized_batch: [max_parallel_score_range_requests + 1]ScoreFetchRange = @splat(.{
@@ -1117,14 +1217,14 @@ test "serverless graph metric range planning caps broad point batches" {
 
 test "serverless graph metric broad point ranges have candidate-independent cache identity" {
     const alloc = std.testing.allocator;
-    var entries: [40]metric_segment.codec.RoutingEntry = undefined;
+    var entries: [128]metric_segment.codec.RoutingEntry = undefined;
     for (&entries, 0..) |*entry, index| entry.* = .{
         .first_node_id = "node",
-        .offset = index * 128 * 1024,
-        .len = 128 * 1024,
+        .offset = index * 64 * 1024,
+        .len = 64 * 1024,
     };
-    var first_counts: [40]usize = @splat(1);
-    var second_counts: [40]usize = @splat(1);
+    var first_counts: [128]usize = @splat(1);
+    var second_counts: [128]usize = @splat(1);
     first_counts[0] = 0;
     second_counts[1] = 0;
     const first = try planScoreFetchRangesAlloc(alloc, &entries, &first_counts, 0);
