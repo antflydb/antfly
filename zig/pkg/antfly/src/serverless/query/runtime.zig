@@ -85,6 +85,12 @@ pub const GraphMetricReadBudget = struct {
         self.range_bytes = next_bytes;
     }
 
+    pub fn remainingRequests(self: *@This()) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.limits.max_range_requests -| self.range_requests;
+    }
+
     pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -254,6 +260,8 @@ pub const QuerySession = struct {
     owns_graph_metric_specs: bool = true,
     graph_metric_read_budget: GraphMetricReadBudget = .{},
     graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
+    /// Deterministic column share; the shared budget remains authoritative.
+    graph_metric_range_allowance: ?u64 = null,
 
     pub fn deinit(self: *QuerySession) void {
         if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
@@ -328,6 +336,7 @@ pub const QuerySession = struct {
             .graph_metric_specs = self.graph_metric_specs,
             .owns_graph_metric_specs = false,
             .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
+            .graph_metric_range_allowance = self.graph_metric_range_allowance,
         };
     }
 
@@ -351,6 +360,10 @@ pub const QuerySession = struct {
 
     pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
         return self.effectiveGraphMetricReadBudget().chargeRange(bytes);
+    }
+
+    pub fn graphMetricRangeAllowance(self: *QuerySession) u64 {
+        return self.graph_metric_range_allowance orelse self.effectiveGraphMetricReadBudget().remainingRequests();
     }
 
     pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {

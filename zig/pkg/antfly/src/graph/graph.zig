@@ -29,6 +29,7 @@ const edge_weight = @import("edge_weight.zig");
 const metric_kernels = @import("metrics.zig");
 const vector_chunk = @import("vector_chunk.zig");
 const ordinal_blocks = @import("ordinal.zig");
+const adjacency_blocks = @import("adjacency.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -4424,8 +4425,17 @@ pub const GraphIndex = struct {
             defer self.alloc.free(retirement_prefix);
             const raw_prefix = try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), "vector", if (phase == .hits_hub_reduce_ranks) "raw_hub" else "raw_rank", try std.fmt.bufPrint(&iteration_buf, "{d}", .{iteration}) });
             defer self.alloc.free(raw_prefix);
+            // Iteration zero has now packed every consumer's adjacency.
+            // Retire producer fragments; later iterations use only receipts
+            // and dense blocks, including after a worker lease takeover.
+            const staged_prefix = if (iteration == 0)
+                try self.ordinalAdjacencyPhasePrefixAlloc(metric_name, job_id, if (phase == .hits_hub_reduce_ranks) .hits_hub_contributions else .iterate_contributions)
+            else
+                try self.alloc.dupe(u8, "");
+            defer self.alloc.free(staged_prefix);
             var remaining = graph_metric_build_adoption_page_units;
-            for ([_][]const u8{raw_prefix}) |prefix| {
+            for ([_][]const u8{ raw_prefix, staged_prefix }) |prefix| {
+                if (prefix.len == 0) continue;
                 const cursor_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ retirement_prefix, prefix });
                 defer self.alloc.free(cursor_key);
                 const saved = batch.get(cursor_key) catch |err| switch (err) {
@@ -6913,8 +6923,9 @@ pub const GraphIndex = struct {
     // v7 uses direct attempt-tagged ordinal shards and bounded summary leaves
     // for every iterative build, independent of node count.
     // v8 retains attempt-fenced adjacency once and folds input vectors directly.
+    // v9 packs producer fragments into dense, receipt-selected adjacency tiles.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 8;
+    const graph_metric_build_execution_schema_version: u64 = 9;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -8809,24 +8820,38 @@ pub const GraphIndex = struct {
         return self.readGraphMetricVectorSlotsAlloc(txn, metric_name, job_id, lane, iteration, slots, required);
     }
 
+    // Cached bytes belong to one read transaction and one vector lane/epoch.
+    // A production fold reads at most 4096 edges, bounding this map as well.
+    const VectorReadCache = std.AutoHashMapUnmanaged(u64, ?[]const u8);
+
     fn readGraphMetricVectorSlotsAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool) ![]f64 {
+        var cache = VectorReadCache.empty;
+        defer cache.deinit(self.alloc);
+        return self.readGraphMetricVectorSlotsCachedAlloc(txn, metric_name, job_id, lane, iteration, slots, required, &cache);
+    }
+
+    fn readGraphMetricVectorSlotsCachedAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool, cache: *VectorReadCache) ![]f64 {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+        var missing = std.AutoHashMapUnmanaged(u64, void).empty;
+        var chunk_ids = std.ArrayListUnmanaged(u64).empty;
         var keys = std.ArrayListUnmanaged([]const u8).empty;
         for (slots) |slot| {
-            const entry = try indexes.getOrPut(temp, slot / vector_chunk.entries);
-            if (entry.found_existing) continue;
-            entry.value_ptr.* = keys.items.len;
-            try keys.append(temp, try graphMetricVectorChunkKey(temp, metric_name, job_id, lane, iteration, slot / vector_chunk.entries));
+            const chunk = slot / vector_chunk.entries;
+            if (cache.contains(chunk) or (try missing.getOrPut(temp, chunk)).found_existing) continue;
+            try chunk_ids.append(temp, chunk);
+            try keys.append(temp, try graphMetricVectorChunkKey(temp, metric_name, job_id, lane, iteration, chunk));
         }
-        const chunks = try self.getManyValuesAlloc(txn, keys.items);
-        defer self.alloc.free(chunks);
+        if (keys.items.len != 0) {
+            const chunks = try self.getManyValuesAlloc(txn, keys.items);
+            defer self.alloc.free(chunks);
+            for (chunk_ids.items, chunks) |chunk, raw| try cache.put(self.alloc, chunk, raw);
+        }
         const values = try self.alloc.alloc(f64, slots.len);
         errdefer self.alloc.free(values);
         for (slots, 0..) |slot, i| {
-            const raw = chunks[indexes.get(slot / vector_chunk.entries).?];
+            const raw = cache.get(slot / vector_chunk.entries).?;
             values[i] = if (raw) |chunk| try vector_chunk.get(chunk, @intCast(slot % vector_chunk.entries), required) else if (required) return error.InvalidGraphMetricScore else 0;
         }
         return values;
@@ -8959,12 +8984,145 @@ pub const GraphIndex = struct {
     }
 
     fn ordinalAdjacencyPrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, chunk: u64) ![]u8 {
+        const prefix = try self.ordinalAdjacencyPhasePrefixAlloc(metric_name, job_id, phase);
+        defer self.alloc.free(prefix);
+        return std.fmt.allocPrint(self.alloc, "{s}{d:0>20}/", .{ prefix, chunk });
+    }
+
+    fn ordinalAdjacencyPhasePrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase) ![]u8 {
         const namespace = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job_id);
         defer self.alloc.free(namespace);
-        return std.fmt.allocPrint(self.alloc, "{s}adjacency/{s}/{d:0>20}/", .{ namespace, @tagName(phase), chunk });
+        return std.fmt.allocPrint(self.alloc, "{s}adjacency/{s}/", .{ namespace, @tagName(phase) });
+    }
+
+    fn packedAdjacencyBaseAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, chunk: u64) ![]u8 {
+        const namespace = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job_id);
+        defer self.alloc.free(namespace);
+        return std.fmt.allocPrint(self.alloc, "{s}adjacency-packed/{s}/{d:0>20}/", .{ namespace, @tagName(phase), chunk });
+    }
+
+    /// Merge winning producer fragments once into dense, immutable tiles.
+    /// Cursor, partial tile and output blocks share the summary-page attempt
+    /// fence. A receipt exposes only a completely packed attempt to readers.
+    fn compactOrdinalAdjacencyChunk(self: *GraphIndex, metric_name: []const u8, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, producer_phase: GraphMetricBuildPhase, chunk: u64, max_records: usize) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+        defer self.alloc.free(base);
+        const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+        const state_key = try std.fmt.allocPrint(temp, "{s}state", .{base});
+        const input_prefix = try self.ordinalAdjacencyPrefixAlloc(metric_name, job.job_id, producer_phase, chunk);
+        defer self.alloc.free(input_prefix);
+        var state = adjacency_blocks.State{ .attempt = claimed.attempt };
+        var old_state: []const u8 = "";
+        var outputs = std.ArrayListUnmanaged([]const u8).empty;
+        var first_block: u64 = 0;
+        var prior_units: u64 = 0;
+        var records: usize = 0;
+        var edges: usize = 0;
+        var complete = false;
+        var receipt: adjacency_blocks.Receipt = undefined;
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const current = try self.metricBuildPage(&txn, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
+            try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
+            prior_units = current.completed_units;
+            if (txn.get(receipt_key)) |raw| {
+                _ = try adjacency_blocks.Receipt.decode(raw);
+                return 0;
+            } else |err| if (err != error.NotFound) return err;
+            if (txn.get(state_key)) |raw| {
+                old_state = try temp.dupe(u8, raw);
+                const saved = try adjacency_blocks.State.decode(old_state);
+                if (saved.attempt == claimed.attempt) state = saved;
+            } else |err| if (err != error.NotFound) return err;
+            first_block = state.blocks;
+            if (state.cursor.len != 0 and !std.mem.startsWith(u8, state.cursor, input_prefix)) return error.InvalidGraphMetricBuildManifest;
+            for (state.pending[0..state.count]) |edge| if (edge.target / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
+            var winners = std.AutoHashMapUnmanaged(u64, u64).empty;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var next = try cursor.seekAtOrAfter(if (state.cursor.len == 0) input_prefix else state.cursor);
+            if (next) |entry| if (std.mem.eql(u8, entry.key, state.cursor)) {
+                next = try cursor.next();
+            };
+            while (next) |entry| : (next = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, input_prefix) or records == max_records) break;
+                const suffix = entry.key[input_prefix.len..];
+                if (suffix.len < 42 or suffix[20] != ':' or suffix[41] != ':') return error.InvalidGraphMetricBuildManifest;
+                const producer = std.fmt.parseInt(u64, suffix[0..20], 10) catch return error.InvalidGraphMetricBuildManifest;
+                const attempt = std.fmt.parseInt(u64, suffix[21..41], 10) catch return error.InvalidGraphMetricBuildManifest;
+                const winner = try winners.getOrPut(temp, producer);
+                if (!winner.found_existing) {
+                    if (winners.count() > graph_metric_build_max_partition_pages) return error.InvalidGraphMetricBuildManifest;
+                    const page = try self.metricBuildPage(&txn, metric_name, job.job_id, producer_phase, 0, producer) orelse return error.InvalidGraphMetricBuildManifest;
+                    if (page.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
+                    winner.value_ptr.* = page.attempt;
+                }
+                if (attempt == winner.value_ptr.*) {
+                    var topology = try ordinal_blocks.decodeTopology(self.alloc, entry.value);
+                    defer topology.deinit(self.alloc);
+                    if (topology.edges.len > adjacency_blocks.tile_entries or !topology.complete or topology.cursor.len != 0 or topology.scanned != topology.edges.len) return error.InvalidGraphMetricBuildManifest;
+                    if (topology.edges.len > ordinal_blocks.max_edges - edges) break;
+                    edges += topology.edges.len;
+                    for (topology.edges) |edge| {
+                        if (edge.target / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
+                        state.pending[state.count] = edge;
+                        state.count += 1;
+                        if (state.count == adjacency_blocks.tile_entries) {
+                            try outputs.append(temp, try ordinal_blocks.encodeTopology(temp, .{ .edges = &state.pending, .cursor = @constCast(""), .scanned = state.count, .complete = true }));
+                            state.blocks = std.math.add(u64, state.blocks, 1) catch return error.InvalidGraphMetricBuildManifest;
+                            state.count = 0;
+                        }
+                    }
+                }
+                records += 1;
+                state.cursor = try temp.dupe(u8, entry.key);
+            }
+            complete = next == null or !std.mem.startsWith(u8, next.?.key, input_prefix);
+            if (complete) {
+                const full_edges = std.math.mul(u64, state.blocks, adjacency_blocks.tile_entries) catch return error.InvalidGraphMetricBuildManifest;
+                receipt = .{ .attempt = state.attempt, .edges = std.math.add(u64, full_edges, state.count) catch return error.InvalidGraphMetricBuildManifest };
+                if (state.count != 0) try outputs.append(temp, try ordinal_blocks.encodeTopology(temp, .{ .edges = state.pending[0..state.count], .cursor = @constCast(""), .scanned = state.count, .complete = true }));
+            }
+        }
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
+        try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
+        if (current.completed_units != prior_units) return error.GraphMetricBuildPageOutputMismatch;
+        if (batch.get(receipt_key)) |raw| {
+            _ = try adjacency_blocks.Receipt.decode(raw);
+            batch.abort();
+            return 0;
+        } else |err| if (err != error.NotFound) return err;
+        const latest = batch.get(state_key) catch |err| switch (err) {
+            error.NotFound => "",
+            else => return err,
+        };
+        if (!std.mem.eql(u8, latest, old_state)) return error.GraphMetricBuildPageOutputMismatch;
+        for (outputs.items, 0..) |output, i| {
+            const key = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/{d:0>20}", .{ base, state.attempt, first_block + i });
+            try batch.put(key, output);
+        }
+        if (complete) {
+            const encoded = receipt.encode();
+            try batch.put(receipt_key, &encoded);
+            if (old_state.len != 0) try batch.delete(state_key);
+        } else try batch.put(state_key, try state.encode(temp));
+        try batch.commit();
+        return records;
     }
 
     fn ordinalAdjacencyValuesAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, raw: []const u8) ![]ordinal_blocks.Value {
+        var cache = VectorReadCache.empty;
+        defer cache.deinit(self.alloc);
+        return self.ordinalAdjacencyValuesCachedAlloc(txn, metric_name, job_id, phase, iteration, raw, &cache);
+    }
+
+    fn ordinalAdjacencyValuesCachedAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, raw: []const u8, cache: *VectorReadCache) ![]ordinal_blocks.Value {
         var topology = try ordinal_blocks.decodeTopology(self.alloc, raw);
         defer topology.deinit(self.alloc);
         if (!topology.complete or topology.cursor.len != 0 or topology.edges.len > vector_chunk.entries or topology.scanned != topology.edges.len) return error.InvalidGraphMetricBuildManifest;
@@ -8979,7 +9137,7 @@ pub const GraphIndex = struct {
         const slots = try self.alloc.alloc(u64, topology.edges.len);
         defer self.alloc.free(slots);
         for (topology.edges, slots) |edge, *slot| slot.* = edge.source;
-        const ranks = try self.readGraphMetricVectorSlotsAlloc(txn, metric_name, job_id, lane, iteration + @as(u32, @intFromBool(hub)), slots, true);
+        const ranks = try self.readGraphMetricVectorSlotsCachedAlloc(txn, metric_name, job_id, lane, iteration + @as(u32, @intFromBool(hub)), slots, true, cache);
         defer self.alloc.free(ranks);
         const values = try self.alloc.alloc(ordinal_blocks.Value, ranks.len);
         errdefer self.alloc.free(values);
@@ -9180,9 +9338,16 @@ pub const GraphIndex = struct {
     /// compensated state. Raw vector output, partial norm/dangling mass and
     /// the leaf checkpoint commit atomically. Data reducers only scale vectors.
     fn executeOrdinalReduceSummary(self: *GraphIndex, metric_name: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, max_nodes: usize, max_records: usize) !usize {
+        return self.executeOrdinalReduceSummaryCheckpoint(metric_name, cfg, job, claimed, max_nodes, max_records, true);
+    }
+
+    // At most one bounded packing pass followed by one bounded numeric fold.
+    // Small chunks do not pay another maintenance tick just to consume a
+    // receipt produced by this same worker; large chunks remain checkpointed.
+    fn executeOrdinalReduceSummaryCheckpoint(self: *GraphIndex, metric_name: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, max_nodes: usize, max_records: usize, may_pack: bool) !usize {
         if (max_nodes == 0 or max_records == 0) return error.InvalidGraphMetricBuildProgress;
-        // Each adjacency record contains at most 256 edges: cap both physical
-        // records (including abandoned attempts) and vector-gather work.
+        // Dense tiles contain at most 256 edges. Bound both tile reads and
+        // vector-gather work independently of producer checkpoint boundaries.
         const record_limit = @min(max_records, ordinal_blocks.max_edges / vector_chunk.entries);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -9190,6 +9355,7 @@ pub const GraphIndex = struct {
         const namespace = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job.job_id);
         defer self.alloc.free(namespace);
         const state_key = try std.fmt.allocPrint(temp, "{s}fold/{s}/{d}/{d}", .{ namespace, @tagName(claimed.phase), claimed.iteration, claimed.page_id });
+        var compaction_chunk: ?u64 = null;
         var old_state: []const u8 = "";
         var fold = ordinal_blocks.Fold{};
         var nodes = std.ArrayListUnmanaged([]u8).empty;
@@ -9234,12 +9400,47 @@ pub const GraphIndex = struct {
             if (fold.count != 0 and (fold.count != slots.len or fold.fingerprint != fingerprint)) return error.InvalidGraphMetricBuildManifest;
             fold.count = @intCast(slots.len);
             fold.fingerprint = fingerprint;
-            var winners = std.AutoHashMapUnmanaged(u64, u64).empty;
-            while (fold.position < slots.len and records < record_limit) {
+            // Check all remaining chunks before gathering any numeric data.
+            // A missing receipt must not cause repeated partial vector work
+            // while another chunk is still being packed.
+            var previous_chunk: ?u64 = null;
+            for (slots[fold.position..]) |slot| {
+                const chunk = slot / vector_chunk.entries;
+                if (previous_chunk == chunk) continue;
+                previous_chunk = chunk;
+                const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+                defer self.alloc.free(base);
+                const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+                if (txn.get(receipt_key)) |raw| {
+                    _ = try adjacency_blocks.Receipt.decode(raw);
+                } else |err| switch (err) {
+                    error.NotFound => {
+                        if (claimed.iteration != 0) return error.InvalidGraphMetricBuildManifest;
+                        compaction_chunk = chunk;
+                        break;
+                    },
+                    else => return err,
+                }
+            }
+            var vector_cache = VectorReadCache.empty;
+            defer vector_cache.deinit(self.alloc);
+            while (compaction_chunk == null and fold.position < slots.len and records < record_limit) {
                 const chunk = slots[fold.position] / vector_chunk.entries;
-                const prefix = try self.ordinalAdjacencyPrefixAlloc(metric_name, job.job_id, producer_phase, chunk);
-                defer self.alloc.free(prefix);
-                if (fold.cursor.len != 0 and !std.mem.startsWith(u8, fold.cursor, prefix)) return error.InvalidGraphMetricBuildManifest;
+                const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+                defer self.alloc.free(base);
+                const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+                const receipt_raw = txn.get(receipt_key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidGraphMetricBuildManifest,
+                    else => return err,
+                };
+                const receipt = try adjacency_blocks.Receipt.decode(receipt_raw);
+                const prefix = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/", .{ base, receipt.attempt });
+                var expected: u64 = 0;
+                if (fold.cursor.len != 0) {
+                    if (!std.mem.startsWith(u8, fold.cursor, prefix) or fold.cursor.len != prefix.len + 20) return error.InvalidGraphMetricBuildManifest;
+                    const last = std.fmt.parseInt(u64, fold.cursor[prefix.len..], 10) catch return error.InvalidGraphMetricBuildManifest;
+                    expected = std.math.add(u64, last, 1) catch return error.InvalidGraphMetricBuildManifest;
+                }
                 var cur = try txn.openCursor();
                 defer cur.close();
                 var next = try cur.seekAtOrAfter(if (fold.cursor.len != 0) fold.cursor else prefix);
@@ -9248,22 +9449,12 @@ pub const GraphIndex = struct {
                 };
                 while (next) |entry| : (next = try cur.next()) {
                     if (!std.mem.startsWith(u8, entry.key, prefix) or records == record_limit) break;
-                    records += 1;
-                    fold.cursor = try temp.dupe(u8, entry.key);
-                    const suffix = entry.key[prefix.len..];
-                    if (suffix.len < 42 or suffix[20] != ':' or suffix[41] != ':') return error.InvalidGraphMetricBuildManifest;
-                    const producer = std.fmt.parseInt(u64, suffix[0..20], 10) catch return error.InvalidGraphMetricBuildManifest;
-                    const attempt = std.fmt.parseInt(u64, suffix[21..41], 10) catch return error.InvalidGraphMetricBuildManifest;
-                    const winner = try winners.getOrPut(temp, producer);
-                    if (!winner.found_existing) {
-                        if (winners.count() > graph_metric_build_max_partition_pages) return error.InvalidGraphMetricBuildManifest;
-                        const producer_page = try self.metricBuildPage(&txn, metric_name, job.job_id, producer_phase, 0, producer) orelse return error.InvalidGraphMetricBuildManifest;
-                        if (producer_page.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
-                        winner.value_ptr.* = producer_page.attempt;
-                    }
-                    if (attempt != winner.value_ptr.*) continue;
-                    const values = try self.ordinalAdjacencyValuesAlloc(&txn, metric_name, job.job_id, producer_phase, claimed.iteration, entry.value);
+                    if (entry.key.len != prefix.len + 20 or expected >= receipt.blocks()) return error.InvalidGraphMetricBuildManifest;
+                    const index = std.fmt.parseInt(u64, entry.key[prefix.len..], 10) catch return error.InvalidGraphMetricBuildManifest;
+                    if (index != expected) return error.InvalidGraphMetricBuildManifest;
+                    const values = try self.ordinalAdjacencyValuesCachedAlloc(&txn, metric_name, job.job_id, producer_phase, claimed.iteration, entry.value, &vector_cache);
                     defer self.alloc.free(values);
+                    if (values.len != @min(adjacency_blocks.tile_entries, receipt.edges - expected * adjacency_blocks.tile_entries)) return error.InvalidGraphMetricBuildManifest;
                     for (values) |value| {
                         if (value.ordinal / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
                         const i = indexes.get(value.ordinal) orelse continue;
@@ -9271,12 +9462,16 @@ pub const GraphIndex = struct {
                         fold.corrections[i] += if (@abs(fold.sums[i]) >= @abs(value.value)) (fold.sums[i] - sum) + value.value else (value.value - sum) + fold.sums[i];
                         fold.sums[i] = sum;
                     }
+                    expected += 1;
+                    records += 1;
+                    fold.cursor = try temp.dupe(u8, entry.key);
                 }
                 if (next != null and std.mem.startsWith(u8, next.?.key, prefix)) break;
+                if (expected != receipt.blocks()) return error.InvalidGraphMetricBuildManifest;
                 while (fold.position < slots.len and slots[fold.position] / vector_chunk.entries == chunk) fold.position += 1;
                 fold.cursor = "";
             }
-            if (fold.position == fold.count) {
+            if (compaction_chunk == null and fold.position == fold.count) {
                 for (nodes.items, 0..) |node, i| {
                     const value = fold.sums[i] + fold.corrections[i];
                     if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricScore;
@@ -9293,6 +9488,11 @@ pub const GraphIndex = struct {
                     };
                 }
             }
+        }
+        if (compaction_chunk) |chunk| {
+            if (!may_pack) return 0;
+            const packed_records = try self.compactOrdinalAdjacencyChunk(metric_name, job, claimed, producer_phase, chunk, @min(max_records, graph_metric_build_adoption_page_units));
+            return packed_records + try self.executeOrdinalReduceSummaryCheckpoint(metric_name, cfg, job, claimed, max_nodes, max_records, false);
         }
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
@@ -13757,6 +13957,7 @@ pub const GraphIndex = struct {
         var status = try self.ensureGraphMetricPlannedBuild(metric_name, target_generation);
         status.deinit(self.alloc);
 
+        var idle_workers: usize = 0;
         var step_index: usize = 0;
         while (step_index < options.max_steps) : (step_index += 1) {
             const worker_id = options.worker_ids[step_index % options.worker_ids.len];
@@ -13772,7 +13973,10 @@ pub const GraphIndex = struct {
                 worker_step.advanced_phase or
                 coordinator_step.advanced_phase or
                 coordinator_step.retired_input_records != 0;
-            if (!progressed and worker_step.phase != .cleanup_old_generations) {
+            // A bounded checkpoint keeps its lease. A different worker can
+            // legitimately have no eligible page until the owner runs again.
+            idle_workers = if (progressed) 0 else idle_workers + 1;
+            if (idle_workers >= options.worker_ids.len and worker_step.phase != .cleanup_old_generations) {
                 return error.GraphMetricBuildNoEligiblePage;
             }
         }
@@ -16628,17 +16832,21 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{ .prepare_generation, .scan_edges_and_out_degree, .initialize_ranks });
     const namespace = try graph.graphMetricBuildJobNamespacePrefixAlloc(cfg.name, job.job_id);
     defer alloc.free(namespace);
-    const prefix = try std.fmt.allocPrint(alloc, "{s}adjacency/", .{namespace});
+    const prefix = try std.fmt.allocPrint(alloc, "{s}adjacency-packed/", .{namespace});
     defer alloc.free(prefix);
     var first_digest: ?u64 = null;
     for (0..3) |iteration| {
         try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.iterate_contributions});
+        try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.reduce_ranks});
         {
             var txn = try graph.beginReadReverseTxn();
             defer txn.abort();
             const shuffle = try graph.graphMetricBuildPageRankContributionPrefixAlloc(cfg.name, job.job_id, @intCast(iteration));
             defer alloc.free(shuffle);
             try std.testing.expectEqual(@as(usize, 0), try GraphIndex.countKeysWithPrefix(&txn, shuffle));
+            const staged = try std.fmt.allocPrint(alloc, "{s}adjacency/", .{namespace});
+            defer alloc.free(staged);
+            try std.testing.expectEqual(@as(usize, 0), try GraphIndex.countKeysWithPrefix(&txn, staged));
             var cursor = try txn.openCursor();
             defer cursor.close();
             var next = try cursor.seekAtOrAfter(prefix);
@@ -16653,7 +16861,7 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
             try std.testing.expect(count != 0);
             if (first_digest) |digest| try std.testing.expectEqual(digest, hash.final()) else first_digest = hash.final();
         }
-        try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{ .reduce_ranks, .check_convergence });
+        try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.check_convergence});
     }
 }
 
@@ -16698,11 +16906,17 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
                 defer alloc.free(prefix);
                 for (0..6) |shard| {
                     const canonical = try std.fmt.allocPrint(temp, "{s}{d:0>20}:{d:0>20}:{d:0>20}", .{ prefix, @as(u64, 3), @as(u64, if (shard == 0) 1 else 2), shard });
-                    var edges = [_]ordinal_blocks.Edge{.{ .source = if (shard == 0) 999 else slot, .target = slot }};
-                    try batch.put(canonical, try ordinal_blocks.encodeTopology(temp, .{ .edges = &edges, .cursor = @constCast(""), .scanned = 1, .complete = true }));
+                    var edges: [256]ordinal_blocks.Edge = @splat(.{ .source = if (shard == 0) 999 else slot, .target = slot });
+                    try batch.put(canonical, try ordinal_blocks.encodeTopology(temp, .{ .edges = &edges, .cursor = @constCast(""), .scanned = edges.len, .complete = true }));
                 }
             }
             try batch.commit();
+        }
+        // Packing has its own restart/takeover regression below. Here the
+        // durable checkpoint must hold partial numeric folds of dense tiles.
+        for (0..nodes.len) |i| {
+            const chunk = ((@as(u64, 1) << 32) + i * 256) / 256;
+            try std.testing.expectEqual(@as(usize, 6), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
         }
         try std.testing.expectEqual(@as(usize, 2), try graph.executeOrdinalReduceSummary("rank", cfg, job, page, 256, 2));
     }
@@ -16722,7 +16936,7 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
         defer txn.abort();
         const current = (try graph.metricBuildPage(&txn, "rank", 1, .reduce_ranks, 0, page.page_id)).?;
         if (current.state == .complete) {
-            try std.testing.expectEqual(@as(f64, 325), current.rank_sum);
+            try std.testing.expectEqual(@as(f64, 325 * 256 * 256), current.rank_sum);
             try std.testing.expectEqual(@as(u64, 2), current.completed_units);
             done = true;
             break;
@@ -16730,12 +16944,132 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
         try std.testing.expectEqual(@as(u64, 0), current.completed_units);
     }
     try std.testing.expect(done);
-    try std.testing.expectEqual(@as(usize, 12), visited);
+    // Takeover recomputes ten dense tiles without mixing the prior sums.
+    try std.testing.expectEqual(@as(usize, 10), visited);
     var txn = try graph.beginReadReverseTxn();
     defer txn.abort();
     const raw = try graph.pageRankContributionsForNodesAlloc(&txn, "rank", 1, 0, &nodes);
     defer alloc.free(raw);
-    try std.testing.expectEqualSlices(f64, &.{ 10, 15 }, raw);
+    try std.testing.expectEqualSlices(f64, &.{ 10 * 256, 15 * 256 }, raw);
+}
+
+test "graph metric vector chunks cache gathers across a bounded fold" {
+    const alloc = std.testing.allocator;
+    var graph: GraphIndex = undefined;
+    graph.alloc = alloc;
+    const Txn = struct {
+        chunk: vector_chunk.Chunk = @splat(0),
+        calls: usize = 0,
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            values[0] = &self.chunk;
+        }
+    };
+    var txn = Txn{};
+    try vector_chunk.put(&txn.chunk, 1, 3);
+    try vector_chunk.put(&txn.chunk, 2, 5);
+    var cache = GraphIndex.VectorReadCache.empty;
+    defer cache.deinit(alloc);
+    for (0..16) |_| {
+        const values = try graph.readGraphMetricVectorSlotsCachedAlloc(&txn, "rank", 1, "rank", 0, &.{ 1, 2, 1 }, true, &cache);
+        defer alloc.free(values);
+        try std.testing.expectEqualSlices(f64, &.{ 3, 5, 3 }, values);
+    }
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+    try std.testing.expectEqual(@as(u32, 1), cache.count());
+    try std.testing.expectError(error.InvalidGraphMetricScore, graph.readGraphMetricVectorSlotsCachedAlloc(&txn, "rank", 1, "rank", 0, &.{3}, true, &cache));
+}
+
+test "graph metric ordinal packing densifies fragmented output and fences incomplete attempts" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-adjacency-packing");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-adjacency-packing");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const cfg = GraphMetricConfig{ .name = "rank", .kind = .eigenvector, .refresh = .manual };
+    const options = GraphIndexOptions{ .metric_configs = &.{cfg}, .reverse_lsm_options = .{ .flush_threshold = 8192 } };
+    const job = GraphIndex.GraphMetricBuildJob{ .job_id = 1, .phase = .reduce_ranks };
+    const page = GraphIndex.GraphMetricBuildPage{ .job_id = 1, .phase = .reduce_ranks, .page_id = graph_metric_build_summary_leaf_base, .state = .leased, .range_kind = .summary, .worker_id = "original", .attempt = 1, .lease_expires_at_ms = 100, .total_units = 1 };
+    const slot: u64 = @as(u64, 1) << 32;
+    const chunk = slot / vector_chunk.entries;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    {
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        defer graph.close();
+        {
+            var batch = try graph.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try graph.putGraphMetricBuildManifestInBatch(&batch, "rank", .{ .job_id = 1, .node_count = 1 });
+            try graph.putGraphMetricBuildPageInBatch(&batch, "rank", page);
+            try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .iterate_contributions, .page_id = 3, .state = .complete, .attempt = 2 });
+            try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, "a"), slot);
+            const node_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("rank", 1, "a", 0);
+            defer alloc.free(node_key);
+            try GraphIndex.putU64(&batch, node_key, 1);
+            var vector: vector_chunk.Chunk = @splat(0);
+            try vector_chunk.put(&vector, 0, 2);
+            try batch.put(try GraphIndex.graphMetricVectorChunkKey(temp, "rank", 1, "rank", 0, chunk), &vector);
+            const prefix = try graph.ordinalAdjacencyPrefixAlloc("rank", 1, .iterate_contributions, chunk);
+            defer alloc.free(prefix);
+            const edge = [_]ordinal_blocks.Edge{.{ .source = slot, .target = slot }};
+            const encoded = try ordinal_blocks.encodeTopology(temp, .{ .edges = @constCast(&edge), .cursor = @constCast(""), .scanned = 1, .complete = true });
+            // The abandoned attempt must not be decoded, even if malformed.
+            try batch.put(try std.fmt.allocPrint(temp, "{s}{d:0>20}:{d:0>20}:{d:0>20}", .{ prefix, 3, 1, 0 }), "invalid");
+            for (0..1025) |i| try batch.put(try std.fmt.allocPrint(temp, "{s}{d:0>20}:{d:0>20}:{d:0>20}", .{ prefix, 3, 2, i }), encoded);
+            try batch.commit();
+        }
+        try std.testing.expectEqual(@as(usize, 512), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
+    }
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+    defer graph.close();
+    const base = try graph.packedAdjacencyBaseAlloc("rank", 1, .iterate_contributions, chunk);
+    defer alloc.free(base);
+    const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+    try std.testing.expectEqual(@as(usize, 512), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(receipt_key));
+        const state = try adjacency_blocks.State.decode(try txn.get(try std.fmt.allocPrint(temp, "{s}state", .{base})));
+        try std.testing.expectEqual(@as(u64, 3), state.blocks);
+        try std.testing.expectEqual(@as(usize, 255), state.count);
+    }
+    const replacement = (try graph.claimGraphMetricBuildPageAt("rank", 1, .reduce_ranks, 0, page.page_id, "replacement", 101)).?;
+    try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
+    for ([_]usize{ 512, 512, 2 }) |count| try std.testing.expectEqual(count, try graph.compactOrdinalAdjacencyChunk("rank", job, replacement, .iterate_contributions, chunk, 512));
+    const missing_key = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/{d:0>20}", .{ base, replacement.attempt, 2 });
+    var saved: []const u8 = undefined;
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const receipt = try adjacency_blocks.Receipt.decode(try batch.get(receipt_key));
+        try std.testing.expectEqual(replacement.attempt, receipt.attempt);
+        try std.testing.expectEqual(@as(u64, 1025), receipt.edges);
+        try std.testing.expectEqual(@as(u64, 5), receipt.blocks());
+        saved = try temp.dupe(u8, try batch.get(missing_key));
+        try batch.delete(missing_key);
+        try batch.commit();
+    }
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.executeOrdinalReduceSummary("rank", cfg, job, replacement, 256, 512));
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try batch.put(missing_key, saved);
+        try batch.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 5), try graph.executeOrdinalReduceSummary("rank", cfg, job, replacement, 256, 512));
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    const values = try graph.pageRankContributionsForNodesAlloc(&txn, "rank", 1, 0, &.{"a"});
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(f64, &.{2050}, values);
 }
 
 test "graph metric consumer barrier retires bounded input pages and resumes after reopen" {
@@ -28690,7 +29024,7 @@ test "graph hits coordinator publish failure preserves prior published pair afte
             const step = try graph.runGraphMetricPlannedWorkerStep("hits_authority", metrics[0], "worker-a");
             try std.testing.expectEqual(expected_phase, step.phase);
             try std.testing.expect(step.claimed_page);
-            try std.testing.expect(step.completed_page);
+            // Adjacency compaction may checkpoint before the page completes.
             if (step.advanced_phase) break;
         }
     }

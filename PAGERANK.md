@@ -596,7 +596,7 @@ An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 8 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 9 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
 The same job/configuration/epoch fence applies to workers, coordinator phase
@@ -622,26 +622,35 @@ checkpoint scans at most 4,096 edges and emits tiles of at most 256 neighbor/out
 ordinal pairs, grouped by output vector block. Later contribution phases are
 metadata-only barriers. Reducers gather the current input vector directly; no
 numeric contribution shuffle is written on any iteration. Adjacency identities
-include the first-iteration producer attempt and checkpoint. Reducers select only
-that producer's completed attempt, so replacement attempts with different tile
-boundaries cannot double-count abandoned output. Document IDs remain at the
+include the first-iteration producer attempt and checkpoint. Before the first
+fold, each output chunk packs only winning producer fragments into dense 256-edge
+tiles. Compaction checkpoints bound both physical records (512) and edges (4,096),
+persisting the input cursor and partial tile atomically. A completion receipt
+selects one immutable packed attempt; replacement attempts cannot mix abandoned
+output, and missing or truncated tiles fail closed. Document IDs remain at the
 input/output boundary; node-oriented reducers resolve ordinals by sorted multi-get.
+A worker step may run one bounded packing pass followed by one bounded fold,
+so small chunks do not wait another maintenance tick after receipt publication.
+Receipt preflight prevents repeated numeric work while another chunk is packing.
 
-All native reducers retain immutable adjacency until job cleanup.
+All native reducers retain packed immutable adjacency until job cleanup.
 Checkpointed output may be replayed safely after lease takeover. Once every
-consumer finishes, the phase barrier deletes at most 512 temporary vector records per
+consumer finishes, the phase barrier deletes at most 512 temporary records per
 transaction, persisting a last-deleted-key cursor atomically with each batch.
 Restart seeks beyond that cursor instead of rescanning LSM tombstones. Completed
 namespaces retain a durable sentinel until job cleanup. Retirement counts flow
 through DB maintenance sweeps, idle detection and runtime status
 (`total_retired_input_records` / `last_retired_input_records`). The barrier advances
-only after cleanup finishes. Both HITS lanes retire raw vectors each iteration.
+only after cleanup finishes. Both HITS lanes retire producer fragments after
+iteration zero and raw vectors each iteration.
 Retained topology is proportional to edges and bounded producer attempts, not
 the number of power iterations; temporary vectors remain iteration-bounded.
 
 Large reduction passes reuse the immutable node quantiles: independently leased
 producers fold at most 16 physical adjacency tiles (at most 4,096 edges) for a group of up to
-256 nodes per checkpoint. Their attempt-fenced cursor and compensated sums
+256 nodes per checkpoint. A checkpoint-local vector-block cache deduplicates
+neighbor reads across all its tiles without retaining state across transactions.
+Their attempt-fenced cursor and compensated sums
 survive restart; a replacement attempt recomputes without mixing old state.
 Completed folds atomically publish raw vector blocks and partial spectral norms
 or PageRank dangling mass. The root deterministically combines at most 256
@@ -655,8 +664,15 @@ directory, and 64-entry primary routing pages. Manifest version 18 authenticates
 the root, which authenticates the directory; each directory entry authenticates
 one routing page, whose entries authenticate score blocks. Point reads load
 only selected pages, with global block ordinals preserving score-cache identity.
-Indexes fitting in one routing page retain a single footer fetch and decoded
+Indexes fitting in one routing page or a 64 KiB footer retain a single footer fetch and decoded
 cache lease, avoiding extra network round trips for small metrics.
+Selected contiguous pages coalesce into authenticated ranges; independent runs
+use the same bounded parallel executor as score ranges (per column: eight reads and 32 MiB
+in flight, with each coalesced range capped at 8 MiB). Column plans divide the
+remaining shared request allowance deterministically, reserving control, root,
+directory and selected routing ranges before planning scores. Paging therefore
+cannot silently add requests beyond a score-only allowance. The shared budget
+remains authoritative across all metric surfaces of the pinned query.
 Top-K reads fetch only the root (at most 1,872 bytes) and requested ranked blocks,
 never the point directory or pages. The root also binds primary vector extents
 and the complete point-index digest for full-artifact/warm-start validation.
@@ -685,8 +701,9 @@ does not create another unbounded cache: fill registrations have fixed capacity,
 and every consuming query applies its retained-memory admission to the lease.
 Routing pages use the authenticated block cache and are decoded only for selected
 pages, so a large primary index cannot repeatedly bypass the decoded-index cache.
-Fetched payloads are freed by their query-session allocator, independently of the
-allocator owning returned scores or per-request routing arrays.
+Parallel range payloads use a thread-safe allocator and transfer ownership
+explicitly, independently of the allocator owning returned scores or per-request
+routing arrays.
 No storage or decode operation runs under the cache lock. Warm point
 and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
 misses, and retained bytes are exposed in query-cache statistics.
