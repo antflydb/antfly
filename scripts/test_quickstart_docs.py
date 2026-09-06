@@ -97,6 +97,10 @@ def main() -> int:
         "QueryWithResponse(": "Go snippets must use the high-level SDK",
         "wiki-articles.json ": "the downloaded fixture must be identified as JSONL",
         "--streaming=false": "the retrieval CLI uses the --no-streaming switch",
+        "eligible-source-covered": "source-covered already excludes skipped documents",
+        "Q4_K_M": "the Gemma quickstart must use the published Q4_0 variant",
+        "--followup": "the quickstart should request only the grounded answer",
+        "--reasoning": "the quickstart should request only the grounded answer",
     }
     for token, message in forbidden.items():
         if token in source:
@@ -106,11 +110,11 @@ def main() -> int:
         'export PATH="$HOME/.local/bin:$PATH"',
         "wiki-articles.jsonl",
         "2,446 of the 10,000",
-        "--tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2",
+        "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
         "--until source-covered=10%",
-        "physical chunks or vector",
+        "Articles can produce multiple chunks",
         "## Troubleshooting",
         "standalone inference paths",
         "--inference-host-budget-mb 8192",
@@ -139,15 +143,21 @@ def main() -> int:
         for language, block in blocks
         if language in {"bash", "sh", "shell"} and "antfly index wait" in block
     ]
-    if len(wait_blocks) < 2 or any(
-        "--until source-covered=10%" not in block for block in wait_blocks
-    ):
-        fail("every quickstart index wait must require 10% source coverage")
+    expected_waits = {
+        "title_body": "--until source-covered=10%",
+        "thumbnail": "--until searchable-artifacts=250",
+    }
+    if len(wait_blocks) != len(expected_waits):
+        fail("the quickstart must have one text wait and one image wait")
+    for index, condition in expected_waits.items():
+        matching = [block for block in wait_blocks if f"--index {index}" in block]
+        if len(matching) != 1 or condition not in matching[0] or "--timeout 45m" not in matching[0]:
+            fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
     if "--until source-covered=10%" not in quickstart_tape:
         fail("the quickstart recording must wait for 10% source coverage")
-    if "Wait@1200s /reached source-covered=10%:/" not in quickstart_tape:
+    if "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape or "--timeout 45m" not in quickstart_tape:
         fail("the quickstart recording must match the source-coverage success message")
     if "--until searchable-artifacts=1" in quickstart_tape:
         fail("the quickstart recording must not retain the legacy single-artifact wait")

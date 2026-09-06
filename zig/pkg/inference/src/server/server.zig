@@ -37,6 +37,7 @@ const registry_mod = @import("../registry/registry.zig");
 const extractors_mod = @import("../extractors/extractor.zig");
 const cache_mod = @import("../cache/cache.zig");
 const model_manager_mod = @import("model_manager.zig");
+const embedding_trace = @import("../embedding_trace.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
@@ -1566,6 +1567,7 @@ const LoadedEmbeddingRuntimeAttemptFn = *const fn (
 ) anyerror!void;
 
 const LoadedEmbeddingRecoveryOptions = struct {
+    trace: ?*embedding_trace.Trace = null,
     preferred_backends: ?[]const backends_mod.BackendType = null,
     cache_default_alias: bool = true,
     pin_on_success: bool = false,
@@ -1610,6 +1612,11 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
         attempt: LoadedEmbeddingRuntimeAttemptFn,
 
         fn acquire(self: *@This()) !model_manager_mod.ModelHandle {
+            const started = if (self.options.trace != null) embedding_trace.now() else 0;
+            defer if (self.options.trace) |trace| {
+                trace.acquire_ns += embedding_trace.now() -| started;
+                trace.attempts += 1;
+            };
             if (self.options.failure_stage) |stage| stage.* = .acquire;
             return if (self.options.preferred_backends) |preferred_backends|
                 try self.node.model_manager.acquireFromDirWithPreferredBackends(
@@ -3238,6 +3245,77 @@ test "compatibility backend candidates honor required policy" {
     );
 }
 
+fn requireGeneratorManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.model_type != .generator) return error.IncompatibleModel;
+}
+
+pub const ProviderGenerationErrorClass = enum(u8) {
+    incompatible_model,
+    unsupported_generator_provider,
+    other,
+};
+
+pub const ProviderGenerationOutcomeTag = enum(u8) {
+    content,
+    incompatible_model,
+    unsupported_generator_provider,
+};
+
+pub const ProviderGenerationOutcome = union(ProviderGenerationOutcomeTag) {
+    content: []u8,
+    incompatible_model: void,
+    unsupported_generator_provider: void,
+};
+
+pub fn classifyProviderGenerationError(err: anyerror) ProviderGenerationErrorClass {
+    return switch (err) {
+        error.IncompatibleModel => .incompatible_model,
+        error.UnsupportedGeneratorProvider => .unsupported_generator_provider,
+        else => .other,
+    };
+}
+
+fn providerGenerationOutcome(result: anyerror![]u8) anyerror!ProviderGenerationOutcome {
+    const content = result catch |err| return switch (classifyProviderGenerationError(err)) {
+        .incompatible_model => .incompatible_model,
+        .unsupported_generator_provider => .unsupported_generator_provider,
+        .other => err,
+    };
+    return .{ .content = content };
+}
+
+test "direct generation rejects non-generator manifests before execution" {
+    const embedder = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expectError(error.IncompatibleModel, requireGeneratorManifest(&embedder));
+
+    const generator = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+    };
+    try requireGeneratorManifest(&generator);
+
+    try std.testing.expectEqual(
+        ProviderGenerationErrorClass.incompatible_model,
+        classifyProviderGenerationError(error.IncompatibleModel),
+    );
+    try std.testing.expectEqual(
+        ProviderGenerationErrorClass.unsupported_generator_provider,
+        classifyProviderGenerationError(error.UnsupportedGeneratorProvider),
+    );
+    try std.testing.expectEqual(
+        ProviderGenerationErrorClass.other,
+        classifyProviderGenerationError(error.OutOfMemory),
+    );
+    try std.testing.expectEqual(
+        ProviderGenerationOutcomeTag.incompatible_model,
+        std.meta.activeTag(try providerGenerationOutcome(error.IncompatibleModel)),
+    );
+    try std.testing.expectEqual(
+        ProviderGenerationOutcomeTag.unsupported_generator_provider,
+        std.meta.activeTag(try providerGenerationOutcome(error.UnsupportedGeneratorProvider)),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -3741,9 +3819,17 @@ pub const Node = struct {
             parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
         else
             EmbeddingTaskType.RETRIEVAL_DOCUMENT;
+        var trace = embedding_trace.Trace.begin(allocator, io, "managed_direct", model_name, texts, @tagName(task_type), instruction);
+        var trace_finished = false;
+        defer if (!trace_finished) {
+            if (trace) |*value| value.finish(null);
+        };
+        const admission_started = if (trace != null) embedding_trace.now() else 0;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        if (trace) |*value| value.admission_ns = embedding_trace.now() -| admission_started;
+        const resolve_started = if (trace != null) embedding_trace.now() else 0;
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
@@ -3753,6 +3839,7 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        if (trace) |*value| value.resolve_manifest_ns = embedding_trace.now() -| resolve_started;
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
@@ -3760,6 +3847,7 @@ pub const Node = struct {
             texts: []const []const u8,
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
+            trace: ?*embedding_trace.Trace,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -3774,6 +3862,7 @@ pub const Node = struct {
                     attempt.texts,
                     attempt.task_type,
                     attempt.instruction,
+                    attempt.trace,
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
@@ -3787,8 +3876,11 @@ pub const Node = struct {
             .texts = texts,
             .task_type = task_type,
             .instruction = instruction,
+            .trace = if (trace) |*value| value else null,
         };
-        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .trace = attempt.trace }, &attempt, Attempt.run);
+        if (trace) |*value| value.finish(attempt.vectors.?);
+        trace_finished = true;
         return attempt.vectors.?;
     }
 
@@ -3799,10 +3891,17 @@ pub const Node = struct {
         texts: []const []const u8,
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
+        trace: ?*embedding_trace.Trace,
     ) ![][]f32 {
+        const asset_started = if (trace != null) embedding_trace.now() else 0;
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
+        pipeline.trace = trace;
+        if (trace) |value| {
+            value.backend = @tagName(model.session.backend());
+            value.asset_prepare_ns += embedding_trace.now() -| asset_started;
+        }
         const owned_prefix = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{
             .model = "",
             .input = .null,
@@ -3938,6 +4037,16 @@ pub const Node = struct {
         return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
+    pub fn generateTextDirectForProvider(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+    ) !ProviderGenerationOutcome {
+        return providerGenerationOutcome(self.generateTextDirect(allocator, model_name, roles, contents));
+    }
+
     pub fn generateMessagesDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -4022,6 +4131,21 @@ pub const Node = struct {
             false,
             null,
         );
+    }
+
+    pub fn generateMessagesDirectAdmittedForProvider(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        admission: *DirectGenerateAdmission,
+    ) !ProviderGenerationOutcome {
+        return providerGenerationOutcome(self.generateMessagesDirectAdmitted(
+            allocator,
+            model_name,
+            messages,
+            admission,
+        ));
     }
 
     const DirectGenerateTiming = struct {
@@ -4159,6 +4283,7 @@ pub const Node = struct {
             try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
+        try requireGeneratorManifest(&model.manifest);
         const loaded_at_ns = embedTimingNowNs();
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
@@ -6113,6 +6238,8 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const tracing = platform.env.getenv("ANTFLY_EMBED_TRACE_DIR") != null;
+        const trace_started = if (tracing) embedding_trace.now() else 0;
         var parsed = (try ctx.parseJson(std.json.Value)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6138,7 +6265,9 @@ pub const Node = struct {
 
         const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(request.input));
         const admission_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), media_admission.units);
+        const trace_admission_started = if (tracing) embedding_trace.now() else 0;
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        const trace_resolve_started = if (tracing) embedding_trace.now() else 0;
         var reserved_units = admission_units;
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed");
@@ -6154,6 +6283,7 @@ pub const Node = struct {
         var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
+        const trace_resolve_finished = if (tracing) embedding_trace.now() else 0;
 
         if (admission_manifest.hasCapability("sparse")) {
             validateSparseEmbeddingRequestOptions(request) catch |err| {
@@ -6244,6 +6374,28 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
         }
 
+        // Capture only bounded text-only, fail-fast batches, matching the
+        // managed document path. Media and partial-success requests are not
+        // silently represented as a replayable text request.
+        var trace_texts: []const []const u8 = &.{};
+        defer if (trace_texts.len > 0) ctx.allocator.free(trace_texts);
+        var trace: ?embedding_trace.Trace = null;
+        var trace_finished = false;
+        defer if (!trace_finished) {
+            if (trace) |*value| value.finish(null);
+        };
+        if (tracing and inputs.total_count <= 32 and inputs.texts.items.len == inputs.total_count and request.error_policy == .fail_fast) {
+            const texts = try ctx.allocator.alloc([]const u8, inputs.texts.items.len);
+            trace_texts = texts;
+            for (inputs.texts.items, 0..) |item, i| texts[i] = item.text;
+            trace = embedding_trace.Trace.begin(ctx.allocator, ctx.io, "http", request.model, texts, @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), request.instruction);
+            if (trace) |*value| {
+                value.started_ns = trace_started;
+                value.admission_ns = trace_resolve_started -| trace_admission_started;
+                value.resolve_manifest_ns = trace_resolve_finished -| trace_resolve_started;
+            }
+        }
+
         var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
 
         if (inputs.images.items.len > 0) {
@@ -6274,15 +6426,22 @@ pub const Node = struct {
             inputs: *ParsedDenseEmbedInputs,
             request: ParsedEmbedRequest,
             audio_decode_working_bytes: usize,
+            trace: ?*embedding_trace.Trace,
             result: ?ExecutionResult = null,
             prompt_tokens: usize = 0,
 
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                const asset_started = if (attempt.trace != null) embedding_trace.now() else 0;
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
                 defer asset_lease.release();
                 var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs);
+                pipeline.trace = attempt.trace;
+                if (attempt.trace) |value| {
+                    value.backend = @tagName(model.session.backend());
+                    value.asset_prepare_ns += embedding_trace.now() -| asset_started;
+                }
                 var audio_asset_guard = AudioEmbeddingAssetGuard.init(
                     model,
                     attempt.inputs.audio.items.len > 0,
@@ -6334,11 +6493,13 @@ pub const Node = struct {
             .inputs = &inputs,
             .request = request,
             .audio_decode_working_bytes = audio_decode_working_bytes,
+            .trace = if (trace) |*value| value else null,
         };
         var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .failure_stage = &failure_stage,
+            .trace = attempt.trace,
         }, &attempt, Attempt.run) catch |err| {
             if (isEmbedRequestOptionError(err)) {
                 return ctx.status(400).json(.{
@@ -6358,6 +6519,8 @@ pub const Node = struct {
 
         switch (attempt.result.?) {
             .fail_fast => |embeddings| {
+                if (trace) |*value| value.finish(embeddings);
+                trace_finished = true;
                 defer {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);

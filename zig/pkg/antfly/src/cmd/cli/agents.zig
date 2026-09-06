@@ -191,13 +191,87 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     };
 
     if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
-    var resp = try client.retrievalAgent(body);
-    defer resp.deinit();
-    if (resp.body) |response_body| {
-        cli.writeStdout(io, response_body);
+    if (streaming) {
+        var output = StreamingSseWriter{ .io = io };
+        var resp = try client.retrievalAgentToWriter(body, &output);
+        defer resp.deinit();
+        output.detector.finish();
         cli.writeStdout(io, "\n");
+        const is_sse = if (resp.content_type) |value|
+            std.mem.startsWith(u8, value, "text/event-stream")
+        else
+            false;
+        if (resp.status_code >= 300 or (is_sse and output.detector.saw_error)) {
+            return error.RetrievalAgentResponseError;
+        }
+    } else {
+        var resp = try client.retrievalAgent(body);
+        defer resp.deinit();
+        var response_failed = resp.status_code >= 300;
+        if (resp.body) |response_body| {
+            cli.writeStdout(io, response_body);
+            cli.writeStdout(io, "\n");
+            response_failed = response_failed or isSseErrorResponse(resp.content_type, response_body);
+        }
+        if (response_failed) return error.RetrievalAgentResponseError;
     }
 }
+
+fn isSseErrorResponse(content_type: ?[]const u8, body: []const u8) bool {
+    const value = content_type orelse return false;
+    if (!std.mem.startsWith(u8, value, "text/event-stream")) return false;
+
+    var detector = SseErrorDetector{};
+    detector.push(body);
+    detector.finish();
+    return detector.saw_error;
+}
+
+const SseErrorDetector = struct {
+    line: [128]u8 = undefined,
+    line_len: usize = 0,
+    line_overflowed: bool = false,
+    saw_error: bool = false,
+
+    fn push(self: *@This(), bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (byte == '\n') {
+                self.finishLine();
+            } else if (self.line_len < self.line.len) {
+                self.line[self.line_len] = byte;
+                self.line_len += 1;
+            } else {
+                self.line_overflowed = true;
+            }
+        }
+    }
+
+    fn finish(self: *@This()) void {
+        if (self.line_len > 0 or self.line_overflowed) self.finishLine();
+    }
+
+    fn finishLine(self: *@This()) void {
+        defer {
+            self.line_len = 0;
+            self.line_overflowed = false;
+        }
+        if (self.line_overflowed) return;
+        const line = std.mem.trimEnd(u8, self.line[0..self.line_len], "\r");
+        if (!std.mem.startsWith(u8, line, "event:")) return;
+        const event_name = std.mem.trim(u8, line["event:".len..], " \t");
+        if (std.mem.eql(u8, event_name, "error")) self.saw_error = true;
+    }
+};
+
+const StreamingSseWriter = struct {
+    io: std.Io,
+    detector: SseErrorDetector = .{},
+
+    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+        cli.writeStdout(self.io, bytes);
+        self.detector.push(bytes);
+    }
+};
 
 fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var intent: ?[]const u8 = null;
@@ -256,4 +330,26 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
     }) catch |err| {
         cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
     };
+}
+
+test "retrieval SSE errors fail the CLI response" {
+    try std.testing.expect(isSseErrorResponse(
+        "text/event-stream; charset=utf-8",
+        "event: generation\r\ndata: \"partial\"\r\n\r\nevent: error\r\ndata: {\"error\":\"IncompatibleModel\"}\r\n\r\n",
+    ));
+    try std.testing.expect(!isSseErrorResponse(
+        "text/event-stream",
+        "event: generation\ndata: \"the words event: error are data\"\n\nevent: done\ndata: {}\n\n",
+    ));
+    try std.testing.expect(!isSseErrorResponse(
+        "application/json",
+        "{\"event\":\"error\"}",
+    ));
+
+    var split_detector = SseErrorDetector{};
+    split_detector.push("event: gen\n\neve");
+    split_detector.push("nt: err");
+    split_detector.push("or\r\ndata: {}\r\n\r\n");
+    split_detector.finish();
+    try std.testing.expect(split_detector.saw_error);
 }

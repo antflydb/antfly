@@ -34,6 +34,7 @@ const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
+const embedding_trace = @import("../embedding_trace.zig");
 
 const qwen3_embedding_resident_override_level = 4;
 
@@ -265,6 +266,7 @@ pub const EmbeddingPipeline = struct {
     /// from the same loaded model. Tokenization and tensor preparation remain
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    trace: ?*embedding_trace.Trace = null,
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
@@ -357,6 +359,8 @@ pub const EmbeddingPipeline = struct {
             for (encoded[0..encoded_count]) |*result| result.deinit();
         }
 
+        const tokenize_started = if (self.trace != null) embedding_trace.now() else 0;
+        var trace_lengths: [32]usize = @splat(0);
         var effective_len: usize = if (self.config.trim_padding_to_batch_max and !fixed_len) 1 else max_len;
         for (texts, 0..) |text, i| {
             const token_text = if (self.config.text_prefix.len > 0)
@@ -370,9 +374,15 @@ pub const EmbeddingPipeline = struct {
             if (self.config.ensure_trailing_eos_id) |eos_id| {
                 ensureTrailingEos(&encoded[i], eos_id);
             }
+            if (self.trace != null and i < trace_lengths.len) trace_lengths[i] = activeTokenLength(encoded[i].attention_mask);
             if (self.config.trim_padding_to_batch_max and !fixed_len) {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
             }
+        }
+
+        if (self.trace) |trace| {
+            trace.tokenize_ns += embedding_trace.now() -| tokenize_started;
+            if (texts.len <= trace_lengths.len) trace.shape(trace_lengths[0..texts.len], batch, effective_len);
         }
 
         // The tokenizer/preprocessing lease above covers the conservative
@@ -490,10 +500,16 @@ pub const EmbeddingPipeline = struct {
         run_permit: *session_mod.RunPermit,
     ) ![][]f32 {
         const alloc = self.allocator;
+        const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_lock) |lock| {
             platform.sync.lockYielding(lock);
         }
         defer if (self.execution_lock) |lock| lock.unlock();
+        const execute_started = if (self.trace != null) embedding_trace.now() else 0;
+        if (self.trace) |trace| trace.execution_lock_ns += execute_started -| lock_started;
+        defer if (self.trace) |trace| {
+            trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
+        };
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(

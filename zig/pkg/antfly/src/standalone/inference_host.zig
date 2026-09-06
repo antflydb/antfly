@@ -527,7 +527,13 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .generate_text => blk: {
             var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.generateTextDirect(alloc, parsed.value.model, parsed.value.roles, parsed.value.contents);
+            const outcome = try state.node.generateTextDirectForProvider(
+                alloc,
+                parsed.value.model,
+                parsed.value.roles,
+                parsed.value.contents,
+            );
+            const result = try providerGenerationContent(outcome);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -578,6 +584,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     response.* = .{ .alloc = alloc, .json = response_json };
     context.out_response_handle.* = response;
     context.out_response_json.* = inference_bridge.String.init(response_json);
+}
+
+fn providerGenerationContent(outcome: inference.server.ProviderGenerationOutcome) ![]u8 {
+    return switch (outcome) {
+        .content => |content| content,
+        .incompatible_model => error.IncompatibleModel,
+        .unsupported_generator_provider => error.UnsupportedGeneratorProvider,
+    };
 }
 
 pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
@@ -1164,7 +1178,13 @@ fn localAntflyGenerateMessages(
 
     var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
-    return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
+    const outcome = try node.generateMessagesDirectAdmittedForProvider(
+        alloc,
+        model,
+        converted.messages,
+        &admission,
+    );
+    return try providerGenerationContent(outcome);
 }
 
 fn localAntflyReadImages(

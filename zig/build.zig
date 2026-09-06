@@ -4275,6 +4275,7 @@ pub fn build(b: *std.Build) void {
             "cmd.cli.backup",
             "cmd.cli.index",
             "cmd.cli.query",
+            "cmd.cli.agents",
             "cmd.cli.table",
             "cmd.cli.mod",
             "cmd.cli.data.test.mutation parser",
@@ -4312,7 +4313,7 @@ pub fn build(b: *std.Build) void {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.agents", "cmd.cli.table", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -10966,17 +10967,14 @@ pub fn build(b: *std.Build) void {
                 // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // 19.51 GB (18.17 GiB) with the platform frameworks enabled.
                 // A clean native aarch64-linux-musl production container build
                 // reached 19.89 GB (18.52 GiB) for the current production
-                // graph. Reserve 20 GiB on Linux so Zig's scheduler does
+                // graph. Reserve 20 GiB on both targets so Zig's scheduler does
                 // not discard a successfully compiled production artifact.
                 // Use the same Linux-target claim for native and cross builds;
                 // the target artifact determines the dominant codegen shape.
-                .distributed => @as(usize, if (target.result.os.tag == .macos)
-                    18
-                else
-                    20) * 1024 * 1024 * 1024,
+                .distributed => 20 * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

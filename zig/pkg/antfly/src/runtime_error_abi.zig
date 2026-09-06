@@ -333,6 +333,11 @@ pub const Detail = enum(c_int) {
     rerank_rate_limited,
     rerank_transient_failure,
     rerank_upstream_failure,
+    // Model compatibility is decided inside the independently generated
+    // inference runtime. Preserve that decision instead of collapsing it to
+    // an unrelated compilation-local error identity at the caller.
+    incompatible_model,
+    unsupported_generator_provider,
 };
 
 pub const Status = extern struct {
@@ -515,6 +520,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RerankRateLimited => status(.retryable, .rerank_rate_limited),
         error.RerankTransientFailure => status(.retryable, .rerank_transient_failure),
         error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
+        error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
+        error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -975,6 +982,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .rerank_rate_limited => "RerankRateLimited",
         .rerank_transient_failure => "RerankTransientFailure",
         .rerank_upstream_failure => "RerankUpstreamFailure",
+        .incompatible_model => "IncompatibleModel",
+        .unsupported_generator_provider => "UnsupportedGeneratorProvider",
     };
 }
 
@@ -1004,6 +1013,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
     try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
     try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
+    try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
+    try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

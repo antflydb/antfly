@@ -1319,7 +1319,10 @@ fn executeInternal(
         var result = exec.executeChain(alloc, cfg.chain, messages) catch |err| switch (format) {
             .sse => return .{
                 .content_type = "text/event-stream",
-                .body = try encodeSseError(alloc, @errorName(err)),
+                // Generation runners may live in independently compiled
+                // runtime units, where Zig error integers are not stable.
+                // Never expose a coincidentally matching local error name.
+                .body = try encodeSseGenerationError(alloc, err),
             },
             .json => return err,
         };
@@ -5364,6 +5367,10 @@ fn encodeSseError(
     return try out.toOwnedSlice(alloc);
 }
 
+fn encodeSseGenerationError(alloc: std.mem.Allocator, _: anyerror) ![]u8 {
+    return encodeSseError(alloc, "GenerationFailed");
+}
+
 fn appendSseEventValue(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -9195,6 +9202,52 @@ test "retrieval agent supports fixed-body sse streaming" {
     var parsed_done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
     defer parsed_done.deinit();
     try std.testing.expect(std.mem.indexOf(u8, parsed_done.value.generation.?, "Generated answer citing doc:a") != null);
+}
+
+test "retrieval agent sse uses a stable generation failure name" {
+    const FakeRunner = struct {
+        fn iface() QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FailingGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.TestGenerationFailure;
+        }
+    };
+
+    const body =
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:alpha"},"limit":5}]}
+    ;
+    const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FailingGeneration.iface(), body);
+    defer std.testing.allocator.free(encoded.body);
+    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"GenerationFailed\"}",
+        firstSseEventData(events, "error").?,
+    );
 }
 
 test "retrieval agent sse emits followup events" {

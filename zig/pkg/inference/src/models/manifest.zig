@@ -535,6 +535,11 @@ pub const ModelManifest = struct {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_gguf_bundle_family);
     }
 
+    pub fn isQwen3TextReranker(self: *const ModelManifest) bool {
+        return self.model_type == .reranker and self.usesGgufWeights() and
+            std.mem.eql(u8, self.config_model_arch, "qwen3");
+    }
+
     pub fn isQwen3VlRerankerSafetensorsBundle(self: *const ModelManifest) bool {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
     }
@@ -882,6 +887,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
             direct.catalog.model_dir_path,
             manifest.gguf_path.?,
         ));
+        try applyImplicitModelTypeHints(&manifest, model_dir_path);
         try finalizeEmbeddingProfile(&manifest);
         return manifest;
     }
@@ -1349,7 +1355,16 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
     // `Qwen3ForCausalLM`/`qwen3` — without this guard the generative-arch
     // flip below would reclassify it as a generator.
     if (manifest.embedding_style != .none) return;
-    if (manifest.config_model_arch.len > 0 and gpt.isGenerativeModel(manifest.config_model_arch)) {
+    // Only reinterpret the neutral default (or a role derived from the
+    // architecture config itself). Explicit directory, manifest, task, and
+    // bundle roles must remain authoritative: decoder backbones are also
+    // used by embedding checkpoints.
+    const architecture_may_select_role = manifest.model_type_origin == .default or
+        manifest.model_type_origin == .config;
+    if (architecture_may_select_role and
+        manifest.config_model_arch.len > 0 and
+        gpt.isGenerativeModel(manifest.config_model_arch))
+    {
         manifest.model_type = .generator;
         manifest.model_type_origin = .config;
     }
@@ -1504,6 +1519,14 @@ fn applyGgufTokenizerMetadata(
         // — the only signal distinguishing it from a generative qwen3
         // checkpoint, so it also resolves the embedding style here.
         if (view.getString("general.architecture")) |arch| {
+            // A standalone GGUF commonly has no config.json. Preserve its
+            // architecture in the manifest so the ordinary model-type hints
+            // can distinguish a decoder from the neutral embedder default.
+            // An explicit config remains authoritative for mixed-artifact
+            // directories.
+            if (manifest.config_model_arch.len == 0) {
+                manifest.config_model_arch = try allocator.dupe(u8, arch);
+            }
             if (std.mem.eql(u8, arch, "qwen3")) {
                 var key_buf: [64]u8 = undefined;
                 // Without this the manifest keeps its BERT-era default of 512
@@ -5916,6 +5939,8 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     defer manifest.deinit();
 
     try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectEqualStrings("gemma4", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
     try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
     try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
     try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
@@ -5964,6 +5989,7 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     defer manifest.deinit();
 
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqualStrings("qwen3", manifest.config_model_arch);
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
     try std.testing.expect(manifest.normalize);
