@@ -3,6 +3,9 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
 
 """Fail-closed Qwen3-VL Transformers preprocessing and CUDA acceptance gate.
 
@@ -28,6 +31,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -37,73 +41,8 @@ RECEIPT_NAME = ".antfly-download-complete.json"
 BLOCKING_MARKERS = (".antfly-download-in-progress", ".antfly-download-plan.json")
 EXPECTED_SOURCE = {
     "owner": "Qwen",
-    "name": "Qwen3-VL-2B-Instruct-GGUF",
-    "variant": "q4-k-m-bundle-v1",
-}
-RERANKER_EXPECTED_SOURCE = {
-    "owner": "Qwen",
-    "name": "Qwen3-VL-Reranker-2B",
+    "name": "Qwen3-VL-2B-Instruct",
     "variant": "bf16-safetensors-bundle-v1",
-}
-RERANKER_EXPECTED_ARTIFACTS = {
-    "model.safetensors": (
-        4_255_140_312,
-        "466ec01961061e9d7f804b4fb1625fb6f406106cd1567e026096d4736fa9d5b9",
-    ),
-    "config.json": (
-        1_652,
-        "82d38a8f803e38e13986fdd622114a6fec12a834adbd3cee9253d757a257d23d",
-    ),
-    "tokenizer.json": (
-        11_422_654,
-        "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
-    ),
-    "tokenizer_config.json": (
-        5_445,
-        "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5",
-    ),
-    "preprocessor_config.json": (
-        628,
-        "fd32af55c2d3846adb0bc46df8eb07c92c332b31b34c338ae85259f3f3951f24",
-    ),
-    "video_preprocessor_config.json": (
-        817,
-        "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1",
-    ),
-    "chat_template.jinja": (
-        5_292,
-        "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
-    ),
-    "additional_chat_templates/reranker.jinja": (
-        2_443,
-        "47c758cb74d7f1e20e22483949a5ba4c8c1f4515126ad173da1c63211f472aa7",
-    ),
-    "1_LogitScore/config.json": (
-        57,
-        "73e3156450564d8a98b7e47bcf5aace0f29600828b51937da545571e84db3ff3",
-    ),
-    "modules.json": (
-        280,
-        "6f13b6b4a89e577b591b2077bca40c67c26541a6740a8809267cb474f90806a9",
-    ),
-    "sentence_bert_config.json": (
-        756,
-        "729676c811dadb5cf2cefdfcfca1bd04de40d0f0caed8a6482016d8a2937341d",
-    ),
-    "scripts/qwen3_vl_reranker.py": (
-        10_873,
-        "bd5d2f5d97fc4a738864d93f6b15d8850243e60da4484f3ea78867a46efdebd6",
-    ),
-}
-RERANKER_GENERATED_ARTIFACTS = {
-    "antfly_inference_bundle.json": (
-        81,
-        "1e2df99d4e60b29e4d95faf2d18f5097a1af02bd74d2a40d037d204358913e46",
-    ),
-    "model_manifest.json": (
-        64,
-        "696935ae5821d0e7babf351925e900d7dd6aaa96e1780608283359554694af16",
-    ),
 }
 PATCH_LIMITS = {
     # Versioned cross-implementation tolerances for normalized spatial patch
@@ -116,14 +55,14 @@ PATCH_LIMITS = {
     "max_abs": 0.150,
 }
 LOGIT_LIMITS = {
-    # Initial Qwen3-VL-2B Q4_K_M decoder + Q8_0 projector acceptance envelope.
+    # BF16 CUDA is compared with the same pinned BF16 Transformers weights.
     # Greedy argmax remains an independent exact gate.
-    "min_cosine_similarity": 0.95,
-    "min_pearson_correlation": 0.95,
-    "max_mean_abs": 1.0,
-    "max_rmse": 1.25,
-    "max_max_abs": 6.0,
-    "min_top_10_overlap": 8,
+    "min_cosine_similarity": 0.995,
+    "min_pearson_correlation": 0.995,
+    "max_mean_abs": 0.25,
+    "max_rmse": 0.40,
+    "max_max_abs": 2.0,
+    "min_top_10_overlap": 9,
 }
 FORBIDDEN_RUNTIME_OUTPUT = re.compile(
     r"falling back|unsupportedvision|segmentation fault|CUDA_ERROR|illegal memory access|panic:",
@@ -149,12 +88,23 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_json_atomic(path: Path, value: object) -> None:
+def write_json_atomic(path: Path, value: object, *, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(encoded, encoding="utf-8")
-    os.replace(temporary, path)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Publish the complete report without replacing a concurrent writer.
+            os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -288,77 +238,17 @@ def validate_managed_bundle(
     seen = {artifact["path"] for artifact in evidence["artifacts"]}
 
     bundle = load_json(root / "antfly_inference_bundle.json")
-    if bundle.get("family") != "qwen3_vl_gguf_bundle/v1":
+    if bundle.get("family") != "qwen3_vl_safetensors_bundle/v1":
         raise QualificationError(f"unexpected bundle family: {bundle.get('family')!r}")
-    decoder = safe_artifact_path(bundle.get("decoder"))
-    projector = safe_artifact_path(bundle.get("projector"))
-    if decoder not in seen or projector not in seen:
-        raise QualificationError(
-            "bundle decoder/projector is absent from the managed receipt"
-        )
-    if not decoder.endswith(".gguf") or not projector.endswith(".gguf"):
-        raise QualificationError(
-            "Qwen3-VL generation bundle must contain GGUF decoder/projector"
-        )
+    model = safe_artifact_path(bundle.get("model"))
+    if model != "model.safetensors" or model not in seen:
+        raise QualificationError("bundle does not select the managed BF16 model")
     evidence.update(
         {
             "bundle": bundle,
-            "decoder_path": str(root / decoder),
-            "projector_path": str(root / projector),
+            "model_path": str(root / model),
         }
     )
-    return evidence
-
-
-def validate_managed_reranker_bundle(model_dir: Path) -> dict[str, Any]:
-    evidence = _validate_managed_install(model_dir, RERANKER_EXPECTED_SOURCE)
-    root = Path(evidence["model_dir"])
-    received = {artifact["path"]: artifact for artifact in evidence["artifacts"]}
-    expected_paths = set(RERANKER_EXPECTED_ARTIFACTS) | set(
-        RERANKER_GENERATED_ARTIFACTS
-    )
-    if set(received) != expected_paths:
-        raise QualificationError(
-            "reranker artifact set mismatch: "
-            f"missing={sorted(expected_paths - set(received))} "
-            f"unexpected={sorted(set(received) - expected_paths)}"
-        )
-    for path, (expected_size, expected_sha) in RERANKER_EXPECTED_ARTIFACTS.items():
-        artifact = received[path]
-        if artifact["size"] != expected_size or artifact["sha256"] != expected_sha:
-            raise QualificationError(
-                f"pinned reranker artifact mismatch for {path}: "
-                f"expected size={expected_size} sha256={expected_sha}, "
-                f"got size={artifact['size']} sha256={artifact['sha256']}"
-            )
-        if artifact["receipt_sha256"] != expected_sha:
-            raise QualificationError(
-                f"reranker receipt does not pin the catalog SHA-256 for {path}"
-            )
-    for path, (expected_size, expected_sha) in RERANKER_GENERATED_ARTIFACTS.items():
-        artifact = received[path]
-        if artifact["size"] != expected_size or artifact["sha256"] != expected_sha:
-            raise QualificationError(
-                f"generated reranker contract mismatch for {path}: "
-                f"expected size={expected_size} sha256={expected_sha}, "
-                f"got size={artifact['size']} sha256={artifact['sha256']}"
-            )
-        if artifact["receipt_sha256"] is not None:
-            raise QualificationError(
-                f"generated reranker artifact unexpectedly has a catalog digest: {path}"
-            )
-
-    bundle = load_json(root / "antfly_inference_bundle.json")
-    if bundle.get("family") != "qwen3_vl_reranker_safetensors_bundle/v1":
-        raise QualificationError(
-            f"unexpected reranker bundle family: {bundle.get('family')!r}"
-        )
-    model = safe_artifact_path(bundle.get("model"))
-    if model != "model.safetensors" or model not in received:
-        raise QualificationError(
-            "reranker bundle does not select the pinned safetensors model"
-        )
-    evidence.update({"bundle": bundle, "model_path": str(root / model)})
     return evidence
 
 
@@ -1481,8 +1371,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=9216.0,
         help=(
             "maximum cold-process RSS in MiB (default: 9216; the pinned 2B "
-            "Q4_K_M decoder + Q8_0 projector measures about 8197 MiB while "
-            "the temporary native load session overlaps CUDA residency)"
+            "BF16 safetensors bundle temporarily overlaps native loading with "
+            "CUDA residency)"
         ),
     )
     parser.add_argument("--max-gpu-memory-mib", type=float, default=8192.0)
@@ -1650,11 +1540,14 @@ def main(argv: list[str] | None = None) -> int:
                 logits,
             )
             add_gate(
-                gates, "bf16_and_q4_logits_finite", logits.get("finite") is True, logits
+                gates,
+                "bf16_transformers_and_cuda_logits_finite",
+                logits.get("finite") is True,
+                logits,
             )
             add_gate(
                 gates,
-                "bf16_q4_logit_quality_within_limits",
+                "bf16_cuda_logit_quality_within_limits",
                 logit_quality_pass(logits),
                 {"metrics": logits, "limits": LOGIT_LIMITS},
             )
@@ -1669,7 +1562,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             add_gate(
                 gates,
-                "bf16_q4_greedy_argmax_exact",
+                "bf16_cuda_greedy_argmax_exact",
                 argmax_exact,
                 {
                     "transformers": logits.get("reference_argmax"),
