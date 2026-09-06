@@ -25,6 +25,7 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
+pub const request_context = @import("request_context.zig");
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
 
@@ -38,6 +39,7 @@ pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
+pub const RequestContext = request_context.RequestContext;
 
 test "inference module compiles" {
     _ = types;
@@ -46,6 +48,7 @@ test "inference module compiles" {
     _ = openai;
     _ = vertex;
     _ = managed_embedder;
+    _ = request_context;
     _ = list_models;
     _ = query_embedding_cache;
 }
@@ -70,6 +73,16 @@ test "bedrock provider request helpers" {
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
     try managed_embedder.testBedrockRequestFormatConfiguration();
+}
+
+test "embedding provider request helpers" {
+    try vertex.testEmbeddingStatusMapping();
+    try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testCohereBatchLimit();
+    try managed_embedder.testVertexEmbeddingRequestPlanning();
+    try managed_embedder.testManagedVertexCredentialManagerLifetime();
+    try managed_embedder.testCatalogSemanticIdentityRejectsProducerOnlyFields();
+    try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
@@ -112,6 +125,10 @@ test "managed embedder sends antfly media parts when local provider is configure
 
 test "managed embedder normalizes local admission overload across embedding modes" {
     try managed_embedder.testLocalAdmissionOverloadNormalization();
+}
+
+test "managed embedder routes query and document embedding tasks" {
+    try managed_embedder.testEmbeddingTaskRouting();
 }
 
 test "query embedding cache owns results and coalesces misses" {

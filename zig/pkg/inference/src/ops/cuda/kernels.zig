@@ -794,7 +794,11 @@ const GqaPrefillProfile = enum {
     }
 
     fn selectsFast(self: GqaPrefillProfile) bool {
-        return self == .fast or self == .required_fast;
+        // Automatic first attempts the qualified paged-F16 Flash route. Dense
+        // F32 attention cannot use that storage-specific kernel, so use the
+        // cooperative dense prefill kernel instead of the scalar fallback
+        // that recomputes Q.K once per output dimension.
+        return self == .automatic or self == .fast or self == .required_fast;
     }
 
     fn failClosed(self: GqaPrefillProfile) bool {
@@ -921,7 +925,7 @@ fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_k
 }
 
 fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
-    return batch == 1 and
+    return batch > 0 and
         q_seq_len > 1 and
         mask_len == 0 and
         bias_mode == 0 and
@@ -929,6 +933,30 @@ fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num
         num_heads % num_kv_heads == 0 and
         head_dim <= 512 and
         head_dim % 32 == 0;
+}
+
+/// Production-qualified automatic tensor-core route for the Qwen3-VL-2B
+/// decoder on NVIDIA L4.  Other shapes and architectures retain the existing
+/// automatic Flash/fallback policy; the explicit `mma` profile remains
+/// available for broader experimentation.
+fn qwen3VlAutomaticM32GqaPrefillEligible(
+    compute_major: i32,
+    compute_minor: i32,
+    batch: usize,
+    q_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mask_len: usize,
+    bias_mode: u32,
+) bool {
+    return compute_major == 8 and
+        compute_minor == 9 and
+        batch == 1 and
+        num_heads == 16 and
+        num_kv_heads == 8 and
+        head_dim == 128 and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
 fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
@@ -1588,6 +1616,8 @@ pub const JitModelProfile = enum {
     gliner2,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 
 pub const JitRouteScope = struct {
@@ -1609,7 +1639,14 @@ pub const JitRouteScope = struct {
         return switch (profile) {
             // Current production CUDA JIT evidence is exclusively Gemma4
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
-            .clipclap, .bert_encoder, .deberta_reranker, .gliner2, .florence2 => .{},
+            .clipclap,
+            .bert_encoder,
+            .deberta_reranker,
+            .gliner2,
+            .florence2,
+            .qwen3_embedding,
+            .qwen3_vl_generation,
+            => .{},
             .gemma4 => .{ .production = .{
                 .mmv = true,
                 .mm = true,
@@ -2144,6 +2181,7 @@ pub const KernelModule = struct {
     f32_to_i32: driver_mod.CUfunction = null,
     round_f32: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
+    pack_q8_0_tensor_core: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
@@ -2232,6 +2270,10 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    // BF16 tensor-core full attention for Qwen3-VL's token-major D=64 vision
+    // tower.  Kept separate from the general attention dispatcher so only the
+    // architecture with the qualified layout/semantics can select it.
+    qwen3vl_vision_attention_tc_bf16_m32n16: driver_mod.CUfunction = null,
     // Generated-shape BERT prefill attention: full, head-major [B,H,256,64].
     // It replaces the legacy block-wide reduction performed once per key.
     attention_f32_bert_prefill_s256_hd64: driver_mod.CUfunction = null,
@@ -2252,6 +2294,8 @@ pub const KernelModule = struct {
     channel_apply_f32: driver_mod.CUfunction = null,
     florence_vision_tail_sources_f32: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
+    qwen3vl_mrope_f32: driver_mod.CUfunction = null,
+    qwen3vl_vision_rope_f32: driver_mod.CUfunction = null,
     rope_decode_scalars_f32: driver_mod.CUfunction = null,
     decode_scalars_advance: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
@@ -3197,6 +3241,7 @@ pub const KernelModule = struct {
         const f32_to_i32 = loadOptionalFunction(ctx, module, "termite_f32_to_i32");
         const round_f32 = loadOptionalFunction(ctx, module, "termite_round_f32");
         const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
+        const pack_q8_0_tensor_core = loadOptionalFunction(ctx, module, "termite_pack_q8_0_tensor_core");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
         var add_scalar_f32: driver_mod.CUfunction = null;
@@ -3333,6 +3378,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const qwen3vl_vision_attention_tc_bf16_m32n16 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_attention_tc_bf16_m32n16");
         const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
         const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
         const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
@@ -3347,6 +3393,8 @@ pub const KernelModule = struct {
         const channel_apply_f32 = loadOptionalFunction(ctx, module, "termite_channel_apply_f32");
         const florence_vision_tail_sources_f32 = loadOptionalFunction(ctx, module, "termite_florence_vision_tail_sources_f32");
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
+        const qwen3vl_mrope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_mrope_f32");
+        const qwen3vl_vision_rope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_rope_f32");
         const rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_decode_scalars_f32");
         const decode_scalars_advance = loadOptionalFunction(ctx, module, "termite_decode_scalars_advance");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
@@ -3739,6 +3787,7 @@ pub const KernelModule = struct {
             .f32_to_i32 = f32_to_i32,
             .round_f32 = round_f32,
             .dequant_q4_0_bf16 = dequant_q4_0_bf16,
+            .pack_q8_0_tensor_core = pack_q8_0_tensor_core,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
             .binary_scalar_f32 = binary_scalar_f32,
@@ -3827,6 +3876,7 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .qwen3vl_vision_attention_tc_bf16_m32n16 = qwen3vl_vision_attention_tc_bf16_m32n16,
             .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
             .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
             .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
@@ -3841,6 +3891,8 @@ pub const KernelModule = struct {
             .channel_apply_f32 = channel_apply_f32,
             .florence_vision_tail_sources_f32 = florence_vision_tail_sources_f32,
             .rope_f32 = rope_f32,
+            .qwen3vl_mrope_f32 = qwen3vl_mrope_f32,
+            .qwen3vl_vision_rope_f32 = qwen3vl_vision_rope_f32,
             .rope_decode_scalars_f32 = rope_decode_scalars_f32,
             .decode_scalars_advance = decode_scalars_advance,
             .rope_scaled_f32 = rope_scaled_f32,
@@ -4105,6 +4157,7 @@ pub const KernelModule = struct {
             self.f32_to_i32 = null;
             self.round_f32 = null;
             self.dequant_q4_0_bf16 = null;
+            self.pack_q8_0_tensor_core = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
             self.binary_scalar_f32 = null;
@@ -4192,6 +4245,7 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.qwen3vl_vision_attention_tc_bf16_m32n16 = null;
             self.attention_f32_bert_prefill_s256_hd64 = null;
             self.attention_f32_bert_prefill_s256_hd64_q8 = null;
             self.attention_f32_bert_prefill_s256_hd64_q16 = null;
@@ -4206,6 +4260,8 @@ pub const KernelModule = struct {
             self.channel_apply_f32 = null;
             self.florence_vision_tail_sources_f32 = null;
             self.rope_f32 = null;
+            self.qwen3vl_mrope_f32 = null;
+            self.qwen3vl_vision_rope_f32 = null;
             self.rope_decode_scalars_f32 = null;
             self.rope_scaled_f32 = null;
             self.rope_scaled_decode_scalars_f32 = null;
@@ -4457,6 +4513,24 @@ pub const KernelModule = struct {
             self.rms_norm_add_mul_scalar_f32 != null and
             self.rms_norm_heads_rope_f32 != null and
             self.gemma4_mtp_masked_argmax_f32 != null;
+    }
+
+    pub fn hasQwen3EmbeddingPrimitives(self: *const KernelModule) bool {
+        return self.hasQuantMatmulMvpPrimitives() and
+            self.hasBf16WeightPrimitives() and
+            self.rope_f32 != null and
+            self.gqa_attention_f32 != null and
+            self.rms_norm_f32 != null and
+            self.elementwise_f32 != null;
+    }
+
+    pub fn hasQwen3VlGenerationPrimitives(self: *const KernelModule) bool {
+        return self.hasQwen3EmbeddingPrimitives() and
+            self.qwen3vl_mrope_f32 != null and
+            self.qwen3vl_vision_rope_f32 != null and
+            self.attention_f32 != null and
+            self.attention_f32_block != null and
+            self.layer_norm_f32 != null;
     }
 
     pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
@@ -4830,6 +4904,34 @@ pub const KernelModule = struct {
         const threads: usize = 256;
         const max_grid: usize = 65535;
         const blocks = @min((block_count + threads - 1) / threads, max_grid);
+        try launchBlocks(function, ctx, blocks, threads, &params);
+    }
+
+    pub fn launchPackQ8_0TensorCore(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        block_count: usize,
+    ) driver_mod.Error!void {
+        const function = self.pack_q8_0_tensor_core orelse return error.CudaKernelUnavailable;
+        const packed_bytes = try checkedTensorElements(block_count, 34);
+        try checkRawBytes(dst, packed_bytes);
+        try checkRawBytes(src, packed_bytes);
+        if (block_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var block_count_u32 = try toU32(block_count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&block_count_u32),
+        };
+        const threads: usize = 256;
+        const byte_count = try checkedTensorElements(block_count, 34);
+        const max_grid: usize = 65535;
+        const blocks = @min((byte_count + threads - 1) / threads, max_grid);
         try launchBlocks(function, ctx, blocks, threads, &params);
     }
 
@@ -8482,6 +8584,51 @@ pub const KernelModule = struct {
     /// token-major [batch, sequence, heads * head_dim]. Keeping this entry
     /// point separate prevents ComputeBackend callers from accidentally opting
     /// into the low-level head-major layout used by specialized kernels.
+    pub fn launchQwen3VlVisionAttentionTcBf16M32N16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.qwen3vl_vision_attention_tc_bf16_m32n16 orelse return false;
+        if (ctx.info.compute_major < 8 or batch == 0 or seq_len == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 31) / 32;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
     pub fn launchTokenMajorAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -9048,6 +9195,94 @@ pub const KernelModule = struct {
                 consecutive_pairs_u32,
             });
         }
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchQwen3VlMropeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        positions: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        token_count: usize,
+        chunks_per_token: usize,
+        head_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        sections: [3]u32,
+    ) driver_mod.Error!void {
+        const function = self.qwen3vl_mrope_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(3, token_count), @sizeOf(u32)));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var positions_ptr = positions.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var token_count_u32 = try toU32(token_count);
+        var chunks_per_token_u32 = try toU32(chunks_per_token);
+        var head_dim_u32 = try toU32(head_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var section_height_u32 = sections[1];
+        var section_width_u32 = sections[2];
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&positions_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&token_count_u32),
+            @ptrCast(&chunks_per_token_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&section_height_u32),
+            @ptrCast(&section_width_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchQwen3VlVisionRopeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        positions: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        token_count: usize,
+        heads_per_token: usize,
+        head_dim: usize,
+        theta: f32,
+    ) driver_mod.Error!void {
+        const function = self.qwen3vl_vision_rope_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(2, token_count), @sizeOf(u32)));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var positions_ptr = positions.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var token_count_u32 = try toU32(token_count);
+        var heads_per_token_u32 = try toU32(heads_per_token);
+        var head_dim_u32 = try toU32(head_dim);
+        var theta_f32 = theta;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&positions_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&token_count_u32),
+            @ptrCast(&heads_per_token_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&theta_f32),
+        };
         try launch1d(function, ctx, count, &params);
     }
 
@@ -10028,7 +10263,11 @@ pub const KernelModule = struct {
             return error.CudaKernelUnavailable;
         }
         if (self.gqa_attention_decode_f32) |decode_function| {
-            if (head_dim <= 512) {
+            // The block-cooperative decode kernel has an exact one-token,
+            // one-item ABI. Batched or multi-token shapes must reach the
+            // general scalar kernel below; the decode kernel rejects those
+            // shapes device-side without writing `dst`.
+            if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
                 try ctx.makeCurrent();
@@ -10896,7 +11135,28 @@ pub const KernelModule = struct {
                         launch_kind = .prefill_tiled_f16_warp;
                     }
                 },
-                .automatic, .flash_f16_sm89, .required_flash_f16_sm89 => {},
+                .automatic => {
+                    if (ctx.driver.fns.cuFuncSetAttribute != null and
+                        mmaM32GqaPrefillEnabled() and
+                        qwen3VlAutomaticM32GqaPrefillEligible(
+                            ctx.info.compute_major,
+                            ctx.info.compute_minor,
+                            batch,
+                            q_seq_len,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            mask_len,
+                            bias_mode,
+                        ))
+                    {
+                        if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
+                            function = mma_m32_function;
+                            launch_kind = .prefill_mma_m32;
+                        }
+                    }
+                },
+                .flash_f16_sm89, .required_flash_f16_sm89 => {},
             }
         }
         if (requiredGqaPrefillLaunch(self.gqa_prefill_profile)) |required_launch| {
@@ -19285,6 +19545,8 @@ test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
         JitModelProfile.deberta_reranker,
         JitModelProfile.gliner2,
         JitModelProfile.florence2,
+        JitModelProfile.qwen3_embedding,
+        JitModelProfile.qwen3_vl_generation,
     }) |profile| {
         try std.testing.expect(!JitRouteScope.maximumForProfile(profile).enabled());
     }
@@ -20244,6 +20506,47 @@ fn smokePrimitiveBatchedDotF32(
             try expectApproxSlice(actual, expected, 0.00001);
         }
     }
+}
+
+pub fn smokeQwen3VlPrimitives(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    if (module.qwen3vl_mrope_f32 == null or
+        module.qwen3vl_vision_rope_f32 == null or
+        module.pack_q8_0_tensor_core == null)
+    {
+        return error.CudaKernelUnavailable;
+    }
+    try smokeQ8TensorCorePack(&ctx, &module);
+    try smokeQwen3VlMropeF32(allocator, &ctx, &module);
+    try smokeQwen3VlVisionRopeF32(allocator, &ctx, &module);
+}
+
+fn smokeQ8TensorCorePack(ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const block_count: usize = 3;
+    var source: [block_count * 34]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @truncate(index * 13 + 7);
+    var expected: [source.len]u8 = undefined;
+    for (0..block_count) |block| {
+        @memcpy(expected[block * 2 ..][0..2], source[block * 34 ..][0..2]);
+        @memcpy(expected[block_count * 2 + block * 32 ..][0..32], source[block * 34 + 2 ..][0..32]);
+    }
+
+    var source_device = try buffer_mod.DeviceBuffer.alloc(ctx, source.len);
+    defer source_device.free(ctx);
+    var output_device = try buffer_mod.DeviceBuffer.alloc(ctx, expected.len);
+    defer output_device.free(ctx);
+    try source_device.copyFromHost(ctx, &source);
+    try module.launchPackQ8_0TensorCore(ctx, output_device, source_device, block_count);
+    try ctx.synchronize();
+
+    var actual: [expected.len]u8 = undefined;
+    try output_device.copyToHost(ctx, &actual);
+    try ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 fn smokeGemma4A4BResidentQ4_0(
@@ -21944,6 +22247,129 @@ fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, mod
     }
 }
 
+fn smokeQwen3VlMropeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const token_count: usize = 2;
+    const heads: usize = 2;
+    const head_dim: usize = 8;
+    const total_chunks = token_count * heads;
+    const theta: f32 = 10000.0;
+    const freq_scale: f32 = 1.0;
+    const sections = [3]u32{ 2, 1, 1 };
+    const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) / 7.0;
+    }
+    var expected: [input_data.len]f32 = undefined;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads;
+        const base = chunk * head_dim;
+        for (0..head_dim / 2) |pair| {
+            const axis: usize = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
+                1
+            else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3)
+                2
+            else
+                0;
+            const exponent = @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(head_dim));
+            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) *
+                freq_scale / std.math.pow(f32, theta, exponent);
+            const left = input_data[base + pair];
+            const right = input_data[base + head_dim / 2 + pair];
+            expected[base + pair] = left * @cos(angle) - right * @sin(angle);
+            expected[base + head_dim / 2 + pair] = left * @sin(angle) + right * @cos(angle);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var positions_device = try buffer_mod.DeviceBuffer.alloc(ctx, positions.len * @sizeOf(u32));
+    defer positions_device.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try positions_device.copyFromHost(ctx, std.mem.sliceAsBytes(&positions));
+    try module.launchQwen3VlMropeF32(
+        ctx,
+        output,
+        input,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads,
+        head_dim,
+        theta,
+        freq_scale,
+        sections,
+    );
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0002);
+}
+
+fn smokeQwen3VlVisionRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const token_count: usize = 2;
+    const heads: usize = 2;
+    const head_dim: usize = 8;
+    const total_chunks = token_count * heads;
+    const theta: f32 = 10000.0;
+    const positions = [_]u32{ 1, 3, 2, 4 };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) / 8.0;
+    }
+    var expected: [input_data.len]f32 = undefined;
+    const rotary_pairs = head_dim / 2;
+    const pairs_per_axis = rotary_pairs / 2;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads;
+        const base = chunk * head_dim;
+        for (0..rotary_pairs) |pair| {
+            const axis: usize = if (pair < pairs_per_axis) 0 else 1;
+            const local_pair = pair % pairs_per_axis;
+            const exponent = @as(f32, @floatFromInt(2 * local_pair)) /
+                @as(f32, @floatFromInt(head_dim / 2));
+            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) /
+                std.math.pow(f32, theta, exponent);
+            const left = input_data[base + pair];
+            const right = input_data[base + rotary_pairs + pair];
+            expected[base + pair] = left * @cos(angle) - right * @sin(angle);
+            expected[base + rotary_pairs + pair] = left * @sin(angle) + right * @cos(angle);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var positions_device = try buffer_mod.DeviceBuffer.alloc(ctx, positions.len * @sizeOf(u32));
+    defer positions_device.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try positions_device.copyFromHost(ctx, std.mem.sliceAsBytes(&positions));
+    try module.launchQwen3VlVisionRopeF32(
+        ctx,
+        output,
+        input,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads,
+        head_dim,
+        theta,
+    );
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0002);
+}
+
 fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
     const batch: usize = 2;
     const max_seq_len: usize = 2;
@@ -21988,16 +22414,16 @@ fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaConte
 }
 
 fn smokeGqaAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
-    const batch: usize = 1;
+    const batch: usize = 2;
     const q_seq_len: usize = 2;
     const kv_seq_len: usize = 2;
     const num_heads: usize = 2;
     const num_kv_heads: usize = 1;
     const head_dim: usize = 1;
-    const q_data = [_]f32{ 1, 1, 1, 1 };
-    const k_data = [_]f32{ 0, 0 };
-    const v_data = [_]f32{ 10, 20 };
-    const expected = [_]f32{ 10, 10, 15, 15 };
+    const q_data = [_]f32{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const k_data = [_]f32{ 0, 0, 0, 0 };
+    const v_data = [_]f32{ 10, 20, 30, 50 };
+    const expected = [_]f32{ 10, 10, 15, 15, 30, 30, 40, 40 };
 
     var q = try buffer_mod.DeviceBuffer.alloc(ctx, q_data.len * @sizeOf(f32));
     defer q.free(ctx);
@@ -22931,6 +23357,14 @@ test "generated CUDA GQA decode shape supports bounded ratios" {
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
 }
 
+test "CUDA fallback GQA decode shape excludes batches and prefill" {
+    try std.testing.expect(fastGqaDecodeEligible(1, 1, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(2, 1, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 2, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 1, 8, 1, 256, 1, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 1, 8, 1, 256, 0, 1));
+}
+
 test "CUDA SM89 split-K online decode profile and telemetry are typed and bounded" {
     try std.testing.expectEqual(GqaDecodeProfile.off, parseGqaDecodeProfile("off").?);
     try std.testing.expectEqual(
@@ -23099,12 +23533,24 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     const defaults = try resolveGqaPrefillProfile(null, false, false, false);
     try std.testing.expectEqual(GqaPrefillProfile.automatic, defaults.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
-    // The promoted automatic default attempts flash and never fails closed;
-    // explicit `off` remains the rollback with no flash selection.
+    // The promoted automatic default attempts paged-F16 Flash first, uses
+    // cooperative dense prefill for F32 attention, and selects the qualified
+    // SM89 Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
+    // `off` remains the rollback with neither selection.
     try std.testing.expect(defaults.profile.selectsFlashF16Sm89());
     try std.testing.expect(!defaults.profile.failClosed());
-    try std.testing.expect(!defaults.profile.selectsFast());
+    try std.testing.expect(defaults.profile.selectsFast());
     try std.testing.expect(!GqaPrefillProfile.off.selectsFlashF16Sm89());
+    try std.testing.expect(!GqaPrefillProfile.off.selectsFast());
+    try std.testing.expect(fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 0, 0));
+    try std.testing.expect(!fastGqaPrefillEligible(.automatic, 0, 511, 16, 8, 128, 0, 0));
+    try std.testing.expect(!fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 1, 0));
+    try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 2, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 8, 1, 256, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 1, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 1, 0));
     try std.testing.expectEqual(
         GqaAttentionLaunchKind.prefill_flash_f16_sm89,
         selectGqaFlashPrefillLaunch(.automatic, .eligible, true),

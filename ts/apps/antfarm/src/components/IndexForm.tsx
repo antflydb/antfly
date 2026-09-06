@@ -18,8 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import type { EmbedderProvider } from "@antfly/sdk";
-import { embedderProviders } from "@antfly/sdk";
+import { type IndexEmbedderProvider, indexEmbedderProviders } from "@antfly/sdk";
 import type React from "react";
 import { useMemo } from "react";
 import { useFieldArray, useFormContext } from "react-hook-form";
@@ -27,21 +26,19 @@ import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connection
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
 
-const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
+const staticModelSuggestions: Record<IndexEmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
-  gemini: ["embeddinggemma", "gemini-embedding-001"],
-  vertex: ["text-embedding-004", "text-multilingual-embedding-002"],
   openai: ["text-embedding-3-small", "text-embedding-3-large"],
-  openrouter: ["openai/text-embedding-3-small", "openai/text-embedding-3-large"],
+  gemini: ["gemini-embedding-001"],
+  vertex: ["gemini-embedding-001", "text-embedding-005"],
+  cohere: ["embed-v4.0", "embed-english-v3.0", "embed-multilingual-v3.0"],
   bedrock: [
     "amazon.titan-embed-text-v2:0",
     "amazon.titan-embed-image-v1",
     "cohere.embed-multilingual-v3",
     "cohere.embed-english-v3",
   ],
-  cohere: ["embed-english-v3.0", "embed-multilingual-v3.0", "embed-english-light-v3.0"],
-  mock: [],
 };
 
 interface IndexFormProps {
@@ -72,14 +69,14 @@ const IndexForm: React.FC<IndexFormProps> = ({
   );
 
   const modelSuggestions = useMemo(() => {
-    const merged: Record<EmbedderProvider, string[]> = {
+    const merged: Record<IndexEmbedderProvider, string[]> = {
       ...staticModelSuggestions,
     };
     // Live provider listings win over static suggestions; unconfigured or
     // failing providers keep their static lists.
     for (const [providerType, models] of Object.entries(liveEmbedders)) {
       if (models.length > 0 && providerType in merged) {
-        merged[providerType as EmbedderProvider] = models;
+        merged[providerType as IndexEmbedderProvider] = models;
       }
     }
     return merged;
@@ -99,7 +96,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
             <FormLabel>Provider</FormLabel>
             <Select
               value={field.value}
-              onValueChange={(value) => field.onChange(value as EmbedderProvider)}
+              onValueChange={(value) => field.onChange(value as IndexEmbedderProvider)}
             >
               <FormControl>
                 <SelectTrigger>
@@ -107,7 +104,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
                 </SelectTrigger>
               </FormControl>
               <SelectContent>
-                {embedderProviders.map((p: string) => (
+                {indexEmbedderProviders.map((p) => (
                   <SelectItem key={p} value={p}>
                     {p}
                   </SelectItem>
@@ -293,7 +290,7 @@ const IndexForm: React.FC<IndexFormProps> = ({
             <FormLabel>Embedder Model</FormLabel>
             <FormControl>
               <Combobox
-                options={(modelSuggestions[provider as EmbedderProvider] || []).map(
+                options={(modelSuggestions[provider as IndexEmbedderProvider] || []).map(
                   (suggestion) => ({
                     value: suggestion,
                     label: suggestion,

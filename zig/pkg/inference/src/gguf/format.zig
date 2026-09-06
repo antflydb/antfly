@@ -115,11 +115,18 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !File {
     return parseWithOptions(allocator, bytes, .{});
 }
 
+/// Parse GGUF metadata when a bundle supplies its tokenizer as sidecar files.
+/// Scalar tokenizer settings (special-token ids, BOS/EOS policy, chat template)
+/// still override generic defaults, while vocabulary-sized arrays are skipped.
+pub fn parseWithExternalTokenizer(allocator: std.mem.Allocator, bytes: []const u8) !File {
+    return parseWithOptions(allocator, bytes, .{ .tokenizer_metadata = .scalars_only });
+}
+
 /// Parse compatibility-relevant metadata and tensor headers without materializing
 /// tokenizer vocabulary arrays. The returned file is sufficient for architecture,
 /// tensor-type, shape, and required-weight inspection.
 pub fn parseStructure(allocator: std.mem.Allocator, bytes: []const u8) !File {
-    return parseWithOptions(allocator, bytes, .{ .skip_tokenizer_metadata = true });
+    return parseWithOptions(allocator, bytes, .{ .tokenizer_metadata = .none });
 }
 
 /// Validate every tensor's encoded byte range without reading tensor payloads.
@@ -205,8 +212,14 @@ pub fn encodedHeaderBytes(bytes: []const u8) !usize {
     return cursor.pos;
 }
 
+const TokenizerMetadata = enum {
+    all,
+    scalars_only,
+    none,
+};
+
 const ParseOptions = struct {
-    skip_tokenizer_metadata: bool = false,
+    tokenizer_metadata: TokenizerMetadata = .all,
 };
 
 fn parseWithOptions(allocator: std.mem.Allocator, bytes: []const u8, options: ParseOptions) !File {
@@ -224,15 +237,16 @@ fn parseWithOptions(allocator: std.mem.Allocator, bytes: []const u8, options: Pa
     }
     try metadata.ensureTotalCapacityPrecise(
         allocator,
-        if (options.skip_tokenizer_metadata) @min(metadata_count, 32) else metadata_count,
+        if (options.tokenizer_metadata != .all) @min(metadata_count, 32) else metadata_count,
     );
 
     for (0..metadata_count) |_| {
-        if (options.skip_tokenizer_metadata) {
+        if (options.tokenizer_metadata != .all) {
             const key = try cursor.readBorrowedString();
             const raw_type = try cursor.readInt(u32);
             const value_type = metadataValueTypeFromRaw(raw_type) orelse return error.UnsupportedMetadataType;
-            if (std.mem.startsWith(u8, key, "tokenizer.")) {
+            const is_tokenizer = std.mem.startsWith(u8, key, "tokenizer.");
+            if (is_tokenizer and (options.tokenizer_metadata == .none or value_type == .array)) {
                 try cursor.skipMetadataValue(value_type);
                 continue;
             }
@@ -773,6 +787,39 @@ test "parseStructure skips tokenizer payloads and retains tensor headers" {
     try std.testing.expectEqual(@as(usize, 2), parsed.metadata.len);
     try std.testing.expectEqualStrings("general.architecture", parsed.metadata[0].key);
     try std.testing.expectEqualStrings("token_embd.weight", parsed.tensors[0].name);
+}
+
+test "external tokenizer parse keeps scalar policy and skips vocabulary arrays" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 3);
+
+    try appendString(allocator, &data, "tokenizer.ggml.tokens");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u64, allocator, &data, 2);
+    try appendString(allocator, &data, "hello");
+    try appendString(allocator, &data, "world");
+
+    try appendString(allocator, &data, "tokenizer.ggml.add_eos_token");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.bool_));
+    try data.append(allocator, 1);
+
+    try appendString(allocator, &data, "general.architecture");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendString(allocator, &data, "qwen3");
+
+    var parsed = try parseWithExternalTokenizer(allocator, data.items);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), parsed.metadata.len);
+    try std.testing.expectEqualStrings("tokenizer.ggml.add_eos_token", parsed.metadata[0].key);
+    try std.testing.expectEqual(true, parsed.metadata[0].value.bool_);
+    try std.testing.expectEqualStrings("general.architecture", parsed.metadata[1].key);
 }
 
 test "metadata skipping rejects overflowing array lengths" {

@@ -18,6 +18,7 @@ const Headers = @import("headers.zig").Headers;
 const HeaderName = @import("headers.zig").HeaderName;
 const Uri = @import("uri.zig").Uri;
 const PercentEncoding = @import("../util/encoding.zig").PercentEncoding;
+const SharedBodyBudget = @import("../protocol/body_budget.zig").SharedBodyBudget;
 
 /// HTTP request representation.
 pub const Request = struct {
@@ -28,6 +29,16 @@ pub const Request = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Full allocation backing an owned body when its capacity is larger than
+    /// the visible body length. This lets body-transform middleware retain a
+    /// geometrically-grown buffer without an exact-size copy.
+    body_allocation: ?[]u8 = null,
+    /// Server-side application allocations that retain a transformed request
+    /// body (for example, a decompressed payload) share the same process-wide
+    /// budget as transport-owned request bytes. Client requests leave this
+    /// unset.
+    body_budget: ?*SharedBodyBudget = null,
+    body_budget_reserved: usize = 0,
     custom_method: ?[]const u8 = null,
     query_owned: bool = false,
     query_builder: ?std.ArrayListUnmanaged(u8) = null,
@@ -67,11 +78,9 @@ pub const Request = struct {
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
-        if (self.body_owned) {
-            if (self.body) |b| {
-                self.allocator.free(b);
-            }
-        }
+        self.freeOwnedBody();
+        if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
+        self.body_budget_reserved = 0;
         if (self.query_builder) |*builder| {
             builder.deinit(self.allocator);
         } else if (self.query_owned) {
@@ -81,15 +90,55 @@ pub const Request = struct {
         }
     }
 
+    /// Reserves retained application-side body capacity before allocating it.
+    /// Keeping the reservation on Request makes teardown ordering exact: the
+    /// owned buffer is freed before its capacity is returned to the budget.
+    pub fn tryReserveBodyBuffer(self: *Self, amount: usize) bool {
+        const budget = self.body_budget orelse return true;
+        if (!budget.tryReserve(amount)) return false;
+        self.body_budget_reserved += amount;
+        return true;
+    }
+
+    pub fn releaseBodyBuffer(self: *Self, amount: usize) void {
+        if (amount == 0) return;
+        std.debug.assert(self.body_budget_reserved >= amount);
+        if (self.body_budget) |budget| budget.release(amount);
+        self.body_budget_reserved -= amount;
+    }
+
+    fn freeOwnedBody(self: *Self) void {
+        if (!self.body_owned) return;
+        if (self.body_allocation) |allocation| {
+            self.allocator.free(allocation);
+        } else if (self.body) |body| {
+            self.allocator.free(body);
+        }
+        self.body = null;
+        self.body_owned = false;
+        self.body_allocation = null;
+    }
+
+    /// Replaces the body with an already-owned allocation. `body` may expose
+    /// only the initialized prefix of `allocation`; both slices must start at
+    /// the same address. Ownership transfers even if updating Content-Length
+    /// fails, so normal request teardown remains sufficient on every path.
+    pub fn replaceOwnedBodyAllocation(self: *Self, body: []u8, allocation: []u8) !void {
+        std.debug.assert(body.len <= allocation.len);
+        std.debug.assert(body.ptr == allocation.ptr);
+        self.freeOwnedBody();
+        self.body = body;
+        self.body_owned = true;
+        self.body_allocation = allocation;
+        try self.headers.setContentLength(body.len);
+    }
+
     /// Sets the request body with ownership.
     pub fn setBody(self: *Self, body: []const u8) !void {
-        if (self.body_owned) {
-            if (self.body) |b| {
-                self.allocator.free(b);
-            }
-        }
+        self.freeOwnedBody();
         self.body = try self.allocator.dupe(u8, body);
         self.body_owned = true;
+        self.body_allocation = null;
         try self.headers.setContentLength(body.len);
     }
 

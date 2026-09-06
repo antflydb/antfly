@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.cohere_embedder_config_input_type import CohereEmbedderConfigInputType
+from ..models.cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from ..models.cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="CohereEmbedderConfig")
 
@@ -27,22 +32,34 @@ class CohereEmbedderConfig:
             {'provider': 'cohere', 'model': 'embed-english-v3.0', 'input_type': 'search_document'}
 
         Attributes:
+            provider (CohereEmbedderConfigProvider):
             model (str): The name of the Cohere embedding model to use. Default: 'embed-english-v3.0'. Example: embed-
                 english-v3.0.
             api_key (str | Unset): The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-            input_type (CohereEmbedderConfigInputType | Unset): Specifies the type of input for optimized embeddings.
-                Default: CohereEmbedderConfigInputType.SEARCH_DOCUMENT.
+            input_type (CohereEmbedderConfigInputType | Unset): Legacy fixed input type applied to every embedding
+                operation. When omitted,
+                Antfly derives `search_query` for semantic searches and `search_document`
+                for indexed documents. Prefer the role-specific fields under `retrieval`.
             truncate (CohereEmbedderConfigTruncate | Unset): How to handle inputs longer than the max token length. Default:
                 CohereEmbedderConfigTruncate.END.
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
+    provider: CohereEmbedderConfigProvider
     model: str = "embed-english-v3.0"
     api_key: str | Unset = UNSET
-    input_type: CohereEmbedderConfigInputType | Unset = CohereEmbedderConfigInputType.SEARCH_DOCUMENT
+    input_type: CohereEmbedderConfigInputType | Unset = UNSET
     truncate: CohereEmbedderConfigTruncate | Unset = CohereEmbedderConfigTruncate.END
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         api_key = self.api_key
@@ -55,10 +72,15 @@ class CohereEmbedderConfig:
         if not isinstance(self.truncate, Unset):
             truncate = self.truncate.value
 
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -68,12 +90,18 @@ class CohereEmbedderConfig:
             field_dict["input_type"] = input_type
         if truncate is not UNSET:
             field_dict["truncate"] = truncate
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
+        provider = CohereEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         api_key = d.pop("api_key", UNSET)
@@ -92,11 +120,20 @@ class CohereEmbedderConfig:
         else:
             truncate = CohereEmbedderConfigTruncate(_truncate)
 
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         cohere_embedder_config = cls(
+            provider=provider,
             model=model,
             api_key=api_key,
             input_type=input_type,
             truncate=truncate,
+            retrieval=retrieval,
         )
 
         cohere_embedder_config.additional_properties = d

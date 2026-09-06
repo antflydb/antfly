@@ -62,8 +62,8 @@ interface StepsConfig {
 }
 
 const DEFAULT_STEPS: StepsConfig = {
-  classification: { enabled: true },
-  followup: { enabled: true, count: 3 },
+  classification: { enabled: false },
+  followup: { enabled: false, count: 3 },
   confidence: { enabled: false },
 };
 
@@ -418,91 +418,100 @@ const ChatPlaygroundPage: React.FC = () => {
               <CardTitle className="text-lg">Chat</CardTitle>
             </CardHeader>
             <CardContent className="flex-1 overflow-hidden flex flex-col p-0">
-              <ChatBar
-                key={chatKey}
-                id="chat-playground"
-                {...(effectiveGenerator ? { generator: effectiveGenerator } : {})}
-                table={selectedTable}
-                semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
-                agentKnowledge={agentKnowledge || undefined}
-                systemPrompt={systemPrompt || undefined}
-                maxInternalIterations={agenticEnabled ? maxInternalIterations : undefined}
-                limit={limit}
-                followUpCount={steps.followup.enabled ? steps.followup.count : undefined}
-                showFollowUpQuestions={steps.followup.enabled}
-                showConfidence={steps.confidence.enabled}
-                showHits
-                steps={{
-                  generation: { enabled: true },
-                  classification: { enabled: steps.classification.enabled },
-                  followup: {
-                    enabled: steps.followup.enabled,
-                    count: steps.followup.count,
-                  },
-                  confidence: { enabled: steps.confidence.enabled },
-                }}
-                tools={
-                  agenticEnabled
-                    ? {
-                        enabled_tools: enabledTools,
-                        max_tool_iterations: maxInternalIterations,
-                      }
-                    : undefined
-                }
-                placeholder="Ask a question..."
-                {...aiRenderers}
-                renderAssistantMessage={(message: string, isStreaming: boolean, turn: ChatTurn) => (
-                  <>
-                    {aiRenderers.renderAssistantMessage?.(message, isStreaming, turn)}
-                    {(turn.steps.length > 0 ||
-                      turn.activeSteps.length > 0 ||
-                      turn.reasoningText) && (
-                      <div className="mt-1 ml-1">
-                        <ReasoningChainCollapsible
-                          chain={turn.steps}
-                          activeSteps={turn.activeSteps}
-                          toolCallsMade={turn.toolCallsMade}
-                          reasoningText={turn.reasoningText}
-                          isStreaming={turn.isStreaming}
-                        />
-                      </div>
-                    )}
-                  </>
-                )}
-                renderInput={({
-                  value,
-                  onChange,
-                  onSubmit,
-                  isStreaming: streaming,
-                  placeholder,
-                  abort,
-                }) => (
-                  <PromptInput
-                    onSubmit={(_msg, e) => {
-                      e.preventDefault();
-                      onSubmit();
-                    }}
-                  >
-                    <PromptInputTextarea
-                      value={value}
-                      onChange={(e) => onChange(e.target.value)}
-                      placeholder={placeholder}
-                      disabled={streaming || !selectedTable || chatIndexes.length === 0}
-                    />
-                    <PromptInputFooter>
-                      <PromptInputSubmit
-                        status={turnToStatus(streaming, !!value)}
-                        onClick={streaming ? () => abort() : undefined}
+              {effectiveGenerator ? (
+                <ChatBar
+                  key={chatKey}
+                  id="chat-playground"
+                  generator={effectiveGenerator}
+                  table={selectedTable}
+                  semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
+                  agentKnowledge={agentKnowledge || undefined}
+                  systemPrompt={systemPrompt || undefined}
+                  maxInternalIterations={agenticEnabled ? maxInternalIterations : undefined}
+                  limit={limit}
+                  followUpCount={steps.followup.enabled ? steps.followup.count : undefined}
+                  showFollowUpQuestions={steps.followup.enabled}
+                  showConfidence={steps.confidence.enabled}
+                  showHits
+                  steps={{
+                    generation: {},
+                    ...(steps.classification.enabled ? { classification: {} } : {}),
+                    ...(steps.followup.enabled
+                      ? { followup: { count: steps.followup.count } }
+                      : {}),
+                    ...(steps.confidence.enabled ? { confidence: {} } : {}),
+                  }}
+                  tools={
+                    agenticEnabled
+                      ? {
+                          enabled_tools: enabledTools,
+                          max_tool_iterations: maxInternalIterations,
+                        }
+                      : undefined
+                  }
+                  placeholder="Ask a question..."
+                  {...aiRenderers}
+                  renderAssistantMessage={(
+                    message: string,
+                    isStreaming: boolean,
+                    turn: ChatTurn
+                  ) => (
+                    <>
+                      {aiRenderers.renderAssistantMessage?.(message, isStreaming, turn)}
+                      {(turn.steps.length > 0 ||
+                        turn.activeSteps.length > 0 ||
+                        turn.reasoningText) && (
+                        <div className="mt-1 ml-1">
+                          <ReasoningChainCollapsible
+                            chain={turn.steps}
+                            activeSteps={turn.activeSteps}
+                            toolCallsMade={turn.toolCallsMade}
+                            reasoningText={turn.reasoningText}
+                            isStreaming={turn.isStreaming}
+                          />
+                        </div>
+                      )}
+                    </>
+                  )}
+                  renderInput={({
+                    value,
+                    onChange,
+                    onSubmit,
+                    isStreaming: streaming,
+                    placeholder,
+                    abort,
+                  }) => (
+                    <PromptInput
+                      onSubmit={(_msg, e) => {
+                        e.preventDefault();
+                        onSubmit();
+                      }}
+                    >
+                      <PromptInputTextarea
+                        value={value}
+                        onChange={(e) => onChange(e.target.value)}
+                        placeholder={placeholder}
+                        disabled={streaming || !selectedTable || chatIndexes.length === 0}
                       />
-                    </PromptInputFooter>
-                  </PromptInput>
-                )}
-                renderError={(error) => (
-                  <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
-                    {error}
-                  </div>
-                )}
-              />
+                      <PromptInputFooter>
+                        <PromptInputSubmit
+                          status={turnToStatus(streaming, !!value)}
+                          onClick={streaming ? () => abort() : undefined}
+                        />
+                      </PromptInputFooter>
+                    </PromptInput>
+                  )}
+                  renderError={(error) => (
+                    <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+                      {error}
+                    </div>
+                  )}
+                />
+              ) : (
+                <div className="m-auto p-6 text-center text-sm text-muted-foreground">
+                  Configure a generator to start a chat.
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>

@@ -16,13 +16,21 @@ const std = @import("std");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference = @import("types.zig");
+const provider_defaults = @import("../common/provider_defaults.zig");
 
 const Allocator = std.mem.Allocator;
-const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
+pub const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const GeminiOptions = struct {
-    base_url: []const u8 = "https://generativelanguage.googleapis.com/v1beta",
+    base_url: []const u8 = provider_defaults.gemini_v1beta_base,
     api_key: []const u8,
+};
+
+pub const EmbedOptions = struct {
+    task_type: []const u8,
+    dimensions: ?u32 = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 pub const GeminiProvider = struct {
@@ -63,6 +71,48 @@ pub const GeminiProvider = struct {
         };
     }
 
+    pub fn embedText(
+        self: *GeminiProvider,
+        alloc: Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        options: EmbedOptions,
+    ) !inference.EmbedResult {
+        const model_path = if (std.mem.startsWith(u8, model, "models/")) model else try std.fmt.allocPrint(alloc, "models/{s}", .{model});
+        defer if (model_path.ptr != model.ptr) alloc.free(model_path);
+        const Request = struct {
+            model: []const u8,
+            content: struct { parts: []const struct { text: []const u8 } },
+            taskType: []const u8,
+            outputDimensionality: ?u32 = null,
+        };
+        const requests = try alloc.alloc(Request, texts.len);
+        defer alloc.free(requests);
+        for (texts, 0..) |text, i| requests[i] = .{
+            .model = model_path,
+            .content = .{ .parts = &.{.{ .text = text }} },
+            .taskType = options.task_type,
+            .outputDimensionality = options.dimensions,
+        };
+        const json_body = try std.json.Stringify.valueAlloc(alloc, .{ .requests = requests }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(json_body);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/{s}:batchEmbedContents", .{ self.base_url, std.fs.path.basename(model_path) });
+        defer self.allocator.free(url);
+        const headers = [_][2][]const u8{self.api_key_header};
+        var response = try self.http.post(url, .{
+            .json = json_body,
+            .headers = &headers,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
+        });
+        defer response.deinit();
+        if (!response.ok()) return mapEmbeddingStatus(response.status.code);
+        const Response = struct { embeddings: []const struct { values: []const f32 } = &.{} };
+        var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return try copyEmbeddingValues(alloc, parsed.value.embeddings);
+    }
+
     pub fn setMaxTokens(self: *GeminiProvider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
     }
@@ -100,11 +150,17 @@ pub const GeminiProvider = struct {
 };
 
 pub const Options = struct {
-    base_url: []const u8 = "https://aiplatform.googleapis.com/v1",
+    base_url: []const u8 = provider_defaults.vertex_v1_base,
     project_id: ?[]const u8 = null,
-    location: []const u8 = "us-central1",
+    location: []const u8 = provider_defaults.default_google_location,
     credentials_path: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    token_source: ?*google_auth.CachedTokenSource = null,
+};
+
+pub const RerankOptions = struct {
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 };
 
 pub const Provider = struct {
@@ -115,6 +171,7 @@ pub const Provider = struct {
     location: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    owns_token_source: bool = false,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -139,8 +196,11 @@ pub const Provider = struct {
 
         if (options.bearer_token) |token| {
             try provider.setBearer(token);
+        } else if (options.token_source) |source| {
+            provider.token_source = source;
         } else {
             provider.token_source = try initVertexTokenSource(allocator, options.credentials_path);
+            provider.owns_token_source = true;
         }
 
         return provider;
@@ -151,9 +211,11 @@ pub const Provider = struct {
         self.allocator.free(self.project_id);
         self.allocator.free(self.location);
         if (self.auth_header) |header| self.allocator.free(header[1]);
-        if (self.token_source) |source| {
-            source.deinit();
-            self.allocator.destroy(source);
+        if (self.owns_token_source) {
+            if (self.token_source) |source| {
+                source.deinit();
+                self.allocator.destroy(source);
+            }
         }
         self.* = undefined;
     }
@@ -171,6 +233,173 @@ pub const Provider = struct {
             .ptr = @ptrCast(self),
             .vtable = &generator_vtable,
         };
+    }
+
+    pub fn rerank(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const u8,
+        options: RerankOptions,
+    ) ![]f32 {
+        const Record = struct {
+            id: []const u8,
+            content: []const u8,
+        };
+        const records = try alloc.alloc(Record, documents.len);
+        defer alloc.free(records);
+        var initialized: usize = 0;
+        defer for (records[0..initialized]) |record| alloc.free(record.id);
+        for (documents, 0..) |document, index| {
+            records[index] = .{
+                .id = try std.fmt.allocPrint(alloc, "{d}", .{index}),
+                .content = document,
+            };
+            initialized += 1;
+        }
+
+        const request_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .model = model,
+            .query = query,
+            .records = records,
+            .ignoreRecordDetailsInResponse = true,
+        }, .{});
+        defer alloc.free(request_body);
+        const url = try std.fmt.allocPrint(
+            alloc,
+            "{s}/projects/{s}/locations/global/rankingConfigs/default_ranking_config:rank",
+            .{ self.base_url, self.project_id },
+        );
+        defer alloc.free(url);
+
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
+
+        var response = try self.http.post(url, .{
+            .json = request_body,
+            .headers = headers.items,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
+        });
+        defer response.deinit();
+        if (!response.ok()) return switch (response.status.code) {
+            408, 504 => error.Timeout,
+            429 => error.RerankRateLimited,
+            500...503, 505...599 => error.RerankTransientFailure,
+            else => error.RerankRequestFailed,
+        };
+        const Response = struct {
+            records: []const struct {
+                id: []const u8,
+                score: f32,
+            } = &.{},
+        };
+        var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return try scoresByStringIndexAlloc(alloc, documents.len, parsed.value.records);
+    }
+
+    pub fn embedText(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        options: EmbedOptions,
+    ) !inference.EmbedResult {
+        if (texts.len == 0) return error.EmptyResponse;
+
+        var vectors = std.ArrayListUnmanaged([]const f32).empty;
+        errdefer {
+            for (vectors.items) |vector| alloc.free(vector);
+            vectors.deinit(alloc);
+        }
+        var dimension: usize = 0;
+        var offset: usize = 0;
+        const max_inputs = provider_defaults.vertexMaxEmbeddingBatchSize(model);
+        while (offset < texts.len) {
+            const batch_len = @min(max_inputs, texts.len - offset);
+            var batch = try self.embedTextRequest(
+                alloc,
+                model,
+                texts[offset .. offset + batch_len],
+                options,
+            );
+            defer batch.deinit();
+            if (batch.vectors.len != batch_len) return error.InvalidEmbeddingResponse;
+            if (dimension == 0) dimension = batch.dimension;
+            if (batch.dimension != dimension) return error.InvalidEmbeddingResponse;
+            try vectors.ensureUnusedCapacity(alloc, batch.vectors.len);
+            for (batch.vectors) |vector| {
+                try vectors.append(alloc, try alloc.dupe(f32, vector));
+            }
+            offset += batch_len;
+        }
+
+        return .{
+            .vectors = try vectors.toOwnedSlice(alloc),
+            .dimension = dimension,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn embedTextRequest(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        options: EmbedOptions,
+    ) !inference.EmbedResult {
+        if (texts.len == 0 or texts.len > provider_defaults.vertexMaxEmbeddingBatchSize(model))
+            return error.InvalidEmbeddingBatchSize;
+        const Instance = struct {
+            content: []const u8,
+            task_type: []const u8,
+        };
+        const instances = try alloc.alloc(Instance, texts.len);
+        defer alloc.free(instances);
+        for (texts, 0..) |text, i| instances[i] = .{
+            .content = text,
+            .task_type = options.task_type,
+        };
+        const json_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .instances = instances,
+            .parameters = .{ .outputDimensionality = options.dimensions },
+        }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(json_body);
+        const model_path = try self.vertexModelPathAlloc(alloc, model);
+        defer alloc.free(model_path);
+        const url = try std.fmt.allocPrint(alloc, "{s}/{s}:predict", .{ self.base_url, model_path });
+        defer alloc.free(url);
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        var response = try self.http.post(url, .{
+            .json = json_body,
+            .headers = headers.items,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
+        });
+        defer response.deinit();
+        if (!response.ok()) return mapEmbeddingStatus(response.status.code);
+        const Response = struct {
+            predictions: []const struct {
+                embeddings: struct { values: []const f32 },
+            } = &.{},
+        };
+        var parsed = try std.json.parseFromSlice(Response, alloc, response.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const Values = struct { values: []const f32 };
+        const values = try alloc.alloc(Values, parsed.value.predictions.len);
+        defer alloc.free(values);
+        for (parsed.value.predictions, 0..) |prediction, i| values[i] = .{ .values = prediction.embeddings.values };
+        return try copyEmbeddingValues(alloc, values);
     }
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
@@ -248,6 +477,50 @@ pub const Provider = struct {
         .generate = &generateImpl,
     };
 };
+
+fn copyEmbeddingValues(alloc: Allocator, items: anytype) !inference.EmbedResult {
+    if (items.len == 0) return error.EmptyResponse;
+    const vectors = try alloc.alloc([]const f32, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    for (items, 0..) |item, i| {
+        if (item.values.len == 0) return error.InvalidEmbeddingResponse;
+        vectors[i] = try alloc.dupe(f32, item.values);
+        initialized += 1;
+    }
+    return .{ .vectors = vectors, .dimension = vectors[0].len, .allocator = alloc };
+}
+
+fn scoresByStringIndexAlloc(alloc: Allocator, count: usize, records: anytype) ![]f32 {
+    const scores = try alloc.alloc(f32, count);
+    errdefer alloc.free(scores);
+    @memset(scores, 0);
+    const seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+    for (records) |record| {
+        const index = std.fmt.parseUnsigned(usize, record.id, 10) catch return error.InvalidRerankerResponse;
+        if (index >= count or seen[index]) return error.InvalidRerankerResponse;
+        scores[index] = record.score;
+        seen[index] = true;
+    }
+    for (seen) |present| if (!present) return error.InvalidRerankerResponse;
+    return scores;
+}
+
+test "reranking runtime maps Vertex record IDs back to input order" {
+    const records = [_]struct { id: []const u8, score: f32 }{
+        .{ .id = "1", .score = 0.85 },
+        .{ .id = "0", .score = 0.2 },
+    };
+    const scores = try scoresByStringIndexAlloc(std.testing.allocator, 2, &records);
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), scores[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.85), scores[1], 0.0001);
+}
 
 fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
     const Response = struct {
@@ -441,9 +714,7 @@ pub fn mintAuthorizationValueAlloc(alloc: Allocator, credentials_path: ?[]const 
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
-        errdefer service_account.deinit(alloc);
-        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromFileAlloc(alloc, path, vertex_auth_scope) catch return error.MissingVertexCredentials;
     } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
     errdefer cfg.deinit(alloc);
 
@@ -455,11 +726,9 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
 
 pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
-        defer service_account.deinit(alloc);
-        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+        return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
     }
-    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
+    return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
 fn appendJsonString(
@@ -470,6 +739,90 @@ fn appendJsonString(
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+fn mapEmbeddingStatus(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.EmbedRateLimited,
+        500...503, 505...599 => error.EmbedTransientFailure,
+        else => error.EmbedRequestFailed,
+    };
+}
+
+pub fn testEmbeddingStatusMapping() !void {
+    try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(408));
+    try std.testing.expectEqual(error.Timeout, mapEmbeddingStatus(504));
+    try std.testing.expectEqual(error.EmbedRateLimited, mapEmbeddingStatus(429));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbeddingStatus(500));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbeddingStatus(599));
+    try std.testing.expectEqual(error.EmbedRequestFailed, mapEmbeddingStatus(400));
+}
+
+test "google embedding status mapping preserves retryability" {
+    try testEmbeddingStatusMapping();
+}
+
+pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 1), provider_defaults.vertexMaxEmbeddingBatchSize("gemini-embedding-001"));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        provider_defaults.vertexMaxEmbeddingBatchSize("publishers/google/models/gemini-embedding-001"),
+    );
+    try std.testing.expectEqual(@as(usize, 250), provider_defaults.vertexMaxEmbeddingBatchSize("text-embedding-005"));
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const path = "/projects/proj/locations/us-central1/publishers/google/models/gemini-embedding-001:predict";
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = path, .assert_request = expectVertexEmbeddingRequest, .respond = .{
+            .body = "{\"predictions\":[{\"embeddings\":{\"values\":[1,2]}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var provider = try Provider.init(alloc, &client, .{
+        .base_url = server.baseUrl(),
+        .project_id = "proj",
+        .bearer_token = "test-token",
+    });
+    defer provider.deinit();
+
+    const texts = [_][]const u8{ "first", "second" };
+    var result: ?inference.EmbedResult = null;
+    defer if (result) |*value| value.deinit();
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: *Provider,
+            out: *?inference.EmbedResult,
+            err_out: *?anyerror,
+            inputs: []const []const u8,
+        ) std.Io.Cancelable!void {
+            out.* = p.embedText(a, "gemini-embedding-001", inputs, .{
+                .task_type = "RETRIEVAL_DOCUMENT",
+                .dimensions = 2,
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ alloc, &provider, &result, &run_err, &texts }) catch return;
+    try server.handleOne();
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 2), result.?.vectors.len);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.?.vectors[1]);
 }
 
 test "vertex provider exchanges service account credentials and generates content" {
@@ -602,6 +955,24 @@ fn expectVertexGenerateRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"systemInstruction\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"text\":\"describe this\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"YWJj\"}") != null);
+}
+
+fn expectVertexEmbeddingRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse return error.MissingHeader);
+    const Parsed = struct {
+        instances: []const struct {
+            content: []const u8,
+            task_type: []const u8,
+        },
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, req.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.instances.len);
+    try std.testing.expect(
+        std.mem.eql(u8, parsed.value.instances[0].content, "first") or
+            std.mem.eql(u8, parsed.value.instances[0].content, "second"),
+    );
+    try std.testing.expectEqualStrings("RETRIEVAL_DOCUMENT", parsed.value.instances[0].task_type);
 }
 
 fn expectGeminiGenerateRequest(req: httpx.testing_mod.RequestInfo) !void {

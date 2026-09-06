@@ -45,6 +45,24 @@ pub const RequestAdmission = struct {
         return false;
     }
 
+    pub const Lease = struct {
+        admission: *RequestAdmission,
+        active: bool = true,
+
+        pub fn release(self: *Lease) void {
+            if (!self.active) return;
+            self.admission.release();
+            self.active = false;
+        }
+    };
+
+    /// Acquires an RAII-style lease so admission can cover setup performed by
+    /// the caller before the core operation begins.
+    pub fn tryAcquireLease(self: *RequestAdmission) ?Lease {
+        if (!self.tryAcquire()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn release(self: *RequestAdmission) void {
         _ = self.in_flight.fetchSub(1, .acq_rel);
     }
@@ -124,6 +142,15 @@ test "request admission bounds positive capacity and preserves unlimited mode" {
     unlimited.release();
     unlimited.release();
     try std.testing.expectEqual(@as(usize, 2), unlimited.stats().peak_in_flight);
+}
+
+test "request admission lease releases exactly once" {
+    var admission = RequestAdmission.init(1);
+    var lease = admission.tryAcquireLease().?;
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
+    lease.release();
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
 }
 
 test "request admission metrics use the shared admission namespace" {

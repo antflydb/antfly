@@ -15,7 +15,6 @@ components:
         - openrouter
         - bedrock
         - cohere
-        - mock
         - antfly
       description: "The embedding provider to use."
 
@@ -30,6 +29,9 @@ components:
 
         **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
       properties:
+        provider:
+          type: string
+          enum: [gemini]
         project_id:
           type: string
           description: "The Google Cloud project ID (optional for Gemini API, required for Vertex AI)."
@@ -53,7 +55,10 @@ components:
           type: string
           format: uri
           description: "The URL of the Google API endpoint (optional, uses default if not specified)."
+        retrieval:
+          $ref: "#/components/schemas/EmbeddingRetrievalConfig"
       required:
+        - provider
         - model
       example:
         provider: "gemini"
@@ -68,10 +73,16 @@ components:
 
         Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
 
-        **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+        **Example Model:** gemini-embedding-001 (default, 3072 dims)
+
+        Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+        instead of being flattened or silently discarded.
 
         **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
       properties:
+        provider:
+          type: string
+          enum: [vertex]
         model:
           type: string
           description: "The name of the Vertex AI embedding model to use."
@@ -87,12 +98,15 @@ components:
         credentials_path:
           type: string
           writeOnly: true
-          description: "Path to service account JSON key file. Alternative to ADC for non-GCP environments."
+          description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain."
         dimension:
           type: integer
-          description: "The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding)."
+          description: "The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001)."
           default: 3072
+        retrieval:
+          $ref: "#/components/schemas/EmbeddingRetrievalConfig"
       required:
+        - provider
         - model
       example:
         provider: "vertex"
@@ -112,6 +126,9 @@ components:
 
         **Docs:** https://ollama.com/search?c=embedding
       properties:
+        provider:
+          type: string
+          enum: [ollama]
         model:
           type: string
           description: "The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large')."
@@ -123,6 +140,7 @@ components:
           default: "http://localhost:11434"
           example: "http://localhost:11434"
       required:
+        - provider
         - model
       example:
         provider: "ollama"
@@ -141,6 +159,9 @@ components:
 
         **Docs:** https://platform.openai.com/docs/guides/embeddings
       properties:
+        provider:
+          type: string
+          enum: [openai]
         model:
           type: string
           description: "The name of the OpenAI model to use."
@@ -160,6 +181,7 @@ components:
           type: integer
           description: "Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072."
       required:
+        - provider
         - model
       example:
         provider: "openai"
@@ -173,14 +195,17 @@ components:
 
         Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
 
-        **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
+        **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
       properties:
+        provider:
+          type: string
+          enum: [bedrock]
         model:
           type: string
-          description: "The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN)."
-          example: "cohere.embed-v4"
+          description: "The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN)."
+          example: "cohere.embed-v4:0"
         request_format:
           type: string
           enum:
@@ -219,11 +244,14 @@ components:
           type: integer
           description: "The batch size for embedding requests to optimize throughput."
           default: 1
+        retrieval:
+          $ref: "#/components/schemas/EmbeddingRetrievalConfig"
       required:
+        - provider
         - model
       example:
         provider: "bedrock"
-        model: "cohere.embed-v4"
+        model: "cohere.embed-v4:0"
         request_format: "cohere_v4"
         region: "us-east-1"
 
@@ -238,6 +266,9 @@ components:
 
         **Docs:** https://docs.cohere.com/reference/embed
       properties:
+        provider:
+          type: string
+          enum: [cohere]
         model:
           type: string
           description: "The name of the Cohere embedding model to use."
@@ -249,13 +280,16 @@ components:
           description: "The Cohere API key. Can also be set via COHERE_API_KEY environment variable."
         input_type:
           type: string
-          description: "Specifies the type of input for optimized embeddings."
+          deprecated: true
+          description: |-
+            Legacy fixed input type applied to every embedding operation. When omitted,
+            Antfly derives `search_query` for semantic searches and `search_document`
+            for indexed documents. Prefer the role-specific fields under `retrieval`.
           enum:
             - search_document
             - search_query
             - classification
             - clustering
-          default: "search_document"
         truncate:
           type: string
           description: "How to handle inputs longer than the max token length."
@@ -264,7 +298,10 @@ components:
             - START
             - END
           default: "END"
+        retrieval:
+          $ref: "#/components/schemas/EmbeddingRetrievalConfig"
       required:
+        - provider
         - model
       example:
         provider: "cohere"
@@ -284,6 +321,9 @@ components:
 
         **Docs:** https://openrouter.ai/docs/api/reference/embeddings
       properties:
+        provider:
+          type: string
+          enum: [openrouter]
         model:
           type: string
           description: "The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001')."
@@ -297,6 +337,7 @@ components:
           type: integer
           description: "Output dimension for the embedding (if supported by the model)."
       required:
+        - provider
         - model
       example:
         provider: "openrouter"
@@ -321,6 +362,9 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        provider:
+          type: string
+          enum: [antfly]
         model:
           type: string
           description: "The embedding model name (maps to models/embedders/{name}/ directory)."
@@ -330,12 +374,68 @@ components:
           format: uri
           description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable."
           example: "http://localhost:8082"
+        retrieval:
+          $ref: "#/components/schemas/EmbeddingRetrievalConfig"
       required:
+        - provider
         - model
       example:
         provider: "antfly"
         model: "bge-base-en-v1.5"
         api_url: "http://localhost:8082"
+
+    EmbeddingRetrievalConfig:
+      type: object
+      additionalProperties: false
+      description: |-
+        Advanced retrieval-role overrides. Antfly assigns canonical task intent
+        automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+        and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+        how a provider or instruction-aware model represents that intent.
+      properties:
+        query_input_type:
+          type: string
+          description: |-
+            Provider-specific query role, such as `search_query` for Cohere.
+            When omitted, the provider adapter derives it from
+            `RETRIEVAL_QUERY`.
+        document_input_type:
+          type: string
+          description: |-
+            Provider-specific document role, such as `search_document` for
+            Cohere. When omitted, the provider adapter derives it from
+            `RETRIEVAL_DOCUMENT`.
+        query_instruction:
+          type: string
+          description: |-
+            Optional instruction sent only with retrieval-query embeddings by
+            instruction-aware Antfly inference models. Provider adapters that
+            do not support free-form instructions reject this field.
+
+    IndexEmbedderConfig:
+      description: |-
+        Embedding provider configuration accepted when Antfly creates and
+        maintains an embeddings index. This purpose-specific subset reuses the
+        canonical provider configurations; it does not define a second provider
+        namespace.
+      oneOf:
+        - $ref: "#/components/schemas/OllamaEmbedderConfig"
+        - $ref: "#/components/schemas/OpenAIEmbedderConfig"
+        - $ref: "#/components/schemas/BedrockEmbedderConfig"
+        - $ref: "#/components/schemas/CohereEmbedderConfig"
+        - $ref: "#/components/schemas/GoogleEmbedderConfig"
+        - $ref: "#/components/schemas/VertexEmbedderConfig"
+        - $ref: "#/components/schemas/AntflyEmbedderConfig"
+      discriminator:
+        propertyName: provider
+        mapping:
+          ollama: "#/components/schemas/OllamaEmbedderConfig"
+          openai: "#/components/schemas/OpenAIEmbedderConfig"
+          bedrock: "#/components/schemas/BedrockEmbedderConfig"
+          cohere: "#/components/schemas/CohereEmbedderConfig"
+          gemini: "#/components/schemas/GoogleEmbedderConfig"
+          vertex: "#/components/schemas/VertexEmbedderConfig"
+          antfly: "#/components/schemas/AntflyEmbedderConfig"
 
     EmbedderConfig:
       description: |-
@@ -531,22 +631,44 @@ components:
                 Declare that this model supports non-text content (images, audio, video, PDFs),
                 even if the model isn't in Antfly's built-in model registry yet.
 
-                When `true`, Antfly treats the model as multimodal and will send binary content
-                (images, audio, etc.) to the provider instead of extracting text. The provider's
-                API is still responsible for accepting the content — this flag just tells Antfly
-                not to strip it.
+                When `true`, Antfly treats the model as multimodal and sends binary content
+                (images, audio, etc.) through an embedding adapter that supports content parts.
+                Antfly currently provides that contract for local Antfly inference and Bedrock;
+                text-only provider adapters reject media rather than silently discarding it.
 
-                Not needed for models already in the registry (e.g., `multimodalembedding`,
-                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
 
                 **Example:**
                 ```json
                 {
-                  "provider": "vertex",
+                  "provider": "antfly",
                   "model": "some-future-multimodal-model",
                   "multimodal": true
                 }
                 ```
+            query_input_type:
+              type: string
+              deprecated: true
+              description: |-
+                Deprecated compatibility form of
+                `retrieval.query_input_type`. New configurations should use the
+                nested `retrieval` object.
+            document_input_type:
+              type: string
+              deprecated: true
+              description: |-
+                Deprecated compatibility form of
+                `retrieval.document_input_type`. New configurations should use
+                the nested `retrieval` object.
+            query_instruction:
+              type: string
+              deprecated: true
+              description: |-
+                Deprecated compatibility form of
+                `retrieval.query_instruction`. New configurations should use the
+                nested `retrieval` object.
+            retrieval:
+              $ref: "#/components/schemas/EmbeddingRetrievalConfig"
           required:
             - provider
       example:

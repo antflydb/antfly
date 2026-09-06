@@ -1051,13 +1051,23 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Update a table's schema */
+        /**
+         * Replace a table's schema
+         * @description Replaces the complete table schema. Properties omitted from the request
+         *     are removed. Use PATCH on this path for a partial JSON Merge Patch update.
+         */
         put: operations["updateSchema"];
         post?: never;
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Patch a table's schema
+         * @description Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+         *     members are merged recursively and a null value removes that member.
+         *     Antfly validates and versions the resulting complete schema atomically.
+         */
+        patch: operations["patchSchema"];
         trace?: never;
     };
     "/db/v1/tables/{tableName}/documents": {
@@ -2685,6 +2695,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description RFC 7396 JSON Merge Patch for a table schema. Object members are merged
+         *     recursively; null removes a member. The resulting document must be a
+         *     valid TableSchema and `version` remains server-managed.
+         */
+        TableSchemaPatch: {
+            [key: string]: unknown;
+        };
         Error: {
             /** @description Optional stable machine-readable error code for programmatic handling. */
             code?: string;
@@ -2855,7 +2873,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -2863,6 +2881,15 @@ export interface components {
              * @enum {boolean}
              */
             retryable: true;
+        };
+        /** @description A stable failure envelope for query embedding and reranking dependencies. */
+        QueryDependencyError: {
+            /** @enum {string} */
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "query_timeout";
+            /** @description Legacy alias of code. Use code for programmatic handling. */
+            error: string;
+            message: string;
+            retryable: boolean;
         };
         /** @description A hierarchy traversal cursor bound to an older source-artifact revision. */
         HierarchyCursorStaleError: {
@@ -3069,6 +3096,25 @@ export interface components {
              */
             status: 422;
         };
+        RerankerCandidateLimitExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /** @enum {string} */
+            error: "reranker_candidate_limit_exceeded";
+            /** @description Human-readable summary of the selected provider's candidate ceiling. */
+            message: string;
+            provider: components["schemas"]["RerankerProvider"];
+            /**
+             * Format: int32
+             * @description Maximum candidate window accepted by the selected provider.
+             */
+            maximum: number;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         GraphDistinctBudgetExceededError: {
             /**
              * Format: int32
@@ -3220,7 +3266,7 @@ export interface components {
             actual: number;
         };
         GraphQueryUnprocessableError: components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["RerankerCandidateLimitExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"] | components["schemas"]["QueryDependencyError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -3233,6 +3279,243 @@ export interface components {
              */
             desc?: boolean;
         };
+        /**
+         * @description The embedding provider to use.
+         * @enum {string}
+         */
+        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
+        /**
+         * @description A unified configuration for an embedding provider.
+         *
+         *     Embedders can be configured with templates to customize how documents are
+         *     converted to text before embedding. Templates use Handlebars syntax and
+         *     support various built-in helpers.
+         *
+         *     **Template System:**
+         *     - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
+         *     - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
+         *     - **Context**: Templates receive the full document as context
+         *
+         *     **Built-in Helpers:**
+         *
+         *     1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
+         *        ```handlebars
+         *        {{scrubHtml html_content}}
+         *        ```
+         *        - Removes `<script>` and `<style>` tags
+         *        - Adds newlines after block elements (p, div, h1-h6, li, etc.)
+         *        - Returns plain text with preserved readability
+         *
+         *     2. **eq** - Equality comparison for conditionals
+         *        ```handlebars
+         *        {{#if (eq status "active")}}Active user{{/if}}
+         *        {{#if (eq @key "special")}}Special field{{/if}}
+         *        ```
+         *
+         *     3. **media** - GenKit dotprompt media directive for multimodal content
+         *        ```handlebars
+         *        {{media url=imageDataURI}}
+         *        {{media url=this.image_url}}
+         *        {{media url="https://example.com/image.jpg"}}
+         *        {{media url="s3://endpoint/bucket/image.png"}}
+         *        {{media url="file:///path/to/image.jpg"}}
+         *        ```
+         *
+         *        **Supported URL Schemes:**
+         *        - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
+         *        - `http://` / `https://` - Web URLs with automatic content type detection
+         *        - `file://` - Local filesystem paths
+         *        - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
+         *
+         *        **Automatic Content Processing:**
+         *        - **Images**: Downloaded, resized (if needed), converted to data URIs
+         *        - **PDFs**: Text extracted or first page rendered as image
+         *        - **HTML**: Readable text extracted using Mozilla Readability
+         *
+         *        **Security Controls:**
+         *        Downloads are protected by content security settings (see Configuration Reference):
+         *        - Allowed host whitelist
+         *        - Private IP blocking (prevents SSRF attacks)
+         *        - Download size limits (default: 100MB)
+         *        - HTTP downloads time out after 30 seconds by default; zero disables the deadline
+         *        - Image dimension limits (default: 2048px, auto-resized)
+         *
+         *        See: https://antfly.io/docs/configuration#security--cors
+         *
+         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
+         *        ```handlebars
+         *        {{encodeToon this.fields}}
+         *        {{encodeToon this.fields lengthMarker=false indent=4}}
+         *        {{encodeToon this.fields delimiter="\t"}}
+         *        ```
+         *
+         *        **What is TOON?**
+         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
+         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
+         *        comprehension accuracy.
+         *
+         *        **Key Features:**
+         *        - Compact syntax using `:` for key-value pairs
+         *        - Array length markers: `tags[#3]: ai,search,ml`
+         *        - Tabular format for uniform data structures
+         *        - Optimized for LLM parsing and understanding
+         *        - Maintains human readability
+         *
+         *        **Benefits:**
+         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
+         *        - **Faster responses** - Less tokens to process
+         *        - **More context** - Fit more documents within token limits
+         *
+         *        **Options:**
+         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
+         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
+         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
+         *
+         *        **Example output:**
+         *        ```
+         *        title: Introduction to Vector Search
+         *        author: Jane Doe
+         *        tags[#3]: ai,search,ml
+         *        metadata:
+         *          edition: 2
+         *          pages: 450
+         *        ```
+         *
+         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
+         *
+         *        **References:**
+         *        - TOON Specification: https://github.com/toon-format/toon
+         *        - Go Implementation: https://github.com/alpkeskin/gotoon
+         *
+         *     **Template Examples:**
+         *
+         *     Document with metadata:
+         *     ```handlebars
+         *     Title: {{metadata.title}}
+         *     Date: {{metadata.date}}
+         *     Tags: {{#each metadata.tags}}{{this}}, {{/each}}
+         *
+         *     {{content}}
+         *     ```
+         *
+         *     HTML content extraction:
+         *     ```handlebars
+         *     Product: {{name}}
+         *     Description: {{scrubHtml description_html}}
+         *     Price: ${{price}}
+         *     ```
+         *
+         *     Multimodal with image:
+         *     ```handlebars
+         *     Product: {{title}}
+         *     {{media url=image}}
+         *     Description: {{description}}
+         *     ```
+         *
+         *     Conditional formatting:
+         *     ```handlebars
+         *     {{title}}
+         *     {{#if author}}By: {{author}}{{/if}}
+         *     {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
+         *     {{body}}
+         *     ```
+         *
+         *     **Environment Variables:**
+         *     - `GEMINI_API_KEY` - API key for Google AI
+         *     - `OPENAI_API_KEY` - API key for OpenAI
+         *     - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
+         *     - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
+         *
+         *     **Importing Pre-computed Embeddings:**
+         *
+         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
+         *     for indexes configured with `external: true`. External indexes accept vectors written
+         *     directly through the document `_embeddings` field and do not generate prompts from
+         *     `field` or `template`.
+         *
+         *     **Steps:**
+         *     1. Create an embeddings index with `external: true`
+         *     2. For dense indexes, set the index `dimension`
+         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
+         *
+         *     **Example:**
+         *     ```json
+         *     {
+         *       "title": "My Document",
+         *       "content": "Document text...",
+         *       "_embeddings": {
+         *         "my_vector_index": [0.1, 0.2, 0.3, ...]
+         *       }
+         *     }
+         *     ```
+         *
+         *     **Delete Behavior:**
+         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
+         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
+         *
+         *     **Use Cases:**
+         *     - Migrating from another vector database with existing embeddings
+         *     - Using embeddings generated by external systems
+         *     - Importing pre-computed OpenAI, Cohere, or other provider embeddings
+         *     - Batch processing embeddings offline before ingestion
+         * @example {
+         *       "provider": "openai",
+         *       "model": "text-embedding-3-small"
+         *     }
+         */
+        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            provider: components["schemas"]["EmbedderProvider"];
+            /**
+             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
+             *     even if the model isn't in Antfly's built-in model registry yet.
+             *
+             *     When `true`, Antfly treats the model as multimodal and sends binary content
+             *     (images, audio, etc.) through an embedding adapter that supports content parts.
+             *     Antfly currently provides that contract for local Antfly inference and Bedrock;
+             *     text-only provider adapters reject media rather than silently discarding it.
+             *
+             *     Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+             *
+             *     **Example:**
+             *     ```json
+             *     {
+             *       "provider": "antfly",
+             *       "model": "some-future-multimodal-model",
+             *       "multimodal": true
+             *     }
+             *     ```
+             */
+            multimodal?: boolean;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.query_input_type`. New configurations should use the
+             *     nested `retrieval` object.
+             */
+            query_input_type?: string;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.document_input_type`. New configurations should use
+             *     the nested `retrieval` object.
+             */
+            document_input_type?: string;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility form of
+             *     `retrieval.query_instruction`. New configurations should use the
+             *     nested `retrieval` object.
+             */
+            query_instruction?: string;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
+        /**
+         * @description Embedding provider configuration accepted when Antfly creates and
+         *     maintains an embeddings index. This purpose-specific subset reuses the
+         *     canonical provider configurations; it does not define a second provider
+         *     namespace.
+         */
+        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -4371,15 +4654,14 @@ export interface components {
              *
              *     **Schema Features:**
              *     - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions
-             *     - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field`
+             *     - **Document TTL**: Configure automatic expiration with a `ttl` policy
              *     - **Primary Keys**: Specify unique identifier fields
              *     - **Validation**: Enforce schema constraints on writes
              *
              *     **TTL Example:**
              *     ```json
              *     {
-             *       "ttl_duration": "7d",
-             *       "ttl_field": "_timestamp",
+             *       "ttl": {"duration": "7d", "field": "_timestamp"},
              *       "document_schemas": {...}
              *     }
              *     ```
@@ -4579,7 +4861,7 @@ export interface components {
             field?: string;
             /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
             mode?: components["schemas"]["CardinalityMode"];
-            /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
+            /** @description Ordered field list for multi-field terms aggregations. Each bucket key is a JSON string containing the serialized value array in the same order; clients should parse bucket.key as JSON. */
             fields?: string[];
             /**
              * @description Maximum number of buckets to return (for bucketing aggregations)
@@ -4625,7 +4907,7 @@ export interface components {
             };
         };
         AggregationBucket: {
-            /** @description Bucket key (term, range name, date, etc.) */
+            /** @description Bucket key (term, range name, date, etc.). For a multi-field terms aggregation this is a JSON string containing the serialized value array; use JSON.parse(bucket.key) to recover the array. */
             key: string;
             /** @description Formatted key for display (e.g., formatted dates) */
             key_as_string?: string;
@@ -5143,7 +5425,7 @@ export interface components {
              *
              *     Notes:
              *     - Non-existent keys are silently ignored
-             *     - Deletions are processed before inserts in the same batch
+             *     - Deletions take precedence over inserts for the same key in one batch
              *     - Keys are permanently removed from storage and indexes
              * @example [
              *       "user:789",
@@ -6633,7 +6915,7 @@ export interface components {
         } & (unknown & unknown & unknown);
         QueryRequest: {
             /**
-             * @description Name of the table to query. Optional for global queries.
+             * @description Name of the table to query. Required for global-query requests.
              * @example wikipedia
              */
             table?: string;
@@ -6892,8 +7174,10 @@ export interface components {
             limit?: number;
             /**
              * @description Number of results to skip for pagination. Supported for text-backed,
-             *     match_all, and filter-only requests. Not supported for semantic_search
-             *     due to vector index limitations.
+             *     match_all, and filter-only requests. Approximate semantic requests do
+             *     not support offset on their own. Semantic and hybrid requests support
+             *     it when a reranker is configured: Antfly retrieves a bounded candidate
+             *     window and applies offset after coordinator-owned reranking.
              * @example 0
              */
             offset?: number;
@@ -7016,7 +7300,10 @@ export interface components {
              *     - You have semantic or hybrid search results to refine
              *     - Latency trade-off is acceptable (reranking adds 100-500ms typically)
              *
-             *     **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+             *     **Best practice:** Set `candidate_count` to the bounded retrieval window
+             *     (often 50-100) and use the query `limit` for the final page size. Antfly
+             *     retrieves and globally merges that window, calls the reranker once, then
+             *     applies pruning, offset, and limit at the coordinator.
              *
              *     Example:
              *     ```json
@@ -7083,7 +7370,9 @@ export interface components {
              * @description Optional result pruning configuration to filter low-relevance results.
              *
              *     Pruning helps detect "elbows" in score distributions and removes
-             *     results that are significantly worse than top matches.
+             *     results that are significantly worse than top matches. It runs once
+             *     on globally merged results, after optional reranking and before the
+             *     final offset/limit page is selected.
              *
              *     **Common patterns:**
              *     - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs
@@ -7218,6 +7507,11 @@ export interface components {
              * @enum {string}
              */
             expand_strategy?: "union" | "intersection";
+        };
+        /** @description A stateful global query. The target table is required on this route. */
+        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
+            /** @description Name of the table to query. */
+            table: string;
         };
         Analyses: {
             pca?: boolean;
@@ -7560,7 +7854,9 @@ export interface components {
         };
         /** @description Reranking execution statistics. */
         RerankerProfile: {
-            /** @description Reranker model that was used. */
+            /** @description Reranking provider that executed the request. */
+            provider: components["schemas"]["RerankerProvider"];
+            /** @description Resolved reranker model when the provider exposes a stable model name. Omitted for automatic local selection. */
             model?: string;
             /** @description Number of documents that were reranked. */
             documents_reranked?: number;
@@ -7844,13 +8140,11 @@ export interface components {
             graph_results?: components["schemas"]["StatefulGraphQueryResults"];
         };
         /**
-         * @description Status of a linear merge page operation:
-         *     - "success": All records in batch processed successfully
-         *     - "partial": Processing stopped at shard boundary, client should retry with next_cursor
-         *     - "error": Fatal error occurred, no records processed successfully
+         * @description Status of a completed linear merge page. Successful responses are atomic
+         *     and use "success"; failures are returned as non-2xx HTTP responses.
          * @enum {string}
          */
-        LinearMergePageStatus: "success" | "partial" | "error";
+        LinearMergePageStatus: "success";
         /**
          * @description Linear merge operation for syncing sorted records from external sources.
          *     Use this to keep Antfly in sync with an external database or data source.
@@ -7859,13 +8153,15 @@ export interface components {
          *     (`Content-Encoding: gzip`).
          *
          *     Request bodies are limited to 64 MiB after decompression. Requests that
-         *     exceed this limit return HTTP 413.
+         *     exceed this limit return HTTP 413. Expanded bytes count toward the
+         *     server-wide request-body memory budget; temporary saturation returns
+         *     HTTP 503 with `Retry-After` instead of allocating outside that budget.
          *
          *     **How it works:**
          *     1. Send sorted records from your external source
          *     2. Server upserts records that exist in your batch
          *     3. Server deletes Antfly records in the key range that are absent from your batch
-         *     4. If stopped at shard boundary, use next_cursor for next request
+         *     4. Use next_cursor as last_merged_id for the next request
          *
          *     **WARNING:** Not safe for concurrent operations with overlapping key ranges.
          */
@@ -7944,7 +8240,7 @@ export interface components {
             deleted: number;
             /** @description IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true. */
             deleted_ids?: string[];
-            failed?: components["schemas"]["FailedOperation"][];
+            failed: components["schemas"]["FailedOperation"][];
             /** @description ID of last record in this batch (use for next request) */
             next_cursor: string;
             key_range?: components["schemas"]["KeyRange"];
@@ -7953,7 +8249,7 @@ export interface components {
             /** @description Additional information (e.g., "stopped at shard boundary", "dry run - no changes made") */
             message?: string;
             /** Format: int64 */
-            took?: number;
+            took: number;
         };
         /** @description A typed, weighted connection between documents */
         Edge: {
@@ -8189,9 +8485,11 @@ export interface components {
             postgres_table: string;
             /**
              * @description Template for constructing the Antfly document key from PG columns.
+             *     When omitted, Antfly first uses `_id`, then falls back to `id` if
+             *     the row has no `_id` column.
              *     A plain string (e.g., "id") uses that column's value directly.
              *     Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
-             * @default id
+             * @default _id
              * @example id
              */
             key_template?: string;
@@ -8251,6 +8549,10 @@ export interface components {
              *     WHERE clause on the PostgreSQL publication. This filters rows at the
              *     source before they are sent over the replication stream, reducing
              *     network and processing overhead.
+             *
+             *     Requires PostgreSQL 15 or newer and is applied only when Antfly
+             *     creates the publication. Changing this value does not alter an
+             *     existing publication; update or recreate that publication directly.
              *
              *     Only a subset of filter types are supported (term, match, range,
              *     conjuncts, disjuncts, must_not). The filter is translated to SQL
@@ -8561,6 +8863,11 @@ export interface components {
             } | null;
         };
         /**
+         * @description The reranking provider to use.
+         * @enum {string}
+         */
+        RerankerProvider: "antfly" | "cohere" | "vertex";
+        /**
          * @description Objective used to rank graph paths:
          *     - min_hops: Minimize the number of edges.
          *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
@@ -8568,6 +8875,370 @@ export interface components {
          * @enum {string}
          */
         GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /**
+         * @description Advanced retrieval-role overrides. Antfly assigns canonical task intent
+         *     automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+         *     and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+         *     how a provider or instruction-aware model represents that intent.
+         */
+        EmbeddingRetrievalConfig: {
+            /**
+             * @description Provider-specific query role, such as `search_query` for Cohere.
+             *     When omitted, the provider adapter derives it from
+             *     `RETRIEVAL_QUERY`.
+             */
+            query_input_type?: string;
+            /**
+             * @description Provider-specific document role, such as `search_document` for
+             *     Cohere. When omitted, the provider adapter derives it from
+             *     `RETRIEVAL_DOCUMENT`.
+             */
+            document_input_type?: string;
+            /**
+             * @description Optional instruction sent only with retrieval-query embeddings by
+             *     instruction-aware Antfly inference models. Provider adapters that
+             *     do not support free-form instructions reject this field.
+             */
+            query_instruction?: string;
+        };
+        /**
+         * @description Configuration for the Google AI (Gemini) embedding provider.
+         *
+         *     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
+         *
+         *     **Example Models:** gemini-embedding-001 (default, 3072 dims)
+         *
+         *     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+         * @example {
+         *       "provider": "gemini",
+         *       "model": "gemini-embedding-001",
+         *       "dimension": 3072,
+         *       "api_key": "your-api-key"
+         *     }
+         */
+        GoogleEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "gemini";
+            /** @description The Google Cloud project ID (optional for Gemini API, required for Vertex AI). */
+            project_id?: string;
+            /** @description The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API. */
+            location?: string;
+            /**
+             * @description The name of the embedding model to use.
+             * @default gemini-embedding-001
+             * @example gemini-embedding-001
+             */
+            model: string;
+            /**
+             * @description The dimension of the embedding vector (768, 1536, or 3072 recommended).
+             * @default 3072
+             */
+            dimension?: number;
+            /** @description The Google API key. Can also be set via GEMINI_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description The URL of the Google API endpoint (optional, uses default if not specified).
+             */
+            url?: string;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
+        /**
+         * @description Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
+         *
+         *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
+         *
+         *     **Example Model:** gemini-embedding-001 (default, 3072 dims)
+         *
+         *     Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+         *     instead of being flattened or silently discarded.
+         *
+         *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+         * @example {
+         *       "provider": "vertex",
+         *       "model": "gemini-embedding-001",
+         *       "project_id": "my-gcp-project",
+         *       "location": "us-central1",
+         *       "dimension": 3072
+         *     }
+         */
+        VertexEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
+            /**
+             * @description The name of the Vertex AI embedding model to use.
+             * @default gemini-embedding-001
+             * @example gemini-embedding-001
+             */
+            model: string;
+            /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
+            project_id?: string;
+            /**
+             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain. */
+            credentials_path?: string;
+            /**
+             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+             * @default 3072
+             */
+            dimension?: number;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
+        /**
+         * @description Configuration for the Ollama embedding provider.
+         *
+         *     Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
+         *
+         *     **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims)
+         *
+         *     **Docs:** https://ollama.com/search?c=embedding
+         * @example {
+         *       "provider": "ollama",
+         *       "model": "nomic-embed-text",
+         *       "url": "http://localhost:11434"
+         *     }
+         */
+        OllamaEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "ollama";
+            /**
+             * @description The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+             * @example nomic-embed-text
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
+             * @default http://localhost:11434
+             * @example http://localhost:11434
+             */
+            url?: string;
+        };
+        /**
+         * @description Configuration for the OpenAI embedding provider.
+         *
+         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+         *     Supports OpenAI-compatible APIs via `url` field.
+         *
+         *     **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims)
+         *
+         *     **Docs:** https://platform.openai.com/docs/guides/embeddings
+         * @example {
+         *       "provider": "openai",
+         *       "model": "text-embedding-3-small",
+         *       "api_key": "sk-..."
+         *     }
+         */
+        OpenAIEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "openai";
+            /**
+             * @description The name of the OpenAI model to use.
+             * @default text-embedding-3-small
+             * @example text-embedding-3-small
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
+             * @default https://api.openai.com
+             * @example https://api.openai.com
+             */
+            url?: string;
+            /** @description The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable. */
+            api_key?: string;
+            /** @description Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072. */
+            dimensions?: number;
+        };
+        /**
+         * @description Configuration for the OpenRouter embedding provider.
+         *
+         *     OpenRouter provides a unified API for multiple embedding models from different providers.
+         *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
+         *
+         *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
+         *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
+         *
+         *     **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+         * @example {
+         *       "provider": "openrouter",
+         *       "model": "openai/text-embedding-3-small",
+         *       "api_key": "sk-or-..."
+         *     }
+         */
+        OpenRouterEmbedderConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
+             * @default openai/text-embedding-3-small
+             * @example openai/text-embedding-3-small
+             */
+            model: string;
+            /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
+            api_key?: string;
+            /** @description Output dimension for the embedding (if supported by the model). */
+            dimensions?: number;
+        };
+        /**
+         * @description Configuration for the AWS Bedrock embedding provider.
+         *
+         *     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
+         *
+         *     **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
+         *
+         *     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+         * @example {
+         *       "provider": "bedrock",
+         *       "model": "cohere.embed-v4:0",
+         *       "request_format": "cohere_v4",
+         *       "region": "us-east-1"
+         *     }
+         */
+        BedrockEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "bedrock";
+            /**
+             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
+             * @example cohere.embed-v4:0
+             */
+            model: string;
+            /**
+             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+             *     for application inference profiles, provisioned throughput, custom models, and
+             *     other aliases whose invocation target does not identify the underlying model.
+             * @default auto
+             * @enum {string}
+             */
+            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
+            /**
+             * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
+             * @example us-east-1
+             */
+            region?: string;
+            /** @description Output dimension for Bedrock embedding models that support configurable dimensions. */
+            dimension?: number;
+            /** @description Alias for output dimension when using OpenAI-compatible configuration fields. */
+            dimensions?: number;
+            /** @description Cohere Bedrock input type, such as search_document, search_query, classification, or clustering. */
+            input_type?: string;
+            /** @description Cohere Bedrock truncate behavior. */
+            truncate?: string;
+            /**
+             * @description Whether to strip new lines from the input text before embedding.
+             * @default false
+             */
+            strip_new_lines?: boolean;
+            /**
+             * @description The batch size for embedding requests to optimize throughput.
+             * @default 1
+             */
+            batch_size?: number;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
+        /**
+         * @description Configuration for the Cohere embedding provider.
+         *
+         *     API key via `api_key` field or `COHERE_API_KEY` environment variable.
+         *
+         *     **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
+         *
+         *     **Docs:** https://docs.cohere.com/reference/embed
+         * @example {
+         *       "provider": "cohere",
+         *       "model": "embed-english-v3.0",
+         *       "input_type": "search_document"
+         *     }
+         */
+        CohereEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "cohere";
+            /**
+             * @description The name of the Cohere embedding model to use.
+             * @default embed-english-v3.0
+             * @example embed-english-v3.0
+             */
+            model: string;
+            /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * @deprecated
+             * @description Legacy fixed input type applied to every embedding operation. When omitted,
+             *     Antfly derives `search_query` for semantic searches and `search_document`
+             *     for indexed documents. Prefer the role-specific fields under `retrieval`.
+             * @enum {string}
+             */
+            input_type?: "search_document" | "search_query" | "classification" | "clustering";
+            /**
+             * @description How to handle inputs longer than the max token length.
+             * @default END
+             * @enum {string}
+             */
+            truncate?: "NONE" | "START" | "END";
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
+        /**
+         * @description Configuration for the Antfly inference embedding provider.
+         *
+         *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
+         *     It provides embedding generation with multi-tier caching (memory + persistent).
+         *
+         *     **Features:**
+         *     - Local ONNX-based embedding generation
+         *     - L1 memory cache with configurable TTL
+         *     - L2 persistent Pebble database cache
+         *     - Singleflight deduplication for concurrent identical requests
+         *
+         *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
+         *
+         *     Models are loaded from the `models/embedders/{name}/` directory.
+         * @example {
+         *       "provider": "antfly",
+         *       "model": "bge-base-en-v1.5",
+         *       "api_url": "http://localhost:8082"
+         *     }
+         */
+        AntflyEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "antfly";
+            /**
+             * @description The embedding model name (maps to models/embedders/{name}/ directory).
+             * @example bge-base-en-v1.5
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             * @example http://localhost:8082
+             */
+            api_url?: string;
+            retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
+        };
         /**
          * @description Managed generated artifact kind.
          * @enum {string}
@@ -8651,813 +9322,11 @@ export interface components {
             artifact: string;
         };
         /**
-         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+         * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
          * @default l2_squared
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
-        /**
-         * @description Configuration for the Google AI (Gemini) embedding provider.
-         *
-         *     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
-         *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims)
-         *
-         *     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
-         * @example {
-         *       "provider": "gemini",
-         *       "model": "gemini-embedding-001",
-         *       "dimension": 3072,
-         *       "api_key": "your-api-key"
-         *     }
-         */
-        GoogleEmbedderConfig: {
-            /** @description The Google Cloud project ID (optional for Gemini API, required for Vertex AI). */
-            project_id?: string;
-            /** @description The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API. */
-            location?: string;
-            /**
-             * @description The name of the embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
-             */
-            model: string;
-            /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 recommended).
-             * @default 3072
-             */
-            dimension?: number;
-            /** @description The Google API key. Can also be set via GEMINI_API_KEY environment variable. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Google API endpoint (optional, uses default if not specified).
-             */
-            url?: string;
-        };
-        /**
-         * @description Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
-         *
-         *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
-         *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
-         *
-         *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-         * @example {
-         *       "provider": "vertex",
-         *       "model": "gemini-embedding-001",
-         *       "project_id": "my-gcp-project",
-         *       "location": "us-central1",
-         *       "dimension": 3072
-         *     }
-         */
-        VertexEmbedderConfig: {
-            /**
-             * @description The name of the Vertex AI embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
-             */
-            model: string;
-            /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
-            project_id?: string;
-            /**
-             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to service account JSON key file. Alternative to ADC for non-GCP environments. */
-            credentials_path?: string;
-            /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
-             * @default 3072
-             */
-            dimension?: number;
-        };
-        /**
-         * @description Configuration for the Ollama embedding provider.
-         *
-         *     Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
-         *
-         *     **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims)
-         *
-         *     **Docs:** https://ollama.com/search?c=embedding
-         * @example {
-         *       "provider": "ollama",
-         *       "model": "nomic-embed-text",
-         *       "url": "http://localhost:11434"
-         *     }
-         */
-        OllamaEmbedderConfig: {
-            /**
-             * @description The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
-             * @example nomic-embed-text
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
-             * @default http://localhost:11434
-             * @example http://localhost:11434
-             */
-            url?: string;
-        };
-        /**
-         * @description Configuration for the OpenAI embedding provider.
-         *
-         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
-         *     Supports OpenAI-compatible APIs via `url` field.
-         *
-         *     **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims)
-         *
-         *     **Docs:** https://platform.openai.com/docs/guides/embeddings
-         * @example {
-         *       "provider": "openai",
-         *       "model": "text-embedding-3-small",
-         *       "api_key": "sk-..."
-         *     }
-         */
-        OpenAIEmbedderConfig: {
-            /**
-             * @description The name of the OpenAI model to use.
-             * @default text-embedding-3-small
-             * @example text-embedding-3-small
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
-             * @default https://api.openai.com
-             * @example https://api.openai.com
-             */
-            url?: string;
-            /** @description The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable. */
-            api_key?: string;
-            /** @description Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072. */
-            dimensions?: number;
-        };
-        /**
-         * @description Configuration for the OpenRouter embedding provider.
-         *
-         *     OpenRouter provides a unified API for multiple embedding models from different providers.
-         *     API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-         *
-         *     **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
-         *     google/gemini-embedding-001, qwen/qwen3-embedding-8b
-         *
-         *     **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-         * @example {
-         *       "provider": "openrouter",
-         *       "model": "openai/text-embedding-3-small",
-         *       "api_key": "sk-or-..."
-         *     }
-         */
-        OpenRouterEmbedderConfig: {
-            /**
-             * @description The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-             * @default openai/text-embedding-3-small
-             * @example openai/text-embedding-3-small
-             */
-            model: string;
-            /** @description The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable. */
-            api_key?: string;
-            /** @description Output dimension for the embedding (if supported by the model). */
-            dimensions?: number;
-        };
-        /**
-         * @description Configuration for the AWS Bedrock embedding provider.
-         *
-         *     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles.
-         *
-         *     **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
-         *
-         *     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-         * @example {
-         *       "provider": "bedrock",
-         *       "model": "cohere.embed-v4",
-         *       "request_format": "cohere_v4",
-         *       "region": "us-east-1"
-         *     }
-         */
-        BedrockEmbedderConfig: {
-            /**
-             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
-             * @example cohere.embed-v4
-             */
-            model: string;
-            /**
-             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
-             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
-             *     for application inference profiles, provisioned throughput, custom models, and
-             *     other aliases whose invocation target does not identify the underlying model.
-             * @default auto
-             * @enum {string}
-             */
-            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
-            /**
-             * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
-             * @example us-east-1
-             */
-            region?: string;
-            /** @description Output dimension for Bedrock embedding models that support configurable dimensions. */
-            dimension?: number;
-            /** @description Alias for output dimension when using OpenAI-compatible configuration fields. */
-            dimensions?: number;
-            /** @description Cohere Bedrock input type, such as search_document, search_query, classification, or clustering. */
-            input_type?: string;
-            /** @description Cohere Bedrock truncate behavior. */
-            truncate?: string;
-            /**
-             * @description Whether to strip new lines from the input text before embedding.
-             * @default false
-             */
-            strip_new_lines?: boolean;
-            /**
-             * @description The batch size for embedding requests to optimize throughput.
-             * @default 1
-             */
-            batch_size?: number;
-        };
-        /**
-         * @description Configuration for the Cohere embedding provider.
-         *
-         *     API key via `api_key` field or `COHERE_API_KEY` environment variable.
-         *
-         *     **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
-         *
-         *     **Docs:** https://docs.cohere.com/reference/embed
-         * @example {
-         *       "provider": "cohere",
-         *       "model": "embed-english-v3.0",
-         *       "input_type": "search_document"
-         *     }
-         */
-        CohereEmbedderConfig: {
-            /**
-             * @description The name of the Cohere embedding model to use.
-             * @default embed-english-v3.0
-             * @example embed-english-v3.0
-             */
-            model: string;
-            /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
-            api_key?: string;
-            /**
-             * @description Specifies the type of input for optimized embeddings.
-             * @default search_document
-             * @enum {string}
-             */
-            input_type?: "search_document" | "search_query" | "classification" | "clustering";
-            /**
-             * @description How to handle inputs longer than the max token length.
-             * @default END
-             * @enum {string}
-             */
-            truncate?: "NONE" | "START" | "END";
-        };
-        /**
-         * @description Configuration for the Antfly inference embedding provider.
-         *
-         *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-         *     It provides embedding generation with multi-tier caching (memory + persistent).
-         *
-         *     **Features:**
-         *     - Local ONNX-based embedding generation
-         *     - L1 memory cache with configurable TTL
-         *     - L2 persistent Pebble database cache
-         *     - Singleflight deduplication for concurrent identical requests
-         *
-         *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
-         *
-         *     Models are loaded from the `models/embedders/{name}/` directory.
-         * @example {
-         *       "provider": "antfly",
-         *       "model": "bge-base-en-v1.5",
-         *       "api_url": "http://localhost:8082"
-         *     }
-         */
-        AntflyEmbedderConfig: {
-            /**
-             * @description The embedding model name (maps to models/embedders/{name}/ directory).
-             * @example bge-base-en-v1.5
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             * @example http://localhost:8082
-             */
-            api_url?: string;
-        };
-        /**
-         * @description The embedding provider to use.
-         * @enum {string}
-         */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
-        /**
-         * @description A unified configuration for an embedding provider.
-         *
-         *     Embedders can be configured with templates to customize how documents are
-         *     converted to text before embedding. Templates use Handlebars syntax and
-         *     support various built-in helpers.
-         *
-         *     **Template System:**
-         *     - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-         *     - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-         *     - **Context**: Templates receive the full document as context
-         *
-         *     **Built-in Helpers:**
-         *
-         *     1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-         *        ```handlebars
-         *        {{scrubHtml html_content}}
-         *        ```
-         *        - Removes `<script>` and `<style>` tags
-         *        - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-         *        - Returns plain text with preserved readability
-         *
-         *     2. **eq** - Equality comparison for conditionals
-         *        ```handlebars
-         *        {{#if (eq status "active")}}Active user{{/if}}
-         *        {{#if (eq @key "special")}}Special field{{/if}}
-         *        ```
-         *
-         *     3. **media** - GenKit dotprompt media directive for multimodal content
-         *        ```handlebars
-         *        {{media url=imageDataURI}}
-         *        {{media url=this.image_url}}
-         *        {{media url="https://example.com/image.jpg"}}
-         *        {{media url="s3://endpoint/bucket/image.png"}}
-         *        {{media url="file:///path/to/image.jpg"}}
-         *        ```
-         *
-         *        **Supported URL Schemes:**
-         *        - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-         *        - `http://` / `https://` - Web URLs with automatic content type detection
-         *        - `file://` - Local filesystem paths
-         *        - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-         *
-         *        **Automatic Content Processing:**
-         *        - **Images**: Downloaded, resized (if needed), converted to data URIs
-         *        - **PDFs**: Text extracted or first page rendered as image
-         *        - **HTML**: Readable text extracted using Mozilla Readability
-         *
-         *        **Security Controls:**
-         *        Downloads are protected by content security settings (see Configuration Reference):
-         *        - Allowed host whitelist
-         *        - Private IP blocking (prevents SSRF attacks)
-         *        - Download size limits (default: 100MB)
-         *        - HTTP downloads time out after 30 seconds by default; zero disables the deadline
-         *        - Image dimension limits (default: 2048px, auto-resized)
-         *
-         *        See: https://antfly.io/docs/configuration#security--cors
-         *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
-         *
-         *     **Template Examples:**
-         *
-         *     Document with metadata:
-         *     ```handlebars
-         *     Title: {{metadata.title}}
-         *     Date: {{metadata.date}}
-         *     Tags: {{#each metadata.tags}}{{this}}, {{/each}}
-         *
-         *     {{content}}
-         *     ```
-         *
-         *     HTML content extraction:
-         *     ```handlebars
-         *     Product: {{name}}
-         *     Description: {{scrubHtml description_html}}
-         *     Price: ${{price}}
-         *     ```
-         *
-         *     Multimodal with image:
-         *     ```handlebars
-         *     Product: {{title}}
-         *     {{media url=image}}
-         *     Description: {{description}}
-         *     ```
-         *
-         *     Conditional formatting:
-         *     ```handlebars
-         *     {{title}}
-         *     {{#if author}}By: {{author}}{{/if}}
-         *     {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
-         *     {{body}}
-         *     ```
-         *
-         *     **Environment Variables:**
-         *     - `GEMINI_API_KEY` - API key for Google AI
-         *     - `OPENAI_API_KEY` - API key for OpenAI
-         *     - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
-         *     - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
-         *
-         *     **Importing Pre-computed Embeddings:**
-         *
-         *     You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
-         *     for indexes configured with `external: true`. External indexes accept vectors written
-         *     directly through the document `_embeddings` field and do not generate prompts from
-         *     `field` or `template`.
-         *
-         *     **Steps:**
-         *     1. Create an embeddings index with `external: true`
-         *     2. For dense indexes, set the index `dimension`
-         *     3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
-         *
-         *     **Example:**
-         *     ```json
-         *     {
-         *       "title": "My Document",
-         *       "content": "Document text...",
-         *       "_embeddings": {
-         *         "my_vector_index": [0.1, 0.2, 0.3, ...]
-         *       }
-         *     }
-         *     ```
-         *
-         *     **Delete Behavior:**
-         *     - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
-         *     - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
-         *
-         *     **Use Cases:**
-         *     - Migrating from another vector database with existing embeddings
-         *     - Using embeddings generated by external systems
-         *     - Importing pre-computed OpenAI, Cohere, or other provider embeddings
-         *     - Batch processing embeddings offline before ingestion
-         * @example {
-         *       "provider": "openai",
-         *       "model": "text-embedding-3-small"
-         *     }
-         */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
-            provider: components["schemas"]["EmbedderProvider"];
-            /**
-             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
-             *     even if the model isn't in Antfly's built-in model registry yet.
-             *
-             *     When `true`, Antfly treats the model as multimodal and will send binary content
-             *     (images, audio, etc.) to the provider instead of extracting text. The provider's
-             *     API is still responsible for accepting the content — this flag just tells Antfly
-             *     not to strip it.
-             *
-             *     Not needed for models already in the registry (e.g., `multimodalembedding`,
-             *     `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
-             *
-             *     **Example:**
-             *     ```json
-             *     {
-             *       "provider": "vertex",
-             *       "model": "some-future-multimodal-model",
-             *       "multimodal": true
-             *     }
-             *     ```
-             */
-            multimodal?: boolean;
-        };
-        /** @description Configuration for the Google generative AI provider (Gemini). */
-        GoogleGeneratorConfig: {
-            /** @description The Google Cloud project ID. */
-            project_id?: string;
-            /** @description The Google Cloud location (e.g., 'us-central1'). */
-            location?: string;
-            /**
-             * @description The name of the generative model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description The Google API key. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Google API endpoint.
-             */
-            url?: string;
-        };
-        /** @description Configuration for Google Cloud Vertex AI generative models. */
-        VertexGeneratorConfig: {
-            /**
-             * @description The name of the Vertex AI model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /** @description Google Cloud project ID. */
-            project_id?: string;
-            /**
-             * @description Google Cloud region for Vertex AI API.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to service account JSON key file. */
-            credentials_path?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Ollama generative AI provider. */
-        OllamaGeneratorConfig: {
-            /**
-             * @description The name of the Ollama model to use.
-             * @example llama3.3:70b
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Ollama API calls. */
-            timeout?: number;
-        };
-        /** @description Configuration for the Antfly inference generative AI provider. */
-        AntflyGeneratorConfig: {
-            /**
-             * @description The name of the generator model.
-             * @example onnxruntime/Gemma-3-ONNX
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             */
-            api_url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Inference API calls. */
-            timeout?: number;
-        };
-        /** @description Configuration for the OpenAI generative AI provider. */
-        OpenAIGeneratorConfig: {
-            /**
-             * @description The name of the OpenAI model to use.
-             * @default gpt-4.1
-             * @example gpt-4.1
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenAI API endpoint.
-             */
-            url?: string;
-            /** @description The OpenAI API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the OpenRouter generative AI provider. */
-        OpenRouterGeneratorConfig: {
-            /**
-             * @description Single model identifier. Either model or models must be provided.
-             * @example openai/gpt-4.1
-             */
-            model?: string;
-            /** @description Array of model identifiers for fallback routing. Either model or models must be provided. */
-            models?: string[];
-            /** @description The OpenRouter API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the AWS Bedrock generative AI provider. */
-        BedrockGeneratorConfig: {
-            /**
-             * @description The Bedrock model ID to use.
-             * @example anthropic.claude-sonnet-4-5-20250929-v1:0
-             */
-            model: string;
-            /** @description The AWS region for the Bedrock service. */
-            region?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Anthropic generative AI provider. */
-        AnthropicGeneratorConfig: {
-            /**
-             * @description The full model ID of the Anthropic model to use.
-             * @default claude-sonnet-4-5-20250929
-             * @example claude-sonnet-4-5-20250929
-             */
-            model: string;
-            /** @description The Anthropic API key. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Anthropic API endpoint.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Cohere generative AI provider. */
-        CohereGeneratorConfig: {
-            /**
-             * @description The name of the Cohere model to use.
-             * @default command-r-plus
-             * @example command-r-plus
-             */
-            model: string;
-            /** @description The Cohere API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-1.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (0.0-1.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (0.0-1.0).
-             */
-            presence_penalty?: number;
-        };
-        /**
-         * @description The generative AI provider to use.
-         * @enum {string}
-         */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "antfly" | "mock";
-        /**
-         * @description A unified configuration for a generative AI provider.
-         * @example {
-         *       "provider": "openai",
-         *       "model": "gpt-4.1",
-         *       "temperature": 0.7,
-         *       "max_tokens": 2048
-         *     }
-         */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["CohereGeneratorConfig"]) & {
-            provider: components["schemas"]["GeneratorProvider"];
-        };
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -9582,7 +9451,7 @@ export interface components {
             /** @description Embedding producer batching for shorthand-created embedding enrichments. */
             embedding?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
+        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
             publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
@@ -9593,7 +9462,7 @@ export interface components {
              */
             external?: boolean;
             /**
-             * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+             * @description When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
              * @default false
              */
             sparse?: boolean;
@@ -9619,10 +9488,8 @@ export interface components {
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
-            embedder?: components["schemas"]["EmbedderConfig"];
-            /** @description Configuration for the summarizer plugin (dense managed indexes only) */
-            summarizer?: components["schemas"]["GeneratorConfig"];
-            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only) */
+            embedder?: components["schemas"]["IndexEmbedderConfig"];
+            /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing. */
             chunker?: components["schemas"]["ChunkerConfig"];
             /**
              * @description Default number of results to return from search (sparse only)
@@ -9684,6 +9551,195 @@ export interface components {
             edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
             context?: components["schemas"]["GraphArtifactContextConfig"];
         };
+        /** @description Configuration for the Google generative AI provider (Gemini). */
+        GoogleGeneratorConfig: {
+            /** @enum {string} */
+            provider: "gemini";
+            /** @description The Google Cloud project ID. */
+            project_id?: string;
+            /** @description The Google Cloud location (e.g., 'us-central1'). */
+            location?: string;
+            /**
+             * @description The name of the generative model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description The Google API key. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description The URL of the Google API endpoint.
+             */
+            url?: string;
+        };
+        /** @description Configuration for Google Cloud Vertex AI generative models. */
+        VertexGeneratorConfig: {
+            /** @enum {string} */
+            provider: "vertex";
+            /**
+             * @description The name of the Vertex AI model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /** @description Google Cloud project ID. */
+            project_id?: string;
+            /**
+             * @description Google Cloud region for Vertex AI API.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to service account JSON key file. */
+            credentials_path?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+        };
+        /** @description Configuration for the Ollama generative AI provider. */
+        OllamaGeneratorConfig: {
+            /** @enum {string} */
+            provider: "ollama";
+            /**
+             * @description The name of the Ollama model to use.
+             * @example llama3.3:70b
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Ollama API endpoint.
+             */
+            url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Ollama API calls. */
+            timeout?: number;
+        };
+        /** @description Configuration for the Antfly inference generative AI provider. */
+        AntflyGeneratorConfig: {
+            /** @enum {string} */
+            provider: "antfly";
+            /**
+             * @description The name of the generator model.
+             * @example onnxruntime/Gemma-3-ONNX
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Inference API calls. */
+            timeout?: number;
+        };
+        /** @description Configuration for the OpenAI generative AI provider. */
+        OpenAIGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openai";
+            /**
+             * @description The name of the OpenAI model to use.
+             * @default gpt-4.1
+             * @example gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenAI API endpoint.
+             */
+            url?: string;
+            /** @description The OpenAI API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /**
+         * @description Generator providers implemented by Antfly's generation runtime.
+         * @enum {string}
+         */
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "antfly";
+        /**
+         * @description A unified configuration for a generative AI provider.
+         * @example {
+         *       "provider": "openai",
+         *       "model": "gpt-4.1",
+         *       "temperature": 0.7,
+         *       "max_tokens": 2048
+         *     }
+         */
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+            provider: components["schemas"]["GeneratorProvider"];
+        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             name: components["schemas"]["GraphEdgeType"];
@@ -9701,25 +9757,6 @@ export interface components {
              * @enum {string}
              */
             topology?: "tree" | "graph";
-            /**
-             * Format: double
-             * @description Maximum allowed edge weight
-             * @default 1
-             */
-            max_weight?: number;
-            /**
-             * Format: double
-             * @description Minimum allowed edge weight
-             * @default 0
-             */
-            min_weight?: number;
-            /**
-             * @description Whether to allow edges from a node to itself
-             * @default true
-             */
-            allow_self_loops?: boolean;
-            /** @description Required metadata fields for this edge type */
-            required_metadata?: string[];
         };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
@@ -9998,6 +10035,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Automatic document-expiration policy for a table. */
+        TtlConfig: {
+            /**
+             * @description Expiration duration using Antfly's integer-component duration format.
+             *     Supported units are `ns`, `us`, `ms`, `s`, `m`, `h`, and `d`;
+             *     examples include `90m`, `1h30m`, and `7d`.
+             */
+            duration: string;
+            /**
+             * @description Timestamp field used as the expiration reference.
+             * @default _timestamp
+             */
+            field?: string;
+        };
         /** @description Field mapping used by a dynamic template. Dynamic templates match one physical field at a time and therefore do not accept multifields; use a DocumentFieldMapping in a document property's `x-antfly-field` annotation when named subfields are required. */
         TemplateFieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
@@ -10089,13 +10140,18 @@ export interface components {
                 [key: string]: components["schemas"]["DocumentSchema"];
             };
             /**
-             * @description The field containing the timestamp for TTL expiration (optional).
-             *     Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+             * @description Automatic document expiration. Set this object to enable TTL and
+             *     set it to null to disable an existing TTL policy.
+             */
+            ttl?: components["schemas"]["TtlConfig"] | null;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
              */
             ttl_field?: string;
             /**
-             * @description The duration after which documents should expire, based on the ttl_field timestamp (optional).
-             *     Uses Go duration format (e.g., '24h', '7d', '168h').
+             * @deprecated
+             * @description Deprecated compatibility alias for `ttl.duration`. Cannot be combined with `ttl`.
              */
             ttl_duration?: string;
             /**
@@ -10209,7 +10265,6 @@ export interface components {
             distance_metric?: components["schemas"]["DistanceMetric"];
             mem_only?: boolean;
             embedder?: components["schemas"]["CreatedProviderConfig"];
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
             chunker?: components["schemas"]["ChunkerConfig"];
             /** @default 10 */
             top_k?: number;
@@ -10403,7 +10458,7 @@ export interface components {
             backfill_active?: boolean;
             /**
              * Format: double
-             * @description Progress of ongoing rebuild as fraction [0.0, 1.0]
+             * @description Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
              */
             backfill_progress?: number;
             /**
@@ -11732,6 +11787,42 @@ export interface components {
              */
             max_tool_iterations?: number;
         };
+        /**
+         * @description Strategy for query transformation and retrieval:
+         *     - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
+         *     - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
+         *     - step_back: Generate broader background query first, then specific query. Best for questions needing context.
+         *     - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+         * @enum {string}
+         */
+        QueryStrategy: "simple" | "decompose" | "step_back" | "hyde";
+        /**
+         * @description Mode for semantic query generation:
+         *     - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
+         *     - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+         * @enum {string}
+         */
+        SemanticQueryMode: "rewrite" | "hypothetical";
+        /**
+         * @description Configuration for the classification step. This step analyzes the query,
+         *     selects the optimal retrieval strategy, and generates semantic transformations.
+         */
+        ClassificationStepConfig: {
+            /**
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
+             */
+            enabled?: boolean;
+            /**
+             * @description Include pre-retrieval reasoning explaining query analysis and strategy selection
+             * @default false
+             */
+            with_reasoning?: boolean;
+            /** @description Override LLM strategy selection. If not set, the LLM chooses optimal strategy. */
+            force_strategy?: components["schemas"]["QueryStrategy"];
+            /** @description Override semantic query mode selection. */
+            force_semantic_mode?: components["schemas"]["SemanticQueryMode"];
+        };
         /** @description Retry configuration for generator calls */
         RetryConfig: {
             /**
@@ -11775,61 +11866,16 @@ export interface components {
             condition?: components["schemas"]["ChainCondition"];
         };
         /**
-         * @description Strategy for query transformation and retrieval:
-         *     - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
-         *     - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
-         *     - step_back: Generate broader background query first, then specific query. Best for questions needing context.
-         *     - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
-         * @enum {string}
-         */
-        QueryStrategy: "simple" | "decompose" | "step_back" | "hyde";
-        /**
-         * @description Mode for semantic query generation:
-         *     - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
-         *     - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
-         * @enum {string}
-         */
-        SemanticQueryMode: "rewrite" | "hypothetical";
-        /**
-         * @description Configuration for the classification step. This step analyzes the query,
-         *     selects the optimal retrieval strategy, and generates semantic transformations.
-         */
-        ClassificationStepConfig: {
-            /**
-             * @description Enable query classification and strategy selection
-             * @default false
-             */
-            enabled?: boolean;
-            /** @description Generator to use for classification. If not specified, uses the default summarizer. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
-            /**
-             * @description Include pre-retrieval reasoning explaining query analysis and strategy selection
-             * @default false
-             */
-            with_reasoning?: boolean;
-            /** @description Override LLM strategy selection. If not set, the LLM chooses optimal strategy. */
-            force_strategy?: components["schemas"]["QueryStrategy"];
-            /** @description Override semantic query mode selection. */
-            force_semantic_mode?: components["schemas"]["SemanticQueryMode"];
-            /**
-             * @description Number of alternative query phrasings to generate
-             * @default 3
-             */
-            multi_phrase_count?: number;
-        };
-        /**
          * @description Configuration for the generation step. This step generates the final
          *     response from retrieved documents using the reasoning as context.
          */
         GenerationStepConfig: {
             /**
-             * @description Enable generation from retrieved documents
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
-            /** @description Generator to use for generation. If not specified, uses the default summarizer. */
+            /** @description Canonical generator configuration for this step. When omitted, the top-level request generator is used. */
             generator?: components["schemas"]["GeneratorConfig"];
             /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
             chain?: components["schemas"]["ChainLink"][];
@@ -11842,29 +11888,20 @@ export interface components {
             generation_context?: string;
         };
         /**
-         * @description Configuration for generating follow-up questions. Uses a separate generator
-         *     call which can use a cheaper/faster model.
+         * @description Configuration for deterministic follow-up suggestions derived from the
+         *     original query and the standard Antfly follow-up templates.
          */
         FollowupStepConfig: {
             /**
-             * @description Enable follow-up question generation
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
-            /** @description Generator for follow-up questions. If not specified, uses the answer step's generator. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
             /**
              * @description Number of follow-up questions to generate
              * @default 3
              */
             count?: number;
-            /**
-             * @description Custom guidance for follow-up question focus and style
-             * @example Focus on implementation details and edge cases
-             */
-            context?: string;
         };
         /**
          * @description Configuration for confidence assessment. Evaluates answer quality and
@@ -11872,19 +11909,10 @@ export interface components {
          */
         ConfidenceStepConfig: {
             /**
-             * @description Enable confidence scoring
-             * @default false
+             * @deprecated
+             * @description Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
              */
             enabled?: boolean;
-            /** @description Generator for confidence assessment. If not specified, uses the answer step's generator. */
-            generator?: components["schemas"]["GeneratorConfig"];
-            /** @description Chain of generators to try in order. Mutually exclusive with 'generator'. */
-            chain?: components["schemas"]["ChainLink"][];
-            /**
-             * @description Custom guidance for confidence assessment approach
-             * @example Be conservative - only give high confidence if resources directly address the question
-             */
-            context?: string;
         };
         /**
          * @description Available evaluator types:
@@ -12335,11 +12363,10 @@ export interface components {
          * @description Merge strategy for combining results from the semantic_search and full_text_search.
          *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
          *     rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
-         *     failover: Use full_text_search if embedding generation fails
          * @default rrf
          * @enum {string}
          */
-        MergeStrategy: "rrf" | "rsf" | "failover";
+        MergeStrategy: "rrf" | "rsf";
         /** @description Configuration for result fusion when combining multiple search indexes. */
         MergeConfig: {
             strategy?: components["schemas"]["MergeStrategy"];
@@ -12364,11 +12391,6 @@ export interface components {
             rank_constant?: number;
         };
         /**
-         * @description The reranking provider to use.
-         * @enum {string}
-         */
-        RerankerProvider: "antfly" | "ollama" | "cohere" | "vertex";
-        /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
          *       "provider": "antfly",
@@ -12377,21 +12399,13 @@ export interface components {
          *     }
          */
         AntflyRerankerConfig: {
-            /** @description The name of the reranking model (e.g., cross-encoder model name). */
-            model: string;
+            /** @enum {string} */
+            provider: "antfly";
+            /** @description Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed. */
+            model?: string;
             /**
              * Format: uri
              * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             */
-            url?: string;
-        };
-        /** @description Configuration for the Ollama reranking provider. */
-        OllamaRerankerConfig: {
-            /** @description The name of the Ollama model to use for reranking. */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint.
              */
             url?: string;
         };
@@ -12409,18 +12423,16 @@ export interface components {
          *     }
          */
         CohereRerankerConfig: {
+            /** @enum {string} */
+            provider: "cohere";
             /**
              * @description The name of the Cohere reranking model to use.
              * @default rerank-english-v3.0
              * @example rerank-english-v3.0
              */
-            model: string;
+            model?: string;
             /** @description The Cohere API key. Can also be set via COHERE_API_KEY environment variable. */
             api_key?: string;
-            /** @description Number of most relevant documents to return. If not specified, returns all documents with scores. */
-            top_n?: number;
-            /** @description Maximum number of chunks per document for long document handling. */
-            max_chunks_per_doc?: number;
         };
         /**
          * @description Configuration for the Google Vertex AI Ranking API.
@@ -12443,24 +12455,24 @@ export interface components {
          *     }
          */
         VertexRerankerConfig: {
+            /** @enum {string} */
+            provider: "vertex";
             /**
              * @description The ranking model to use.
              * @default semantic-ranker-default@latest
              * @example semantic-ranker-default@latest
              */
-            model: string;
+            model?: string;
             /** @description Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
-            /** @description Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain. */
             credentials_path?: string;
-            /** @description Maximum number of records to return. If not specified, returns all documents with scores. */
-            top_n?: number;
         };
         /**
          * @description A unified configuration for a reranking provider.
          * @example {
-         *       "provider": "ollama",
-         *       "model": "dengcao/Qwen3-Reranker-0.6B:F16",
+         *       "provider": "cohere",
+         *       "model": "rerank-v4.0-pro",
          *       "field": "content"
          *     }
          */
@@ -12470,7 +12482,16 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+            /** @description Optional provider model name. When omitted, the selected provider's documented default is used. */
+            model?: string;
+            /** @description Maximum number of globally highest-ranked retrieval candidates to send to the reranker. In distributed deployments each shard retrieves at most this many candidates, the coordinator retains the global window, and the provider is called once. Defaults to offset plus the effective final result limit and, when supplied explicitly, must be at least that page boundary. Candidates outside this window are not returned, but hits.total continues to describe the underlying retrieval match count. The ceiling bounds retrieval fan-out, memory, provider latency, and external API cost. The effective window must be at most 1000, and providers may impose a lower ceiling; Vertex currently accepts at most 200. Antfly rejects invalid or provider-specific windows before retrieval fan-out. */
+            candidate_count?: number;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
+             */
+            top_n?: number;
+        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;
         GraphDocumentFuzzyFilter: {
@@ -12817,14 +12838,16 @@ export interface components {
         /**
          * @description Configuration for pruning search results based on score quality.
          *     Helps filter out low-relevance results in RAG pipelines by detecting
-         *     score gaps or deviations from top results.
+         *     score gaps or deviations from top results. Pruning runs once on the
+         *     globally merged score domain, after reranking when a reranker is
+         *     configured and before offset/limit paging.
          */
         Pruner: {
             /**
              * Format: double
              * @description Keep only results with score >= max_score * min_score_ratio.
              *     For example, 0.5 keeps results scoring at least half of the top result.
-             *     Applied after fusion scoring.
+             *     Applied to final scores after global fusion and optional reranking.
              * @example 0.5
              */
             min_score_ratio?: number;
@@ -13338,13 +13361,15 @@ export interface components {
              * @enum {string}
              */
             encoding_format?: "float";
-            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models. */
+            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
             dimensions?: number;
             /**
-             * @description Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+             * @description Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
              * @enum {string}
              */
             task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "CODE_RETRIEVAL_QUERY" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
+            /** @description Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support. */
+            instruction?: string;
             /**
              * @deprecated
              * @description Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
@@ -14215,6 +14240,21 @@ export interface components {
          */
         InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
         /**
+         * @description Loader implementation for qualified Gemma 4 26B-A4B Q4_0 loads. Auto selects the production default, pipeline requires the bounded pinned-host pipeline, and legacy selects the single-threaded loader.
+         * @enum {string}
+         */
+        InferenceA4bLoadStrategy: "auto" | "pipeline" | "legacy";
+        /**
+         * @description Prepared-pack policy for qualified A4B CUDA loads. Required fails closed unless a valid pack is installed.
+         * @enum {string}
+         */
+        InferenceA4bPreparedPackMode: "auto" | "off" | "required";
+        /**
+         * @description Eager loads and publishes a reusable session. Prefetch only reads A4B CUDA artifact pages into the host page cache and does not publish a session.
+         * @enum {string}
+         */
+        InferenceWarmModelStartupStrategy: "eager" | "prefetch";
+        /**
          * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
          *     where device defaults to `auto`.
          *
@@ -14255,6 +14295,29 @@ export interface components {
              * @default 0
              */
             memory_budget_mb?: number;
+            /** @default auto */
+            load_strategy?: components["schemas"]["InferenceA4bLoadStrategy"];
+            /**
+             * Format: uint8
+             * @description Bounded loader worker count for qualified A4B loads. Zero selects the runtime default.
+             * @default 0
+             */
+            load_workers?: number;
+            /**
+             * Format: uint32
+             * @description Aggregate pinned-host staging budget in MiB. Zero selects the runtime default; explicit values must be between 64 and 1024.
+             * @default 0
+             */
+            load_staging_mb?: number;
+            /** @default auto */
+            prepared_pack?: components["schemas"]["InferenceA4bPreparedPackMode"];
+            /**
+             * @description Drop clean GGUF pages from the host page cache after a successful A4B load.
+             * @default false
+             */
+            drop_host_cache_after_load?: boolean;
+            /** @default eager */
+            startup_strategy?: components["schemas"]["InferenceWarmModelStartupStrategy"];
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {
@@ -15208,6 +15271,44 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["QueryTemporarilyUnavailableError"];
+            };
+        };
+        /** @description Query embedding input exceeds the provider or server limit */
+        QueryPayloadTooLarge: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description A query embedding or reranking dependency is rate limited */
+        QueryRateLimited: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description A query embedding or reranking provider returned an unusable response */
+        QueryBadGateway: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
+            };
+        };
+        /** @description Query execution or a query dependency timed out */
+        QueryGatewayTimeout: {
+            headers: {
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryDependencyError"];
             };
         };
         /** @description Internal server error */
@@ -16200,7 +16301,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["StatefulQueryRequest"];
+                "application/json": components["schemas"]["GlobalStatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };
@@ -16231,9 +16332,13 @@ export interface operations {
                 };
             };
             409: components["responses"]["QueryConflict"];
+            413: components["responses"]["QueryPayloadTooLarge"];
             422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             500: components["responses"]["QueryInternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     evaluate: {
@@ -16361,6 +16466,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["QueryPayloadTooLarge"];
+            422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             /** @description Internal server error */
             500: {
                 headers: {
@@ -16370,6 +16479,9 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     listTables: {
@@ -16526,9 +16638,13 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["QueryConflict"];
+            413: components["responses"]["QueryPayloadTooLarge"];
             422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
             500: components["responses"]["QueryInternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
         };
     };
     batchWrite: {
@@ -16760,7 +16876,10 @@ export interface operations {
     updateSchema: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -16776,6 +16895,8 @@ export interface operations {
             /** @description Schema updated successfully */
             200: {
                 headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16784,6 +16905,44 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    patchSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/merge-patch+json": components["schemas"]["TableSchemaPatch"];
+                "application/json": components["schemas"]["TableSchemaPatch"];
+            };
+        };
+        responses: {
+            /** @description Schema patched successfully */
+            200: {
+                headers: {
+                    /** @description Strong ETag for the committed schema version. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Table"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

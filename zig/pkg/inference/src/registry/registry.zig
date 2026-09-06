@@ -21,6 +21,8 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
+pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
+pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -49,31 +51,50 @@ const DiscoverKindMode = enum {
 
 test {
     _ = download;
+    _ = qwen3vl_catalog;
+    _ = qwen3_embedding_catalog;
 }
 
-/// Friendly short names accepted by user-facing commands (chat) in place of a
-/// full HuggingFace `owner/name[:variant]` reference. The blessed sources are
-/// Google's official QAT q4_0 GGUF conversions — the checkpoints production
-/// workflows already run on. Each repo carries a single decoder GGUF plus an
-/// mmproj sidecar, so the plain `:gguf` variant resolves unambiguously.
+/// Friendly short names accepted by user-facing commands in place of a full
+/// HuggingFace `owner/name[:variant]` reference. Every entry selects a qualified
+/// production artifact explicitly rather than relying on repository contents
+/// to remain unambiguous.
 pub const FriendlyAlias = struct {
     alias: []const u8,
     ref: []const u8,
 };
 
+pub const bge_m3_pinned_revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
+pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revision;
+
 pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "bge-m3", .ref = bge_m3_pinned_ref },
     .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e2b-it", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "qwen3-vl-2b", .ref = "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-2b-bf16", .ref = "Qwen/Qwen3-VL-2B-Instruct:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-vl-4b", .ref = "Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-8b", .ref = "Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-reranker-2b", .ref = "Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-embedding", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its pinned `owner/name:variant` reference.
 /// Returns null when the name is not a known alias (callers then treat it as
 /// a raw model reference or path).
 pub fn resolveFriendlyRef(name: []const u8) ?[]const u8 {
+    const without_hf = if (std.mem.startsWith(u8, name, "hf:")) name[3..] else name;
+    // BGE-M3 main currently publishes framework weights but no safetensors.
+    // Resolve the canonical repo reference to the qualified official commit so
+    // pull, local chat, and server lookup all share one immutable cache key.
+    if (std.ascii.eqlIgnoreCase(without_hf, "BAAI/bge-m3")) return bge_m3_pinned_ref;
     for (friendly_aliases) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.alias, name)) return entry.ref;
     }
@@ -92,13 +113,57 @@ test "resolveFriendlyRef resolves gemma4 aliases case-insensitively" {
     try std.testing.expect(resolveFriendlyRef("ggml-org/gemma-4-e2b-it-gguf") == null);
 }
 
-test "friendly alias refs parse as model refs" {
+test "resolveFriendlyRef pins BGE-M3 to the qualified safetensors commit" {
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("bge-m3").?);
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("BAAI/bge-m3").?);
+    try std.testing.expectEqualStrings(bge_m3_pinned_ref, resolveFriendlyRef("hf:BAAI/bge-m3").?);
+    const ref = try ModelRef.parse(bge_m3_pinned_ref);
+    try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
+}
+
+test "friendly alias refs parse as explicit model refs" {
     for (friendly_aliases) |entry| {
         const ref = try ModelRef.parse(entry.ref);
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
-        try std.testing.expectEqualStrings("gguf", ref.variant);
+        try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
+        if (std.mem.eql(u8, entry.alias, "qwen3-vl-reranker-2b")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "qwen3-vl-2b-bf16")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-vl-")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-embedding")) {
+            try std.testing.expect(
+                qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
+            );
+        } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
+        } else {
+            try std.testing.expectEqualStrings("gguf", ref.variant);
+        }
     }
+}
+
+fn parseModelRefOrAlias(value: []const u8) !ModelRef {
+    return ModelRef.parse(resolveFriendlyRef(value) orelse value);
+}
+
+test "pull model refs accept friendly Qwen aliases" {
+    const generation = try parseModelRefOrAlias("qwen3-vl-2b");
+    try std.testing.expectEqualStrings("Qwen", generation.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", generation.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, generation.variant);
+
+    const bf16_generation = try parseModelRefOrAlias("qwen3-vl-2b-bf16");
+    try std.testing.expectEqualStrings("Qwen", bf16_generation.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct", bf16_generation.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, bf16_generation.variant);
+
+    const reranker = try parseModelRefOrAlias("QWEN3-VL-RERANKER-2B");
+    try std.testing.expectEqualStrings("Qwen", reranker.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -426,7 +491,8 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const ref = try ModelRef.parse(ref_str);
+        const resolved_ref = resolveFriendlyRef(ref_str) orelse ref_str;
+        const ref = try ModelRef.parse(resolved_ref);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -449,10 +515,70 @@ pub const ModelRegistry = struct {
         defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
+        const progress_sink: download.ProgressSink = .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
-        });
+        };
+        if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationSafetensorsBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant)) {
+            try download.downloadPinnedQwen3VlRerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else {
+            try download.downloadModel(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                projector_selection,
+                progress_sink,
+            );
+        }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);
@@ -1646,9 +1772,25 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
-/// Resolve a model name by variant suffix.
+fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8) bool {
+    const marker = "--antfly-";
+    if (!std.mem.startsWith(u8, candidate, requested_name) or
+        candidate.len != requested_name.len + marker.len + 16 or
+        !std.mem.eql(u8, candidate[requested_name.len..][0..marker.len], marker))
+    {
+        return false;
+    }
+    for (candidate[candidate.len - 16 ..]) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return false;
+    }
+    return true;
+}
+
+/// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
 /// prefixed with "requested-" and returns the shortest deterministic match.
+/// Managed variant directories are deliberately excluded: their suffix is an
+/// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
 /// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
@@ -1681,7 +1823,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
             else => return err,
         };
         if (entry_kind != .directory) continue;
-        if (std.mem.startsWith(u8, entry.name, prefix)) {
+        if (std.mem.startsWith(u8, entry.name, prefix) and
+            !isManagedVariantInstallLeaf(requested_name, entry.name))
+        {
             if (best_name == null or entry.name.len < best_name.?.len or
                 (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
             {
@@ -1769,7 +1913,7 @@ test "explicit model variants use distinct stable install directories" {
     try std.testing.expectEqualStrings("/models/owner/model", auto);
 }
 
-test "resolveVariant finds nested explicit variant install" {
+test "resolveVariant ignores opaque managed variant install hashes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1779,11 +1923,24 @@ test "resolveVariant finds nested explicit variant install" {
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
+    try std.testing.expect(try resolveVariant(allocator, io, models_dir, "owner/model") == null);
+}
+
+test "resolveVariant retains legacy suffix resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
     const resolved = (try resolveVariant(allocator, io, models_dir, "owner/model")) orelse
         return error.ExpectedVariantResolution;
     defer allocator.free(resolved);
 
-    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model-q4_0" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }

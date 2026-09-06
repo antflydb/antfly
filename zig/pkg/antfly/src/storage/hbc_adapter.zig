@@ -4541,6 +4541,10 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn usesSharedCache(self: *const HBCIndex) bool {
+        return self.shared_cache != null;
+    }
+
     pub fn clearAllCaches(self: *HBCIndex) void {
         self.clearNodeCache();
         self.clearQuantizedCache();
@@ -10820,6 +10824,22 @@ test "hbc shared cache namespaces entries" {
     cache.invalidateNamespace(ns_a);
     try expectSharedVectorNotCached(&cache, ns_a, 7);
     try expectSharedVectorCached(&cache, ns_b, 7, &vec_b);
+}
+
+test "hbc index reports shared cache ownership" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    defer idx.close();
+
+    try std.testing.expect(!idx.usesSharedCache());
+    idx.attachSharedCache(&cache);
+    try std.testing.expect(idx.usesSharedCache());
 }
 
 test "hbc shared cache rejects node quantized and metadata fills from an older publication" {

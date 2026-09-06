@@ -1,5 +1,6 @@
 import {
   type AggregationBucket,
+  type GlobalQueryRequest,
   type QueryHit,
   type QueryResult,
   queryResultTotalHits,
@@ -23,7 +24,6 @@ interface SearchWidgetConfig {
 interface FacetWidgetConfig {
   fields: string[];
   size: number;
-  filterValue?: string;
   useCustomQuery?: boolean;
 }
 
@@ -74,6 +74,8 @@ export default function Listener({ children, onChange }: ListenerProps) {
   const [{ url, table, listenerEffect, configVersion = 0, widgets, headers }, dispatch] =
     useSharedContext();
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
 
   // We need to prepare some data in each render.
   // This needs to be done out of the effect function.
@@ -104,6 +106,15 @@ export default function Listener({ children, onChange }: ListenerProps) {
   );
   const configurations = mapFrom("configuration");
   const values = mapFrom("value");
+  const changeEntries = [
+    ...[...configurations]
+      .filter(([, v]) => (v as SearchWidgetConfig)?.page && (v as SearchWidgetConfig).page > 1)
+      .map(([k, v]) => [`${k}Page`, (v as SearchWidgetConfig).page] as [string, unknown]),
+    ...values,
+  ] as Array<[string, unknown]>;
+  const changeKey = JSON.stringify(changeEntries);
+  const changeEntriesRef = useRef(changeEntries);
+  changeEntriesRef.current = changeEntries;
 
   const isAutosuggestWidget = (widgetId: string) => widgets.get(widgetId)?.isAutosuggest === true;
 
@@ -138,21 +149,14 @@ export default function Listener({ children, onChange }: ListenerProps) {
     nonAutosuggest: "",
   });
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: changeKey is the stable representation of the ref-backed callback payload
   useEffect(() => {
-    // Apply custom callback effect on every change, useful for query params.
-    if (onChange) {
-      // Add pages to params.
-      const pages = [...configurations]
-        .filter(([, v]) => (v as SearchWidgetConfig)?.page && (v as SearchWidgetConfig).page > 1)
-        .map(([k, v]) => [`${k}Page`, (v as SearchWidgetConfig).page]);
-      // Run the change callback with all params.
-      onChange(new Map([...pages, ...values] as Array<[string, unknown]>));
-    }
-    // Run the deferred (thx algolia) listener effect.
-    if (listenerEffect) {
-      listenerEffect();
-    }
-  });
+    onChangeRef.current?.(new Map(changeEntriesRef.current));
+  }, [changeKey]);
+
+  useEffect(() => {
+    listenerEffect?.();
+  }, [listenerEffect]);
 
   // Run effect on update for each change in queries or configuration.
   // We intentionally use stable JSON keys instead of Map objects/methods to prevent infinite re-renders.
@@ -312,7 +316,6 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 const config = f.configuration as FacetWidgetConfig;
                 const fields = config.fields;
                 const size = config.size;
-                const filterValue = config.filterValue;
                 const useCustomQuery = config.useCustomQuery;
 
                 // Get the aggs (antfly queries) from fields
@@ -401,12 +404,6 @@ export default function Listener({ children, onChange }: ListenerProps) {
                         if (!result.aggregations?.[f]?.buckets) {
                           return [];
                         }
-                        // Only use filterValue for legacy mode (non-custom queries)
-                        if (filterValue && !useCustomQuery) {
-                          return result.aggregations[f].buckets?.filter((i: AggregationBucket) =>
-                            i.key.toLowerCase().includes(filterValue.toLowerCase())
-                          );
-                        }
                         return result.aggregations[f].buckets;
                       })
                       .reduce((a: AggregationBucket[], b: AggregationBucket[]) => a.concat(b), [])
@@ -435,7 +432,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                 if (multiqueryData.length) {
                   try {
                     const msearchRequests: MultiqueryRequest[] = multiqueryData.map((item) => ({
-                      query: item.query as Record<string, unknown>,
+                      query: item.query as GlobalQueryRequest,
                     }));
                     const result = await multiquery(url || "", msearchRequests, headers || {});
 

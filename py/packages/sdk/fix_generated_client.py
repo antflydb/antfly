@@ -15,7 +15,10 @@ FILES = {
 # envelope, while the SDK's primary QueryRequest model remains canonical.
 # Keep this post-generation check tied to the endpoint body contract rather
 # than the canonical model's historical name.
-REQUIRED_BODY = re.compile(r"(body:\s+StatefulQueryRequest\s+\|\s+File)\s+\|\s+Unset\s*=\s*UNSET")
+REQUIRED_BODY = re.compile(
+    r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest)\s+\|\s+File)"
+    r"\s+\|\s+Unset\s*=\s*UNSET"
+)
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 
 

@@ -27,6 +27,7 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const reranking = @import("../reranking/mod.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
@@ -76,6 +77,7 @@ pub const MetadataServer = struct {
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
+    owned_reranker_runtime: ?*reranking.Runtime = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
@@ -152,6 +154,11 @@ pub const MetadataServer = struct {
         errdefer if (owned_admin_http_server) |admin_http_server| alloc.destroy(admin_http_server);
         var owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null;
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
+        var owned_reranker_runtime: ?*reranking.Runtime = null;
+        errdefer if (owned_reranker_runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        };
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
         var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
@@ -214,6 +221,12 @@ pub const MetadataServer = struct {
                 svc.raft.host.http_host.request_executor,
             );
             const backend_runtime = try svc.ensureBackendRuntime();
+            const reranker_io = backend_runtime.io() orelse return error.QueryRuntimeUnavailable;
+            const reranker_runtime = try alloc.create(reranking.Runtime);
+            reranker_runtime.* = reranking.Runtime.init(alloc, reranker_io);
+            _ = public_read_source.withRerankerRuntime(reranker_runtime);
+            _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
+            owned_reranker_runtime = reranker_runtime;
             _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
@@ -290,6 +303,7 @@ pub const MetadataServer = struct {
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
+            .owned_reranker_runtime = owned_reranker_runtime,
             .owned_public_write_source = owned_public_write_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
@@ -333,6 +347,10 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
+        }
+        if (self.owned_reranker_runtime) |runtime| {
+            runtime.deinit();
+            self.alloc.destroy(runtime);
         }
         if (self.owned_admin_http_server) |admin_http_server| {
             self.alloc.destroy(admin_http_server);

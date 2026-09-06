@@ -138,11 +138,15 @@ test "standalone linked inference ABI validates the supported function-table pre
 const ModelTextsRequest = struct {
     model: []const u8,
     texts: []const []const u8,
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 const ModelPartsRequest = struct {
     model: []const u8,
     parts: []const antfly.template.ContentPart,
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 const RerankTextsRequest = struct {
@@ -295,6 +299,14 @@ test "standalone data directory does not change the default models directory" {
 
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(!std.mem.startsWith(u8, first, "/tmp/antfly-data-"));
+
+    const first_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-a");
+    defer std.testing.allocator.free(first_ml);
+    const second_ml = try antfly.inference_runtime.defaultMlDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-b");
+    defer std.testing.allocator.free(second_ml);
+
+    try std.testing.expectEqualStrings(first_ml, second_ml);
+    try std.testing.expect(!std.mem.startsWith(u8, first_ml, "/tmp/antfly-data-"));
 }
 
 /// Creates the standalone inference implementation inside its focused codegen
@@ -440,7 +452,15 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithContext(state.alloc, state.io, deadline_ns, parsed.value.model, parsed.value.texts)
+                try state.node.embedDenseTextsDirectWithContextAndTask(
+                    state.alloc,
+                    state.io,
+                    deadline_ns,
+                    parsed.value.model,
+                    parsed.value.texts,
+                    parsed.value.task_type,
+                    parsed.value.instruction,
+                )
             else
                 try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
             defer {
@@ -469,6 +489,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.parts,
                 state.io,
                 if (operation == .embed_dense_parts_with_context) deadline_ns else null,
+                if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
+                if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
             defer {
                 for (result) |values| alloc.free(values);
@@ -479,7 +501,26 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.rerankTextsDirect(alloc, parsed.value.model, parsed.value.query, parsed.value.documents);
+            const CancellationControl = struct {
+                fn check(raw: ?*anyopaque) !void {
+                    const cancellation: *const http_abi.CancellationView = @ptrCast(@alignCast(raw.?));
+                    if (cancellation.requested()) return error.Cancelled;
+                }
+            };
+            var cancellation = context.cancellation;
+            const execution_control: ?inference.pipelines.RerankingExecutionControl = if (cancellation.is_cancelled != null)
+                .{ .ptr = &cancellation, .check_fn = CancellationControl.check }
+            else
+                null;
+            const result = try state.node.rerankTextsDirectWithContext(
+                alloc,
+                state.io,
+                deadline_ns,
+                execution_control,
+                parsed.value.model,
+                parsed.value.query,
+                parsed.value.documents,
+            );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -593,6 +634,7 @@ const ManifestServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, handler) catch |err| {
             std.log.err("linked inference route manifest rejected method={s} path={s} err={}", .{
                 @tagName(method),
@@ -630,6 +672,10 @@ const ManifestServer = struct {
     pub fn delete(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
     }
+
+    pub fn patch(self: *const ManifestServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
+    }
 };
 
 const RouteMetadata = struct {
@@ -643,6 +689,7 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
         .post => "POST",
         .put => "PUT",
         .delete => "DELETE",
+        .patch => "PATCH",
     };
     const relative_path = if (std.mem.startsWith(u8, path, inference.server.public_api_prefix))
         path[inference.server.public_api_prefix.len..]
@@ -682,6 +729,7 @@ const DirectServer = struct {
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, path, localInferenceHttpHandler, route);
     }
 
@@ -699,6 +747,10 @@ const DirectServer = struct {
 
     pub fn delete(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
         try self.register(.delete, path, handler);
+    }
+
+    pub fn patch(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {
+        try self.register(.patch, path, handler);
     }
 };
 
@@ -724,6 +776,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         .post => .POST,
         .put => .PUT,
         .delete => .DELETE,
+        .patch => .PATCH,
     }, target);
     defer http_request.deinit();
     const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
@@ -1000,7 +1053,15 @@ fn localAntflyEmbedDenseTextsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
+    return try node.embedDenseTextsDirectWithContextAndTask(
+        alloc,
+        context.request.io,
+        context.request.deadline_ns,
+        model,
+        texts,
+        context.task_type.canonical(),
+        context.instruction,
+    );
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(
@@ -1010,11 +1071,21 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     parts: []const antfly.template.ContentPart,
     io: std.Io,
     deadline_ns: ?u64,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
     defer alloc.free(direct_parts);
-    return try node.embedDensePartsDirectWithContext(alloc, io, deadline_ns, model, direct_parts);
+    return try node.embedDensePartsDirectWithContextAndTask(
+        alloc,
+        io,
+        deadline_ns,
+        model,
+        direct_parts,
+        task_type,
+        instruction,
+    );
 }
 
 pub fn localAntflyDirectDenseParts(
@@ -1031,16 +1102,6 @@ pub fn localAntflyDirectDenseParts(
         } },
     };
     return out;
-}
-
-fn localAntflyEmbedDensePartsWithContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
 }
 
 fn localAntflyEmbedSparseTexts(
