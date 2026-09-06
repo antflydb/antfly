@@ -72,6 +72,8 @@ pub const Epoch = struct {
         owned_schema: schema_mod.TableSchema,
         owned_validator: ?schema_api.CompiledTableValidator,
     ) !*Epoch {
+        if (owned_schema.requires_public_schema and owned_validator == null)
+            return error.InvalidSchemaUpdateRequest;
         if (owned_validator) |validator| {
             if (validator.schema.version != owned_schema.version) return error.InvalidSchemaUpdateRequest;
             const derived = try schema_api.deriveRuntimeTableSchema(alloc, validator.schema);

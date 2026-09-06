@@ -1574,20 +1574,13 @@ pub const ImportOptions = struct {
     unpublished_staging: bool = false,
     progress_context: ?*anyopaque = null,
     progress_fn: ?*const fn (?*anyopaque, ImportProgress) void = null,
-    cancel_context: ?*anyopaque = null,
-    is_cancelled_fn: ?*const fn (?*anyopaque) bool = null,
+    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
     /// Decoded historical epochs, not total archive history. A single oversized
     /// epoch may exceed this budget while its row is being validated.
     schema_cache_bytes: usize = default_schema_cache_bytes,
 };
 
-pub const ImportProgress = struct {
-    blocks_processed: u64,
-    rows_validated: u64,
-    payload_bytes_processed: u64,
-    elapsed_ns: u64,
-    rows_per_second: u64,
-};
+pub const ImportProgress = @import("../common/restore_progress.zig").Progress;
 
 /// Import AFB data into the DocStore.
 pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !void {
@@ -1615,12 +1608,11 @@ pub fn validateCompleteDatabaseImageAlloc(alloc: Allocator, store: *DocStore) !v
 
     // A public schema is never a standalone durable contract: it is the source
     // from which the executable runtime schema is derived. Direct compiled
-    // document schemas may legitimately omit schema_json, while relational
-    // schemas require it for the constraints that the packed column catalog
-    // cannot represent on its own.
+    // schemas may legitimately omit schema_json. Public-schema provenance is
+    // explicit in each immutable epoch, never inferred from missing metadata.
     if (schema_json != null and runtime_schema == null) return error.InvalidBackupRequest;
     if (runtime_schema) |schema| {
-        if (schema.storage_mode == .relational and schema_json == null) return error.InvalidBackupRequest;
+        if (schema.requires_public_schema and schema_json == null) return error.InvalidBackupRequest;
         if (schema_json) |value| {
             var public_schema = public_table_schema.parseValidatedTableSchema(alloc, value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -1673,6 +1665,7 @@ pub fn visitPortableBlocksWithBase(
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
+    try opts.cancellation.check();
     if (opts.unpublished_staging) {
         var raw = backup_codec.SliceReader.init(data);
         var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, opts.bundle_base);
@@ -1712,6 +1705,7 @@ pub fn importPortableFileWithOptions(
 ) !void {
     // Restore admission must never wait behind an archive writer while the
     // caller may already hold a destination-wide restore lock.
+    try opts.cancellation.check();
     if (!try file.tryLock(io, .shared)) return error.WriterLocked;
     defer file.unlock(io);
     const initial_stat = try file.stat(io);
@@ -1795,8 +1789,7 @@ fn validateAndImportPortableStagingReader(
     var payload_bytes: u64 = 0;
     const restore_started_ns = platform_time.monotonicNs();
     while (reader.hasRemaining()) {
-        if (opts.is_cancelled_fn) |is_cancelled| if (is_cancelled(opts.cancel_context))
-            return error.Canceled;
+        try opts.cancellation.check();
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
         if (block_index == 0 and block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
@@ -1846,6 +1839,7 @@ fn validateAndImportPortableStagingReader(
         }
     }
     if (!saw_bundle_manifest) return error.InvalidBackupManifest;
+    try opts.cancellation.check();
     try archive.finish(alloc);
     return imported_identity;
 }
@@ -2151,6 +2145,9 @@ const PortableArchiveValidation = struct {
         if (self.active_public_validator != null and self.runtime_schema != null and runtime_relational != public_relational)
             return error.InvalidBackupRequest;
         if (self.active_public_validator != null and self.runtime_schema == null) return error.InvalidBackupRequest;
+        if (self.runtime_schema) |schema|
+            if (schema.requires_public_schema and self.active_public_validator == null)
+                return error.InvalidBackupRequest;
         if (self.table_catalog) |catalog| {
             if (catalog.reconciled and (catalog.row_count != 0) != (self.document_row_count != 0))
                 return error.InvalidBackupRequest;
@@ -2364,7 +2361,7 @@ fn validatePortableDocumentEntryAgainstArchive(
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };
-    } else if (archive.active_public_validator != null) {
+    } else if (layout.schema.requires_public_schema) {
         return error.InvalidBackupRequest;
     } else {
         relational_store.validateCanonicalValueForSchemaAndLayout(
@@ -3247,14 +3244,10 @@ test "portable backup round trips relational rows and schema metadata" {
     defer tmp_cancelled.cleanup();
     var cancelled_dst = try openTestStore(alloc, &tmp_cancelled);
     defer cancelled_dst.close();
-    const Cancellation = struct {
-        fn requested(_: ?*anyopaque) bool {
-            return true;
-        }
-    };
+    var cancellation = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, importPortableWithOptions(alloc, &cancelled_dst, portable.items, .{
         .unpublished_staging = true,
-        .is_cancelled_fn = Cancellation.requested,
+        .cancellation = .fromAtomic(&cancellation),
     }));
     try std.testing.expectError(error.NotFound, cancelled_dst.get(alloc, row_key));
 

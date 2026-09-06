@@ -222,6 +222,10 @@ pub const TableSchema = struct {
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     storage_mode: StorageMode = .document,
+    /// Immutable provenance of the validation contract, persisted per epoch.
+    /// Runtime-only embedders have no public constraints to restore. A schema
+    /// derived from the public API must never silently lose those constraints.
+    requires_public_schema: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -392,6 +396,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
 
     if (format_version >= 13) {
         try buf.append(alloc, @intFromEnum(schema.storage_mode));
+        try buf.append(alloc, @intFromBool(schema.requires_public_schema));
         try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
         for (schema.relational_columns) |column| {
             try appendStr(&buf, alloc, column.name);
@@ -828,6 +833,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         else => return error.InvalidSchema,
     } else .document;
     if (fmt_version >= 13) pos += 1;
+    const requires_public_schema = if (fmt_version >= 13) data[pos] == 1 else false;
+    if (fmt_version >= 13) pos += 1;
 
     const relational_columns: []RelationalColumn = if (fmt_version >= 13) blk: {
         const column_count = readU32(data, &pos);
@@ -897,6 +904,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .ttl_field = ttl_field,
         .enforce_types = enforce_types,
         .storage_mode = storage_mode,
+        .requires_public_schema = requires_public_schema,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1096,6 +1104,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             @intFromEnum(StorageMode.document), @intFromEnum(StorageMode.relational) => {},
             else => return error.InvalidSchema,
         }
+        try cursor.readBool(); // immutable public-validation provenance
         const column_count = try cursor.readU32();
         try cursor.ensureCount(column_count, 13);
         for (0..column_count) |_| {
@@ -2563,12 +2572,14 @@ test "schema round trips relational storage catalog and reads version 11 default
     };
     const encoded = try serializeSchema(alloc, .{
         .storage_mode = .relational,
+        .requires_public_schema = true,
         .relational_columns = &columns,
     });
     defer alloc.free(encoded);
     const loaded = try deserializeSchema(alloc, encoded);
     defer freeSchema(alloc, loaded);
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    try std.testing.expect(loaded.requires_public_schema);
     try std.testing.expectEqual(@as(usize, 2), loaded.relational_columns.len);
     try std.testing.expectEqual(RelationalColumnType.integer, loaded.relational_columns[0].column_type);
     try std.testing.expect(loaded.relational_columns[0].required);
@@ -2580,6 +2591,7 @@ test "schema round trips relational storage catalog and reads version 11 default
     const loaded_legacy = try deserializeSchema(alloc, legacy);
     defer freeSchema(alloc, loaded_legacy);
     try std.testing.expectEqual(StorageMode.document, loaded_legacy.storage_mode);
+    try std.testing.expect(!loaded_legacy.requires_public_schema);
     try std.testing.expectEqual(@as(usize, 0), loaded_legacy.relational_columns.len);
 }
 

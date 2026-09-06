@@ -110,6 +110,7 @@ comptime {
     _ = @import("db/promotion_runtime.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
+    _ = @import("db/query/relational_projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
     _ = @import("db/query_metrics.zig");

@@ -696,7 +696,12 @@ fn assessWithRuntimeFacts(
                 );
             }
         },
-        .reranker, .chunker, .recognizer, .transcriber => {},
+        .reranker => {
+            if (std.mem.eql(u8, architecture, "qwen3") and man.usesGgufWeights()) {
+                return makeCompatible(architecture, "Qwen3 GGUF final-token yes/no reranking runtime");
+            }
+        },
+        .chunker, .recognizer, .transcriber => {},
         .generator => unreachable,
     }
 
@@ -1065,6 +1070,27 @@ test "qualified Gemma4 A4B architecture is enabled while unified layout is block
     try std.testing.expectEqual(Level.incompatible, assessInspection(&man, qualified).level);
 }
 
+test "Qwen3 text reranker uses selected GGUF without enabling unqualified VL bundles" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .model_type_origin = .tasks,
+        .config_model_arch = "qwen3",
+        .gguf_path = "qwen3-reranker-0.6b-q8_0.gguf",
+    };
+    try std.testing.expect(man.isQwen3TextReranker());
+    try std.testing.expectEqual(Level.compatible, assessWithFacts(&man, "qwen3", 0).level);
+    man.config_model_arch = "qwen3_vl";
+    man.inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family;
+    try std.testing.expect(!man.isQwen3TextReranker());
+    try std.testing.expectEqual(Level.incompatible, assessWithFacts(&man, "qwen3_vl", 0).level);
+    man.config_model_arch = "qwen3";
+    man.inference_bundle_family = "";
+    man.gguf_path = null;
+    try std.testing.expect(!man.isQwen3TextReranker());
+    try std.testing.expect(assessWithFacts(&man, "qwen3", 0).level != .compatible);
+}
+
 test "standalone GGUF decoder architecture does not depend on directory taxonomy" {
     var man = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
@@ -1120,11 +1146,13 @@ test "listing inspection recognizes standalone GGUF decoder outside taxonomy" {
     defer allocator.free(model_dir);
     var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
     defer listing_man.deinit();
-    try expectLoadedGgufAssessment(allocator, &listing_man, .default, .compatible);
+    // Listing intentionally avoids opening multi-gigabyte GGUFs; compatibility
+    // inspection still recognizes the decoder architecture when requested.
+    try expectLoadedGgufAssessment(allocator, &listing_man, .embedder, .default, .compatible);
 
     var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
     defer full_man.deinit();
-    try expectLoadedGgufAssessment(allocator, &full_man, .default, .compatible);
+    try expectLoadedGgufAssessment(allocator, &full_man, .generator, .config, .compatible);
 }
 
 test "loader-derived embedder roles cannot be relabeled by GGUF architecture" {
@@ -1180,21 +1208,22 @@ test "loader-derived embedder roles cannot be relabeled by GGUF architecture" {
         defer allocator.free(model_dir);
         var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
         defer listing_man.deinit();
-        try expectLoadedGgufAssessment(allocator, &listing_man, case.origin, .unknown);
+        try expectLoadedGgufAssessment(allocator, &listing_man, .embedder, case.origin, .unknown);
 
         var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
         defer full_man.deinit();
-        try expectLoadedGgufAssessment(allocator, &full_man, case.origin, .unknown);
+        try expectLoadedGgufAssessment(allocator, &full_man, .embedder, case.origin, .unknown);
     }
 }
 
 fn expectLoadedGgufAssessment(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
+    expected_type: manifest_mod.ModelType,
     expected_origin: manifest_mod.ModelTypeOrigin,
     expected_level: Level,
 ) !void {
-    try std.testing.expectEqual(manifest_mod.ModelType.embedder, man.model_type);
+    try std.testing.expectEqual(expected_type, man.model_type);
     try std.testing.expectEqual(expected_origin, man.model_type_origin);
     try std.testing.expect(man.usesGgufWeights());
     var inspection = try inspectAlloc(allocator, man);

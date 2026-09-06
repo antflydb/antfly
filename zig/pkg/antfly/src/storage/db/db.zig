@@ -250,6 +250,7 @@ const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
+const RelationalProjectionPlan = @import("query/relational_projection.zig").Plan;
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
 
@@ -20017,19 +20018,19 @@ pub const DB = struct {
         }
         try checkLookupOptionsActive(opts);
         const direct_fields = if (relational)
-            exactOrdinalProjectionFields(opts.fields, opts.include_all_fields)
+            ordinalProjectionFields(opts.fields, opts.include_all_fields)
         else
             null;
         const stored = if (direct_fields) |fields| blk: {
             const row = ordinal_row.?;
-            var projection = try relational_row_codec.OrdinalProjectionPlan.init(
+            var projection = try RelationalProjectionPlan.init(
                 alloc,
                 row.table_schema,
                 row.layout,
                 fields,
             );
             defer projection.deinit();
-            break :blk try row.projectAlloc(alloc, projection);
+            break :blk try projection.project(alloc, row);
         } else blk: {
             const materialized = if (ordinal_row) |row|
                 try row.reconstructValueAlloc(alloc)
@@ -22852,19 +22853,50 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        var retries: usize = 0;
+        while (true) {
+            self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator()) catch |err| switch (err) {
+                error.PreparedGenerationChanged => {
+                    if (retries >= 2) return err;
+                    retries += 1;
+                    continue;
+                },
+                else => return preparation.mapError(err),
+            };
+            return;
+        }
+    }
+
+    fn writeIntentsPreparedOnce(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        preparation_alloc: Allocator,
+    ) !void {
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer identity_upsert_keys.deinit(self.alloc);
+        defer identity_upsert_keys.deinit(preparation_alloc);
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer writes.deinit(preparation_alloc);
         for (intents) |intent| {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
-            try identity_upsert_keys.append(self.alloc, intent.key);
+            try identity_upsert_keys.append(preparation_alloc, intent.key);
+            try writes.append(preparation_alloc, .{ .key = intent.key, .value = intent.value.? });
         }
+        var view = self.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        try validateRelationalWritesWithSchemaView(preparation_alloc, writes.items, view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.validateRelationalTransactionIntentsLocked(intents);
+        try self.validatePreparedSchemaViewLocked(view);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents, predicates);
     }
@@ -22984,13 +23016,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (prepared_schema_view) |view| {
-            if (!self.core.isSchemaViewCurrent(view)) return error.PreparedGenerationChanged;
-        } else {
-            var current_view = self.core.acquireSchemaView();
-            defer if (current_view) |*view| view.release();
-            if (current_view != null) return error.PreparedGenerationChanged;
-        }
+        try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         if (raft_entry) |identity| {
@@ -23011,25 +23037,14 @@ pub const DB = struct {
         }
     }
 
-    fn validateRelationalTransactionIntentsLocked(
-        self: *DB,
-        intents: []const transactions_mod.WriteIntent,
-    ) !void {
-        if (relationalColumns(self) == null) return;
-        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-        defer writes.deinit(self.alloc);
-        for (intents) |intent| {
-            const value = intent.value orelse continue;
-            if (isMetadataKey(intent.key)) continue;
-            try writes.append(self.alloc, .{ .key = intent.key, .value = value });
+    fn validatePreparedSchemaViewLocked(self: *DB, prepared: ?schema_registry_mod.SchemaView) !void {
+        if (prepared) |view| {
+            if (!self.core.isSchemaViewCurrent(view)) return error.PreparedGenerationChanged;
+        } else {
+            var current = self.core.acquireSchemaView();
+            defer if (current) |*view| view.release();
+            if (current != null) return error.PreparedGenerationChanged;
         }
-        try self.validateRelationalWritesLocked(writes.items);
-    }
-
-    fn validateRelationalWritesLocked(self: *DB, writes: anytype) !void {
-        var schema_view = self.core.acquireSchemaView();
-        defer if (schema_view) |*view| view.release();
-        return try validateRelationalWritesWithSchemaView(self.alloc, writes, schema_view);
     }
 
     fn validateRelationalWritesWithSchemaView(
@@ -31847,7 +31862,7 @@ pub const DB = struct {
             null;
         defer if (prepared_filter) |*filter| filter.deinit();
         const direct_projection_fields = if (opts.include_documents)
-            exactOrdinalProjectionFields(opts.fields, opts.include_all_fields)
+            ordinalProjectionFields(opts.fields, opts.include_all_fields)
         else
             null;
         var read_txn = try self.core.store.beginReadTxn();
@@ -31865,7 +31880,7 @@ pub const DB = struct {
                 access: u64,
                 view: schema_registry_mod.SchemaView,
                 filter: ?db_query_graph.PreparedOrdinalPatternFilter = null,
-                projection: ?relational_row_codec.OrdinalProjectionPlan = null,
+                projection: ?RelationalProjectionPlan = null,
 
                 fn deinit(plan: *@This()) void {
                     if (plan.filter) |*filter| filter.deinit();
@@ -31947,7 +31962,7 @@ pub const DB = struct {
                 var filter_owned = filter != null;
                 errdefer if (filter_owned) filter.?.deinit();
                 var projection = if (state.direct_projection_fields) |fields|
-                    try relational_row_codec.OrdinalProjectionPlan.init(
+                    try RelationalProjectionPlan.init(
                         state.alloc,
                         view.tableSchema().*,
                         view.physicalLayout(),
@@ -32094,7 +32109,7 @@ pub const DB = struct {
                 const projected = if (state.opts.include_documents)
                     if (state.direct_projection_fields) |_|
                         if (ordinal_row) |row|
-                            try row.projectAlloc(state.alloc, row_plan.?.projection.?)
+                            try row_plan.?.projection.?.project(state.alloc, row)
                         else
                             try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                                 .fields = state.opts.fields,
@@ -35619,7 +35634,7 @@ pub const DB = struct {
         keys: []const []const u8,
     ) anyerror![]?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys, exactOrdinalProjectionFields(query.fields, query.include_all_fields));
+        const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys, ordinalProjectionFields(query.fields, query.include_all_fields));
         errdefer freeOptionalOwnedBytes(alloc, loaded);
         for (loaded, keys, 0..) |maybe_stored, key, i| {
             const stored = maybe_stored orelse continue;
@@ -35810,7 +35825,7 @@ pub const DB = struct {
     ) ![]?[]u8 {
         const bench_profile = benchQueryProfileEnabled();
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const direct_fields = if (req.defer_stored_projection) null else exactOrdinalProjectionFields(req.fields, req.include_all_fields);
+        const direct_fields = if (req.defer_stored_projection) null else ordinalProjectionFields(req.fields, req.include_all_fields);
         const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys, direct_fields);
         errdefer freeOptionalOwnedBytes(alloc, loaded);
 
@@ -36427,11 +36442,11 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
     });
 }
 
-fn exactOrdinalProjectionFields(fields: []const []const u8, include_all_fields: bool) ?[]const []const u8 {
+fn ordinalProjectionFields(fields: []const []const u8, include_all_fields: bool) ?[]const []const u8 {
     if (include_all_fields or fields.len == 0) return null;
     for (fields) |field| {
         if (field.len == 0 or field[0] == '-' or field[0] == '_' or
-            std.mem.indexOfAny(u8, field, ".*") != null) return null;
+            std.mem.indexOfScalar(u8, field, '*') != null) return null;
     }
     return fields;
 }
@@ -36459,7 +36474,7 @@ fn loadStoredSearchDocumentsMany(
             version: u32,
             access: u64,
             view: schema_registry_mod.SchemaView,
-            projection: ?relational_row_codec.OrdinalProjectionPlan,
+            projection: ?RelationalProjectionPlan,
 
             fn deinit(plan: *@This()) void {
                 if (plan.projection) |*projection| projection.deinit();
@@ -36472,7 +36487,7 @@ fn loadStoredSearchDocumentsMany(
         alloc: Allocator,
         fields: ?[]const []const u8,
         pinned: ?*const schema_registry_mod.SchemaView,
-        pinned_projection: ?relational_row_codec.OrdinalProjectionPlan = null,
+        pinned_projection: ?RelationalProjectionPlan = null,
         historical: std.ArrayListUnmanaged(HistoricalPlan) = .empty,
         historical_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
         historical_clock: u64 = 0,
@@ -36509,7 +36524,7 @@ fn loadStoredSearchDocumentsMany(
             errdefer if (view_owned) view.release();
             if (view.storageMode() != .relational) return error.RelationalRowSchemaMismatch;
             var projection = if (plans.fields) |fields|
-                try relational_row_codec.OrdinalProjectionPlan.init(
+                try RelationalProjectionPlan.init(
                     plans.alloc,
                     view.tableSchema().*,
                     view.physicalLayout(),
@@ -36583,14 +36598,14 @@ fn loadStoredSearchDocumentsMany(
                     );
                 if (plans.fields) |fields| {
                     if (plans.pinned_projection == null) {
-                        plans.pinned_projection = try relational_row_codec.OrdinalProjectionPlan.init(
+                        plans.pinned_projection = try RelationalProjectionPlan.init(
                             plans.alloc,
                             view.tableSchema().*,
                             view.physicalLayout(),
                             fields,
                         );
                     }
-                    return try row.projectAlloc(plans.alloc, plans.pinned_projection.?);
+                    return try plans.pinned_projection.?.project(plans.alloc, row);
                 }
                 return try row.reconstructValueAlloc(plans.alloc);
             };
@@ -36609,7 +36624,7 @@ fn loadStoredSearchDocumentsMany(
                     plan.view.physicalLayout(),
                 );
             if (plan.projection) |projection| {
-                return try row.projectAlloc(plans.alloc, projection);
+                return try projection.project(plans.alloc, row);
             }
             return try row.reconstructValueAlloc(plans.alloc);
         }
@@ -61163,6 +61178,87 @@ test "db default primary backend survives reopen" {
     }
 }
 
+test "relational runtime-only and mixed schema epochs survive portable restore" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |upgrade| {
+        var source_buf: [256]u8 = undefined;
+        const source_path = tempPath(&source_buf);
+        defer cleanupTempDir(source_path);
+        var target_buf: [256]u8 = undefined;
+        const target_path = tempPath(&target_buf);
+        defer cleanupTempDir(target_path);
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_index_workers = false });
+        defer source.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .string, .required = true }};
+        try source.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        try source.batch(.{ .writes = &.{.{ .key = "old", .value = "{\"id\":\"old\"}" }} });
+        if (upgrade) {
+            try source.setSchemaJson(alloc,
+                \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+            );
+            try source.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"id\":\"new\"}" }} });
+        }
+        var archive = std.ArrayList(u8).empty;
+        defer archive.deinit(alloc);
+        try portable_backup.exportPortable(alloc, source.core.store, &archive);
+        var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_index_workers = false });
+        defer target.close();
+        try target.importPortableIntoUnpublishedEmpty(alloc, archive.items, doc_identity.default_namespace);
+        const old = (try target.get(alloc, "old")).?;
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("{\"id\":\"old\"}", old);
+        if (upgrade) {
+            const new = (try target.get(alloc, "new")).?;
+            defer alloc.free(new);
+            try std.testing.expectEqualStrings("{\"id\":\"new\"}", new);
+        }
+    }
+}
+
+test "relational public schema provenance rejects missing validators on reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+        );
+        try db.core.store.delete(public_schema_json_key);
+    }
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false }));
+}
+
+test "relational direct intents share preparation admission before the apply fence" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .string, .required = true }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const txn_id = try db.beginTransaction(100);
+    const hard_limit = manager.sliceStats(.relational_preparation_working_set).hard_limit_bytes;
+    var reservation = try manager.reserve(.relational_preparation_working_set, hard_limit);
+    defer reservation.release();
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "row", .value = "{\"id\":\"ok\"}" }};
+    const before = db.snapshotApplyLockStats();
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.writeIntents(txn_id, &intents, &.{}));
+    try std.testing.expectEqualDeep(before, db.snapshotApplyLockStats());
+    reservation.release();
+    try db.writeIntents(txn_id, &intents, &.{});
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    try db.commitTransaction(txn_id, 200);
+    const row = (try db.get(alloc, "row")).?;
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"id\":\"ok\"}", row);
+}
+
 test "relational preparation budget rejects contention before commit and releases on retry" {
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
@@ -62844,7 +62940,6 @@ test "portable import scratch scavenging removes abandoned stages and preserves 
 
 test "db relational one-shot recovery resolves orphaned intents into packed rows" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -62856,11 +62951,7 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
     ;
-    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer schema_mod.freeSchema(alloc, runtime_schema);
-    try db.setSchema(runtime_schema);
+    try db.setSchemaJson(alloc, schema_json);
 
     const commit_ts: u64 = 2_000;
     const txn_id = try db.beginTransaction(1_000);
@@ -62911,14 +63002,8 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
 
 test "db rejects relational storage mode transitions and physical row reinterpretation" {
     const alloc = std.testing.allocator;
-    const table_schema_api = @import("../../schema/mod.zig");
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
-    ;
-    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const relational_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer schema_mod.freeSchema(alloc, relational_schema);
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "title", .path = "title", .column_type = .string, .required = true }};
+    const relational_schema = schema_mod.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
 
     var relational_path_buf: [256]u8 = undefined;
     const relational_path = tempPath(&relational_path_buf);

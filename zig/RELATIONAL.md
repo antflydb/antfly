@@ -112,6 +112,13 @@ against the active cached contract, including embedded batches, transaction
 prepares, replicated callers, and recovery resolution. API validation remains
 an early feedback optimization rather than the only integrity boundary.
 
+Each durable epoch explicitly records whether it requires a public schema.
+API-derived relational epochs require their matching immutable public contract;
+missing metadata is rejected on open and restore. Runtime-only embedded schemas
+instead declare that their physical column contract is complete. Both kinds can
+coexist in a table's history and round-trip through portable backup without
+inferring intent from absent metadata or dropping public constraints.
+
 The validator's immutable execution plan includes hashed property dispatch for
 wide objects (including nested and composed schemas) and deduplicated Thompson
 regex programs. Small objects keep linear lookup to avoid hash-table overhead.
@@ -190,6 +197,11 @@ not merely to each request's worker count. Admission denial releases the entire
 attempt and returns retryable `ResourceBudgetExceeded`; no preparer waits for
 memory while retaining a partial batch. Slice usage and limits are observable
 through the standard resource metrics.
+
+Direct transaction intents use this same admission ledger and validate before
+the exclusive apply fence. Publication checks the pinned epoch and retries a
+bounded number of times if it changed; intent ordering and predicates retain
+their transaction semantics.
 
 Field-backed dense indexes consume the prepared row's typed ordinal view.
 Decimal vector elements round directly to f32 once, so foreground indexing,
@@ -311,6 +323,12 @@ from the authenticated row header, and vector rebuilds decode only their target
 ordinal. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
 `JOINS.md`, `ALGEBRAIC.md`).
 
+Positive nested projections compile their root ordinals and path segments once
+per epoch. Only referenced columns are materialized, then the existing document
+projection operators run on that partial typed root. Unselected vectors and JSON
+columns are not expanded; exact top-level selections retain the direct encoder.
+Exclusions, wildcard selections, and special fields keep their general fallback.
+
 Dense-vector membership and indexed element predicates run directly on binary
 f32 payloads without constructing a JSON array. Other composite predicates use
 the same logical-cell conversion as projection, cached once per referenced
@@ -324,6 +342,12 @@ executors that do not implement streaming retain the bounded row-paged fallback.
 Table-owned `typed_doc_values` remain a complementary accelerator for broad
 range scans and aggregations. They are not required for direct AROW projection
 or filtering and never become a second row authority.
+
+API-bound and Raft portable restores select the unpublished, one-pass importer.
+The request's semantic cancellation token reaches the block loop, and bound
+restore plans can report transport-neutral block/row/byte progress. Cancellation
+discards staging rather than publishing partial state. Complete-image identity
+and public-contract checks still run before publication.
 
 ### Schema evolution
 

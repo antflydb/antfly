@@ -474,6 +474,8 @@ pub const DBCore = struct {
                 else => return err,
             };
             defer if (public_json) |json| alloc.free(json);
+            if (active_schema.requires_public_schema and public_json == null)
+                return error.InvalidSchemaUpdateRequest;
             if (public_json) |json| {
                 var validator = try public_schema_mod.CompiledTableValidator.init(alloc, json);
                 var validator_owned = true;

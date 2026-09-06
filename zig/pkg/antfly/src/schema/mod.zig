@@ -377,6 +377,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .requires_public_schema = schema.storage_mode == .relational,
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,

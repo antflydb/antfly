@@ -6740,7 +6740,12 @@ pub const BoundTableWriteSource = struct {
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFileWithIo(alloc, restored.core.store, snapshot_root, restore_io);
+                try importPortableBackupFileWithOptions(alloc, restored.core.store, snapshot_root, restore_io, .{
+                    .unpublished_staging = true,
+                    .cancellation = plan.cancellation,
+                    .progress_context = plan.progress_context,
+                    .progress_fn = plan.progress_fn,
+                });
                 try restored.reloadSchemaForInternalRestore();
                 try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
@@ -29880,17 +29885,23 @@ fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.Do
 }
 
 fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    return importPortableBackupFileWithOptions(alloc, store, path, io, .{});
+}
+
+fn importPortableBackupFileWithOptions(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, options: portable_backup.ImportOptions) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
-    try portable_backup.importPortableFile(alloc, store, io, file, stat.size);
+    try portable_backup.importPortableFileWithOptions(alloc, store, io, file, stat.size, options);
+    try options.cancellation.check();
     portable_backup.validateCompleteDatabaseImageAlloc(alloc, store) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidBackupRequest,
     };
+    try options.cancellation.check();
 }
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
@@ -31868,12 +31879,38 @@ test "bound table write source backs up and restores a portable local table" {
         .timestamp_ns = 2,
     });
 
-    _ = try source.source().restoreTable(alloc, "docs", .{
+    const Progress = struct {
+        cancelled: std.atomic.Value(bool) = .init(false),
+        cancel_on_rows: bool = true,
+        rows: u64 = 0,
+        fn update(ctx: ?*anyopaque, progress: portable_backup.ImportProgress) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.rows = progress.rows_validated;
+            if (self.cancel_on_rows and self.rows > 0) self.cancelled.store(true, .release);
+        }
+    };
+    var progress = Progress{};
+    const restore_plan = backups_api.TableRestorePlan{
         .backup_root = backup_root,
         .manifest = &manifest,
         .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///bound-portable-test",
-    });
+        .cancellation = .fromAtomic(&progress.cancelled),
+        .progress_context = &progress,
+        .progress_fn = Progress.update,
+    };
+    try std.testing.expectError(error.Canceled, source.source().restoreTable(alloc, "docs", restore_plan));
+    try std.testing.expectEqual(@as(u64, 1), progress.rows);
+    {
+        var unchanged = (try db.lookup(alloc, "doc:a", .{})).?;
+        defer unchanged.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, unchanged.json, "\"beta\"") != null);
+    }
+    progress.cancel_on_rows = false;
+    progress.cancelled.store(false, .release);
+    progress.rows = 0;
+    _ = try source.source().restoreTable(alloc, "docs", restore_plan);
+    try std.testing.expectEqual(@as(u64, 1), progress.rows);
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
