@@ -2762,6 +2762,45 @@ The hardening above follows these long-term rules:
     Older nodes and external providers remain on their existing admitted
     transport. The v4 feature bit is intentionally additive, preserving rolling
     compatibility in both upgrade directions.
+117. **Implemented after framed-body residency review:** `httpx` now has an
+    explicit synchronous borrowed-body option. Attachment envelopes keep their
+    existing owned encoding buffer through redirects and retries but are no
+    longer duplicated into request-owned storage. Ordinary `body` and `json`
+    retain their copying contracts, conflicting body sources fail closed, and
+    the remote attachment planner's two-live-representation admission bound is
+    once again exact.
+118. **Implemented after replay-window scalability review:** durable PDF page
+    embeddings finish model work first, then promote and index page units in
+    bounded replay windows. A page promotion and all of its consumer-index
+    writes stay in one window; old page visibility remains available while a
+    partial publication is retried; stale finals and abandoned private stages
+    are deleted in bounded windows; and produced coverage is committed last.
+    The publisher reserves coverage capacity in its final window and retains at
+    least one derived page/index or cleanup mutation there, so completion stays
+    attached to the normal transaction-fenced generated write without adding
+    an otherwise empty replay sequence.
+119. **Implemented after large-document validation review:** desired pages,
+    staged promotions, and artifact deletes are validated with pre-sized hash
+    sets. Both enrichment-side assembly and database-side promotion validation
+    are linear in item count instead of repeatedly scanning document-sized
+    arrays while the apply path is held.
+120. **Implemented after Florence cache-copy review:** preallocated Florence
+    decoder caches compact surviving rows in place on CUDA and Metal. Cross
+    attention moves only displaced page slabs; self attention moves only the
+    populated prefix at capacity-strided destinations. This removes the second
+    full KV-cache allocation and avoids copying unused decode capacity at every
+    mixed-EOS transition. Backends without device row copy retain the existing
+    transactional gather fallback.
+121. **Implemented after cross-request batching review:** the task-neutral
+    broker accepts an existing item array, launches borrowed tickets together,
+    and preserves per-item identity, limits, deadline, cancellation, allocator,
+    result, and execution mode. Encoded reader windows now flatten through this
+    path, so PDF pages can coalesce with compatible work from other documents
+    under the exact immutable model generation instead of bypassing the broker
+    merely because the caller already supplied more than one image. Multi-item
+    results use a thread-safe temporary allocation domain because one request
+    may span concurrently executing groups; transfer to the caller allocator
+    occurs only after every borrowed ticket has joined.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3637,6 +3676,22 @@ The post-implementation performance review resulted in these concrete changes:
   while waiting. The group leader derives decoded-pixel residency for the
   complete fused batch and acquires one authoritative lease immediately before
   execution.
+- Existing reader request batches are flattened into concurrent broker tickets,
+  allowing a short PDF window and compatible pages from another request to
+  fill one native model batch. The broker still groups on immutable generation,
+  prompt, schema, transform, options, and resource class, and the leader admits
+  the realized aggregate media shape once.
+- Preallocated Florence KV compaction reuses resident tensors and copies only
+  displaced cross-attention slabs plus the populated self-attention prefix.
+  Mixed-length batches therefore avoid both a second cache-sized peak and work
+  proportional to the unused output-token capacity.
+- Framed remote attachments borrow their already-owned envelope through the
+  synchronous HTTP call. Peak host transport residency is source bytes plus one
+  envelope rather than source bytes plus two envelope copies.
+- PDF vector publication is windowed independently of render/inference windows.
+  Promotion, consumer-index updates, stale cleanup, and final coverage never
+  accumulate a document-sized apply transaction, and validation remains linear
+  as the page ceiling grows.
 - The task-neutral microbatch broker is sharded by the complete resolved
   executor key. Independent models, tasks, prompts, schemas, transformations,
   options, and resource classes therefore do not contend on one global group

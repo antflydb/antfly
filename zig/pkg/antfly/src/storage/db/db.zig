@@ -43974,14 +43974,20 @@ fn appendGeneratedBatchFromEnrichment(
     defer staged_key_set.deinit(batch_ctx.alloc);
     var final_key_set = std.StringHashMapUnmanaged(void).empty;
     defer final_key_set.deinit(batch_ctx.alloc);
+    var artifact_delete_key_set = std.StringHashMapUnmanaged(void).empty;
+    defer artifact_delete_key_set.deinit(batch_ctx.alloc);
     const promotion_capacity = std.math.cast(u32, artifact_promotions.len) orelse
+        return error.InvalidGeneratedArtifactPromotion;
+    const delete_capacity = std.math.cast(u32, artifact_delete_keys.len) orelse
         return error.InvalidGeneratedArtifactPromotion;
     try staged_key_set.ensureTotalCapacity(batch_ctx.alloc, promotion_capacity);
     try final_key_set.ensureTotalCapacity(batch_ctx.alloc, promotion_capacity);
+    try artifact_delete_key_set.ensureTotalCapacity(batch_ctx.alloc, delete_capacity);
+    for (artifact_delete_keys) |key| artifact_delete_key_set.putAssumeCapacity(key, {});
     for (artifact_promotions) |promotion| {
         if (promotion.staged_key.len == 0 or promotion.final_key.len == 0 or
             std.mem.eql(u8, promotion.staged_key, promotion.final_key) or
-            containsDeleteKey(artifact_delete_keys, promotion.final_key))
+            artifact_delete_key_set.contains(promotion.final_key))
             return error.InvalidGeneratedArtifactPromotion;
         const staged = staged_key_set.getOrPutAssumeCapacity(promotion.staged_key);
         const final = final_key_set.getOrPutAssumeCapacity(promotion.final_key);

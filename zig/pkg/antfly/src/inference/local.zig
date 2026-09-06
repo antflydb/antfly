@@ -419,7 +419,7 @@ pub const Provider = struct {
         const count = if (base_headers) |headers| headers.len else 0;
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
-            .body = body,
+            .borrowed_body = body,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
             .max_response_size = self.max_response_bytes,

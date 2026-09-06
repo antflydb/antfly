@@ -123,6 +123,11 @@ pub const ClientConfig = struct {
 pub const RequestOptions = struct {
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
+    /// Body borrowed only until the synchronous request call returns. Unlike
+    /// `body`, this is not duplicated into Request-owned storage. It is suited
+    /// to already-owned large envelopes whose lifetime spans redirects and
+    /// retries. At most one of body, borrowed_body, and json may be set.
+    borrowed_body: ?[]const u8 = null,
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
@@ -716,8 +721,16 @@ pub const Client = struct {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
+        if (@intFromBool(reqOpts.body != null) +
+            @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.json != null) > 1)
+            return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
             try req.setBody(body);
+        }
+
+        if (reqOpts.borrowed_body) |body| {
+            try req.setBorrowedBody(body);
         }
 
         if (reqOpts.json) |json_body| {
@@ -812,8 +825,16 @@ pub const Client = struct {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
+        if (@intFromBool(reqOpts.body != null) +
+            @intFromBool(reqOpts.borrowed_body != null) +
+            @intFromBool(reqOpts.json != null) > 1)
+            return error.ConflictingRequestBodies;
         if (reqOpts.body) |body| {
             try req.setBody(body);
+        }
+
+        if (reqOpts.borrowed_body) |body| {
+            try req.setBorrowedBody(body);
         }
 
         if (reqOpts.json) |json_body| {

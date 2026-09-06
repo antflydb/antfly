@@ -3176,6 +3176,13 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    /// Whether this backend exposes the device-to-device row-copy primitive.
+    /// Callers may use this to choose an in-place layout-preserving algorithm
+    /// without probing by partially mutating a destination tensor.
+    pub fn supportsCopyRows2D(self: *const ComputeBackend) bool {
+        return self.vtable.copyRows2D != null;
+    }
+
     pub fn concatRows2D(
         self: *const ComputeBackend,
         allocator: std.mem.Allocator,

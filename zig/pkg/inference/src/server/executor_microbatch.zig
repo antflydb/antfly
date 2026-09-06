@@ -135,6 +135,9 @@ pub fn ItemResult(comptime T: type) type {
     return struct {
         identity: Identity,
         execution: Execution,
+        /// Process-local identity of the fused executor invocation. Zero means
+        /// the item bypassed native grouping before an invocation was formed.
+        execution_id: u64 = 0,
         result: union(enum) {
             value: T,
             item_error: ItemError,
@@ -147,6 +150,7 @@ pub const ResultSlot = struct {
     completed: bool = false,
     err: ?anyerror = null,
     execution: Execution = .serial,
+    execution_id: u64 = 0,
 
     pub fn setValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution) void {
         const output: *T = @ptrCast(@alignCast(self.output));
@@ -251,6 +255,7 @@ pub const Broker = struct {
     /// Independent model/task cohorts never contend on one process-wide lock.
     /// Exact-key grouping remains unchanged within a shard.
     shards: [broker_shard_count]BrokerShard = [_]BrokerShard{.{}} ** broker_shard_count,
+    next_execution_id: std.atomic.Value(u64) = .init(1),
 
     pub fn init(allocator: std.mem.Allocator) Broker {
         return .{ .allocator = allocator };
@@ -433,6 +438,120 @@ pub const Broker = struct {
         return takeResult(Output, identity, &output, slot);
     }
 
+    /// Submit an existing request batch as independently attributable work.
+    /// Lightweight fibers enqueue the items concurrently, allowing them to
+    /// fill the same native group and to coalesce with compatible items from
+    /// other requests. Per-item payloads, shapes, identities, and cancellation
+    /// contexts remain borrowed until this synchronous method returns.
+    pub fn submitBatchControlled(
+        self: *Broker,
+        comptime Payload: type,
+        comptime Output: type,
+        io: std.Io,
+        result_allocator: std.mem.Allocator,
+        key: Key,
+        limits: Limits,
+        shapes: []const Shape,
+        identities: []const Identity,
+        deadline: ?std.Io.Clock.Timestamp,
+        cancellation: Cancellation,
+        payloads: []const Payload,
+        execute_ctx: *anyopaque,
+        execute_fn: ExecuteFn,
+    ) ![]ItemResult(Output) {
+        if (payloads.len != shapes.len or payloads.len != identities.len)
+            return error.InvalidMicrobatchInput;
+        try limits.validate();
+        const results = try result_allocator.alloc(ItemResult(Output), payloads.len);
+        errdefer result_allocator.free(results);
+        if (payloads.len == 0) return results;
+        for (results, identities) |*result, identity|
+            result.* = resultError(Output, identity, error.Canceled);
+
+        // Compatibility executors are explicitly singleton and may own
+        // thread-confined state. Preserve that contract for array callers;
+        // only genuine native batching is fanned into concurrent tickets.
+        if (limits.mode != .native or limits.max_items == 1) {
+            for (payloads, shapes, identities, results) |*payload, shape, identity, *result| {
+                result.* = self.submitControlled(
+                    Payload,
+                    Output,
+                    io,
+                    result_allocator,
+                    key,
+                    limits,
+                    shape,
+                    identity,
+                    deadline,
+                    cancellation,
+                    payload,
+                    execute_ctx,
+                    execute_fn,
+                ) catch |err| resultError(Output, identity, err);
+            }
+            return results;
+        }
+
+        const BatchSubmit = struct {
+            broker: *Broker,
+            io: std.Io,
+            result_allocator: std.mem.Allocator,
+            key: Key,
+            limits: Limits,
+            shape: Shape,
+            identity: Identity,
+            deadline: ?std.Io.Clock.Timestamp,
+            cancellation: Cancellation,
+            payload: *const Payload,
+            execute_ctx: *anyopaque,
+            execute_fn: ExecuteFn,
+            result: *ItemResult(Output),
+
+            fn run(task: *@This()) std.Io.Cancelable!void {
+                task.result.* = task.broker.submitControlled(
+                    Payload,
+                    Output,
+                    task.io,
+                    task.result_allocator,
+                    task.key,
+                    task.limits,
+                    task.shape,
+                    task.identity,
+                    task.deadline,
+                    task.cancellation,
+                    task.payload,
+                    task.execute_ctx,
+                    task.execute_fn,
+                ) catch |err| resultError(Output, task.identity, err);
+            }
+        };
+        const tasks = try result_allocator.alloc(BatchSubmit, payloads.len);
+        defer result_allocator.free(tasks);
+        var group: std.Io.Group = .init;
+        for (tasks, payloads, shapes, identities, results) |*task, *payload, shape, identity, *result| {
+            task.* = .{
+                .broker = self,
+                .io = io,
+                .result_allocator = result_allocator,
+                .key = key,
+                .limits = limits,
+                .shape = shape,
+                .identity = identity,
+                .deadline = deadline,
+                .cancellation = cancellation,
+                .payload = payload,
+                .execute_ctx = execute_ctx,
+                .execute_fn = execute_fn,
+                .result = result,
+            };
+            group.async(io, BatchSubmit.run, .{task});
+        }
+        // Each child converts broker/control failures into its typed item
+        // envelope. Await still joins every borrowed ticket before returning.
+        group.await(io) catch {};
+        return results;
+    }
+
     fn shardFor(self: *Broker, key: Key) *BrokerShard {
         var hasher = std.hash.Wyhash.init(0);
         updateBrokerKeyHash(&hasher, key.model);
@@ -515,9 +634,11 @@ pub const Broker = struct {
         shard.mutex.unlock(io);
 
         if (active_count > 0) {
+            const execution_id = self.next_execution_id.fetchAdd(1, .monotonic);
             group.execute_fn(group.execute_ctx, items[0..active_count]);
             for (items[0..active_count]) |item| {
                 if (!item.slot.completed) item.slot.fail(error.MissingMicrobatchResult);
+                item.slot.execution_id = execution_id;
             }
         }
         self.allocator.free(items);
@@ -585,6 +706,7 @@ fn takeResult(comptime T: type, identity: Identity, output: *const T, slot: Resu
     return .{
         .identity = identity,
         .execution = slot.execution,
+        .execution_id = slot.execution_id,
         .result = if (slot.err) |err|
             .{ .item_error = .{ .cause = err } }
         else
@@ -712,6 +834,93 @@ test "microbatch broker groups native work and preserves provenance" {
     const stats = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), stats.native_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.native_items);
+}
+
+test "microbatch broker flattens an existing request batch" {
+    const allocator = std.testing.allocator;
+    var broker = Broker.init(allocator);
+    defer broker.deinit();
+    var executor = TestExecutor{};
+    const inputs = [_]usize{ 3, 5, 7 };
+    const shapes = [_]Shape{
+        .{ .bytes = 1 },
+        .{ .bytes = 1 },
+        .{ .bytes = 1 },
+    };
+    const identities = [_]Identity{
+        .{ .item_id = "page-1", .page_number = 1 },
+        .{ .item_id = "page-2", .page_number = 2 },
+        .{ .item_id = "page-3", .page_number = 3 },
+    };
+    const results = try broker.submitBatchControlled(
+        usize,
+        usize,
+        std.testing.io,
+        allocator,
+        .{ .model = "reader", .task = .read, .prompt = "ocr", .resource_class = .gpu },
+        .{
+            .mode = .native,
+            .preferred_items = 3,
+            .max_items = 4,
+            .max_bytes = 4,
+            .max_wait_us = 500_000,
+        },
+        &shapes,
+        &identities,
+        null,
+        .{},
+        &inputs,
+        &executor,
+        TestExecutor.run,
+    );
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), executor.largest_batch.load(.monotonic));
+    for (results, inputs, identities) |result, input, identity| {
+        try std.testing.expectEqualStrings(identity.item_id, result.identity.item_id);
+        try std.testing.expectEqual(Execution.native_batch, result.execution);
+        try std.testing.expect(result.execution_id != 0);
+        try std.testing.expectEqual(results[0].execution_id, result.execution_id);
+        try std.testing.expectEqual(input * 2, result.result.value);
+    }
+}
+
+test "microbatch array preserves serial compatibility execution" {
+    const allocator = std.testing.allocator;
+    var broker = Broker.init(allocator);
+    defer broker.deinit();
+    var executor = TestExecutor{};
+    const inputs = [_]usize{ 2, 4, 6 };
+    const shapes = [_]Shape{ .{}, .{}, .{} };
+    const identities = [_]Identity{
+        .{ .item_id = "item-1" },
+        .{ .item_id = "item-2" },
+        .{ .item_id = "item-3" },
+    };
+    const results = try broker.submitBatchControlled(
+        usize,
+        usize,
+        std.testing.io,
+        allocator,
+        .{ .model = "compat", .task = .extract, .resource_class = .cpu },
+        .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 },
+        &shapes,
+        &identities,
+        null,
+        .{},
+        &inputs,
+        &executor,
+        TestExecutor.run,
+    );
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(@as(usize, inputs.len), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), executor.largest_batch.load(.monotonic));
+    for (results) |result| {
+        try std.testing.expectEqual(Execution.serial, result.execution);
+        try std.testing.expectEqual(@as(u64, 0), result.execution_id);
+    }
 }
 
 test "microbatch follower deadline shortens window without forcing an immediate flush" {

@@ -140,10 +140,11 @@ pub const DecoderIncrementalCache = struct {
 };
 
 /// Remove completed decoder rows while preserving their original relative
-/// order. The replacement cache is built transactionally: unsupported backend
-/// row-gathering returns false without mutating `cache`, and any error leaves the
-/// original cache intact. Device backends can therefore shrink decoder and
-/// LM-head batch dimensions as soon as pages reach EOS.
+/// order. Preallocated device caches are compacted in place, copying only the
+/// populated self-attention prefix rather than reallocating every layer's full
+/// decode capacity. Other cache layouts retain the transactional row-gather
+/// fallback. Device backends can therefore shrink decoder and LM-head batch
+/// dimensions as soon as pages reach EOS without a second full KV-cache peak.
 pub fn compactDecoderIncrementalCache(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -167,6 +168,16 @@ pub fn compactDecoderIncrementalCache(
     for (retained_rows) |row| {
         if (row >= cache.batch or (previous != null and row <= previous.?)) return error.InvalidInputShape;
         previous = row;
+    }
+
+    if (cache.self.preallocated and cb.supportsCopyRows2D()) {
+        return compactPreallocatedDecoderIncrementalCacheInPlace(
+            cb,
+            allocator,
+            config,
+            cache,
+            retained_rows,
+        );
     }
 
     const old_batch = cache.batch;
@@ -312,6 +323,107 @@ pub fn compactDecoderIncrementalCache(
     old_self.deinit(cb, allocator);
     allocator.free(old_encoder_mask);
     allocator.free(old_self_mask);
+    return true;
+}
+
+fn compactPreallocatedDecoderIncrementalCacheInPlace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    cache: *DecoderIncrementalCache,
+    retained_rows: []const u32,
+) !bool {
+    const old_batch = cache.batch;
+    const next_batch = retained_rows.len;
+    const encoder_mask_len = std.math.mul(usize, next_batch, cache.enc_seq) catch
+        return error.InvalidInputShape;
+    const encoder_mask = try allocator.alloc(i64, encoder_mask_len);
+    errdefer allocator.free(encoder_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * cache.enc_seq;
+        @memcpy(
+            encoder_mask[dst_batch * cache.enc_seq ..][0..cache.enc_seq],
+            cache.encoder_mask[source..][0..cache.enc_seq],
+        );
+    }
+
+    const self_mask_stride = cache.self_mask.len / old_batch;
+    const self_mask_len = std.math.mul(usize, next_batch, self_mask_stride) catch
+        return error.InvalidInputShape;
+    const self_mask = try allocator.alloc(i64, self_mask_len);
+    errdefer allocator.free(self_mask);
+    for (retained_rows, 0..) |source_batch, dst_batch| {
+        const source = @as(usize, source_batch) * self_mask_stride;
+        @memcpy(
+            self_mask[dst_batch * self_mask_stride ..][0..self_mask_stride],
+            cache.self_mask[source..][0..self_mask_stride],
+        );
+    }
+
+    // Retained rows are strictly increasing, so every moved source slab is
+    // above its destination and cannot be overwritten before it is consumed.
+    // The unpopulated self-cache tail is deliberately ignored: future decode
+    // steps write it at the same capacity-strided offsets.
+    for (0..config.decoder_layers) |layer| {
+        const self_key = cache.self.keys[layer] orelse return error.InvalidInputShape;
+        const self_value = cache.self.values[layer] orelse return error.InvalidInputShape;
+        for (retained_rows, 0..) |source_batch_u32, dst_batch| {
+            const source_batch = @as(usize, source_batch_u32);
+            if (source_batch == dst_batch) continue;
+            const source_cross_row = std.math.mul(usize, source_batch, cache.enc_seq) catch
+                return error.InvalidInputShape;
+            const dest_cross_row = std.math.mul(usize, dst_batch, cache.enc_seq) catch
+                return error.InvalidInputShape;
+            if (!try cb.copyRows2D(
+                allocator,
+                cache.cross.keys[layer],
+                dest_cross_row,
+                cache.cross.keys[layer],
+                source_cross_row,
+                cache.enc_seq,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+            if (!try cb.copyRows2D(
+                allocator,
+                cache.cross.values[layer],
+                dest_cross_row,
+                cache.cross.values[layer],
+                source_cross_row,
+                cache.enc_seq,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+
+            if (cache.self.len == 0) continue;
+            const source_self_row = std.math.mul(usize, source_batch, cache.self.capacity) catch
+                return error.InvalidInputShape;
+            const dest_self_row = std.math.mul(usize, dst_batch, cache.self.capacity) catch
+                return error.InvalidInputShape;
+            if (!try cb.copyRows2D(
+                allocator,
+                self_key,
+                dest_self_row,
+                self_key,
+                source_self_row,
+                cache.self.len,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+            if (!try cb.copyRows2D(
+                allocator,
+                self_value,
+                dest_self_row,
+                self_value,
+                source_self_row,
+                cache.self.len,
+                config.d_model,
+            )) return error.UnsupportedOperation;
+        }
+    }
+
+    allocator.free(cache.encoder_mask);
+    allocator.free(cache.self_mask);
+    cache.encoder_mask = encoder_mask;
+    cache.self_mask = self_mask;
+    cache.batch = next_batch;
     return true;
 }
 

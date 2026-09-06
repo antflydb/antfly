@@ -16010,18 +16010,10 @@ fn processPdfPageImageEmbedding(
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     }
-    var expanded = try expandDenseEmbeddingsForConsumers(runtime, base_embeddings.items, consumer_indexes);
-    defer {
-        for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
-        if (expanded.len > 0) runtime.alloc.free(expanded);
-    }
-    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale);
-    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
     // Discover abandoned attempts without mutating storage. Their deletion is
-    // transferred together with this attempt's promotions and runs inside the
-    // same lease-fenced publication transaction. A superseded worker therefore
-    // cannot delete stages written by its replacement.
+    // transferred through lease-fenced bounded publication windows. A
+    // superseded worker therefore cannot delete stages written by its
+    // replacement.
     var obsolete_stage_keys = try collectObsoletePdfPageEmbeddingStageKeys(
         runtime,
         request.doc_key,
@@ -16030,19 +16022,168 @@ fn processPdfPageImageEmbedding(
         stage_generation_id,
     );
     defer freeKeyList(runtime.alloc, obsolete_stage_keys);
-    // Transfer every stage-related owner in one allocation-safe operation and
-    // keep it last: no later fallible operation may orphan this attempt outside
-    // the commit cleanup path.
+    // Rendering and provider execution are complete before publication begins.
+    // Promote/index pages in bounded replay windows, retain old page visibility
+    // throughout partial progress, and commit the coverage transition last.
+    // A retry recognizes already-promoted source hashes and resumes the
+    // remaining stages without rebuilding completed vectors.
     try embedding_lease_guard.check();
-    try queuePdfPageEmbeddingCommit(
+    try publishPdfPageEmbeddingBatches(
         runtime,
         window,
         desired_page_keys.items,
+        base_embeddings.items,
+        consumer_indexes,
         promotion_page_keys.items,
         staged_page_keys.items,
         embedding_name,
+        &stale.artifact_delete_keys,
         &obsolete_stage_keys,
+        request,
     );
+    stale.artifact_delete_keys = &.{};
+}
+
+fn appendPdfPageEmbeddingPromotion(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    page_key: []const u8,
+    stage_key: []const u8,
+    embedding_name: []const u8,
+) !void {
+    const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
+    errdefer runtime.alloc.free(final_key);
+    const owned_stage_key = try runtime.alloc.dupe(u8, stage_key);
+    errdefer runtime.alloc.free(owned_stage_key);
+    try window.artifact_promotions.append(runtime.alloc, .{
+        .staged_key = owned_stage_key,
+        .final_key = final_key,
+    });
+}
+
+fn flushOwnedPdfArtifactDeletesBounded(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    owned_keys: *[][]u8,
+    max_window_items: usize,
+) !void {
+    if (max_window_items == 0) return error.GeneratedReplayWindowTooLarge;
+    var next: usize = 0;
+    while (next < owned_keys.*.len) {
+        if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(runtime, window);
+        if (window.itemCount() >= max_window_items) return error.GeneratedReplayWindowTooLarge;
+        const available = max_window_items - window.itemCount();
+        const end = @min(owned_keys.*.len, next + available);
+        try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, end - next);
+        for (owned_keys.*[next..end]) |*key| {
+            window.artifact_delete_keys.appendAssumeCapacity(key.*);
+            key.* = &.{};
+        }
+        next = end;
+    }
+    if (owned_keys.*.len > 0) runtime.alloc.free(owned_keys.*);
+    owned_keys.* = &.{};
+}
+
+fn appendPdfPageEmbeddingConsumer(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    base: *const derived_types.DerivedDenseEmbeddingWrite,
+    index_name: []const u8,
+) !void {
+    const owned_index_name = try runtime.alloc.dupe(u8, index_name);
+    errdefer runtime.alloc.free(owned_index_name);
+    const owned_parent_doc_key = if (base.parent_doc_key) |key| try runtime.alloc.dupe(u8, key) else null;
+    errdefer if (owned_parent_doc_key) |key| runtime.alloc.free(key);
+    const owned_doc_key = try runtime.alloc.dupe(u8, base.doc_key);
+    errdefer runtime.alloc.free(owned_doc_key);
+    const owned_artifact_key = if (base.artifact_key) |key| try runtime.alloc.dupe(u8, key) else null;
+    errdefer if (owned_artifact_key) |key| runtime.alloc.free(key);
+
+    // Reserve before transferring ownership. The caller marks the complete
+    // consumer set once per replay window instead of repeating activity-map
+    // scans and notifications for every page/index pair.
+    try window.dense_embeddings.ensureUnusedCapacity(runtime.alloc, 1);
+    window.dense_embeddings.appendAssumeCapacity(.{
+        .index_name = owned_index_name,
+        .parent_doc_key = owned_parent_doc_key,
+        .doc_key = owned_doc_key,
+        .artifact_key = owned_artifact_key,
+        .vector = &.{},
+    });
+}
+
+fn publishPdfPageEmbeddingBatches(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    desired_page_keys: []const []const u8,
+    base_embeddings: []const derived_types.DerivedDenseEmbeddingWrite,
+    consumer_indexes: []const []const u8,
+    promotion_page_keys: []const []const u8,
+    staged_page_keys: []const []const u8,
+    embedding_name: []const u8,
+    stale_artifact_keys: *[][]u8,
+    obsolete_stage_keys: *[][]u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !void {
+    if (base_embeddings.len != desired_page_keys.len or
+        staged_page_keys.len != promotion_page_keys.len)
+        return error.InvalidPdfPageEmbeddingStage;
+    if (!window.isEmpty()) try flushGeneratedReplayWindow(runtime, window);
+
+    var desired_page_key_set = try borrowedRuntimeKeySet(runtime.alloc, desired_page_keys);
+    defer desired_page_key_set.deinit(runtime.alloc);
+    var stage_by_page = std.StringHashMapUnmanaged([]const u8).empty;
+    defer stage_by_page.deinit(runtime.alloc);
+    const promotion_capacity = std.math.cast(u32, promotion_page_keys.len) orelse
+        return error.InvalidPdfPageEmbeddingStage;
+    try stage_by_page.ensureTotalCapacity(runtime.alloc, promotion_capacity);
+    for (promotion_page_keys, staged_page_keys) |page_key, stage_key| {
+        if (!desired_page_key_set.contains(page_key) or stage_key.len == 0)
+            return error.InvalidPdfPageEmbeddingStage;
+        const entry = stage_by_page.getOrPutAssumeCapacity(page_key);
+        if (entry.found_existing) return error.InvalidPdfPageEmbeddingStage;
+        entry.value_ptr.* = stage_key;
+    }
+
+    const max_window_items = generatedReplayWindowItems();
+    // Reserve enough room for final coverage in the last fenced derived
+    // commit. Keeping at least one page/index or cleanup mutation in that
+    // window prevents a long publication from ending in an unfenced
+    // coverage-only transition after its lease has expired.
+    if (consumer_indexes.len >= max_window_items)
+        return error.GeneratedReplayWindowTooLarge;
+    const derived_window_items = max_window_items - consumer_indexes.len;
+    for (desired_page_keys, 0..) |page_key, page_index| {
+        const base_embedding = &base_embeddings[page_index];
+        if (!std.mem.eql(u8, base_embedding.doc_key, page_key))
+            return error.InvalidPdfPageEmbeddingStage;
+        const stage_key = stage_by_page.get(page_key);
+        const page_items = std.math.add(
+            usize,
+            consumer_indexes.len,
+            @intFromBool(stage_key != null),
+        ) catch return error.GeneratedReplayWindowTooLarge;
+        if (page_items > derived_window_items) return error.GeneratedReplayWindowTooLarge;
+        if (page_items > derived_window_items -| window.itemCount())
+            try flushGeneratedReplayWindow(runtime, window);
+        if (consumer_indexes.len > 0 and window.publishing_indexes.items.len == 0)
+            try markWindowPublishing(runtime, window, consumer_indexes);
+        if (stage_key) |key| {
+            try appendPdfPageEmbeddingPromotion(runtime, window, page_key, key, embedding_name);
+        }
+
+        for (consumer_indexes) |index_name| {
+            try appendPdfPageEmbeddingConsumer(runtime, window, base_embedding, index_name);
+        }
+    }
+    try flushOwnedPdfArtifactDeletesBounded(runtime, window, stale_artifact_keys, derived_window_items);
+    try flushOwnedPdfArtifactDeletesBounded(runtime, window, obsolete_stage_keys, derived_window_items);
+
+    for (consumer_indexes) |index_name| {
+        try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, .produced);
+    }
+    try flushGeneratedReplayWindow(runtime, window);
 }
 
 fn pdfPageEmbeddingStageKeyAlloc(
@@ -16170,19 +16311,17 @@ fn queuePdfPageEmbeddingCommit(
     obsolete_stage_keys: *[][]u8,
 ) !void {
     if (staged_page_keys.len != promotion_page_keys.len) return error.InvalidPdfPageEmbeddingStage;
-    for (promotion_page_keys, 0..) |page_key, index| {
-        var desired = false;
-        for (desired_page_keys) |candidate| {
-            if (std.mem.eql(u8, candidate, page_key)) {
-                desired = true;
-                break;
-            }
-        }
-        if (!desired) return error.InvalidPdfPageEmbeddingStage;
-        for (promotion_page_keys[0..index]) |previous| {
-            if (std.mem.eql(u8, previous, page_key))
-                return error.InvalidPdfPageEmbeddingStage;
-        }
+    var desired_page_key_set = try borrowedRuntimeKeySet(runtime.alloc, desired_page_keys);
+    defer desired_page_key_set.deinit(runtime.alloc);
+    var promotion_page_key_set = std.StringHashMapUnmanaged(void).empty;
+    defer promotion_page_key_set.deinit(runtime.alloc);
+    const promotion_capacity = std.math.cast(u32, promotion_page_keys.len) orelse
+        return error.InvalidPdfPageEmbeddingStage;
+    try promotion_page_key_set.ensureTotalCapacity(runtime.alloc, promotion_capacity);
+    for (promotion_page_keys) |page_key| {
+        if (!desired_page_key_set.contains(page_key)) return error.InvalidPdfPageEmbeddingStage;
+        if (promotion_page_key_set.getOrPutAssumeCapacity(page_key).found_existing)
+            return error.InvalidPdfPageEmbeddingStage;
     }
     const promotions = try runtime.alloc.alloc(GeneratedArtifactPromotion, staged_page_keys.len);
     var initialized: usize = 0;
@@ -16210,16 +16349,17 @@ fn queuePdfPageEmbeddingCommit(
     // replay window referring to stages that request cleanup still owns.
     try window.artifact_promotions.ensureUnusedCapacity(runtime.alloc, promotions.len);
     try window.artifact_delete_keys.ensureUnusedCapacity(runtime.alloc, obsolete_stage_keys.*.len);
+    var artifact_delete_key_set = try borrowedRuntimeKeySet(runtime.alloc, window.artifact_delete_keys.items);
+    defer artifact_delete_key_set.deinit(runtime.alloc);
+    const delete_capacity = std.math.cast(
+        u32,
+        window.artifact_delete_keys.items.len +| obsolete_stage_keys.*.len,
+    ) orelse return error.InvalidPdfPageEmbeddingStage;
+    try artifact_delete_key_set.ensureTotalCapacity(runtime.alloc, delete_capacity);
+
     window.artifact_promotions.appendSliceAssumeCapacity(promotions);
     for (obsolete_stage_keys.*) |key| {
-        var duplicate = false;
-        for (window.artifact_delete_keys.items) |candidate| {
-            if (std.mem.eql(u8, candidate, key)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) {
+        if (artifact_delete_key_set.getOrPutAssumeCapacity(key).found_existing) {
             runtime.alloc.free(key);
             continue;
         }

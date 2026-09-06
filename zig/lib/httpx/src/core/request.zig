@@ -142,6 +142,19 @@ pub const Request = struct {
         try self.headers.setContentLength(body.len);
     }
 
+    /// Borrows a request body for the duration of synchronous client
+    /// execution. Callers must keep `body` alive until the client request
+    /// method returns, including redirects and retries. This is intentionally
+    /// separate from `setBody`: the latter preserves its ownership/copying
+    /// contract for builders and asynchronously retained requests.
+    pub fn setBorrowedBody(self: *Self, body: []const u8) !void {
+        self.freeOwnedBody();
+        self.body = body;
+        self.body_owned = false;
+        self.body_allocation = null;
+        try self.headers.setContentLength(body.len);
+    }
+
     /// Sets the request body as JSON with appropriate headers.
     pub fn setJson(self: *Self, body: []const u8) !void {
         try self.headers.set(HeaderName.CONTENT_TYPE, "application/json");
@@ -337,6 +350,18 @@ test "Request with body" {
     try request.setJson("{\"key\":\"value\"}");
     try std.testing.expect(request.body != null);
     try std.testing.expectEqualStrings("application/json", request.headers.get(HeaderName.CONTENT_TYPE).?);
+}
+
+test "Request can borrow an already-owned body without copying it" {
+    const allocator = std.testing.allocator;
+    var request = try Request.init(allocator, .POST, "https://example.com/api");
+    defer request.deinit();
+
+    var body = [_]u8{ 1, 2, 3, 4 };
+    try request.setBorrowedBody(&body);
+    try std.testing.expect(!request.body_owned);
+    try std.testing.expectEqual(@intFromPtr(body[0..].ptr), @intFromPtr(request.body.?.ptr));
+    try std.testing.expectEqualStrings("4", request.headers.get(HeaderName.CONTENT_LENGTH).?);
 }
 
 test "Request builder" {

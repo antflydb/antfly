@@ -5568,131 +5568,19 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
-        // Cross-request coalescing is enabled only when the resolved reader
-        // advertises a real native batch primitive. Existing multi-image calls
-        // already arrive as a complete fused batch and use the direct path.
-        if (request.images.len == 1) broker_attempt: {
-            // The path manifest is provisional and used only to reject invalid
-            // encoded input and decide whether acquiring a broker generation
-            // is worthwhile. It never supplies execution limits after model
-            // acquisition, so a concurrent republish cannot mix generations.
-            var provisional_manifest = try manifest_mod.loadFromDir(allocator, model_path);
-            defer provisional_manifest.deinit();
-            const provisional_contract = try resolvedInferenceExecutorContract(self, "read", &provisional_manifest);
-            if (provisional_contract.batch.mode == .native and provisional_contract.batch.max_items > 1) {
-                try validateEncodedImageMime(request.images[0].mime_type, request.images[0].bytes);
-                _ = try measureExecutorDecodedImages(
-                    &provisional_manifest,
-                    &.{request.images[0].bytes},
-                );
-
-                // Fence the immutable generation, then authoritatively derive
-                // all grouping limits and image shape from that generation.
-                // Component readers without one aggregate generation bypass
-                // cross-request coalescing.
-                if (try readers_mod.LoadedReader.acquireExecutionFence(
-                    allocator,
-                    model_path,
-                    &self.model_manager,
-                )) |acquired_fence| {
-                    var broker_fence = acquired_fence;
-                    defer broker_fence.deinit();
-                    const broker_manifest = broker_fence.manifest();
-                    const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_manifest);
-                    if (broker_contract.batch.mode != .native or broker_contract.batch.max_items <= 1)
-                        break :broker_attempt;
-                    const broker_pixels = try measureExecutorDecodedImages(
-                        broker_manifest,
-                        &.{request.images[0].bytes},
-                    );
-                    const resolved_backend = broker_fence.backend();
-                    const resolved_generation = broker_fence.generationIdentity();
-                    const broker_payload = ReadMicrobatchPayload{
-                        .model_path = model_path,
-                        .fence = &broker_fence,
-                        .image = request.images[0],
-                        .prompt = normalizeReadPrompt(request.prompt),
-                        .max_tokens = max_tokens,
-                        .profile_source_fingerprint = request.source_fingerprint,
-                    };
-                    const max_batch_tokens = if (broker_contract.batch.max_output_tokens_per_item) |limit|
-                        std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
-                    else
-                        std.math.maxInt(usize);
-                    const broker_result = try self.executorMicrobatchBroker().submitControlled(
-                        ReadMicrobatchPayload,
-                        readers_api.Result,
-                        io,
-                        allocator,
-                        .{
-                            .model = model_path,
-                            .generation = resolved_generation,
-                            .task = .read,
-                            .prompt = broker_payload.prompt orelse "",
-                            // Provenance is carried per item and must not fragment
-                            // otherwise-compatible work from different documents.
-                            // Reader transforms are fixed by this resolved model.
-                            .transform = "",
-                            .option_key = max_tokens orelse 0,
-                            .resource_class = executorMicrobatchResourceClass(resolved_backend),
-                        },
-                        .{
-                            .mode = .native,
-                            .preferred_items = broker_contract.batch.preferred_items,
-                            .max_items = broker_contract.batch.max_items,
-                            .max_bytes = broker_contract.batch.max_encoded_media_bytes,
-                            .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
-                            .max_tokens = max_batch_tokens,
-                            .max_wait_us = self.config.executor_microbatch_max_wait_us,
-                        },
-                        .{
-                            .bytes = request.images[0].bytes.len,
-                            .pixels = broker_pixels,
-                            .tokens = max_tokens orelse 0,
-                        },
-                        .{
-                            .item_id = request.images[0].item_id,
-                            .source_fingerprint = request.images[0].source_fingerprint,
-                            .page_number = request.images[0].page_number,
-                        },
-                        broker_deadline,
-                        cancellation,
-                        &broker_payload,
-                        self,
-                        executeReadMicrobatch,
-                    );
-                    switch (broker_result.result) {
-                        .item_error => |failure| return failure.cause,
-                        .value => |value| {
-                            var owned_value = value;
-                            errdefer readers_api.deinitResult(allocator, &owned_value);
-                            const items = try allocator.alloc(readers_api.Result, 1);
-                            items[0] = owned_value;
-                            return .{
-                                .items = items,
-                                .execution = switch (broker_result.execution) {
-                                    .native_batch => .{
-                                        .requested_items = 1,
-                                        .native_batches = 1,
-                                        .native_items = 1,
-                                    },
-                                    .serial => .{
-                                        .requested_items = 1,
-                                        .serial_items = 1,
-                                    },
-                                    .fallback => .{
-                                        .requested_items = 1,
-                                        .serial_items = 1,
-                                        .fallback_items = 1,
-                                        .fallback_reason = "native reader microbatch fallback",
-                                    },
-                                },
-                            };
-                        },
-                    }
-                }
-            }
-        }
+        // Flatten even an existing PDF/window batch into independently
+        // attributable tickets. Compatible work from other requests can fill
+        // the same native model batch; component readers without an immutable
+        // aggregate generation still use the direct path below.
+        if (try self.tryReadEncodedImagesViaBroker(
+            allocator,
+            io,
+            model_path,
+            request,
+            max_tokens,
+            broker_deadline,
+            cancellation,
+        )) |broker_batch| return broker_batch;
 
         // Direct batches acquire their full execution lease here. Singleton
         // native-batch candidates above are admitted once by the broker leader
@@ -5714,6 +5602,191 @@ pub const Node = struct {
             null,
             null,
         );
+    }
+
+    fn tryReadEncodedImagesViaBroker(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model_path: []const u8,
+        request: readers_api.EncodedRequest,
+        max_tokens: ?usize,
+        broker_deadline: ?std.Io.Clock.Timestamp,
+        cancellation: ExecutorCancellation,
+    ) !?readers_api.BatchResult {
+        // This manifest is provisional. The acquired immutable generation is
+        // the sole authority for grouping identity and execution limits.
+        var provisional_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer provisional_manifest.deinit();
+        const provisional_contract = try resolvedInferenceExecutorContract(self, "read", &provisional_manifest);
+        if (provisional_contract.batch.mode != .native or provisional_contract.batch.max_items <= 1)
+            return null;
+        for (request.images) |image| try validateEncodedImageMime(image.mime_type, image.bytes);
+
+        const acquired_fence = try readers_mod.LoadedReader.acquireExecutionFence(
+            allocator,
+            model_path,
+            &self.model_manager,
+        ) orelse return null;
+        var broker_fence = acquired_fence;
+        defer broker_fence.deinit();
+        const broker_manifest = broker_fence.manifest();
+        const broker_contract = try resolvedInferenceExecutorContract(self, "read", broker_manifest);
+        if (broker_contract.batch.mode != .native or broker_contract.batch.max_items <= 1)
+            return null;
+
+        const payloads = try allocator.alloc(ReadMicrobatchPayload, request.images.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, request.images.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, request.images.len);
+        defer allocator.free(identities);
+        const normalized_prompt = normalizeReadPrompt(request.prompt);
+        for (request.images, 0..) |image, index| {
+            const pixels = try measureExecutorDecodedImages(broker_manifest, &.{image.bytes});
+            payloads[index] = .{
+                .model_path = model_path,
+                .fence = &broker_fence,
+                .image = image,
+                .prompt = normalized_prompt,
+                .max_tokens = max_tokens,
+                .profile_source_fingerprint = request.source_fingerprint,
+            };
+            shapes[index] = .{
+                .bytes = image.bytes.len,
+                .pixels = pixels,
+                .tokens = max_tokens orelse 0,
+            };
+            identities[index] = .{
+                .item_id = image.item_id,
+                .source_fingerprint = image.source_fingerprint,
+                .page_number = image.page_number,
+            };
+        }
+        const max_batch_tokens = if (broker_contract.batch.max_output_tokens_per_item) |limit|
+            std.math.mul(usize, limit, broker_contract.batch.max_items) catch std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
+        // A request can spill across two full broker groups which execute on
+        // different leaders. Multi-item results therefore use a thread-safe
+        // temporary domain and transfer only after every ticket joins. A
+        // singleton cannot spill and keeps the direct caller-allocator path.
+        const broker_results_need_clone = request.images.len > 1;
+        const broker_result_allocator = if (broker_results_need_clone)
+            std.heap.smp_allocator
+        else
+            allocator;
+        const broker_results = try self.executorMicrobatchBroker().submitBatchControlled(
+            ReadMicrobatchPayload,
+            readers_api.Result,
+            io,
+            broker_result_allocator,
+            .{
+                .model = model_path,
+                .generation = broker_fence.generationIdentity(),
+                .task = .read,
+                .prompt = normalized_prompt orelse "",
+                .transform = "",
+                .option_key = max_tokens orelse 0,
+                .resource_class = executorMicrobatchResourceClass(broker_fence.backend()),
+            },
+            .{
+                .mode = .native,
+                .preferred_items = broker_contract.batch.preferred_items,
+                .max_items = broker_contract.batch.max_items,
+                .max_bytes = broker_contract.batch.max_encoded_media_bytes,
+                .max_pixels = broker_contract.batch.max_decoded_pixels orelse std.math.maxInt(u64),
+                .max_tokens = max_batch_tokens,
+                .max_wait_us = self.config.executor_microbatch_max_wait_us,
+            },
+            shapes,
+            identities,
+            broker_deadline,
+            cancellation,
+            payloads,
+            self,
+            executeReadMicrobatch,
+        );
+        defer broker_result_allocator.free(broker_results);
+
+        var broker_values_owned = true;
+        defer if (broker_values_owned) {
+            for (broker_results) |*result| switch (result.result) {
+                .value => |*value| readers_api.deinitResult(broker_result_allocator, value),
+                .item_error => {},
+            };
+        };
+        var first_error: ?anyerror = null;
+        for (broker_results) |result| switch (result.result) {
+            .item_error => |failure| if (first_error == null) {
+                first_error = failure.cause;
+            },
+            .value => {},
+        };
+        if (first_error) |failure| return failure;
+
+        var native_execution_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer native_execution_ids.deinit(allocator);
+        const result_capacity = std.math.cast(u32, broker_results.len) orelse
+            return error.InvalidReadResultCount;
+        try native_execution_ids.ensureTotalCapacity(allocator, result_capacity);
+        for (broker_results) |result| if (result.execution == .native_batch) {
+            if (result.execution_id == 0) return error.InvalidReadExecutionReport;
+            native_execution_ids.putAssumeCapacity(result.execution_id, {});
+        };
+        const items = try allocator.alloc(readers_api.Result, broker_results.len);
+        var transferred: usize = 0;
+        errdefer {
+            for (items[0..transferred]) |*item| readers_api.deinitResult(allocator, item);
+            allocator.free(items);
+        }
+        var execution = readers_api.BatchExecution{ .requested_items = items.len };
+        for (broker_results, items) |result, *item| {
+            const value = switch (result.result) {
+                .value => |owned| owned,
+                .item_error => unreachable,
+            };
+            item.* = if (broker_results_need_clone)
+                try cloneReaderApiResult(allocator, value)
+            else
+                value;
+            transferred += 1;
+            switch (result.execution) {
+                .native_batch => execution.native_items += 1,
+                .serial => execution.serial_items += 1,
+                .fallback => {
+                    execution.serial_items += 1;
+                    execution.fallback_items += 1;
+                },
+            }
+        }
+        execution.native_batches = native_execution_ids.count();
+        if (execution.fallback_items > 0)
+            execution.fallback_reason = "native reader microbatch fallback";
+        if (!broker_results_need_clone) broker_values_owned = false;
+        try execution.validate(items.len);
+        return .{ .items = items, .execution = execution };
+    }
+
+    fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
+        const text = try allocator.dupe(u8, source.text);
+        errdefer allocator.free(text);
+        const fields_json = if (source.fields_json) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (fields_json) |value| allocator.free(value);
+        const regions_json = if (source.regions_json) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (regions_json) |value| allocator.free(value);
+        const item_id = if (source.item_id.len > 0) try allocator.dupe(u8, source.item_id) else "";
+        errdefer if (item_id.len > 0) allocator.free(@constCast(item_id));
+        const source_fingerprint = if (source.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (source_fingerprint) |value| allocator.free(value);
+        return .{
+            .text = text,
+            .fields_json = fields_json,
+            .regions_json = regions_json,
+            .item_id = item_id,
+            .source_fingerprint = source_fingerprint,
+            .page_number = source.page_number,
+        };
     }
 
     pub fn readRasterImagesDirect(
