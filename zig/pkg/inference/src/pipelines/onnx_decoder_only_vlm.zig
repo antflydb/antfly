@@ -55,12 +55,16 @@ const vision_candidates = [_][]const u8{
 };
 
 pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    return probeModelDir(allocator, model_dir) catch false;
+}
+
+pub fn probeModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
     if (!build_options.enable_onnx) return false;
-    if (!c_file.fileExistsInDir(allocator, model_dir, "config.json")) return false;
-    if (!c_file.fileExistsInDir(allocator, model_dir, "tokenizer.json")) return false;
-    const decoder_path = findOnnxFile(allocator, model_dir, &decoder_candidates) catch return false;
+    if (!try c_file.fileExistsInDirChecked(allocator, model_dir, "config.json")) return false;
+    if (!try c_file.fileExistsInDirChecked(allocator, model_dir, "tokenizer.json")) return false;
+    const decoder_path = try findOnnxFile(allocator, model_dir, &decoder_candidates);
     if (decoder_path) |path| allocator.free(path) else return false;
-    const embed_path = findOnnxFile(allocator, model_dir, &embed_candidates) catch return false;
+    const embed_path = try findOnnxFile(allocator, model_dir, &embed_candidates);
     if (embed_path) |path| allocator.free(path) else return false;
     return true;
 }
@@ -733,7 +737,7 @@ fn findOnnxFile(allocator: std.mem.Allocator, model_dir: []const u8, candidates:
             else
                 try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, candidate });
             errdefer allocator.free(path);
-            if (c_file.fileExists(allocator, path)) return path;
+            if (try c_file.fileExistsChecked(allocator, path)) return path;
             allocator.free(path);
         }
     }

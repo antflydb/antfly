@@ -659,13 +659,19 @@ fn ignoreNonResourceMetadataError(result: anytype) !void {
     };
 }
 
-/// Antfly-owned bundle metadata remains forward-compatible, but a disagreement
-/// with another Antfly-owned executable contract must fail closed.
-fn ignoreOptionalAntflyMetadataError(result: anytype) !void {
-    result catch |err| switch (err) {
-        error.OutOfMemory, error.InvalidModelManifest => return err,
-        else => return,
+/// Antfly contracts distinguish an unsupported family from a broken known family.
+const BundleParseResult = enum { applied, unsupported_family };
+
+fn parseBundleObject(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(std.json.Value) {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceBundle,
     };
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return error.InvalidInferenceBundle;
+    }
+    return parsed;
 }
 
 const ArtifactCatalog = struct {
@@ -724,9 +730,9 @@ const ArtifactCatalog = struct {
         };
     }
 
-    fn exists(self: *const ArtifactCatalog, relative_path: []const u8) bool {
+    fn exists(self: *const ArtifactCatalog, relative_path: []const u8) !bool {
         if (self.receipt != null) return self.find(relative_path) != null;
-        return c_file.fileExistsInDir(self.allocator, self.model_dir_path, relative_path);
+        return c_file.fileExistsInDirChecked(self.allocator, self.model_dir_path, relative_path);
     }
 
     fn resolve(self: *const ArtifactCatalog, relative_path: []const u8) !?[]u8 {
@@ -939,9 +945,9 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreOptionalAntflyMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes));
+        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes);
     }
-    if (shouldParseClipclapGgufVariant(catalog)) {
+    if (try shouldParseClipclapGgufVariant(catalog)) {
         try parseOptionalInferenceVariantsFile(&manifest, allocator, catalog);
     }
 
@@ -987,12 +993,12 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     try fillAutoDetectedGgufPaths(&manifest, allocator, catalog);
 
     // Auto-detect tokenizer
-    if (catalog.exists("tokenizer.json") or
-        catalog.exists("vocab.txt") or
-        catalog.exists("vocab.json"))
+    if (try catalog.exists("tokenizer.json") or
+        try catalog.exists("vocab.txt") or
+        try catalog.exists("vocab.json"))
     {
         manifest.tokenizer_type = .huggingface;
-    } else if (catalog.exists("tokenizer.model")) {
+    } else if (try catalog.exists("tokenizer.model")) {
         manifest.tokenizer_type = .sentencepiece;
     }
 
@@ -1019,8 +1025,8 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(&manifest, allocator, catalog, model_dir_path, gguf_path));
     }
 
-    applyImplicitSparseOutputLayout(&manifest, catalog);
-    try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog));
+    try applyImplicitSparseOutputLayout(&manifest, catalog);
+    try applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
 
@@ -1072,7 +1078,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreOptionalAntflyMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes));
+        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes);
     }
     try parseOptionalInferenceVariantsFile(&manifest, allocator, &catalog);
 
@@ -1107,8 +1113,8 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
 
-    applyImplicitSparseOutputLayout(&manifest, &catalog);
-    try ignoreNonResourceMetadataError(applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog));
+    try applyImplicitSparseOutputLayout(&manifest, &catalog);
+    try applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
 
@@ -1146,6 +1152,7 @@ fn isListingCandidateRejection(err: anyerror) bool {
         error.ModelArtifactOutsideRoot,
         error.ModelArtifactNotPublished,
         error.InvalidModelManifest,
+        error.InvalidInferenceBundle,
         error.InvalidEmbeddingTaskProfile,
         error.MissingEmbeddingTaskProfile,
         => true,
@@ -1175,9 +1182,9 @@ fn listingSpecialTokensMapHasGlinerMarkers(json_bytes: []const u8) bool {
         std.mem.indexOf(u8, json_bytes, "\"[SEP_TEXT]\"") != null;
 }
 
-fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const ArtifactCatalog) void {
+fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
     if (manifest.sparse_3d_output_layout != null) return;
-    if (catalog.exists("1_SpladePooling/config.json")) {
+    if (try catalog.exists("1_SpladePooling/config.json")) {
         manifest.sparse_3d_output_layout = .batch_seq;
     }
 }
@@ -1199,7 +1206,10 @@ fn applySentenceTransformersPoolingSidecars(
 
     const modules_bytes = (try catalog.readOptional("modules.json")) orelse return;
     defer allocator.free(modules_bytes);
-    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch return;
+    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
     defer modules_parsed.deinit();
     if (modules_parsed.value != .array) return;
 
@@ -1225,7 +1235,10 @@ fn applySentenceTransformersPoolingSidecars(
     const pooling_path = std.fmt.bufPrint(&pooling_path_buf, "{s}/config.json", .{dir}) catch return;
     const pooling_bytes = (try catalog.readOptional(pooling_path)) orelse return;
     defer allocator.free(pooling_bytes);
-    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch return;
+    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
     defer pooling_parsed.deinit();
     if (pooling_parsed.value != .object) return;
     const pooling_obj = pooling_parsed.value.object;
@@ -1460,10 +1473,10 @@ fn applyGgufTokenizerMetadata(
     // Do not issue a whole-file DONTNEED that defeats rolling-worker prefetch.
     region.preserveFileCacheOnDeinit();
 
-    const has_external_tokenizer = artifactExists(catalog, allocator, model_dir_path, "tokenizer.json") or
-        artifactExists(catalog, allocator, model_dir_path, "tokenizer.model") or
-        artifactExists(catalog, allocator, model_dir_path, "vocab.json") or
-        artifactExists(catalog, allocator, model_dir_path, "vocab.txt");
+    const has_external_tokenizer = try artifactExists(catalog, allocator, model_dir_path, "tokenizer.json") or
+        try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model") or
+        try artifactExists(catalog, allocator, model_dir_path, "vocab.json") or
+        try artifactExists(catalog, allocator, model_dir_path, "vocab.txt");
     var parsed = if (has_external_tokenizer)
         try gguf_format.parseWithExternalTokenizer(allocator, region.data)
     else
@@ -1542,9 +1555,9 @@ fn applyGgufTokenizerMetadata(
 
     const gguf_model_name = view.getString("tokenizer.ggml.model");
     if (gguf_model_name) |model_name| {
-        if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
+        if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
             manifest.tokenizer_type = .sentencepiece;
-        } else if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.json")) {
+        } else if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.json")) {
             manifest.tokenizer_type = .huggingface;
         } else if (supportsGgufHuggingFaceFallback(model_name) and hasGgufHuggingFaceMetadata(&parsed)) {
             manifest.tokenizer_type = .huggingface;
@@ -1553,7 +1566,7 @@ fn applyGgufTokenizerMetadata(
         } else {
             manifest.tokenizer_type = null;
         }
-    } else if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
+    } else if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
         manifest.tokenizer_type = .sentencepiece;
     }
 
@@ -1585,9 +1598,9 @@ fn artifactExists(
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
     relative_path: []const u8,
-) bool {
+) !bool {
     if (catalog) |value| return value.exists(relative_path);
-    return c_file.fileExistsInDir(allocator, model_dir_path, relative_path);
+    return c_file.fileExistsInDirChecked(allocator, model_dir_path, relative_path);
 }
 
 fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
@@ -2540,7 +2553,7 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
 }
 
 fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
-    return parseInferenceBundleJsonInternal(manifest, allocator, null, model_dir_path, json_bytes);
+    _ = try parseInferenceBundleJsonInternal(manifest, allocator, null, model_dir_path, json_bytes);
 }
 
 fn parseInferenceBundleJsonWithCatalog(
@@ -2549,7 +2562,7 @@ fn parseInferenceBundleJsonWithCatalog(
     catalog: *const ArtifactCatalog,
     json_bytes: []const u8,
 ) !void {
-    return parseInferenceBundleJsonInternal(manifest, allocator, catalog, catalog.model_dir_path, json_bytes);
+    _ = try parseInferenceBundleJsonInternal(manifest, allocator, catalog, catalog.model_dir_path, json_bytes);
 }
 
 /// Reconcile the model family implied by Antfly bundle metadata with an
@@ -2600,13 +2613,13 @@ fn parseInferenceBundleJsonInternal(
     catalog: ?*const ArtifactCatalog,
     model_dir_path: []const u8,
     json_bytes: []const u8,
-) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+) !BundleParseResult {
+    const parsed = try parseBundleObject(allocator, json_bytes);
     defer parsed.deinit();
 
     const obj = parsed.value.object;
-    const family_value = obj.get("family") orelse return;
-    if (family_value != .string or family_value.string.len == 0) return;
+    const family_value = obj.get("family") orelse return error.InvalidInferenceBundle;
+    if (family_value != .string or family_value.string.len == 0) return error.InvalidInferenceBundle;
     const bundle_family = family_value.string;
 
     if (std.mem.eql(u8, bundle_family, "gliner2_split_bundle/v1")) {
@@ -2616,22 +2629,7 @@ fn parseInferenceBundleJsonInternal(
             encoder.? != .string or encoder.?.string.len == 0 or
             head.? != .string or head.?.string.len == 0)
         {
-            // Unmanaged local directories may intentionally contain a marker
-            // for an incomplete bundle. Managed publications must never let a
-            // receipt-backed bundle select artifacts absent from the receipt.
-            if (catalog != null) return;
-            const owned_family = try allocator.dupe(u8, bundle_family);
-            errdefer allocator.free(owned_family);
-            const wrapper = obj.get("wrapper");
-            const owned_wrapper = if (wrapper != null and wrapper.? == .string and wrapper.?.string.len > 0)
-                try allocator.dupe(u8, wrapper.?.string)
-            else
-                null;
-            errdefer if (owned_wrapper) |value| allocator.free(value);
-            try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
-            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
-            if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
-            return;
+            return error.InvalidInferenceBundle;
         }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
         errdefer allocator.free(encoder_path);
@@ -2655,12 +2653,12 @@ fn parseInferenceBundleJsonInternal(
         } else {
             setOptionalPath(allocator, &manifest.gliner_head_safetensors_path, head_path);
         }
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
-        const clip = obj.get("clip") orelse return;
-        const clap = obj.get("clap") orelse return;
-        if (clip != .string or clip.string.len == 0 or clap != .string or clap.string.len == 0) return;
+        const clip = obj.get("clip") orelse return error.InvalidInferenceBundle;
+        const clap = obj.get("clap") orelse return error.InvalidInferenceBundle;
+        if (clip != .string or clip.string.len == 0 or clap != .string or clap.string.len == 0) return error.InvalidInferenceBundle;
         const clip_path = try resolveBundlePath(allocator, catalog, model_dir_path, clip.string);
         errdefer allocator.free(clip_path);
         const clap_path = try resolveBundlePath(allocator, catalog, model_dir_path, clap.string);
@@ -2676,18 +2674,19 @@ fn parseInferenceBundleJsonInternal(
         setOptionalPath(allocator, &manifest.audio_model_path, clap_path);
         manifest.native_arch_hint = .clip;
         replaceOwnedString(allocator, &manifest.config_model_arch, config_model_arch);
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, "florence2_gguf_bundle/v1")) {
-        const model = obj.get("model") orelse obj.get("gguf") orelse return;
-        if (model == .string and model.string.len > 0) {
+        const model = obj.get("model") orelse obj.get("gguf") orelse return error.InvalidInferenceBundle;
+        if (model != .string or model.string.len == 0) return error.InvalidInferenceBundle;
+        {
             try applyFlorence2GgufBundle(
                 manifest,
                 allocator,
                 try resolveBundlePath(allocator, catalog, model_dir_path, model.string),
             );
         }
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, qwen3_vl_safetensors_bundle_family) or
         std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family))
@@ -2695,15 +2694,7 @@ fn parseInferenceBundleJsonInternal(
         const model = obj.get("model") orelse obj.get("safetensors");
         const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
         if (model == null or model.? != .string or model.?.string.len == 0) {
-            if (catalog != null) return;
-            const owned_family = try allocator.dupe(u8, bundle_family);
-            errdefer allocator.free(owned_family);
-            const owned_arch = try allocator.dupe(u8, "qwen3_vl");
-            errdefer allocator.free(owned_arch);
-            try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
-            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
-            replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
-            return;
+            return error.InvalidInferenceBundle;
         }
         const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.?.string);
         errdefer allocator.free(model_path);
@@ -2715,7 +2706,7 @@ fn parseInferenceBundleJsonInternal(
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.safetensors_path, model_path);
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, qwen3_vl_gguf_bundle_family) or
         std.mem.eql(u8, bundle_family, qwen3_vl_reranker_gguf_bundle_family))
@@ -2727,15 +2718,7 @@ fn parseInferenceBundleJsonInternal(
             decoder.? != .string or decoder.?.string.len == 0 or
             projector.? != .string or projector.?.string.len == 0)
         {
-            if (catalog != null) return;
-            const owned_family = try allocator.dupe(u8, bundle_family);
-            errdefer allocator.free(owned_family);
-            const owned_arch = try allocator.dupe(u8, "qwen3_vl");
-            errdefer allocator.free(owned_arch);
-            try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
-            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
-            replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
-            return;
+            return error.InvalidInferenceBundle;
         }
 
         const decoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, decoder.?.string);
@@ -2752,14 +2735,33 @@ fn parseInferenceBundleJsonInternal(
         replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
         setOptionalPath(allocator, &manifest.gguf_path, decoder_path);
         setOptionalPath(allocator, &manifest.gguf_projector_path, projector_path);
-        return;
+        return .applied;
     }
 
-    const owned_family = try allocator.dupe(u8, bundle_family);
-    replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+    if (std.mem.eql(u8, bundle_family, "colqwen2_gguf_bundle/v1")) {
+        const model = obj.get("model") orelse return error.InvalidInferenceBundle;
+        if (model != .string or model.string.len == 0) return error.InvalidInferenceBundle;
+        const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.string);
+        errdefer allocator.free(model_path);
+        if (obj.get("required_sidecars")) |sidecars| {
+            if (sidecars != .array) return error.InvalidInferenceBundle;
+            for (sidecars.array.items) |sidecar| {
+                if (sidecar != .string or sidecar.string.len == 0) return error.InvalidInferenceBundle;
+                const path = try resolveBundlePath(allocator, catalog, model_dir_path, sidecar.string);
+                allocator.free(path);
+            }
+        }
+        const family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(family);
+        try applyBundleContract(allocator, manifest, .reranker, &.{ "text", "image" });
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, family);
+        setOptionalPath(allocator, &manifest.gguf_path, model_path);
+        return .applied;
+    }
+    return .unsupported_family;
 }
 
-fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) bool {
+fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) !bool {
     const required = [_][]const u8{
         "text_model.onnx",
         "visual_model.onnx",
@@ -2769,19 +2771,19 @@ fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) bool {
         "audio_projection.onnx",
     };
     for (&required) |name| {
-        if (!catalog.exists(name)) return false;
+        if (!try catalog.exists(name)) return false;
     }
     return true;
 }
 
-fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) bool {
-    return !completeClipclapDefaultOnnxPresent(catalog);
+fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
+    return !try completeClipclapDefaultOnnxPresent(catalog);
 }
 
-fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) bool {
-    if (shouldUseClipclapGgufVariant(catalog)) return true;
+fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
+    if (try shouldUseClipclapGgufVariant(catalog)) return true;
     if (build_options.enable_cuda and !build_options.enable_onnx) {
-        return catalog.exists("antfly_inference_variants.json");
+        return try catalog.exists("antfly_inference_variants.json");
     }
     return false;
 }
@@ -2806,12 +2808,12 @@ fn parseInferenceVariantsJsonInternal(
     model_dir_path: []const u8,
     json_bytes: []const u8,
 ) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try parseBundleObject(allocator, json_bytes);
     defer parsed.deinit();
 
     const obj = parsed.value.object;
-    const variants_family = obj.get("family") orelse return;
-    if (variants_family != .string) return;
+    const variants_family = obj.get("family") orelse return error.InvalidInferenceBundle;
+    if (variants_family != .string or variants_family.string.len == 0) return error.InvalidInferenceBundle;
     if (std.mem.eql(u8, variants_family.string, "florence2_variants/v1")) {
         return parseFlorence2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, obj);
     }
@@ -2824,13 +2826,13 @@ fn parseInferenceVariantsJsonInternal(
         return parseFlorence2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, obj);
     }
     if (!std.mem.eql(u8, variants_family.string, "clipclap_variants/v1")) return;
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedClipclapGgufPair = null;
     errdefer if (selected) |*pair| pair.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isClipclapGgufVariant(variant)) continue;
+        if (!try isClipclapGgufVariant(variant)) continue;
         var pair = (try resolveExistingClipclapGgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -2870,7 +2872,7 @@ fn parseInferenceVariantsJsonInternal(
 fn parseOptionalInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     const variants_bytes = (try catalog.readOptional("antfly_inference_variants.json")) orelse return;
     defer allocator.free(variants_bytes);
-    try ignoreOptionalAntflyMetadataError(parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes));
+    try parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes);
 }
 
 fn parseGliner2InferenceVariantsJson(
@@ -2880,13 +2882,13 @@ fn parseGliner2InferenceVariantsJson(
     model_dir_path: []const u8,
     obj: std.json.ObjectMap,
 ) !void {
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedGliner2GgufPair = null;
     errdefer if (selected) |*pair| pair.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isGliner2GgufVariant(variant)) continue;
+        if (!try isGliner2GgufVariant(variant)) continue;
         var pair = (try resolveExistingGliner2GgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -2929,13 +2931,13 @@ fn parseFlorence2InferenceVariantsJson(
     model_dir_path: []const u8,
     obj: std.json.ObjectMap,
 ) !void {
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedFlorence2Gguf = null;
     errdefer if (selected) |*model| model.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isFlorence2GgufVariant(variant)) continue;
+        if (!try isFlorence2GgufVariant(variant)) continue;
         var model = (try resolveExistingFlorence2GgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -3047,17 +3049,11 @@ fn resolveExistingClipclapGgufVariant(
     if (clip != .string or clip.string.len == 0) return null;
     if (clap != .string or clap.string.len == 0) return null;
 
-    const clip_path = resolveBundlePath(allocator, catalog, model_dir_path, clip.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
-    errdefer allocator.free(clip_path);
-    const clap_path = resolveBundlePath(allocator, catalog, model_dir_path, clap.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const clip_path = (try resolveArtifact(allocator, catalog, model_dir_path, clip.string, .optional_variant)) orelse return null;
+    defer allocator.free(clip_path);
+    const clap_path = (try resolveArtifact(allocator, catalog, model_dir_path, clap.string, .optional_variant)) orelse return null;
     errdefer allocator.free(clap_path);
-    return .{ .clip_path = clip_path, .clap_path = clap_path };
+    return .{ .clip_path = try allocator.dupe(u8, clip_path), .clap_path = clap_path };
 }
 
 fn resolveExistingGliner2GgufVariant(
@@ -3071,17 +3067,11 @@ fn resolveExistingGliner2GgufVariant(
     if (encoder != .string or encoder.string.len == 0) return null;
     if (head != .string or head.string.len == 0) return null;
 
-    const encoder_path = resolveBundlePath(allocator, catalog, model_dir_path, encoder.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
-    errdefer allocator.free(encoder_path);
-    const head_path = resolveBundlePath(allocator, catalog, model_dir_path, head.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const encoder_path = (try resolveArtifact(allocator, catalog, model_dir_path, encoder.string, .optional_variant)) orelse return null;
+    defer allocator.free(encoder_path);
+    const head_path = (try resolveArtifact(allocator, catalog, model_dir_path, head.string, .optional_variant)) orelse return null;
     errdefer allocator.free(head_path);
-    return .{ .encoder_path = encoder_path, .head_path = head_path };
+    return .{ .encoder_path = try allocator.dupe(u8, encoder_path), .head_path = head_path };
 }
 
 fn resolveExistingFlorence2GgufVariant(
@@ -3093,38 +3083,64 @@ fn resolveExistingFlorence2GgufVariant(
     const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return null;
     if (model != .string or model.string.len == 0) return null;
 
-    const model_path = resolveBundlePath(allocator, catalog, model_dir_path, model.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const model_path = (try resolveArtifact(allocator, catalog, model_dir_path, model.string, .optional_variant)) orelse return null;
     errdefer allocator.free(model_path);
     return .{ .model_path = model_path };
 }
 
-fn isClipclapGgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const clip = variant.object.get("clip") orelse return false;
-    const clap = variant.object.get("clap") orelse return false;
-    return clip == .string and clip.string.len > 0 and clap == .string and clap.string.len > 0;
+fn isClipclapGgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const clip = variant.object.get("clip") orelse return error.InvalidInferenceBundle;
+    const clap = variant.object.get("clap") orelse return error.InvalidInferenceBundle;
+    if (!(clip == .string and clip.string.len > 0 and clap == .string and clap.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
 }
 
-fn isGliner2GgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const encoder = variant.object.get("encoder") orelse return false;
-    const head = variant.object.get("head") orelse return false;
-    return encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0;
+fn isGliner2GgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const encoder = variant.object.get("encoder") orelse return error.InvalidInferenceBundle;
+    const head = variant.object.get("head") orelse return error.InvalidInferenceBundle;
+    if (!(encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
 }
 
-fn isFlorence2GgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return false;
-    return model == .string and model.string.len > 0;
+fn isFlorence2GgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return error.InvalidInferenceBundle;
+    if (!(model == .string and model.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
+}
+
+const ArtifactRequirement = enum { required, optional_variant };
+
+fn resolveArtifact(
+    allocator: std.mem.Allocator,
+    catalog: ?*const ArtifactCatalog,
+    model_dir_path: []const u8,
+    path: []const u8,
+    requirement: ArtifactRequirement,
+) !?[]const u8 {
+    // Validate owned metadata even when a managed receipt omits this variant.
+    if (!managed_receipt.artifactPathIsSafe(path)) return error.InvalidModelArtifactPath;
+    const resolved = if (catalog) |value|
+        try value.resolve(path)
+    else
+        managed_receipt.resolveContainedArtifactPath(allocator, std.Options.debug_io, model_dir_path, path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+    if (resolved) |value| return value;
+    if (requirement == .optional_variant) return null;
+    return if (catalog != null and catalog.?.receipt != null) error.ModelArtifactNotPublished else error.FileNotFound;
 }
 
 fn resolveBundlePath(
@@ -3133,13 +3149,7 @@ fn resolveBundlePath(
     model_dir_path: []const u8,
     path: []const u8,
 ) ![]const u8 {
-    if (catalog) |value| return (try value.resolve(path)) orelse error.FileNotFound;
-    return managed_receipt.resolveContainedArtifactPath(
-        allocator,
-        std.Options.debug_io,
-        model_dir_path,
-        path,
-    );
+    return (try resolveArtifact(allocator, catalog, model_dir_path, path, .required)).?;
 }
 
 fn setOptionalPath(allocator: std.mem.Allocator, slot: *?[]const u8, value: []const u8) void {
@@ -4399,7 +4409,7 @@ test "manifest detects incomplete colqwen bundle" {
 
     const bundle_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\"}" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\",\"model\":\"model.gguf\"}" });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
@@ -4428,11 +4438,17 @@ test "manifest detects incomplete colqwen bundle" {
 
 test "manifest parses Antfly inference bundle marker" {
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseInferenceBundleJson(&manifest, allocator, ".",
-        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2"}
+    try parseInferenceBundleJson(&manifest, allocator, model_dir,
+        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2","encoder":"encoder.gguf","head":"head.gguf"}
     );
 
     try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.inference_bundle_family);
@@ -4441,14 +4457,20 @@ test "manifest parses Antfly inference bundle marker" {
 
 test "Antfly bundles must agree with explicit manifest contracts" {
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
     const gliner_bundle =
-        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2"}
+        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2","encoder":"encoder.gguf","head":"head.gguf"}
     ;
 
     var matching = ModelManifest{ .allocator = allocator };
     defer matching.deinit();
     try parseModelManifestJson(&matching, allocator, "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
-    try parseInferenceBundleJson(&matching, allocator, ".", gliner_bundle);
+    try parseInferenceBundleJson(&matching, allocator, model_dir, gliner_bundle);
     try std.testing.expectEqual(ModelType.recognizer, matching.model_type);
     try std.testing.expectEqual(ModelTypeOrigin.manifest, matching.model_type_origin);
     try std.testing.expect(matching.model_manifest_declarations.inputs);
@@ -4459,7 +4481,7 @@ test "Antfly bundles must agree with explicit manifest contracts" {
     try parseModelManifestJson(&conflicting, allocator, "{\"type\":\"embedder\"}");
     try std.testing.expectError(
         error.InvalidModelManifest,
-        ignoreOptionalAntflyMetadataError(parseInferenceBundleJson(&conflicting, allocator, ".", gliner_bundle)),
+        parseInferenceBundleJson(&conflicting, allocator, model_dir, gliner_bundle),
     );
     try std.testing.expectEqual(ModelType.embedder, conflicting.model_type);
     try std.testing.expectEqual(ModelTypeOrigin.manifest, conflicting.model_type_origin);
@@ -4474,7 +4496,7 @@ test "Antfly bundles must agree with explicit manifest contracts" {
     );
     try std.testing.expectError(
         error.InvalidModelManifest,
-        ignoreOptionalAntflyMetadataError(parseInferenceBundleJson(&conflicting_inputs, allocator, ".", gliner_bundle)),
+        parseInferenceBundleJson(&conflicting_inputs, allocator, model_dir, gliner_bundle),
     );
     try std.testing.expectEqual(ModelType.embedder, conflicting_inputs.model_type);
     try std.testing.expectEqual(ModelTypeOrigin.default, conflicting_inputs.model_type_origin);
@@ -4486,8 +4508,8 @@ test "Antfly bundles must agree with explicit manifest contracts" {
     try parseModelManifestJson(&duplicate_inputs, allocator, "{\"inputs\":[\"text\",\"text\"]}");
     try std.testing.expectError(
         error.InvalidModelManifest,
-        parseInferenceBundleJson(&duplicate_inputs, allocator, ".",
-            \\{"family":"qwen3_vl_safetensors_bundle/v1"}
+        parseInferenceBundleJson(&duplicate_inputs, allocator, model_dir,
+            \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"encoder.gguf"}
         ),
     );
     try std.testing.expectEqual(ModelType.embedder, duplicate_inputs.model_type);
@@ -5162,7 +5184,7 @@ test "manifest uses clipclap variants when default ONNX bundle is partial" {
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
-    try std.testing.expect(shouldUseClipclapGgufVariant(&catalog));
+    try std.testing.expect(try shouldUseClipclapGgufVariant(&catalog));
 }
 
 test "manifest keeps default clipclap ONNX when six model files are present" {
@@ -5189,7 +5211,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
-    try std.testing.expect(!shouldUseClipclapGgufVariant(&catalog));
+    try std.testing.expect(!try shouldUseClipclapGgufVariant(&catalog));
 }
 
 test "manifest distilbert detection" {
@@ -5478,10 +5500,8 @@ test "managed bundle metadata cannot reference unreceipted artifacts" {
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
-    var manifest = try loadFromDir(allocator, model_dir);
-    defer manifest.deinit();
-    try std.testing.expectEqualStrings("", manifest.inference_bundle_family);
-    try std.testing.expectEqual(@as(?[]const u8, null), manifest.audio_model_path);
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadFromDir(allocator, model_dir));
+    try std.testing.expectEqual(@as(?ModelManifest, null), try loadListingCandidateFromDir(allocator, model_dir));
 }
 
 test "managed explicit bundles retain their receipted artifact route" {
@@ -6203,4 +6223,48 @@ fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
+}
+
+test "bundle contracts reject malformed known metadata but ignore unknown families atomically" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    const invalid = [_][]const u8{
+        "[]",                                                              "null",                                                      "{", "{}", "{\"family\":12}",
+        "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\"}", "{\"family\":\"florence2_gguf_bundle/v1\",\"model\":false}",
+    };
+    for (invalid) |bytes| try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceBundleJson(&manifest, allocator, ".", bytes));
+    try std.testing.expectEqual(BundleParseResult.unsupported_family, try parseInferenceBundleJsonInternal(
+        &manifest,
+        allocator,
+        null,
+        ".",
+        "{\"family\":\"future/v99\",\"model\":\"absent.gguf\"}",
+    ));
+    try std.testing.expectEqualStrings("", manifest.inference_bundle_family);
+    try std.testing.expectEqual(ModelTypeOrigin.default, manifest.model_type_origin);
+}
+
+test "optional bundle variants preserve failures and clean up partially resolved pairs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clip.gguf", .data = "clip" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const Check = struct {
+        fn run(a: std.mem.Allocator, path: []const u8, complete: bool) !void {
+            var man = ModelManifest{ .allocator = a };
+            defer man.deinit();
+            try parseInferenceVariantsJson(&man, a, path, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}]}");
+            try std.testing.expectEqual(complete, man.isClipclapGgufBundle());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clap.gguf", .data = "clap" });
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\"}]}"));
+    try std.testing.expectError(error.InvalidModelArtifactPath, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"../escape.gguf\",\"clap\":\"clap.gguf\"}]}"));
 }
