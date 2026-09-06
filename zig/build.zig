@@ -8256,6 +8256,8 @@ pub fn build(b: *std.Build) void {
         "graph degree scan attempt adoption resumes in bounded pages",
         "graph degree scan page reclaim recomputes without double counting partials",
         "graph degree large-build summary counts filtered materialization without coordinator scan",
+        "graph metric large-build summary",
+        "graph metric vector chunks",
         "graph degree planned build honors edge filter during scan page execution",
         "graph metric filtered scan checkpoints advance past excluded edges",
         "graph metric partition spans remain balanced at production cardinality",

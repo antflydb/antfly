@@ -6,6 +6,7 @@
 //! pinned entries remain charged and admission bypasses a saturated cache.
 const std = @import("std");
 const codec = @import("../graph_metric_segment/codec.zig");
+const CancellationToken = @import("../../api/operation.zig").CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const Entry = struct {
@@ -51,6 +52,49 @@ pub const Cache = struct {
     clock: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
+    // Fixed-capacity ownership table: fetch/decode happens outside the lock.
+    // Releasing a failed/canceled fill permits a live waiter to take over.
+    fills: [64]?[32]u8 = @splat(null),
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+
+    pub const Lookup = union(enum) { hit: Lease, fill: usize, wait: u32 };
+
+    pub fn begin(self: *Cache, key: [32]u8) Lookup {
+        self.lock();
+        defer self.mu.unlock();
+        if (self.acquireLocked(key)) |lease| return .{ .hit = lease };
+        var empty: ?usize = null;
+        for (self.fills, 0..) |fill, index| {
+            if (fill) |existing| {
+                if (std.mem.eql(u8, &existing, &key)) return .{ .wait = self.wake_epoch.load(.acquire) };
+            } else empty = index;
+        }
+        const index = empty orelse return .{ .wait = self.wake_epoch.load(.acquire) };
+        self.fills[index] = key;
+        self.misses +|= 1;
+        return .{ .fill = index };
+    }
+
+    pub fn finish(self: *Cache, index: usize, io: ?std.Io) void {
+        self.lock();
+        std.debug.assert(self.fills[index] != null);
+        self.fills[index] = null;
+        _ = self.wake_epoch.fetchAdd(1, .release);
+        self.mu.unlock();
+        (io orelse std.Options.debug_io).futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+    }
+
+    /// Notification-driven waiting avoids extra cold-read latency. The bounded
+    /// timeout observes request-token cancellation independently of Io task
+    /// cancellation. Epoch comparison prevents lost wakes; no lock spans I/O.
+    pub fn awaitFill(self: *Cache, io: ?std.Io, cancellation: CancellationToken, observed_epoch: u32) !void {
+        try cancellation.check();
+        if (self.wake_epoch.load(.acquire) != observed_epoch) return;
+        try (io orelse std.Options.debug_io).futexWaitTimeout(u32, &self.wake_epoch.raw, observed_epoch, .{
+            .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake },
+        });
+        try cancellation.check();
+    }
 
     pub fn snapshot(self: *Cache) struct { hits: u64, misses: u64, bytes: usize } {
         self.lock();
@@ -59,12 +103,18 @@ pub const Cache = struct {
     }
 
     fn lock(self: *Cache) void {
-        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
+        @import("antfly_platform").sync.lockYielding(&self.mu);
     }
 
     pub fn acquire(self: *Cache, key: [32]u8) ?Lease {
         self.lock();
         defer self.mu.unlock();
+        const lease = self.acquireLocked(key);
+        if (lease == null) self.misses +|= 1;
+        return lease;
+    }
+
+    fn acquireLocked(self: *Cache, key: [32]u8) ?Lease {
         self.clock +|= 1;
         for (self.entries) |maybe_entry| {
             const entry = maybe_entry orelse continue;
@@ -74,7 +124,6 @@ pub const Cache = struct {
             self.hits +|= 1;
             return .{ .entry = entry, .cache = self };
         }
-        self.misses +|= 1;
         return null;
     }
 
@@ -121,6 +170,7 @@ pub const Cache = struct {
 
     /// The owning QueryCache outlives all query sessions and their leases.
     pub fn deinit(self: *Cache) void {
+        for (self.fills) |fill| std.debug.assert(fill == null);
         for (self.entries) |maybe_entry| if (maybe_entry) |entry| {
             std.debug.assert(entry.references == 0);
             entry.destroy();
@@ -168,4 +218,73 @@ test "serverless graph metric routing cache bounds pinned memory and deduplicate
     var hit = cache.acquire(@splat(2)).?;
     defer hit.deinit();
     try std.testing.expectEqual(limit, cache.retained_bytes);
+}
+
+test "serverless graph metric routing cache coalesces misses and releases canceled fills" {
+    var cache = Cache{};
+    defer cache.deinit();
+    const leader = cache.begin(@splat(1)).fill;
+    try std.testing.expect(cache.begin(@splat(1)) == .wait);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().misses);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, cache.awaitFill(null, CancellationToken.fromAtomic(&canceled), 0));
+    // Canceling a waiter does not disturb its leader. A failed leader releases
+    // ownership so another live caller can independently retry.
+    try std.testing.expect(cache.begin(@splat(1)) == .wait);
+    const epoch = cache.begin(@splat(1)).wait;
+    cache.finish(leader, null);
+    try cache.awaitFill(null, .none, epoch); // Completion before waiting cannot lose a wake.
+    const replacement = cache.begin(@splat(1)).fill;
+    var filled = cache.adopt(try testEntry(1), 4096);
+    defer filled.deinit();
+    cache.finish(replacement, null);
+    var shared = cache.begin(@splat(1)).hit;
+    defer shared.deinit();
+    try std.testing.expect(shared.entry == filled.entry);
+
+    var fills: [64]usize = undefined;
+    for (&fills, 0..) |*fill, i| fill.* = cache.begin(@splat(@intCast(i + 2))).fill;
+    try std.testing.expect(cache.begin(@splat(100)) == .wait);
+    for (fills) |fill| cache.finish(fill, null);
+}
+
+test "serverless graph metric routing cache wakes a concurrent waiter without duplicating a fill" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cache = Cache{};
+    defer cache.deinit();
+    const leader = cache.begin(@splat(1)).fill;
+    var started: std.Io.Event = .unset;
+    const Waiter = struct {
+        fn run(runtime: std.Io, target: *Cache, ready: *std.Io.Event) !void {
+            const epoch = target.begin(@splat(1)).wait;
+            ready.set(runtime);
+            var observed = epoch;
+            while (true) {
+                try target.awaitFill(runtime, .none, observed);
+                switch (target.begin(@splat(1))) {
+                    .wait => |next| observed = next,
+                    .hit => |hit| {
+                        var lease = hit;
+                        defer lease.deinit();
+                        try std.testing.expectEqualStrings("immutable footer", lease.entry.footer);
+                        return;
+                    },
+                    .fill => |unexpected| {
+                        target.finish(unexpected, runtime);
+                        return error.TestUnexpectedResult;
+                    },
+                }
+            }
+        }
+    };
+    var waiter = try io.concurrent(Waiter.run, .{ io, &cache, &started });
+    defer _ = waiter.cancel(io) catch {};
+    try started.wait(io);
+    var filled = cache.adopt(try testEntry(1), 4096);
+    defer filled.deinit();
+    cache.finish(leader, io);
+    try waiter.await(io);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().misses);
 }

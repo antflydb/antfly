@@ -572,15 +572,40 @@ deleted nodes, and lets the kernel validate and normalize the result. A
 disjoint, rejected, over-budget, or incompatible prior artifact cold-starts;
 corrupt object identity still fails closed. Seed admission covers both preparation
 (including decoded routing memory) and execution alongside kernel/output memory.
+Cold kernel work is admitted before optional seed I/O. A separate per-publication
+seed budget caps input at 64 MiB and decode/mapping work at 67,108,864 units
+(one prior byte plus one current node per unit). Every actual read is charged,
+including repeated identities; no seed cache is implied. Zero allowance disables
+warm starts. Exhausting this optional budget cold-starts without consuming later
+metrics' cold execution allowance. Materializer epoch 7 fingerprints this policy.
 An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 3 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 4 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
+The same job/configuration/epoch fence applies to workers, coordinator phase
+transitions, and the final publication transaction, including paired HITS.
+Continuing an unexpired owned lease does not consume a retry; the final attempt
+may finish any number of bounded checkpoints, but cannot be reclaimed after expiry.
 Warm starts preserve PageRank's probability normalization, but finite-iteration
 results and tolerance-based stopping can depend on the seed.
+
+Native jobs above 4,096 global nodes assign stable, partition-local ordinals in
+the initialization producers. The dictionary is immutable for the job and is
+retired with job state. PageRank ranks/source factors and both spectral vectors
+use 256-slot blocks with explicit presence bits; zero and missing output are
+distinct. Sorted multi-get resolves dictionary slots, deduplicates block reads,
+and preserves caller order. Attempt-fenced checkpoint writes update each block
+once and retire obsolete iterations by block. Small jobs keep the inline scalar
+layout to avoid sparse block and dictionary overhead.
+
+Large normalization passes reuse the immutable node quantiles: independently
+leased producers scan up to 4,096 nodes per checkpoint, and the root deterministically
+combines at most 256 completed scalar records. Data reducers stay behind that
+barrier. This preserves exact target-wise spectral normalization while removing
+the serial graph-wide scalar scan; filtered-out ranges contribute empty leaves.
 
 Eigenvector and HITS always use canonical cold seeds in both runtimes. An old
 spectral vector may have zero support on a newly dominant disconnected component;
@@ -591,7 +616,12 @@ Serverless query caches retain authenticated decoded metric routing indexes unde
 an independent 16 MiB process-memory budget (configurable with
 `max_graph_metric_routing_bytes`). Identity includes the immutable artifact,
 checksums, footer extent, and wire version. Leases keep borrowed IDs alive;
-eviction skips pinned entries and saturated caches bypass retention. Warm point
+eviction skips pinned entries and saturated caches bypass retention.
+Misses reserve bounded per-identity fill ownership before fetching or decoding.
+Waiters yield through caller-owned `std.Io`, check cancellation independently,
+and can take over when a failed/canceled producer releases ownership. At most
+64 distinct fills are admitted concurrently; cache saturation applies backpressure.
+No storage or decode operation runs under the cache lock. Warm point
 and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
 misses, and retained bytes are exposed in query-cache statistics.
 

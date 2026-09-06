@@ -15,11 +15,10 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 6 makes warm starts PageRank-only and admits both preparation and
-// execution memory before loading an optional prior vector.
+// Epoch 7 bounds optional seed I/O and decode separately from cold execution.
 // Rebuild older sidecars so admission decisions and output remain tied to one
 // explicit materializer contract.
-pub const materializer_epoch: u32 = 6;
+pub const materializer_epoch: u32 = 7;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -34,6 +33,11 @@ pub const Limits = struct {
     max_total_graph_payload_bytes: usize = 512 * 1024 * 1024,
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
+    // Optional acceleration must not starve a later cold materialization.
+    // Zero disables warm starts. Charge every read, not just unique identities:
+    // seeds are not retained across materializations.
+    max_total_seed_payload_bytes: u64 = 64 * 1024 * 1024,
+    max_total_seed_work_items: u64 = 64 * 1024 * 1024,
     // Bounds the decoded topology, compiled projection, dense kernel vectors,
     // borrowed sortable score views, and encoded output that may coexist for one
     // materialization. Work and payload limits alone do not bound this peak.
@@ -56,8 +60,24 @@ pub const Budget = struct {
     work_items: u64 = 0,
     metric_payload_bytes: usize = 0,
     graph_payload_bytes: usize = 0,
+    seed_payload_bytes: u64 = 0,
+    seed_work_items: u64 = 0,
     graph_identity_count: usize = 0,
     graph_identities: [max_tracked_graph_indexes][32]u8 = undefined,
+
+    /// Reserve optional work atomically. One byte of prior input is a
+    /// conservative decode-work unit, including authentication and ID parsing;
+    /// mapping also visits the current vector. Rejection leaves the cold budget
+    /// and both seed counters untouched.
+    pub fn admitSeed(self: *Budget, byte_len: u64, node_count: usize) bool {
+        const bytes = std.math.add(u64, self.seed_payload_bytes, byte_len) catch return false;
+        const work = std.math.add(u64, byte_len, node_count) catch return false;
+        const total = std.math.add(u64, self.seed_work_items, work) catch return false;
+        if (bytes > self.limits.max_total_seed_payload_bytes or total > self.limits.max_total_seed_work_items) return false;
+        self.seed_payload_bytes = bytes;
+        self.seed_work_items = total;
+        return true;
+    }
 
     /// Charges one immutable topology identity at most once. The digest is
     /// bookkeeping only: artifact authentication remains the responsibility
@@ -218,6 +238,14 @@ fn hash(hasher: *std.hash.Wyhash, value: anytype) void {
 }
 
 test "serverless graph metric policy bounds aggregate work and configuration fanout" {
+    var seeds = Budget{ .limits = .{ .max_total_seed_payload_bytes = 100, .max_total_seed_work_items = 110 } };
+    try std.testing.expect(seeds.admitSeed(50, 5));
+    try std.testing.expect(!seeds.admitSeed(51, 5));
+    try std.testing.expect(!seeds.admitSeed(50, 6));
+    try std.testing.expect(seeds.admitSeed(50, 5));
+    try std.testing.expectEqual(@as(u64, 100), seeds.seed_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 110), seeds.seed_work_items);
+    try std.testing.expectEqual(@as(u64, 0), seeds.work_items);
     var budget = Budget{ .limits = .{ .max_work_items = 10, .max_total_work_items = 12 } };
     try budget.chargeWork(10);
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, budget.chargeWork(3));

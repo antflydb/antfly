@@ -540,10 +540,19 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
                 processed[pair_index] = true;
                 continue;
             }
+            admitProjectionKernel(projection.*, options) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => {
+                    refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
+                    initialized[candidate_index] = true;
+                    processed[candidate_index] = true;
+                    continue;
+                },
+                else => return err,
+            };
             const warm_seed: ?[]f64 = if (prior_artifacts.len == 0)
                 null
             else
-                try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[candidate_index], projection.node_ids.items, candidate, cancellation, limits, projection_resident_bytes, cold_peak_bytes);
+                try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[candidate_index], projection.node_ids.items, candidate, cancellation, limits, projection_resident_bytes, cold_peak_bytes, options.batch_budget);
             defer if (warm_seed) |seed| alloc.free(seed);
             switch (candidate.kind) {
                 .pagerank, .eigenvector => options.initial_scores = warm_seed,
@@ -551,7 +560,7 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
                 .hits_hub => options.initial_hubs = warm_seed,
                 .degree => {},
             }
-            var built = buildFromProjectionAlloc(alloc, projection.*, options) catch |err| switch (err) {
+            var built = buildAdmittedProjectionAlloc(alloc, projection.*, options) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => {
                     refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
                     initialized[candidate_index] = true;
@@ -1384,10 +1393,17 @@ fn chargeKernelWork(options: BuildOptions, projection: Projection) !void {
     }
 }
 
-fn buildFromProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
+fn admitProjectionKernel(projection: Projection, options: BuildOptions) !void {
     try admitPeakMemory(projection, options, 1);
     try chargeKernelWork(options, projection);
+}
 
+fn buildFromProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
+    try admitProjectionKernel(projection, options);
+    return buildAdmittedProjectionAlloc(alloc, projection, options);
+}
+
+fn buildAdmittedProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
     const kernel_options = kernelOptions(options);
     const topology = projection.topology orelse return error.InvalidGraphMetricBuildOptions;
     var result = switch (options.config.kind) {
@@ -1537,6 +1553,7 @@ fn warmStartVectorAlloc(
     limits: Limits,
     existing_resident_bytes: usize,
     execution_peak_bytes: usize,
+    batch_budget: ?*graph_metric_policy.Budget,
 ) !?[]f64 {
     if (!metrics.warm_start.supported(config.kind) or prior_artifact == null or current_node_ids.len == 0) return null;
     const prior = prior_artifact.?;
@@ -1555,6 +1572,9 @@ fn warmStartVectorAlloc(
     // layout is bounded by twice the encoded footer size.
     retained = std.math.add(u64, retained, @as(u64, prior.graph_metric_routing_footer_len) * 2) catch return null;
     if (retained > limits.max_peak_memory_bytes) return null;
+    var local_budget = graph_metric_policy.Budget{ .limits = limits };
+    const seed_budget = batch_budget orelse &local_budget;
+    if (!seed_budget.admitSeed(prior.byte_len, current_node_ids.len)) return null;
 
     const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
         alloc,
@@ -1981,7 +2001,7 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
     defer freeArtifactRef(alloc, prior);
 
     const current_nodes = [_][]const u8{ "a", "b", "c" };
-    const seed = (try warmStartVectorAlloc(alloc, &artifacts, prior, &current_nodes, config, .none, .{}, 0, 0)).?;
+    const seed = (try warmStartVectorAlloc(alloc, &artifacts, prior, &current_nodes, config, .none, .{}, 0, 0, null)).?;
     defer alloc.free(seed);
     try std.testing.expect(seed[0] > 0);
     try std.testing.expect(seed[1] > 0);
@@ -1991,10 +2011,12 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
     // retained vector would crowd out otherwise admissible cold execution.
     var unavailable = prior;
     unavailable.artifact_id = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, .{}, 0, (Limits{}).max_peak_memory_bytes)) == null);
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, .{}, 0, (Limits{}).max_peak_memory_bytes, null)) == null);
+    var exhausted = graph_metric_policy.Budget{ .limits = .{ .max_total_seed_payload_bytes = 0 } };
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, exhausted.limits, 0, 0, &exhausted)) == null);
     var spectral = config;
     spectral.kind = .eigenvector;
-    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, spectral, .none, .{}, 0, 0)) == null);
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, spectral, .none, .{}, 0, 0, null)) == null);
 
     // A content-addressed but semantically malformed score block is not a
     // usable seed. The nullable fallback must also release the dense vector it
@@ -2029,6 +2051,7 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
         .{},
         0,
         0,
+        null,
     )) == null);
 }
 

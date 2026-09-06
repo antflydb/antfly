@@ -805,13 +805,27 @@ fn acquireRouting(
     hash.update(&dimensions);
     var key: [32]u8 = undefined;
     hash.final(&key);
+    var fill: ?usize = null;
+    defer if (fill) |index| session.cache.?.graph_metric_routing.finish(index, session.io);
     if (session.cache) |cache| {
-        if (cache.graph_metric_routing.acquire(key)) |cached| {
-            var lease = cached;
-            errdefer lease.deinit();
-            try session.chargeGraphMetricRetained(lease.entry.bytes());
-            try session.chargeGraphMetricDecode(0, 1);
-            return lease;
+        while (true) {
+            try session.cancellation.check();
+            switch (cache.graph_metric_routing.begin(key)) {
+                .hit => |cached| {
+                    var lease = cached;
+                    errdefer lease.deinit();
+                    try session.chargeGraphMetricRetained(lease.entry.bytes());
+                    try session.chargeGraphMetricDecode(0, 1);
+                    return lease;
+                },
+                .fill => |index| {
+                    fill = index;
+                    break;
+                },
+                .wait => |epoch| {
+                    try cache.graph_metric_routing.awaitFill(session.io, session.cancellation, epoch);
+                },
+            }
         }
     }
     // Reserve transient decode memory before fetching/duplicating the footer.
@@ -822,10 +836,10 @@ fn acquireRouting(
         (metric_segment.codec.max_persisted_top_entries / metric_segment.codec.ranked_score_block_entries + 1) * @sizeOf(metric_segment.codec.RankedRoutingEntry);
     const reservation = std.math.add(usize, footer_bytes, routing_bytes) catch return error.GraphMetricQueryBudgetExceeded;
     try session.chargeGraphMetricRetained(std.math.add(usize, reservation, overhead) catch return error.GraphMetricQueryBudgetExceeded);
+    try session.chargeGraphMetricDecode(1, decode_work);
     const footer = try fetchRoutingFooterAlloc(session, metric_index, artifact, version, offset, len);
     var owns_footer = true;
     defer if (owns_footer) session.alloc.free(footer);
-    try session.chargeGraphMetricDecode(1, decode_work);
     const owner = if (session.cache) |cache| cache.alloc else session.alloc;
     const owned = if (owner.ptr == session.alloc.ptr and owner.vtable == session.alloc.vtable) blk: {
         owns_footer = false;
