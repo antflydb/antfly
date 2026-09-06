@@ -13317,6 +13317,13 @@ export interface components {
         StatefulGraphQueryResults: {
             [key: string]: components["schemas"]["StatefulGraphResult"];
         };
+        /** @description An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation. */
+        IndexMutationConflictError: {
+            /** @enum {string} */
+            error: "table_mutation_conflict" | "artifact_dependency_conflict" | "metadata_mutation_outcome_unknown";
+            message: string;
+            retryable: boolean;
+        };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
          *     Useful for testing evaluators without running a query.
@@ -15175,6 +15182,17 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The index mutation conflicts with current state, or its commit outcome could not be proven. */
+        IndexMutationConflict: {
+            headers: {
+                /** @description Present with value `unknown-v1` only when the mutation may already have committed and must not be blindly retried. */
+                "X-Antfly-Raft-Mutation-Outcome"?: "unknown-v1";
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationConflictError"];
             };
         };
         /** @description Method not allowed for this resource */
@@ -17742,7 +17760,7 @@ export interface operations {
             400: components["responses"]["IndexMutationBadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
-            409: components["responses"]["Conflict"];
+            409: components["responses"]["IndexMutationConflict"];
             /** @description Graph resolver destinations cannot be bound to this credential type */
             422: {
                 headers: {
@@ -17779,6 +17797,9 @@ export interface operations {
                 content?: never;
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

@@ -494,6 +494,8 @@ from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
 from .index_milestone_status import IndexMilestoneStatus
 from .index_milestones import IndexMilestones
+from .index_mutation_conflict_error import IndexMutationConflictError
+from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
 from .index_publication_policy import IndexPublicationPolicy
@@ -1501,6 +1503,8 @@ __all__ = (
     "IndexExecutionConfig",
     "IndexMilestones",
     "IndexMilestoneStatus",
+    "IndexMutationConflictError",
+    "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
     "IndexPublicationPolicy",

@@ -1784,10 +1784,13 @@ pub const OpenOptions = struct {
     node_config: ?*const common_config.Config = null,
     connection: ?[]const u8 = null,
     required_capability: []const u8 = "",
-    /// Borrow the server's shared backend runtime for dynamic credential HTTP
-    /// refresh. CLI and embedded callers may omit it and receive an owned
-    /// threaded fallback.
-    io: ?std.Io = null,
+    /// Network-only authority retained by remote object clients and dynamic
+    /// credential refresh. Callers may omit it and receive an owned threaded
+    /// fallback.
+    network_io: ?std.Io = null,
+    /// Filesystem-only authority used while resolving local repository paths
+    /// and credential files. It is never retained as the remote transport.
+    filesystem_io: ?std.Io = null,
 };
 
 fn createOwnedThreadedIo(alloc: std.mem.Allocator) !*std.Io.Threaded {
@@ -1817,11 +1820,18 @@ const AwsCredentialContext = struct {
     cache: bedrock.CredentialCache = .{},
     region: []u8,
     source: bedrock.CredentialSource,
+    filesystem_io: ?std.Io,
 
-    fn init(alloc: std.mem.Allocator, region: []const u8, source: bedrock.CredentialSource, shared_io: ?std.Io) !AwsCredentialContext {
+    fn init(
+        alloc: std.mem.Allocator,
+        region: []const u8,
+        source: bedrock.CredentialSource,
+        network_io: ?std.Io,
+        filesystem_io: ?std.Io,
+    ) !AwsCredentialContext {
         const owned_region = try alloc.dupe(u8, region);
         errdefer alloc.free(owned_region);
-        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
+        const io_impl: ?*std.Io.Threaded = if (network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
@@ -1831,9 +1841,10 @@ const AwsCredentialContext = struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .http = httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
+            .http = httpx.Client.init(alloc, network_io orelse io_impl.?.io()),
             .region = owned_region,
             .source = source,
+            .filesystem_io = filesystem_io,
         };
     }
 
@@ -1855,7 +1866,13 @@ const AwsCredentialContext = struct {
     fn get(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!object_storage.S3.DynamicCredentials {
         const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
         _ = alloc;
-        const lease = try self.cache.getLeaseForSource(self.alloc, &self.http, self.region, self.source);
+        const lease = try self.cache.getLeaseForSourceWithIo(
+            self.alloc,
+            &self.http,
+            self.filesystem_io,
+            self.region,
+            self.source,
+        );
         const credentials = lease.credentials();
         return .{
             .access_key_id = @constCast(credentials.access_key_id),
@@ -1927,7 +1944,8 @@ fn s3ConfigForConnection(
     alloc: std.mem.Allocator,
     external: common_config.Config.ExternalIoConnectionConfig,
     credential_context: *?*AwsCredentialContext,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !object_storage.S3.Config {
     const static = external.credentials.source == .static;
     var cfg = try object_storage.S3.fromEnvAlloc(
@@ -1962,7 +1980,13 @@ fn s3ConfigForConnection(
     };
     const context = try alloc.create(AwsCredentialContext);
     errdefer alloc.destroy(context);
-    context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, source, io);
+    context.* = try AwsCredentialContext.init(
+        alloc,
+        cfg.credentials.region,
+        source,
+        network_io,
+        filesystem_io,
+    );
     credential_context.* = context;
     cfg.credential_provider = context.provider();
     return cfg;
@@ -2011,14 +2035,14 @@ const RemoteBackupStore = struct {
     }
 
     fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
-        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+        const io_impl: ?*std.Io.Threaded = if (options.network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
             owned.deinit();
             alloc.destroy(owned);
         };
-        const io = options.io orelse io_impl.?.io();
+        const network_io = options.network_io orelse io_impl.?.io();
         const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
         errdefer alloc.destroy(gcs);
         var create_bucket_if_missing = false;
@@ -2035,12 +2059,18 @@ const RemoteBackupStore = struct {
             );
             create_bucket_if_missing = external.bucket_provisioning == .create_if_missing;
             resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, external, options.secret_store);
-            break :blk try gcsConfigForConnection(alloc, resolved_credentials.?.apply(external), io);
-        } else blk: {
-            var env_cfg = try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
-            env_cfg.io = io;
-            break :blk env_cfg;
-        };
+            break :blk try gcsConfigForConnection(
+                alloc,
+                resolved_credentials.?.apply(external),
+                network_io,
+                options.filesystem_io,
+            );
+        } else try object_storage.Gcs.jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
+            alloc,
+            null,
+            network_io,
+            options.filesystem_io,
+        );
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
         errdefer {
             var client = gcs.client();
@@ -2053,7 +2083,7 @@ const RemoteBackupStore = struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .io = io,
+            .io = network_io,
             .client = gcs.client(),
             .gcs_client = gcs,
             .resolved_credentials = resolved_credentials,
@@ -2069,14 +2099,14 @@ const RemoteBackupStore = struct {
         prefix: []const u8,
         options: OpenOptions,
     ) !RemoteBackupStore {
-        const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
+        const io_impl: ?*std.Io.Threaded = if (options.network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
             owned.deinit();
             alloc.destroy(owned);
         };
-        const io = options.io orelse io_impl.?.io();
+        const network_io = options.network_io orelse io_impl.?.io();
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
         var credential_context: ?*AwsCredentialContext = null;
@@ -2091,7 +2121,13 @@ const RemoteBackupStore = struct {
             const connection = try authorizedObjectConnection(options.node_config orelse return error.ConnectionConfigUnavailable, connection_id, .s3, bucket, prefix, options.required_capability);
             create_bucket_if_missing = connection.bucket_provisioning == .create_if_missing;
             resolved_credentials = try common_config.Config.resolveExternalIoCredentials(alloc, connection, options.secret_store);
-            break :blk try s3ConfigForConnection(alloc, resolved_credentials.?.apply(connection), &credential_context, io);
+            break :blk try s3ConfigForConnection(
+                alloc,
+                resolved_credentials.?.apply(connection),
+                &credential_context,
+                network_io,
+                options.filesystem_io,
+            );
         } else blk: {
             var overrides = try loadS3SecretOverrides(alloc, options.secret_store);
             defer overrides.deinit(alloc);
@@ -2106,7 +2142,7 @@ const RemoteBackupStore = struct {
                 .path,
             );
         };
-        cfg.io = io;
+        cfg.io = network_io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
         errdefer {
             var client = s3.client();
@@ -2119,7 +2155,7 @@ const RemoteBackupStore = struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .io = io,
+            .io = network_io,
             .client = s3.client(),
             .s3_client = s3,
             .credential_context = credential_context,
@@ -2650,6 +2686,7 @@ const RemoteBackupStore = struct {
     fn writeFile(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        source_io: std.Io,
         suffix: []const u8,
         src_path: []const u8,
         content_type: []const u8,
@@ -2659,7 +2696,7 @@ const RemoteBackupStore = struct {
         try self.ensureBucketWithCancellation(cancellation);
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        var result = try self.client.putFileWithIo(self.io, self.bucket, key, src_path, .{
+        var result = try self.client.putFileWithIo(source_io, self.bucket, key, src_path, .{
             .content_type = content_type,
             .cancellation = objectCancellationToken(cancellation),
         });
@@ -3008,15 +3045,16 @@ const RemoteBackupStore = struct {
         };
     }
 
-    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, dest_path: []const u8) !void {
+    fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, destination_io: std.Io, suffix: []const u8, dest_path: []const u8) !void {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
-        try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
+        try self.client.getFileWithIo(destination_io, self.bucket, key, dest_path, .{});
     }
 
     fn copyFileVerified(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         suffix: []const u8,
         destination_path: []const u8,
         expected_size: u64,
@@ -3031,10 +3069,10 @@ const RemoteBackupStore = struct {
             return error.BackupArtifactIntegrityMismatch;
         const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
         if (std.fs.path.dirname(destination_path)) |parent|
-            try ensureDirPathWithIo(self.io, parent);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, destination_path) catch {};
-        var destination = try fs_paths.createFilePortable(self.io, destination_path, .{ .truncate = true });
-        defer destination.close(self.io);
+            try ensureDirPathWithIo(destination_io, parent);
+        errdefer std.Io.Dir.cwd().deleteFile(destination_io, destination_path) catch {};
+        var destination = try fs_paths.createFilePortable(destination_io, destination_path, .{ .truncate = true });
+        defer destination.close(destination_io);
 
         const object_cancellation = object_storage.CancellationToken.fromCallback(
             cancellation.ptr,
@@ -3058,7 +3096,7 @@ const RemoteBackupStore = struct {
             defer result.deinit(alloc);
             if (result.body.len != wanted) return error.SourceFileChanged;
             hasher.update(result.body);
-            try destination.writePositionalAll(self.io, result.body, offset);
+            try destination.writePositionalAll(destination_io, result.body, offset);
             offset += wanted;
         }
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -3066,7 +3104,7 @@ const RemoteBackupStore = struct {
         const actual = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &actual, expected_sha256))
             return error.BackupArtifactIntegrityMismatch;
-        try destination.sync(self.io);
+        try destination.sync(destination_io);
     }
 
     fn listObjectsPage(
@@ -3106,6 +3144,7 @@ const RemoteBackupStore = struct {
     fn uploadDirectoryRecursive(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        source_io: std.Io,
         src_path: []const u8,
         dest_suffix: []const u8,
         cancellation: CancellationToken,
@@ -3113,7 +3152,7 @@ const RemoteBackupStore = struct {
         try cancellation.check();
         try self.ensureBucketWithCancellation(cancellation);
 
-        const io = self.io;
+        const io = source_io;
 
         var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
         defer src_dir.close(io);
@@ -3144,18 +3183,22 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, 1000, .none);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, 1000, .none);
     }
 
     fn downloadDirectoryRecursiveWithCancellation(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         src_suffix: []const u8,
         dest_path: []const u8,
         cancellation: CancellationToken,
     ) !void {
         return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(
             alloc,
+            destination_io,
             src_suffix,
             dest_path,
             1000,
@@ -3164,12 +3207,15 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
-        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, page_size, .none);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, page_size, .none);
     }
 
     fn downloadDirectoryRecursiveWithPageSizeAndCancellation(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
+        destination_io: std.Io,
         src_suffix: []const u8,
         dest_path: []const u8,
         page_size: u32,
@@ -3193,7 +3239,7 @@ const RemoteBackupStore = struct {
         // Preserve that fast path for uncancellable callers; restore jobs use
         // per-object transfers so active provider requests can be interrupted.
         if (object_cancellation == null) {
-            if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
+            if (try self.client.getPrefixWithIo(destination_io, self.bucket, key_prefix, dest_path)) |downloaded| {
                 if (downloaded == 0) return error.FileNotFound;
                 return;
             }
@@ -3224,7 +3270,7 @@ const RemoteBackupStore = struct {
                 try validateArtifactRelativePath(rel);
                 const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
                 defer alloc.free(dest_file);
-                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{
+                try self.client.getFileWithIo(destination_io, self.bucket, entry.key, dest_file, .{
                     .cancellation = object_cancellation,
                 });
                 found = true;
@@ -3245,10 +3291,16 @@ const RemoteBackupStore = struct {
 pub fn gcsConfigForConnection(
     alloc: std.mem.Allocator,
     external: common_config.Config.ExternalIoConnectionConfig,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !object_storage.Gcs.JsonApiConfig {
     var cfg = switch (external.gcs_credentials.source) {
-        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc),
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
+            alloc,
+            external.gcs_credentials.scope,
+            network_io,
+            filesystem_io,
+        ),
         .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
             alloc,
             external.gcs_credentials.bearer_token orelse return error.InvalidConnectionCredentials,
@@ -3258,7 +3310,7 @@ pub fn gcsConfigForConnection(
             var account = if (external.gcs_credentials.service_account_json) |raw|
                 try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
             else
-                try google_auth.serviceAccountFromFileAllocWithIo(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials, io);
+                try google_auth.serviceAccountFromFileAllocWithIo(alloc, external.gcs_credentials.credentials_path orelse return error.InvalidConnectionCredentials, filesystem_io);
             var account_owned = true;
             errdefer if (account_owned) account.deinit(alloc);
             const account_project_id = if (account.project_id) |value| try alloc.dupe(u8, value) else null;
@@ -3272,7 +3324,12 @@ pub fn gcsConfigForConnection(
             errdefer auth_cfg.deinit(alloc);
             const source = try alloc.create(google_auth.CachedTokenSource);
             errdefer alloc.destroy(source);
-            source.* = try google_auth.CachedTokenSource.initWithIo(alloc, auth_cfg, io);
+            source.* = try google_auth.CachedTokenSource.initWithAuthorities(
+                alloc,
+                auth_cfg,
+                network_io,
+                filesystem_io,
+            );
             var value = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
             value.auth = .{ .google_token_source = source };
             if (external.project_id orelse account_project_id) |project_id| value.project_id = try alloc.dupe(u8, project_id);
@@ -3280,7 +3337,7 @@ pub fn gcsConfigForConnection(
         },
     };
     errdefer cfg.deinit(alloc);
-    cfg.io = io;
+    cfg.io = network_io;
     if (external.endpoint) |endpoint| {
         alloc.free(cfg.endpoint);
         cfg.endpoint = try alloc.dupe(u8, endpoint);
@@ -3599,7 +3656,7 @@ pub fn openBackupLocationWithOptions(
                 connection_id,
                 options.required_capability,
             );
-            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location, options.io) };
+            return .{ .file = try resolveFilesystemLocationAlloc(alloc, external.root.?, location, options.filesystem_io) };
         }
         return .{ .file = try alloc.dupe(u8, try parseFileLocation(location)) };
     }
@@ -13814,16 +13871,39 @@ pub fn copyDirectoryToLocationWithCancellation(
     src_path: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    return copyDirectoryToLocationUsingIoWithCancellation(
+        alloc,
+        null,
+        location,
+        backup_id,
+        group_id,
+        src_path,
+        cancellation,
+    );
+}
+
+pub fn copyDirectoryToLocationUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    filesystem_io: ?std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    group_id: u64,
+    src_path: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    // `filesystem_io` owns only the local source tree. Remote object clients
+    // retain their configured transport I/O for repository requests.
     try cancellation.check();
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const dest_root = try shardSnapshotPath(alloc, backup_root, backup_id, group_id);
             defer alloc.free(dest_root);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
             try copyDirectoryRecursiveWithIo(
                 alloc,
-                io_impl.io(),
+                source_io,
                 src_path,
                 dest_root,
                 .transient,
@@ -13833,7 +13913,7 @@ pub fn copyDirectoryToLocationWithCancellation(
         .remote => |*store| {
             const dest_suffix = try shardSnapshotRelPath(alloc, backup_id, group_id);
             defer alloc.free(dest_suffix);
-            try store.uploadDirectoryRecursive(alloc, src_path, dest_suffix, cancellation);
+            try store.uploadDirectoryRecursive(alloc, source_io, src_path, dest_suffix, cancellation);
         },
     }
 }
@@ -13849,14 +13929,14 @@ pub fn copyDirectoryFromLocation(
 
 pub fn copyDirectoryFromLocationUsingIo(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    destination_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
     return try copyDirectoryFromLocationUsingIoWithCancellation(
         alloc,
-        shared_io,
+        destination_io,
         location,
         snapshot_path,
         dest_path,
@@ -13866,28 +13946,28 @@ pub fn copyDirectoryFromLocationUsingIo(
 
 pub fn copyDirectoryFromLocationUsingIoWithCancellation(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    filesystem_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    // `filesystem_io` owns only the local destination tree. Remote object
+    // clients retain their configured transport I/O for repository requests.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_root);
-            if (shared_io) |io|
-                try copyDirectoryRecursiveWithIo(alloc, io, src_root, dest_path, .transient, cancellation)
-            else {
-                var io_impl = std.Io.Threaded.init(alloc, .{});
-                defer io_impl.deinit();
-                try copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_root, dest_path, .transient, cancellation);
-            }
+            try copyDirectoryRecursiveWithIo(alloc, destination_io, src_root, dest_path, .transient, cancellation);
         },
         .remote => |*store| try store.downloadDirectoryRecursiveWithCancellation(
             alloc,
+            destination_io,
             snapshot_path,
             dest_path,
             cancellation,
@@ -13906,23 +13986,24 @@ pub fn copyFileFromLocation(
 
 pub fn copyFileFromLocationUsingIo(
     alloc: std.mem.Allocator,
-    shared_io: ?std.Io,
+    filesystem_io: ?std.Io,
     location: *BackupLocation,
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    // The explicit I/O authority is for the local destination, not transport.
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_path);
-            if (shared_io) |io|
-                try copyFileAbsoluteWithIoOptions(io, src_path, dest_path, .transient)
-            else
-                try copyFileAbsoluteWithDurability(src_path, dest_path, .transient);
+            try copyFileAbsoluteWithIoOptions(destination_io, src_path, dest_path, .transient);
         },
         .remote => |*store| {
-            try store.readFile(alloc, trimLeftSlash(snapshot_path), dest_path);
+            try store.readFile(alloc, destination_io, trimLeftSlash(snapshot_path), dest_path);
         },
     }
 }
@@ -14009,6 +14090,7 @@ pub fn copyFileFromLocationVerifiedUsingIo(
         },
         .remote => |*store| try store.copyFileVerified(
             alloc,
+            io,
             trimLeftSlash(relative_path),
             destination_path,
             expected_size,
@@ -14043,25 +14125,47 @@ pub fn copyFileToLocationWithCancellation(
     content_type: []const u8,
     cancellation: CancellationToken,
 ) !void {
+    return copyFileToLocationUsingIoWithCancellation(
+        alloc,
+        null,
+        location,
+        snapshot_path,
+        src_path,
+        content_type,
+        cancellation,
+    );
+}
+
+pub fn copyFileToLocationUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    filesystem_io: ?std.Io,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    src_path: []const u8,
+    content_type: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    // The explicit I/O authority is for the local source, not transport.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
+    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (io_impl) |*owned| owned.deinit();
+    const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
         .file => |backup_root| {
             const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(dest_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
             try copyFileAbsoluteWithIoOptionsCancellable(
-                io_impl.io(),
+                source_io,
                 src_path,
                 dest_path,
                 .durable,
                 cancellation,
             );
-            try syncPathAncestorsWithIo(io_impl.io(), std.fs.path.dirname(dest_path) orelse ".");
+            try syncPathAncestorsWithIo(source_io, std.fs.path.dirname(dest_path) orelse ".");
         },
         .remote => |*store| {
-            try store.writeFile(alloc, trimLeftSlash(snapshot_path), src_path, content_type, cancellation);
+            try store.writeFile(alloc, source_io, trimLeftSlash(snapshot_path), src_path, content_type, cancellation);
         },
     }
 }
@@ -16203,10 +16307,15 @@ fn writePortableListValidationFixture(
 ) !void {
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}.afb", .{fixture_backup_id});
     defer alloc.free(artifact_path);
+    const payload = "payload";
+    var integrity = try portableBytesIntegrityAlloc(alloc, payload);
+    defer integrity.deinit(alloc);
     const shards = [_]ShardSnapshot{.{
         .group_id = 1,
         .start_key = "",
         .snapshot_path = artifact_path,
+        .artifact_size_bytes = integrity.size_bytes,
+        .artifact_sha256 = integrity.sha256,
     }};
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 1,
@@ -16215,12 +16324,6 @@ fn writePortableListValidationFixture(
     };
     var manifest = try createManifest(alloc, fixture_backup_id, .portable, &table, &shards);
     defer manifest.deinit(alloc);
-    const payload = "payload";
-    var integrity = try portableBytesIntegrityAlloc(alloc, payload);
-    const mutable_shard = &@constCast(manifest.shards)[0];
-    mutable_shard.artifact_size_bytes = integrity.size_bytes;
-    mutable_shard.artifact_sha256 = integrity.sha256;
-    integrity = undefined;
     switch (location.*) {
         .file => |backup_root| {
             const absolute_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
@@ -21102,7 +21205,7 @@ test "native backup directory copy preserves nested files" {
         ),
     };
     defer remote_location.deinit(alloc);
-    try remote_location.remote.uploadDirectoryRecursive(alloc, src, expected.snapshot_path, .none);
+    try remote_location.remote.uploadDirectoryRecursive(alloc, std.testing.io, src, expected.snapshot_path, .none);
     const remote_verified_top_path = try std.fmt.allocPrint(alloc, "{s}/verified/remote-top.sst", .{root});
     defer alloc.free(remote_verified_top_path);
     try copyFileFromLocationVerifiedUsingIo(
@@ -21446,6 +21549,192 @@ test "backup connections enforce capability bucket and segment bounded prefix" {
     try std.testing.expectError(error.ConnectionCapabilityDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups/daily", "objects.delete"));
     try std.testing.expectError(error.ConnectionBucketDenied, authorizedObjectConnection(&config, "archive", .s3, "other", "tenant-a/backups/daily", "backup.write"));
     try std.testing.expectError(error.ConnectionPrefixDenied, authorizedObjectConnection(&config, "archive", .s3, "prod-archive", "tenant-a/backups-evil", "backup.write"));
+}
+
+test "remote backup connection retains network io instead of filesystem io" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{
+        \\  "connections": {
+        \\    "archive": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
+        \\        "endpoint": "object-storage.internal:9000",
+        \\        "use_ssl": false,
+        \\        "region": "us-east-1",
+        \\        "buckets": ["prod-archive"],
+        \\        "prefix": "tenant-a/backups",
+        \\        "credentials": {
+        \\          "source": "static",
+        \\          "access_key_id": "test-access-key",
+        \\          "secret_access_key": "test-secret-key"
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var config = try common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+
+    var network_impl = std.Io.Threaded.init(alloc, .{});
+    defer network_impl.deinit();
+    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    defer filesystem_impl.deinit();
+    const network_io = network_impl.io();
+    const filesystem_io = filesystem_impl.io();
+
+    var location = try openBackupLocationWithOptions(
+        alloc,
+        "s3://prod-archive/tenant-a/backups/daily",
+        .{
+            .node_config = &config,
+            .connection = "archive",
+            .required_capability = "backup.write",
+            .network_io = network_io,
+            .filesystem_io = filesystem_io,
+        },
+    );
+    defer location.deinit(alloc);
+
+    const retained_io = location.remote.io;
+    try std.testing.expect(retained_io.userdata == network_io.userdata);
+    try std.testing.expect(retained_io.vtable == network_io.vtable);
+    try std.testing.expect(retained_io.userdata != filesystem_io.userdata);
+}
+
+test "dynamic gcs credentials borrow distinct network and filesystem authorities" {
+    const alloc = std.testing.allocator;
+    var network_impl = std.Io.Threaded.init(alloc, .{});
+    defer network_impl.deinit();
+    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    defer filesystem_impl.deinit();
+    const network_io = network_impl.io();
+    const filesystem_io = filesystem_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const service_account_json =
+        \\{"type":"service_account","project_id":"archive-project","private_key_id":"kid","private_key":"-----BEGIN PRIVATE KEY-----\\nABC\\n-----END PRIVATE KEY-----\\n","client_email":"archive@example.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}
+    ;
+    const credentials_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/gcs-service-account.json", .{tmp.sub_path});
+    defer alloc.free(credentials_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{
+        .sub_path = credentials_path,
+        .data = service_account_json,
+    });
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "archive": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write"],
+        \\      "external_io": {{
+        \\        "protocol": "gcs",
+        \\        "buckets": ["prod-archive"],
+        \\        "credentials": {{"source":"service_account","credentials_path":"{s}"}}
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{credentials_path});
+    defer alloc.free(json);
+    var config = try common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const external = config.connections.get("archive").?.external_io.?;
+
+    var cfg = try gcsConfigForConnection(alloc, external, network_io, filesystem_io);
+    defer cfg.deinit(alloc);
+    try std.testing.expect(cfg.io.?.userdata == network_io.userdata);
+    try std.testing.expect(cfg.io.?.vtable == network_io.vtable);
+    const source = switch (cfg.auth) {
+        .google_token_source => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(source.io.?.userdata == network_io.userdata);
+    try std.testing.expect(source.filesystem_io.?.userdata == filesystem_io.userdata);
+    try std.testing.expect(source.owned_httpx.?.io_impl == null);
+
+    var fallback_account = try google_auth.parseServiceAccountJsonAlloc(alloc, service_account_json);
+    var fallback_account_owned = true;
+    errdefer if (fallback_account_owned) fallback_account.deinit(alloc);
+    var fallback_auth_cfg = try google_auth.configFromServiceAccountAlloc(alloc, fallback_account, google_auth.default_scope);
+    fallback_account_owned = false;
+    var fallback_cfg_owned = true;
+    errdefer if (fallback_cfg_owned) fallback_auth_cfg.deinit(alloc);
+    var fallback_source = try google_auth.CachedTokenSource.initWithAuthorities(alloc, fallback_auth_cfg, network_io, null);
+    fallback_cfg_owned = false;
+    defer fallback_source.deinit();
+    try std.testing.expect(fallback_source.owned_httpx.?.io_impl == null);
+    try std.testing.expect(fallback_source.owned_filesystem_io != null);
+    try std.testing.expect(fallback_source.filesystem_io.?.userdata != network_io.userdata);
+}
+
+test "dynamic s3 profile and web identity retain explicit credential authorities" {
+    const alloc = std.testing.allocator;
+    var network_impl = std.Io.Threaded.init(alloc, .{});
+    defer network_impl.deinit();
+    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    defer filesystem_impl.deinit();
+    const network_io = network_impl.io();
+    const filesystem_io = filesystem_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const credentials_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/aws-credentials", .{tmp.sub_path});
+    defer alloc.free(credentials_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{
+        .sub_path = credentials_path,
+        .data = "[archive]\naws_access_key_id = AKIAPROFILE\naws_secret_access_key = profile-secret\naws_session_token = profile-token\n",
+    });
+    const token_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/web-identity-token", .{tmp.sub_path});
+    defer alloc.free(token_path);
+    try std.Io.Dir.cwd().writeFile(filesystem_io, .{ .sub_path = token_path, .data = "signed-token\n" });
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "profile": {{"kind":"external_io","capabilities":["backup.write"],"external_io":{{"protocol":"s3","region":"us-east-1","buckets":["prod-archive"],"credentials":{{"source":"profile","profile":"archive","shared_credentials_file":"{s}"}}}}}},
+        \\    "web": {{"kind":"external_io","capabilities":["backup.write"],"external_io":{{"protocol":"s3","region":"us-east-1","buckets":["prod-archive"],"credentials":{{"source":"web_identity","role_arn":"arn:aws:iam::123456789012:role/archive","token_file":"{s}","session_name":"antfly-test","sts_endpoint":"http://sts.invalid"}}}}}}
+        \\  }}
+        \\}}
+    , .{ credentials_path, token_path });
+    defer alloc.free(json);
+    var config = try common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+
+    var profile_context: ?*AwsCredentialContext = null;
+    var profile_cfg = try s3ConfigForConnection(alloc, config.connections.get("profile").?.external_io.?, &profile_context, network_io, filesystem_io);
+    defer profile_cfg.deinit(alloc);
+    defer {
+        profile_context.?.deinit();
+        alloc.destroy(profile_context.?);
+    }
+    try std.testing.expect(profile_context.?.io_impl == null);
+    try std.testing.expect(profile_context.?.http.io.userdata == network_io.userdata);
+    try std.testing.expect(profile_context.?.filesystem_io.?.userdata == filesystem_io.userdata);
+    var credentials = try profile_cfg.credential_provider.?.get(alloc);
+    defer credentials.deinit(alloc);
+    try std.testing.expectEqualStrings("AKIAPROFILE", credentials.access_key_id);
+    try std.testing.expectEqualStrings("profile-secret", credentials.secret_access_key);
+
+    var web_context: ?*AwsCredentialContext = null;
+    var web_cfg = try s3ConfigForConnection(alloc, config.connections.get("web").?.external_io.?, &web_context, network_io, filesystem_io);
+    defer web_cfg.deinit(alloc);
+    defer {
+        web_context.?.deinit();
+        alloc.destroy(web_context.?);
+    }
+    try std.testing.expect(web_context.?.io_impl == null);
+    try std.testing.expect(web_context.?.http.io.userdata == network_io.userdata);
+    try std.testing.expect(web_context.?.filesystem_io.?.userdata == filesystem_io.userdata);
+    switch (web_context.?.source) {
+        .web_identity => |identity| try std.testing.expectEqualStrings(token_path, identity.token_file),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try bedrock.testCredentialFilesUseSuppliedFilesystemAuthority();
 }
 
 test "backup identifiers and artifact paths reject traversal" {

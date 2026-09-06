@@ -108,6 +108,7 @@ comptime {
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
+    _ = @import("db/publication.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
     _ = @import("db/query/relational_projection.zig");

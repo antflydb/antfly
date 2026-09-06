@@ -31,6 +31,86 @@ from test_standalone import (
     _resolve_binary_path,
 )
 
+_UNSETTLED_EMBEDDING_PHASES = {
+    "preparing",
+    "embedding",
+    "publishing",
+    "waiting_retry",
+}
+_UNSETTLED_COMPLETE_BLOCKERS = {
+    "target_observation",
+    "source_coverage",
+    "replay",
+    "publication",
+}
+
+
+def _index_has_unsettled_enrichment_work(status: dict) -> bool:
+    """Recognize owned work without treating unknown coverage as zero."""
+
+    source_coverage = status.get("source_coverage")
+    if isinstance(source_coverage, dict):
+        pending = source_coverage.get("pending")
+        if type(pending) is int and pending > 0:
+            return True
+
+    activity = status.get("activity")
+    if (
+        isinstance(activity, dict)
+        and activity.get("phase") in _UNSETTLED_EMBEDDING_PHASES
+    ):
+        return True
+
+    milestones = status.get("milestones")
+    complete = milestones.get("complete") if isinstance(milestones, dict) else None
+    if isinstance(complete, dict) and complete.get("reached") is False:
+        blockers = complete.get("blockers")
+        if isinstance(blockers, list) and any(
+            blocker in _UNSETTLED_COMPLETE_BLOCKERS for blocker in blockers
+        ):
+            return True
+
+    replay_applied = status.get("replay_applied_sequence")
+    replay_target = status.get("replay_target_sequence")
+    if (
+        type(replay_applied) is int
+        and type(replay_target) is int
+        and replay_applied < replay_target
+    ):
+        return True
+    return (
+        status.get("catch_up_active") is True or status.get("backfill_active") is True
+    )
+
+
+def test_unsettled_enrichment_accepts_nullable_coverage_observation():
+    status = {
+        "source_coverage": {
+            "observation_complete": False,
+            "pending": None,
+        },
+        "milestones": {
+            "complete": {
+                "reached": False,
+                "blockers": ["target_observation", "source_coverage"],
+            }
+        },
+    }
+
+    assert _index_has_unsettled_enrichment_work(status)
+
+
+def test_unsettled_enrichment_does_not_infer_work_from_unknown_coverage_alone():
+    status = {
+        "source_coverage": {
+            "observation_complete": False,
+            "pending": None,
+        },
+        "milestones": {"complete": {"reached": False, "blockers": []}},
+    }
+
+    assert not _index_has_unsettled_enrichment_work(status)
+
 
 @pytest.fixture(scope="function")
 def standalone_lifecycle_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -181,17 +261,10 @@ def test_standalone_drop_drains_pending_enrichment_work(
                 assert isinstance(detail, dict)
                 latest_statuses[table_name] = detail
                 status = detail.get("status", {})
-                coverage = status.get("coverage", {})
                 provider_limited = (
                     rate_limited_openai_embedder.stats()["rate_limited_requests"] > 0
                 )
-                work_pending = (
-                    int(coverage.get("pending", 0)) > 0
-                    or int(status.get("replay_applied_sequence", 0))
-                    < int(status.get("replay_target_sequence", 0))
-                    or status.get("catch_up_active") is True
-                    or status.get("backfill_active") is True
-                )
+                work_pending = _index_has_unsettled_enrichment_work(status)
                 if provider_limited and work_pending:
                     return detail
             return None

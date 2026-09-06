@@ -924,6 +924,46 @@ pub const Operations = struct {
             else => error.Internal,
         };
     }
+
+    pub fn acceptIndexTarget(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        target: metadata_mod.IndexActivationTarget,
+    ) Error!metadata_mod.IndexActivationProgress {
+        try request.ensureActive();
+        if (target.group_id != group_id or target.table_name.len == 0 or
+            target.index_name.len == 0 or target.indexes_json.len == 0)
+            return error.InvalidArgument;
+        const adapter = self.shard_db_adapter orelse return error.NotFound;
+        return adapter.activateIndex(alloc, target) catch |err| switch (err) {
+            error.UnknownGroup => return error.NotFound,
+            error.InvalidIndexActivationTarget => return .{
+                .state = .action_required,
+                .error_code = .invalid_target,
+            },
+            error.IndexActivationTargetConflict => return .{
+                .state = .action_required,
+                .error_code = .conflicting_target,
+            },
+            error.UnsupportedOperation => return .{
+                .state = .action_required,
+                .error_code = .unsupported,
+            },
+            error.GroupLeaderUnavailable => return error.GroupLeaderUnavailable,
+            error.StaleIndexActivationTarget => return .{ .state = .stale },
+            error.OutOfMemory,
+            error.ResourceBudgetExceeded,
+            error.BackgroundOwnerClosing,
+            error.RuntimeStatusPublicationFenced,
+            => return error.Unavailable,
+            else => return .{
+                .state = .action_required,
+                .error_code = .internal,
+            },
+        };
+    }
 };
 
 fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void {

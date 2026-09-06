@@ -1498,6 +1498,25 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
     };
 }
 
+/// Whether request execution binds `index_name` directly as a full-text index.
+/// Keep planning, binding validation, and API lifecycle error classification
+/// on one definition so an unavailable index cannot change a permanent shape
+/// error into a retryable rebuilding response.
+pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
+    return req.full_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
+}
+
+/// Structured text filters use their own resolution chain: the routed primary
+/// text index, then the root index, then the default full-text index. Keep that
+/// distinct from direct root-index binding so preflight does not reject a
+/// valid request merely because its semantic root index is not full-text.
+pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
+    return req.filter_text != null or req.exclusion_text != null;
+}
+
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;

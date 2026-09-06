@@ -16,7 +16,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const common = @import("http_common.zig");
 const std_http_listener = @import("std_http_listener.zig");
-const threaded_connect_io = @import("threaded_connect_io.zig");
+const threaded_connect_io = @import("../threaded_connect_io.zig");
 
 const cancellation_poll_interval_ms: i64 = 25;
 
@@ -107,13 +107,14 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
+        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
-            .io = threaded_connect_io.io(io_impl, io_vtable),
+            .io = safe_io,
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
-        self.resolved_client = httpx.Client.initWithConfig(alloc, io_impl.io(), resolvedClientConfig(cfg));
+        self.resolved_client = httpx.Client.initWithConfig(alloc, safe_io, resolvedClientConfig(cfg));
     }
 
     pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *std.Io.Threaded) void {
@@ -135,13 +136,14 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
+        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
-            .io = threaded_connect_io.io(io_impl, io_vtable),
+            .io = safe_io,
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
-        self.resolved_client = httpx.Client.initWithConfig(alloc, io_impl.io(), resolvedClientConfig(cfg));
+        self.resolved_client = httpx.Client.initWithConfig(alloc, safe_io, resolvedClientConfig(cfg));
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) StdHttpExecutor {
@@ -926,6 +928,15 @@ test "std http executor owns a finite controlled request worker budget" {
     defer executor.deinit();
 
     try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.concurrent_limit);
+}
+
+test "std http executor applies the safe connector to both transports" {
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expect(executor.client.io.vtable == executor.io_vtable);
+    try std.testing.expect(executor.resolved_client.io.vtable == executor.io_vtable);
+    try std.testing.expect(executor.io_impl.io().vtable.netConnectIp != executor.io_vtable.netConnectIp);
 }
 
 test "controlled HTTP completion time arbitrates the absolute deadline" {

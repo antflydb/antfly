@@ -29,6 +29,7 @@ pub const fs_paths = @import("fs_paths.zig");
 pub const byte_copy = @import("byte_copy.zig");
 pub const cache_budget = @import("cache_budget.zig");
 pub const threaded_io_limits = @import("threaded_io_limits.zig");
+pub const threaded_connect_io = @import("threaded_connect_io.zig");
 
 test {
     _ = provider_registry;
@@ -48,4 +49,5 @@ test {
     _ = byte_copy;
     _ = cache_budget;
     _ = threaded_io_limits;
+    _ = threaded_connect_io;
 }

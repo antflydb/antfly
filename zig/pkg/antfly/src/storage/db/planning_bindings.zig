@@ -37,19 +37,12 @@ pub fn validateSearchRequestBindings(
     }
 }
 
-fn preflightRequestNeedsPrimaryTextIndex(req: types.SearchRequest) bool {
-    return req.full_text != null or
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query));
-}
-
 fn validateTextBindings(
     core: *db_core.DBCore,
     alloc: Allocator,
     req: types.SearchRequest,
 ) !void {
-    const needs_primary_text_index = preflightRequestNeedsPrimaryTextIndex(req);
+    const needs_primary_text_index = query_search.requestBindsRootTextIndex(req);
     if (needs_primary_text_index) {
         const entry = core.textIndexEntry(req.index_name) orelse return error.IndexNotFound;
         {

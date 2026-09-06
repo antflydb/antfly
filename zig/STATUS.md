@@ -411,6 +411,37 @@ cannot revoke a published serving generation or reset its counters. Explicit
 root replacement, exact-index mutation, and corruption fences remain the only
 paths that can revoke the corresponding serving authority.
 
+Local writable owners publish independent serving and coverage stamps, scoped
+by the enclosing exact index identity and table root. A stamp contains a local
+owner epoch, observation revision, and the applied replay prefix sampled before
+the corresponding facts. Captures are serialized on the owner, not on HTTP
+readers. New authoritative revisions replace facts even when counts decrease;
+counts are not ordering tokens. Reusing a stamp with different facts is rejected.
+Metadata relabeling, cloning, and replay-target overlays cannot mint stamps.
+
+A successor owner also supplies an admitted, config-matching durable checkpoint
+prefix. It may replace a previous payload only after that recovery proof covers
+the payload's applied prefix. Older local owners cannot replace their successor.
+Read-only/status-only observations cannot claim writable-owner succession.
+These local stamps are not persisted or sent through the runtime wire codec;
+distributed reporter fencing remains a separate authority.
+
+Commit callbacks merge the maximum target sequence and maximum reducing
+sequence independently. An older delete callback must not be discarded merely
+because an additive callback arrived first. The merge is idempotent and uses
+constant space per exact index/group. A callback watermark does not authorize
+publication: an owner may publish intermediate progress before the newest
+accepted delete is applied. Physical topology and coverage bucket counts are
+not generally monotonic, even in the absence of source deletes.
+
+Chunk retirement is reducing work for each vector projection bound to that
+chunk source, even when surviving chunks reuse cached embeddings and emit no
+new vectors. Replay eligibility and delete-key collection use the same source
+scope. Generated projections delete chunk identities; multi-source projections
+delete their configured embedding-artifact identities. Those identities are
+derived from catalog bindings, not from already-deleted artifact rows, and
+unrelated source projections remain untouched.
+
 Distributed publication has two released profiles: v12 for v0.2.0 peers and
 v15 for current admission/restore safety facts. V13 and v14 were development
 artifacts and are rejected rather than negotiated. During rolling upgrades,

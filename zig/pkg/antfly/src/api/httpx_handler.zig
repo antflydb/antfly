@@ -78,6 +78,7 @@ const metadata_authority = @import("../metadata/authority.zig");
 const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
+const metadata_shard_db_adapter = @import("../metadata/shard_db_adapter.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -1009,6 +1010,7 @@ pub const AntflyApiHandler = struct {
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
+        try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
@@ -1082,6 +1084,16 @@ pub const AntflyApiHandler = struct {
                 var retry_after_buf: [10]u8 = undefined;
                 const retry_after = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
                 try ctx.setHeader("Retry-After", retry_after);
+            }
+        }
+        if (@hasField(Response, "metadata_mutation_outcome")) {
+            if (resp.metadata_mutation_outcome) |outcome| {
+                try ctx.setHeader(
+                    metadata_http_routes.Routes.raft_mutation_outcome_header,
+                    switch (outcome) {
+                        .unknown => metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                    },
+                );
             }
         }
         _ = ctx.response.body(resp.body);
@@ -1852,11 +1864,14 @@ pub const AntflyApiHandler = struct {
         if (sharedInternalHttpErrorSpec(err)) |spec|
             return textResponse(ctx, spec.status, spec.message);
         return switch (err) {
+            error.InvalidArgument => textResponse(ctx, 400, "InvalidArgument"),
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
+            error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
+            error.Unavailable => textResponse(ctx, 503, "temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
@@ -1877,6 +1892,28 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer if (median_key) |value| ctx.allocator.free(value);
         return ctx.json(.{ .median_key = median_key });
+    }
+
+    fn internalGroupIndexActivation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const group_id_raw = ctx.param("group_id") orelse return textResponse(ctx, 400, "invalid group id");
+        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch
+            return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse
+            return textResponse(ctx, 400, "invalid index activation target");
+        var parsed = std.json.parseFromSlice(
+            metadata_shard_db_adapter.IndexActivationTarget,
+            ctx.allocator,
+            body,
+            .{ .allocate = .alloc_always },
+        ) catch return textResponse(ctx, 400, "invalid index activation target");
+        defer parsed.deinit();
+        const progress = self.internalGroupOperations().acceptIndexTarget(
+            ctx.allocator,
+            operationContext(ctx, null),
+            group_id,
+            parsed.value,
+        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        return ctx.json(progress);
     }
 
     fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -1907,7 +1944,8 @@ pub const AntflyApiHandler = struct {
             .node_config = self.api_server.cfg.node_config,
             .connection = parsed.value.connection,
             .required_capability = "backup.write",
-            .io = self.api_server.sharedApiIo(),
+            .network_io = self.api_server.sharedApiNetworkIo(),
+            .filesystem_io = self.api_server.sharedApiFilesystemIo(),
         }) catch return textResponse(ctx, 400, "invalid backup location");
         defer location.deinit(ctx.allocator);
 
@@ -4371,7 +4409,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), operationContext(ctx, authenticated_identity));
+        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo(), operationContext(ctx, authenticated_identity));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4449,7 +4487,7 @@ pub const AntflyApiHandler = struct {
             backups_api.default_backup_list_limit;
         if (limit == 0 or limit > backups_api.max_backup_list_limit) return try textResponse(ctx, 400, "invalid backup list limit");
         if (params.cursor) |cursor| backups_api.validateBackupId(cursor) catch return try textResponse(ctx, 400, "invalid backup list cursor");
-        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), .{
+        var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, params.connection, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo(), .{
             .limit = limit,
             .cursor = params.cursor,
         });
@@ -5367,7 +5405,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid backup fence");
         };
-        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiNetworkIo(), self.api_server.sharedApiFilesystemIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

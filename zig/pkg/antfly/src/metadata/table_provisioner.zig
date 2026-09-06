@@ -368,9 +368,8 @@ pub fn reconcileDbIndexTargetWithOptions(
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
-    if (index_name.len == 0 or
-        std.mem.eql(u8, index_name, "resolvers") or
-        std.mem.eql(u8, index_name, "enrichments")) return error.InvalidTableIndexMetadata;
+    if (index_name.len == 0 or indexes_api.isReservedIndexMetadataEntry(index_name))
+        return error.InvalidTableIndexMetadata;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -1010,8 +1009,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
         // by the index reconciler.
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
@@ -1100,7 +1098,7 @@ fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
         }
         return false;
     }
-    if (std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments")) return false;
+    if (indexes_api.isReservedIndexMetadataEntry(name)) return false;
     return object.contains(name);
 }
 
@@ -3123,7 +3121,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     );
@@ -3317,7 +3315,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     ));
