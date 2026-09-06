@@ -418,6 +418,17 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
     };
 }
 
+fn qwen3VlAutomaticPrefillForProfile(profile: ?CapabilityProfile) bool {
+    return profile != null and profile.? == .qwen3_vl_generation;
+}
+
+test "Qwen3-VL automatic prefill is model scoped" {
+    try std.testing.expect(qwen3VlAutomaticPrefillForProfile(.qwen3_vl_generation));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.gemma4));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.qwen3_embedding));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(null));
+}
+
 fn kernelJitRouteCount(routes: kernels_mod.JitProductionRoutes) usize {
     return @as(usize, @intFromBool(routes.mmv)) +
         @as(usize, @intFromBool(routes.mm)) +
@@ -2224,7 +2235,7 @@ pub const CudaCompute = struct {
         }
         var ctx = try context_mod.CudaContext.initDefault();
         errdefer ctx.deinit();
-        const kernels = if (profile) |value|
+        var kernels = if (profile) |value|
             kernels_mod.KernelModule.loadWithKernelJitForScopeAndLoadContext(
                 &ctx,
                 allocator,
@@ -2243,6 +2254,7 @@ pub const CudaCompute = struct {
                 jit_config,
                 load_context,
             );
+        kernels.qwen3vl_automatic_prefill = qwen3VlAutomaticPrefillForProfile(profile);
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -3210,93 +3222,6 @@ pub const CudaCompute = struct {
             .owns_shape = false,
             .owned_by_tensor = false,
         });
-    }
-
-    /// Cache a quantized tensor from an external, model-scoped GGUF store in
-    /// this CUDA session. Qwen3-VL uses a separate projector file, so its
-    /// weights are not present in the decoder's ordinary resident map. The
-    /// stable cache key keeps the upload resident across requests. The
-    /// returned tensor is a heap-stable wrapper that borrows storage from the
-    /// session-owned map; returning the map value's address directly would
-    /// leave request caches with dangling pointers after a later map rehash.
-    pub fn cacheExternalQuantizedStorage(
-        cb: *const ops.ComputeBackend,
-        cache_key: []const u8,
-        storage_value: weight_source_mod.QuantizedStorage,
-        output_shape: []const i64,
-    ) !CT {
-        var storage = storage_value;
-        defer storage.deinit();
-        if (cb.kind() != .cuda) return error.UnsupportedTensorType;
-        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.resident_weights.getPtr(cache_key)) |tensor| {
-            return createBorrowedTensorWrapper(self, tensor);
-        }
-        if (storage.packed_expert != null or output_shape.len != 2 or
-            output_shape[0] <= 0 or output_shape[1] <= 0 or
-            knownQuantTensorType(storage.tensor_type) == null)
-        {
-            return error.UnsupportedTensorType;
-        }
-        const source_elements = try elementCountFromShape(storage.shape);
-        const output_elements = try elementCountFromShape(output_shape);
-        if (source_elements != output_elements) return error.InvalidShape;
-
-        const owned_key = try self.allocator.dupe(u8, cache_key);
-        errdefer self.allocator.free(owned_key);
-        const shape = try self.allocator.dupe(i64, output_shape);
-        errdefer self.allocator.free(shape);
-        var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
-        errdefer device.free(&self.ctx);
-        // GgufStore marks its tensor-data region MADV_RANDOM by default so
-        // arbitrary CPU consumers do not pull multi-gigabyte checkpoints into
-        // RAM. This path immediately scans the complete tensor for a resident
-        // CUDA upload, so restore readahead for the exact borrowed span just
-        // like the ordinary model-residency uploader does. Without this hint,
-        // a lazily opened Qwen3-VL projector faults its Q8 file one page at a
-        // time and can spend tens of seconds preparing the first image.
-        if (storage.raw_mmap_backed) {
-            c_file.MmapRegion.adviseBytesSequential(storage.raw_bytes);
-        }
-        try copyFromHostTracked(self, device, storage.raw_bytes);
-        var tc_quant = try self.prepareTensorCoreQuantOnUpload(
-            storage.tensor_type,
-            output_shape,
-            device,
-            storage.raw_bytes,
-        );
-        errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
-        // The storage metadata may own the source mapping. Complete both raw
-        // and optional tensor-core uploads before releasing it.
-        try synchronizeAndDrainDeferredDeviceFrees(self);
-        const packed_bytes = if (tc_quant) |packed_quant| packed_quant.bytes else 0;
-        const resident_weight_bytes = try checkedAdd(
-            self.stats.resident_weight_bytes,
-            try checkedAdd(storage.raw_bytes.len, packed_bytes),
-        );
-        // Allocate the request-owned wrapper before transferring the key,
-        // shape, and device buffers into resident_weights. Once insertion
-        // succeeds there must be no fallible operation left in this function:
-        // otherwise the errdefers above would release storage now owned by the
-        // map and leave a dangling resident entry behind.
-        const wrapper = try self.allocator.create(CudaTensor);
-        errdefer self.allocator.destroy(wrapper);
-        try self.resident_weights.putNoClobber(self.allocator, owned_key, .{
-            .buffer = device,
-            .dtype = .u8,
-            .shape = shape,
-            .elem_count = output_elements,
-            .quant_type = storage.tensor_type,
-            .tc_quant = tc_quant,
-            .owns_buffer = false,
-            .owns_shape = false,
-            .owned_by_tensor = false,
-        });
-        const resident = self.resident_weights.getPtr(cache_key).?;
-        wrapper.* = borrowedSlotTensor(resident);
-        wrapper.owned_by_tensor = true;
-        self.stats.resident_weight_bytes = resident_weight_bytes;
-        return wrapper;
     }
 
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
@@ -4709,8 +4634,6 @@ fn isApprovedQuantLinearShape(in_dim: usize, out_dim: usize) bool {
     if (in_dim == 3072 and out_dim == 768) return true;
     if (in_dim == 3072 and out_dim == 1536) return true;
     if (in_dim == 4096 and out_dim == 1024) return true;
-    if (in_dim == 4096 and out_dim == 2048) return true;
-    if (in_dim == 4096 and out_dim == 4096) return true;
     return false;
 }
 
@@ -4718,15 +4641,6 @@ fn isTensorCoreQuantLinearShape(in_dim: usize, out_dim: usize) bool {
     if (out_dim == 1) return false;
     if (in_dim == 0 or in_dim % 256 != 0) return false;
     return isApprovedQuantLinearShape(in_dim, out_dim);
-}
-
-test "CUDA tensor-core quant shapes cover Qwen3-VL projector" {
-    try std.testing.expect(isTensorCoreQuantLinearShape(1024, 1024));
-    try std.testing.expect(isTensorCoreQuantLinearShape(1024, 3072));
-    try std.testing.expect(isTensorCoreQuantLinearShape(1024, 4096));
-    try std.testing.expect(isTensorCoreQuantLinearShape(4096, 1024));
-    try std.testing.expect(isTensorCoreQuantLinearShape(4096, 2048));
-    try std.testing.expect(isTensorCoreQuantLinearShape(4096, 4096));
 }
 
 // Shape gate for the opt-in Q4_0 W4A16 tensor-core route. The WMMA kernel needs
@@ -8669,47 +8583,6 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.owns_shape = false;
     borrowed.owned_by_tensor = false;
     return borrowed;
-}
-
-fn createBorrowedTensorWrapper(self: *CudaCompute, resident: *const CudaTensor) !CT {
-    const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = borrowedSlotTensor(resident);
-    // The wrapper itself is request-owned even though every referenced
-    // storage allocation remains owned by the resident session entry.
-    tensor.owned_by_tensor = true;
-    return tensor;
-}
-
-test "external resident weights use stable storage-borrowing wrappers" {
-    var self: CudaCompute = undefined;
-    self.allocator = std.testing.allocator;
-    var shape = [_]i64{ 8, 16 };
-    const resident = CudaTensor{
-        .buffer = .{ .ptr = 0x1234, .len = 128 },
-        .dtype = .u8,
-        .shape = &shape,
-        .elem_count = 128,
-        .tc_quant = .{
-            .buffer = .{ .ptr = 0x5678, .len = 256 },
-            .layout = .q8_0_hmma,
-            .row_blocks = 1,
-            .bytes = 256,
-        },
-        .owns_buffer = false,
-        .owns_shape = false,
-        .owned_by_tensor = false,
-    };
-
-    const wrapper_ct = try createBorrowedTensorWrapper(&self, &resident);
-    const wrapper = tensorFromCt(wrapper_ct);
-    defer std.testing.allocator.destroy(wrapper);
-    try std.testing.expect(wrapper != &resident);
-    try std.testing.expect(wrapper.owned_by_tensor);
-    try std.testing.expect(!wrapper.owns_buffer);
-    try std.testing.expect(!wrapper.owns_tc_quant);
-    try std.testing.expect(!wrapper.owns_shape);
-    try std.testing.expectEqual(resident.buffer.ptr, wrapper.buffer.ptr);
-    try std.testing.expectEqual(resident.tc_quant.?.buffer.ptr, wrapper.tc_quant.?.buffer.ptr);
 }
 
 fn residentTensorForSlot(self: *CudaCompute, tensor: *const CudaTensor) ?*CudaTensor {
