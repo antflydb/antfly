@@ -161,20 +161,24 @@ class CancellationE2E(unittest.TestCase):
             self.assertIn(".exited = 86", log)
         else:
             recovered = self.wait_state(
-                lambda s: s["cancelled"] == 1
-                and s["active"] == 0
-                and s["requests"] == 0
-                and s["units"] == 0
+                lambda s: (
+                    s["cancelled"] == 1
+                    and s["active"] == 0
+                    and s["requests"] == 0
+                    and s["units"] == 0
+                )
             )
             self.assertEqual(recovered["pid"], initial["pid"])
         self.assertEqual(recovered["scratch"], baseline["scratch"])
         self.assertIsNone(self.proc.poll(), "supervisor must survive cancellation")
         self.assertEqual(self.embed(), expected)
         completed = self.wait_state(
-            lambda s: s["active"] == 0
-            and s["requests"] == 0
-            and s["units"] == 0
-            and s["scratch"] == baseline["scratch"]
+            lambda s: (
+                s["active"] == 0
+                and s["requests"] == 0
+                and s["units"] == 0
+                and s["scratch"] == baseline["scratch"]
+            )
         )
         self.assertEqual(completed["pid"], recovered["pid"])
         self.assertEqual(completed["entered"], 1 if mode == "hard" else 3)
