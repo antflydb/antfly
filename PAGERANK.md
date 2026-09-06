@@ -469,15 +469,15 @@ work ceiling meaningful for sparse graphs and prevents HITS from being admitted
 using a cheaper single-vector estimate.
 
 The durable planned runner treats attempt records and per-page contribution
-records as recovery journals, not history. Successful attempt outputs are
-consumed during bounded adoption, and the corresponding per-page contribution
-journal is deleted atomically when its page completes. A shared summary barrier
-is created whenever reduction spans multiple pages, allowing reducers to delete
-consumed contribution totals after the next rank is durable and roll old
-rank/source-factor generations as later iterations advance. The active working
-set is therefore bounded by graph cardinality and page size, not multiplied by
-the configured iteration count; final cleanup still removes the job namespace
-and abandoned attempts.
+records as recovery journals, not history. Iterative producers write immutable,
+attempt-tagged ordinal shards directly in reducer order; the final checkpoint
+and producer completion commit atomically. There is no contribution copy/delete
+adoption pass. Every iterative build uses checkpointed summary leaves and a
+scalar-only root, regardless of node count, because small graphs can still have
+dense edge sets. Consumers select only completed producer attempts and retain
+inputs until the entire consumer phase finishes. Bounded, cursor-based barrier
+cleanup then retires all winning and abandoned shards. The working set does not
+grow with the configured iteration count; final cleanup removes job state.
 
 Scan-page adoption also maintains one target-owned out-degree total per node.
 The retained per-page value is an idempotency ledger: a reclaimed attempt
@@ -566,24 +566,27 @@ an asynchronous child.
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible
 limit. PageRank accepts authenticated, ordinal-aligned seeds from
-the last compatible publication. Reconciliation linearly maps the prior
+the last compatible publication. Both document-backed publication and lake
+reconciliation use the same seed admission and mapping path. It linearly maps the prior
 node-sorted vector onto the new projection, assigns zero to new nodes, skips
 deleted nodes, and lets the kernel validate and normalize the result. A
-disjoint, rejected, over-budget, or incompatible prior artifact cold-starts;
-corrupt object identity still fails closed. Seed admission covers both preparation
+disjoint, rejected, over-budget, incompatible, missing, or corrupt prior artifact
+cold-starts. Unauthenticated seeds are never used; optional fetch failures do not
+block publication from authoritative topology. Cancellation and allocation
+failure still propagate. Seed admission covers both preparation
 (including decoded routing memory) and execution alongside kernel/output memory.
 Cold kernel work is admitted before optional seed I/O. A separate per-publication
 seed budget caps input at 64 MiB and decode/mapping work at 67,108,864 units
 (one prior byte plus one current node per unit). Every actual read is charged,
 including repeated identities; no seed cache is implied. Zero allowance disables
 warm starts. Exhausting this optional budget cold-starts without consuming later
-metrics' cold execution allowance. Materializer epoch 8 fingerprints this policy
+metrics' cold execution allowance. Materializer epoch 9 fingerprints this policy
 and the independently authenticated routing-root format.
 An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 6 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 7 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
 The same job/configuration/epoch fence applies to workers, coordinator phase
@@ -593,20 +596,22 @@ may finish any number of bounded checkpoints, but cannot be reclaimed after expi
 Warm starts preserve PageRank's probability normalization, but finite-iteration
 results and tolerance-based stopping can depend on the seed.
 
-Native jobs above 4,096 global nodes assign stable, partition-local ordinals in
+All iterative native jobs assign stable, partition-local ordinals in
 the initialization producers. The dictionary is immutable for the job and is
 retired with job state. PageRank ranks/source factors and both spectral vectors
 use 256-slot blocks with explicit presence bits; zero and missing output are
 distinct. Sorted multi-get resolves dictionary slots, deduplicates block reads,
 and preserves caller order. Attempt-fenced checkpoint writes update each block
-once and retire obsolete iterations by block. Small jobs keep the inline scalar
-layout to avoid sparse block and dictionary overhead.
+once and retire obsolete iterations by block. Small graphs use the same bounded
+pipeline, with one summary leaf, one scalar root, and one data partition.
 
-Large native jobs compile bounded, immutable ordinal topology checkpoints once
+Iterative native jobs compile bounded, immutable ordinal topology checkpoints once
 per job and contribution lane. Subsequent iterations consume numeric edge and
 vector blocks without parsing document IDs or repeating source dictionary lookups.
 Contribution output is packed by target ordinal block and checkpoint, with the
-producer attempt in its identity. Reducers select only the completed producer's
+producer attempt in its identity. Each producer checkpoint writes at most 4,096
+ordinal values directly to their destination block namespaces; retries do not
+rescan or delete staged output. Reducers select only the completed producer's
 attempt, so a replacement attempt with different checkpoint boundaries cannot
 double-count abandoned output. Document IDs remain at the input/output boundary;
 node-oriented reducer reads still resolve their ordinals through sorted multi-get.

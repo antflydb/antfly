@@ -1579,13 +1579,23 @@ fn warmStartVectorAlloc(
     const seed_budget = batch_budget orelse &local_budget;
     if (!seed_budget.admitSeed(prior.byte_len, current_node_ids.len)) return null;
 
-    const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
+    const payload = artifacts.getVerifiedAllocWithCancellationUsingAllocator(
         alloc,
         prior.artifact_id,
         prior.byte_len,
         prior.checksum,
         cancellation,
-    );
+    ) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => {
+            // The old vector is an optional accelerator, never an input to
+            // the authoritative cold build. Authentication failures must not
+            // use the seed, but must not poison fresh topology publication.
+            try cancellation.check();
+            std.log.warn("graph metric warm start unavailable; using cold seed metric={s} artifact={s} err={s}", .{ config.name, prior.artifact_id, @errorName(err) });
+            return null;
+        },
+    };
     defer alloc.free(payload);
     const header = metric_segment.decodeHeader(payload) catch return null;
     if (header.kind != config.kind or header.materialization_state != .ready or
@@ -2014,6 +2024,15 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
     // retained vector would crowd out otherwise admissible cold execution.
     var unavailable = prior;
     unavailable.artifact_id = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    unavailable.checksum = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, .{}, 0, 0, null)) == null);
+    var mismatched = prior;
+    mismatched.byte_len += 1;
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, mismatched, &current_nodes, config, .none, .{}, 0, 0, null)) == null);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, warmStartVectorAlloc(alloc, &artifacts, prior, &current_nodes, config, CancellationToken.fromAtomic(&canceled), .{}, 0, 0, null));
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, warmStartVectorAlloc(failing.allocator(), &artifacts, prior, &current_nodes, config, .none, .{}, 0, 0, null));
     try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, .{}, 0, (Limits{}).max_peak_memory_bytes, null)) == null);
     var exhausted = graph_metric_policy.Budget{ .limits = .{ .max_total_seed_payload_bytes = 0 } };
     try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, exhausted.limits, 0, 0, &exhausted)) == null);

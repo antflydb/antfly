@@ -15,10 +15,10 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 7 bounds optional seed I/O and decode separately from cold execution.
+// Epoch 9 shares optional warm starts across lake and document publication.
 // Rebuild older sidecars so admission decisions and output remain tied to one
 // explicit materializer contract.
-pub const materializer_epoch: u32 = 8;
+pub const materializer_epoch: u32 = 9;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

@@ -3645,12 +3645,24 @@ fn buildGraphMetricArtifactRefsAlloc(
                     else => return err,
                 };
             }
-            break :build lake_graph_metric.publishManyFromPreparedGraphWithBudgetAlloc(
+            const prior_metrics = try alloc.alloc(?manifest_mod.ArtifactRef, dirty_configs.items.len);
+            defer alloc.free(prior_metrics);
+            @memset(prior_metrics, null);
+            if (current) |manifest| {
+                for (dirty_configs.items, 0..) |config, i| {
+                    const name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                    defer alloc.free(name);
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, name)) |index|
+                        prior_metrics[i] = manifest.artifacts[index];
+                }
+            }
+            break :build lake_graph_metric.publishManyFromPreparedGraphWithWarmStartsAlloc(
                 alloc,
                 artifacts,
                 spec.index_name,
                 graph_ref,
                 dirty_configs.items,
+                prior_metrics,
                 cancellation,
                 graph_metric_limits,
                 &graph_metric_budget,
@@ -5657,6 +5669,83 @@ test "builder publishes named graph segments for graph indexes" {
         manifest.artifacts[graph_a_index].artifact_id,
         manifest.artifacts[graph_b_index].artifact_id,
     );
+}
+
+test "serverless builder warm starts changed graphs and cold starts when prior scores disappear" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-graph-metric-seed");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-graph-metric-seed");
+    const wal_root = tmpPath(&wal_root_buf, "wal-graph-metric-seed");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    const plan = publication_plan.TablePublicationPlan{
+        .targets = .{
+            .published_search_sources = search_sources.defaultPublishedSearchSources(),
+            .include_graph = true,
+        },
+        .table_definition = .{ .indexes_json = @constCast(
+            \\{"graph_idx":{"type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":1}}}}
+        ) },
+    };
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    const metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "rank");
+    defer alloc.free(metric_name);
+    for ([_][]const u8{ "doc-a", "doc-c", "doc-d" }, 0..) |node, round| {
+        const mutation = try api_codec.encodeMutationAlloc(alloc, .{
+            .kind = .upsert,
+            .doc_id = node,
+            .body =
+            \\{"graph_edges":[{"target":"doc-b","edge_type":"cites"}]}
+            ,
+        });
+        defer alloc.free(mutation);
+        _ = try wal_store.append("docs", @intCast(100 * (round + 1)), mutation);
+        var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+        defer result.deinit(alloc);
+        try std.testing.expect(result.published);
+        var runtime = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+        defer runtime.deinit();
+        var session = try runtime.openHeadSession("docs");
+        defer session.deinit();
+        var top = try query_mod.graphMetricTopAlloc(alloc, &session, "graph_idx", "rank", 10);
+        defer top.deinit(alloc);
+        try std.testing.expectEqual(round + 2, top.scores.len);
+        try std.testing.expectEqualStrings("doc-b", top.scores[0].node_id);
+        // One iteration makes use of the prior seed observable. Round 1 maps
+        // [0.2875, 0.7125] onto [a, b, c], giving c zero initial mass.
+        const expected_top: f64 = switch (round) {
+            0 => 0.7125,
+            1 => 0.49625,
+            else => 0.728125,
+        };
+        try std.testing.expectApproxEqAbs(expected_top, top.scores[0].value, 0.0000001);
+        if (round == 1) {
+            var manifest = try manifest_store.getAlloc("docs", 2);
+            defer manifest.deinit(alloc);
+            const prior = manifest.artifacts[findNamedArtifactIndex(manifest, .graph_metric_segment, metric_name).?];
+            // Missing optional acceleration cannot block the next authoritative
+            // graph publication; round 2 must use the four-node cold seed.
+            try artifact_store.delete(prior.artifact_id);
+        }
+    }
 }
 
 test "serverless builder publishes and lifecycle-binds configured graph metrics" {

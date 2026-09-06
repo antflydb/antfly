@@ -8457,6 +8457,9 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_graph_metric_smoke_tests.step);
 
     const graph_metric_integration_filters = [_][]const u8{
+        "graph.graph.test.graph pagerank ",
+        "graph.graph.test.graph eigenvector ",
+        "graph.graph.test.graph hits ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
