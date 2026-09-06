@@ -34,6 +34,7 @@ const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 const encoding = @import("../util/encoding.zig");
+const attachment_envelope = @import("../util/attachment_envelope.zig");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -341,6 +342,7 @@ pub const Context = struct {
     /// use this to retain transport ownership while application admission runs
     /// before a streaming upload is buffered.
     body_delegate: ?BodyDelegate = null,
+    body_read_offset: usize = 0,
 
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
@@ -374,7 +376,16 @@ pub const Context = struct {
     pub const BodyDelegate = struct {
         ptr: ?*anyopaque,
         read_all: *const fn (?*anyopaque) anyerror!?[]const u8,
+        read: ?*const fn (?*anyopaque, []u8) anyerror!usize = null,
         streaming: bool,
+    };
+
+    pub const RequestBodyReader = struct {
+        context: *Self,
+
+        pub fn read(self: *@This(), dest: []u8) !usize {
+            return self.context.readBodyChunk(dest);
+        }
     };
 
     /// Creates a new context for a request.
@@ -608,6 +619,65 @@ pub const Context = struct {
         return self.response.build();
     }
 
+    /// Reader for fixed-length HTTP/1 request bodies dispatched immediately
+    /// after headers. It consumes already-buffered body bytes first and never
+    /// reads beyond Content-Length, preserving a pipelined next request.
+    pub const H1StreamReader = struct {
+        allocator: Allocator,
+        io: Io,
+        sock: *Socket,
+        buffer: *[8192]u8,
+        leftover: *usize,
+        remaining: u64,
+        deadline_ms: i64,
+        owned_body: ?[]u8 = null,
+
+        pub fn deinit(self: *H1StreamReader) void {
+            if (self.owned_body) |body_bytes| self.allocator.free(body_bytes);
+            self.owned_body = null;
+        }
+
+        pub fn read(self: *H1StreamReader, dest: []u8) !usize {
+            if (dest.len == 0 or self.remaining == 0) return 0;
+            const requested = @min(dest.len, std.math.cast(usize, self.remaining) orelse dest.len);
+            if (self.leftover.* > 0) {
+                const n = @min(requested, self.leftover.*);
+                @memcpy(dest[0..n], self.buffer[0..n]);
+                if (n < self.leftover.*)
+                    std.mem.copyForwards(u8, self.buffer[0 .. self.leftover.* - n], self.buffer[n..self.leftover.*]);
+                self.leftover.* -= n;
+                self.remaining -= n;
+                return n;
+            }
+            try applyReadDeadline(self.sock, self.io, self.deadline_ms);
+            const n = try self.sock.recv(dest[0..requested]);
+            if (n == 0) return error.EndOfStream;
+            self.remaining -= n;
+            return n;
+        }
+
+        fn readErased(ptr: ?*anyopaque, dest: []u8) anyerror!usize {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            return self.read(dest);
+        }
+
+        fn readAllErased(ptr: ?*anyopaque) anyerror!?[]const u8 {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            if (self.owned_body != null) return self.owned_body.?;
+            const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
+            const body_bytes = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(body_bytes);
+            var offset: usize = 0;
+            while (offset < body_bytes.len) {
+                const n = try self.read(body_bytes[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            self.owned_body = body_bytes;
+            return body_bytes;
+        }
+    };
+
     /// Reader for server-side HTTP/2 streaming request bodies.
     /// Reads incrementally from the stream's data_buf mailbox, waiting
     /// on data_event when no data is available. Returns 0 (EOF) when
@@ -675,9 +745,9 @@ pub const Context = struct {
         }
     };
 
-    /// Returns the request body, buffering from the streaming H2 reader if needed.
-    /// For HTTP/1.1 this returns request.body directly. For HTTP/2 streaming,
-    /// reads the entire body on first call.
+    /// Returns the request body, materializing an incremental transport reader
+    /// when needed. Ordinary HTTP/1 requests return request.body directly;
+    /// opted-in fixed-length HTTP/1 and streaming HTTP/2 bodies are read once.
     pub fn body(self: *Self) !?[]const u8 {
         if (self.request.body != null) return self.request.body;
         if (self.body_delegate) |delegate| {
@@ -702,6 +772,35 @@ pub const Context = struct {
             return self.request.body;
         }
         return null;
+    }
+
+    /// Return an incremental reader over whichever transport owns the request
+    /// body. Buffered H1 requests borrow their existing slice; H2 and linked
+    /// delegates can release transport chunks as the application consumes
+    /// them. Calling code must choose either this reader or body(), not both.
+    pub fn requestBodyReader(self: *Self) RequestBodyReader {
+        return .{ .context = self };
+    }
+
+    fn readBodyChunk(self: *Self, dest: []u8) !usize {
+        if (dest.len == 0) return 0;
+        if (self.request.body) |body_bytes| {
+            if (self.body_read_offset >= body_bytes.len) return 0;
+            const n = @min(dest.len, body_bytes.len - self.body_read_offset);
+            @memcpy(dest[0..n], body_bytes[self.body_read_offset..][0..n]);
+            self.body_read_offset += n;
+            return n;
+        }
+        if (self.body_delegate) |delegate| {
+            if (delegate.read) |read| return read(delegate.ptr, dest);
+            const data = (try delegate.read_all(delegate.ptr)) orelse return 0;
+            self.request.body = data;
+            self.request.body_owned = false;
+            self.body_delegate = null;
+            return self.readBodyChunk(dest);
+        }
+        if (self.h2_body_reader) |reader| return reader.read(dest);
+        return 0;
     }
 
     /// Charge transformed request-body capacity to the server-wide body
@@ -1416,6 +1515,13 @@ pub const Server = struct {
         try self.router.addWithBodyLimit(method, path, handler, max_body_size);
     }
 
+    /// Register a route whose fixed-length body may be consumed incrementally
+    /// after header parsing. Transport-specific framing still decides whether
+    /// a particular request is safe to stream.
+    pub fn routeStreaming(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
+        try self.router.addStreaming(method, path, handler);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -1429,6 +1535,10 @@ pub const Server = struct {
     /// Registers a POST route.
     pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.POST, path, handler);
+    }
+
+    pub fn postStreaming(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.routeStreaming(.POST, path, handler);
     }
 
     pub fn postWithBodyLimit(self: *Self, path: []const u8, max_body_size: usize, handler: anytype) !void {
@@ -1843,6 +1953,8 @@ pub const Server = struct {
             parser.request_body_limit_context = self;
             parser.request_body_limit_resolver = resolveRequestBodyLimit;
         }
+        parser.request_body_streaming_context = self;
+        parser.request_body_streaming_resolver = resolveRequestBodyStreaming;
 
         var first_request = true;
         var request_active = false;
@@ -1979,7 +2091,7 @@ pub const Server = struct {
                 }
             }
 
-            if (h1_body_reserved) {
+            if (h1_body_reserved and !parser.headers_only) {
                 self.h1_body_budget.release(1);
                 h1_body_reserved = false;
             }
@@ -2045,6 +2157,24 @@ pub const Server = struct {
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
             req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
+            var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and parser.content_length.? > 0) .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .sock = &sock,
+                .buffer = &buffer,
+                .leftover = &leftover,
+                .remaining = parser.content_length.?,
+                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
+            } else null;
+            defer if (h1_stream_reader) |*reader| reader.deinit();
+            if (h1_stream_reader) |*reader| {
+                ctx.body_delegate = .{
+                    .ptr = reader,
+                    .read_all = Context.H1StreamReader.readAllErased,
+                    .read = Context.H1StreamReader.readErased,
+                    .streaming = true,
+                };
+            }
             // A non-empty suffix is not necessarily a pipelined request: it
             // can be a partial or malformed request line. Preserve this fact
             // for handlers without mutating the live parser or buffer.
@@ -2150,13 +2280,22 @@ pub const Server = struct {
             // for the next request, similar to Go's net/http finishRequest.
             if (parser.content_length) |cl| {
                 const body_read = parser.getBody().len;
-                var remaining: u64 = if (cl > body_read) cl - body_read else 0;
+                var remaining: u64 = if (h1_stream_reader) |reader|
+                    reader.remaining
+                else if (cl > body_read)
+                    cl - body_read
+                else
+                    0;
                 const max_drain: u64 = 256 * 1024; // Match Go's 256 KB limit.
                 if (remaining > max_drain) return; // Too much to drain; close.
                 var drain_buf: [8192]u8 = undefined;
                 while (remaining > 0) {
-                    const to_read = @min(remaining, drain_buf.len);
-                    const n = sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    const n = if (h1_stream_reader) |*reader|
+                        reader.read(&drain_buf) catch return
+                    else blk: {
+                        const to_read = @min(remaining, drain_buf.len);
+                        break :blk sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    };
                     if (n == 0) return;
                     remaining -= n;
                 }
@@ -2177,7 +2316,9 @@ pub const Server = struct {
     /// Admit an HTTP/1 request body as soon as headers identify it, rather
     /// than after the parser has waited for an attacker-controlled upload.
     fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *bool) bool {
-        if (reserved.* or !parser.hasCompleteHeaders() or parser.isComplete()) return true;
+        if (reserved.* or !parser.hasCompleteHeaders()) return true;
+        if (parser.isComplete() and !parser.headers_only) return true;
+        if (parser.content_length == null and !parser.chunked) return true;
         if (!self.h1_body_budget.tryReserve(1)) return false;
         reserved.* = true;
         return true;
@@ -2188,6 +2329,19 @@ pub const Server = struct {
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
         const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
         return @min(route_limit, self.config.max_body_size);
+    }
+
+    fn resolveRequestBodyStreaming(ptr: *anyopaque, method: types.Method, request_target: []const u8, content_type_value: ?[]const u8) bool {
+        if (method != .POST and method != .PUT and method != .PATCH) return false;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const query_start = mem.indexOfScalar(u8, request_target, '?') orelse request_target.len;
+        if (!self.router.streamsRequestBody(method, request_target[0..query_start])) return false;
+        const content_type = content_type_value orelse return false;
+        const separator = mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+        return std.ascii.eqlIgnoreCase(
+            mem.trim(u8, content_type[0..separator], " \t"),
+            attachment_envelope.content_type,
+        );
     }
 
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
@@ -3609,6 +3763,37 @@ test "route body limits resolve before transport body admission" {
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
 }
 
+test "attachment body streaming requires route opt-in and framed content type" {
+    var server = Server.init(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postStreaming("/stream/:id", handler);
+    try server.post("/buffered", handler);
+
+    try std.testing.expect(Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7?x=1",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/buffered",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7",
+        "application/json",
+    ));
+}
+
 test "Context queryDecoded decodes percent escapes exactly once" {
     const allocator = std.testing.allocator;
     var req = try Request.init(
@@ -3858,6 +4043,75 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     const n = try client.recv(&response);
     try std.testing.expect(mem.indexOf(u8, response[0..n], " 408 ") != null);
     try std.testing.expect(!State.handled.load(.acquire));
+}
+
+test "H1 opted-in framed route dispatches before the full body arrives" {
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            var reader = ctx.requestBodyReader();
+            var body: [3]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < body.len) {
+                const n = try reader.read(body[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            if (!mem.eql(u8, &body, "xyz")) return error.TestUnexpectedResult;
+            return ctx.text("streamed");
+        }
+    };
+    State.started.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .body_read_timeout_ms = 2_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.postStreaming("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("streaming-body listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Type: application/vnd.antfly.attachments.v1\r\n" ++
+            "Content-Length: 3\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "x",
+    );
+
+    const start_deadline = milliTimestamp(client_io) + 1_000;
+    while (!State.started.load(.acquire) and milliTimestamp(client_io) < start_deadline)
+        std.Thread.yield() catch {};
+    const dispatched_before_full_body = State.started.load(.acquire);
+    try client.sendAll("yz");
+    try std.testing.expect(dispatched_before_full_body);
+
+    var response: [1024]u8 = undefined;
+    const n = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..n], "streamed") != null);
 }
 
 test "H1 oversized content length returns 413 before handler admission" {

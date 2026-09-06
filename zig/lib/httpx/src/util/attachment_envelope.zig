@@ -26,15 +26,30 @@ pub const Limits = struct {
     max_mime_bytes: usize = 1024,
     max_attachment_bytes: usize = std.math.maxInt(usize),
     max_total_attachment_bytes: usize = std.math.maxInt(usize),
+    payload_admission: ?PayloadAdmission = null,
+};
+
+pub const PayloadAdmission = struct {
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque, usize) bool,
+    release: *const fn (*anyopaque, usize) void,
 };
 
 pub const Envelope = struct {
     metadata: []const u8,
     attachments: []Attachment,
     allocator: std.mem.Allocator,
+    /// Streaming decoders own one compact payload slab. Slice-based decoding
+    /// leaves this null because metadata and media borrow the caller's body.
+    owned_payload: ?[]u8 = null,
+    payload_admission: ?PayloadAdmission = null,
 
     pub fn deinit(self: *Envelope) void {
+        const admitted_payload_len = if (self.owned_payload) |payload| payload.len else 0;
         if (self.attachments.len > 0) self.allocator.free(self.attachments);
+        if (self.owned_payload) |payload| self.allocator.free(payload);
+        if (self.payload_admission) |admission|
+            admission.release(admission.context, admitted_payload_len);
         self.* = undefined;
     }
 };
@@ -218,6 +233,98 @@ pub fn parseAlloc(
     };
 }
 
+fn readExact(reader: anytype, dest: []u8) !void {
+    var offset: usize = 0;
+    while (offset < dest.len) {
+        const n = try reader.read(dest[offset..]);
+        if (n == 0) return error.InvalidAttachmentEnvelope;
+        offset += n;
+    }
+}
+
+/// Decode an envelope incrementally from a transport reader. Only the compact
+/// descriptor table and the final metadata/media payload are retained; the
+/// HTTP transport does not need to materialize a second body-sized buffer.
+pub fn parseReaderAlloc(
+    allocator: std.mem.Allocator,
+    reader: anytype,
+    limits: Limits,
+) !Envelope {
+    var header: [header_len]u8 = undefined;
+    try readExact(reader, &header);
+    if (!std.mem.eql(u8, header[0..magic.len], magic))
+        return error.InvalidAttachmentEnvelope;
+    if (!std.mem.allEqual(u8, header[20..24], 0)) return error.UnsupportedAttachmentEnvelope;
+
+    const metadata_len = std.math.cast(usize, std.mem.readInt(u64, header[8..16], .little)) orelse
+        return error.AttachmentEnvelopeTooLarge;
+    const attachment_count: usize = std.mem.readInt(u32, header[16..20], .little);
+    if (metadata_len > limits.max_metadata_bytes or attachment_count > limits.max_attachments)
+        return error.AttachmentEnvelopeTooLarge;
+    const descriptors_len = std.math.mul(usize, attachment_count, descriptor_len) catch
+        return error.AttachmentEnvelopeTooLarge;
+    const descriptors = try allocator.alloc(u8, descriptors_len);
+    defer allocator.free(descriptors);
+    try readExact(reader, descriptors);
+
+    var payload_len = metadata_len;
+    var total_attachment_bytes: usize = 0;
+    for (0..attachment_count) |index| {
+        const descriptor = descriptors[index * descriptor_len ..][0..descriptor_len];
+        if (!std.mem.allEqual(u8, descriptor[4..8], 0))
+            return error.UnsupportedAttachmentEnvelope;
+        const mime_len: usize = std.mem.readInt(u32, descriptor[0..4], .little);
+        const data_len = std.math.cast(usize, std.mem.readInt(u64, descriptor[8..16], .little)) orelse
+            return error.AttachmentEnvelopeTooLarge;
+        if (mime_len == 0 or mime_len > limits.max_mime_bytes or data_len == 0 or
+            data_len > limits.max_attachment_bytes) return error.AttachmentEnvelopeTooLarge;
+        total_attachment_bytes = std.math.add(usize, total_attachment_bytes, data_len) catch
+            return error.AttachmentEnvelopeTooLarge;
+        if (total_attachment_bytes > limits.max_total_attachment_bytes)
+            return error.AttachmentEnvelopeTooLarge;
+        try addSize(&payload_len, mime_len);
+        try addSize(&payload_len, data_len);
+    }
+
+    var payload_admitted = false;
+    if (limits.payload_admission) |admission| {
+        if (!admission.acquire(admission.context, payload_len))
+            return error.AttachmentEnvelopeCapacityExceeded;
+        payload_admitted = true;
+    }
+    errdefer if (payload_admitted) if (limits.payload_admission) |admission|
+        admission.release(admission.context, payload_len);
+    const payload = try allocator.alloc(u8, payload_len);
+    errdefer allocator.free(payload);
+    try readExact(reader, payload);
+    var trailing: [1]u8 = undefined;
+    if (try reader.read(&trailing) != 0) return error.InvalidAttachmentEnvelope;
+
+    const attachments = try allocator.alloc(Attachment, attachment_count);
+    errdefer if (attachments.len > 0) allocator.free(attachments);
+    var payload_offset = metadata_len;
+    for (attachments, 0..) |*attachment, index| {
+        const descriptor = descriptors[index * descriptor_len ..][0..descriptor_len];
+        const mime_len: usize = std.mem.readInt(u32, descriptor[0..4], .little);
+        const data_len: usize = @intCast(std.mem.readInt(u64, descriptor[8..16], .little));
+        const mime_end = payload_offset + mime_len;
+        const data_end = mime_end + data_len;
+        attachment.* = .{
+            .mime_type = payload[payload_offset..mime_end],
+            .data = payload[mime_end..data_end],
+        };
+        payload_offset = data_end;
+    }
+    std.debug.assert(payload_offset == payload.len);
+    return .{
+        .metadata = payload[0..metadata_len],
+        .attachments = attachments,
+        .allocator = allocator,
+        .owned_payload = payload,
+        .payload_admission = limits.payload_admission,
+    };
+}
+
 test "attachment envelope round trips borrowed payloads" {
     const attachments = [_]Attachment{
         .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } },
@@ -232,6 +339,82 @@ test "attachment envelope round trips borrowed payloads" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, parsed.attachments[0].data);
     try std.testing.expectEqualStrings("audio/wav", parsed.attachments[1].mime_type);
     try std.testing.expectEqualSlices(u8, &.{ 4, 5 }, parsed.attachments[1].data);
+}
+
+test "attachment envelope streaming decoder owns one compact payload slab" {
+    const ChunkReader = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+
+        fn read(self: *@This(), dest: []u8) !usize {
+            if (self.offset == self.bytes.len) return 0;
+            const n = @min(@min(dest.len, @as(usize, 3)), self.bytes.len - self.offset);
+            @memcpy(dest[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    const source = [_]Attachment{
+        .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } },
+        .{ .mime_type = "audio/wav", .data = &.{ 4, 5 } },
+    };
+    const encoded = try encodeAlloc(std.testing.allocator, "{\"task\":\"embed\"}", &source);
+    defer std.testing.allocator.free(encoded);
+    var reader = ChunkReader{ .bytes = encoded };
+    var parsed = try parseReaderAlloc(std.testing.allocator, &reader, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.owned_payload != null);
+    try std.testing.expectEqualStrings("{\"task\":\"embed\"}", parsed.metadata);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, parsed.attachments[0].data);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 5 }, parsed.attachments[1].data);
+}
+
+test "attachment envelope streaming payload admission is exact and released" {
+    const Tracker = struct {
+        acquired: usize = 0,
+        released: usize = 0,
+
+        fn acquire(raw: *anyopaque, bytes: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.acquired += bytes;
+            return true;
+        }
+
+        fn release(raw: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released += bytes;
+        }
+    };
+    const ChunkReader = struct {
+        bytes: []const u8,
+        offset: usize = 0,
+
+        fn read(self: *@This(), dest: []u8) !usize {
+            if (self.offset == self.bytes.len) return 0;
+            const n = @min(dest.len, self.bytes.len - self.offset);
+            @memcpy(dest[0..n], self.bytes[self.offset..][0..n]);
+            self.offset += n;
+            return n;
+        }
+    };
+    const metadata = "{\"task\":\"read\"}";
+    const source = [_]Attachment{.{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } }};
+    const encoded = try encodeAlloc(std.testing.allocator, metadata, &source);
+    defer std.testing.allocator.free(encoded);
+    var tracker = Tracker{};
+    var reader = ChunkReader{ .bytes = encoded };
+    var parsed = try parseReaderAlloc(std.testing.allocator, &reader, .{
+        .payload_admission = .{
+            .context = &tracker,
+            .acquire = Tracker.acquire,
+            .release = Tracker.release,
+        },
+    });
+    const expected = metadata.len + "image/png".len + 3;
+    try std.testing.expectEqual(expected, tracker.acquired);
+    try std.testing.expectEqual(@as(usize, 0), tracker.released);
+    parsed.deinit();
+    try std.testing.expectEqual(expected, tracker.released);
 }
 
 test "segmented attachment envelope preserves the v1 wire format" {

@@ -2321,7 +2321,6 @@ fn localModelCapabilitiesInScope(
         .document = executor_modalities.document,
     };
 
-    const native_batch_read = task == .read and manifest.native_arch_hint == .florence;
     const task_max_items = inference.server.resolvedTaskMaxItems(@tagName(task));
     const max_images = if (!modalities.image)
         0
@@ -2332,7 +2331,10 @@ fn localModelCapabilitiesInScope(
     const resolved_batch = try inference.server.resolveInferenceBatchCapabilities(
         @tagName(task),
         manifest.capabilities,
-        inference.server.resolvedExecutorBatchImplementation(@tagName(task), native_batch_read),
+        inference.server.resolvedExecutorBatchImplementation(
+            @tagName(task),
+            inference.server.resolvedExecutorKind(@tagName(task), &manifest),
+        ),
         inference.server.requestMediaMaxBytes(node),
         if (max_images > 0) inference.server.requestMediaMaxDecodedPixels(node, max_images) else 0,
         modalities.image,
@@ -2376,6 +2378,19 @@ fn localModelCapabilitiesInScope(
             .max_media_parts_per_item = resolved_batch.max_media_parts_per_item,
             .per_item_failures = resolved_batch.per_item_failures,
         },
+        .image_transform = if (inference.server.resolvedImageTransform(@tagName(task), &manifest)) |transform| .{
+            .target_width = transform.target_width,
+            .target_height = transform.target_height,
+            .resize_mode = switch (transform.resize_mode) {
+                .stretch => .stretch,
+                .cover_center_crop => .cover_center_crop,
+            },
+            .resample = switch (transform.resample) {
+                .nearest => .nearest,
+                .bilinear => .bilinear,
+                .bicubic => .bicubic,
+            },
+        } else null,
         .task_limits = .{
             .max_text_bytes_per_item = resolved_batch.max_text_bytes_per_item,
             .max_input_tokens_per_item = resolved_batch.max_input_tokens_per_item,

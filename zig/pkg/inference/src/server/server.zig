@@ -7763,15 +7763,13 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
             }) catch |err| {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
+                return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                    .@"error" = attachmentEnvelopeErrorCode(err),
                     .message = attachmentEnvelopeErrorMessage(err),
                 });
             };
@@ -8111,15 +8109,13 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachments = 1,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
             break :blk std.json.parseFromSlice(api.ChunkRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
@@ -8266,14 +8262,12 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed_body = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
             break :blk std.json.parseFromSlice(api.RerankMultimodalRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
@@ -8652,22 +8646,24 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const raw_body = (try ctx.body()) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         if (uses_attachment_envelope) {
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
         }
-        const request_json = if (attachment_envelope) |envelope| envelope.metadata else raw_body;
+        const request_json = if (attachment_envelope) |envelope|
+            envelope.metadata
+        else
+            (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         // Single JSON parse per request: only bodies that can carry
         // chat_template_kwargs (substring pre-gate, false positives harmless)
         // are parsed as an untyped Value, which then doubles as the kwargs
@@ -11017,22 +11013,24 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const raw_body = (try ctx.body()) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         if (uses_attachment_envelope) {
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
         }
-        const request_json = if (attachment_envelope) |envelope| envelope.metadata else raw_body;
+        const request_json = if (attachment_envelope) |envelope|
+            envelope.metadata
+        else
+            (try ctx.body()) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, request_json, true)) {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -13816,14 +13814,12 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
             break :blk std.json.parseFromSlice(api.ReadRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
@@ -14184,15 +14180,13 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachments = 1,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
             break :blk std.json.parseFromSlice(api.TranscribeRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
@@ -14429,14 +14423,12 @@ pub const Node = struct {
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
         var parsed = if (uses_attachment_envelope) blk: {
-            const raw_body = (try ctx.body()) orelse
-                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-            attachment_envelope = httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, .{
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
                 .max_metadata_bytes = ctx.max_request_body_size,
                 .max_attachment_bytes = requestMediaMaxBytes(self),
                 .max_total_attachment_bytes = requestMediaMaxBytes(self),
-            }) catch |err| return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
                 .message = attachmentEnvelopeErrorMessage(err),
             });
             break :blk std.json.parseFromSlice(extraction_api.ExtractionRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
@@ -14943,7 +14935,8 @@ pub const Node = struct {
                         false,
                         true,
                         true,
-                        false,
+                        .compatibility,
+                        null,
                         task,
                         requestMediaMaxBytes(self),
                         modelCatalogDecodedPixelCap(self, task),
@@ -14998,7 +14991,8 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&listing.manifest),
                     has_visual,
                     has_audio,
-                    listing.manifest.native_arch_hint == .florence,
+                    resolvedExecutorKind(normalizedInferenceTask(task).?, &listing.manifest),
+                    resolvedImageTransform(normalizedInferenceTask(task).?, &listing.manifest),
                     task,
                     requestMediaMaxBytes(self),
                     modelCatalogDecodedPixelCap(self, task),
@@ -15060,7 +15054,8 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&model.manifest),
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    model.manifest.native_arch_hint == .florence,
+                    resolvedExecutorKind(normalizedInferenceTask(task).?, &model.manifest),
+                    resolvedImageTransform(normalizedInferenceTask(task).?, &model.manifest),
                     task,
                     requestMediaMaxBytes(self),
                     modelCatalogDecodedPixelCap(self, task),
@@ -16873,9 +16868,10 @@ fn appendModelInfo(
     zero_shot_classification: bool,
     has_visual: bool,
     has_audio: bool,
-    /// Normalized executor capability inferred from the resolved architecture.
+    /// Concrete executor registered for this resolved model generation.
     /// Publishing this keeps remote planners from guessing from model names.
-    native_batch_read: bool,
+    executor_kind: ResolvedExecutorKind,
+    image_transform: ?ResolvedImageTransform,
     /// Public task category and live request-media limit. These are executor
     /// facts, not model-manifest claims.
     task: []const u8,
@@ -16892,11 +16888,11 @@ fn appendModelInfo(
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
-    const effective_native_batch_read = native_batch_read and effectiveNativeReadBatchSize() > 1;
+    const effective_native_batch_read = executor_kind == .native_florence_reader and effectiveNativeReadBatchSize() > 1;
     const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
     const resolved_task_for_executor = normalizedInferenceTask(task);
     const batch_implementation = if (resolved_task_for_executor) |resolved_task|
-        resolvedExecutorBatchImplementation(resolved_task, effective_native_batch_read)
+        resolvedExecutorBatchImplementation(resolved_task, executor_kind)
     else
         null;
     const has_known_inputs = model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "text") or
@@ -17006,7 +17002,8 @@ fn appendModelInfo(
         allocator,
         task,
         capabilities,
-        effective_native_batch_read,
+        executor_kind,
+        image_transform,
         request_media_max_bytes,
         request_media_max_decoded_pixels,
         accepts_text,
@@ -17144,7 +17141,8 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         false,
         true,
         true,
-        false,
+        .compatibility,
+        null,
         "chunkers",
         16 * 1024 * 1024,
         32 * 1024 * 1024,
@@ -17170,7 +17168,8 @@ fn appendResolvedInferenceCapabilities(
     allocator: std.mem.Allocator,
     task: []const u8,
     manifest_capabilities: []const []const u8,
-    native_batch_read: bool,
+    executor_kind: ResolvedExecutorKind,
+    image_transform: ?ResolvedImageTransform,
     request_media_max_bytes: usize,
     request_media_max_decoded_pixels: u64,
     accepts_text: bool,
@@ -17186,7 +17185,7 @@ fn appendResolvedInferenceCapabilities(
     const resolved = try resolveInferenceBatchCapabilities(
         resolved_task,
         manifest_capabilities,
-        resolvedExecutorBatchImplementation(resolved_task, native_batch_read),
+        resolvedExecutorBatchImplementation(resolved_task, executor_kind),
         request_media_max_bytes,
         request_media_max_decoded_pixels,
         accepts_image,
@@ -17283,6 +17282,18 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "chunk") or
         std.mem.eql(u8, resolved_task, "transcribe") or
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"image_transform\":");
+    if (if (accepts_image) image_transform else null) |transform| {
+        const encoded = try std.fmt.allocPrint(
+            allocator,
+            "{{\"target_width\":{d},\"target_height\":{d},\"resize_mode\":\"{s}\",\"resample\":\"{s}\"}}",
+            .{ transform.target_width, transform.target_height, @tagName(transform.resize_mode), @tagName(transform.resample) },
+        );
+        defer allocator.free(encoded);
+        try buf.appendSlice(allocator, encoded);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",\"task_limits\":{");
     inline for ([_]struct { name: []const u8, value: ?usize }{
         .{ .name = "max_text_bytes_per_item", .value = resolved.max_text_bytes_per_item },
@@ -17405,6 +17416,78 @@ pub const ResolvedInferenceBatchCapabilities = struct {
     max_schema_bytes: ?usize = null,
 };
 
+pub const ResolvedImageTransform = struct {
+    target_width: u32,
+    target_height: u32,
+    resize_mode: ResolvedImageResizeMode,
+    resample: manifest_mod.VisionResample,
+};
+
+pub const ResolvedImageResizeMode = enum {
+    stretch,
+    cover_center_crop,
+};
+
+pub fn resolvedImageTransform(
+    resolved_task: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+) ?ResolvedImageTransform {
+    const is_florence_reader = std.mem.eql(u8, resolved_task, "read") and
+        manifest.native_arch_hint == .florence;
+    const is_image_embedder = std.mem.eql(u8, resolved_task, "embed") and
+        (manifest.native_arch_hint == .clip or manifest.visual_model_path != null or
+            manifest.visual_projection_path != null);
+    if (!is_florence_reader and !is_image_embedder) return null;
+    const width = manifest.vision_target_width orelse return null;
+    const height = manifest.vision_target_height orelse return null;
+    // Current native reader/embedder preprocessing accepts one square side.
+    // Do not publish a rectangular upstream declaration the executor cannot
+    // reproduce exactly.
+    if (width == 0 or height == 0 or width != height) return null;
+    return .{
+        .target_width = width,
+        .target_height = height,
+        .resize_mode = if (is_image_embedder and manifest.native_arch_hint == .clip)
+            .cover_center_crop
+        else
+            .stretch,
+        // The embedding executor currently uses bilinear sampling for both
+        // square and CLIP profiles. Florence honors its preprocessor sidecar.
+        .resample = if (is_image_embedder) .bilinear else manifest.vision_resample,
+    };
+}
+
+test "resolved image transforms are executor-owned" {
+    var florence = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    defer florence.deinit();
+    florence.native_arch_hint = .florence;
+    florence.vision_target_width = 768;
+    florence.vision_target_height = 768;
+    florence.vision_resample = .bicubic;
+    const reader = resolvedImageTransform("read", &florence).?;
+    try std.testing.expectEqual(ResolvedExecutorKind.native_florence_reader, resolvedExecutorKind("read", &florence));
+    try std.testing.expectEqual(ResolvedExecutorKind.compatibility, resolvedExecutorKind("generate", &florence));
+    try std.testing.expectEqual(ResolvedImageResizeMode.stretch, reader.resize_mode);
+    try std.testing.expectEqual(manifest_mod.VisionResample.bicubic, reader.resample);
+    try std.testing.expect(resolvedImageTransform("generate", &florence) == null);
+
+    var clip = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    defer clip.deinit();
+    clip.native_arch_hint = .clip;
+    clip.vision_target_width = 224;
+    clip.vision_target_height = 224;
+    clip.vision_resample = .bicubic;
+    const embedder = resolvedImageTransform("embed", &clip).?;
+    try std.testing.expectEqual(ResolvedExecutorKind.native_dense_embedding, resolvedExecutorKind("embed", &clip));
+    try std.testing.expectEqual(ResolvedImageResizeMode.cover_center_crop, embedder.resize_mode);
+    // This describes the concrete executor, which currently samples linearly,
+    // rather than copying an upstream preprocessor aspiration.
+    try std.testing.expectEqual(manifest_mod.VisionResample.bilinear, embedder.resample);
+
+    clip.vision_target_height = 256;
+    try std.testing.expect(resolvedImageTransform("embed", &clip) == null);
+}
+
 /// What the concrete executor can actually do, before applying narrower
 /// model-manifest limits. Keeping this separate from the task name prevents a
 /// manifest aspiration from being mistaken for an implemented batch path and
@@ -17417,20 +17500,50 @@ pub const ResolvedExecutorBatchImplementation = struct {
     per_item_failures: bool,
 };
 
+/// A concrete execution path, resolved from the loaded/discovered model rather
+/// than inferred from a public task name or a manifest's aspirational flags.
+/// Adding a fused backend is an explicit registration here; compatibility
+/// loops cannot accidentally advertise native batching.
+pub const ResolvedExecutorKind = enum {
+    compatibility,
+    native_dense_embedding,
+    native_sparse_embedding,
+    native_florence_reader,
+};
+
+pub fn resolvedExecutorKind(
+    resolved_task: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+) ResolvedExecutorKind {
+    if (std.mem.eql(u8, resolved_task, "embed")) {
+        // The generic embedding pipeline can adaptively fall back to singleton
+        // calls. Only model generations with a registered fused path may
+        // advertise native batching; accepting an input array is insufficient.
+        const registered_native_batch = manifest.hasCapability("native_batch_embed") or
+            manifest.native_arch_hint == .clip or manifest.native_arch_hint == .clap or
+            manifest.embedding_style != .none;
+        if (!registered_native_batch) return .compatibility;
+        return if (manifest.hasCapability("sparse")) .native_sparse_embedding else .native_dense_embedding;
+    }
+    if (std.mem.eql(u8, resolved_task, "read") and manifest.native_arch_hint == .florence)
+        return .native_florence_reader;
+    return .compatibility;
+}
+
 pub fn resolvedExecutorBatchImplementation(
     resolved_task: []const u8,
-    native_batch_read: bool,
+    executor_kind: ResolvedExecutorKind,
 ) ResolvedExecutorBatchImplementation {
     const task_max_items = resolvedTaskMaxItems(resolved_task);
-    const native_reader = std.mem.eql(u8, resolved_task, "read") and
-        native_batch_read and effectiveNativeReadBatchSize() > 1;
+    const native_reader = executor_kind == .native_florence_reader and
+        effectiveNativeReadBatchSize() > 1;
     const max_items = if (native_reader)
         @min(task_max_items, effectiveNativeReadBatchSize())
     else
         task_max_items;
     const preferred_items = @min(@as(usize, 8), max_items);
-    const native = std.mem.eql(u8, resolved_task, "embed") or
-        native_reader;
+    const native = executor_kind == .native_dense_embedding or
+        executor_kind == .native_sparse_embedding or native_reader;
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,
@@ -17552,6 +17665,7 @@ const ResolvedInferenceExecutorContract = struct {
     accepts_audio: bool,
     accepts_document: bool,
     accepts_borrowed_rasters: bool = false,
+    image_transform: ?ResolvedImageTransform = null,
 };
 
 const InferenceExecutorInvocationShape = struct {
@@ -17606,7 +17720,7 @@ fn resolvedInferenceExecutorContract(
             manifest.capabilities,
             resolvedExecutorBatchImplementation(
                 resolved_task,
-                manifest.native_arch_hint == .florence,
+                resolvedExecutorKind(resolved_task, manifest),
             ),
             requestMediaMaxBytes(node),
             if (max_images > 0) requestMediaMaxDecodedPixels(node, max_images) else 0,
@@ -17618,6 +17732,7 @@ fn resolvedInferenceExecutorContract(
         .accepts_image = modalities.image,
         .accepts_audio = modalities.audio,
         .accepts_document = modalities.document,
+        .image_transform = if (modalities.image) resolvedImageTransform(resolved_task, manifest) else null,
         .accepts_borrowed_rasters = (std.mem.eql(u8, resolved_task, "read") and
             manifest.native_arch_hint == .florence) or
             (std.mem.eql(u8, resolved_task, "embed") and modalities.image),
@@ -18069,7 +18184,8 @@ test "standalone inference model catalog publishes resolved native reader batchi
         false,
         false,
         false,
-        true,
+        .native_florence_reader,
+        .{ .target_width = 768, .target_height = 768, .resize_mode = .stretch, .resample = .bilinear },
         "readers",
         32 * 1024 * 1024,
         8 * 1024 * 1024,
@@ -18106,6 +18222,9 @@ test "standalone inference model catalog publishes resolved native reader batchi
     const task_limits = resolved.object.get("task_limits").?.object;
     try std.testing.expectEqual(@as(i64, max_read_tokens), task_limits.get("max_output_tokens_per_item").?.integer);
     try std.testing.expect(task_limits.get("max_candidates_per_request").? == .null);
+    const transform = resolved.object.get("image_transform").?.object;
+    try std.testing.expectEqual(@as(i64, 768), transform.get("target_width").?.integer);
+    try std.testing.expectEqualStrings("bilinear", transform.get("resample").?.string);
 }
 
 test "standalone inference catalog validates extensible MIME against executor codecs" {
@@ -18118,7 +18237,8 @@ test "standalone inference catalog validates extensible MIME against executor co
         alloc,
         "embedders",
         &.{"inference.mime_type=image/gif"},
-        false,
+        .native_dense_embedding,
+        null,
         1024,
         4096,
         false,
@@ -18147,7 +18267,8 @@ test "standalone inference catalog validates extensible MIME against executor co
             alloc,
             "embedders",
             &.{"inference.mime_type=image/tiff"},
-            false,
+            .native_dense_embedding,
+            null,
             1024,
             4096,
             false,
@@ -18274,7 +18395,8 @@ test "normalized inference capabilities cover every model family" {
             false,
             std.mem.eql(u8, case.input, "image"),
             std.mem.eql(u8, case.input, "audio"),
-            false,
+            .compatibility,
+            null,
             case.category,
             32 * 1024 * 1024,
             8 * 1024 * 1024,
@@ -18324,6 +18446,18 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
     @compileError(std.fmt.comptimePrint("unclassified inference HTTP route: {s} {s}", .{ method, path }));
 }
 
+fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
+    return std.mem.eql(u8, path, "/chunk") or
+        std.mem.eql(u8, path, "/embed") or
+        std.mem.eql(u8, path, "/embeddings") or
+        std.mem.eql(u8, path, "/extract") or
+        std.mem.eql(u8, path, "/generate") or
+        std.mem.eql(u8, path, "/generate/batch") or
+        std.mem.eql(u8, path, "/read") or
+        std.mem.eql(u8, path, "/rerank_multimodal") or
+        std.mem.eql(u8, path, "/transcribe");
+}
+
 fn admittedInferenceHandler(node: *Node, handler: httpx.Handler, ctx: *httpx.Context) anyerror!httpx.Response {
     if (!node.tryAcquireRequestSlot()) {
         return try transientCapacityFailureResponse(
@@ -18347,11 +18481,11 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            try self.inner.post(prefix ++ path, httpx.Handler.wrap(
-                self.node,
-                handler,
-                admittedInferenceHandler,
-            ));
+            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
+                try self.inner.postStreaming(prefix ++ path, wrapped)
+            else
+                try self.inner.post(prefix ++ path, wrapped);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -18387,11 +18521,11 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            try self.inner.post(prefix ++ path, httpx.Handler.wrap(
-                self.node,
-                handler,
-                admittedInferenceHandler,
-            ));
+            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
+                try self.inner.postStreaming(prefix ++ path, wrapped)
+            else
+                try self.inner.post(prefix ++ path, wrapped);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -23453,9 +23587,21 @@ fn embedRequestParseErrorMessage(err: anyerror) []const u8 {
 fn attachmentEnvelopeErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.AttachmentEnvelopeTooLarge => "attachment envelope exceeds configured limits",
+        error.AttachmentEnvelopeCapacityExceeded => "attachment payload capacity is temporarily exhausted",
         error.UnsupportedAttachmentEnvelope => "unsupported attachment envelope version or flags",
         else => "malformed attachment envelope",
     };
+}
+
+fn attachmentEnvelopeErrorStatus(err: anyerror) u16 {
+    return if (err == error.AttachmentEnvelopeCapacityExceeded) 503 else 400;
+}
+
+fn attachmentEnvelopeErrorCode(err: anyerror) []const u8 {
+    return if (err == error.AttachmentEnvelopeCapacityExceeded)
+        "SERVICE_UNAVAILABLE"
+    else
+        "INVALID_REQUEST";
 }
 
 fn requestUsesAttachmentEnvelope(ctx: *httpx.Context) bool {
@@ -23465,6 +23611,34 @@ fn requestUsesAttachmentEnvelope(ctx: *httpx.Context) bool {
         std.mem.trim(u8, content_type[0..separator], " \t"),
         httpx.attachment_envelope.content_type,
     );
+}
+
+fn parseRequestAttachmentEnvelope(
+    ctx: *httpx.Context,
+    requested_limits: httpx.attachment_envelope.Limits,
+) !httpx.attachment_envelope.Envelope {
+    if (ctx.hasStreamingRequestBody()) {
+        var limits = requested_limits;
+        limits.payload_admission = .{
+            .context = ctx,
+            .acquire = acquireAttachmentPayload,
+            .release = releaseAttachmentPayload,
+        };
+        var reader = ctx.requestBodyReader();
+        return httpx.attachment_envelope.parseReaderAlloc(ctx.allocator, &reader, limits);
+    }
+    const raw_body = (try ctx.body()) orelse return error.InvalidAttachmentEnvelope;
+    return httpx.attachment_envelope.parseAlloc(ctx.allocator, raw_body, requested_limits);
+}
+
+fn acquireAttachmentPayload(raw: *anyopaque, bytes: usize) bool {
+    const ctx: *httpx.Context = @ptrCast(@alignCast(raw));
+    return ctx.tryReserveRequestBodyBuffer(bytes);
+}
+
+fn releaseAttachmentPayload(raw: *anyopaque, bytes: usize) void {
+    const ctx: *httpx.Context = @ptrCast(@alignCast(raw));
+    ctx.releaseRequestBodyBuffer(bytes);
 }
 
 fn parseAttachmentUrl(url: []const u8) !?usize {

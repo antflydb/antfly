@@ -343,6 +343,41 @@ pub const BatchCapabilities = struct {
     }
 };
 
+/// The deterministic spatial transform performed immediately before a vision
+/// encoder. Document producers may use this to avoid rendering detail that the
+/// resolved model will discard, but the executor remains authoritative and
+/// must still apply the transform. A null transform means "not published", not
+/// that the model accepts arbitrary raster dimensions.
+pub const ImageResizeMode = enum {
+    /// Resize width and height independently to the fixed model input.
+    stretch,
+    /// Preserve aspect ratio, resize until both target axes are covered, then
+    /// take the centered target rectangle (CLIP/SigLIP-style preprocessing).
+    cover_center_crop,
+};
+
+pub const ImageResample = enum {
+    nearest,
+    bilinear,
+    bicubic,
+};
+
+pub const ImageTransform = struct {
+    target_width: u32,
+    target_height: u32,
+    resize_mode: ImageResizeMode,
+    resample: ImageResample,
+
+    pub fn validate(self: ImageTransform) !void {
+        if (self.target_width == 0 or self.target_height == 0)
+            return error.InvalidInferenceCapabilities;
+    }
+
+    pub fn targetPixels(self: ImageTransform) u64 {
+        return @as(u64, self.target_width) * @as(u64, self.target_height);
+    }
+};
+
 fn parseManifestLimit(comptime T: type, raw: []const u8) !T {
     if (raw.len == 0) return error.InvalidInferenceCapabilities;
     const value = std.fmt.parseUnsigned(T, raw, 10) catch return error.InvalidInferenceCapabilities;
@@ -799,6 +834,9 @@ pub const InferenceCapabilities = struct {
     accepted_mime_types: MimeTypes = .{},
     input_granularity: InputGranularity,
     batch: BatchCapabilities = .{},
+    /// Model-owned fixed image preprocessing, when the resolved executor can
+    /// prove it. This is intentionally separate from aggregate admission caps.
+    image_transform: ?ImageTransform = null,
     task_limits: TaskResourceLimits = .{},
     output: OutputKind,
     result_cardinality: ResultCardinality = .one_per_item,
@@ -817,6 +855,14 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        if (self.image_transform) |transform| {
+            try transform.validate();
+            if (!self.input_modalities.image) return error.InvalidInferenceCapabilities;
+            if (self.batch.max_decoded_pixels) |max_pixels| {
+                if (transform.targetPixels() > max_pixels)
+                    return error.InvalidInferenceCapabilities;
+            }
+        }
         try self.accepted_mime_types.validate();
         try self.task_limits.validate();
         if (@as(u8, @bitCast(self.input_modalities)) == 0) return error.InvalidInferenceCapabilities;
@@ -1273,6 +1319,37 @@ test "batch capabilities accept model-owned limit overrides" {
         error.InvalidInferenceCapabilities,
         batch.applyManifestCapability("inference.batch.max_items=0"),
     );
+}
+
+test "image transforms stay within modality and decoded-pixel admission" {
+    var capabilities = InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 2,
+            .max_items = 4,
+            .max_decoded_pixels = 224 * 224,
+            .max_media_parts_per_item = 1,
+        },
+        .image_transform = .{
+            .target_width = 224,
+            .target_height = 224,
+            .resize_mode = .cover_center_crop,
+            .resample = .bilinear,
+        },
+        .output = .embedding,
+    };
+    try capabilities.validate();
+
+    capabilities.image_transform.?.target_width = 225;
+    try std.testing.expectError(error.InvalidInferenceCapabilities, capabilities.validate());
+    capabilities.image_transform.?.target_width = 224;
+    capabilities.input_modalities = .{ .text = true };
+    capabilities.accepted_mime_types = .{ .text_plain = true };
+    try std.testing.expectError(error.InvalidInferenceCapabilities, capabilities.validate());
 }
 
 test "work identity and execution reports preserve per-item semantics" {

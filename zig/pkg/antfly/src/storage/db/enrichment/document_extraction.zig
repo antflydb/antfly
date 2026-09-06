@@ -179,6 +179,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             requested_dpi: u16 = 150,
             max_pixels: u64 = 40_000_000,
             max_dimension: u32 = 4096,
+            preferred_width: ?u32 = null,
+            preferred_height: ?u32 = null,
             max_output_bytes: ?usize = null,
             min_output_dimension: u32 = 1,
             max_output_attempts: u8 = 8,

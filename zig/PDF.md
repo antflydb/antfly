@@ -2934,16 +2934,23 @@ The hardening above follows these long-term rules:
     extractors, chunkers, rerankers, and transcribers therefore share the same
     copy-free client transport contract across redirects and retries.
 141. **Implemented after distributed-proxy residency review:** the Go proxy
-    reads only the bounded v1 descriptor/metadata prefix needed for model
-    resolution. A one-attempt route streams the untouched attachment tail
-    directly to the inference node. A retry-enabled route first copies the
-    bounded body into a process-admitted temporary replay file, then opens an
-    independent section reader per attempt. Framed v1 requires its exact
-    descriptor-derived `Content-Length`; descriptor/length mismatches and
-    ambiguous chunked framing fail before routing, while the HTTP transport
-    rejects a physically truncated tail. Request retry spills share
-    the proxy's existing process-wide spool admission and configured spool
-    directory.
+    reads the fixed header first, derives and admits the exact v1
+    descriptor/metadata prefix, and reads only that prefix for model
+    resolution. It no longer reserves the protocol-wide maximum prefix for
+    every request. A one-attempt route streams the untouched attachment tail
+    directly to the inference node. A retry-enabled route sends its first
+    attempt through a tee while writing the same bytes to a process-admitted
+    replay file; it does not delay the first upstream byte until the entire
+    upload has been received. Transport `Close` is nonblocking and only marks
+    the attempt closed; the forwarding owner then serializes after any active
+    read and seals the admitted spool exactly once before a retry opens an
+    independent section reader. This avoids deadlocking an early upstream
+    response against a client upload while preserving replay errors. Framed v1
+    requires its exact descriptor-derived
+    `Content-Length`; descriptor/length mismatches and ambiguous chunked framing
+    fail before routing, while a physically truncated tail fails request
+    forwarding. Request retry spills share the proxy's existing process-wide
+    spool admission and configured spool directory.
 142. **Implemented after Florence patch-embedding review:** tensor-native CUDA
     and Metal vision paths upload normalized NCHW pixels once, execute the
     stage-zero convolution on device, transpose NCHW output to NHWC on device,
@@ -2957,6 +2964,52 @@ The hardening above follows these long-term rules:
     `batch_projected_argmax`; compatibility paths keep their existing labels.
     A future Metal multi-row fused kernel may claim the fused label only after
     it supports the production dense and quantized LM-head formats.
+144. **Implemented after inference-node residency review:** HTTPX exposes a
+    route-scoped incremental request reader for fixed-length framed bodies.
+    Attachment-capable inference POST routes opt in, and the transport also
+    requires the exact v1 attachment MIME before dispatching after headers. The
+    envelope decoder
+    validates its fixed header and descriptor table incrementally, admits the
+    exact retained metadata/media payload, then reads it into one compact slab.
+    HTTP/1 consumes already-buffered bytes before the socket and never crosses
+    `Content-Length`, preserving pipelined requests; HTTP/2 consumes the
+    existing stream mailbox. JSON and non-opted-in routes retain normal
+    buffering. Temporary payload admission is released with the envelope, and
+    capacity exhaustion is a retryable 503 rather than malformed input.
+145. **Implemented after transform-amplification review:** resolved model
+    capabilities may publish an exact image transform: target width, target
+    height, resize mode, and resampler. Concrete native reader/embedder
+    registrations derive this from the vision/preprocessor configuration. The
+    architecture/session geometry is authoritative and a processor sidecar may
+    only fill missing dimensions, never overwrite them; this matches the actual
+    executor and prevents discovery from publishing a conflicting resize;
+    generator metadata is not treated as an executor promise. Standalone and
+    distributed catalogs preserve it, the proxy retains it only when all
+    eligible nodes agree exactly, and remote parsing validates it. PDF planning
+    uses both target
+    axes to choose the lowest DPI that still supplies the model input whenever
+    operator limits permit; if it cannot reach the target it keeps the highest
+    admissible geometry. This avoids rendering a default high-resolution page
+    only for the model preprocessor to downsample it again.
+146. **Implemented after executor-registration review:** native batching is
+    selected from a typed resolved executor kind, not from a broad provider or
+    task test. Dense and sparse embedding registrations are distinct; only an
+    explicit native-batch declaration or a resolved Clip/Clap or decoder-
+    embedding implementation may select them. The native Florence reader has
+    its own registration. Every other resolved family remains the compatibility
+    executor until it supplies a true fused operation. Catalog, direct, and
+    standalone capability publication share the same resolver, so advertised
+    execution mode cannot drift between deployment shapes.
+147. **Implemented after generated-client review:** the Python client was
+    regenerated from the corrected chunker schema, including the documented
+    zero-as-default `max_chunks` contract, instead of carrying a hand-maintained
+    stale model description.
+148. **Implemented after embedded-build verification:** the durable chunk
+    provider stores a lazily connecting HTTPX client, so HTTPX is now an
+    explicit dependency of the shared embedded support module in both native
+    and WASM build graphs. Embedded API and database surfaces therefore compile
+    from their declared module graph instead of relying on a transitive import
+    present only in the full server build.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -3901,6 +3954,15 @@ The post-implementation performance review resulted in these concrete changes:
   reuses another authority's catalog. This removes request-time all-node
   discovery and repeated node manifest scans on the common service-credential
   path while retaining exact capability leases.
+- The distributed ingress path overlaps client upload, retry-spool writes, and
+  the first upstream attempt. Both the proxy and inference node retain only the
+  exact routing/payload regions they need, so a large media request no longer
+  incurs a full pre-forward delay or simultaneous wire-body and decoded-payload
+  copies on the common HTTP/1 and HTTP/2 paths.
+- Resolved image transforms feed PDF render planning before allocation. This
+  turns model preprocessing geometry into a producer-side resource constraint,
+  reducing renderer CPU, encoded bytes, transport bytes, and decode work as one
+  coordinated optimization rather than a backend-specific resize tweak.
 
 ### Resource and pool ownership
 
@@ -3928,12 +3990,13 @@ shortcuts:
 
 - The shipped distributed attachment envelope is bounded, authenticated by the
   existing route lease, cancellation-aware at the request boundary, and exact
-  in reference cardinality. V1 can now be produced and transported as
-  replayable borrowed segments, and a single-attempt proxy streams its payload
-  without whole-body heap materialization. Incrementally produced or
-  independently retryable media still needs a successor with checksums, flow
-  control, per-frame cancellation, and provenance in the wire descriptors. A
-  proxy must not infer either version from logical model modalities.
+  in reference cardinality. V1 is produced as replayable borrowed segments;
+  the proxy streams both one-attempt and retry-enabled first attempts, and the
+  inference node decodes transport bodies incrementally into one admitted
+  payload slab. Independently produced media and resumable partial retries
+  still need a successor with checksums, frame-level flow control,
+  cancellation, and provenance in the wire descriptors. A proxy must not infer
+  either version from logical model modalities.
 - Logical render-lane reader/font caches now remove repeated initialization
   across joined waves within a render batch even when fixed-executor arena
   scratch resets after each callback. Each reader uses a private, freeing lane
@@ -4148,12 +4211,13 @@ The following remain qualification work rather than architectural blockers:
   physical lane because renderer scratch benefits from worker affinity; any
   additional split must remain beneath the same aggregate ceiling and preserve
   shutdown ordering.
-- Whether the buffered v1 distributed attachment envelope should gain a
-  streaming/checksummed variant. Reading, batched generation, embedding,
+- Whether the streamed v1 distributed attachment envelope should gain a
+  checksummed, resumable frame format. Reading, batched generation, embedding,
   extraction, multimodal reranking, chunking, and transcription now consume raw
   framed attachments; older nodes and external providers retain JSON/base64 or
-  multipart compatibility. A future direct single-generation client path can
-  adopt the same envelope without changing generator result semantics.
+  multipart compatibility. A successor is justified by independently produced
+  media or partial retry, not by ordinary bounded streaming, which v1 now
+  supports end to end.
 - Whether cross-request broker adapters should be enabled for a model family is
   executor-specific. The task-neutral broker exists, but a family must expose a
   genuinely fused native batch implementation before it may opt in; accepting

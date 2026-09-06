@@ -103,6 +103,12 @@ pub const PageRenderRequest = struct {
     requested_dpi: u16 = 150,
     max_pixels: u64 = 40_000_000,
     max_dimension: u32 = 4096,
+    /// Optional downstream fixed raster target. When both are set, geometry
+    /// planning chooses the lowest DPI that supplies at least this many source
+    /// samples on both axes. If the configured DPI/caps cannot reach it, the
+    /// ordinary highest-quality admissible geometry is retained.
+    preferred_width: ?u32 = null,
+    preferred_height: ?u32 = null,
     /// Bound retained output for this page. PNG rendering resizes and
     /// re-encodes when necessary; raw raster rendering constrains geometry
     /// before painting because its byte size is known exactly.
@@ -967,6 +973,10 @@ fn adaptiveRenderGeometryForBox(
     if (!(point_width > 0) or !(point_height > 0) or
         !std.math.isFinite(point_width) or !std.math.isFinite(point_height))
         return error.InvalidPageBox;
+    if ((request.preferred_width == null) != (request.preferred_height == null))
+        return error.InvalidRenderTarget;
+    if (request.preferred_width == 0 or request.preferred_height == 0)
+        return error.InvalidRenderTarget;
 
     // ceil(points * dpi / 72) <= max_dimension exactly when the unrounded
     // extent is <= max_dimension. Use that direct bound to avoid probing as
@@ -1002,7 +1012,34 @@ fn adaptiveRenderGeometryForBox(
             upper = dpi - 1;
         }
     }
-    return best orelse error.RenderedPageTooLarge;
+    const highest = best orelse return error.RenderedPageTooLarge;
+    const preferred_width = request.preferred_width orelse return highest;
+    const preferred_height = request.preferred_height.?;
+    if (highest.width < preferred_width or highest.height < preferred_height)
+        return highest;
+
+    // Rendering above the executor's fixed input size spends PDF raster and
+    // codec work on samples discarded by the next deterministic resize. Find
+    // the first DPI that supplies both target axes; monotonic page geometry
+    // makes this logarithmic and preserves the existing hard-cap result.
+    lower = minimum_direct_render_dpi;
+    upper = highest.effective_dpi;
+    var preferred: ?AdaptiveRenderGeometry = null;
+    while (lower <= upper) {
+        const dpi: u16 = lower + (upper - lower) / 2;
+        const geometry = renderGeometryAtDpi(box, rotation, swaps_dimensions, dpi) catch {
+            lower = dpi + 1;
+            continue;
+        };
+        if (geometry.width >= preferred_width and geometry.height >= preferred_height) {
+            preferred = geometry;
+            if (dpi == minimum_direct_render_dpi) break;
+            upper = dpi - 1;
+        } else {
+            lower = dpi + 1;
+        }
+    }
+    return preferred orelse highest;
 }
 
 fn renderGeometryAtDpi(
@@ -2156,6 +2193,35 @@ test "direct adaptive geometry matches exhaustive DPI selection" {
             );
         }
     }
+}
+
+test "adaptive geometry stops once a fixed model target is supplied on both axes" {
+    const geometry = try adaptiveRenderGeometryForBox(
+        .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
+        .none,
+        false,
+        .{
+            .page_number = 1,
+            .requested_dpi = 150,
+            .max_pixels = 40_000_000,
+            .max_dimension = 4096,
+            .preferred_width = 768,
+            .preferred_height = 768,
+        },
+    );
+    try std.testing.expectEqual(@as(u16, 91), geometry.effective_dpi);
+    try std.testing.expect(geometry.width >= 768);
+    try std.testing.expect(geometry.height >= 768);
+
+    try std.testing.expectError(
+        error.InvalidRenderTarget,
+        adaptiveRenderGeometryForBox(
+            .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
+            .none,
+            false,
+            .{ .page_number = 1, .preferred_width = 768 },
+        ),
+    );
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {

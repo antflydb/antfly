@@ -670,6 +670,8 @@ const GeneratedTextBatchPolicy = struct {
     max_items: usize,
     max_bytes: usize,
     max_pixels: u64 = std.math.maxInt(u64),
+    preferred_image_width: ?u32 = null,
+    preferred_image_height: ?u32 = null,
 };
 
 fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) GeneratedTextBatchPolicy {
@@ -9003,6 +9005,8 @@ fn renderRuntimePdfWindow(
             .requested_dpi = config.ocr_render_dpi,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, dimension_pixels), batch_policy.max_pixels),
             .max_dimension = config.ocr_max_rendered_dimension,
+            .preferred_width = batch_policy.preferred_image_width,
+            .preferred_height = batch_policy.preferred_image_height,
             .max_output_bytes = if (use_borrowed_rasters)
                 raw_page_bytes_cap
             else
@@ -9400,6 +9404,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             }
             if (capabilities.batch.max_decoded_pixels) |limit|
                 admitted_batch_policy.max_pixels = @min(admitted_batch_policy.max_pixels, limit);
+            if (capabilities.image_transform) |transform| {
+                admitted_batch_policy.preferred_image_width = transform.target_width;
+                admitted_batch_policy.preferred_image_height = transform.target_height;
+            }
         }
     }
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
@@ -15237,6 +15245,8 @@ const PdfEmbeddingWindowPreparer = struct {
             .requested_dpi = self.render_config.ocr_render_dpi,
             .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
             .max_dimension = self.render_config.ocr_max_rendered_dimension,
+            .preferred_width = if (self.capabilities.image_transform) |transform| transform.target_width else null,
+            .preferred_height = if (self.capabilities.image_transform) |transform| transform.target_height else null,
             .max_output_bytes = null,
             .min_output_dimension = minimum_dimension,
             .max_output_attempts = maximum_pdf_page_render_attempts,

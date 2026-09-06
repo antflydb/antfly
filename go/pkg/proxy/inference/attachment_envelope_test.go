@@ -17,12 +17,25 @@ package proxy
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
+	"time"
 )
 
 type testProxyAttachment struct {
 	mime string
 	data []byte
+}
+
+type blockingProxyReader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingProxyReader) Read([]byte) (int, error) {
+	close(r.started)
+	<-r.release
+	return 0, io.EOF
 }
 
 func TestProxyAttachmentRoutingPrefixLeavesMediaOnStream(t *testing.T) {
@@ -45,6 +58,136 @@ func TestProxyAttachmentRoutingPrefixLeavesMediaOnStream(t *testing.T) {
 	if _, _, err := readProxyAttachmentRoutingPrefix(bytes.NewReader(body), -1, int64(len(body))); err == nil {
 		t.Fatal("chunked v1 attachment body was accepted")
 	}
+}
+
+func TestProxyAttachmentRoutingPrefixAdmitsExactRetainedBytes(t *testing.T) {
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: []byte{1, 2, 3}})
+	reader := bytes.NewReader(body)
+	admitted := int64(-1)
+	prefix, _, err := readProxyAttachmentRoutingPrefixAdmitted(
+		reader,
+		int64(len(body)),
+		int64(len(body)),
+		func(prefixBytes int64) error {
+			admitted = prefixBytes
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted != int64(len(prefix)) {
+		t.Fatalf("admitted prefix bytes = %d, want %d", admitted, len(prefix))
+	}
+	if admitted >= int64(len(body)) {
+		t.Fatalf("attachment tail was included in routing admission: admitted=%d body=%d", admitted, len(body))
+	}
+}
+
+func TestProxyStreamingReplayBodyTeesFirstAttemptAndSealsOnFinish(t *testing.T) {
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: bytes.Repeat([]byte{7}, 4096)})
+	tail := bytes.NewReader(body)
+	prefix, _, err := readProxyAttachmentRoutingPrefix(tail, int64(len(body)), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := &proxyStreamingReplayBody{
+		prefix:   prefix,
+		tail:     tail,
+		total:    int64(len(body)),
+		spillDir: t.TempDir(),
+	}
+	defer replay.Close()
+	if err := replay.Prepare(2); err != nil {
+		t.Fatal(err)
+	}
+	first, err := replay.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial := make([]byte, len(prefix)+2)
+	if _, err := io.ReadFull(first, partial); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.(interface{ Finish() error }).Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if replay.spooled != int64(len(body)) {
+		t.Fatalf("sealed bytes = %d, want %d", replay.spooled, len(body))
+	}
+	retry, err := replay.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := io.ReadAll(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(replayed, body) {
+		t.Fatal("retry body differs from the original framed request")
+	}
+}
+
+func TestProxyStreamingReplayBodyRetainsSealFailure(t *testing.T) {
+	replay := &proxyStreamingReplayBody{
+		prefix:   []byte("prefix"),
+		tail:     bytes.NewReader([]byte("short")),
+		total:    int64(len("prefix") + len("short") + 1),
+		spillDir: t.TempDir(),
+	}
+	defer replay.Close()
+	if err := replay.Prepare(2); err != nil {
+		t.Fatal(err)
+	}
+	first, err := replay.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	finalizer := first.(interface{ Finish() error })
+	if err := finalizer.Finish(); err == nil {
+		t.Fatal("expected a truncated replay body to fail while sealing")
+	}
+	if err := finalizer.Finish(); err == nil {
+		t.Fatal("expected repeated Finish to retain the sealing failure")
+	}
+}
+
+func TestProxyStreamingAttemptCloseDoesNotBlockOnActiveRead(t *testing.T) {
+	reader := &blockingProxyReader{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	attempt := &proxyStreamingAttemptBody{reader: reader}
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = attempt.Read(make([]byte, 1))
+	}()
+	<-reader.started
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- attempt.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind an active request-body read")
+	}
+	close(reader.release)
+	<-readDone
 }
 
 func testProxyAttachmentEnvelope(metadata []byte, attachments ...testProxyAttachment) []byte {

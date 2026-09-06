@@ -810,6 +810,7 @@ const ExactWireCapabilities = struct {
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
     framed_attachments: bool,
+    image_transform: ?work.ImageTransform = null,
     task_limits: work.TaskResourceLimits = .{},
 };
 
@@ -898,6 +899,31 @@ fn parseTaskResourceLimits(object: std.json.ObjectMap) !work.TaskResourceLimits 
     return result;
 }
 
+fn parseImageTransform(object: std.json.ObjectMap) !?work.ImageTransform {
+    const value = object.get("image_transform") orelse return null;
+    if (value == .null) return null;
+    if (value != .object or value.object.count() != 4)
+        return error.InvalidInferenceCapabilities;
+    const width = value.object.get("target_width") orelse return error.InvalidInferenceCapabilities;
+    const height = value.object.get("target_height") orelse return error.InvalidInferenceCapabilities;
+    if (width != .integer or width.integer <= 0 or height != .integer or height.integer <= 0)
+        return error.InvalidInferenceCapabilities;
+    const result = work.ImageTransform{
+        .target_width = std.math.cast(u32, width.integer) orelse return error.InvalidInferenceCapabilities,
+        .target_height = std.math.cast(u32, height.integer) orelse return error.InvalidInferenceCapabilities,
+        .resize_mode = std.meta.stringToEnum(
+            work.ImageResizeMode,
+            try requiredString(value.object, "resize_mode"),
+        ) orelse return error.InvalidInferenceCapabilities,
+        .resample = std.meta.stringToEnum(
+            work.ImageResample,
+            try requiredString(value.object, "resample"),
+        ) orelse return error.InvalidInferenceCapabilities,
+    };
+    try result.validate();
+    return result;
+}
+
 fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !ExactWireCapabilities {
     const modality_values = try requiredStringArray(object, "input_modalities");
     const mime_values = try requiredStringArray(object, "accepted_mime_types");
@@ -954,6 +980,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
         .framed_attachments = framed_attachments,
+        .image_transform = try parseImageTransform(object),
         .task_limits = if (version >= 4) try parseTaskResourceLimits(object) else .{},
     };
 }
@@ -1026,6 +1053,7 @@ pub fn parseModelCapabilities(
         .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
         .task_limits = if (exact) |value| value.task_limits else .{},
+        .image_transform = if (exact) |value| value.image_transform else null,
         // Discovery is performed across an HTTP boundary. A remote catalog
         // cannot turn that concrete route into a borrowed-memory invocation,
         // even if a misconfigured upstream publishes its local ABI fact.
@@ -1332,7 +1360,7 @@ test "remote Antfly capability v3 preserves exact task contract" {
 
 test "remote Antfly capability v4 preserves extensible MIME and task limits" {
     const payload =
-        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/gif","image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"task_limits":{"max_text_bytes_per_item":4096,"max_input_tokens_per_item":1024,"max_output_tokens_per_item":512,"max_candidates_per_request":null,"max_schema_bytes":8192},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
+        \\{"extractors":{"vision-extractor":{"inputs":["image"],"inference_capabilities":{"version":4,"task":"extract","input_modalities":["image"],"accepted_mime_types":["image/gif","image/png"],"input_granularity":"page","output":"extraction","result_cardinality":"one_per_item","prompt_policy":"structured_schema","borrowed_attachments":false,"image_transform":{"target_width":768,"target_height":768,"resize_mode":"stretch","resample":"bicubic"},"task_limits":{"max_text_bytes_per_item":4096,"max_input_tokens_per_item":1024,"max_output_tokens_per_item":512,"max_candidates_per_request":null,"max_schema_bytes":8192},"batch":{"mode":"native","preferred_items":4,"max_items":8,"max_encoded_media_bytes":1048576,"max_decoded_pixels":16777216,"max_media_parts_per_item":1,"per_item_failures":true}}}}}
     ;
     const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "vision-extractor", .extract)).?;
     try std.testing.expect(capabilities.acceptsMimeType("image/gif; profile=baseline"));
@@ -1342,6 +1370,8 @@ test "remote Antfly capability v4 preserves extensible MIME and task limits" {
     try std.testing.expectEqual(@as(?usize, 512), capabilities.task_limits.max_output_tokens_per_item);
     try std.testing.expectEqual(@as(?usize, null), capabilities.task_limits.max_candidates_per_request);
     try std.testing.expectEqual(@as(?usize, 8192), capabilities.task_limits.max_schema_bytes);
+    try std.testing.expectEqual(@as(u32, 768), capabilities.image_transform.?.target_width);
+    try std.testing.expectEqual(work.ImageResample.bicubic, capabilities.image_transform.?.resample);
     try std.testing.expectError(
         error.InferenceSchemaBytesExceeded,
         capabilities.validateInvocation(.extract, .{

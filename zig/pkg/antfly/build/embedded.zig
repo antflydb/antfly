@@ -27,6 +27,7 @@ pub fn configureModule(
     metadata_openapi_mod: *std.Build.Module,
     reranking_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
+    httpx_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     chunking_mod: *std.Build.Module,
     bloom_mod: *std.Build.Module,
@@ -50,6 +51,7 @@ pub fn configureModule(
     mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
     mod.addImport("antfly_reranking", reranking_mod);
     mod.addImport("objectstore", objectstore_mod);
+    mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_chunking", chunking_mod);
     mod.addImport("bloom", bloom_mod);

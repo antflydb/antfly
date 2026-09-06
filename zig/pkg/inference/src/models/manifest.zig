@@ -205,6 +205,12 @@ pub const NativeArchHint = enum {
     layoutlmv3,
 };
 
+pub const VisionResample = enum {
+    nearest,
+    bilinear,
+    bicubic,
+};
+
 /// Primary native weight source selected consistently by compatibility,
 /// admission, export, and runtime loading. Explicit GGUF bundles retain their
 /// declared route. Otherwise the canonical safetensors artifacts take
@@ -297,6 +303,12 @@ pub const ModelManifest = struct {
     model_manifest_declarations: ModelManifestDeclarations = .{},
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
+    /// Fixed spatial input owned by the resolved vision preprocessor. These
+    /// remain null for dynamic or unrecognized processors; callers must never
+    /// infer a default merely from image modality.
+    vision_target_width: ?u32 = null,
+    vision_target_height: ?u32 = null,
+    vision_resample: VisionResample = .bilinear,
 
     // Classification / NER
     num_labels: u32 = 0,
@@ -926,6 +938,10 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
         }
     }
+    if (try catalog.readOptional("preprocessor_config.json")) |preprocessor_bytes| {
+        defer allocator.free(preprocessor_bytes);
+        try ignoreNonResourceMetadataError(parseVisionPreprocessorJson(&manifest, allocator, preprocessor_bytes));
+    }
 
     // SentenceTransformers checkpoints carry their embedding reduction in a
     // numbered pooling module. Honor a single declared reduction before an
@@ -1066,6 +1082,10 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
             defer allocator.free(config_bytes);
             try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
         }
+    }
+    if (try catalog.readOptional("preprocessor_config.json")) |preprocessor_bytes| {
+        defer allocator.free(preprocessor_bytes);
+        try ignoreNonResourceMetadataError(parseVisionPreprocessorJson(&manifest, allocator, preprocessor_bytes));
     }
 
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
@@ -1975,6 +1995,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
 
     const obj = parsed.value.object;
     const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
+    applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("hidden_size")) |v| {
         if (jsonU32(v)) |val| manifest.hidden_size = val;
@@ -2168,6 +2189,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     defer parsed.deinit();
 
     const obj = parsed.value.object;
+    applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("architectures")) |v| {
         if (v == .array) {
@@ -2218,6 +2240,89 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         manifest.model_type = .embedder;
         manifest.model_type_origin = .config;
         manifest.embedding_style = .jina_v5;
+    }
+}
+
+fn positiveJsonU32(value: std.json.Value) ?u32 {
+    if (value != .integer or value.integer <= 0) return null;
+    return std.math.cast(u32, value.integer);
+}
+
+fn applySquareVisionTarget(manifest: *ModelManifest, value: std.json.Value, overwrite: bool) void {
+    const size = positiveJsonU32(value) orelse return;
+    if (overwrite or manifest.vision_target_width == null) manifest.vision_target_width = size;
+    if (overwrite or manifest.vision_target_height == null) manifest.vision_target_height = size;
+}
+
+fn applyVisionTargetFromModelConfig(manifest: *ModelManifest, obj: std.json.ObjectMap) void {
+    const vision = obj.get("vision_config") orelse return;
+    if (vision != .object) return;
+    if (vision.object.get("image_size")) |size| applySquareVisionTarget(manifest, size, true);
+}
+
+fn applyPreprocessorSize(manifest: *ModelManifest, value: std.json.Value) void {
+    switch (value) {
+        // The loaded encoder/session owns spatial geometry. A processor
+        // sidecar may complete missing metadata but must not make discovery
+        // advertise dimensions different from those the executor will use.
+        .integer => applySquareVisionTarget(manifest, value, false),
+        .object => |object| {
+            if (object.get("width")) |width| {
+                if (manifest.vision_target_width == null) {
+                    if (positiveJsonU32(width)) |parsed| manifest.vision_target_width = parsed;
+                }
+            }
+            if (object.get("height")) |height| {
+                if (manifest.vision_target_height == null) {
+                    if (positiveJsonU32(height)) |parsed| manifest.vision_target_height = parsed;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+test "vision preprocessor geometry cannot override the model executor contract" {
+    var manifest = ModelManifest{ .allocator = std.testing.allocator };
+    defer manifest.deinit();
+    try parseConfigJson(
+        &manifest,
+        std.testing.allocator,
+        "{\"vision_config\":{\"image_size\":336}}",
+    );
+    try parseVisionPreprocessorJson(
+        &manifest,
+        std.testing.allocator,
+        "{\"size\":{\"width\":224,\"height\":224},\"resample\":3}",
+    );
+    try std.testing.expectEqual(@as(?u32, 336), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, 336), manifest.vision_target_height);
+    try std.testing.expectEqual(VisionResample.bicubic, manifest.vision_resample);
+}
+
+fn parseVisionPreprocessorJson(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
+    const obj = parsed.value.object;
+    if (obj.get("size")) |size| {
+        applyPreprocessorSize(manifest, size);
+    } else if (obj.get("crop_size")) |size| {
+        applyPreprocessorSize(manifest, size);
+    }
+    if (obj.get("resample")) |resample| {
+        if (resample == .integer) {
+            manifest.vision_resample = switch (resample.integer) {
+                0 => .nearest,
+                2 => .bilinear,
+                3 => .bicubic,
+                else => manifest.vision_resample,
+            };
+        }
     }
 }
 
@@ -4566,6 +4671,11 @@ test "manifest parses florence2 gguf bundle marker" {
     try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
     try std.testing.expectEqual(ModelType.reader, manifest.model_type);
     try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    // A bundle marker selects the executor but does not invent preprocessing
+    // metadata. Exact producer transforms are published only after config or
+    // preprocessor sidecars establish the model-owned spatial contract.
+    try std.testing.expectEqual(@as(?u32, null), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, null), manifest.vision_target_height);
     try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/florence2-q4_k/florence-2-base.Q4_K.gguf"));
@@ -5135,6 +5245,9 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
     try std.testing.expectEqual(ModelType.reader, manifest.model_type);
     try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqual(@as(?u32, 768), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, 768), manifest.vision_target_height);
+    try std.testing.expectEqual(VisionResample.bilinear, manifest.vision_resample);
     try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
     try expectCanonicalPath(allocator, q4_path, manifest.gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));

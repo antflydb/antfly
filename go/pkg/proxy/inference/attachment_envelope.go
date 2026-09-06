@@ -45,11 +45,19 @@ func proxyUsesAttachmentEnvelope(contentType string) bool {
 // the exact wire length knowable, and rejecting ambiguous chunked bodies keeps
 // descriptor/length validation deterministic at the proxy boundary.
 func readProxyAttachmentRoutingPrefix(reader io.Reader, contentLength, maxBytes int64) ([]byte, []byte, error) {
+	return readProxyAttachmentRoutingPrefixAdmitted(reader, contentLength, maxBytes, nil)
+}
+
+// readProxyAttachmentRoutingPrefixAdmitted invokes admit with the exact
+// retained prefix size before allocating it. The fixed header is read into
+// stack storage first, so callers never need to reserve the 16 MiB metadata
+// ceiling merely to discover an ordinary kilobyte-sized routing document.
+func readProxyAttachmentRoutingPrefixAdmitted(reader io.Reader, contentLength, maxBytes int64, admit func(int64) error) ([]byte, []byte, error) {
 	if contentLength < 0 || contentLength > maxBytes {
 		return nil, nil, errInvalidProxyAttachmentEnvelope
 	}
-	header := make([]byte, proxyAttachmentEnvelopeHeaderBytes)
-	if _, err := io.ReadFull(reader, header); err != nil {
+	var header [proxyAttachmentEnvelopeHeaderBytes]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, nil, errInvalidProxyAttachmentEnvelope
 	}
 	if !bytes.Equal(header[:8], []byte(proxyAttachmentEnvelopeMagic)) {
@@ -68,8 +76,13 @@ func readProxyAttachmentRoutingPrefix(reader io.Reader, contentLength, maxBytes 
 	if prefixBytes > uint64(contentLength) || prefixBytes > uint64(maxBytes) || prefixBytes > uint64(^uint(0)>>1) {
 		return nil, nil, errInvalidProxyAttachmentEnvelope
 	}
+	if admit != nil {
+		if err := admit(int64(prefixBytes)); err != nil {
+			return nil, nil, err
+		}
+	}
 	prefix := make([]byte, int(prefixBytes))
-	copy(prefix, header)
+	copy(prefix, header[:])
 	if _, err := io.ReadFull(reader, prefix[proxyAttachmentEnvelopeHeaderBytes:]); err != nil {
 		return nil, nil, errInvalidProxyAttachmentEnvelope
 	}

@@ -5554,6 +5554,61 @@ func TestConservativeCapabilitiesV4RequiresEveryEndpointToSupportFramedAttachmen
 	}
 }
 
+func TestConservativeCapabilitiesV4PreservesOnlyIdenticalImageTransforms(t *testing.T) {
+	base := func(transform any) map[string]any {
+		return map[string]any{
+			"version": float64(4), "task": "embed",
+			"input_modalities": []any{"image"}, "accepted_mime_types": []any{"image/png"},
+			"input_granularity": "page", "output": "embedding",
+			"result_cardinality": "one_per_item", "prompt_policy": "explicit",
+			"borrowed_attachments": false, "framed_attachments": true,
+			"image_transform": transform,
+			"task_limits": map[string]any{
+				"max_text_bytes_per_item": nil, "max_input_tokens_per_item": nil,
+				"max_output_tokens_per_item": nil, "max_candidates_per_request": nil,
+				"max_schema_bytes": nil,
+			},
+			"batch": map[string]any{
+				"mode": "native", "preferred_items": float64(4), "max_items": float64(8),
+				"max_encoded_media_bytes": float64(4096), "max_decoded_pixels": float64(1_000_000),
+				"max_media_parts_per_item": float64(1), "per_item_failures": true,
+			},
+		}
+	}
+	transform := map[string]any{
+		"target_width": float64(224), "target_height": float64(224),
+		"resize_mode": "cover_center_crop", "resample": "bilinear",
+	}
+	merged, ok := conservativeInferenceCapabilities(base(transform), base(transform))
+	if !ok || !reflect.DeepEqual(merged["image_transform"], transform) {
+		t.Fatalf("identical image transform was not preserved: %#v", merged)
+	}
+	different := map[string]any{
+		"target_width": float64(768), "target_height": float64(768),
+		"resize_mode": "stretch", "resample": "bilinear",
+	}
+	merged, ok = conservativeInferenceCapabilities(base(transform), base(different))
+	if !ok || merged["image_transform"] != nil {
+		t.Fatalf("mixed image transforms were not weakened: %#v", merged)
+	}
+	merged, ok = conservativeInferenceCapabilities(base(transform), base(nil))
+	if !ok || merged["image_transform"] != nil {
+		t.Fatalf("unknown image transform was not weakened: %#v", merged)
+	}
+	malformed := map[string]any{
+		"target_width": float64(224), "target_height": float64(224),
+		"resize_mode": "crop_sometimes", "resample": "bilinear",
+	}
+	if _, ok := conservativeInferenceCapabilities(base(transform), base(malformed)); ok {
+		t.Fatal("malformed image transform was accepted")
+	}
+	undersized := base(transform)
+	undersized["batch"].(map[string]any)["max_decoded_pixels"] = float64(1024)
+	if _, ok := conservativeInferenceCapabilities(base(transform), undersized); ok {
+		t.Fatal("image transform larger than decoded-pixel admission was accepted")
+	}
+}
+
 func TestConservativeCapabilitiesV3RejectsMalformedExactFields(t *testing.T) {
 	valid := func() map[string]any {
 		return map[string]any{

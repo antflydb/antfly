@@ -3799,6 +3799,11 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 				limits[field] = value
 			}
 			result["task_limits"] = limits
+			transform, ok := conservativeImageTransform(a["image_transform"], b["image_transform"])
+			if !ok {
+				return nil, false
+			}
+			result["image_transform"] = transform
 			version = 4
 		}
 		result["version"] = float64(version)
@@ -3837,6 +3842,8 @@ var exactOutputs = map[string]bool{
 }
 var exactCardinalities = map[string]bool{"one_per_item": true, "one_per_request": true}
 var exactPromptPolicies = map[string]bool{"explicit": true, "model_default": true, "structured_schema": true}
+var exactImageResizeModes = map[string]bool{"stretch": true, "cover_center_crop": true}
+var exactImageResamples = map[string]bool{"nearest": true, "bilinear": true, "bicubic": true}
 
 var taskLimitFields = []string{
 	"max_text_bytes_per_item", "max_input_tokens_per_item", "max_output_tokens_per_item",
@@ -3850,6 +3857,46 @@ func optionalInferenceCapabilityBool(capabilities map[string]any, field string) 
 	}
 	parsed, ok := value.(bool)
 	return parsed, ok
+}
+
+func validatedImageTransform(value any) (map[string]any, bool) {
+	if value == nil {
+		return nil, true
+	}
+	transform, ok := value.(map[string]any)
+	if !ok || len(transform) != 4 {
+		return nil, false
+	}
+	for _, field := range []string{"target_width", "target_height"} {
+		dimension, ok := nonNegativeInteger(transform[field])
+		if !ok || dimension == 0 || dimension > math.MaxUint32 {
+			return nil, false
+		}
+	}
+	resizeMode, ok := transform["resize_mode"].(string)
+	if !ok || !exactImageResizeModes[resizeMode] {
+		return nil, false
+	}
+	resample, ok := transform["resample"].(string)
+	if !ok || !exactImageResamples[resample] {
+		return nil, false
+	}
+	return transform, true
+}
+
+// A pooled route may advertise producer-side geometry only when every
+// eligible endpoint promises the identical deterministic transform. Null or
+// absence is safe but disables the optimization for that merged generation.
+func conservativeImageTransform(left, right any) (any, bool) {
+	a, aok := validatedImageTransform(left)
+	b, bok := validatedImageTransform(right)
+	if !aok || !bok {
+		return nil, false
+	}
+	if a == nil || b == nil || !reflect.DeepEqual(a, b) {
+		return nil, true
+	}
+	return a, true
 }
 
 func validExactInferenceCapabilities(capabilities map[string]any, version int) bool {
@@ -3949,6 +3996,21 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 			number, valid := nonNegativeInteger(value)
 			if !valid || number == 0 {
 				return false
+			}
+		}
+		transform, ok := validatedImageTransform(capabilities["image_transform"])
+		if !ok || transform != nil && !modalitySet["image"] {
+			return false
+		}
+		if transform != nil {
+			width, _ := nonNegativeInteger(transform["target_width"])
+			height, _ := nonNegativeInteger(transform["target_height"])
+			batch := capabilities["batch"].(map[string]any)
+			if maxPixels := batch["max_decoded_pixels"]; maxPixels != nil {
+				limit, _ := nonNegativeInteger(maxPixels)
+				if uint64(width)*uint64(height) > uint64(limit) {
+					return false
+				}
 			}
 		}
 	}
@@ -4284,6 +4346,8 @@ type proxyStreamingReplayBody struct {
 	opened    bool
 	spill     *os.File
 	spillPath string
+	spooled   int64
+	prepared  bool
 }
 
 func (b *proxyStreamingReplayBody) Len() int64 { return b.total }
@@ -4307,19 +4371,102 @@ func (b *proxyStreamingReplayBody) Prepare(attempts int) error {
 	if _, err := spill.Write(b.prefix); err != nil {
 		return err
 	}
-	remaining := b.total - int64(len(b.prefix))
+	b.spooled = int64(len(b.prefix))
+	if b.total-b.spooled < 0 {
+		return errInvalidProxyAttachmentEnvelope
+	}
+	b.prepared = true
+	cleanup = false
+	return nil
+}
+
+type proxyReplaySpoolWriter struct {
+	body *proxyStreamingReplayBody
+}
+
+func (w proxyReplaySpoolWriter) Write(p []byte) (int, error) {
+	n, err := w.body.spill.Write(p)
+	w.body.spooled += int64(n)
+	return n, err
+}
+
+type proxyStreamingAttemptBody struct {
+	body       *proxyStreamingReplayBody
+	reader     io.Reader
+	readMu     sync.Mutex
+	closed     atomic.Bool
+	finishOnce sync.Once
+	finishErr  error
+}
+
+func (b *proxyStreamingAttemptBody) Read(p []byte) (int, error) {
+	if b.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	b.readMu.Lock()
+	defer b.readMu.Unlock()
+	if b.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	return b.reader.Read(p)
+}
+
+func (b *proxyStreamingAttemptBody) Close() error {
+	// net/http is allowed to close a request body asynchronously after
+	// RoundTrip returns. Close must therefore be nonblocking and must never
+	// compete with an active socket read. The forwarding owner calls Finish
+	// after Do returns to serialize and seal the replay file exactly once.
+	b.closed.Store(true)
+	return nil
+}
+
+func (b *proxyStreamingAttemptBody) Finish() error {
+	b.closed.Store(true)
+	b.finishOnce.Do(func() {
+		b.readMu.Lock()
+		defer b.readMu.Unlock()
+		b.finishErr = b.body.sealReplay()
+	})
+	return b.finishErr
+}
+
+// sealReplay completes the bounded spool when an upstream rejects a request
+// before consuming its entire body. The ordinary successful path reaches EOF
+// through the TeeReader, making this a constant-time check.
+func (b *proxyStreamingReplayBody) sealReplay() error {
+	if b.spill == nil || b.spooled == b.total {
+		return nil
+	}
+	remaining := b.total - b.spooled
 	if remaining < 0 {
 		return errInvalidProxyAttachmentEnvelope
 	}
-	if _, err := io.CopyN(spill, b.tail, remaining); err != nil {
+	if _, err := io.CopyN(proxyReplaySpoolWriter{body: b}, b.tail, remaining); err != nil {
 		return errInvalidProxyAttachmentEnvelope
 	}
-	cleanup = false
+	if b.spooled != b.total {
+		return errInvalidProxyAttachmentEnvelope
+	}
 	return nil
 }
 
 func (b *proxyStreamingReplayBody) Open() (io.ReadCloser, error) {
 	if b.spill != nil {
+		if !b.opened {
+			b.opened = true
+			remaining := b.total - int64(len(b.prefix))
+			if remaining < 0 || !b.prepared {
+				return nil, errInvalidProxyAttachmentEnvelope
+			}
+			reader := io.MultiReader(
+				bytes.NewReader(b.prefix),
+				io.TeeReader(io.LimitReader(b.tail, remaining), proxyReplaySpoolWriter{body: b}),
+			)
+			return &proxyStreamingAttemptBody{body: b, reader: reader}, nil
+		}
+		if err := b.sealReplay(); err != nil {
+			return nil, err
+		}
 		return io.NopCloser(io.NewSectionReader(b.spill, 0, b.total)), nil
 	}
 	if b.opened {
@@ -4349,17 +4496,26 @@ func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, opera
 	// The bounded metadata prefix is the only request-sized allocation retained
 	// by the routing proxy. Media stays on the socket for a single attempt; a
 	// retry-enabled route uses a bounded temporary replay file.
-	maxRoutingPrefix := int64(proxyAttachmentEnvelopeHeaderBytes +
-		proxyAttachmentMaxCount*proxyAttachmentDescriptorBytes + proxyAttachmentMaxMetadataBytes)
-	routingBytes := min(r.ContentLength, maxRoutingPrefix)
-	routingReservation := proxyBodyAdmissionBytes(routingBytes)
-	if err := p.bodyAdmission.Acquire(r.Context(), routingReservation); err != nil {
-		http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
-		return
-	}
+	routingReservation := int64(0)
 	defer p.bodyAdmission.Release(routingReservation)
-	prefix, routingPayload, err := readProxyAttachmentRoutingPrefix(r.Body, r.ContentLength, p.maxRequestBodyBytes)
+	prefix, routingPayload, err := readProxyAttachmentRoutingPrefixAdmitted(
+		r.Body,
+		r.ContentLength,
+		p.maxRequestBodyBytes,
+		func(prefixBytes int64) error {
+			routingReservation = proxyMaterializedBodyAdmissionBytes(prefixBytes, prefixBytes)
+			return p.bodyAdmission.Acquire(r.Context(), routingReservation)
+		},
+	)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "request canceled while waiting for inference body admission", http.StatusRequestTimeout)
+			return
+		}
+		if errors.Is(err, errByteAdmissionRequestTooLarge) {
+			http.Error(w, "inference attachment routing metadata is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid inference attachment envelope: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -5619,8 +5775,16 @@ func (p *Proxy) forwardRequest(r *http.Request, replay proxyReplayBody, endpoint
 	}
 
 	resp, err := p.registry.client.Do(outReq)
-	if err != nil {
-		_ = body.Close()
+	_ = body.Close()
+	finishErr := error(nil)
+	if finalizer, ok := body.(interface{ Finish() error }); ok {
+		finishErr = finalizer.Finish()
+	}
+	if err == nil && finishErr != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, finishErr
 	}
 	return resp, err
 }
