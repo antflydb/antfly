@@ -3760,11 +3760,14 @@ pub const Node = struct {
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
+        // Manager-owned loads can outlive their request and retain watchdog
+        // guards. Drain those tasks (including guard cleanup) while their
+        // hard-cancellation boundary is still alive.
+        self.model_manager.deinit();
         if (self.hard_cancellation_watchdog) |watchdog| {
             watchdog.destroy();
             self.hard_cancellation_watchdog = null;
         }
-        self.model_manager.deinit();
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
         self.tabular_registry.deinit();
@@ -16857,6 +16860,48 @@ test "supervised node owns and joins the hard cancellation watchdog" {
     try std.testing.expect(control.hard_cancellation != null);
     var guard = try control.enterUninterruptible(.process_required);
     guard.deinit();
+}
+
+test "supervised node drains load task guards before destroying watchdog" {
+    const Probe = struct {
+        ready: std.Io.Event = .unset,
+        blocked: std.Io.Event = .unset,
+        finished: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This(), io: std.Io, control: InferenceExecutionControl) std.Io.Cancelable!void {
+            defer self.finished = true;
+            var guard = control.enterUninterruptible(.process_required) catch |err| {
+                self.err = err;
+                self.ready.set(io);
+                return;
+            };
+            defer guard.deinit();
+            self.ready.set(io);
+            // Only manager shutdown can release this task. Its watchdog guard
+            // must remain valid until cancellation has unwound the task.
+            try self.blocked.wait(io);
+        }
+    };
+    var probe = Probe{};
+    {
+        var node = try Node.init(std.testing.allocator, .{
+            .process_termination_available = true,
+        });
+        defer node.deinit();
+        const io = std.testing.io;
+        try node.attachIo(io);
+        node.model_manager.load_io = io;
+        try node.model_manager.load_group.concurrent(io, Probe.run, .{
+            &probe, io, node.bindExecutionControl(null, .{}),
+        });
+        try probe.ready.waitTimeout(io, .{ .duration = .{
+            .raw = std.Io.Duration.fromSeconds(5),
+            .clock = .awake,
+        } });
+        try std.testing.expect(probe.err == null);
+    }
+    try std.testing.expect(probe.finished);
 }
 
 test "canonical relation schemas preserve endpoint label constraints" {

@@ -6352,11 +6352,13 @@ pub const ModelManager = struct {
         flight: *LoadFlight,
         control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        var waiter_consumed = false;
+        defer if (!waiter_consumed) {
+            var result = self.consumeLoadFlightWaiter(flight_key, flight, .abandon);
+            result.handle.release();
+        };
         while (!flight.completed.isSet()) {
-            if (control) |active| active.update(.loading_model, 0, 1) catch |err| {
-                self.releaseLoadFlightWaiter(flight_key, flight, true);
-                return err;
-            };
+            if (control) |active| try active.update(.loading_model, 0, 1);
             flight.completed.waitTimeout(flight.io, .{
                 .duration = .{
                     .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms),
@@ -6364,62 +6366,43 @@ pub const ModelManager = struct {
                 },
             }) catch |err| switch (err) {
                 error.Timeout => continue,
-                else => {
-                    self.releaseLoadFlightWaiter(flight_key, flight, true);
-                    return err;
-                },
+                else => return err,
             };
         }
-        var removed_key: ?[]const u8 = null;
-        var destroy_flight = false;
-        self.lockLoadedModels();
-        const model = flight.model;
-        const maybe_err = flight.err;
-        if (model) |loaded| {
-            if (!flight.handles_reserved) loaded.active_handles += 1;
-        }
-        std.debug.assert(flight.refs > 0);
-        flight.refs -= 1;
-        flight.releaseWaiter(false);
-        if (flight.refs == 0) {
-            if (flight.registered) {
-                const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
-                std.debug.assert(removed.value == flight);
-                flight.registered = false;
-                removed_key = removed.key;
-            }
-            destroy_flight = true;
-        }
-        self.unlockLoadedModels();
-
-        if (removed_key) |key| self.allocator.free(key);
-        if (destroy_flight) self.allocator.destroy(flight);
-        if (control) |active| active.check() catch |err| {
-            if (model) |loaded| {
-                var handle = ModelHandle{ .manager = self, .model = loaded };
-                handle.release();
-            }
-            return err;
-        };
-        if (maybe_err) |err| return err;
-        return .{
-            .manager = self,
-            .model = model orelse return error.NoBackendAvailable,
-        };
+        var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
+        waiter_consumed = true;
+        errdefer result.handle.release();
+        if (control) |active| try active.check();
+        if (result.err) |err| return err;
+        if (result.handle.model == null) return error.NoBackendAvailable;
+        return result.handle;
     }
 
-    fn releaseLoadFlightWaiter(
+    /// Consume exactly one waiter reference and transfer its model ownership,
+    /// if any, to the caller. Retirement reserves handles for outstanding
+    /// waiters; even an abandoning waiter must release that reservation. Keep
+    /// this accounting under the same lock as retirement, and release returned
+    /// handles outside the lock because the last release can destroy a model.
+    fn consumeLoadFlightWaiter(
         self: *ModelManager,
         flight_key: []const u8,
         flight: *LoadFlight,
-        abandon_if_last: bool,
-    ) void {
+        disposition: enum { adopt, abandon },
+    ) struct { handle: ModelHandle, err: ?anyerror } {
         var removed_key: ?[]const u8 = null;
         var destroy_flight = false;
         self.lockLoadedModels();
+        var handle = ModelHandle{ .manager = self, .model = null };
+        const maybe_err = flight.err;
+        if (flight.model) |loaded| {
+            if (flight.handles_reserved or disposition == .adopt) {
+                if (!flight.handles_reserved) loaded.active_handles += 1;
+                handle.model = loaded;
+            }
+        }
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
-        flight.releaseWaiter(abandon_if_last);
+        flight.releaseWaiter(disposition == .abandon);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6432,6 +6415,7 @@ pub const ModelManager = struct {
         self.unlockLoadedModels();
         if (removed_key) |key| self.allocator.free(key);
         if (destroy_flight) self.allocator.destroy(flight);
+        return .{ .handle = handle, .err = maybe_err };
     }
 
     fn loadFromDirCoordinated(
@@ -8399,6 +8383,87 @@ test "cold load rollback owns manifest and constructed session before cancellati
         } else {
             try std.testing.expectError(error.Cancelled, result);
             try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "load flight waiter exits release retirement reservations and admission" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+
+    const Exit = enum { cancel_during_wait, cancel_after_completion, adopt };
+    const Cancellation = struct {
+        manager: *ModelManager,
+        flight: *LoadFlight,
+        model: *LoadedModel,
+        publish_before_cancel: bool,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.publish_before_cancel) {
+                // Deterministically interleave completion and retirement after
+                // the waiter observed an incomplete flight, before it exits.
+                self.manager.finishLoadFlight(self.flight, self.model, null);
+                self.manager.retireLoadedModel(self.model);
+            }
+            return error.Cancelled;
+        }
+    };
+
+    for ([_]bool{ false, true }) |task_ref_pending| {
+        for ([_]Exit{ .cancel_during_wait, .cancel_after_completion, .adopt }) |exit| {
+            var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+            defer manager.deinit();
+            manager.configureServingPolicy(.{ .allow_unknown = true });
+            manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+            try manager.ensureResourceOwnerReady();
+            var keeper = try manager.loadFromDirUncached(root, &manager.session_manager, true, null, null);
+            defer keeper.release();
+            const model = keeper.get();
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+
+            const flight = try allocator.create(LoadFlight);
+            flight.* = .{
+                .io = std.testing.io,
+                .refs = 1 + @as(usize, @intFromBool(task_ref_pending)),
+                .task_ref_pending = task_ref_pending,
+            };
+            try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
+            // The task can drop its reference either before or after the
+            // waiter. Only waiter references own retirement reservations.
+            defer if (task_ref_pending) manager.releaseLoadFlight("flight", flight);
+            var cancellation = Cancellation{
+                .manager = &manager,
+                .flight = flight,
+                .model = model,
+                .publish_before_cancel = exit == .cancel_during_wait,
+            };
+            if (exit != .cancel_during_wait) {
+                manager.finishLoadFlight(flight, model, null);
+                manager.retireLoadedModel(model);
+            }
+            const result = manager.waitForLoadFlight("flight", flight, if (exit == .adopt) null else .{
+                .ptr = &cancellation,
+                .check_fn = Cancellation.check,
+            });
+            if (exit == .adopt) {
+                var adopted = try result;
+                try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+                adopted.release();
+            } else {
+                try std.testing.expectError(error.Cancelled, result);
+            }
+            try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+            keeper.release();
+            // This proves that cancellation releases the native model and its
+            // lease, not merely that it removes the flight from the registry.
             try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
         }
     }
