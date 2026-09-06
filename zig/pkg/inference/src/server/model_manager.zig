@@ -6814,6 +6814,15 @@ pub const ModelManager = struct {
         owned_model_dir_owned = false;
         model_storage_owned = false;
         _ = loaded_session.take();
+        model.kernel_jit_profile_bundle = qualified_profile_bundle;
+        qualified_profile_bundle = null;
+        // Preparation is still fallible after construction ownership moves to
+        // the model. Keep a single rollback owner until publication takes it.
+        var unpublished_model_owned = true;
+        errdefer if (unpublished_model_owned) {
+            model.deinit();
+            self.allocator.destroy(model);
+        };
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the
@@ -6826,16 +6835,26 @@ pub const ModelManager = struct {
         {
             if (session_factory.getGptConfig(session)) |gpt_config| {
                 if (graph_mod.metal_executor.supportsSession(session)) {
-                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(self.allocator, session, gpt_config) catch |err| {
+                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntimeWithControl(self.allocator, session, gpt_config, control) catch |err| {
+                        if (control) |active| try active.check();
+                        switch (err) {
+                            error.Canceled,
+                            error.Cancelled,
+                            error.Timeout,
+                            error.ProcessIsolationRequired,
+                            error.HardCancellationWatchdogNotStarted,
+                            error.InferenceWorkerShuttingDown,
+                            => return err,
+                            else => {},
+                        }
                         std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_dir, @errorName(err) });
                     };
                 }
             }
         }
 
-        model.kernel_jit_profile_bundle = qualified_profile_bundle;
-        qualified_profile_bundle = null;
-
+        if (control) |active| try active.check();
+        unpublished_model_owned = false;
         return self.publishLoadedModel(model, cache_default_alias, a4b_request);
     }
 
@@ -8365,8 +8384,8 @@ test "cold load rollback owns manifest and constructed session before cancellati
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
     defer allocator.free(root);
-    var checkpoints: [2]usize = undefined;
-    for (0..3) |iteration| {
+    var checkpoints: [3]usize = undefined;
+    for (0..4) |iteration| {
         var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
         defer manager.deinit();
         manager.configureServingPolicy(.{ .allow_unknown = true });
@@ -8376,10 +8395,17 @@ test "cold load rollback owns manifest and constructed session before cancellati
         const result = manager.loadFromDirUncached(root, &manager.session_manager, true, null, trace.control());
         if (iteration == 0) {
             var handle = try result;
-            handle.release();
+            defer handle.release();
             try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
-            checkpoints = .{ trace.after_manifest, trace.after_session };
+            // The final checkpoint is after ownership has moved into the
+            // unpublished model, including any speculative preparation.
+            checkpoints = .{ trace.after_manifest, trace.after_session, trace.checks };
             try std.testing.expect(checkpoints[0] > 0 and checkpoints[1] > checkpoints[0]);
+            try std.testing.expect(checkpoints[2] > checkpoints[1]);
+            var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+            defer compute.deinit();
+            trace.fail_at = trace.checks + 1;
+            try std.testing.expectError(error.Cancelled, compute.backend.checkExecutionControl());
         } else {
             try std.testing.expectError(error.Cancelled, result);
             try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());

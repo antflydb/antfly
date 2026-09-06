@@ -2136,17 +2136,29 @@ pub fn prewarmSharedDecoderRuntime(
     session: backends.Session,
     gpt_config: gpt_mod.Config,
 ) !bool {
+    return prewarmSharedDecoderRuntimeWithControl(allocator, session, gpt_config, null);
+}
+
+pub fn prewarmSharedDecoderRuntimeWithControl(
+    allocator: std.mem.Allocator,
+    session: backends.Session,
+    gpt_config: gpt_mod.Config,
+    control: ?@import("../execution_control.zig").InferenceExecutionControl,
+) !bool {
+    if (control) |active| try active.update(.preparing_weights, 0, 1);
     if (!supportsSession(session)) return false;
     if (gemma4_runtime.shouldSkipSharedDecoderPrewarm(gpt_config)) return false;
 
-    var cb = try session_factory.getComputeBackend(session, allocator);
-    defer cb.deinit();
+    var managed = try session_factory.getComputeBackendWithControl(session, allocator, control);
+    defer managed.deinit();
+    const cb = &managed.backend;
 
     // A4B uses the graph fallback rather than the prepared dense-family
     // decoder, so its bounded mapped-page warmup is the complete shared
     // pre-publication prepare operation when explicitly enabled.
     if (a4bMappedLayer0PrewarmEnabled(gpt_config)) {
-        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        try prewarmA4bMappedLayer0(cb, gpt_config);
+        if (control) |active| try active.update(.preparing_weights, 1, 1);
         return true;
     }
     // Multi-row prefill and the prepared A4B decoder share the provider's
@@ -2162,10 +2174,22 @@ pub fn prewarmSharedDecoderRuntime(
         configured_layer_count,
     );
     if (prepare.prepared) {
-        try prewarmEmbeddingWeight(&cb, gpt_config);
-        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        try cb.checkExecutionControl();
+        try prewarmEmbeddingWeight(cb, gpt_config);
+        try cb.checkExecutionControl();
+        try prewarmA4bMappedLayer0(cb, gpt_config);
     }
+    if (control) |active| try active.update(.preparing_weights, 1, 1);
     return prepare.prepared;
+}
+
+test "Metal prewarm checks request lifetime before session inspection" {
+    try std.testing.expectError(error.Timeout, prewarmSharedDecoderRuntimeWithControl(
+        std.testing.allocator,
+        undefined,
+        .{},
+        .{ .deadline_ns = 0 },
+    ));
 }
 
 pub fn createModelExecutor(

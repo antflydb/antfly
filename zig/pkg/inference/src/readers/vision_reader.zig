@@ -276,6 +276,7 @@ pub const LoadedVisionReader = struct {
     }
 
     fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {
+        if (options.execution_control) |control| try control.check();
         const prefix_len: usize = if (self.dec_config.forced_bos_token_id == null) 1 else 2;
         const max_length = try resolveMaxLength(self.dec_config.max_length, options.max_tokens, prefix_len);
         var reader_pipeline = reading_pipeline_mod.ReadingPipeline.init(

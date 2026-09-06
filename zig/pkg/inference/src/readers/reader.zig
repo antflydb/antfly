@@ -86,11 +86,11 @@ const VisionLoadedReader = struct {
     pub fn read(self: *VisionLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
-        var raw = try self.core.readRaw(image_data, .{
-            .prompt = normalized_prompt,
-            .max_tokens = options.max_tokens,
-            .source_fingerprint = options.source_fingerprint,
-        });
+        // Normalize only the family-specific field; retain the complete
+        // request contract, including cancellation and future option fields.
+        var forwarded = options;
+        forwarded.prompt = normalized_prompt;
+        var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
@@ -99,11 +99,9 @@ const VisionLoadedReader = struct {
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
-        const raw_results = try self.core.readRawBatch(image_datas, .{
-            .prompt = normalized_prompt,
-            .max_tokens = options.max_tokens,
-            .source_fingerprint = options.source_fingerprint,
-        });
+        var forwarded = options;
+        forwarded.prompt = normalized_prompt;
+        const raw_results = try self.core.readRawBatch(image_datas, forwarded);
         defer {
             for (raw_results) |raw| {
                 var tmp = raw;
@@ -423,6 +421,29 @@ fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: 
         filled += 1;
     }
     return out;
+}
+
+test "vision option normalization preserves cancellation for single and batch reads" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    for ([_]InferenceExecutionControl{
+        .{ .deadline_ns = 0 },
+        .{ .check_fn = Cancel.check },
+    }, [_]anyerror{ error.Timeout, error.Cancelled }) |control, expected| {
+        // Expired requests must stop before consulting the loaded sessions or
+        // tokenizer. This also covers the wrapper, not just the raw pipeline.
+        var reader = VisionLoadedReader{
+            .allocator = std.testing.allocator,
+            .parser_kind = .florence,
+            .core = undefined,
+        };
+        const options = ReadOptions{ .prompt = "", .execution_control = control };
+        try std.testing.expectError(expected, reader.read("unused", options));
+        try std.testing.expectError(expected, reader.readBatch(&.{ "unused", "unused" }, options));
+    }
 }
 
 fn validateReadOptions(options: ReadOptions) !void {
