@@ -16,13 +16,11 @@
 //! lake-native publication planning.
 
 /// First manifest version carrying artifact materializer provenance.
-pub const artifact_provenance_manifest_wire_version: u16 = 15;
-
 /// The only manifest wire that may publish graph-metric artifacts. Serverless
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
-pub const graph_metric_manifest_wire_version: u16 = 17;
-pub const graph_metric_segment_wire_version: u16 = 7;
+pub const graph_metric_manifest_wire_version: u16 = 18;
+pub const graph_metric_segment_wire_version: u16 = 8;
 
 pub const GraphMetricMaterializationState = enum(u8) {
     ready = 0,
@@ -72,7 +70,10 @@ pub const ArtifactRef = struct {
     graph_metric_control_len: u32 = 0,
     graph_metric_routing_footer_len: u32 = 0,
     graph_metric_control_checksum: [32]u8 = @splat(0),
+    // Authenticates the bounded routing root, which in turn authenticates the
+    // primary point index. Top-K readers never need to fetch that point index.
     graph_metric_routing_checksum: [32]u8 = @splat(0),
+    graph_metric_point_index_checksum: [32]u8 = @splat(0),
     graph_metric_config_fingerprint: u64 = 0,
     graph_metric_source_checksum: [32]u8 = @splat(0),
     graph_metric_materialization_state: GraphMetricMaterializationState = .ready,

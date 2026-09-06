@@ -3116,11 +3116,12 @@ fn aggregateGraphMetricRuntimeStats(dst: *db_mod.types.GraphMetricRuntimeStats, 
     dst.shutdown = dst.shutdown or src.shutdown;
     dst.notified = dst.notified or src.notified;
     inline for (.{
-        "ticks_started",         "ticks_completed",       "durable_progress_ticks", "idle_ticks",         "error_ticks",
-        "total_metrics_scanned", "total_active_builds",   "total_builds_started",   "total_worker_steps", "total_coordinator_steps",
-        "total_pages_claimed",   "total_pages_completed", "total_phases_advanced",  "total_published",    "total_failed_builds",
-        "last_metrics_scanned",  "last_active_builds",    "last_builds_started",    "last_worker_steps",  "last_coordinator_steps",
-        "last_pages_claimed",    "last_pages_completed",  "last_phases_advanced",   "last_published",     "last_failed_builds",
+        "ticks_started",               "ticks_completed",            "durable_progress_ticks", "idle_ticks",            "error_ticks",
+        "total_retired_input_records", "last_retired_input_records", "total_metrics_scanned",  "total_active_builds",   "total_builds_started",
+        "total_worker_steps",          "total_coordinator_steps",    "total_pages_claimed",    "total_pages_completed", "total_phases_advanced",
+        "total_published",             "total_failed_builds",        "last_metrics_scanned",   "last_active_builds",    "last_builds_started",
+        "last_worker_steps",           "last_coordinator_steps",     "last_pages_claimed",     "last_pages_completed",  "last_phases_advanced",
+        "last_published",              "last_failed_builds",
     }) |field_name| {
         @field(dst, field_name) +|= @field(src, field_name);
     }
@@ -10193,6 +10194,8 @@ test "index encoders expose mixed graph metric runtime roles without aggregate r
                 .worker_count = 0,
                 .has_lease = true,
                 .total_coordinator_steps = 3,
+                .total_retired_input_records = 512,
+                .last_retired_input_records = 256,
                 .total_published = 1,
             },
         },
@@ -10243,6 +10246,8 @@ test "index encoders expose mixed graph metric runtime roles without aggregate r
     try std.testing.expectEqual(@as(i64, 0x33), aggregate_runtime.get("owner_id_hash").?.integer);
     try std.testing.expectEqual(@as(i64, 2), aggregate_runtime.get("worker_count").?.integer);
     try std.testing.expectEqual(@as(i64, 3), aggregate_runtime.get("total_coordinator_steps").?.integer);
+    try std.testing.expectEqual(@as(i64, 512), aggregate_runtime.get("total_retired_input_records").?.integer);
+    try std.testing.expectEqual(@as(i64, 256), aggregate_runtime.get("last_retired_input_records").?.integer);
     try std.testing.expectEqual(@as(i64, 5), aggregate_runtime.get("total_worker_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 4), aggregate_runtime.get("total_pages_completed").?.integer);
 

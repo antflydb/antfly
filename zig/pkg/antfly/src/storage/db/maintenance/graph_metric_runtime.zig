@@ -697,6 +697,22 @@ fn updateSuccessStats(
     stats_snapshot.last_result = result;
 }
 
+test "graph metric runtime retirement remains durable through aggregation and idle accounting" {
+    const Sweep = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult;
+    var aggregate = Sweep{};
+    aggregate.add(.{ .coordinator_steps = 1, .retired_input_records = 512 });
+    try std.testing.expect(aggregate.durableProgressed());
+    try std.testing.expect(aggregate.progressed());
+    var snapshot = initialStats(.{});
+    updateSuccessStats(&snapshot, aggregate);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_progress_ticks);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.idle_ticks);
+    try std.testing.expectEqual(@as(usize, 512), snapshot.total_result.retired_input_records);
+    try std.testing.expectEqual(@as(usize, 512), snapshot.last_result.retired_input_records);
+    updateSuccessStats(&snapshot, .{ .coordinator_steps = 1 });
+    try std.testing.expectEqual(@as(u64, 1), snapshot.idle_ticks);
+}
+
 fn updateErrorStats(stats_snapshot: *Stats, err: anyerror) void {
     stats_snapshot.error_ticks += 1;
     stats_snapshot.last_error_name = @errorName(err);

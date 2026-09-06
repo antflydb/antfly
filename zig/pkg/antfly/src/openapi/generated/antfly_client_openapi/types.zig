@@ -15396,6 +15396,8 @@ pub const GraphMetricRuntimeStats = struct {
     total_builds_started: ?i64 = null,
     total_worker_steps: ?i64 = null,
     total_coordinator_steps: ?i64 = null,
+    /// Consumed intermediate records retired at completed reduction barriers.
+    total_retired_input_records: ?i64 = null,
     total_pages_claimed: ?i64 = null,
     total_pages_completed: ?i64 = null,
     total_phases_advanced: ?i64 = null,
@@ -15406,6 +15408,8 @@ pub const GraphMetricRuntimeStats = struct {
     last_builds_started: ?i64 = null,
     last_worker_steps: ?i64 = null,
     last_coordinator_steps: ?i64 = null,
+    /// Consumed intermediate records retired in the latest maintenance tick.
+    last_retired_input_records: ?i64 = null,
     last_pages_claimed: ?i64 = null,
     last_pages_completed: ?i64 = null,
     last_phases_advanced: ?i64 = null,
@@ -15446,6 +15450,7 @@ pub const GraphMetricRuntimeStats = struct {
         .{ "total_builds_started", "total_builds_started", true },
         .{ "total_worker_steps", "total_worker_steps", true },
         .{ "total_coordinator_steps", "total_coordinator_steps", true },
+        .{ "total_retired_input_records", "total_retired_input_records", true },
         .{ "total_pages_claimed", "total_pages_claimed", true },
         .{ "total_pages_completed", "total_pages_completed", true },
         .{ "total_phases_advanced", "total_phases_advanced", true },
@@ -15456,6 +15461,7 @@ pub const GraphMetricRuntimeStats = struct {
         .{ "last_builds_started", "last_builds_started", true },
         .{ "last_worker_steps", "last_worker_steps", true },
         .{ "last_coordinator_steps", "last_coordinator_steps", true },
+        .{ "last_retired_input_records", "last_retired_input_records", true },
         .{ "last_pages_claimed", "last_pages_claimed", true },
         .{ "last_pages_completed", "last_pages_completed", true },
         .{ "last_phases_advanced", "last_phases_advanced", true },
@@ -15598,6 +15604,10 @@ pub const GraphMetricRuntimeStats = struct {
             try jw.objectField("total_coordinator_steps");
             try jw.write(value);
         }
+        if (self.total_retired_input_records) |value| {
+            try jw.objectField("total_retired_input_records");
+            try jw.write(value);
+        }
         if (self.total_pages_claimed) |value| {
             try jw.objectField("total_pages_claimed");
             try jw.write(value);
@@ -15636,6 +15646,10 @@ pub const GraphMetricRuntimeStats = struct {
         }
         if (self.last_coordinator_steps) |value| {
             try jw.objectField("last_coordinator_steps");
+            try jw.write(value);
+        }
+        if (self.last_retired_input_records) |value| {
+            try jw.objectField("last_retired_input_records");
             try jw.write(value);
         }
         if (self.last_pages_claimed) |value| {

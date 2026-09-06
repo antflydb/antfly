@@ -15,7 +15,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_types = @import("types.zig");
-const artifact_ref = @import("artifact_ref.zig");
 
 pub const PublishResult = struct {
     published: bool,
@@ -26,10 +25,6 @@ pub const ManifestStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
-    /// Maximum wire version this publisher is allowed to emit. Deployments
-    /// hold this at the previous release while new readers roll out, then
-    /// advance it after every reader understands the new format.
-    write_version: u16 = artifact_ref.graph_metric_manifest_wire_version,
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
@@ -93,16 +88,5 @@ pub const ManifestStore = struct {
             .published = false,
             .current_head = current_head,
         };
-    }
-
-    pub fn supportsArtifactKind(self: *const ManifestStore, kind: manifest_types.ArtifactKind) bool {
-        return switch (kind) {
-            .graph_metric_segment => self.write_version >= artifact_ref.graph_metric_manifest_wire_version,
-            else => true,
-        };
-    }
-
-    pub fn supportsArtifactProvenance(self: *const ManifestStore) bool {
-        return self.write_version >= artifact_ref.artifact_provenance_manifest_wire_version;
     }
 };

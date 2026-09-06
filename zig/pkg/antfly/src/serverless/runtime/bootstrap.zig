@@ -56,9 +56,8 @@ pub const BootstrapConfig = struct {
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024,
     query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024,
-    /// Hold at v12 for the reader-first rollout, then set to the current wire
-    /// version once every serverless reader has been upgraded.
-    manifest_write_version: u16 = manifest_mod.codec.rolling_compatible_write_version,
+    /// Only the current wire is supported while serverless is unreleased.
+    manifest_write_version: u16 = manifest_mod.codec.wire_version,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: []const u8 = search_sources.default_sparse_embedding_index_name,
     chunk_embedding_index_name: []const u8 = search_sources.default_chunk_embedding_index_name,
@@ -704,7 +703,7 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
-    if (cfg.manifest_write_version != manifest_mod.codec.rolling_compatible_write_version and cfg.manifest_write_version != manifest_mod.codec.wire_version) {
+    if (cfg.manifest_write_version != manifest_mod.codec.wire_version) {
         return error.UnsupportedManifestWriteVersion;
     }
     if (cfg.query_cache_dir) |path| {
@@ -1368,7 +1367,7 @@ test "runtime bootstrap requires bounded query cache budgets" {
     try std.testing.expectError(error.QueryCachePayloadExceedsBudget, validateConfig(alloc, invalid));
 }
 
-test "runtime bootstrap requires bounded graph metric parallelism" {
+test "runtime bootstrap requires bounded graph metric parallelism and current manifest wire" {
     const alloc = std.testing.allocator;
     const base = BootstrapConfig{
         .artifacts_uri = "file:///tmp/antfly-artifacts",
@@ -1383,6 +1382,12 @@ test "runtime bootstrap requires bounded graph metric parallelism" {
     try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
     invalid.graph_metric_max_parallelism = 17;
     try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
+    try std.testing.expectEqual(manifest_mod.codec.wire_version, base.manifest_write_version);
+    invalid = base;
+    for ([_]u16{ 12, manifest_mod.codec.wire_version - 1, manifest_mod.codec.wire_version + 1 }) |version| {
+        invalid.manifest_write_version = version;
+        try std.testing.expectError(error.UnsupportedManifestWriteVersion, validateConfig(alloc, invalid));
+    }
 }
 
 test "runtime bootstrap bucket provisioning fails closed" {

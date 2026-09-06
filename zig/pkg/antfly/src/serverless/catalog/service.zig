@@ -571,16 +571,11 @@ pub const CatalogService = struct {
         const pending_materialization_rebuild =
             !head_republish_recommended and
             (plan.artifact_actions.any() or plan.derived_output_actions.any());
-        const graph_metrics_supported = self.manifests.supportsArtifactKind(.graph_metric_segment);
-        var graph_metric_readiness = try graphMetricReadinessAlloc(
+        const graph_metric_readiness = try graphMetricReadinessAlloc(
             self.alloc,
             published_head.manifest,
             plan.table_definition.indexes_json,
         );
-        if (!graph_metrics_supported and graph_metric_readiness.configured != 0) {
-            graph_metric_readiness.pending = graph_metric_readiness.configured;
-            graph_metric_readiness.rejected = 0;
-        }
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
@@ -605,7 +600,6 @@ pub const CatalogService = struct {
             .head_republish_recommended = head_republish_recommended,
             .pending_materialization_rebuild = pending_materialization_rebuild,
             .graph_metrics_configured = graph_metric_readiness.configured,
-            .graph_metrics_supported = graph_metrics_supported,
             .graph_metrics_pending = graph_metric_readiness.pending,
             .graph_metrics_rejected = graph_metric_readiness.rejected,
             .pending_materialization_families = pending_materialization_families,
@@ -939,8 +933,7 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
-                metadata_republish.graph_metric_policy_changed = self.manifests.supportsArtifactKind(.graph_metric_segment) and
-                    try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
+                metadata_republish.graph_metric_policy_changed = try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,

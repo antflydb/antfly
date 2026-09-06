@@ -470,7 +470,7 @@ fn scoresInto(
     const footer_offset = metric_artifact.byte_len - footer_len;
     const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
         @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
-    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len, expected_blocks);
+    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len, expected_blocks, metric_segment.codec.routingRootLen(control.score_count), false);
     defer routing_lease.deinit();
     const routing = routing_lease.entry.routing;
     if (routing.entries.len != expected_blocks or routing.footer_offset != footer_offset or
@@ -766,15 +766,22 @@ fn fetchRoutingFooterAlloc(
     segment_version: u16,
     footer_offset: u64,
     footer_len: usize,
+    root_len: usize,
 ) ![]u8 {
     try session.chargeGraphMetricRange(footer_len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
+    if (root_len > footer_len) return error.InvalidGraphMetricSegment;
     const subranges = [_]runtime_mod.AuthenticatedSubrange{.{
-        .relative_offset = 0,
-        .len = footer_len,
+        .relative_offset = footer_len - root_len,
+        .len = root_len,
         .checksum = artifact.graph_metric_routing_checksum,
     }};
-    return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, footer_offset, footer_len, &subranges) catch |err| switch (err) {
+    const both = [_]runtime_mod.AuthenticatedSubrange{ .{
+        .relative_offset = 0,
+        .len = footer_len - root_len,
+        .checksum = artifact.graph_metric_point_index_checksum,
+    }, subranges[0] };
+    return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, footer_offset, footer_len, if (footer_len == root_len) &subranges else &both) catch |err| switch (err) {
         error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
         else => |other| other,
     };
@@ -788,6 +795,8 @@ fn acquireRouting(
     offset: u64,
     len: usize,
     decode_work: usize,
+    root_len: usize,
+    ranked_only: bool,
 ) !routing_cache.Lease {
     try session.cancellation.check();
     // Include all authentication and interpretation inputs, not merely a
@@ -797,6 +806,7 @@ fn acquireRouting(
     hash.update(&.{0});
     hash.update(artifact.checksum);
     hash.update(&artifact.graph_metric_routing_checksum);
+    hash.update(&artifact.graph_metric_point_index_checksum);
     var dimensions: [26]u8 = undefined;
     std.mem.writeInt(u64, dimensions[0..8], artifact.byte_len, .little);
     std.mem.writeInt(u64, dimensions[8..16], offset, .little);
@@ -848,7 +858,7 @@ fn acquireRouting(
     const reservation = std.math.add(usize, footer_bytes, routing_bytes) catch return error.GraphMetricQueryBudgetExceeded;
     try session.chargeGraphMetricRetained(std.math.add(usize, reservation, overhead) catch return error.GraphMetricQueryBudgetExceeded);
     try session.chargeGraphMetricDecode(1, decode_work);
-    const footer = try fetchRoutingFooterAlloc(session, metric_index, artifact, version, offset, len);
+    const footer = try fetchRoutingFooterAlloc(session, metric_index, artifact, version, offset, len, root_len);
     var owns_footer = true;
     defer if (owns_footer) session.alloc.free(footer);
     const owner = if (session.cache) |cache| cache.alloc else session.alloc;
@@ -857,8 +867,12 @@ fn acquireRouting(
         break :blk footer;
     } else try owner.dupe(u8, footer);
     errdefer owner.free(owned);
-    var routing = try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(owner, owned, artifact.byte_len, version, session.cancellation);
+    var routing = if (ranked_only)
+        try metric_segment.codec.decodeRoutingRootAlloc(owner, owned, artifact.byte_len, version, session.cancellation)
+    else
+        try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(owner, owned, artifact.byte_len, version, session.cancellation);
     errdefer routing.deinit(owner);
+    if (!std.mem.eql(u8, &routing.point_index_checksum, &artifact.graph_metric_point_index_checksum)) return error.InvalidGraphMetricSegment;
     const entry = try owner.create(routing_cache.Entry);
     errdefer owner.destroy(entry);
     entry.* = .{ .key = key, .alloc = owner, .footer = owned, .routing = routing };
@@ -1129,22 +1143,19 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
             .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
         };
     }
-    // Wire-v7 artifacts serve bounded top-k reads from an authenticated footer
-    // tier without touching the score vector.
+    // Wire-v8 has an independently authenticated routing root. Cold top-K
+    // never fetches, decodes or retains the primary point-lookup index.
     const footer_len = try routingFooterLen(metric_artifact, control.header.version);
     const footer_offset = metric_artifact.byte_len - footer_len;
-    const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
-        @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
     const expected_top_count = @min(@as(usize, control.score_count), metric_segment.codec.max_persisted_top_entries);
     const expected_ranked_blocks = expected_top_count / metric_segment.codec.ranked_score_block_entries +
         @intFromBool(expected_top_count % metric_segment.codec.ranked_score_block_entries != 0);
-    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len, expected_blocks + expected_ranked_blocks);
+    const root_len = metric_segment.codec.routingRootLen(control.score_count);
+    if (root_len > footer_len) return error.InvalidGraphMetricSegment;
+    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, metric_artifact.byte_len - root_len, root_len, expected_ranked_blocks, root_len, true);
     defer routing_lease.deinit();
     const routing = routing_lease.entry.routing;
-    if (routing.entries.len != expected_blocks or routing.footer_offset != footer_offset or
-        (routing.entries.len == 0 and routing.footer_offset != control.score_data_offset) or
-        (routing.entries.len > 0 and routing.entries[0].offset != control.score_data_offset))
-    {
+    if (routing.entries.len != 0 or routing.footer_offset != footer_offset or routing.primary_data_offset != control.score_data_offset) {
         return error.InvalidGraphMetricSegment;
     }
 
@@ -1530,9 +1541,13 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
         payload: []const u8,
         control_len: usize,
         footer_offset: usize,
+        root_offset: usize,
         range_calls: std.atomic.Value(usize) = .init(0),
         verify_calls: std.atomic.Value(usize) = .init(0),
         corrupt_score_reads: bool = false,
+        reject_point_index_reads: bool = false,
+        corrupt_point_index: bool = false,
+        corrupt_routing_root: bool = false,
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
@@ -1546,7 +1561,11 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
             _ = self.range_calls.fetchAdd(1, .monotonic);
             const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
             if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
+            const touches_point_index = start < self.root_offset and start + len > self.footer_offset;
+            if (self.reject_point_index_reads and touches_point_index) return error.UnexpectedPointIndexRead;
             const out = try result_alloc.dupe(u8, self.payload[start..][0..len]);
+            if (self.corrupt_point_index and touches_point_index) out[self.footer_offset - start] ^= 1;
+            if (self.corrupt_routing_root and start <= self.root_offset and start + len > self.root_offset) out[self.root_offset - start] ^= 1;
             if (self.corrupt_score_reads and start >= self.control_len and start < self.footer_offset and out.len > @sizeOf(u32)) {
                 out[@sizeOf(u32)] ^= 0x01;
             }
@@ -1578,6 +1597,7 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
         .payload = payload,
         .control_len = integrity.control_len,
         .footer_offset = payload.len - integrity.routing_footer_len,
+        .root_offset = payload.len - metric_segment.codec.routingRootLen(metric.scores.len),
     };
     var artifacts = artifacts_mod.ArtifactStore{ .allocator = alloc, .ptr = &state, .vtable = &State.vtable };
     defer artifacts.deinit();
@@ -1595,6 +1615,7 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
             .graph_metric_routing_footer_len = integrity.routing_footer_len,
             .graph_metric_control_checksum = integrity.control_checksum,
             .graph_metric_routing_checksum = integrity.routing_checksum,
+            .graph_metric_point_index_checksum = integrity.point_index_checksum,
             .graph_metric_config_fingerprint = metric.config_fingerprint,
             .graph_metric_source_checksum = @splat(0xaa),
         },
@@ -1655,6 +1676,12 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
     try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&session});
 
     state.range_calls.store(0, .monotonic);
+    state.reject_point_index_reads = true;
+    var top_one = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", 1, .{});
+    defer top_one.deinit(alloc);
+    try std.testing.expectEqualStrings("node:1024", top_one.scores[0].node_id);
+    try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
+    state.range_calls.store(0, .monotonic);
     var top = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", metric_segment.score_block_entries + 1, .{});
     defer top.deinit(alloc);
     try std.testing.expectEqual(@as(usize, metric_segment.score_block_entries + 1), top.scores.len);
@@ -1664,6 +1691,14 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
     try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), state.verify_calls.load(.monotonic));
 
+    state.reject_point_index_reads = false;
+    state.corrupt_point_index = true;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
+    state.corrupt_point_index = false;
+    state.corrupt_routing_root = true;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
+    try std.testing.expectError(error.InvalidGraphMetricSegment, topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", 1, .{}));
+    state.corrupt_routing_root = false;
     state.corrupt_score_reads = true;
     try std.testing.expectError(error.InvalidGraphMetricSegment, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
     try std.testing.expectError(error.InvalidGraphMetricSegment, topWithLimitsAlloc(

@@ -249,6 +249,7 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
         .graph_metric_routing_footer_len = built.artifact.graph_metric_routing_footer_len,
         .graph_metric_control_checksum = built.artifact.graph_metric_control_checksum,
         .graph_metric_routing_checksum = built.artifact.graph_metric_routing_checksum,
+        .graph_metric_point_index_checksum = built.artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
         .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
@@ -616,6 +617,7 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
         .graph_metric_routing_footer_len = built.artifact.graph_metric_routing_footer_len,
         .graph_metric_control_checksum = built.artifact.graph_metric_control_checksum,
         .graph_metric_routing_checksum = built.artifact.graph_metric_routing_checksum,
+        .graph_metric_point_index_checksum = built.artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
         .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
@@ -1531,6 +1533,7 @@ fn populateGraphMetricIntegrity(ref: *artifact_ref.ArtifactRef, segment: metric_
     ref.graph_metric_routing_footer_len = integrity.routing_footer_len;
     ref.graph_metric_control_checksum = integrity.control_checksum;
     ref.graph_metric_routing_checksum = integrity.routing_checksum;
+    ref.graph_metric_point_index_checksum = integrity.point_index_checksum;
     ref.graph_metric_config_fingerprint = segment.config_fingerprint;
     ref.graph_metric_source_checksum = artifact_store.sha256DigestFromChecksum(segment.source_graph_checksum) catch
         return error.ArtifactIntegrityMismatch;

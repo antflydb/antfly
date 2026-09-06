@@ -11216,6 +11216,11 @@ export interface components {
             total_worker_steps?: number;
             /** Format: uint64 */
             total_coordinator_steps?: number;
+            /**
+             * Format: uint64
+             * @description Consumed intermediate records retired at completed reduction barriers.
+             */
+            total_retired_input_records?: number;
             /** Format: uint64 */
             total_pages_claimed?: number;
             /** Format: uint64 */
@@ -11236,6 +11241,11 @@ export interface components {
             last_worker_steps?: number;
             /** Format: uint64 */
             last_coordinator_steps?: number;
+            /**
+             * Format: uint64
+             * @description Consumed intermediate records retired in the latest maintenance tick.
+             */
+            last_retired_input_records?: number;
             /** Format: uint64 */
             last_pages_claimed?: number;
             /** Format: uint64 */

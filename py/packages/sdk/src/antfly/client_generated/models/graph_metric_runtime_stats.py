@@ -51,6 +51,8 @@ class GraphMetricRuntimeStats:
             total_builds_started (int | Unset):
             total_worker_steps (int | Unset):
             total_coordinator_steps (int | Unset):
+            total_retired_input_records (int | Unset): Consumed intermediate records retired at completed reduction
+                barriers.
             total_pages_claimed (int | Unset):
             total_pages_completed (int | Unset):
             total_phases_advanced (int | Unset):
@@ -61,6 +63,7 @@ class GraphMetricRuntimeStats:
             last_builds_started (int | Unset):
             last_worker_steps (int | Unset):
             last_coordinator_steps (int | Unset):
+            last_retired_input_records (int | Unset): Consumed intermediate records retired in the latest maintenance tick.
             last_pages_claimed (int | Unset):
             last_pages_completed (int | Unset):
             last_phases_advanced (int | Unset):
@@ -100,6 +103,7 @@ class GraphMetricRuntimeStats:
     total_builds_started: int | Unset = UNSET
     total_worker_steps: int | Unset = UNSET
     total_coordinator_steps: int | Unset = UNSET
+    total_retired_input_records: int | Unset = UNSET
     total_pages_claimed: int | Unset = UNSET
     total_pages_completed: int | Unset = UNSET
     total_phases_advanced: int | Unset = UNSET
@@ -110,6 +114,7 @@ class GraphMetricRuntimeStats:
     last_builds_started: int | Unset = UNSET
     last_worker_steps: int | Unset = UNSET
     last_coordinator_steps: int | Unset = UNSET
+    last_retired_input_records: int | Unset = UNSET
     last_pages_claimed: int | Unset = UNSET
     last_pages_completed: int | Unset = UNSET
     last_phases_advanced: int | Unset = UNSET
@@ -183,6 +188,8 @@ class GraphMetricRuntimeStats:
 
         total_coordinator_steps = self.total_coordinator_steps
 
+        total_retired_input_records = self.total_retired_input_records
+
         total_pages_claimed = self.total_pages_claimed
 
         total_pages_completed = self.total_pages_completed
@@ -202,6 +209,8 @@ class GraphMetricRuntimeStats:
         last_worker_steps = self.last_worker_steps
 
         last_coordinator_steps = self.last_coordinator_steps
+
+        last_retired_input_records = self.last_retired_input_records
 
         last_pages_claimed = self.last_pages_claimed
 
@@ -280,6 +289,8 @@ class GraphMetricRuntimeStats:
             field_dict["total_worker_steps"] = total_worker_steps
         if total_coordinator_steps is not UNSET:
             field_dict["total_coordinator_steps"] = total_coordinator_steps
+        if total_retired_input_records is not UNSET:
+            field_dict["total_retired_input_records"] = total_retired_input_records
         if total_pages_claimed is not UNSET:
             field_dict["total_pages_claimed"] = total_pages_claimed
         if total_pages_completed is not UNSET:
@@ -300,6 +311,8 @@ class GraphMetricRuntimeStats:
             field_dict["last_worker_steps"] = last_worker_steps
         if last_coordinator_steps is not UNSET:
             field_dict["last_coordinator_steps"] = last_coordinator_steps
+        if last_retired_input_records is not UNSET:
+            field_dict["last_retired_input_records"] = last_retired_input_records
         if last_pages_claimed is not UNSET:
             field_dict["last_pages_claimed"] = last_pages_claimed
         if last_pages_completed is not UNSET:
@@ -385,6 +398,8 @@ class GraphMetricRuntimeStats:
 
         total_coordinator_steps = d.pop("total_coordinator_steps", UNSET)
 
+        total_retired_input_records = d.pop("total_retired_input_records", UNSET)
+
         total_pages_claimed = d.pop("total_pages_claimed", UNSET)
 
         total_pages_completed = d.pop("total_pages_completed", UNSET)
@@ -404,6 +419,8 @@ class GraphMetricRuntimeStats:
         last_worker_steps = d.pop("last_worker_steps", UNSET)
 
         last_coordinator_steps = d.pop("last_coordinator_steps", UNSET)
+
+        last_retired_input_records = d.pop("last_retired_input_records", UNSET)
 
         last_pages_claimed = d.pop("last_pages_claimed", UNSET)
 
@@ -449,6 +466,7 @@ class GraphMetricRuntimeStats:
             total_builds_started=total_builds_started,
             total_worker_steps=total_worker_steps,
             total_coordinator_steps=total_coordinator_steps,
+            total_retired_input_records=total_retired_input_records,
             total_pages_claimed=total_pages_claimed,
             total_pages_completed=total_pages_completed,
             total_phases_advanced=total_phases_advanced,
@@ -459,6 +477,7 @@ class GraphMetricRuntimeStats:
             last_builds_started=last_builds_started,
             last_worker_steps=last_worker_steps,
             last_coordinator_steps=last_coordinator_steps,
+            last_retired_input_records=last_retired_input_records,
             last_pages_claimed=last_pages_claimed,
             last_pages_completed=last_pages_completed,
             last_phases_advanced=last_phases_advanced,

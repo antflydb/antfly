@@ -2694,6 +2694,10 @@ components:
         total_coordinator_steps:
           type: integer
           format: uint64
+        total_retired_input_records:
+          description: Consumed intermediate records retired at completed reduction barriers.
+          type: integer
+          format: uint64
         total_pages_claimed:
           type: integer
           format: uint64
@@ -2722,6 +2726,10 @@ components:
           type: integer
           format: uint64
         last_coordinator_steps:
+          type: integer
+          format: uint64
+        last_retired_input_records:
+          description: Consumed intermediate records retired in the latest maintenance tick.
           type: integer
           format: uint64
         last_pages_claimed:

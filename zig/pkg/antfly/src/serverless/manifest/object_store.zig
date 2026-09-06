@@ -88,12 +88,11 @@ pub const ObjectStore = struct {
             .allocator = self.alloc,
             .ptr = self,
             .vtable = &vtable,
-            .write_version = self.write_version,
         };
     }
 
     pub fn setWriteVersion(self: *ObjectStore, write_version: u16) !void {
-        if (write_version != manifest_codec.rolling_compatible_write_version and write_version != manifest_codec.wire_version) {
+        if (write_version != manifest_codec.wire_version) {
             return error.UnsupportedManifestWriteVersion;
         }
         self.write_version = write_version;

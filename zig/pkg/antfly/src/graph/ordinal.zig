@@ -17,6 +17,62 @@
 //! compiling topology or crossing the public score boundary.
 const std = @import("std");
 pub const max_edges = 4096;
+pub const fold_entries = 256;
+
+/// One bounded shuffle fold. Cursor and compensated accumulators commit
+/// together; attempt identity prevents a replacement from mixing executions.
+pub const Fold = struct {
+    attempt: u64 = 0,
+    prior: u64 = 0,
+    fingerprint: u64 = 0,
+    position: u16 = 0,
+    count: u16 = 0,
+    cursor: []const u8 = "",
+    sums: [fold_entries]f64 = @splat(0),
+    corrections: [fold_entries]f64 = @splat(0),
+
+    const fixed_len = 36 + fold_entries * 16;
+
+    pub fn encode(self: *const Fold, alloc: std.mem.Allocator) ![]u8 {
+        if (self.count > fold_entries or self.position > self.count or self.cursor.len > std.math.maxInt(u32)) return error.InvalidGraphMetricBuildManifest;
+        const raw = try alloc.alloc(u8, fixed_len + self.cursor.len);
+        errdefer alloc.free(raw);
+        @memcpy(raw[0..4], "GOF1");
+        std.mem.writeInt(u64, raw[4..12], self.attempt, .little);
+        std.mem.writeInt(u64, raw[12..20], self.prior, .little);
+        std.mem.writeInt(u64, raw[20..28], self.fingerprint, .little);
+        std.mem.writeInt(u16, raw[28..30], self.position, .little);
+        std.mem.writeInt(u16, raw[30..32], self.count, .little);
+        std.mem.writeInt(u32, raw[32..36], @intCast(self.cursor.len), .little);
+        for (self.sums, self.corrections, 0..) |sum, correction, i| {
+            if (!std.math.isFinite(sum) or sum < 0 or !std.math.isFinite(correction)) return error.InvalidGraphMetricScore;
+            std.mem.writeInt(u64, raw[36 + i * 16 ..][0..8], @bitCast(sum), .little);
+            std.mem.writeInt(u64, raw[44 + i * 16 ..][0..8], @bitCast(correction), .little);
+        }
+        @memcpy(raw[fixed_len..], self.cursor);
+        return raw;
+    }
+
+    /// The cursor borrows raw; the caller owns its lifetime.
+    pub fn decode(raw: []const u8) !Fold {
+        if (raw.len < fixed_len or !std.mem.eql(u8, raw[0..4], "GOF1") or std.mem.readInt(u32, raw[32..36], .little) != raw.len - fixed_len) return error.InvalidGraphMetricBuildManifest;
+        var result = Fold{
+            .attempt = std.mem.readInt(u64, raw[4..12], .little),
+            .prior = std.mem.readInt(u64, raw[12..20], .little),
+            .fingerprint = std.mem.readInt(u64, raw[20..28], .little),
+            .position = std.mem.readInt(u16, raw[28..30], .little),
+            .count = std.mem.readInt(u16, raw[30..32], .little),
+            .cursor = raw[fixed_len..],
+        };
+        if (result.count > fold_entries or result.position > result.count) return error.InvalidGraphMetricBuildManifest;
+        for (&result.sums, &result.corrections, 0..) |*sum, *correction, i| {
+            sum.* = @bitCast(std.mem.readInt(u64, raw[36 + i * 16 ..][0..8], .little));
+            correction.* = @bitCast(std.mem.readInt(u64, raw[44 + i * 16 ..][0..8], .little));
+            if (!std.math.isFinite(sum.*) or sum.* < 0 or !std.math.isFinite(correction.*)) return error.InvalidGraphMetricScore;
+        }
+        return result;
+    }
+};
 pub const Edge = struct { source: u64, target: u64 };
 pub const Value = struct {
     ordinal: u64,
@@ -111,4 +167,16 @@ test "ordinal blocks round trip and reject malformed input" {
     try std.testing.expectEqualSlices(u8, &cursor, decoded.cursor);
     try std.testing.expectEqual(@as(u64, 9), decoded.edges[0].source);
     try std.testing.expect(!decoded.complete);
+    var fold = Fold{ .attempt = 2, .prior = 256, .count = 2, .position = 1, .cursor = "checkpoint" };
+    fold.sums[0] = 1.0e16;
+    fold.corrections[0] = 1;
+    const state = try fold.encode(alloc);
+    defer alloc.free(state);
+    const restored = try Fold.decode(state);
+    try std.testing.expectEqual(@as(u64, 2), restored.attempt);
+    try std.testing.expectEqual(@as(f64, 1), restored.corrections[0]);
+    try std.testing.expectEqualStrings("checkpoint", restored.cursor);
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, Fold.decode(state[0 .. state.len - 1]));
+    fold.position = 3;
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, fold.encode(alloc));
 }

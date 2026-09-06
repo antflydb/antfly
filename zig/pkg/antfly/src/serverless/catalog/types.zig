@@ -262,7 +262,6 @@ pub const BuildStatus = struct {
     head_republish_recommended: bool,
     pending_materialization_rebuild: bool,
     graph_metrics_configured: usize = 0,
-    graph_metrics_supported: bool = true,
     graph_metrics_pending: usize = 0,
     graph_metrics_rejected: usize = 0,
     pending_materialization_families: PendingMaterializationFamilies = .{},

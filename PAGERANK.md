@@ -577,12 +577,13 @@ seed budget caps input at 64 MiB and decode/mapping work at 67,108,864 units
 (one prior byte plus one current node per unit). Every actual read is charged,
 including repeated identities; no seed cache is implied. Zero allowance disables
 warm starts. Exhausting this optional budget cold-starts without consuming later
-metrics' cold execution allowance. Materializer epoch 7 fingerprints this policy.
+metrics' cold execution allowance. Materializer epoch 8 fingerprints this policy
+and the independently authenticated routing-root format.
 An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 5 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 6 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
 The same job/configuration/epoch fence applies to workers, coordinator phase
@@ -613,17 +614,34 @@ node-oriented reducer reads still resolve their ordinals through sorted multi-ge
 All native reducers retain immutable inputs throughout the consumer phase.
 Checkpointed output may be replayed safely after lease takeover. Once every
 consumer finishes, the phase barrier deletes at most 512 input records per
-transaction, resuming from the remaining namespace after restart. It advances
+transaction, persisting a last-deleted-key cursor atomically with each batch.
+Restart seeks beyond that cursor instead of rescanning LSM tombstones. Completed
+namespaces retain a durable sentinel until job cleanup. Retirement counts flow
+through DB maintenance sweeps, idle detection and runtime status
+(`total_retired_input_records` / `last_retired_input_records`). The barrier advances
 only after cleanup finishes. Both HITS lanes retire each iteration this way,
 rather than accumulating hub shards until publication. Retained contribution
 state is bounded by one iteration (including bounded abandoned attempts), not
 the number of power iterations.
 
-Large normalization passes reuse the immutable node quantiles: independently
-leased producers scan up to 4,096 nodes per checkpoint, and the root deterministically
-combines at most 256 completed scalar records. Data reducers stay behind that
-barrier. This preserves exact target-wise spectral normalization while removing
-the serial graph-wide scalar scan; filtered-out ranges contribute empty leaves.
+Large reduction passes reuse the immutable node quantiles: independently leased
+producers fold at most 512 physical contribution shards for a group of up to
+256 nodes per checkpoint. Their attempt-fenced cursor and compensated sums
+survive restart; a replacement attempt recomputes without mixing old state.
+Completed folds atomically publish raw vector blocks and partial spectral norms
+or PageRank dangling mass. The root deterministically combines at most 256
+completed scalar records. Data reducers stay behind that barrier and read only
+raw vector blocks, eliminating the second shuffle fold for normalization.
+Raw vectors retire with the consumed inputs, bounding retained state by an
+iteration. Filtered-out ranges contribute empty leaves.
+
+Serverless metric wire version 8 separates the ranked routing root from the
+primary point index. Manifest version 18 carries both digests, so point reads
+still authenticate the complete footer in one range request. Top-K reads fetch
+only the root (at most 1,832 bytes) and the requested ranked blocks, never the
+primary point index. The root also binds primary vector extents and the point
+index digest; decoders validate the cross-tier relationship. Unreleased older
+graph-metric wire versions are rejected rather than migrated at query time.
 
 Eigenvector and HITS always use canonical cold seeds in both runtimes. An old
 spectral vector may have zero support on a newly dominant disconnected component;

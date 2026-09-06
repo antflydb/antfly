@@ -8241,6 +8241,7 @@ pub fn build(b: *std.Build) void {
         "graph metric runtime role gates apply",
         "graph metric runtime worker pool identity",
         "graph metric runtime boundary tick",
+        "graph metric runtime retirement",
         "ownership state tracks lease takeover and loss",
         "ownership state renews only at the cached renewal deadline",
         "graph metric query shape bounds clauses and unique dependencies",

@@ -18,7 +18,7 @@ const bounded_decode = @import("../bounded_decode.zig");
 // Epoch 7 bounds optional seed I/O and decode separately from cold execution.
 // Rebuild older sidecars so admission decisions and output remain tied to one
 // explicit materializer contract.
-pub const materializer_epoch: u32 = 7;
+pub const materializer_epoch: u32 = 8;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

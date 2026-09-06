@@ -133,7 +133,7 @@ pub fn runFromIterator(
             init.environ_map,
             u16,
             "ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION",
-            serverless.manifest.codec.rolling_compatible_write_version,
+            serverless.manifest.codec.wire_version,
         ),
         .embedding_indexes_json = cli.embedding_indexes_json orelse init.environ_map.get("ANTFLY_SERVERLESS_EMBEDDING_INDEXES_JSON"),
         .sparse_embedding_index_name = cli.sparse_embedding_index_name orelse init.environ_map.get("ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME") orelse "serverless_sparse",
@@ -667,7 +667,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --catalog-uri <uri>
         \\  --query-cache-dir <path>
         \\  --query-cache-max-bytes <bytes>
-        \\  --manifest-write-version <12|15|16|17>
+        \\  --manifest-write-version <18>
         \\  --query-cache-payload-max-bytes <bytes>
         \\  --host <host>
         \\  --port <port>
@@ -699,7 +699,7 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_DIR
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_MAX_BYTES default: 4294967296
         \\  ANTFLY_SERVERLESS_QUERY_CACHE_PAYLOAD_MAX_BYTES default: 67108864
-        \\  ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION default: 12 (set 17 after all readers are upgraded)
+        \\  ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION default: 18 (only the current version is supported)
         \\  ANTFLY_SERVERLESS_BIND_HOST      default: 127.0.0.1
         \\  ANTFLY_SERVERLESS_BIND_PORT      default: 8080
         \\  ANTFLY_SERVERLESS_HEALTH_PORT    default: unset (disables dedicated health server)

@@ -667,26 +667,21 @@ The listener is configured with:
 - `ANTFLY_SERVERLESS_BIND_PORT`
 - `ANTFLY_SERVERLESS_TICK_INTERVAL_MS`
 
-### Manifest rollout gate
+### Current-version-only storage contract
 
-Serverless manifest writers default to wire version 12 so a rolling deployment
-cannot publish data that readers from the previous release reject. Deploy a new
-release in two phases:
+Serverless is unreleased and supports only the current version. All readers and
+writers use manifest version 18; graph metric segments use version 8. Older
+manifests are rejected, and no legacy writer or two-phase rollout gate is kept.
+Graph metric materialization is enabled by default. Catalog reconciliation
+detects configured metrics without artifacts and schedules their publication.
+Any explicit `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION` must be `18`; other values
+fail startup. All components must run the same current release, and old
+development data must be rebuilt before use.
 
-1. Roll out the new query/API binaries everywhere while leaving
-   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=12` (the default).
-2. After every reader is on the new release, set
-   `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION=17` on maintenance or combined
-   publishers.
-
-Graph metric materialization remains dormant while the gate is at version 12.
-Once version 17 is enabled, catalog reconciliation detects configured metrics
-without artifacts and schedules their publication. Readers remain backward
-compatible with version 12 manifests throughout the rollout. Because the
-serverless graph-metric feature has not shipped, partial development versions
-15 and 16 are deliberately unsupported: graph-metric manifests and segments
-must use the current authenticated ranked-block format. Other values fail
-startup rather than risking a partially compatible deployment.
+The manifest authenticates the
+point-lookup index and the bounded ranked routing root independently. Cold
+top-K reads fetch at most 1,832 routing bytes, regardless of vector cardinality;
+point reads authenticate both tiers in one routing fetch.
 
 ## Image And CI Path
 
