@@ -2962,7 +2962,10 @@ pub fn build(b: *std.Build) void {
 
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
-        .filters = &.{"H2 response serialization strips connection-specific headers"},
+        .filters = &.{
+            "H2 response serialization strips connection-specific headers",
+            "HTTP streaming headers and automatic preflight preserve middleware policy",
+        },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
 
@@ -3493,7 +3496,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend", "asset producer runtime", "provider quotas", "vertex provider" },
+        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -4220,6 +4223,9 @@ pub fn build(b: *std.Build) void {
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
+        "httpx retrieval SSE",
+        "retrieval agent sse",
+        "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
         "inference invocation remaining deadline rounds up and expires",
         "inference connection ABI reclaims partial responses on target failure",
@@ -4311,6 +4317,7 @@ pub fn build(b: *std.Build) void {
             "cmd.cli.backup",
             "cmd.cli.index",
             "cmd.cli.query",
+            "cmd.cli.agents",
             "cmd.cli.table",
             "cmd.cli.mod",
             "cmd.cli.data.test.mutation parser",
@@ -4348,7 +4355,7 @@ pub fn build(b: *std.Build) void {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.agents", "cmd.cli.table", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -7833,7 +7840,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
             "standalone inference middleware reuses public API authentication",
-            "standalone CORS middleware enforces dynamic configuration",
+            "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
@@ -11178,17 +11185,14 @@ pub fn build(b: *std.Build) void {
                 // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // 19.51 GB (18.17 GiB) with the platform frameworks enabled.
                 // A clean native aarch64-linux-musl production container build
                 // reached 19.89 GB (18.52 GiB) for the current production
-                // graph. Reserve 20 GiB on Linux so Zig's scheduler does
+                // graph. Reserve 20 GiB on both targets so Zig's scheduler does
                 // not discard a successfully compiled production artifact.
                 // Use the same Linux-target claim for native and cross builds;
                 // the target artifact determines the dominant codegen shape.
-                .distributed => @as(usize, if (target.result.os.tag == .macos)
-                    18
-                else
-                    20) * 1024 * 1024 * 1024,
+                .distributed => 20 * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

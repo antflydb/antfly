@@ -424,6 +424,152 @@ const CachedAuthenticatedIdentity = struct {
     }
 };
 
+/// Lazy commitment preserves HTTP validation/auth errors until the first
+/// event. Synchronous writes provide bounded transport backpressure while
+/// the handler retains its request, identity, and query-admission lifetimes.
+const RetrievalSseSink = struct {
+    context: *httpx.Context,
+    writer: ?httpx.Context.StreamWriter = null,
+    failed: bool = false,
+
+    fn iface(self: *@This()) retrieval_agent.EventSink {
+        return .{ .sse_only = true, .ptr = self, .emit_json_fn = emitJson };
+    }
+
+    fn emitJson(raw: *anyopaque, _: std.mem.Allocator, name: []const u8, json: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        errdefer self.failed = true;
+        if (self.context.isCancellationRequested()) return error.Canceled;
+        if (self.writer == null) self.writer = try self.context.streamResponse(200);
+        try self.writer.?.writeEvent(name, json);
+    }
+
+    fn emitError(self: *@This()) !void {
+        try emitJson(self, self.context.allocator, "error", "{\"error\":\"RetrievalFailed\"}");
+    }
+
+    fn close(self: *@This()) !void {
+        if (self.writer) |*writer| try writer.close();
+    }
+};
+
+test "httpx retrieval SSE writes before generation and preserves terminal outcomes" {
+    const State = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        started: bool = false,
+        closed: bool = false,
+        generated: bool = false,
+        fail_generation: bool = false,
+        fail_query: bool = false,
+        fail_write: bool = false,
+        json_request: bool = false,
+        forbidden: bool = false,
+        cancelled: bool = false,
+
+        fn authorize(raw: *anyopaque, _: []const u8, _: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.forbidden) return error.Forbidden;
+        }
+        fn isCancelled(raw: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.cancelled;
+        }
+
+        fn start(raw: ?*anyopaque, status: u16) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expect(!self.started);
+            self.started = true;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail_write) return error.ConnectionResetByPeer;
+            try std.testing.expect(std.unicode.utf8ValidateSlice(bytes));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.closed);
+            self.closed = true;
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_query) return error.TableNotFound;
+            return .{ .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha"}}]}}]}
+            ) };
+        }
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, chain: []const generating_runtime.ChainLink, _: []const generating_runtime.ChatMessage) !generating_runtime.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.generated = true;
+            // No sleeps/timing races: the generation callback cannot begin
+            // until the earlier hit has actually reached the transport.
+            try std.testing.expectEqual(!self.json_request, self.started);
+            if (!self.json_request) try std.testing.expect(std.mem.indexOf(u8, self.bytes.items, "event: hit\n") != null);
+            try std.testing.expectEqual(@as(i64, 128), chain[0].generator.max_tokens);
+            if (self.fail_generation) return error.TestGenerationFailure;
+            return .{ .allocator = alloc, .content = try alloc.dupe(u8, ("x" ** 79) ++ "한국어 answer") };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (0..8) |case| {
+        var state = State{ .fail_generation = case == 1, .fail_write = case == 2, .json_request = case == 3 or case == 7, .forbidden = case == 4, .cancelled = case == 5, .fail_query = case >= 6 };
+        defer state.bytes.deinit(alloc);
+        var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+        ctx.cancellation_probe = .{ .ptr = &state, .is_cancelled = State.isCancelled };
+        var sink = RetrievalSseSink{ .context = &ctx };
+        const body = try std.fmt.allocPrint(alloc,
+            \\{{"query":"alpha","stream":{s},"generator":{{"provider":"antfly","model":"local","max_tokens":128}},"steps":{{"generation":{{"enabled":true}}}},"queries":[{{"table":"docs","full_text_search":{{"query":"body:alpha"}}}}]}}
+        , .{if (state.json_request) "false" else "true"});
+        defer alloc.free(body);
+        const result = retrieval_agent.executeWithEventSink(alloc, .{ .ptr = &state, .vtable = &.{ .authorize_query = State.authorize, .run_query = State.query } }, .{ .ptr = &state, .vtable = &.{ .execute_chain = State.generate } }, body, sink.iface());
+        if (state.fail_query and state.json_request) {
+            try std.testing.expectError(error.TableNotFound, result);
+            try std.testing.expect(!state.started);
+            continue;
+        }
+        if (state.forbidden or state.cancelled) {
+            try std.testing.expectError(if (state.forbidden) error.Forbidden else error.Canceled, result);
+            try std.testing.expect(!state.started);
+            try std.testing.expect(!state.generated);
+            continue;
+        }
+        if (state.fail_write) {
+            try std.testing.expectError(error.ConnectionResetByPeer, result);
+            try std.testing.expect(sink.failed);
+            try std.testing.expect(!state.generated);
+            continue;
+        }
+        const encoded = try result;
+        defer alloc.free(encoded.body);
+        try sink.close();
+        if (state.fail_query) {
+            try std.testing.expect(!state.generated);
+            try std.testing.expect(state.closed);
+            try std.testing.expectEqual(@as(usize, 0), encoded.body.len);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, state.bytes.items, "event: error\n"));
+            try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "TableNotFound") != null);
+            try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "event: done\n") == null);
+            continue;
+        }
+        try std.testing.expect(state.generated);
+        if (state.json_request) {
+            try std.testing.expect(!state.started);
+            try std.testing.expectEqualStrings("application/json", encoded.content_type);
+            continue;
+        }
+        try std.testing.expect(state.closed);
+        try std.testing.expectEqual(@as(usize, 0), encoded.body.len);
+        try std.testing.expectEqual(!state.fail_generation, std.mem.indexOf(u8, state.bytes.items, "event: done\n") != null);
+        try std.testing.expectEqual(state.fail_generation, std.mem.indexOf(u8, state.bytes.items, "GenerationFailed") != null);
+        if (!state.fail_generation) try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "한국어") != null);
+    }
+}
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
     /// Separate phase admission for H2 query bodies. Slow uploads must not
@@ -4584,56 +4730,72 @@ pub const AntflyApiHandler = struct {
             .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
             .authenticated_identity = authenticated_identity,
         };
-        const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
-            error.TreeRootSetTooLarge => {
-                _ = ctx.status(422);
-                return ctx.text("tree root set exceeds the bounded retrieval limit");
-            },
-            error.RerankerCandidateLimitExceeded => {
-                var response = contextual_operations.jsonWithStatus(
-                    422,
-                    try public_table_http.rerankerCandidateLimitExceededBody(alloc),
-                    false,
-                );
-                return try respondOwnedApiResponse(ctx, &response);
-            },
-            error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
-                _ = ctx.status(400);
-                return ctx.text("invalid retrieval agent request");
-            },
-            error.EmbeddingIndexNotFound => {
-                var response = try public_table_http.queryDependencyErrorOwnedResponse(
-                    alloc,
-                    422,
-                    "embedding_index_not_found",
-                    "embedding index not found",
-                    false,
-                );
-                return try respondOwnedApiResponse(ctx, &response);
-            },
-            error.MissingGenerationConfig => {
-                _ = ctx.status(422);
-                return ctx.text("steps.generation requires a step-level or top-level generator or chain");
-            },
-            error.TableNotFound => {
-                _ = ctx.status(404);
-                return ctx.text("not found");
-            },
-            error.Forbidden => {
-                _ = ctx.status(403);
-                return ctx.text("forbidden");
-            },
-            error.DocIdentityNamespaceMismatch => {
-                _ = ctx.status(503);
-                return ctx.text("doc identity unavailable");
-            },
-            else => {
-                if (try respondQueryOperationalError(ctx, err)) |response| return response;
-                std.log.err("public retrieval failed err={}", .{err});
-                return err;
-            },
+        var sink = RetrievalSseSink{ .context = ctx };
+        const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body_data, sink.iface()) catch |err| {
+            if (sink.writer != null) {
+                // Headers are committed. Report application errors in-band;
+                // transport/cancellation failures must close the connection,
+                // never attempt to send a second HTTP response.
+                if (sink.failed or ctx.isCancellationRequested()) return err;
+                try sink.emitError();
+                try sink.close();
+                return ctx.response.build();
+            }
+            return switch (err) {
+                error.TreeRootSetTooLarge => {
+                    _ = ctx.status(422);
+                    return ctx.text("tree root set exceeds the bounded retrieval limit");
+                },
+                error.RerankerCandidateLimitExceeded => {
+                    var response = contextual_operations.jsonWithStatus(
+                        422,
+                        try public_table_http.rerankerCandidateLimitExceededBody(alloc),
+                        false,
+                    );
+                    return try respondOwnedApiResponse(ctx, &response);
+                },
+                error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid retrieval agent request");
+                },
+                error.EmbeddingIndexNotFound => {
+                    var response = try public_table_http.queryDependencyErrorOwnedResponse(
+                        alloc,
+                        422,
+                        "embedding_index_not_found",
+                        "embedding index not found",
+                        false,
+                    );
+                    return try respondOwnedApiResponse(ctx, &response);
+                },
+                error.MissingGenerationConfig => {
+                    _ = ctx.status(422);
+                    return ctx.text("steps.generation requires a step-level or top-level generator or chain");
+                },
+                error.TableNotFound => {
+                    _ = ctx.status(404);
+                    return ctx.text("not found");
+                },
+                error.Forbidden => {
+                    _ = ctx.status(403);
+                    return ctx.text("forbidden");
+                },
+                error.DocIdentityNamespaceMismatch => {
+                    _ = ctx.status(503);
+                    return ctx.text("doc identity unavailable");
+                },
+                else => {
+                    if (try respondQueryOperationalError(ctx, err)) |response| return response;
+                    std.log.err("public retrieval failed err={}", .{err});
+                    return err;
+                },
+            };
         };
         defer alloc.free(retrieval_resp.body);
+        if (sink.writer != null) {
+            try sink.close();
+            return ctx.response.build();
+        }
         if (std.mem.eql(u8, retrieval_resp.content_type, "text/event-stream")) {
             try ctx.setHeader("content-type", "text/event-stream");
             _ = ctx.response.body(retrieval_resp.body);

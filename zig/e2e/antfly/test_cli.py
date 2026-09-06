@@ -617,20 +617,25 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert image_status["status"]["readiness"]["queryable"] is True
         assert image_status["status"]["searchable_vectors"] >= 1
 
-        # The searchable-artifact threshold proves serving authority, not
-        # convergence authority. Wait separately for an exact target
-        # observation before asserting whole-source completion.
+        # A source census can settle before replay/publication does. The
+        # warning-free query below requires the full readiness milestone,
+        # not only one searchable image or completed source decisions.
         def completed_image_coverage() -> dict | None:
             current = parse_json(
                 cli("index", "get", "--table", table, "--index", "thumbnail").stdout
             )
             coverage = current["status"]["source_coverage"]
-            if coverage["observation_complete"] and coverage["complete"]:
+            if (
+                coverage["observation_complete"]
+                and coverage["complete"]
+                and current["status"]["readiness"]["state"] == "ready"
+                and current["status"]["milestones"]["complete"]["reached"]
+            ):
                 return current
             return None
 
         completed_image_status = wait_until(
-            completed_image_coverage, timeout_s=5.0, interval_s=0.025
+            completed_image_coverage, timeout_s=20.0, interval_s=0.025
         )
         assert completed_image_status is not None, json.dumps(image_status, indent=2)
         completed_image_coverage_status = completed_image_status["status"][

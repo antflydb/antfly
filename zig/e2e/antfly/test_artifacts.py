@@ -1273,18 +1273,36 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
     )
     assert merged["inserted"] == 1
 
+    text_observation: dict = {}
+
     def text_projection_intact() -> dict | None:
         detail = stateful_api.get_index(table_name, "document_text")
+        text_observation["detail"] = detail
+        # Probe the data plane: conservative source-observation status can
+        # remain pending even while the existing text projection is serving.
+        try:
+            result = stateful_api.query_table(
+                table_name,
+                {
+                    "full_text_index": "document_text",
+                    "full_text_search": {"field": "text", "match": canary},
+                    "limit": 5,
+                },
+            )
+        except requests.HTTPError as err:
+            # A status read and query are not atomic with reconciliation.
+            # Retry only this explicit admission fence; unrelated failures
+            # must still fail the test immediately.
+            response = err.response
+            if response is not None and response.status_code == 503:
+                body = response.json()
+                if body.get("code") == "index_rebuilding" and body.get("retryable"):
+                    text_observation["query_error"] = body
+                    return None
+            raise
+        text_observation["result"] = result
         if detail.get("status", {}).get("doc_count") != 1:
             return None
-        result = stateful_api.query_table(
-            table_name,
-            {
-                "full_text_index": "document_text",
-                "full_text_search": {"field": "text", "match": canary},
-                "limit": 5,
-            },
-        )
         if doc_key not in _query_hit_ids(result):
             return None
         return {"detail": detail, "result": result}
@@ -1294,7 +1312,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert before_restart is not None
+    assert before_restart is not None, json.dumps(text_observation, indent=2)
     text_incarnation = before_restart["detail"]["status"]["readiness"]["incarnation"]
 
     stateful_api.restart_server()
@@ -1303,7 +1321,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert baseline_restart is not None
+    assert baseline_restart is not None, json.dumps(text_observation, indent=2)
     assert (
         baseline_restart["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation
@@ -1378,8 +1396,15 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         is not None
     )
 
-    after_embedding_add = text_projection_intact()
-    assert after_embedding_add is not None
+    # Vector readiness does not prove the sibling text projection has finished
+    # reconciliation. Require its own query-visible result, without changing
+    # the original incarnation/cardinality/content invariants.
+    after_embedding_add = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert after_embedding_add is not None, json.dumps(text_observation, indent=2)
     assert (
         after_embedding_add["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation
@@ -1391,7 +1416,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert after_final_restart is not None
+    assert after_final_restart is not None, json.dumps(text_observation, indent=2)
     assert (
         after_final_restart["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation

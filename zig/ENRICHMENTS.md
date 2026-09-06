@@ -288,7 +288,11 @@ still pending. Blockers are labeled for the milestone they gate
 normalizes each index type's published result-bearing unit (vectors/chunks for
 embeddings and query-visible documents for document indexes), and requires
 query admission for the same incarnation. `--until source-covered=N%` uses
-covered source documents only; skipped outcomes never inflate the percentage.
+`covered / (source_total - skipped)`: skips are excluded, while pending and
+failed sources remain in the denominator. Pending sources are conservatively
+included until their outcomes are known. An all-skipped index cannot satisfy a
+positive source-coverage target; use `--until complete` to wait for processing
+to finish regardless of whether any source produced embeddings.
 When dense publication exposes an exact target, the coverage threshold also
 waits for that target to be query-visible.
 

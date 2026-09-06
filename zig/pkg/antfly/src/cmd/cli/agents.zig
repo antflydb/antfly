@@ -191,13 +191,126 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     };
 
     if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
-    var resp = try client.retrievalAgent(body);
-    defer resp.deinit();
-    if (resp.body) |response_body| {
-        cli.writeStdout(io, response_body);
+    if (streaming) {
+        var output = StreamingSseWriter{ .io = io };
+        var resp = try client.retrievalAgentToWriter(body, &output);
+        defer resp.deinit();
+        output.detector.finish();
         cli.writeStdout(io, "\n");
+        const is_sse = if (resp.content_type) |value|
+            std.mem.startsWith(u8, value, "text/event-stream")
+        else
+            false;
+        if (resp.status_code >= 300 or !is_sse or output.detector.failed()) {
+            return error.RetrievalAgentResponseError;
+        }
+    } else {
+        var resp = try client.retrievalAgent(body);
+        defer resp.deinit();
+        const response_failed = resp.status_code >= 300 or
+            isSseFailureResponse(resp.content_type, resp.body orelse "");
+        if (resp.body) |response_body| {
+            cli.writeStdout(io, response_body);
+            cli.writeStdout(io, "\n");
+        }
+        if (response_failed) return error.RetrievalAgentResponseError;
     }
 }
+
+fn isSseFailureResponse(content_type: ?[]const u8, body: []const u8) bool {
+    const value = content_type orelse return false;
+    if (!std.mem.startsWith(u8, value, "text/event-stream")) return false;
+
+    var detector = SseCompletionDetector{};
+    detector.push(body);
+    detector.finish();
+    return detector.failed();
+}
+
+const SseCompletionDetector = struct {
+    const Event = enum { message, done, failure };
+    line: [128]u8 = undefined,
+    line_len: usize = 0,
+    line_overflowed: bool = false,
+    skip_lf: bool = false,
+    event: Event = .message,
+    has_data: bool = false,
+    frame_pending: bool = false,
+    saw_done: bool = false,
+    saw_error: bool = false,
+
+    fn push(self: *@This(), bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (self.skip_lf) {
+                self.skip_lf = false;
+                if (byte == '\n') continue;
+            }
+            if (byte == '\r' or byte == '\n') {
+                self.finishLine();
+                self.skip_lf = byte == '\r';
+            } else if (self.line_len < self.line.len) {
+                self.line[self.line_len] = byte;
+                self.line_len += 1;
+            } else {
+                self.line_overflowed = true;
+            }
+        }
+    }
+
+    fn finish(self: *@This()) void {
+        // EOF does not dispatch an unterminated event. Parsing the last line
+        // only marks its frame pending; success requires a blank delimiter.
+        if (self.line_len > 0 or self.line_overflowed) self.finishLine();
+    }
+
+    fn failed(self: *const @This()) bool {
+        return self.saw_error or !self.saw_done or self.frame_pending;
+    }
+
+    fn finishLine(self: *@This()) void {
+        defer {
+            self.line_len = 0;
+            self.line_overflowed = false;
+        }
+        const line = self.line[0..self.line_len];
+        if (line.len == 0 and !self.line_overflowed) {
+            if (self.has_data) {
+                self.saw_done = self.event == .done;
+                self.saw_error = self.saw_error or self.event == .failure;
+            }
+            self.event = .message;
+            self.has_data = false;
+            self.frame_pending = false;
+            return;
+        }
+        // Data values need not fit the line buffer: only their field name
+        // matters for completion, and event-like strings in data are ignored.
+        if (std.mem.eql(u8, line, "data") or std.mem.startsWith(u8, line, "data:")) {
+            self.has_data = true;
+            self.frame_pending = true;
+        } else if (std.mem.eql(u8, line, "event") or std.mem.startsWith(u8, line, "event:")) {
+            self.frame_pending = true;
+            var name = if (line.len > "event:".len) line["event:".len..] else "";
+            if (std.mem.startsWith(u8, name, " ")) name = name[1..];
+            self.event = if (!self.line_overflowed and std.mem.eql(u8, name, "done"))
+                .done
+            else if (!self.line_overflowed and std.mem.eql(u8, name, "error"))
+                .failure
+            else
+                .message;
+        }
+    }
+};
+
+const StreamingSseWriter = struct {
+    io: std.Io,
+    detector: SseCompletionDetector = .{},
+
+    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+        cli.writeStdout(self.io, bytes);
+        self.detector.push(bytes);
+    }
+};
 
 fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var intent: ?[]const u8 = null;
@@ -256,4 +369,56 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
     }) catch |err| {
         cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
     };
+}
+
+test "retrieval SSE errors fail the CLI response" {
+    try std.testing.expect(isSseFailureResponse(
+        "text/event-stream; charset=utf-8",
+        "event: generation\r\ndata: \"partial\"\r\n\r\nevent: error\r\ndata: {\"error\":\"IncompatibleModel\"}\r\n\r\n",
+    ));
+    try std.testing.expect(!isSseFailureResponse(
+        "text/event-stream",
+        "event: generation\ndata: \"the words event: error are data\"\n\nevent: done\ndata: {}\n\n",
+    ));
+    try std.testing.expect(!isSseFailureResponse(
+        "application/json",
+        "{\"event\":\"error\"}",
+    ));
+
+    var split_detector = SseCompletionDetector{};
+    split_detector.push("event: gen\n\neve");
+    split_detector.push("nt: err");
+    split_detector.push("or\r\ndata: {}\r\n\r\n");
+    split_detector.finish();
+    try std.testing.expect(split_detector.saw_error);
+}
+
+test "retrieval SSE requires a complete terminal done event" {
+    for ([_][]const u8{
+        "",
+        "event: generation\ndata: partial\n\n",
+        "event: done",
+        "event: done\ndata: {}\n",
+        "event: done\n\n",
+        "data: event: done\n\n",
+        "event: done\nevent: generation\ndata: {}\n\n",
+        "event: error\ndata: failed\n\nevent: done\ndata: {}\n\n",
+        "event: done\ndata: {}\n\nevent: error\ndata: failed",
+        "event: done\ndata: {}\n\nevent: generation\ndata: late\n\n",
+    }) |body| {
+        try std.testing.expect(isSseFailureResponse("text/event-stream", body));
+    }
+    for ([_][]const u8{
+        "event: done\ndata: {}\n\n",
+        "event: done\r\ndata: {}\r\n\r\n",
+        "event: done\rdata: {}\r\r",
+        "data: {}\nevent: done\n\n: heartbeat\n\n",
+        "event: done\ndata: " ++ ("x" ** 256) ++ "\n\n",
+    }) |body| {
+        try std.testing.expect(!isSseFailureResponse("text/event-stream", body));
+        var detector = SseCompletionDetector{};
+        for (body) |byte| detector.push(&.{byte});
+        detector.finish();
+        try std.testing.expect(!detector.failed());
+    }
 }
