@@ -1284,7 +1284,10 @@ fn findParsedOrdinalCell(
         return try ordinalCellFromPayload(column, ordinal, payload, sparseEntryIsNull(parsed, entry_index));
     }
     if (!bitmapBit(parsed.present, ordinal)) return null;
-    const payload = try ordinalPayloadSliceChecked(parsed, column, ordinal);
+    const payload = if (parsed.layout != null)
+        try ordinalPayloadSliceChecked(parsed, column, ordinal)
+    else
+        ordinalPayloadSlice(parsed, columns, column, ordinal);
     return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(parsed.nulls, ordinal));
 }
 

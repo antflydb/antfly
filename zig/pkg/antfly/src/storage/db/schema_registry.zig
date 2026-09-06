@@ -145,7 +145,7 @@ pub const Registry = struct {
     mutex: std.Io.Mutex = .init,
     /// Serializes durable cache misses. Faulting is rare and potentially does
     /// storage I/O; one fiber-aware lane prevents concurrent readers from
-    /// deserializing the same immutable layout and compiling redundant state.
+    /// repeating the same metadata read and immutable-layout deserialization.
     historical_fault_mutex: std.Io.Mutex = .init,
     current: std.atomic.Value(?*Epoch) = .init(null),
     /// Readers publish a short acquisition hazard without entering a mutex or
@@ -472,6 +472,12 @@ pub const Registry = struct {
     /// the successor bank; request-held views retain their epochs independently.
     pub fn replaceAllPrepared(self: *Registry, replacement: *PreparedReplacement) void {
         if (!replacement.active) @panic("schema replacement already consumed");
+        // A whole-store publication must not interleave with a durable
+        // historical fault from the retiring namespace. The fault lane is
+        // acquired first everywhere, so replacement and cache installation
+        // have one deadlock-free ordering point.
+        self.historical_fault_mutex.lockUncancelable(self.io);
+        defer self.historical_fault_mutex.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         var retired_epochs = self.epochs;
         self.epochs = replacement.epochs;
