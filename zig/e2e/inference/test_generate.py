@@ -621,6 +621,152 @@ def test_generate_with_tools_tool_model(api):
         json.loads(call.get("function", {}).get("arguments", "{}"))
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_gemma4_tool_result_round_trip(api, stream):
+    """Require a real tool call and a result-grounded answer, not plain-text fallback."""
+    model = _first_tool_generator_model(api)
+    if "gemma4" not in model.lower().replace("-", ""):
+        pytest.skip("This qualification requires a Gemma 4 generator")
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_articles",
+                "description": "Search the article database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": "What is the secret archive identifier in the anatomy article? "
+            "Use search_articles to look it up in the database; do not guess.",
+        }
+    ]
+    request = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0,
+        "max_tokens": 96,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    first = api.post("/generate", json=request, timeout=FIRST_USE_REQUEST_TIMEOUT)
+    first.raise_for_status()
+    choice = _assert_chat_completion(first.json())
+    assert choice["finish_reason"] == "tool_calls", choice
+    assistant = choice["message"]
+    assert len(assistant["tool_calls"]) == 1, assistant
+    call = assistant["tool_calls"][0]
+    assert call["function"]["name"] == "search_articles", call
+    args = json.loads(call["function"]["arguments"])
+    assert isinstance(args.get("query"), str), args
+    assert "anatomy" in args["query"].lower(), args
+    messages.extend(
+        [
+            assistant,
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": json.dumps(
+                    {
+                        "hits": [
+                            {
+                                "title": "Anatomy",
+                                "body": "The secret archive identifier is AZURE-731.",
+                            }
+                        ]
+                    }
+                ),
+            },
+        ]
+    )
+    response = api.post(
+        "/generate",
+        json={**request, "stream": stream},
+        stream=stream,
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
+    )
+    try:
+        response.raise_for_status()
+        if stream:
+            data = [
+                line[6:]
+                for line in response.iter_lines(decode_unicode=True)
+                if line.startswith("data: ")
+            ]
+            assert data and data[-1] == "[DONE]", data
+            events = [json.loads(line) for line in data[:-1]]
+            assert not any("error" in event for event in events), events
+            assert events[-1]["choices"][0]["finish_reason"] == "stop", events
+            answer = "".join(
+                event["choices"][0]["delta"].get("content") or "" for event in events
+            )
+        else:
+            result = _assert_chat_completion(response.json())
+            assert result["finish_reason"] == "stop", result
+            answer = result["message"].get("content") or ""
+        assert "AZURE-731" in answer, answer
+    finally:
+        response.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("temperature", [0, 0.7])
+def test_gemma4_public_answer(api, stream, thinking, temperature):
+    """A successful stop must contain the answer, with no thought text in content."""
+    model = _first_tool_generator_model(api)
+    if "gemma4" not in model.lower().replace("-", ""):
+        pytest.skip("This qualification requires a Gemma 4 generator")
+    response = api.post(
+        "/generate",
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer with only the city name.",
+                }
+            ],
+            "max_tokens": 128,
+            "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": thinking},
+            "stream": stream,
+        },
+        stream=stream,
+        timeout=FIRST_USE_REQUEST_TIMEOUT,
+    )
+    try:
+        response.raise_for_status()
+        if stream:
+            data = [
+                line[6:]
+                for line in response.iter_lines(decode_unicode=True)
+                if line.startswith("data: ")
+            ]
+            assert data and data[-1] == "[DONE]", data
+            events = [json.loads(line) for line in data[:-1]]
+            assert not any("error" in event for event in events), events
+            assert events[-1]["choices"][0]["finish_reason"] == "stop", events
+            answer = "".join(
+                event["choices"][0]["delta"].get("content") or "" for event in events
+            )
+        else:
+            choice = _assert_chat_completion(response.json())
+            assert choice["finish_reason"] == "stop", choice
+            answer = choice["message"].get("content") or ""
+        assert answer.strip().strip(".* ").lower() == "paris", answer
+    finally:
+        response.close()
+
+
 @pytest.mark.streaming
 def test_stream_generate_with_tools_tool_model(api):
     model = _first_tool_generator_model(api)

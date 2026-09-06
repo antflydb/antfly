@@ -7694,6 +7694,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "standalone runtime module compiles",
             "standalone runtime local generator accepts media url data uris",
+            "local generate message conversion preserves tool history and admission",
+            "inference worker",
             "standalone runtime local dense embed preserves borrowed binary media",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",

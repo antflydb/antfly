@@ -351,6 +351,9 @@ const BackendState = struct {
                 const contents = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(contents);
                 for (messages, 0..) |message, i| {
+                    // A legacy text-only callback cannot preserve tool identity.
+                    if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool)
+                        return error.UnsupportedGeneratorProvider;
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
@@ -675,6 +678,17 @@ test "generating backend routes antfly and url-less antfly to local provider" {
     }, &messages);
     defer controlled_result.deinit();
     try std.testing.expectEqualStrings("local ok", controlled_result.content);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    const tool_messages = [_]ChatMessage{.{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &.{.{
+        .id = "c1",
+        .name = "search",
+        .arguments = "{}",
+    }} }};
+    try std.testing.expectError(error.UnsupportedGeneratorProvider, executeChainWithAntflyProvider(alloc, &client, &antfly_chain, local_provider, &tool_messages));
+    try std.testing.expectError(error.UnsupportedGeneratorProvider, executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = null },
+    }, &tool_messages));
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 

@@ -213,6 +213,8 @@ const InferenceRuntimeConfigWire = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    embedded_enabled: bool = true,
+    worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
@@ -2066,7 +2068,15 @@ pub fn runFromIterator(
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
         cli.inference_kernel_jit_mode,
     );
+    var worker_environment: std.ArrayList(@typeInfo(@FieldType(InferenceRuntimeConfigWire, "worker_environment")).pointer.child) = .empty;
+    defer worker_environment.deinit(alloc);
+    var environment_iterator = init.environ_map.iterator();
+    while (environment_iterator.next()) |entry| {
+        try worker_environment.append(alloc, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+    }
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
+        .embedded_enabled = embedded_inference_enabled,
+        .worker_environment = worker_environment.items,
         .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
