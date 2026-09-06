@@ -39,9 +39,9 @@ const ForwardControl = struct {
         }
     }
 
-    fn event(raw: ?*anyopaque, bytes: []const u8) !void {
+    fn event(raw: ?*anyopaque, payload: rpc.Payload) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        var parsed = try std.json.parseFromSlice(wire.Event, self.alloc, bytes, .{});
+        var parsed = try std.json.parseFromSlice(wire.Event, self.alloc, payload.metadata, .{});
         defer parsed.deinit();
         const value = parsed.value;
         switch (value.kind) {
@@ -51,9 +51,7 @@ const ForwardControl = struct {
                 self.stream_started = true;
             },
             .stream_write => {
-                const decoded = try wire.decodeBytes(self.alloc, value.data);
-                defer self.alloc.free(decoded);
-                try callbackResult((self.stream.write orelse return error.StreamingUnavailable)(self.stream.context, .init(decoded)));
+                try callbackResult((self.stream.write orelse return error.StreamingUnavailable)(self.stream.context, .init(payload.body)));
             },
             .stream_close => try callbackResult((self.stream.close orelse return error.StreamingUnavailable)(self.stream.context)),
         }
@@ -85,11 +83,12 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
     };
     const data = try std.json.Stringify.valueAlloc(client.alloc, wire.Provider{
         .operation = context.operation,
-        .request_json = context.request_json.slice(),
         .deadline_ns = control.deadline_ns,
     }, .{});
     defer client.alloc.free(data);
-    return client.invoke(.provider, data, control.view());
+    const response = try client.invoke(.provider, data, context.request_json.slice(), control.view());
+    defer response.deinit();
+    return client.alloc.dupe(u8, response.view().body);
 }
 
 pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.HttpHandleContext) !httpx.Response {
@@ -117,10 +116,17 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .query = context.request.query.slice(),
         .headers = headers,
         .params = params,
-        .body_b64 = if (body.slice()) |bytes| try wire.encodeBytes(alloc, bytes) else null,
+        .has_body = body.slice() != null,
     }, .{});
-    const result = client.invoke(.http, data, control.view()) catch |err| {
+    const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
         if (control.stream_started) return err;
+        if (err == error.BodyTooLarge) {
+            var response = httpx.Response.init(client.alloc, 413);
+            errdefer response.deinit();
+            try response.headers.append("content-type", "application/json");
+            response.body = "{\"error\":\"inference request too large\"}";
+            return response;
+        }
         if (err == error.ResourceTemporarilyUnavailable) {
             var response = httpx.Response.init(client.alloc, 503);
             errdefer response.deinit();
@@ -131,12 +137,13 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         }
         return err;
     };
-    defer client.alloc.free(result);
-    const value = try std.json.parseFromSliceLeaky(wire.HttpResponse, alloc, result, .{});
+    defer result.deinit();
+    const result_header = try std.json.parseFromSliceLeaky(wire.Reply, alloc, result.view().metadata, .{});
+    const value = try std.json.parseFromSliceLeaky(wire.HttpResponse, alloc, result_header.options, .{});
     var response = httpx.Response.init(client.alloc, value.status);
     errdefer response.deinit();
     for (value.headers) |header| try response.headers.append(header.name, header.value);
-    response.body = try wire.decodeBytes(client.alloc, value.body_b64);
+    response.body = try client.alloc.dupe(u8, result.view().body);
     response.body_owned = true;
     return response;
 }
@@ -203,15 +210,13 @@ pub const Client = struct {
         errdefer self.alloc.destroy(worker);
         const executable = try std.process.executablePathAlloc(self.io, self.alloc);
         defer self.alloc.free(executable);
-        var child = try std.process.spawn(self.io, .{
+        const child = try std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
             .environ_map = &self.environment,
         });
-        var endpoint_started = false;
-        errdefer if (!endpoint_started) child.kill(self.io);
         worker.* = .{
             .owner = self,
             .child = child,
@@ -221,13 +226,17 @@ pub const Client = struct {
                 .input = child.stdout.?,
                 .output = child.stdin.?,
                 .context = worker,
-                .handler = Worker.resourceRequest,
+                .handler = Worker.rejectRequest,
+                .resource_handler = Worker.resourceRequest,
                 .on_closed = Worker.closed,
                 .next_id = 1,
             },
         };
+        // The worker owns the child even during partial startup. start() can
+        // already reap it through on_closed before returning an error; kill
+        // must inspect that same handle, whose ID is then null.
+        errdefer worker.child.kill(self.io);
         try worker.endpoint.start();
-        endpoint_started = true;
         errdefer worker.endpoint.deinit();
         const initialized = try call(&worker.endpoint, .initialize, self.create_json, control);
         self.alloc.free(initialized);
@@ -239,7 +248,7 @@ pub const Client = struct {
         return worker;
     }
 
-    pub fn invoke(self: *Client, operation: wire.Operation, data: []const u8, control: rpc.Control) ![]u8 {
+    pub fn invoke(self: *Client, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
         while (!self.mutex.tryLock()) {
             if (control.check) |check| try check(control.ptr);
             try self.io.sleep(.fromMilliseconds(1), .awake);
@@ -255,23 +264,44 @@ pub const Client = struct {
             self.active -= 1;
             self.mutex.unlock(self.io);
         }
-        return call(&worker.endpoint, operation, data, control);
+        const result = try callPayload(&worker.endpoint, operation, options, data, control);
+        // Hand off an independent response before releasing this worker lease.
+        return result.detach();
     }
 };
 
-fn call(endpoint: *rpc.Endpoint, operation: wire.Operation, data: []const u8, control: rpc.Control) ![]u8 {
+fn callPayload(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
     const alloc = endpoint.alloc;
-    const request = try std.json.Stringify.valueAlloc(alloc, wire.Envelope{ .operation = operation, .data = data }, .{});
-    defer alloc.free(request);
-    const response = endpoint.call(request, control) catch |err| switch (err) {
+    if (options.len > rpc.max_metadata_bytes or data.len > rpc.max_body_bytes) return error.BodyTooLarge;
+    const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options }, .{});
+    defer alloc.free(header);
+    const response = endpoint.call(.{ .metadata = header, .body = data }, control) catch |err| switch (err) {
         error.InferenceWorkerUnavailable, error.InferenceWorkerRequestFailed, error.BrokenPipe => return error.ResourceTemporarilyUnavailable,
         else => return err,
     };
-    defer alloc.free(response);
-    var parsed = try std.json.parseFromSlice(wire.Reply, alloc, response, .{});
+    errdefer response.deinit();
+    var parsed = try std.json.parseFromSlice(wire.Reply, alloc, response.view().metadata, .{});
     defer parsed.deinit();
     if (!parsed.value.status.isOk()) return bridge.errorFromStatus(parsed.value.status);
-    return alloc.dupe(u8, parsed.value.data);
+    return response;
+}
+
+fn call(endpoint: *rpc.Endpoint, operation: wire.Operation, data: []const u8, control: rpc.Control) ![]u8 {
+    const response = try callPayload(endpoint, operation, "", data, control);
+    defer response.deinit();
+    return endpoint.alloc.dupe(u8, response.view().body);
+}
+
+fn reply(endpoint: *rpc.Endpoint, status: bridge.Status, options: []const u8, body: []const u8) !rpc.OwnedPayload {
+    const header = try std.json.Stringify.valueAlloc(endpoint.alloc, wire.Reply{ .status = status, .options = options }, .{});
+    defer endpoint.alloc.free(header);
+    return endpoint.copyPayload(.{ .metadata = header, .body = body });
+}
+
+fn requestEnvelope(arena: std.mem.Allocator, request: *rpc.Request) !wire.Envelope {
+    const payload = request.payload.view();
+    const header = try std.json.parseFromSliceLeaky(wire.Request, arena, payload.metadata, .{});
+    return .{ .operation = header.operation, .options = header.options, .data = payload.body };
 }
 
 const Observation = struct { key: u64, bytes: u64 = 0, tokenizer: bool };
@@ -313,32 +343,42 @@ const Worker = struct {
         self.observations = .empty;
     }
 
-    fn resourceRequest(raw: *anyopaque, request: *rpc.Request) ![]u8 {
-        const self: *Worker = @ptrCast(@alignCast(raw));
-        const alloc = self.owner.alloc;
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const envelope = try std.json.parseFromSliceLeaky(wire.Envelope, arena.allocator(), request.payload, .{});
-        self.resources.lockUncancelable(self.owner.io);
-        defer self.resources.unlock(self.owner.io);
-        const result = self.resourceOperation(arena.allocator(), envelope) catch |err|
-            return std.json.Stringify.valueAlloc(alloc, wire.Reply{ .status = bridge.statusFromError(err) }, .{});
-        return std.json.Stringify.valueAlloc(alloc, wire.Reply{ .data = result }, .{});
+    fn rejectRequest(_: *anyopaque, _: *rpc.Request) !rpc.OwnedPayload {
+        return error.UnsupportedOperation;
     }
 
-    fn resourceOperation(self: *Worker, arena: std.mem.Allocator, envelope: wire.Envelope) ![]const u8 {
+    fn resourceRequest(raw: *anyopaque, bytes: []const u8) !rpc.ResourceReply {
+        const self: *Worker = @ptrCast(@alignCast(raw));
+        var arena = std.heap.ArenaAllocator.init(self.owner.alloc);
+        defer arena.deinit();
+        const incoming = try std.json.parseFromSliceLeaky(wire.ResourceRequest, arena.allocator(), bytes, .{});
+        self.resources.lockUncancelable(self.owner.io);
+        defer self.resources.unlock(self.owner.io);
+        const result = self.resourceOperation(arena.allocator(), .{ .operation = incoming.operation, .data = incoming.data }) catch |err| {
+            // Only an explicit budget denial is recoverable. Other errors can
+            // mean ownership diverged; the RPC lifecycle will reap the worker.
+            if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+            const status = bridge.statusFromError(err);
+            return .{ .code = status.code, .detail = status.detail };
+        };
+        return .{ .value = result };
+    }
+
+    fn resourceOperation(self: *Worker, arena: std.mem.Allocator, envelope: wire.Envelope) !u64 {
         if (self.endpoint.closed.load(.acquire)) return error.ResourceOwnerShuttingDown;
         const budget = self.owner.budget.?;
         switch (envelope.operation) {
             .reserve => {
                 const reservation = try std.json.parseFromSliceLeaky(wire.Reservation, arena, envelope.data, .{});
+                // No allocation may fail after a successful reserve before it
+                // is recorded for reaped cleanup.
+                try self.leases.ensureUnusedCapacity(self.owner.alloc, 1);
                 var lease: usize = 0;
                 const status = budget.reserve_admission(budget.context, &reservation.amounts, &lease);
                 if (!status.isOk()) return bridge.errorFromStatus(status);
-                errdefer budget.release_admission(budget.context, lease);
                 if (lease == 0 or self.leases.contains(lease)) return error.InvalidGenerationAdmission;
-                try self.leases.put(self.owner.alloc, lease, {});
-                return std.json.Stringify.valueAlloc(arena, lease, .{});
+                self.leases.putAssumeCapacity(lease, {});
+                return lease;
             },
             .retain => {
                 const reservation = try std.json.parseFromSliceLeaky(wire.Reservation, arena, envelope.data, .{});
@@ -379,7 +419,7 @@ const Worker = struct {
             },
             else => return error.UnsupportedOperation,
         }
-        return "";
+        return 0;
     }
 };
 
@@ -398,17 +438,16 @@ const Child = struct {
         std.process.exit(0);
     }
 
-    fn dispatch(raw: *anyopaque, request: *rpc.Request) ![]u8 {
+    fn dispatch(raw: *anyopaque, request: *rpc.Request) !rpc.OwnedPayload {
         const self: *Child = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const envelope = try std.json.parseFromSliceLeaky(wire.Envelope, arena.allocator(), request.payload, .{});
-        const result = self.execute(arena.allocator(), request, envelope) catch |err|
-            return std.json.Stringify.valueAlloc(self.alloc, wire.Reply{ .status = bridge.statusFromError(err) }, .{});
-        return std.json.Stringify.valueAlloc(self.alloc, wire.Reply{ .data = result }, .{});
+        const envelope = try requestEnvelope(arena.allocator(), request);
+        return self.execute(arena.allocator(), request, envelope) catch |err|
+            reply(&self.endpoint, bridge.statusFromError(err), "", "");
     }
 
-    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope) ![]const u8 {
+    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope) !rpc.OwnedPayload {
         if (envelope.operation == .initialize) {
             try self.startup_mutex.lock(self.io);
             defer self.startup_mutex.unlock(self.io);
@@ -418,7 +457,7 @@ const Child = struct {
             var out: ?*anyopaque = null;
             const context = try create.toContext(create_arena, &self.io, &out);
             self.state = @ptrCast(@alignCast(try host.linkedInferenceCreateLocal(&context, true)));
-            return "";
+            return reply(&self.endpoint, .ok, "", "");
         }
         try self.startup_mutex.lock(self.io);
         const state = self.state orelse {
@@ -434,14 +473,14 @@ const Child = struct {
             var length: usize = 0;
             try host.linkedInferenceRouteManifest(&.{ .abi_version = bridge.abi_version, .handle = state, .out_entries = &entries, .out_len = &length });
             self.configured = true;
-            return "";
+            return reply(&self.endpoint, .ok, "", "");
         }
         const configured = self.configured;
         self.startup_mutex.unlock(self.io);
         if (!configured) return error.ResourceOwnerNotConfigured;
         switch (envelope.operation) {
             .provider => {
-                const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.data, .{});
+                const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
                 var response_handle: ?*anyopaque = null;
                 var response: bridge.String = undefined;
                 defer if (response_handle) |handle| host.linkedInferenceDestroyProviderResponse(handle);
@@ -449,7 +488,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
-                    .request_json = .init(provider.request_json),
+                    .request_json = .init(envelope.data),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),
                     .out_response_handle = &response_handle,
@@ -457,10 +496,10 @@ const Child = struct {
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .progress = .{ .context = request, .update_progress = progress },
                 });
-                return arena.dupe(u8, response.slice());
+                return reply(&self.endpoint, .ok, "", response.slice());
             },
             .http => {
-                const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.data, .{});
+                const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});
                 // Route identity, not an ordinal: replacing the executable
                 // must never redirect a request to a different handler.
                 const route_handle = found: {
@@ -474,7 +513,7 @@ const Child = struct {
                 for (incoming.headers, headers) |header, *out| out.* = .{ .name = .init(header.name), .value = .init(header.value) };
                 const params = try arena.alloc(http.RouteParamView, incoming.params.len);
                 for (incoming.params, params) |param, *out| out.* = .{ .name = .init(param.name), .value = .init(param.value) };
-                const body = if (incoming.body_b64) |value| try wire.decodeBytes(arena, value) else null;
+                const body: ?[]const u8 = if (incoming.has_body) envelope.data else null;
                 const view = http.HttpRequestView{
                     .method = incoming.method,
                     .path = .init(incoming.path),
@@ -500,11 +539,11 @@ const Child = struct {
                 const output_headers = try arena.alloc(wire.Header, response.headers_len);
                 const source_headers = if (response.headers_ptr) |ptr| ptr[0..response.headers_len] else &.{};
                 for (source_headers, output_headers) |header, *out| out.* = .{ .name = header.name.slice(), .value = header.value.slice() };
-                return std.json.Stringify.valueAlloc(arena, wire.HttpResponse{
+                const response_options = try std.json.Stringify.valueAlloc(arena, wire.HttpResponse{
                     .status = response.status,
                     .headers = output_headers,
-                    .body_b64 = try wire.encodeBytes(arena, response.body.slice()),
                 }, .{});
+                return reply(&self.endpoint, .ok, response_options, response.body.slice());
             },
             else => return error.UnsupportedOperation,
         }
@@ -516,10 +555,14 @@ const Child = struct {
     }
 
     fn emit(request: *rpc.Request, event: wire.Event) !void {
+        return emitBody(request, event, "");
+    }
+
+    fn emitBody(request: *rpc.Request, event: wire.Event, body: []const u8) !void {
         const alloc = request.endpoint.alloc;
         const data = try std.json.Stringify.valueAlloc(alloc, event, .{});
         defer alloc.free(data);
-        try request.event(data);
+        try request.event(.{ .metadata = data, .body = body });
     }
 
     fn progress(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: bridge.String, backend: bridge.String) callconv(.c) void {
@@ -534,9 +577,7 @@ const Child = struct {
     }
     fn streamWrite(raw: ?*anyopaque, bytes: http.Bytes) callconv(.c) http.CallbackStatus {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
-        const encoded = wire.encodeBytes(request.endpoint.alloc, bytes.slice()) catch return .failed;
-        defer request.endpoint.alloc.free(encoded);
-        emit(request, .{ .kind = .stream_write, .data = encoded }) catch return .canceled;
+        emitBody(request, .{ .kind = .stream_write }, bytes.slice()) catch return .canceled;
         return .ok;
     }
     fn streamClose(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
@@ -562,33 +603,47 @@ const Child = struct {
         return 1;
     }
     fn releaseContext(_: *anyopaque) callconv(.c) void {}
-    fn resourceCall(self: *Child, operation: wire.Operation, value: anytype) ![]u8 {
-        const data = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
-        defer self.alloc.free(data);
-        return call(&self.endpoint, operation, data, .{});
+    fn resourceFailure(self: *Child) noreturn {
+        // Continuing could reuse unaccounted device memory. Exiting also wakes
+        // a parent whose resource reply failed; it reaps before reclaiming.
+        self.endpoint.fail();
+        std.process.exit(1);
+    }
+
+    fn resourceCall(self: *Child, operation: wire.Operation, value: anytype) rpc.ResourceReply {
+        var value_buffer: [rpc.max_resource_bytes]u8 = undefined;
+        var value_writer = std.Io.Writer.fixed(&value_buffer);
+        std.json.Stringify.value(value, .{}, &value_writer) catch self.resourceFailure();
+        var request_buffer: [rpc.max_resource_bytes]u8 = undefined;
+        var request_writer = std.Io.Writer.fixed(&request_buffer);
+        std.json.Stringify.value(wire.ResourceRequest{ .operation = operation, .data = value_writer.buffered() }, .{}, &request_writer) catch self.resourceFailure();
+        const response = self.endpoint.callResource(request_writer.buffered()) catch self.resourceFailure();
+        validateResourceReply(operation, response) catch self.resourceFailure();
+        return response;
     }
     fn reserve(raw: *anyopaque, amounts: *const bridge.AdmissionAmounts, lease: *usize) callconv(.c) bridge.Status {
         const self: *Child = @ptrCast(@alignCast(raw));
-        const data = self.resourceCall(.reserve, wire.Reservation{ .amounts = amounts.* }) catch |err| return bridge.statusFromError(err);
-        defer self.alloc.free(data);
-        lease.* = std.fmt.parseUnsigned(usize, data, 10) catch return bridge.statusFromError(error.InvalidGenerationAdmission);
-        return .ok;
+        const response = self.resourceCall(.reserve, wire.Reservation{ .amounts = amounts.* });
+        const status: bridge.Status = .{ .code = response.code, .detail = response.detail };
+        if (status.isOk()) lease.* = @intCast(response.value);
+        return status;
     }
     fn retain(raw: *anyopaque, lease: usize, amounts: *const bridge.AdmissionAmounts) callconv(.c) bridge.Status {
         const self: *Child = @ptrCast(@alignCast(raw));
-        const data = self.resourceCall(.retain, wire.Reservation{ .lease = lease, .amounts = amounts.* }) catch |err| return bridge.statusFromError(err);
-        self.alloc.free(data);
-        return .ok;
+        const response = self.resourceCall(.retain, wire.Reservation{ .lease = lease, .amounts = amounts.* });
+        return .{ .code = response.code, .detail = response.detail };
     }
     fn release(raw: *anyopaque, lease: usize) callconv(.c) void {
         const self: *Child = @ptrCast(@alignCast(raw));
-        const data = self.resourceCall(.release, lease) catch return;
-        self.alloc.free(data);
+        _ = self.resourceCall(.release, lease);
     }
     fn observe(self: *Child, operation: wire.Operation, key: usize, previous: u64, next: u64) u8 {
-        const data = self.resourceCall(operation, wire.Observation{ .key = key, .previous = previous, .next = next }) catch return 0;
-        self.alloc.free(data);
-        return 1;
+        const response = self.resourceCall(operation, wire.Observation{ .key = key, .previous = previous, .next = next });
+        const status: bridge.Status = .{ .code = response.code, .detail = response.detail };
+        // Cache teardown must reach the parent; its caller cannot retry a lost
+        // release once the cache object is destroyed.
+        if (!status.isOk() and next < previous) self.resourceFailure();
+        return @intFromBool(status.isOk());
     }
     fn observePrompt(raw: *anyopaque, key: usize, previous: u64, next: u64) callconv(.c) u8 {
         const self: *Child = @ptrCast(@alignCast(raw));
@@ -599,6 +654,22 @@ const Child = struct {
         return self.observe(.tokenizer_cache, key, previous, next);
     }
 };
+
+fn validateResourceReply(operation: wire.Operation, reply_value: rpc.ResourceReply) !void {
+    if (reply_value.code == 0 and reply_value.detail == 0) {
+        if (operation == .reserve) {
+            if (reply_value.value == 0 or reply_value.value > std.math.maxInt(usize)) return error.InvalidResourceReply;
+        } else if (reply_value.value != 0) return error.InvalidResourceReply;
+        return;
+    }
+    if (operation != .release and reply_value.value == 0) {
+        for ([_]anyerror{ error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable }) |err| {
+            const denial = bridge.statusFromError(err);
+            if (reply_value.code == denial.code and reply_value.detail == denial.detail) return;
+        }
+    }
+    return error.InvalidResourceReply;
+}
 
 pub fn runChild(alloc: std.mem.Allocator, io: std.Io) !void {
     var child: Child = .{
@@ -623,7 +694,7 @@ pub fn runChild(alloc: std.mem.Allocator, io: std.Io) !void {
     try lifetime.wait(io);
 }
 
-test "inference worker retains reservations until reaped cleanup" {
+test "inference worker retains reservations until reaped cleanup and owns partial startup" {
     const Budget = struct {
         leased: bool = false,
         cached: u64 = 0,
@@ -675,7 +746,7 @@ test "inference worker retains reservations until reaped cleanup" {
     var worker: Worker = .{
         .owner = &client,
         .child = undefined,
-        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
+        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.rejectRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
     };
     defer worker.releaseResources();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -688,7 +759,27 @@ test "inference worker retains reservations until reaped cleanup" {
         .host_scratch_bytes = 0,
         .backend_scratch_bytes = 0,
     } }, .{});
-    try std.testing.expectEqualStrings("7", try worker.resourceOperation(arena.allocator(), .{ .operation = .reserve, .data = reserve_json }));
+    // Regression: ordinary reply credit used to fail after reserve succeeded,
+    // leaving a live lease whose ID the child never received.
+    worker.endpoint.control_bytes = 4 * 1024 * 1024;
+    worker.endpoint.retained_bytes = 256 * 1024 * 1024;
+    defer {
+        worker.endpoint.control_bytes = 0;
+        worker.endpoint.retained_bytes = 0;
+    }
+    const resource_json = try std.json.Stringify.valueAlloc(arena.allocator(), wire.ResourceRequest{ .operation = .reserve, .data = reserve_json }, .{});
+    const reserved = try Worker.resourceRequest(&worker, resource_json);
+    try validateResourceReply(.reserve, reserved);
+    try std.testing.expectEqual(@as(u64, 7), reserved.value);
+    const denied = try Worker.resourceRequest(&worker, resource_json);
+    try validateResourceReply(.reserve, denied);
+    try std.testing.expectEqual(bridge.statusFromError(error.ResourceLimitExceeded).detail, denied.detail);
+    try std.testing.expect(!worker.endpoint.closed.load(.acquire));
+    const release_json = try std.json.Stringify.valueAlloc(arena.allocator(), wire.ResourceRequest{ .operation = .release, .data = "7" }, .{});
+    try validateResourceReply(.release, try Worker.resourceRequest(&worker, release_json));
+    try std.testing.expect(!budget.leased);
+    try std.testing.expectEqual(@as(usize, 0), worker.leases.count());
+    _ = try Worker.resourceRequest(&worker, resource_json);
     _ = try worker.resourceOperation(arena.allocator(), .{ .operation = .prompt_cache, .data = "{\"key\":9,\"previous\":0,\"next\":64}" });
     try std.testing.expectError(error.InvalidGenerationAdmission, worker.resourceOperation(arena.allocator(), .{ .operation = .release, .data = "8" }));
     worker.endpoint.closed.store(true, .release);
@@ -698,4 +789,76 @@ test "inference worker retains reservations until reaped cleanup" {
     worker.releaseResources();
     try std.testing.expect(!budget.leased);
     try std.testing.expectEqual(@as(u64, 0), budget.cached);
+
+    if (@import("builtin").os.tag == .windows) return; // POSIX child fixture.
+    client.create_json = try alloc.dupe(u8, "{}");
+    defer alloc.free(client.create_json);
+    client.environment = std.process.Environ.Map.init(alloc);
+    defer client.environment.deinit();
+    const Fault = struct {
+        var fail_at: usize = 0;
+        var groups: usize = 0;
+        var kills: usize = 0;
+        fn concurrent(raw: ?*anyopaque, group: *std.Io.Group, context: []const u8, alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+            groups += 1;
+            if (groups == fail_at) return error.ConcurrencyUnavailable;
+            return std.testing.io.vtable.groupConcurrent(raw, group, context, alignment, start);
+        }
+        fn spawn(raw: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            var modified = options;
+            modified.argv = &.{"/bin/cat"};
+            modified.environ_map = null;
+            return std.testing.io.vtable.processSpawn(raw, modified);
+        }
+        fn kill(raw: ?*anyopaque, child: *std.process.Child) void {
+            kills += 1;
+            if (kills == 1) {
+                std.testing.io.vtable.childKill(raw, child);
+            } else {
+                // Count a duplicate cleanup without signaling a reused PID or
+                // closing unrelated descriptors if this regression returns.
+                child.id = null;
+                child.stdin = null;
+                child.stdout = null;
+                child.stderr = null;
+            }
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.groupConcurrent = Fault.concurrent;
+    vtable.processSpawn = Fault.spawn;
+    vtable.childKill = Fault.kill;
+    client.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    // Failure before any reader, failure after the reader owns cleanup, and
+    // failure during initialization must all use the same child handle. With
+    // no injected spawn failure, cat echoes our offer as an invalid peer frame.
+    for ([_]usize{ 1, 2, 0 }) |fail_at| {
+        Fault.fail_at = fail_at;
+        Fault.groups = 0;
+        Fault.kills = 0;
+        try std.testing.expectError(
+            if (fail_at == 0) error.ResourceTemporarilyUnavailable else error.ConcurrencyUnavailable,
+            client.ensureWorker(.{}),
+        );
+        try std.testing.expectEqual(@as(usize, 1), Fault.kills);
+        try std.testing.expect(client.worker == null);
+        try std.testing.expectEqual(@as(u64, 0), client.generation);
+        try std.testing.expect(!budget.leased);
+    }
+}
+
+test "inference worker resource replies distinguish denials from ownership uncertainty" {
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable }) |err| {
+        const status = bridge.statusFromError(err);
+        const denial: rpc.ResourceReply = .{ .code = status.code, .detail = status.detail };
+        for ([_]wire.Operation{ .reserve, .retain, .prompt_cache, .tokenizer_cache }) |operation|
+            try validateResourceReply(operation, denial);
+        try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.release, denial));
+    }
+    try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.reserve, .{}));
+    try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.release, .{ .value = 7 }));
+    try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.reserve, .{ .code = 999 }));
+    try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.retain, .{ .detail = 999 }));
+    const failure = bridge.statusFromError(error.OutOfMemory);
+    try std.testing.expectError(error.InvalidResourceReply, validateResourceReply(.reserve, .{ .code = failure.code, .detail = failure.detail }));
 }
