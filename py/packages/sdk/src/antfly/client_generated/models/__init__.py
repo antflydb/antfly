@@ -112,6 +112,8 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .committed_mutation_outcome import CommittedMutationOutcome
+from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -1115,6 +1117,8 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommittedMutationOutcome",
+    "CommittedMutationOutcomeStatus",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",

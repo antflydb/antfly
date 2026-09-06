@@ -90,6 +90,22 @@ pub fn materializeRootForSchemaAndLayoutAlloc(
     return try row_codec.materializeOrdinalRootWithLayoutAlloc(alloc, packed_row, table_schema, layout);
 }
 
+pub fn validateCanonicalAndMaterializeRootForSchemaAndLayoutAlloc(
+    alloc: Allocator,
+    packed_row: []const u8,
+    table_schema: schema.TableSchema,
+    layout: *const row_codec.PhysicalLayout,
+) !row_codec.MaterializedOrdinalRoot {
+    if (!document_mapper.isRelationalRowValue(packed_row)) return error.InvalidFormat;
+    _ = try row_codec.rowSchemaVersion(packed_row);
+    return try row_codec.validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
+        alloc,
+        packed_row,
+        table_schema,
+        layout,
+    );
+}
+
 pub fn rowSchemaVersion(packed_row: []const u8) !u32 {
     return try document_mapper.relationalRowSchemaVersion(packed_row);
 }

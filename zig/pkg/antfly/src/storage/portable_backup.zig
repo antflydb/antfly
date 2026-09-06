@@ -2089,14 +2089,8 @@ fn validatePortableImportBlockPayload(
 }
 
 fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
-    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
-    defer {
-        for (entries) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        alloc.free(entries);
-    }
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
     var validation_arena = std.heap.ArenaAllocator.init(alloc);
     defer validation_arena.deinit();
     for (entries) |entry| {
@@ -2116,14 +2110,8 @@ fn validateAndImportDocumentBatchPayload(
     payload: []const u8,
     archive: *PortableArchiveValidation,
 ) !void {
-    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
-    defer {
-        for (entries) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        alloc.free(entries);
-    }
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
     var validation_arena = std.heap.ArenaAllocator.init(alloc);
     defer validation_arena.deinit();
     for (entries) |entry| {
@@ -2148,17 +2136,8 @@ fn validatePortableDocumentEntryAgainstArchive(
     if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
     const row_version = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
     const layout = archive.layoutForVersion(row_version) orelse return error.InvalidBackupRequest;
-    relational_store.validateCanonicalValueForSchemaAndLayout(
-        alloc,
-        entry.value,
-        layout.schema.*,
-        layout.physical,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return error.InvalidBackupRequest,
-    };
     if (archive.validatorForVersion(row_version)) |validator| {
-        var logical = relational_store.materializeRootForSchemaAndLayoutAlloc(
+        var logical = relational_store.validateCanonicalAndMaterializeRootForSchemaAndLayoutAlloc(
             alloc,
             entry.value,
             layout.schema.*,
@@ -2174,6 +2153,16 @@ fn validatePortableDocumentEntryAgainstArchive(
         };
     } else if (archive.active_public_validator != null) {
         return error.InvalidBackupRequest;
+    } else {
+        relational_store.validateCanonicalValueForSchemaAndLayout(
+            alloc,
+            entry.value,
+            layout.schema.*,
+            layout.physical,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
     }
 }
 
@@ -2399,14 +2388,8 @@ fn validateImportedIdentityNamespace(store: *DocStore, opts: ImportOptions) !voi
 }
 
 fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
-    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
-    defer {
-        for (entries) |e| {
-            alloc.free(e.key);
-            alloc.free(e.value);
-        }
-        alloc.free(entries);
-    }
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
 
     try importDecodedDocumentEntries(alloc, store, entries);
 }

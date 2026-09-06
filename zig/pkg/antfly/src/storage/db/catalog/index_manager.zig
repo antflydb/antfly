@@ -573,17 +573,6 @@ const TextMergeBudgetAllocator = struct {
     }
 };
 
-fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
-}
-
 test "text merge bounded task allocator enforces live reservation" {
     var stats = PhaseAllocStats{};
     var tracking = PhaseTrackingAllocator.initBounded(std.testing.allocator, &stats, 64);
@@ -1311,7 +1300,7 @@ pub const IndexManager = struct {
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
     write_plan_generation: std.atomic.Value(u64) = .init(1),
-    write_plan_cache_mutex: std.atomic.Mutex = .unlocked,
+    write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
@@ -1585,7 +1574,8 @@ pub const IndexManager = struct {
         /// producer admission estimates while the caller waits for a permit.
         projection_revision: u64 = 1,
         apply_mutex: *std.atomic.Mutex,
-        merge_delta_mutex: std.atomic.Mutex = .unlocked,
+        io: std.Io,
+        merge_delta_mutex: std.Io.Mutex = .init,
         merge_deletion_states: std.ArrayListUnmanaged(*TextMergeDeletionState) = .empty,
         analysis_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
         config: types.IndexConfig,
@@ -1612,14 +1602,14 @@ pub const IndexManager = struct {
         }
 
         fn attachMergeDeletionState(self: *TextIndex, alloc: Allocator, state: *TextMergeDeletionState) !void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             try self.merge_deletion_states.append(alloc, state);
         }
 
         fn detachMergeDeletionState(self: *TextIndex, state: *const TextMergeDeletionState) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items, 0..) |candidate, i| {
                 if (candidate != state) continue;
                 _ = self.merge_deletion_states.orderedRemove(i);
@@ -1628,14 +1618,14 @@ pub const IndexManager = struct {
         }
 
         fn detachAllMergeDeletionStates(self: *TextIndex) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             self.merge_deletion_states.clearRetainingCapacity();
         }
 
         fn mergeDeletionStateCurrent(self: *TextIndex, state: *const TextMergeDeletionState) bool {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items) |candidate| {
                 if (candidate == state) return candidate.valid;
             }
@@ -1647,17 +1637,17 @@ pub const IndexManager = struct {
         /// makes the lower-level public batch helpers safe even when a caller
         /// omits the customary per-index apply lease.
         fn lockMergeDeletionStateCurrent(self: *TextIndex, state: *const TextMergeDeletionState) bool {
-            lockAtomicMutex(&self.merge_delta_mutex);
+            self.merge_delta_mutex.lockUncancelable(self.io);
             for (self.merge_deletion_states.items) |candidate| {
                 if (candidate == state and candidate.valid) return true;
             }
-            self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.unlock(self.io);
             return false;
         }
 
         fn recordCommittedDeletes(self: *TextIndex, delete_infos: []const index_mod.IndexWriter.DeleteInfo) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items) |state| state.recordCommittedDeletes(delete_infos);
         }
     };
@@ -2770,13 +2760,20 @@ pub const IndexManager = struct {
         return try registry.installHistorical(epoch);
     }
 
-    /// Pins each schema epoch encountered by a scan/backfill once. Historical
-    /// rows are common immediately after schema evolution; resolving them per
-    /// row would otherwise take the registry mutex and may repeat durable
-    /// metadata probes on concurrent cold misses.
+    /// Pins a bounded LRU of schema epochs encountered by a scan/backfill.
+    /// Historical rows are common immediately after schema evolution; this
+    /// avoids per-row registry traffic without letting an adversarial archive
+    /// or long-lived scan retain every schema generation it encounters.
     pub const SchemaViewSet = struct {
+        const max_resident_views = 32;
+        const Entry = struct {
+            view: schema_registry_mod.SchemaView,
+            access: u64,
+        };
+
         manager: *IndexManager,
-        views: std.AutoHashMapUnmanaged(u32, schema_registry_mod.SchemaView) = .empty,
+        views: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+        clock: u64 = 0,
 
         pub fn init(manager: *IndexManager) @This() {
             return .{ .manager = manager };
@@ -2784,17 +2781,37 @@ pub const IndexManager = struct {
 
         pub fn deinit(self: *@This()) void {
             var values = self.views.valueIterator();
-            while (values.next()) |view| view.release();
+            while (values.next()) |entry| entry.view.release();
             self.views.deinit(self.manager.alloc);
             self.* = undefined;
         }
 
         pub fn get(self: *@This(), version: u32) !*const schema_registry_mod.SchemaView {
-            if (self.views.getPtr(version)) |view| return view;
+            self.clock +%= 1;
+            if (self.clock == 0) self.clock = 1;
+            if (self.views.getPtr(version)) |entry| {
+                entry.access = self.clock;
+                return &entry.view;
+            }
             var view = try self.manager.acquireSchemaVersionView(version);
             errdefer view.release();
-            try self.views.put(self.manager.alloc, version, view);
-            return self.views.getPtr(version).?;
+            if (self.views.count() >= max_resident_views) {
+                var candidate_version: ?u32 = null;
+                var candidate_access: u64 = std.math.maxInt(u64);
+                var iterator = self.views.iterator();
+                while (iterator.next()) |entry| {
+                    if (candidate_version == null or entry.value_ptr.access < candidate_access) {
+                        candidate_version = entry.key_ptr.*;
+                        candidate_access = entry.value_ptr.access;
+                    }
+                }
+                if (candidate_version) |evicted_version| {
+                    var evicted = self.views.fetchRemove(evicted_version).?.value;
+                    evicted.view.release();
+                }
+            }
+            try self.views.put(self.manager.alloc, version, .{ .view = view, .access = self.clock });
+            return &self.views.getPtr(version).?.view;
         }
     };
 
@@ -2819,7 +2836,7 @@ pub const IndexManager = struct {
     };
 
     pub fn materializeStoredDocumentWithSchemaViewsAlloc(
-        _: *IndexManager,
+        self: *IndexManager,
         alloc: Allocator,
         store_key: []const u8,
         stored_value: []const u8,
@@ -2831,12 +2848,19 @@ pub const IndexManager = struct {
         }
         const version = try relational_store.rowSchemaVersion(stored_value);
         const view = try schema_views.get(version);
-        var materialized = try relational_store.materializeRootForSchemaAndLayoutAlloc(
-            alloc,
-            stored_value,
-            view.tableSchema().*,
-            view.physicalLayout(),
-        );
+        const row = if (self.primary_store != null and self.primary_store.?.valuesAreAuthenticated())
+            try relational_row_codec.ordinalRowViewTrusted(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            )
+        else
+            try relational_row_codec.ordinalRowView(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            );
+        var materialized = try row.materializeRootAlloc(alloc);
         errdefer materialized.deinit(alloc);
         // Text rebuilds never persist source JSON in their segments. Supply an
         // owned empty slice for the generic MapperDoc lifetime contract while
@@ -3778,13 +3802,13 @@ pub const IndexManager = struct {
     pub fn acquireWritePlanSnapshot(self: *IndexManager) !WritePlanSnapshotView {
         while (true) {
             const target_generation = self.writePlanGeneration();
-            lockAtomicMutex(&self.write_plan_cache_mutex);
+            self.write_plan_cache_mutex.lockUncancelable(self.checkpointIo());
             if (self.write_plan_cache) |cached| if (cached.value.generation == target_generation) {
                 cached.retain();
-                self.write_plan_cache_mutex.unlock();
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
                 return .{ .epoch = cached };
             };
-            self.write_plan_cache_mutex.unlock();
+            self.write_plan_cache_mutex.unlock(self.checkpointIo());
 
             if (self.write_plan_build_generation.cmpxchgStrong(
                 0,
@@ -3809,16 +3833,16 @@ pub const IndexManager = struct {
             errdefer self.alloc.destroy(replacement);
             replacement.* = .{ .value = snapshot };
 
-            lockAtomicMutex(&self.write_plan_cache_mutex);
+            self.write_plan_cache_mutex.lockUncancelable(self.checkpointIo());
             const current_generation = self.writePlanGeneration();
             if (self.write_plan_cache) |cached| if (cached.value.generation == current_generation) {
                 cached.retain();
-                self.write_plan_cache_mutex.unlock();
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
                 replacement.release();
                 return .{ .epoch = cached };
             };
             if (snapshot.generation != current_generation) {
-                self.write_plan_cache_mutex.unlock();
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
                 replacement.release();
                 continue;
             }
@@ -3826,7 +3850,7 @@ pub const IndexManager = struct {
             const displaced = self.write_plan_cache;
             self.write_plan_cache = replacement;
             replacement.retain();
-            self.write_plan_cache_mutex.unlock();
+            self.write_plan_cache_mutex.unlock(self.checkpointIo());
             if (displaced) |old| old.release();
             return .{ .epoch = replacement };
         }
@@ -7085,6 +7109,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.text_indexes.items) |*entry| entry.io = self.checkpointIo();
         for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
@@ -12178,19 +12203,38 @@ pub const IndexManager = struct {
         var start: usize = 0;
         while (start < filtered.items.len) {
             const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
-            const estimate = try self.estimateTextMapperDocsPublicationRange(
-                entry,
-                projection_options,
+            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer projection_arena_state.deinit();
+            const projection_arena = projection_arena_state.allocator();
+            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+                projection_arena,
                 filtered.items[start..end],
-            );
-            try self.appendTextMapperDocsPublicationAtomicRanges(
-                entry,
                 projection_options,
-                filtered.items,
-                original_ends.items,
-                start,
-                end,
-                estimate,
+            );
+            var projected_source_indices = std.ArrayListUnmanaged(usize).empty;
+            defer projected_source_indices.deinit(projection_arena);
+            const projection_batch = try buildTextProjectionBatchForEntry(
+                projection_arena,
+                entry,
+                source_batch.docs,
+                null,
+                &projected_source_indices,
+            );
+            if (projected_source_indices.items.len != projection_batch.docs.len)
+                return error.InvalidTextProjection;
+            var projected_original_ends = std.ArrayListUnmanaged(usize).empty;
+            defer projected_original_ends.deinit(projection_arena);
+            try projected_original_ends.ensureTotalCapacity(projection_arena, projection_batch.docs.len);
+            for (projected_source_indices.items) |source_idx| {
+                projected_original_ends.appendAssumeCapacity(original_ends.items[start + source_idx]);
+            }
+            try appendProjectedTextPublicationAtomicRanges(
+                projection_batch.docs,
+                projected_original_ends.items,
+                original_ends.items[end - 1],
+                0,
+                projection_batch.docs.len,
+                estimateProjectedTextPublication(projection_batch.docs),
                 reservation_limit,
                 arena,
                 &atomic_ranges,
@@ -12214,29 +12258,6 @@ pub const IndexManager = struct {
         std.debug.assert(current_end > 0);
         try chunks.append(context.alloc, .{ .end = docs.len, .estimate = current });
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
-    }
-
-    fn estimateTextMapperDocsPublicationRange(
-        self: *IndexManager,
-        entry: *TextIndex,
-        projection_options: mapper.TextProjectionOptions,
-        docs: []const mapper.MapperDoc,
-    ) !TextPublicationEstimate {
-        var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer projection_arena_state.deinit();
-        const projection_arena = projection_arena_state.allocator();
-        const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
-            projection_arena,
-            docs,
-            projection_options,
-        );
-        const projection_batch = try buildTextProjectionBatchForEntry(
-            projection_arena,
-            entry,
-            source_batch.docs,
-            null,
-        );
-        return estimateProjectedTextPublication(projection_batch.docs);
     }
 
     /// Build immutable text segments while only read locks are held. This is
@@ -12309,6 +12330,7 @@ pub const IndexManager = struct {
                     entry,
                     source_docs_with_ordinals,
                     &chunk_observed,
+                    null,
                 );
                 try appendOwnedObservedFieldAnalyzers(alloc, &observed, projection_batch.observed_field_analyzers);
 
@@ -12353,6 +12375,7 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
         observed: ?*std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+        projected_source_indices: ?*std.ArrayListUnmanaged(usize),
     ) !mapper.TextProjectionBatch {
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(
             arena,
@@ -12362,8 +12385,14 @@ pub const IndexManager = struct {
             entry.selected_field,
         );
         defer builder.deinit();
-        for (source_docs) |doc| {
+        for (source_docs, 0..) |doc, source_idx| {
+            const before = builder.text_docs.items.len;
             try builder.appendSourceDocWithSelectedField(doc, textIndexSelectedFieldForKey(entry, doc.key));
+            if (projected_source_indices) |indices| {
+                const appended = builder.text_docs.items.len - before;
+                if (appended > 1) return error.InvalidTextProjection;
+                if (appended == 1) try indices.append(arena, source_idx);
+            }
         }
         return .{
             .docs = try arena.dupe(introducer_mod.TextDocument, builder.text_docs.items),
@@ -12371,12 +12400,10 @@ pub const IndexManager = struct {
         };
     }
 
-    fn appendTextMapperDocsPublicationAtomicRanges(
-        self: *IndexManager,
-        entry: *TextIndex,
-        projection_options: mapper.TextProjectionOptions,
-        docs: []const mapper.MapperDoc,
+    fn appendProjectedTextPublicationAtomicRanges(
+        docs: []const introducer_mod.TextDocument,
         original_ends: []const usize,
+        terminal_end: usize,
         start: usize,
         end: usize,
         estimate: TextPublicationEstimate,
@@ -12384,18 +12411,17 @@ pub const IndexManager = struct {
         alloc: Allocator,
         out: *std.ArrayListUnmanaged(TextPublicationAtomicRange),
     ) !void {
-        if (reservation_limit == std.math.maxInt(usize) or estimate.segment_count <= reservation_limit or end - start == 1) {
-            try out.append(alloc, .{ .end = original_ends[end - 1], .estimate = estimate });
+        if (reservation_limit == std.math.maxInt(usize) or estimate.segment_count <= reservation_limit or end - start <= 1) {
+            try out.append(alloc, .{ .end = terminal_end, .estimate = estimate });
             return;
         }
 
         const mid = start + (end - start) / 2;
-        const left_estimate = try self.estimateTextMapperDocsPublicationRange(entry, projection_options, docs[start..mid]);
-        try self.appendTextMapperDocsPublicationAtomicRanges(
-            entry,
-            projection_options,
+        const left_estimate = estimateProjectedTextPublication(docs[start..mid]);
+        try appendProjectedTextPublicationAtomicRanges(
             docs,
             original_ends,
+            original_ends[mid - 1],
             start,
             mid,
             left_estimate,
@@ -12403,12 +12429,11 @@ pub const IndexManager = struct {
             alloc,
             out,
         );
-        const right_estimate = try self.estimateTextMapperDocsPublicationRange(entry, projection_options, docs[mid..end]);
-        try self.appendTextMapperDocsPublicationAtomicRanges(
-            entry,
-            projection_options,
+        const right_estimate = estimateProjectedTextPublication(docs[mid..end]);
+        try appendProjectedTextPublicationAtomicRanges(
             docs,
             original_ends,
+            terminal_end,
             mid,
             end,
             right_estimate,
@@ -12436,6 +12461,7 @@ pub const IndexManager = struct {
             projection_arena,
             entry,
             source_batch.docs,
+            null,
             null,
         );
         return estimateProjectedTextPublication(projection_batch.docs);
@@ -14425,6 +14451,7 @@ pub const IndexManager = struct {
                 var entry = TextIndex{
                     .instance_id = self.allocateTextIndexInstanceId(),
                     .apply_mutex = apply_mutex,
+                    .io = self.checkpointIo(),
                     .config = owned_config.config,
                     .chunk_name = owned_config.chunk_name,
                     .source_artifact_names = owned_config.source_artifact_names,
@@ -15649,7 +15676,7 @@ pub const IndexManager = struct {
             return false;
         }
         var merge_delta_locked = true;
-        defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        defer if (merge_delta_locked) entry.merge_delta_mutex.unlock(entry.io);
         var has_deletion_deltas = false;
         for (task.deletion_state.deltas) |delta| {
             if (delta.count == 0) continue;
@@ -15722,7 +15749,7 @@ pub const IndexManager = struct {
                 },
             };
         };
-        entry.merge_delta_mutex.unlock();
+        entry.merge_delta_mutex.unlock(entry.io);
         merge_delta_locked = false;
         entry.apply_mutex.unlock();
         index_apply_locked = false;
@@ -33157,8 +33184,12 @@ test "text merge deletion states synchronize recording with per-index detach" {
     defer state_b.destroy();
     state_b.segment_ids[0] = source_b[0].id;
 
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var entry: IndexManager.TextIndex = undefined;
-    entry.merge_delta_mutex = .unlocked;
+    entry.io = io;
+    entry.merge_delta_mutex = .init;
     entry.merge_deletion_states = .empty;
     defer entry.merge_deletion_states.deinit(alloc);
     try entry.attachMergeDeletionState(alloc, state_a);
@@ -33187,9 +33218,6 @@ test "text merge deletion states synchronize recording with per-index detach" {
     };
 
     var context = Context{ .entry = &entry, .iterations = iterations };
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var writer = std.Io.async(io, Context.record, .{&context});
     var writer_awaited = false;
     defer if (!writer_awaited) writer.await(io);

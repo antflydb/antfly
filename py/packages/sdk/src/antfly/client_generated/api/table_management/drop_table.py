@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.committed_mutation_outcome import CommittedMutationOutcome
 from ...models.error import Error
 from ...types import Response
 
@@ -24,7 +25,14 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | Error | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | CommittedMutationOutcome | Error | None:
+    if response.status_code == 202:
+        response_202 = CommittedMutationOutcome.from_dict(response.json())
+
+        return response_202
+
     if response.status_code == 204:
         response_204 = cast(Any, None)
         return response_204
@@ -45,7 +53,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | Error]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | CommittedMutationOutcome | Error]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -58,7 +68,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | Error]:
+) -> Response[Any | CommittedMutationOutcome | Error]:
     """Drop a table
 
     Args:
@@ -69,7 +79,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[Any | CommittedMutationOutcome | Error]
     """
 
     kwargs = _get_kwargs(
@@ -87,7 +97,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | Error | None:
+) -> Any | CommittedMutationOutcome | Error | None:
     """Drop a table
 
     Args:
@@ -98,7 +108,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        Any | CommittedMutationOutcome | Error
     """
 
     return sync_detailed(
@@ -111,7 +121,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | Error]:
+) -> Response[Any | CommittedMutationOutcome | Error]:
     """Drop a table
 
     Args:
@@ -122,7 +132,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error]
+        Response[Any | CommittedMutationOutcome | Error]
     """
 
     kwargs = _get_kwargs(
@@ -138,7 +148,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | Error | None:
+) -> Any | CommittedMutationOutcome | Error | None:
     """Drop a table
 
     Args:
@@ -149,7 +159,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error
+        Any | CommittedMutationOutcome | Error
     """
 
     return (

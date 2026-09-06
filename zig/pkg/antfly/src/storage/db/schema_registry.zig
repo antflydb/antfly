@@ -104,10 +104,6 @@ pub const Epoch = struct {
         schema_mod.freeSchema(self.alloc, self.schema);
         self.alloc.destroy(self);
     }
-
-    fn cacheOwnsOnlyReference(self: *const Epoch) bool {
-        return self.ref_count.load(.acquire) == 1;
-    }
 };
 
 pub const SchemaView = struct {
@@ -254,9 +250,11 @@ pub const Registry = struct {
         epoch.historical_access = self.historical_clock;
     }
 
-    /// Remove one least-recently-used cache-only historical epoch. Pinned views
-    /// are never selected; their references bound temporary overflow by active
-    /// reader concurrency rather than by schema-update history.
+    /// Remove one least-recently-used historical cache entry. Cache membership
+    /// is independent of object lifetime: a pinned SchemaView keeps the epoch
+    /// alive after the registry drops its reference. A later lookup may fault a
+    /// new immutable epoch for the same historical version, which is safe
+    /// because only the active epoch participates in publication identity.
     fn takeHistoricalEvictionLocked(self: *Registry) ?*Epoch {
         const active_allowance: usize = @intFromBool(self.current.load(.acquire) != null);
         if (self.epochs.count() <= max_resident_historical_epochs + active_allowance) return null;
@@ -266,7 +264,7 @@ pub const Registry = struct {
         var iterator = self.epochs.iterator();
         while (iterator.next()) |entry| {
             const epoch = entry.value_ptr.*;
-            if (epoch == active or !epoch.cacheOwnsOnlyReference()) continue;
+            if (epoch == active) continue;
             if (candidate_version == null or epoch.historical_access < candidate_access) {
                 candidate_version = entry.key_ptr.*;
                 candidate_access = epoch.historical_access;
@@ -611,6 +609,31 @@ test "historical epoch residency is bounded while pinned views remain valid" {
     var current = registry.acquire().?;
     defer current.release();
     try std.testing.expectEqual(@as(u32, max_resident_historical_epochs + 39), current.version());
+}
+
+test "historical epoch residency remains bounded when every installed epoch is pinned" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    defer registry.deinit();
+
+    const pinned_count = max_resident_historical_epochs + 20;
+    var pinned: [pinned_count]SchemaView = undefined;
+    var initialized: usize = 0;
+    defer for (pinned[0..initialized]) |*view| view.release();
+
+    for (pinned[0..], 2..) |*slot, version| {
+        slot.* = try registry.installHistorical(try Epoch.createCloned(alloc, .{
+            .version = @intCast(version),
+        }));
+        initialized += 1;
+        try std.testing.expectEqual(@as(u32, @intCast(version)), slot.version());
+        try std.testing.expect(registry.epochs.count() <= max_resident_historical_epochs + 1);
+    }
+
+    // Eviction released only the registry references; every caller-owned view
+    // remains usable through the end of the request.
+    for (pinned, 2..) |view, version|
+        try std.testing.expectEqual(@as(u32, @intCast(version)), view.version());
 }
 
 test "whole generation replacement does not wait for pinned views" {

@@ -313,6 +313,23 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("surfaces committed-but-pending table mutations without encouraging a retry", async () => {
+      const pending = { status: "committed_visibility_pending" as const };
+      mockPost.mockResolvedValueOnce({
+        data: pending,
+        error: undefined,
+        response: new Response(JSON.stringify(pending), { status: 202 }),
+      });
+      mockDelete.mockResolvedValueOnce({
+        data: pending,
+        error: undefined,
+        response: new Response(JSON.stringify(pending), { status: 202 }),
+      });
+
+      await expect(client.tables.create("new_table")).resolves.toEqual(pending);
+      await expect(client.tables.drop("new_table")).resolves.toEqual(pending);
+    });
+
     it("rejects invalid inline indexes before creating a table", async () => {
       const config = {
         indexes: {

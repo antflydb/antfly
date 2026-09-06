@@ -8682,6 +8682,39 @@ pub const DB = struct {
             };
         };
 
+        // Reserve the fixed-size apply workspace before admission to the
+        // serialized section. These buffers are request-owned and contain no
+        // mutable store state; allocating them while holding apply only extends
+        // tail latency for every writer queued behind this batch.
+        const extracted = try self.alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
+        var extracted_initialized: usize = 0;
+        defer {
+            for (extracted[0..extracted_initialized]) |*item| item.deinit(self.alloc);
+            self.alloc.free(extracted);
+        }
+        const overwritten_flags = try self.alloc.alloc(bool, effective_req.writes.len);
+        defer self.alloc.free(overwritten_flags);
+        @memset(overwritten_flags, false);
+        const derived_changed_flags = try self.alloc.alloc(bool, effective_req.writes.len);
+        defer self.alloc.free(derived_changed_flags);
+        @memset(derived_changed_flags, true);
+        const overwrite_probe_keys = try self.alloc.alloc([]const u8, effective_req.writes.len);
+        defer self.alloc.free(overwrite_probe_keys);
+        const overwrite_probe_values = try self.alloc.alloc(?[]const u8, effective_req.writes.len);
+        defer self.alloc.free(overwrite_probe_values);
+        var semantic_noop_store_keys = std.StringHashMapUnmanaged(void).empty;
+        defer semantic_noop_store_keys.deinit(self.alloc);
+        const can_elide_primary_noops = if (request_schema_view) |view|
+            view.storageMode() == .document
+        else
+            true;
+        if (can_elide_primary_noops) {
+            try semantic_noop_store_keys.ensureTotalCapacity(
+                self.alloc,
+                std.math.cast(u32, effective_req.writes.len) orelse return error.InvalidBatchRequest,
+            );
+        }
+
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         if (builtin.is_test) {
@@ -8831,13 +8864,6 @@ pub const DB = struct {
         }
 
         const extract_writes_start_ns = monotonicTimeNs();
-        var extracted = try self.alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
-        var extracted_initialized: usize = 0;
-        defer {
-            for (extracted[0..extracted_initialized]) |*item| item.deinit(self.alloc);
-            self.alloc.free(extracted);
-        }
-
         var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer store_writes.deinit(self.alloc);
         var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -8906,12 +8932,6 @@ pub const DB = struct {
             for (timestamp_delete_keys.items) |key| self.alloc.free(@constCast(key));
             timestamp_delete_keys.deinit(self.alloc);
         }
-        var overwritten_flags = try self.alloc.alloc(bool, effective_req.writes.len);
-        defer self.alloc.free(overwritten_flags);
-        @memset(overwritten_flags, false);
-        var derived_changed_flags = try self.alloc.alloc(bool, effective_req.writes.len);
-        defer self.alloc.free(derived_changed_flags);
-        @memset(derived_changed_flags, true);
         var overwrite_probe_entries = std.ArrayListUnmanaged(OverwriteProbeEntry).empty;
         defer overwrite_probe_entries.deinit(self.alloc);
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -9140,10 +9160,8 @@ pub const DB = struct {
             const overwrite_probe_start_ns = monotonicTimeNs();
             const unchanged_derived_targets_serviceable = try self.unchangedDerivedReplayTargetsServiceable(self.alloc);
             std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
-            const probe_keys = try self.alloc.alloc([]const u8, overwrite_probe_entries.items.len);
-            defer self.alloc.free(probe_keys);
-            const probe_values = try self.alloc.alloc(?[]const u8, overwrite_probe_entries.items.len);
-            defer self.alloc.free(probe_values);
+            const probe_keys = overwrite_probe_keys[0..overwrite_probe_entries.items.len];
+            const probe_values = overwrite_probe_values[0..overwrite_probe_entries.items.len];
             for (overwrite_probe_entries.items, 0..) |entry, i| {
                 probe_keys[i] = entry.key;
             }
@@ -9171,14 +9189,24 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.overwrite_probe_ns, overwrite_probe_start_ns);
         }
 
-        // A semantic no-op may avoid rewriting the primary document and
-        // derived journal. Keep its timestamp write: timestamps are observable
-        // write metadata and, when a TTL field is absent, define the document's
-        // expiry baseline. This preserves logical-write and TTL-refresh
-        // semantics without paying the much larger source/derived replay cost.
+        // A document-mode semantic no-op may avoid rewriting the primary value
+        // while retaining its timestamp sidecar. AROW carries the authoritative
+        // TTL timestamp in its checksummed header, so relational rows must still
+        // publish the newly prepared physical row even when derived content is
+        // unchanged. The derived journal remains safely elided in both modes.
         for (overwrite_probe_entries.items) |entry| {
             if (derived_changed_flags[entry.write_index]) continue;
-            removePendingStoreWriteByKey(&store_writes, entry.key);
+            if (internal_keys.isRelationalRowKey(entry.key)) continue;
+            semantic_noop_store_keys.putAssumeCapacity(entry.key, {});
+        }
+        if (semantic_noop_store_keys.count() != 0) {
+            var retained: usize = 0;
+            for (store_writes.items) |write| {
+                if (semantic_noop_store_keys.contains(write.key)) continue;
+                store_writes.items[retained] = write;
+                retained += 1;
+            }
+            store_writes.shrinkRetainingCapacity(retained);
         }
 
         for (effective_req.graph_writes) |graph_write| {
@@ -9932,14 +9960,6 @@ pub const DB = struct {
             if (changed) return true;
         }
         return false;
-    }
-
-    fn removePendingStoreWriteByKey(writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), key: []const u8) void {
-        for (writes.items, 0..) |write, i| {
-            if (!std.mem.eql(u8, write.key, key)) continue;
-            _ = writes.orderedRemove(i);
-            return;
-        }
     }
 
     /// Inject (or clear) the cross-shard entity-resolution candidate source on
@@ -11215,22 +11235,36 @@ pub const DB = struct {
                     break :blk try self.alloc.dupe(u8, stored);
                 const version = try relational_store.rowSchemaVersion(stored);
                 if (schema_view) |view| if (view.version() == version) {
-                    break :blk try relational_store.decodeValueForSchemaAndLayoutAlloc(
-                        self.alloc,
-                        stored,
-                        view.tableSchema().*,
-                        view.physicalLayout(),
-                    );
+                    const row = if (self.core.store.valuesAreAuthenticated())
+                        try relational_row_codec.ordinalRowViewTrusted(
+                            stored,
+                            view.tableSchema().*,
+                            view.physicalLayout(),
+                        )
+                    else
+                        try relational_row_codec.ordinalRowView(
+                            stored,
+                            view.tableSchema().*,
+                            view.physicalLayout(),
+                        );
+                    break :blk try row.reconstructValueAlloc(self.alloc);
                 };
                 var historical = (try self.core.acquireSchemaVersionView(version)) orelse
                     return error.UnknownSchemaVersion;
                 defer historical.release();
-                break :blk try relational_store.decodeValueForSchemaAndLayoutAlloc(
-                    self.alloc,
-                    stored,
-                    historical.tableSchema().*,
-                    historical.physicalLayout(),
-                );
+                const row = if (self.core.store.valuesAreAuthenticated())
+                    try relational_row_codec.ordinalRowViewTrusted(
+                        stored,
+                        historical.tableSchema().*,
+                        historical.physicalLayout(),
+                    )
+                else
+                    try relational_row_codec.ordinalRowView(
+                        stored,
+                        historical.tableSchema().*,
+                        historical.physicalLayout(),
+                    );
+                break :blk try row.reconstructValueAlloc(self.alloc);
             } else null;
             errdefer if (value) |owned| self.alloc.free(owned);
             const expected_version = if (internal_keys.isInternalUserKey(key))
@@ -19873,48 +19907,67 @@ pub const DB = struct {
         defer alloc.free(store_key);
         const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
         defer alloc.free(raw);
+        const relational = internal_keys.isRelationalRowKey(store_key);
+        var historical_schema_view: ?schema_registry_mod.SchemaView = null;
+        defer if (historical_schema_view) |*view| view.release();
+        const ordinal_row = if (relational) blk: {
+            const version = try relational_store.rowSchemaVersion(raw);
+            const row_schema = if (schema_view) |view|
+                if (view.version() == version)
+                    view
+                else historical: {
+                    historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
+                        return error.UnknownSchemaVersion;
+                    break :historical historical_schema_view.?;
+                }
+            else historical: {
+                historical_schema_view = (try self.core.acquireSchemaVersionView(version)) orelse
+                    return error.UnknownSchemaVersion;
+                break :historical historical_schema_view.?;
+            };
+            break :blk if (self.core.store.valuesAreAuthenticated())
+                try relational_row_codec.ordinalRowViewTrusted(
+                    raw,
+                    row_schema.tableSchema().*,
+                    row_schema.physicalLayout(),
+                )
+            else
+                try relational_row_codec.ordinalRowView(
+                    raw,
+                    row_schema.tableSchema().*,
+                    row_schema.physicalLayout(),
+                );
+        } else null;
         if (!internal_keys.isInternalUserKey(key)) {
             const ttl_duration_ns = if (schema_view) |view| view.tableSchema().ttl_duration_ns else 0;
             if (ttl_duration_ns != 0) {
-                const timestamp_ns = if (internal_keys.isRelationalRowKey(store_key))
-                    if (self.core.store.valuesAreAuthenticated())
-                        try relational_store.rowWriteTimestampNsTrusted(raw)
-                    else
-                        try relational_store.rowWriteTimestampNs(raw)
+                const timestamp_ns = if (ordinal_row) |row|
+                    row.writeTimestampNs()
                 else
                     try self.getTimestamp(alloc, key);
                 if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
         try checkLookupOptionsActive(opts);
-        const direct_fields = if (internal_keys.isRelationalRowKey(store_key))
+        const direct_fields = if (relational)
             exactOrdinalProjectionFields(opts.fields, opts.include_all_fields)
         else
             null;
         const stored = if (direct_fields) |fields| blk: {
-            break :blk if (self.core.store.valuesAreAuthenticated())
-                try self.core.index_manager.projectStoredOrdinalFieldsTrustedWithPinnedSchemaAlloc(
-                    alloc,
-                    store_key,
-                    raw,
-                    fields,
-                    schema_view,
-                )
-            else
-                try self.core.index_manager.projectStoredOrdinalFieldsWithPinnedSchemaAlloc(
-                    alloc,
-                    store_key,
-                    raw,
-                    fields,
-                    schema_view,
-                );
-        } else blk: {
-            const materialized = try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(
+            const row = ordinal_row.?;
+            var projection = try relational_row_codec.OrdinalProjectionPlan.init(
                 alloc,
-                store_key,
-                raw,
-                schema_view,
+                row.table_schema,
+                row.layout,
+                fields,
             );
+            defer projection.deinit();
+            break :blk try row.projectAlloc(alloc, projection);
+        } else blk: {
+            const materialized = if (ordinal_row) |row|
+                try row.reconstructValueAlloc(alloc)
+            else
+                try alloc.dupe(u8, raw);
             if (opts.fields.len == 0 and opts.include_all_fields) break :blk materialized;
             defer alloc.free(materialized);
             break :blk try projectLookupStoredBytes(self, alloc, key, materialized, opts);
@@ -31845,12 +31898,32 @@ pub const DB = struct {
                         return .stop;
                 }
                 const relational = internal_keys.isRelationalRowKey(store_key);
+                const row_plan = if (relational)
+                    try state.schemaPlan(try relational_store.rowSchemaVersion(stored_value))
+                else
+                    null;
+                // Authenticate and structurally parse the row exactly once for
+                // this callback. Every downstream consumer receives the same
+                // immutable verified view instead of independently rescanning
+                // the physical checksum and header.
+                const ordinal_row = if (row_plan) |plan|
+                    if (state.values_authenticated)
+                        try relational_row_codec.ordinalRowViewTrusted(
+                            stored_value,
+                            plan.view.tableSchema().*,
+                            plan.view.physicalLayout(),
+                        )
+                    else
+                        try relational_row_codec.ordinalRowView(
+                            stored_value,
+                            plan.view.tableSchema().*,
+                            plan.view.physicalLayout(),
+                        )
+                else
+                    null;
                 if (state.ttl_duration_ns != 0) {
                     const timestamp = if (relational)
-                        if (state.values_authenticated)
-                            try relational_store.rowWriteTimestampNsTrusted(stored_value)
-                        else
-                            try relational_store.rowWriteTimestampNs(stored_value)
+                        ordinal_row.?.writeTimestampNs()
                     else blk: {
                         state.ttl_key_scratch.clearRetainingCapacity();
                         try internal_keys.appendDocumentPrefix(&state.ttl_key_scratch, state.alloc, raw_key);
@@ -31868,45 +31941,18 @@ pub const DB = struct {
                         return .@"continue";
                 }
 
-                const semantic_hash = if (relational)
-                    if (state.values_authenticated)
-                        try relational_store.rowSemanticHashTrusted(stored_value)
-                    else
-                        try relational_store.rowSemanticHash(stored_value)
-                else
-                    null;
+                const semantic_hash = if (ordinal_row) |row| row.semanticHash() else null;
                 var ordinal_filter_match: ?bool = null;
-                const row_plan = if (relational)
-                    try state.schemaPlan(try relational_store.rowSchemaVersion(stored_value))
-                else
-                    null;
                 if (row_plan) |plan| if (plan.filter) |*filter| {
-                    const ordinal_row = if (state.values_authenticated)
-                        try relational_row_codec.ordinalRowViewTrusted(
-                            stored_value,
-                            plan.view.tableSchema().*,
-                            plan.view.physicalLayout(),
-                        )
-                    else
-                        try relational_row_codec.ordinalRowView(
-                            stored_value,
-                            plan.view.tableSchema().*,
-                            plan.view.physicalLayout(),
-                        );
-                    ordinal_filter_match = try filter.matches(state.alloc, raw_key, ordinal_row);
+                    ordinal_filter_match = try filter.matches(state.alloc, raw_key, ordinal_row.?);
                     if (ordinal_filter_match == false) return .@"continue";
                 };
                 const needs_logical_value = !relational or semantic_hash == null or
                     (state.filter != null and ordinal_filter_match == null) or
                     (state.opts.include_documents and state.direct_projection_fields == null);
                 const logical_value = if (needs_logical_value)
-                    if (row_plan) |plan|
-                        try relational_store.decodeValueForSchemaAndLayoutAlloc(
-                            state.alloc,
-                            stored_value,
-                            plan.view.tableSchema().*,
-                            plan.view.physicalLayout(),
-                        )
+                    if (ordinal_row) |row|
+                        try row.reconstructValueAlloc(state.alloc)
                     else
                         try state.alloc.dupe(u8, stored_value)
                 else
@@ -31926,14 +31972,8 @@ pub const DB = struct {
                 }
                 const projected = if (state.opts.include_documents)
                     if (state.direct_projection_fields) |_|
-                        if (row_plan) |plan|
-                            try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
-                                state.alloc,
-                                stored_value,
-                                plan.view.tableSchema().*,
-                                plan.view.physicalLayout(),
-                                plan.projection.?,
-                            )
+                        if (ordinal_row) |row|
+                            try row.projectAlloc(state.alloc, row_plan.?.projection.?)
                         else
                             try projectLookupStoredBytesTxn(state.projection_context, state.alloc, raw_key, logical_value.?, .{
                                 .fields = state.opts.fields,
@@ -36361,6 +36401,18 @@ fn loadStoredSearchDocumentsMany(
 
             const version = try relational_store.rowSchemaVersion(stored_value);
             if (plans.pinned) |view| if (view.version() == version) {
+                const row = if (values_authenticated)
+                    try relational_row_codec.ordinalRowViewTrusted(
+                        stored_value,
+                        view.tableSchema().*,
+                        view.physicalLayout(),
+                    )
+                else
+                    try relational_row_codec.ordinalRowView(
+                        stored_value,
+                        view.tableSchema().*,
+                        view.physicalLayout(),
+                    );
                 if (plans.fields) |fields| {
                     if (plans.pinned_projection == null) {
                         plans.pinned_projection = try relational_row_codec.OrdinalProjectionPlan.init(
@@ -36370,56 +36422,28 @@ fn loadStoredSearchDocumentsMany(
                             fields,
                         );
                     }
-                    return if (values_authenticated)
-                        try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
-                            plans.alloc,
-                            stored_value,
-                            view.tableSchema().*,
-                            view.physicalLayout(),
-                            plans.pinned_projection.?,
-                        )
-                    else
-                        try relational_row_codec.projectOrdinalPlanWithLayoutAlloc(
-                            plans.alloc,
-                            stored_value,
-                            view.tableSchema().*,
-                            view.physicalLayout(),
-                            plans.pinned_projection.?,
-                        );
+                    return try row.projectAlloc(plans.alloc, plans.pinned_projection.?);
                 }
-                return try relational_store.decodeValueForSchemaAndLayoutAlloc(
-                    plans.alloc,
-                    stored_value,
-                    view.tableSchema().*,
-                    view.physicalLayout(),
-                );
+                return try row.reconstructValueAlloc(plans.alloc);
             };
 
             const plan = try plans.historicalPlan(version);
+            const row = if (values_authenticated)
+                try relational_row_codec.ordinalRowViewTrusted(
+                    stored_value,
+                    plan.view.tableSchema().*,
+                    plan.view.physicalLayout(),
+                )
+            else
+                try relational_row_codec.ordinalRowView(
+                    stored_value,
+                    plan.view.tableSchema().*,
+                    plan.view.physicalLayout(),
+                );
             if (plan.projection) |projection| {
-                return if (values_authenticated)
-                    try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
-                        plans.alloc,
-                        stored_value,
-                        plan.view.tableSchema().*,
-                        plan.view.physicalLayout(),
-                        projection,
-                    )
-                else
-                    try relational_row_codec.projectOrdinalPlanWithLayoutAlloc(
-                        plans.alloc,
-                        stored_value,
-                        plan.view.tableSchema().*,
-                        plan.view.physicalLayout(),
-                        projection,
-                    );
+                return try row.projectAlloc(plans.alloc, projection);
             }
-            return try relational_store.decodeValueForSchemaAndLayoutAlloc(
-                plans.alloc,
-                stored_value,
-                plan.view.tableSchema().*,
-                plan.view.physicalLayout(),
-            );
+            return try row.reconstructValueAlloc(plans.alloc);
         }
     };
 
@@ -61292,6 +61316,50 @@ test "db relational ttl cleanup preserves physical mode across reopen" {
     const stats = try reopened.diagnosticStats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+}
+
+test "db relational semantic no-op refreshes authoritative row timestamp" {
+    const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 10 * std.time.ns_per_s;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{
+        .version = 1,
+        .storage_mode = .relational,
+        .ttl_duration_ns = ttl_duration_ns,
+        .relational_columns = &.{.{
+            .name = "title",
+            .path = "title",
+            .column_type = .string,
+            .required = true,
+        }},
+    });
+
+    const value = "{\"title\":\"same logical row\"}";
+    const refresh_timestamp = currentTimeNs();
+    const original_timestamp = refresh_timestamp - 2 * ttl_duration_ns;
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:refresh", .value = value }},
+        .timestamp_ns = original_timestamp,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:refresh", .value = value }},
+        .timestamp_ns = refresh_timestamp,
+    });
+
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:refresh");
+    defer alloc.free(row_key);
+    const packed_row = try db.core.store.get(alloc, row_key);
+    defer alloc.free(packed_row);
+    try std.testing.expectEqual(refresh_timestamp, try relational_store.rowWriteTimestampNs(packed_row));
+    try std.testing.expectEqual(refresh_timestamp, try db.getTimestamp(alloc, "row:refresh"));
+    const visible = (try db.get(alloc, "row:refresh")) orelse return error.TestExpectedEqual;
+    defer alloc.free(visible);
+    try std.testing.expectEqualStrings(value, visible);
 }
 
 test "db portable relational restore refreshes open runtime before returning" {

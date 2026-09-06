@@ -610,6 +610,51 @@ pub fn decodeDocumentBatch(alloc: Allocator, data: []const u8) ![]DocumentEntry 
     return entries.toOwnedSlice(alloc);
 }
 
+/// Decode only the entry directory while borrowing key/value bytes from the
+/// verified block payload. The minimum encoded entry size bounds `count` before
+/// allocation, so malformed input cannot turn a tiny block into a large
+/// allocation request. Restore can then validate and commit each block without
+/// duplicating its complete contents in memory.
+pub fn decodeDocumentBatchBorrowed(alloc: Allocator, data: []const u8) ![]DocumentEntry {
+    if (data.len < 4) return error.BatchTooShort;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    const minimum_entry_len = 4 + 1 + 4 + 8;
+    if (count > (data.len - 4) / minimum_entry_len) return error.Truncated;
+    const entries = try alloc.alloc(DocumentEntry, count);
+    errdefer alloc.free(entries);
+
+    var off: usize = 4;
+    for (entries) |*entry| {
+        if (data.len - off < 4) return error.Truncated;
+        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (key_len > data.len - off) return error.Truncated;
+        const key = data[off..][0..key_len];
+        off += key_len;
+
+        if (data.len - off < 1 + 4) return error.Truncated;
+        const value_flags = data[off];
+        off += 1;
+        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (value_len > data.len - off) return error.Truncated;
+        const value = data[off..][0..value_len];
+        off += value_len;
+
+        if (data.len - off < 8) return error.Truncated;
+        const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
+        off += 8;
+        entry.* = .{
+            .key = key,
+            .value_flags = value_flags,
+            .value = value,
+            .timestamp_ns = timestamp_ns,
+        };
+    }
+    if (off != data.len) return error.TrailingData;
+    return entries;
+}
+
 /// Validates a document batch and returns its entry count without allocating.
 /// Decoders use this bounded preflight before materializing keys and values.
 pub fn documentBatchEntryCount(data: []const u8) !u32 {
@@ -1060,6 +1105,14 @@ test "document batch round-trip" {
     try std.testing.expectEqualStrings("AROW-payload", decoded[2].value);
     try std.testing.expectEqual(@as(u64, 42), decoded[2].timestamp_ns);
 
+    const borrowed = try decodeDocumentBatchBorrowed(alloc, encoded);
+    defer alloc.free(borrowed);
+    try std.testing.expectEqual(@as(usize, 3), borrowed.len);
+    try std.testing.expectEqualStrings("doc1", borrowed[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"Hello\"}", borrowed[0].value);
+    try std.testing.expectEqual(@as(u64, 1234567890), borrowed[1].timestamp_ns);
+    try std.testing.expectEqualStrings("AROW-payload", borrowed[2].value);
+
     try std.testing.expectEqual(@as(u32, 3), try documentBatchEntryCount(encoded));
     try std.testing.expectError(error.Truncated, documentBatchEntryCount(encoded[0 .. encoded.len - 1]));
     const with_trailing = try alloc.alloc(u8, encoded.len + 1);
@@ -1067,6 +1120,11 @@ test "document batch round-trip" {
     @memcpy(with_trailing[0..encoded.len], encoded);
     with_trailing[encoded.len] = 0;
     try std.testing.expectError(error.TrailingData, documentBatchEntryCount(with_trailing));
+    try std.testing.expectError(error.TrailingData, decodeDocumentBatchBorrowed(alloc, with_trailing));
+
+    var impossible_count = [_]u8{0} ** 4;
+    std.mem.writeInt(u32, &impossible_count, std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.Truncated, decodeDocumentBatchBorrowed(alloc, &impossible_count));
 
     const AllocationRunner = struct {
         fn run(failing_alloc: Allocator, input: []const u8) !void {

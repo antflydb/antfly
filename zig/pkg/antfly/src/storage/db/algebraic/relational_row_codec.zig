@@ -559,6 +559,14 @@ pub fn reconstructOrdinalValueAlloc(
     table_schema: runtime_schema.TableSchema,
 ) ![]u8 {
     const parsed = try parseOrdinal(value, table_schema);
+    return try reconstructParsedOrdinalValueAlloc(alloc, parsed, table_schema);
+}
+
+fn reconstructParsedOrdinalValueAlloc(
+    alloc: Allocator,
+    parsed: ParsedOrdinal,
+    table_schema: runtime_schema.TableSchema,
+) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -579,17 +587,7 @@ pub fn reconstructOrdinalValueWithLayoutAlloc(
     layout: *const PhysicalLayout,
 ) ![]u8 {
     const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var needs_comma = false;
-    var iterator = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
-    while (try iterator.next()) |cell| {
-        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
-        needs_comma = true;
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try reconstructParsedOrdinalValueAlloc(alloc, parsed, table_schema);
 }
 
 /// Logical JSON source plus its already-decoded tree for callers that need
@@ -635,7 +633,84 @@ pub fn materializeOrdinalRootWithLayoutAlloc(
     table_schema: runtime_schema.TableSchema,
     layout: *const PhysicalLayout,
 ) !MaterializedOrdinalRoot {
-    var cells = try ordinalCellIteratorWithLayout(value, table_schema, layout);
+    const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    return try materializeParsedOrdinalRootAlloc(alloc, parsed, table_schema);
+}
+
+/// Restore boundary that authenticates and canonically validates one physical
+/// row while constructing the public-validator tree from the same typed-cell
+/// traversal. This avoids separately decoding the row for integrity and schema
+/// validation while preserving the semantic-hash/physical-checksum split.
+pub fn validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !MaterializedOrdinalRoot {
+    var iterator = try canonicalOrdinalCellIteratorWithLayout(value, table_schema, layout);
+    const stored_hash = iterator.semanticHash();
+    const root_arena = try alloc.create(std.heap.ArenaAllocator);
+    root_arena.* = std.heap.ArenaAllocator.init(alloc);
+    errdefer {
+        root_arena.deinit();
+        alloc.destroy(root_arena);
+    }
+    const root_alloc = root_arena.allocator();
+    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
+
+    if (iterator.isSparse()) {
+        const cells = try alloc.alloc(Cell, iterator.presentCount());
+        defer alloc.free(cells);
+        var count: usize = 0;
+        while (try iterator.next()) |cell| : (count += 1) {
+            cells[count] = cell;
+            const column = table_schema.relational_columns[cell.ordinal];
+            const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
+            if (cell.is_json and !cell.is_null) {
+                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
+            }
+            try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
+        }
+        std.debug.assert(count == cells.len);
+        std.mem.sort(Cell, cells, table_schema.relational_columns, struct {
+            fn lessThan(columns: []const runtime_schema.RelationalColumn, lhs: Cell, rhs: Cell) bool {
+                return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
+            }
+        }.lessThan);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(cells, table_schema);
+        if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
+    } else {
+        const cells = try alloc.alloc(?Cell, table_schema.relational_columns.len);
+        defer alloc.free(cells);
+        @memset(cells, null);
+        while (try iterator.next()) |cell| {
+            cells[cell.ordinal] = cell;
+            const column = table_schema.relational_columns[cell.ordinal];
+            const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
+            if (cell.is_json and !cell.is_null) {
+                const canonical = try document_content_hash.canonicalJsonValueAlloc(root_alloc, logical);
+                if (!std.mem.eql(u8, canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
+            }
+            try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
+        }
+        const computed_hash = try document_content_hash.hashRelationalCellsWithOrdinals(
+            alloc,
+            cells,
+            table_schema,
+            layout.hash_ordinals,
+        );
+        if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
+    }
+    return .{ .root = root, .root_arena = root_arena };
+}
+
+fn materializeParsedOrdinalRootAlloc(
+    alloc: Allocator,
+    parsed: ParsedOrdinal,
+    table_schema: runtime_schema.TableSchema,
+) !MaterializedOrdinalRoot {
+    var cells = OrdinalCellIterator{ .parsed = parsed, .table_schema = table_schema };
     const root_arena = try alloc.create(std.heap.ArenaAllocator);
     root_arena.* = std.heap.ArenaAllocator.init(alloc);
     errdefer {
@@ -647,7 +722,7 @@ pub fn materializeOrdinalRootWithLayoutAlloc(
     while (try cells.next()) |cell| {
         const column = table_schema.relational_columns[cell.ordinal];
         const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
-        try root.object.put(root_alloc, column.name, logical);
+        try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
     }
     return .{ .root = root, .root_arena = root_arena };
 }
@@ -679,7 +754,7 @@ pub fn materializeOrdinalDocumentWithLayoutAlloc(
         const logical = try ownedJsonValueFromCellAlloc(root_alloc, column, cell);
         // Schema names outlive this projection arena. Keep them borrowed instead
         // of retaining a second copy of every field name.
-        try root.object.put(root_alloc, column.name, logical);
+        try root.object.put(root_alloc, try root_alloc.dupe(u8, column.name), logical);
     }
     try out.append(alloc, '}');
     return .{ .json = try out.toOwnedSlice(alloc), .root = root, .root_arena = root_arena };
@@ -802,6 +877,16 @@ pub fn projectOrdinalPlanWithLayoutAlloc(
 ) ![]u8 {
     if (plan.schema_version != table_schema.version) return error.RelationalRowSchemaMismatch;
     const parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout);
+    return try projectParsedOrdinalPlanAlloc(alloc, parsed, table_schema, plan);
+}
+
+fn projectParsedOrdinalPlanAlloc(
+    alloc: Allocator,
+    parsed: ParsedOrdinal,
+    table_schema: runtime_schema.TableSchema,
+    plan: OrdinalProjectionPlan,
+) ![]u8 {
+    if (plan.schema_version != table_schema.version) return error.RelationalRowSchemaMismatch;
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -844,18 +929,7 @@ pub fn projectOrdinalPlanTrustedWithLayoutAlloc(
         plan.schema_version != table_schema.version)
         return error.RelationalRowSchemaMismatch;
     const parsed = try parseOrdinalInternal(value, table_schema, layout, false, false);
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var needs_comma = false;
-    for (plan.ordinals) |ordinal_raw| {
-        const ordinal: usize = ordinal_raw;
-        const cell = (try findParsedOrdinalCell(parsed, table_schema.relational_columns, ordinal)) orelse continue;
-        try appendValidatedCellValue(alloc, &out, cell, needs_comma);
-        needs_comma = true;
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try projectParsedOrdinalPlanAlloc(alloc, parsed, table_schema, plan);
 }
 
 /// Project one column after the containing storage page/block has already
@@ -884,6 +958,7 @@ const ParsedOrdinal = struct {
     sparse_entry_count: usize = 0,
     sparse_terminal_offset_pos: usize = 0,
     semantic_hash: [semantic_hash_len]u8,
+    write_timestamp_ns: u64,
     layout: ?*const PhysicalLayout = null,
 };
 
@@ -973,6 +1048,26 @@ pub const OrdinalRowView = struct {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
         return try findParsedOrdinalCell(self.parsed, self.table_schema.relational_columns, ordinal);
     }
+
+    pub fn semanticHash(self: OrdinalRowView) [semantic_hash_len]u8 {
+        return self.parsed.semantic_hash;
+    }
+
+    pub fn writeTimestampNs(self: OrdinalRowView) u64 {
+        return self.parsed.write_timestamp_ns;
+    }
+
+    pub fn reconstructValueAlloc(self: OrdinalRowView, alloc: Allocator) ![]u8 {
+        return try reconstructParsedOrdinalValueAlloc(alloc, self.parsed, self.table_schema);
+    }
+
+    pub fn materializeRootAlloc(self: OrdinalRowView, alloc: Allocator) !MaterializedOrdinalRoot {
+        return try materializeParsedOrdinalRootAlloc(alloc, self.parsed, self.table_schema);
+    }
+
+    pub fn projectAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) ![]u8 {
+        return try projectParsedOrdinalPlanAlloc(alloc, self.parsed, self.table_schema, plan);
+    }
 };
 
 pub fn ordinalRowView(
@@ -1061,7 +1156,7 @@ fn parseOrdinalInternal(
     var semantic_hash: [semantic_hash_len]u8 = undefined;
     @memcpy(&semantic_hash, value[pos..][0..semantic_hash_len]);
     pos += semantic_hash_len;
-    _ = readU64(value, &pos); // resolved logical write timestamp
+    const write_timestamp_ns = readU64(value, &pos);
     var present: []const u8 = &.{};
     var nulls: []const u8 = &.{};
     if (!sparse) {
@@ -1123,6 +1218,7 @@ fn parseOrdinalInternal(
             .sparse_entry_count = entry_count,
             .sparse_terminal_offset_pos = terminal_offset_pos,
             .semantic_hash = semantic_hash,
+            .write_timestamp_ns = write_timestamp_ns,
             .layout = layout,
         };
         if (canonical) {
@@ -1169,6 +1265,7 @@ fn parseOrdinalInternal(
             .payload = value[payload_start..][0..payload_len],
             .capabilities = capabilities,
             .semantic_hash = semantic_hash,
+            .write_timestamp_ns = write_timestamp_ns,
             .layout = layout,
         };
     }
