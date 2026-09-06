@@ -2694,6 +2694,52 @@ test "prepared pattern filters own source JSON" {
     ));
 }
 
+test "prepared pattern filters preserve dense vector logical array semantics" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 3, .storage_mode = .relational, .relational_columns = &columns };
+    const bytes = [_]u8{ 0, 0, 128, 63, 0, 0, 0, 64 };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .ordinal = 0, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = &bytes } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowView(encoded, schema, &layout);
+    const logical = try row.reconstructValueAlloc(alloc);
+    defer alloc.free(logical);
+    const queries = [_][]const u8{
+        "{\"term\":{\"embedding\":1}}",
+        "{\"term\":{\"embedding\":3}}",
+        "{\"exists\":{\"field\":\"embedding.0\"}}",
+        "{\"exists\":{\"field\":\"embedding.2\"}}",
+        "{\"term\":{\"/embedding/0\":1}}",
+        "{\"term\":{\"/embedding/01\":2}}",
+        "{\"numeric_range\":{\"field\":\"embedding\",\"min\":1.5}}",
+        "{\"bool\":{\"must\":[{\"term\":{\"embedding\":1}},{\"term\":{\"embedding\":2}}]}}",
+    };
+    for (queries) |query| {
+        var filter = try PreparedPatternFilter.init(alloc, query);
+        defer filter.deinit();
+        var bound = try PreparedOrdinalPatternFilter.init(alloc, &filter, schema, &layout);
+        defer bound.deinit();
+        const expected = try filter.matchesStored(alloc, "row", logical);
+        try std.testing.expectEqual(expected, (try filter.matchesOrdinal(alloc, "row", row)).?);
+        try std.testing.expectEqual(expected, (try bound.matches(alloc, "row", row)).?);
+    }
+    var allocating = try PreparedPatternFilter.init(alloc, "{\"numeric_range\":{\"field\":\"embedding\",\"min\":1.5}}");
+    defer allocating.deinit();
+    const Check = struct {
+        fn run(scratch: Allocator, filter: *const PreparedPatternFilter, typed_row: relational_row_codec.OrdinalRowView) !void {
+            try std.testing.expect((try filter.matchesOrdinal(scratch, "row", typed_row)).?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &allocating, row });
+}
+
 test "prepared pattern filters evaluate scalar and nested ordinal cells" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{
@@ -3058,12 +3104,24 @@ const OrdinalEvaluation = struct {
     alloc: Allocator,
     row: relational_row_codec.OrdinalRowView,
     parsed_json_cells: std.AutoHashMapUnmanaged(usize, std.json.Parsed(std.json.Value)) = .empty,
+    logical_arena: ?std.heap.ArenaAllocator = null,
+    logical_cells: std.AutoHashMapUnmanaged(usize, std.json.Value) = .empty,
 
     fn deinit(self: *@This()) void {
         var values = self.parsed_json_cells.valueIterator();
         while (values.next()) |parsed| parsed.deinit();
         self.parsed_json_cells.deinit(self.alloc);
+        if (self.logical_arena) |*arena| arena.deinit();
         self.* = undefined;
+    }
+
+    fn logicalCell(self: *@This(), cell: relational_row_codec.Cell) !std.json.Value {
+        if (self.logical_cells.get(cell.ordinal)) |value| return value;
+        if (self.logical_arena == null) self.logical_arena = std.heap.ArenaAllocator.init(self.alloc);
+        const arena = self.logical_arena.?.allocator();
+        const value = try self.row.materializeCellAlloc(arena, cell);
+        try self.logical_cells.put(arena, cell.ordinal, value);
+        return value;
     }
 
     fn parsedJsonCell(self: *@This(), ordinal: usize, bytes: []const u8) !std.json.Value {
@@ -3132,6 +3190,33 @@ fn matcherMatchesOrdinal(
         else => {},
     };
 
+    if (cell.is_dense_vector) {
+        const bytes = cell.value.bytes_val;
+        if (path.remaining.len > 0) {
+            // A vector is a flat logical array. Selecting one element should
+            // not allocate a JSON array proportional to the vector dimension.
+            const segment = path.remaining[0];
+            if (path.remaining.len != 1 or (path.pointer and !isCanonicalJsonPointerArrayIndex(segment)))
+                return try matcher.predicate.matches(alloc, &.{});
+            const index = std.fmt.parseInt(usize, segment, 10) catch
+                return try matcher.predicate.matches(alloc, &.{});
+            if (index >= bytes.len / @sizeOf(f32)) return try matcher.predicate.matches(alloc, &.{});
+            const number: f32 = @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+            return try matcher.predicate.matches(alloc, &.{.{ .float = number }});
+        }
+        switch (matcher.predicate) {
+            .term, .terms => {
+                var offset: usize = 0;
+                while (offset < bytes.len) : (offset += 4) {
+                    const number: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+                    if (try matcher.predicate.matches(alloc, &.{.{ .float = number }})) return true;
+                }
+                return false;
+            },
+            else => {},
+        }
+    }
+
     var number_buf: [64]u8 = undefined;
     const root: std.json.Value = switch (cell.value) {
         .u64_val => |value| if (value <= std.math.maxInt(i64))
@@ -3149,12 +3234,13 @@ fn matcherMatchesOrdinal(
             .i64_val => |number| .{ .integer = number },
             .f64_val => |number| .{ .float = number },
         },
-        .bytes_val => |bytes| if (cell.is_json)
+        .bytes_val => |bytes| if (cell.is_dense_vector)
+            try evaluation.logicalCell(cell)
+        else if (cell.is_json)
             try evaluation.parsedJsonCell(ordinal, bytes)
         else
             .{ .string = bytes },
-        // Geo predicates use shape-specific semantics. Keep their existing
-        // general evaluator until it has a native typed-cell implementation.
+        // Keep shape-specific predicates on the existing general evaluator.
         .geo_point => return null,
     };
     if (path.remaining.len == 0) {

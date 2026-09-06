@@ -1049,6 +1049,12 @@ pub const OrdinalRowView = struct {
         return try findParsedOrdinalCell(self.parsed, self.table_schema.relational_columns, ordinal);
     }
 
+    /// Shared logical interpretation for projection and predicate execution.
+    /// Composite values belong to the caller's arena, never to a scan cursor.
+    pub fn materializeCellAlloc(self: OrdinalRowView, alloc: Allocator, cell: Cell) !std.json.Value {
+        return try ownedJsonValueFromCellAlloc(alloc, self.table_schema.relational_columns[cell.ordinal], cell);
+    }
+
     pub fn semanticHash(self: OrdinalRowView) [semantic_hash_len]u8 {
         return self.parsed.semantic_hash;
     }
@@ -1871,17 +1877,23 @@ pub fn encodeDenseVectorValueAlloc(alloc: Allocator, value: std.json.Value) ![]u
     const bytes = try alloc.alloc(u8, byte_len);
     errdefer alloc.free(bytes);
     for (value.array.items, 0..) |item, index| {
-        const number: f64 = switch (item) {
-            .integer => |integer| @floatFromInt(integer),
-            .float => |float| float,
-            .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidBatchRequest,
-            else => return error.InvalidBatchRequest,
-        };
-        const narrowed: f32 = @floatCast(number);
-        if (!std.math.isFinite(number) or !std.math.isFinite(narrowed)) return error.InvalidBatchRequest;
+        const narrowed = try denseVectorElement(item);
         std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @bitCast(narrowed), .little);
     }
     return bytes;
+}
+
+/// Round the API number directly into the canonical vector domain. Going via
+/// f64 double-rounds decimal literals near an f32 midpoint.
+pub fn denseVectorElement(value: std.json.Value) !f32 {
+    const number: f32 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| @floatCast(float),
+        .number_string => |text| std.fmt.parseFloat(f32, text) catch return error.InvalidBatchRequest,
+        else => return error.InvalidBatchRequest,
+    };
+    if (!std.math.isFinite(number)) return error.InvalidBatchRequest;
+    return number;
 }
 
 pub fn decodeDenseVectorValueAlloc(alloc: Allocator, bytes: []const u8) ![]f32 {

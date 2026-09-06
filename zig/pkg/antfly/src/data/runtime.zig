@@ -3083,6 +3083,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.inference_scratch_working_set,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.relational_preparation_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{

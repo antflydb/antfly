@@ -106,6 +106,7 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    relational_preparation_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -139,6 +140,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .relational_preparation_working_set => "relational.preparation_working_set",
         };
     }
 };
@@ -364,6 +366,7 @@ pub const Options = struct {
             .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
     }
 
@@ -399,6 +402,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
         };
     }
 };

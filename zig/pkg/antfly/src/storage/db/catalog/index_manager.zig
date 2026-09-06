@@ -3465,9 +3465,10 @@ pub const IndexManager = struct {
             field: DenseFieldWritePlan,
             doc_key: []const u8,
             root: std.json.Value,
+            row: relational_row_codec.OrdinalRowView,
             extracted: *mapper.ExtractedWrite,
         ) !void {
-            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, field.field_name, field.dims)) orelse return;
+            const vector = (try mapper.extractDenseVectorFieldFromPrepared(alloc, row, root, field.field_name, field.dims)) orelse return;
             errdefer alloc.free(vector);
             const index_name = try alloc.dupe(u8, field.index_name);
             errdefer alloc.free(index_name);
@@ -3503,16 +3504,17 @@ pub const IndexManager = struct {
             sparse_vec.values = &.{};
         }
 
-        pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+        pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
             self: WritePlanSnapshot,
             alloc: Allocator,
             doc_key: []const u8,
             root: std.json.Value,
+            row: relational_row_codec.OrdinalRowView,
             extracted: *mapper.ExtractedWrite,
         ) !void {
             for (self.dense_fields) |field| {
                 if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
-                try appendDenseField(alloc, field, doc_key, root, extracted);
+                try appendDenseField(alloc, field, doc_key, root, row, extracted);
             }
             for (self.sparse_fields) |field| {
                 if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
@@ -9528,16 +9530,17 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+    pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
         self: *const IndexManager,
         alloc: Allocator,
         doc_key: []const u8,
         root: std.json.Value,
+        row: relational_row_codec.OrdinalRowView,
         extracted: *mapper.ExtractedWrite,
     ) !void {
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
-            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, entry.field_name, entry.dims)) orelse continue;
+            const vector = (try mapper.extractDenseVectorFieldFromPrepared(alloc, row, root, entry.field_name, entry.dims)) orelse continue;
             errdefer alloc.free(vector);
             const index_name = try alloc.dupe(u8, entry.config.name);
             errdefer alloc.free(index_name);

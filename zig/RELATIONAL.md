@@ -183,6 +183,19 @@ The scratch uses four bytes per schema column, with width at most twice the
 number of present cells. Genuinely
 sparse rows retain present-cell sorting without schema-width allocation.
 
+Retained row regions, worker scratch, and prepared mutation effects charge the
+shared `relational.preparation_working_set` resource slice before allocating.
+The limit applies across requests (and provisioned groups sharing a manager),
+not merely to each request's worker count. Admission denial releases the entire
+attempt and returns retryable `ResourceBudgetExceeded`; no preparer waits for
+memory while retaining a partial batch. Slice usage and limits are observable
+through the standard resource metrics.
+
+Field-backed dense indexes consume the prepared row's typed ordinal view.
+Decimal vector elements round directly to f32 once, so foreground indexing,
+row projection, semantic hashing, and index rebuilds use identical values.
+JSON-backed vectors retain the document extraction path.
+
 Every request pins one immutable `SchemaView`. JSON is parsed once into an owned
 `PreparedRelationalWrite`; one schema-guided preparation fills ordinal logical
 values for public-schema validation, special-field and index extraction, the
@@ -297,6 +310,11 @@ same compiled ordinal layout. TTL reads the physical write timestamp directly
 from the authenticated row header, and vector rebuilds decode only their target
 ordinal. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
 `JOINS.md`, `ALGEBRAIC.md`).
+
+Dense-vector membership and indexed element predicates run directly on binary
+f32 payloads without constructing a JSON array. Other composite predicates use
+the same logical-cell conversion as projection, cached once per referenced
+column for the row's evaluation.
 
 First-party cross-node scans use one response-streamed request per shard. The
 remote shard therefore holds one read transaction for the requested range and

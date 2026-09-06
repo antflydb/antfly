@@ -361,6 +361,12 @@ pub const PreparedRelationalWrite = struct {
         self.metadata_finalized = true;
     }
 
+    /// Trusted because this request just encoded the row. This view is valid
+    /// even before timestamp/checksum finalization and borrows the row region.
+    pub fn typedView(self: *const PreparedRelationalWrite, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout) !relational_row_codec.OrdinalRowView {
+        return try relational_row_codec.ordinalRowViewTrusted(self.packed_row, schema, layout);
+    }
+
     pub fn initInOwnedRegion(
         backing: Allocator,
         scratch: Allocator,
@@ -1182,6 +1188,26 @@ pub fn extractDenseVectorField(
     }
 }
 
+/// A physical vector is already converted and validated. Index consumers use
+/// those exact values; JSON columns retain the document extraction contract.
+pub fn extractDenseVectorFieldFromPrepared(
+    alloc: Allocator,
+    row: relational_row_codec.OrdinalRowView,
+    root: std.json.Value,
+    field_name: []const u8,
+    dims: u32,
+) !?[]f32 {
+    if (row.ordinalForName(field_name)) |ordinal| {
+        const cell = (try row.findCell(ordinal)) orelse return null;
+        if (cell.is_null) return null;
+        if (cell.is_dense_vector) {
+            if (cell.value.bytes_val.len / @sizeOf(f32) != dims) return error.InvalidVectorDimensions;
+            return try relational_row_codec.decodeDenseVectorValueAlloc(alloc, cell.value.bytes_val);
+        }
+    }
+    return try extractDenseVectorFieldFromParsed(alloc, root, field_name, dims);
+}
+
 pub fn extractDenseVectorFieldFromParsed(
     alloc: Allocator,
     root: std.json.Value,
@@ -1194,12 +1220,7 @@ pub fn extractDenseVectorFieldFromParsed(
     if (field.array.items.len != dims) return error.InvalidVectorDimensions;
     const values = try alloc.alloc(f32, dims);
     errdefer alloc.free(values);
-    for (field.array.items, 0..) |item, i| values[i] = switch (item) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| @floatCast(number),
-        .number_string => |number| try std.fmt.parseFloat(f32, number),
-        else => return error.InvalidVectorValue,
-    };
+    for (field.array.items, 0..) |item, i| values[i] = relational_row_codec.denseVectorElement(item) catch return error.InvalidVectorValue;
     return values;
 }
 
@@ -5811,6 +5832,31 @@ test "dense relational preparation gathers ordinal holes and preserves logical h
     var missing = try std.json.parseFromSlice(std.json.Value, alloc, "{\"alpha\":\"x\",\"last\":true}", .{});
     defer missing.deinit();
     try std.testing.expectError(error.InvalidBatchRequest, buildRelationalRowValueForSchemaFromParsedAlloc(alloc, missing.value, schema));
+}
+
+test "relational prepared vector consumers share directly rounded typed values" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var prepared = try PreparedRelationalWrite.init(alloc, "row", "{\"embedding\":[1.000000059604644775390626,-1.000000059604644775390626]}", null, schema, &layout);
+    defer prepared.deinit(alloc);
+    const row = try prepared.typedView(schema, &layout);
+    // Deliberately omit the JSON source: native vector consumers must read the
+    // canonical typed row, not accidentally fall back to numeric reparsing.
+    const vector = (try extractDenseVectorFieldFromPrepared(alloc, row, .null, "embedding", 2)).?;
+    defer alloc.free(vector);
+    try std.testing.expectEqual(@as(u32, 0x3f800001), @as(u32, @bitCast(vector[0])));
+    try std.testing.expectEqual(@as(u32, 0xbf800001), @as(u32, @bitCast(vector[1])));
+    const parsed_vector = (try extractDenseVectorFieldFromParsed(alloc, prepared.parsedValue(), "embedding", 2)).?;
+    defer alloc.free(parsed_vector);
+    try std.testing.expectEqualSlices(f32, vector, parsed_vector);
+    try std.testing.expectError(error.InvalidVectorDimensions, extractDenseVectorFieldFromPrepared(alloc, row, .null, "embedding", 3));
+    try prepared.finalizeMetadata(0);
+    try relational_row_codec.validateOrdinalWithLayout(prepared.packed_row, schema, &layout);
 }
 
 test "relational dense vectors bypass JSON storage and hash logical values" {

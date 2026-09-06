@@ -2560,10 +2560,15 @@ fn prepareRelationalRows(
                         ctx.fail(err);
                         return;
                     };
-                    pinned_write_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+                    pinned_write_plan.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
                         row_alloc,
                         ctx.writes[index].key,
                         prepared.parsedValue(),
+                        prepared.typedView(ctx.table_schema, ctx.physical_layout) catch |err| {
+                            prepared.deinit(owner_alloc);
+                            ctx.fail(err);
+                            return;
+                        },
                         &prepared.extracted,
                     ) catch |err| {
                         prepared.deinit(owner_alloc);
@@ -2628,8 +2633,8 @@ fn prepareRelationalRows(
     const desired_workers = @min(@as(usize, 8), @min(writes.len, size_workers));
     const parallel = io != null and desired_workers > 1 and input_bytes >= 512 * 1024;
     var ctx = Context{
-        .alloc = if (parallel) allocator_guard.allocator() else allocator_guard.child,
-        .scratch_child = if (parallel) allocator_guard.allocator() else allocator_guard.child,
+        .alloc = allocator_guard.allocator(),
+        .scratch_child = allocator_guard.allocator(),
         .writes = writes,
         .validator = validator,
         .table_schema = table_schema,
@@ -8399,6 +8404,37 @@ pub const DB = struct {
         opts: BatchExecutionOptions,
         generated_memo: *GeneratedEmbeddingMemo,
     ) anyerror!void {
+        // Actual arena pages, including retained rows and side effects, are
+        // charged across concurrent requests before allocation. Never wait for
+        // another preparer while retaining a partial batch: fail the admission
+        // cleanly, release every page, and let the caller retry with backoff.
+        var budget = if (self.core.index_manager.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
+        else
+            null;
+        defer if (budget) |*tracked| {
+            std.debug.assert(tracked.live_bytes == 0);
+            tracked.deinit();
+        };
+        var allocator_guard = PreparedRowAllocator{
+            .child = if (budget) |*tracked| tracked.allocator() else self.alloc,
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+        };
+        self.batchInternalPrepared(req, profile, opts, generated_memo, &allocator_guard) catch |err| {
+            if (err == error.OutOfMemory) if (budget) |*tracked|
+                if (tracked.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn batchInternalPrepared(
+        self: *DB,
+        req: types.BatchRequest,
+        profile: ?*BatchProfile,
+        opts: BatchExecutionOptions,
+        generated_memo: *GeneratedEmbeddingMemo,
+        prepared_row_allocator: *PreparedRowAllocator,
+    ) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
         var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
@@ -8501,14 +8537,11 @@ pub const DB = struct {
         // mutation is detected after admission by comparing pinned epochs.
         var request_schema_view = self.core.acquireSchemaView();
         defer if (request_schema_view) |*view| view.release();
-        var prepared_row_allocator = PreparedRowAllocator{
-            .child = self.alloc,
-            .io = self.backend_runtime.io() orelse std.Options.debug_io,
-        };
+        const preparation_alloc = prepared_row_allocator.allocator();
         // Row side effects outlive speculative preparation but are consumed as
         // borrowed slices by the serialized commit. A batch arena turns their
         // many small keys/payloads into bump allocations and one release.
-        var prepared_effects_arena = std.heap.ArenaAllocator.init(self.alloc);
+        var prepared_effects_arena = std.heap.ArenaAllocator.init(preparation_alloc);
         defer prepared_effects_arena.deinit();
         var preprepared_rows: ?[]?mapper.PreparedRelationalWrite = null;
         var preprepared_effects: ?[]PreparedRowEffects = null;
@@ -8519,10 +8552,10 @@ pub const DB = struct {
         defer if (write_plan_snapshot) |*plan_snapshot| plan_snapshot.release();
         defer if (preprepared_rows) |rows| {
             for (rows) |*maybe_row| if (maybe_row.*) |*row| row.deinit(self.alloc);
-            self.alloc.free(rows);
+            preparation_alloc.free(rows);
         };
         defer if (preprepared_effects) |effects| {
-            self.alloc.free(effects);
+            preparation_alloc.free(effects);
         };
         defer if (preprepared_generated) |*generated| generated.deinit(self.alloc);
         defer if (preprepared_generated_plan) |*plan| plan.deinit();
@@ -8550,17 +8583,17 @@ pub const DB = struct {
                 const requires_inline_generated =
                     (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
                     splitShadowRequiresMaterializedDerivedBatch(self);
-                const rows = try self.alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
+                const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                 @memset(rows, null);
                 preprepared_rows = rows;
-                const effects = try self.alloc.alloc(PreparedRowEffects, effective_req.writes.len);
+                const effects = try preparation_alloc.alloc(PreparedRowEffects, effective_req.writes.len);
                 for (effects) |*effect| effect.* = .{};
                 preprepared_effects = effects;
                 const prepare_start_ns = monotonicTimeNs();
                 write_plan_snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
                 prepared_write_plan_generation = write_plan_snapshot.?.generation();
                 try prepareRelationalRows(
-                    &prepared_row_allocator,
+                    prepared_row_allocator,
                     self.backend_runtime.io(),
                     self,
                     effective_req.writes,
@@ -9014,7 +9047,7 @@ pub const DB = struct {
             const index_field_embeddings_start_ns = monotonicTimeNs();
             if (!use_preprepared_rows) {
                 if (prepared_relational) |*prepared|
-                    try self.core.index_manager.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(self.alloc, write.key, prepared.parsedValue(), &extracted[i])
+                    try self.core.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(self.alloc, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
                 else
                     try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
             }
@@ -61085,6 +61118,34 @@ test "db default primary backend survives reopen" {
     }
 }
 
+test "relational preparation budget rejects contention before commit and releases on retry" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string, .required = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const hard_limit = manager.sliceStats(.relational_preparation_working_set).hard_limit_bytes;
+    var competing = try manager.reserve(.relational_preparation_working_set, hard_limit);
+    defer competing.release();
+    const request: types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{\"id\":\"ok\"}" }}, .sync_level = .write };
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.batch(request));
+    try std.testing.expectEqual(hard_limit, manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "row"));
+    competing.release();
+    try db.batch(request);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    const stored = (try db.get(alloc, "row")).?;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("{\"id\":\"ok\"}", stored);
+}
+
 test "prepared relational batch uses bounded parallel workers safely" {
     const alloc = std.testing.allocator;
     const columns = [_]schema_mod.RelationalColumn{
@@ -61110,11 +61171,18 @@ test "prepared relational batch uses bounded parallel workers safely" {
         alloc.free(@constCast(write.value));
     };
 
-    var rows: [writes.len]?mapper.PreparedRelationalWrite = @splat(null);
-    defer for (&rows) |*row| if (row.*) |*prepared| prepared.deinit(alloc);
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var budget = resource_manager_mod.BudgetedAllocator.init(&manager, .relational_preparation_working_set, alloc, 1);
+    defer {
+        std.testing.expectEqual(@as(u64, 0), budget.live_bytes) catch @panic("prepared row budget leak");
+        budget.deinit();
+    }
     var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
     defer io_impl.deinit();
-    var allocator_guard = PreparedRowAllocator{ .child = alloc, .io = io_impl.io() };
+    var allocator_guard = PreparedRowAllocator{ .child = budget.allocator(), .io = io_impl.io() };
+    var rows: [writes.len]?mapper.PreparedRelationalWrite = @splat(null);
+    defer for (&rows) |*row| if (row.*) |*prepared| prepared.deinit(alloc);
     var physical_layout = try relational_row_codec.PhysicalLayout.init(alloc, table_schema);
     defer physical_layout.deinit();
     try prepareRelationalRows(
