@@ -219,59 +219,33 @@ pub fn hashRelationalSparseCellsCanonical(
     return digest;
 }
 
-/// Hash sparse cells that remain in the physical encoder's required ordinal
-/// order. The immutable layout supplies the canonical logical-name order, so a
-/// prepared row does not have to reorder its comparatively large `Cell`
-/// records for hashing and then reorder them again for encoding.
-pub fn hashRelationalSparseOrdinalCellsCanonical(
+/// Dense preparation supplies its worker-local inverse ordinal map. Missing
+/// columns use maxInt(u32); no per-column search or extra Cell array is needed.
+pub fn hashRelationalIndexedCellsCanonical(
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
     hash_ordinals: []const u32,
+    positions: []const u32,
 ) !Digest {
-    if (hash_ordinals.len != table_schema.relational_columns.len)
-        return error.InvalidBatchRequest;
-
+    const width = table_schema.relational_columns.len;
+    if (hash_ordinals.len != width or positions.len != width) return error.InvalidBatchRequest;
     var count: usize = 0;
-    var previous_ordinal: ?u32 = null;
     for (cells) |cell| {
-        if (cell.ordinal >= table_schema.relational_columns.len or
-            (previous_ordinal != null and cell.ordinal <= previous_ordinal.?))
-            return error.InvalidBatchRequest;
-        previous_ordinal = cell.ordinal;
+        if (cell.ordinal >= width) return error.InvalidBatchRequest;
         if (!isIgnoredSystemField(table_schema.relational_columns[cell.ordinal].name)) count += 1;
     }
-
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update("o");
     hashInt(&hasher, u64, @intCast(count));
     for (hash_ordinals) |ordinal| {
-        if (ordinal >= table_schema.relational_columns.len) return error.InvalidBatchRequest;
-
-        // Fully dense rows map ordinal to cell index directly. Partially dense
-        // rows use binary lookup, preserving scratch proportional to row
-        // density instead of allocating a schema-width map for every batch row.
-        const cell_index = if (cells.len == table_schema.relational_columns.len) blk: {
-            if (cells[ordinal].ordinal != ordinal) return error.InvalidBatchRequest;
-            break :blk @as(usize, ordinal);
-        } else blk: {
-            var low: usize = 0;
-            var high: usize = cells.len;
-            while (low < high) {
-                const middle = low + (high - low) / 2;
-                if (cells[middle].ordinal < ordinal)
-                    low = middle + 1
-                else
-                    high = middle;
-            }
-            if (low >= cells.len or cells[low].ordinal != ordinal) continue;
-            break :blk low;
-        };
-
+        if (ordinal >= width) return error.InvalidBatchRequest;
+        const index = positions[ordinal];
+        if (index == std.math.maxInt(u32)) continue;
+        if (index >= cells.len or cells[index].ordinal != ordinal) return error.InvalidBatchRequest;
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        const cell = cells[cell_index];
-        try hashRelationalCellCanonical(&hasher, cell, column);
+        try hashRelationalCellCanonical(&hasher, cells[index], column);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);

@@ -3917,22 +3917,38 @@ fn buildRelationalRowValueFromParsedInternal(
         std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
         break :blk digest;
     } else blk: {
-        // Dense rows keep cells in encoder order after one sort. The immutable
-        // layout provides canonical hash order, avoiding two further Cell
-        // reorderings on every prepared write.
-        std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
-        var present_index: usize = 0;
-        for (physical_layout.required_ordinals) |required_ordinal| {
-            while (present_index < cells.items.len and cells.items[present_index].ordinal < required_ordinal)
-                present_index += 1;
-            if (present_index >= cells.items.len or cells.items[present_index].ordinal != required_ordinal)
-                return error.InvalidBatchRequest;
+        // Dense rows use worker-local ordinal scratch. Its width is at most
+        // twice the number of present cells, and the worker recycles it after
+        // each row. Neither sorting nor a binary lookup per hash ordinal is
+        // needed when even one optional column is absent.
+        const positions = try scratch.alloc(u32, columns.len);
+        defer scratch.free(positions);
+        @memset(positions, std.math.maxInt(u32));
+        for (cells.items, 0..) |cell, index| {
+            if (positions[cell.ordinal] != std.math.maxInt(u32)) return error.InvalidBatchRequest;
+            positions[cell.ordinal] = @intCast(index);
         }
-        break :blk try document_content_hash.hashRelationalSparseOrdinalCellsCanonical(
+        for (physical_layout.required_ordinals) |ordinal|
+            if (positions[ordinal] == std.math.maxInt(u32)) return error.InvalidBatchRequest;
+        // Gather in place, updating the inverse map after every swap. Scratch
+        // is four bytes per schema column rather than another full Cell array.
+        var target: usize = 0;
+        for (positions, 0..) |source, ordinal| {
+            if (source == std.math.maxInt(u32)) continue;
+            if (source != target) {
+                std.mem.swap(relational_row_codec.Cell, &cells.items[target], &cells.items[source]);
+                positions[cells.items[source].ordinal] = source;
+                positions[ordinal] = @intCast(target);
+            }
+            target += 1;
+        }
+        const digest = try document_content_hash.hashRelationalIndexedCellsCanonical(
             cells.items,
             table_schema,
             physical_layout.hash_ordinals,
+            positions,
         );
+        break :blk digest;
     };
     const bytes = try relational_row_codec.serializePreparedOrdinalDeferredHash(
         alloc,
@@ -5767,6 +5783,34 @@ test "sparse relational preparation preserves canonical hash order with one phys
         error.InvalidBatchRequest,
         buildRelationalRowValueForSchemaFromParsedAlloc(alloc, missing_required.value, table_schema),
     );
+}
+
+test "dense relational preparation gathers ordinal holes and preserves logical hashes" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "zeta", .path = "zeta", .column_type = .integer, .required = true },
+        .{ .name = "hole", .path = "hole", .column_type = .string },
+        .{ .name = "alpha", .path = "alpha", .column_type = .string, .allows_null = true },
+        .{ .name = "last", .path = "last", .column_type = .boolean },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 14, .storage_mode = .relational, .relational_columns = &columns };
+    const documents = [_][]const u8{
+        "{\"last\":true,\"alpha\":null,\"zeta\":7}",
+        "{\"alpha\":\"same\",\"zeta\":7}",
+        "{\"hole\":\"present\",\"last\":false,\"alpha\":\"same\",\"zeta\":7}",
+    };
+    for (documents) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        const encoded = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed.value, schema);
+        defer alloc.free(encoded);
+        const expected = try document_content_hash.hashRelationalParsedValue(alloc, parsed.value, schema);
+        try std.testing.expectEqualSlices(u8, &expected, &(try relational_row_codec.rowSemanticHash(encoded)));
+        try relational_row_codec.validateOrdinal(encoded, schema);
+    }
+    var missing = try std.json.parseFromSlice(std.json.Value, alloc, "{\"alpha\":\"x\",\"last\":true}", .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, buildRelationalRowValueForSchemaFromParsedAlloc(alloc, missing.value, schema));
 }
 
 test "relational dense vectors bypass JSON storage and hash logical values" {

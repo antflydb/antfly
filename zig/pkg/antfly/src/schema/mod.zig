@@ -144,6 +144,35 @@ test "compiled validator reuses wide nested property dispatch and deduplicates p
     };
 }
 
+test "compiled table validates a declared pattern exactly once" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"value":{"type":"string","pattern":"^[a-z]+$"}},"required":["value"],"additionalProperties":false}}}}
+    );
+    defer compiled.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"value\":\"abc\"}", .{});
+    defer parsed.deinit();
+    var once = std.testing.FailingAllocator.init(alloc, .{});
+    const pattern = compiled.execution.patterns.getPtr("^[a-z]+$").?;
+    try std.testing.expect(try pattern.matches(once.allocator(), "abc"));
+    var validation = std.testing.FailingAllocator.init(alloc, .{});
+    try compiled.validateValue(validation.allocator(), &parsed.value);
+    try std.testing.expectEqual(once.allocations, validation.allocations);
+    try std.testing.expectEqual(once.allocated_bytes, validation.allocated_bytes);
+}
+
+test "single declared-member validation preserves closed document root policies" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"doc","ttl_duration_ns":1,"ttl_field":"expires_at","document_schemas":{"doc":{"schema":{"type":"object","properties":{"value":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    defer compiled.deinit(alloc);
+    // TTL dispatch must not bypass the document root's closed-object check.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"value\":\"ok\",\"expires_at\":1}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, compiled.validateValue(alloc, &parsed.value));
+}
+
 test "compiled validator construction cleans up allocation failures without consuming borrowed schema" {
     const Check = struct {
         fn run(alloc: std.mem.Allocator, schema: ParsedTableSchema) !void {

@@ -113,10 +113,15 @@ prepares, replicated callers, and recovery resolution. API validation remains
 an early feedback optimization rather than the only integrity boundary.
 
 The validator's immutable execution plan includes hashed property dispatch for
-wide objects (including nested and composed schemas) and deduplicated parsed
-regex patterns. Small objects keep linear lookup to avoid hash-table overhead.
-Pattern evaluation uses request-local scratch; concurrent preparation and
-restore never mutate shared matcher state or reparse a pattern per field.
+wide objects (including nested and composed schemas) and deduplicated Thompson
+regex programs. Small objects keep linear lookup to avoid hash-table overhead.
+Pattern execution uses O(program size) request-local scratch and
+O(input length × program size) work, including unanchored substring searches.
+Compilation is limited to 4096 states, 16384 parse nodes/lowering steps, and 128 nesting levels;
+over-complex patterns are rejected as invalid schema patterns. Concurrent
+preparation and restore never mutate shared matcher state. Root constraints
+and root members are dispatched separately so ordinary declared fields are
+validated once; composition retains its branch-specific checks.
 
 The raw JSON Schema type `json` is accepted for a relational property. It is
 not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
@@ -171,6 +176,12 @@ First-cut physical mapping:
 | json          | `bytes_val` | indexed as a document subtree         |
 
 ### Write path
+
+Dense preparation gathers cells through recycled worker-local ordinal scratch,
+then hashes and emits them in linear time, including rows with optional holes.
+The scratch uses four bytes per schema column, with width at most twice the
+number of present cells. Genuinely
+sparse rows retain present-cell sorting without schema-width allocation.
 
 Every request pins one immutable `SchemaView`. JSON is parsed once into an owned
 `PreparedRelationalWrite`; one schema-guided preparation fills ordinal logical

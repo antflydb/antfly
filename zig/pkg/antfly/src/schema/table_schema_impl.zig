@@ -452,6 +452,11 @@ pub const CompiledValidationPlan = struct {
 const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
     compiled: ?*const CompiledValidationPlan = null,
+    /// The table boundary validates declared root members once. The recursive
+    /// root call defers their value checks but preserves unknown-member rules
+    /// (including document-mode TTL/dynamic-field compatibility). Nested and
+    /// composed calls still validate their own declared members normally.
+    defer_next_root_members: bool = false,
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
@@ -718,8 +723,12 @@ pub fn validateDocumentValueWithPlan(
     if (document_schema) |resolved_document_schema| {
         root_property = makeRootDocumentProperty(resolved_document_schema);
         validation_context.root_property = &root_property.?;
+        validation_context.defer_next_root_members = true;
         try validateDocumentFieldValueWithContext(&validation_context, root_property.?, value, false);
-        try collectComposedObjectFieldCoverage(&validation_context, root_property.?, root, schema.enforce_types, &root_composition_evaluated_fields, false);
+        // Direct properties, patterns and additionalProperties are dispatched
+        // below. Only composition can contribute otherwise-unrecognized keys.
+        if (hasComposedObjectCoverage(root_property.?))
+            try collectComposedObjectFieldCoverage(&validation_context, root_property.?, root, schema.enforce_types, &root_composition_evaluated_fields, false);
     }
     var it = root.iterator();
     while (it.next()) |entry| {
@@ -3612,6 +3621,8 @@ fn validateDocumentFieldValueWithContext(
     value: *const std.json.Value,
     enforce_types: bool,
 ) !void {
+    const defer_root_members = context.defer_next_root_members;
+    context.defer_next_root_members = false;
     const require_physical_encoding = context.require_physical_encoding;
     const physical_numeric_kind = context.physical_numeric_kind;
     if (require_physical_encoding) {
@@ -3811,11 +3822,13 @@ fn validateDocumentFieldValueWithContext(
         try validateDependentSchemas(context, object, property.dependent_schemas, composed_enforce_types);
         var composition_evaluated_fields = std.StringHashMapUnmanaged(void).empty;
         defer composition_evaluated_fields.deinit(context.alloc);
-        try collectComposedObjectFieldCoverage(context, property, object, enforce_types, &composition_evaluated_fields, false);
+        if (hasComposedObjectCoverage(property))
+            try collectComposedObjectFieldCoverage(context, property, object, enforce_types, &composition_evaluated_fields, false);
         var it = object.iterator();
         while (it.next()) |entry| {
             if (context.findProperty(property.properties, entry.key_ptr.*)) |child_property| {
-                try validateDocumentFieldValueWithContext(context, child_property, entry.value_ptr, enforce_types);
+                if (!defer_root_members)
+                    try validateDocumentFieldValueWithContext(context, child_property, entry.value_ptr, enforce_types);
                 continue;
             }
             if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
@@ -4358,6 +4371,11 @@ fn markDirectObjectFieldCoverage(
             try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
         }
     }
+}
+
+fn hasComposedObjectCoverage(property: DocumentProperty) bool {
+    return property.root_ref or property.all_of.len > 0 or property.any_of.len > 0 or
+        property.one_of.len > 0 or property.if_schema != null or property.dependent_schemas.len > 0;
 }
 
 fn collectComposedObjectFieldCoverage(
