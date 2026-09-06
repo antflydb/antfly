@@ -28,6 +28,7 @@ const ResidentTextEmbeddingRequest = @import("../backends/session.zig").Resident
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -6255,13 +6256,60 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 
 const arch_vtable = Session.VTable{
     .run = &archRun,
+    .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
+    .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .backend = &archBackend,
     .close = &archClose,
 };
+
+fn archRunResidentWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .classifier or self.task == .recognizer) return null;
+    const cfg = switch (self.arch_config) {
+        .bert => |cfg| cfg,
+        // Returning null forces the caller through runWithControl. Never
+        // advertise a controlled resident fast path by delegating to an
+        // implementation that cannot observe the request lifetime.
+        else => return null,
+    };
+    const bert_inputs = try parseBertRunInputs(inputs);
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
+    errdefer cb.deinit();
+    const hidden = try bert_arch.forwardCtWithControl(
+        cb,
+        allocator,
+        cfg,
+        bert_inputs.input_ids,
+        bert_inputs.attention_mask,
+        bert_inputs.token_type_ids,
+        bert_inputs.batch,
+        bert_inputs.seq_len,
+        control,
+    );
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    errdefer allocator.free(outputs);
+    outputs[0] = hidden;
+    return .{
+        .outputs = outputs,
+        .backend = cb,
+        .allocator = allocator,
+        .backend_owner = cb,
+        .deinit_backend_owner = &deinitResidentComputeBackend,
+    };
+}
 
 fn deinitResidentComputeBackend(owner: *anyopaque, allocator: std.mem.Allocator) void {
     const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
@@ -6862,6 +6910,40 @@ pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.Co
     return cb;
 }
 
+/// Direct compute paths bypass Session.runWithControl. This owner binds their
+/// cooperative checks and holds process protection from backend creation until
+/// backend cleanup completes, including on cancellation and constructor errors.
+pub const ManagedComputeBackend = struct {
+    backend: ops.ComputeBackend,
+    guard: @import("../execution_control.zig").UninterruptibleGuard,
+    owns_backend: bool = true,
+
+    pub fn deinit(self: *ManagedComputeBackend) void {
+        if (!self.owns_backend) return;
+        self.owns_backend = false;
+        defer self.guard.deinit();
+        self.backend.deinit();
+    }
+};
+
+pub fn getComputeBackendWithControl(
+    session: Session,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !ManagedComputeBackend {
+    if (control) |active| try active.check();
+    var guard = if (control) |active|
+        try active.enterUninterruptible(session.interruption())
+    else
+        @import("../execution_control.zig").UninterruptibleGuard{};
+    errdefer guard.deinit();
+    var cb = try getComputeBackend(session, allocator);
+    errdefer cb.deinit();
+    cb.execution_control = control;
+    if (control) |active| try active.check();
+    return .{ .backend = cb, .guard = guard };
+}
+
 pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: LoadedWeight) !void {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -6875,6 +6957,62 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
     }
 
     try self.backend_data.native.resident_weights.put(self.allocator, try self.allocator.dupe(u8, name), weight);
+}
+
+test "managed direct compute guards construction and cleanup" {
+    const Probe = struct {
+        armed: bool = false,
+        disarms: usize = 0,
+        closes: usize = 0,
+        fn backend(_: *anyopaque) BackendType {
+            return .metal;
+        }
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.armed);
+            self.armed = true;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.armed);
+            self.armed = false;
+            self.disarms += 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.armed);
+            self.closes += 1;
+        }
+    };
+    var probe = Probe{};
+    var vtable: Session.VTable = undefined;
+    vtable.backend = Probe.backend;
+    vtable.interruption = null;
+    const session = Session{ .ptr = &probe, .vtable = &vtable };
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Timeout, getComputeBackendWithControl(session, allocator, .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.ProcessIsolationRequired, getComputeBackendWithControl(session, allocator, .{}));
+    const control = InferenceExecutionControl{
+        .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm },
+    };
+    // A non-architecture session fails construction only after arming, then
+    // unwinds the guard without retaining the borrowed control.
+    try std.testing.expectError(error.NotArchSession, getComputeBackendWithControl(session, allocator, control));
+    try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+    try std.testing.expect(!probe.armed);
+
+    var compute_vtable: ops.ComputeBackend.VTable = undefined;
+    compute_vtable.deinitBackend = Probe.close;
+    var managed = ManagedComputeBackend{
+        .backend = .{ .ptr = &probe, .vtable = &compute_vtable },
+        .guard = try control.enterUninterruptible(.process_required),
+    };
+    managed.deinit();
+    managed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.closes);
+    try std.testing.expectEqual(@as(usize, 2), probe.disarms);
+    try std.testing.expect(!probe.armed);
 }
 
 pub fn getComputeBackendWithBudget(
@@ -7033,12 +7171,32 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, null);
+}
+
+fn archRunWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, control);
+}
+
+fn archRunImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) ![]Tensor {
+    if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
 
     // Create the appropriate ComputeBackend
     var cb = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
     if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
     defer cb.deinit();
 
@@ -7048,7 +7206,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const bert_inputs = try parseBertRunInputs(inputs);
             const batch = bert_inputs.batch;
             const seq_len = bert_inputs.seq_len;
-            const hidden = try bert_arch.forward(
+            const hidden = try bert_arch.forwardWithControl(
                 &cb,
                 allocator,
                 cfg,
@@ -7057,6 +7215,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 bert_inputs.token_type_ids,
                 batch,
                 seq_len,
+                control,
             );
             defer allocator.free(hidden);
 

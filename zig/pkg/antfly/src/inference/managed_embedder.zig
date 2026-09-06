@@ -15,7 +15,8 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
-const RequestContext = @import("request_context.zig").RequestContext;
+const request_context = @import("request_context.zig");
+const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -23,6 +24,7 @@ const hbs = @import("handlebars");
 const openai_api = @import("openai_api");
 const google_auth = @import("antfly_google").auth;
 const common_secrets = @import("../common/secrets.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
 const credential_safety = @import("../common/credential_safety.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -123,6 +125,13 @@ pub const AntflyProvider = struct {
         model: []const u8,
         texts: []const []const u8,
     ) anyerror![]db_embedder.SparseEmbedding,
+    embed_sparse_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        context: EmbeddingRequestContext,
+    ) anyerror![]db_embedder.SparseEmbedding = null,
     embed_dense_parts: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -158,11 +167,26 @@ pub const AntflyProvider = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) anyerror![]u8 = null,
+    generate_text_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        context: RequestContext,
+    ) anyerror![]u8 = null,
     generate_messages: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+    ) anyerror![]u8 = null,
+    generate_messages_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        context: RequestContext,
     ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,
@@ -177,17 +201,38 @@ pub const AntflyProvider = struct {
         model: []const u8,
         request: transcribing.Request,
     ) anyerror!transcribing.Response = null,
+    transcribe_audio_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: transcribing.Request,
+        context: RequestContext,
+    ) anyerror!transcribing.Response = null,
     read_images: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         request: readers.Request,
     ) anyerror![]readers.Result = null,
+    read_images_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.Request,
+        context: RequestContext,
+    ) anyerror![]readers.Result = null,
     extract: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         request: extracting.Request,
+    ) anyerror!extracting.Response = null,
+    extract_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: extracting.Request,
+        context: RequestContext,
     ) anyerror!extracting.Response = null,
     /// Returns the task-keyed /ai/v1/models JSON body for the embedded node.
     list_models_json: ?*const fn (
@@ -239,6 +284,7 @@ const BedrockCredentialPool = struct {
 /// embedders. API runtimes should own one of these for their full service
 /// lifetime so request-scoped embedders reuse credentials and refresh work.
 pub const ProviderRuntime = struct {
+    limits: *provider_limits.Registry = &provider_limits.process_registry,
     google_credentials: google_auth.CredentialManager,
     bedrock_credentials: BedrockCredentialPool,
 
@@ -266,6 +312,7 @@ pub const InitOptions = struct {
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    progress: ?request_context.ProgressSink = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -286,9 +333,8 @@ pub const QueryTemplateError = error{
     TransientPromptFailure,
 };
 
+const provider_limits = @import("../common/provider_limits.zig");
 const default_pacing_burst: u32 = 1;
-const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
-const pacing_cancellation_poll_ns: u64 = 5 * std.time.ns_per_ms;
 const max_embedding_request_timeout_ms: u64 = 30_000;
 const max_embedding_index_sources: usize = 64;
 const max_embedding_request_timeout_ns: u64 = max_embedding_request_timeout_ms * std.time.ns_per_ms;
@@ -307,196 +353,13 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-const RequestPacer = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    capacity: f64,
-    tokens: f64,
-    refill_per_ns: f64,
-    last_refill_ns: u64,
-    interval_ns: u64,
-    next_send_ns: u64,
-
-    fn init(requests_per_minute: u32, burst: u32) RequestPacer {
-        const effective_burst = @max(@as(u32, 1), burst);
-        const capacity = @as(f64, @floatFromInt(effective_burst));
-        const interval_ns = @max(
-            @as(u64, 1),
-            (@as(u64, 60) * std.time.ns_per_s + @as(u64, requests_per_minute) - 1) / @as(u64, requests_per_minute),
-        );
-        return .{
-            .capacity = capacity,
-            .tokens = capacity,
-            .refill_per_ns = @as(f64, @floatFromInt(requests_per_minute)) / (@as(f64, 60.0) * @as(f64, @floatFromInt(std.time.ns_per_s))),
-            .last_refill_ns = monotonicNowNs(),
-            .interval_ns = interval_ns,
-            .next_send_ns = 0,
-        };
-    }
-
-    fn acquire(
-        self: *RequestPacer,
-        io: std.Io,
-        deadline_ns: ?u64,
-        cancellation: ?CancellationToken,
-    ) !void {
-        if (self.capacity <= 1.0) {
-            while (true) {
-                if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-                lockAtomic(&self.mutex);
-                const now_ns = monotonicNowNs();
-                if (now_ns >= self.next_send_ns) {
-                    self.next_send_ns = now_ns +| self.interval_ns +| pacing_safety_margin_ns;
-                    self.mutex.unlock();
-                    return;
-                }
-                const wait_ns = self.next_send_ns - now_ns;
-                if (deadline_ns) |deadline| {
-                    if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
-                        self.mutex.unlock();
-                        return error.Timeout;
-                    }
-                }
-                self.mutex.unlock();
-                try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
-            }
-        }
-
-        while (true) {
-            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-            lockAtomic(&self.mutex);
-            const now_ns = monotonicNowNs();
-            const elapsed_ns = now_ns - self.last_refill_ns;
-            if (elapsed_ns > 0) {
-                const replenished = self.tokens + @as(f64, @floatFromInt(elapsed_ns)) * self.refill_per_ns;
-                self.tokens = @min(self.capacity, replenished);
-                self.last_refill_ns = now_ns;
-            }
-            if (self.tokens >= 1.0) {
-                self.tokens -= 1.0;
-                self.mutex.unlock();
-                return;
-            }
-            const deficit = 1.0 - self.tokens;
-            const wait_ns = @max(@as(u64, 1), @as(u64, @intFromFloat(@ceil(deficit / self.refill_per_ns)))) + pacing_safety_margin_ns;
-            self.mutex.unlock();
-            if (deadline_ns) |deadline| {
-                if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
-            }
-            try io.sleep(.fromNanoseconds(@intCast(@min(wait_ns, pacing_cancellation_poll_ns))), .awake);
-        }
-    }
-};
-
-const shared_request_pacer_alloc = std.heap.page_allocator;
-const shared_request_pacer_idle_ttl_ns: u64 = 5 * 60 * std.time.ns_per_s;
-const shared_request_pacer_max_idle_entries: usize = 64;
-
-const SharedRequestPacerEntry = struct {
-    key: []u8,
-    pacer: RequestPacer,
-    ref_count: usize,
-    last_release_ns: u64 = 0,
-};
-
-var shared_request_pacer_mutex: std.atomic.Mutex = .unlocked;
-var shared_request_pacers: std.ArrayListUnmanaged(*SharedRequestPacerEntry) = .empty;
-
-fn destroySharedRequestPacerEntry(entry: *SharedRequestPacerEntry) void {
-    shared_request_pacer_alloc.free(entry.key);
-    shared_request_pacer_alloc.destroy(entry);
-}
-
-fn pruneSharedRequestPacersLocked(now_ns: u64) void {
-    var idle_count: usize = 0;
-    var oldest_idle_index: ?usize = null;
-    var oldest_idle_ns: u64 = std.math.maxInt(u64);
-
-    var i: usize = 0;
-    while (i < shared_request_pacers.items.len) {
-        const entry = shared_request_pacers.items[i];
-        if (entry.ref_count != 0) {
-            i += 1;
-            continue;
-        }
-        if (entry.last_release_ns != 0 and now_ns -| entry.last_release_ns >= shared_request_pacer_idle_ttl_ns) {
-            destroySharedRequestPacerEntry(entry);
-            _ = shared_request_pacers.swapRemove(i);
-            continue;
-        }
-        idle_count += 1;
-        if (entry.last_release_ns < oldest_idle_ns) {
-            oldest_idle_ns = entry.last_release_ns;
-            oldest_idle_index = i;
-        }
-        i += 1;
-    }
-
-    while (idle_count > shared_request_pacer_max_idle_entries) {
-        const remove_index = oldest_idle_index orelse return;
-        destroySharedRequestPacerEntry(shared_request_pacers.items[remove_index]);
-        _ = shared_request_pacers.swapRemove(remove_index);
-        idle_count -= 1;
-
-        oldest_idle_index = null;
-        oldest_idle_ns = std.math.maxInt(u64);
-        for (shared_request_pacers.items, 0..) |entry, j| {
-            if (entry.ref_count != 0) continue;
-            if (entry.last_release_ns < oldest_idle_ns) {
-                oldest_idle_ns = entry.last_release_ns;
-                oldest_idle_index = j;
-            }
-        }
-    }
-}
-
-fn acquireSharedRequestPacer(scope_key: []const u8, requests_per_minute: u32, burst: u32) !*RequestPacer {
-    lockAtomic(&shared_request_pacer_mutex);
-    defer shared_request_pacer_mutex.unlock();
-
-    pruneSharedRequestPacersLocked(monotonicNowNs());
-    for (shared_request_pacers.items) |entry| {
-        if (!std.mem.eql(u8, entry.key, scope_key)) continue;
-        entry.ref_count += 1;
-        entry.last_release_ns = 0;
-        return &entry.pacer;
-    }
-
-    const entry = try shared_request_pacer_alloc.create(SharedRequestPacerEntry);
-    errdefer shared_request_pacer_alloc.destroy(entry);
-    entry.* = .{
-        .key = try shared_request_pacer_alloc.dupe(u8, scope_key),
-        .pacer = RequestPacer.init(requests_per_minute, burst),
-        .ref_count = 1,
-        .last_release_ns = 0,
-    };
-    errdefer shared_request_pacer_alloc.free(entry.key);
-    try shared_request_pacers.append(shared_request_pacer_alloc, entry);
-    return &entry.pacer;
-}
-
-fn releaseSharedRequestPacer(scope_key: []const u8) void {
-    lockAtomic(&shared_request_pacer_mutex);
-    defer shared_request_pacer_mutex.unlock();
-
-    for (shared_request_pacers.items) |entry| {
-        if (!std.mem.eql(u8, entry.key, scope_key)) continue;
-        if (entry.ref_count > 1) {
-            entry.ref_count -= 1;
-            return;
-        }
-        entry.ref_count = 0;
-        entry.last_release_ns = monotonicNowNs();
-        pruneSharedRequestPacersLocked(entry.last_release_ns);
-        return;
-    }
-}
-
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    progress: ?request_context.ProgressSink = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     embedding_names: [][]u8 = &.{},
@@ -534,11 +397,13 @@ pub const ManagedEmbeddingEntry = struct {
     multimodal: bool = false,
     requests_per_minute: u32 = 0,
     burst: u32 = default_pacing_burst,
-    pacer: ?*RequestPacer = null,
+    rate_limit: provider_limits.Policy = .{},
+    quota: ?provider_limits.Handle = null,
     antfly_provider: ?AntflyProvider = null,
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
+        if (self.quota) |*quota| quota.release();
         alloc.free(self.index_name);
         if (self.embedding_name.len > 0) alloc.free(self.embedding_name);
         for (self.embedding_names) |name| alloc.free(name);
@@ -567,82 +432,56 @@ pub const ManagedEmbeddingEntry = struct {
     }
 };
 
-const RequestPacerScopeEntry = struct {
-    key: []u8,
-    pacer: *RequestPacer,
-};
-
-fn attachRequestPacers(
-    alloc: std.mem.Allocator,
-    entries: []ManagedEmbeddingEntry,
-    pacer_scope_keys: *std.ArrayListUnmanaged([]u8),
-) !void {
-    var scopes = std.ArrayListUnmanaged(RequestPacerScopeEntry).empty;
-    defer {
-        scopes.deinit(alloc);
+fn attachProviderQuota(entry: *ManagedEmbeddingEntry, options: InitOptions) !void {
+    if (entry.antfly_provider != null) {
+        if (entry.rate_limit.enabled()) return error.UnsupportedLocalRateLimit;
+        return;
     }
-
-    for (entries) |*entry| {
-        if (entry.requests_per_minute == 0) continue;
-        const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
-        defer alloc.free(scope_key);
-
-        for (scopes.items) |scope| {
-            if (!std.mem.eql(u8, scope.key, scope_key)) continue;
-            entry.pacer = scope.pacer;
-            break;
-        }
-        if (entry.pacer != null) continue;
-
-        const pacer = try acquireSharedRequestPacer(scope_key, entry.requests_per_minute, entry.burst);
-        errdefer releaseSharedRequestPacer(scope_key);
-        const owned_key = try alloc.dupe(u8, scope_key);
-        errdefer alloc.free(owned_key);
-        try pacer_scope_keys.append(alloc, owned_key);
-        try scopes.append(alloc, .{
-            .key = owned_key,
-            .pacer = pacer,
-        });
-        entry.pacer = pacer;
-    }
+    const registry = if (options.provider_runtime) |runtime| runtime.limits else &provider_limits.process_registry;
+    entry.quota = try registry.acquire(.{ .endpoint = managedEmbeddingEndpointIdentity(entry), .operation = .embedding }, entry.rate_limit);
 }
 
-fn attachRequestPacerToEntry(
-    alloc: std.mem.Allocator,
-    entry: *ManagedEmbeddingEntry,
-) !?[]u8 {
-    if (entry.requests_per_minute == 0) return null;
-    const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
-    errdefer alloc.free(scope_key);
-    const pacer = try acquireSharedRequestPacer(scope_key, entry.requests_per_minute, entry.burst);
-    errdefer releaseSharedRequestPacer(scope_key);
-    entry.pacer = pacer;
-    return scope_key;
+fn managedEmbeddingEndpointIdentity(entry: *const ManagedEmbeddingEntry) provider_limits.EndpointIdentity {
+    return .{
+        .provider = std.meta.stringToEnum(provider_limits.Provider, @tagName(entry.provider)).?,
+        .endpoint = entry.base_url,
+        .model = entry.model,
+        .region = entry.region,
+        .project = entry.project_id,
+        .location = entry.location,
+        .credentials = managedEmbeddingCredentialSourceIdentity(entry),
+    };
 }
 
-fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) void {
-    const scope_key = maybe_scope_key orelse return;
-    releaseSharedRequestPacer(scope_key);
-    alloc.free(scope_key);
-}
-
-fn managedEmbeddingApiKeyIdentityHash(entry: *const ManagedEmbeddingEntry) u64 {
-    if (entry.api_key) |api_key| return api_key.identityHash();
-    return 0;
+fn managedEmbeddingCredentialSourceIdentity(
+    entry: *const ManagedEmbeddingEntry,
+) credential_source_identity.CredentialSourceIdentity {
+    const Identity = credential_source_identity.CredentialSourceIdentity;
+    return switch (entry.provider) {
+        .openai, .cohere, .gemini, .antfly => credential_source_identity.fromSecretValue(entry.api_key),
+        .vertex => Identity.googleAdc(if (entry.credentials_path.len > 0) entry.credentials_path else null),
+        // Managed Bedrock currently exposes the process-wide AWS default
+        // chain. Profile and web-identity constructors live in the shared
+        // identity type so future per-index sources cannot bypass these
+        // execution/cache boundaries.
+        .bedrock => Identity.awsDefaultChain(),
+        .ollama => Identity.none(),
+    };
 }
 
 fn managedEmbeddingEntriesEquivalentForLookup(
     lhs: *const ManagedEmbeddingEntry,
     rhs: *const ManagedEmbeddingEntry,
 ) bool {
-    return lhs.provider == rhs.provider and
+    return managedEmbeddingEndpointIdentity(lhs).eql(managedEmbeddingEndpointIdentity(rhs)) and
         lhs.dimensions == rhs.dimensions and
         lhs.sparse == rhs.sparse and
         lhs.multimodal == rhs.multimodal and
+        std.meta.eql(lhs.rate_limit, rhs.rate_limit) and
         lhs.requests_per_minute == rhs.requests_per_minute and
         lhs.burst == rhs.burst and
         (lhs.antfly_provider != null) == (rhs.antfly_provider != null) and
-        managedEmbeddingApiKeyIdentityHash(lhs) == managedEmbeddingApiKeyIdentityHash(rhs) and
+        managedEmbeddingCredentialSourceIdentity(lhs).eql(managedEmbeddingCredentialSourceIdentity(rhs)) and
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
@@ -808,17 +647,71 @@ fn validateManagedEmbeddingLookupNames(
 }
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
-    const api_key_hash = if (entry.api_key) |*api_key| api_key.identityHash() else 0;
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}\x1f{d}\x1f{d}\x1f{d}", .{
-        @tagName(entry.provider),
-        entry.base_url,
-        entry.model,
-        entry.project_id,
-        api_key_hash,
-        @intFromBool(entry.sparse),
-        entry.requests_per_minute,
-        entry.burst,
-    });
+    const key = (provider_limits.QuotaIdentity{ .endpoint = managedEmbeddingEndpointIdentity(entry), .operation = .embedding }).digest();
+    return alloc.dupe(u8, &key);
+}
+
+pub fn testManagedEmbeddingCredentialSourceIdentities() !void {
+    const alloc = std.testing.allocator;
+    const base = ManagedEmbeddingEntry{
+        .alloc = alloc,
+        .index_name = @constCast("dense"),
+        .provider = .vertex,
+        .model = @constCast("gemini-embedding-001"),
+        .base_url = @constCast("https://us-central1-aiplatform.googleapis.com/v1"),
+        .project_id = @constCast("project-a"),
+        .location = @constCast("us-central1"),
+        .dimensions = 3072,
+    };
+
+    var vertex_default = base;
+    var vertex_file_a = base;
+    vertex_file_a.credentials_path = @constCast("credentials-a.json");
+    var vertex_file_b = base;
+    vertex_file_b.credentials_path = @constCast("credentials-b.json");
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&vertex_default, &vertex_file_a));
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&vertex_file_a, &vertex_file_b));
+
+    var cohere_a = base;
+    cohere_a.provider = .cohere;
+    cohere_a.api_key = .{ .secret_ref = @constCast("cohere-a") };
+    var cohere_b = cohere_a;
+    cohere_b.api_key = .{ .secret_ref = @constCast("cohere-b") };
+    try std.testing.expect(!managedEmbeddingEntriesEquivalentForLookup(&cohere_a, &cohere_b));
+
+    var bedrock_a = base;
+    bedrock_a.provider = .bedrock;
+    bedrock_a.region = @constCast("us-east-1");
+    var bedrock_b = bedrock_a;
+    try std.testing.expect(managedEmbeddingEntriesEquivalentForLookup(&bedrock_a, &bedrock_b));
+    try std.testing.expectEqual(
+        credential_source_identity.CredentialSourceIdentity.Kind.aws_default_chain,
+        managedEmbeddingCredentialSourceIdentity(&bedrock_a).kind,
+    );
+
+    const default_scope = try requestPacerScopeKeyAlloc(alloc, &vertex_default);
+    defer alloc.free(default_scope);
+    const file_scope = try requestPacerScopeKeyAlloc(alloc, &vertex_file_a);
+    defer alloc.free(file_scope);
+    try std.testing.expect(!std.mem.eql(u8, default_scope, file_scope));
+
+    // These two scopes collided under delimiter-based concatenation because
+    // the separator could be moved between adjacent user-controlled fields.
+    var framed_a = base;
+    framed_a.model = @constCast("alpha\x1fbeta");
+    framed_a.project_id = @constCast("gamma");
+    var framed_b = base;
+    framed_b.model = @constCast("alpha");
+    framed_b.project_id = @constCast("beta\x1fgamma");
+    const framed_scope_a = try requestPacerScopeKeyAlloc(alloc, &framed_a);
+    defer alloc.free(framed_scope_a);
+    const framed_scope_b = try requestPacerScopeKeyAlloc(alloc, &framed_b);
+    defer alloc.free(framed_scope_b);
+    try std.testing.expect(!std.mem.eql(u8, framed_scope_a, framed_scope_b));
+}
+
+test "managed embedding execution identities include every credential source" {
+    try testManagedEmbeddingCredentialSourceIdentities();
 }
 
 fn attachManagedGoogleCredentialManager(
@@ -879,7 +772,6 @@ fn attachManagedBedrockCredentialCaches(
 pub const ManagedEmbedder = struct {
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
-    pacer_scope_keys: [][]u8 = &.{},
     owned_google_credentials: ?*google_auth.CredentialManager = null,
 
     pub fn initFromIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !ManagedEmbedder {
@@ -930,15 +822,7 @@ pub const ManagedEmbedder = struct {
         try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
         try validateManagedEmbeddingLookupNames(alloc, entries.items, &vector_spaces);
 
-        var pacer_scope_keys = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (pacer_scope_keys.items) |scope_key| {
-                releaseSharedRequestPacer(scope_key);
-                alloc.free(scope_key);
-            }
-            pacer_scope_keys.deinit(alloc);
-        }
-        try attachRequestPacers(alloc, entries.items, &pacer_scope_keys);
+        for (entries.items) |*entry| try attachProviderQuota(entry, options);
 
         const owned_google_credentials = try attachManagedGoogleCredentialManager(
             alloc,
@@ -959,7 +843,6 @@ pub const ManagedEmbedder = struct {
         return .{
             .alloc = alloc,
             .entries = try entries.toOwnedSlice(alloc),
-            .pacer_scope_keys = try pacer_scope_keys.toOwnedSlice(alloc),
             .owned_google_credentials = owned_google_credentials,
         };
     }
@@ -967,11 +850,6 @@ pub const ManagedEmbedder = struct {
     pub fn deinit(self: *ManagedEmbedder) void {
         for (self.entries) |*entry| entry.deinit(self.alloc);
         self.alloc.free(self.entries);
-        for (self.pacer_scope_keys) |scope_key| {
-            releaseSharedRequestPacer(scope_key);
-            self.alloc.free(scope_key);
-        }
-        if (self.pacer_scope_keys.len > 0) self.alloc.free(self.pacer_scope_keys);
         if (self.owned_google_credentials) |manager| {
             manager.deinit();
             self.alloc.destroy(manager);
@@ -1003,9 +881,14 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
+            .dense_embed_with_context_fn = embedDenseWithContext,
+            .dense_embed_batch_with_context_fn = embedDenseBatchWithContext,
+            .dense_embed_parts_with_context_fn = embedDensePartsWithContext,
             .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
+            .set_progress_fn = setEmbedderProgress,
+            .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.denseForegroundBounded(),
         };
     }
@@ -1015,8 +898,12 @@ pub const ManagedEmbedder = struct {
             .ptr = self,
             .sparse_embed_fn = embedSparse,
             .sparse_embed_batch_fn = embedSparseBatch,
+            .sparse_embed_with_context_fn = embedSparseWithContext,
+            .sparse_embed_batch_with_context_fn = embedSparseBatchWithContext,
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
+            .set_progress_fn = setEmbedderProgress,
+            .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
     }
@@ -1131,21 +1018,10 @@ pub const ManagedEmbedder = struct {
         }
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hashQueryCacheField(&hasher, "antfly-query-embedding-v2");
+        hashQueryCacheField(&hasher, "antfly-query-embedding-v3");
         hashQueryCacheField(&hasher, @tagName(security_domain));
         hashQueryCacheField(&hasher, security_scope);
-        hashQueryCacheField(&hasher, @tagName(entry.provider));
-        hashQueryCacheField(&hasher, entry.base_url);
-        hashQueryCacheField(&hasher, entry.model);
-        hashQueryCacheField(&hasher, entry.region);
-        hashQueryCacheField(&hasher, entry.project_id);
-        hashQueryCacheField(&hasher, entry.location);
-        // Keep cache authorization boundaries aligned with CredentialManager.
-        // The explicit tag prevents a valid file path from aliasing default
-        // ADC. Token refreshes retain the same vector identity, while distinct
-        // credential sources must never coalesce.
-        hashQueryCacheU64(&hasher, @intFromBool(entry.credentials_path.len > 0));
-        hashQueryCacheField(&hasher, entry.credentials_path);
+        managedEmbeddingEndpointIdentity(entry).updateHash(&hasher);
         hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
@@ -1154,7 +1030,6 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_query.canonical());
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
-        hashQueryCacheSecretIdentity(&hasher, entry.api_key);
         hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
@@ -1246,11 +1121,34 @@ pub const ManagedEmbedder = struct {
         return self.findQueryEntry(name) orelse self.findArtifactEntry(name);
     }
 
+    fn recoveryIdentity(ptr: *anyopaque, embedding_name: []const u8) ?db_embedder.RecoveryIdentity {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(embedding_name) orelse return null;
+        return .{ .model = entry.model, .backend = @tagName(entry.provider) };
+    }
+
     fn embedDense(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         return try embedWithEntry(alloc, entry, text, dims);
+    }
+
+    fn embedDenseWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedWithEntry(alloc, &entry, text, dims);
     }
 
     fn embedDenseBatch(
@@ -1266,6 +1164,23 @@ pub const ManagedEmbedder = struct {
         return try embedBatchWithEntry(alloc, entry, texts, dims);
     }
 
+    fn embedDenseBatchWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedBatchWithEntry(alloc, &entry, texts, dims);
+    }
+
     fn embedDenseParts(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1279,6 +1194,23 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryParts(alloc, entry, parts, dims);
     }
 
+    fn embedDensePartsWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        parts: []const template_mod.ContentPart,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedWithEntryParts(alloc, &entry, parts, dims);
+    }
+
     fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return null;
@@ -1288,6 +1220,11 @@ pub const ManagedEmbedder = struct {
     fn setEmbedderCancellation(ptr: *anyopaque, cancellation: CancellationToken) void {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         for (self.entries) |*entry| entry.cancellation = cancellation;
+    }
+
+    fn setEmbedderProgress(ptr: *anyopaque, progress: request_context.ProgressSink) void {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        for (self.entries) |*entry| entry.progress = progress;
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -1305,6 +1242,22 @@ pub const ManagedEmbedder = struct {
         return try embedSparseWithEntry(alloc, entry, text);
     }
 
+    fn embedSparseWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        context: RequestContext,
+    ) !db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedSparseWithEntry(alloc, &entry, text);
+    }
+
     fn embedSparseBatch(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1317,6 +1270,22 @@ pub const ManagedEmbedder = struct {
         return try embedSparseBatchWithEntry(alloc, entry, texts);
     }
 
+    fn embedSparseBatchWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        context: RequestContext,
+    ) ![]db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        var entry = configured.*;
+        applyRequestContext(&entry, context, &cancellation);
+        return try embedSparseBatchWithEntry(alloc, &entry, texts);
+    }
+
     fn deinitSparseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         _ = alloc;
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
@@ -1325,6 +1294,44 @@ pub const ManagedEmbedder = struct {
         owner_alloc.destroy(self);
     }
 };
+
+/// A request-scoped entry preserves the runtime shutdown token while adding
+/// the caller's independent cancellation source. The adapter is stack-owned
+/// for exactly the synchronous provider invocation that borrows it.
+const CombinedCancellation = struct {
+    configured: ?CancellationToken,
+    request: ?CancellationToken,
+
+    fn init(configured: ?CancellationToken, request: ?CancellationToken) @This() {
+        return .{ .configured = configured, .request = request };
+    }
+
+    fn isCancelled(raw: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.configured) |source| if (source.isCancelled()) return true;
+        if (self.request) |source| if (source.isCancelled()) return true;
+        return false;
+    }
+
+    fn token(self: *const @This()) ?CancellationToken {
+        if (self.configured == null and self.request == null) return null;
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+};
+
+fn applyRequestContext(
+    entry: *ManagedEmbeddingEntry,
+    context: RequestContext,
+    cancellation: *const CombinedCancellation,
+) void {
+    entry.io = context.io;
+    entry.deadline_ns = if (entry.deadline_ns) |configured|
+        if (context.deadline_ns) |request| @min(configured, request) else configured
+    else
+        context.deadline_ns;
+    entry.cancellation = cancellation.token();
+    if (context.progress) |progress| entry.progress = progress;
+}
 
 pub const QueryCacheSecurityDomain = enum {
     anonymous,
@@ -1342,32 +1349,10 @@ fn hashQueryCacheU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void 
     hasher.update(std.mem.asBytes(&encoded));
 }
 
-fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secret: ?common_secrets.SecretValue) void {
-    const secret = maybe_secret orelse {
-        hashQueryCacheField(hasher, "none");
-        return;
-    };
-    switch (secret) {
-        .literal => |value| {
-            hashQueryCacheField(hasher, "literal");
-            hashQueryCacheField(hasher, value);
-        },
-        .secret_ref => |value| {
-            hashQueryCacheField(hasher, "secret_ref");
-            hashQueryCacheField(hasher, value);
-        },
-        .env_var => |value| {
-            hashQueryCacheField(hasher, "env_var");
-            hashQueryCacheField(hasher, value);
-        },
-    }
-}
-
-fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
+fn checkEntryDispatchDeadline(entry: *const ManagedEmbeddingEntry) !void {
     try ensureEntryDeadline(entry);
-    const pacer = entry.pacer orelse return;
-    try pacer.acquire(embeddingIo(entry), embeddingOperationDeadline(entry), entry.cancellation);
-    try ensureEntryDeadline(entry);
+    // Remote attempts acquire at the transport boundary; local execution has
+    // no HTTP quota. Keep this checkpoint for the existing cancellation contract.
 }
 
 fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
@@ -1380,6 +1365,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
             .io = embeddingIo(entry),
             .deadline_ns = embeddingOperationDeadline(entry),
             .cancellation = entry.cancellation,
+            .progress = entry.progress,
         },
         .task_type = task_type,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
@@ -1396,10 +1382,17 @@ fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
 
+fn embeddingAttemptObserver(entry: *const ManagedEmbeddingEntry) ?httpx.AttemptObserver {
+    return if (entry.quota) |quota| quota.limiter().observer(0) else null;
+}
+
 fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientConfig {
     var config = httpx.ClientConfig{
         .keep_alive = false,
         .max_response_size = 4 << 20,
+        // Bedrock's client also resolves credentials. Model admission belongs
+        // only on InvokeModel, never on STS/ECS/IMDS traffic.
+        .attempt_observer = if (entry.provider == .bedrock) null else embeddingAttemptObserver(entry),
     };
     const timeout_ms = try embeddingRemainingTimeoutMs(entry);
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
@@ -1433,7 +1426,7 @@ fn embeddingRemainingTimeoutMs(entry: *const ManagedEmbeddingEntry) !u64 {
 fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) bool {
     if (isAntflyProvider(entry.provider)) {
         if (entry.antfly_provider) |local| {
-            if (sparse) return false;
+            if (sparse) return local.embed_sparse_texts_with_context != null;
             if (local.embed_dense_texts_with_context == null) return false;
             if (entry.multimodal and local.embed_dense_parts_with_context == null)
                 return false;
@@ -1446,29 +1439,90 @@ fn entryForegroundBounded(entry: *const ManagedEmbeddingEntry, sparse: bool) boo
     return entry.bounded_http_request;
 }
 
-pub fn testEmbeddingProviderDeadlines() !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var pacer = RequestPacer.init(60, 1);
-    try pacer.acquire(io, null, null);
-    try std.testing.expect(pacer.mutex.tryLock());
-    pacer.mutex.unlock();
-    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms, null));
+pub fn testLocalForegroundEmbeddingAdmissionCapabilities() !void {
+    const Stub = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
 
-    const CancelAfterFirstPacingSlice = struct {
-        checks: usize = 0,
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
 
-        fn cancelled(raw: *const anyopaque) bool {
-            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
-            self.checks += 1;
-            return self.checks >= 2;
+        fn sparseWithContext(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: EmbeddingRequestContext,
+        ) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
         }
     };
-    var cancelled = CancelAfterFirstPacingSlice{};
-    try std.testing.expectError(
-        error.Cancelled,
-        pacer.acquire(io, null, .{ .ptr = &cancelled, .is_cancelled_fn = CancelAfterFirstPacingSlice.cancelled }),
-    );
-    try std.testing.expectEqual(@as(usize, 2), cancelled.checks);
+
+    var provider_context: u8 = 0;
+    var entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .index_name = @constCast("sparse_idx"),
+        .provider = .antfly,
+        .model = @constCast("bge-m3"),
+        .base_url = @constCast(""),
+        .dimensions = 1,
+        .sparse = true,
+        .antfly_provider = .{
+            .ptr = &provider_context,
+            .embed_dense_texts = Stub.dense,
+            .embed_sparse_texts = Stub.sparse,
+        },
+    };
+    try std.testing.expect(!entryForegroundBounded(&entry, true));
+
+    entry.antfly_provider = .{
+        .ptr = &provider_context,
+        .embed_dense_texts = Stub.dense,
+        .embed_sparse_texts = Stub.sparse,
+        .embed_sparse_texts_with_context = Stub.sparseWithContext,
+    };
+    try std.testing.expect(entryForegroundBounded(&entry, true));
+}
+
+pub fn testManagedEmbeddingRequestContextProgress() !void {
+    const Capture = struct {
+        last: ?request_context.Progress = null,
+
+        fn update(raw: ?*anyopaque, progress: request_context.Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.last = progress;
+        }
+    };
+
+    var capture = Capture{};
+    const entry = ManagedEmbeddingEntry{
+        .alloc = std.testing.allocator,
+        .deadline_ns = std.math.maxInt(u64),
+        .progress = .{ .ptr = &capture, .update_fn = Capture.update },
+        .index_name = @constCast("semantic_idx"),
+        .provider = .antfly,
+        .model = @constCast("bge-m3"),
+        .base_url = @constCast(""),
+        .dimensions = 1,
+    };
+
+    const context = embeddingRequestContext(&entry, .retrieval_document);
+    try std.testing.expect(context.request.progress != null);
+    try context.request.updateDetail(.executing, 2, 3, entry.model, "metal");
+    const progress = capture.last.?;
+    try std.testing.expectEqual(request_context.Phase.executing, progress.phase);
+    try std.testing.expectEqual(@as(u64, 2), progress.completed);
+    try std.testing.expectEqual(@as(u64, 3), progress.total);
+    try std.testing.expectEqualStrings("bge-m3", progress.model);
+    try std.testing.expectEqualStrings("metal", progress.backend);
+    try std.testing.expectEqual(entry.deadline_ns, progress.deadline_ns);
+}
+
+pub fn testEmbeddingProviderDeadlines() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try provider_limits.testCancellationAndDeadline();
 
     const indexes_json =
         \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
@@ -3574,8 +3628,21 @@ fn buildManagedEmbeddingEntry(
         )
     else
         bedrock_provider.RequestFormat.auto;
-    const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
-    const burst = try resolveEmbedderBurst(embedder, provider);
+    var rate_limit = try provider_limits.Policy.fromConfig(embedder_cfg.rate_limit);
+    if (embedder_cfg.rate_limit != null) {
+        if (embedder.object.contains("requests_per_minute") or embedder.object.contains("burst"))
+            return error.ConflictingRateLimitPolicy;
+    } else {
+        rate_limit.requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
+        rate_limit.burst = try resolveEmbedderBurst(embedder, provider);
+        // Legacy single-request pacing promised a non-bursting provider path.
+        // Anchor it to completion rather than an arbitrary transport margin.
+        if (rate_limit.requests_per_minute != 0 and rate_limit.burst == 1)
+            rate_limit.pacing = .completion;
+    }
+    if (rate_limit.tokens_per_minute != 0 and embedder_cfg.multimodal) return error.UnsupportedMediaTokenBudget;
+    const requests_per_minute = rate_limit.requests_per_minute;
+    const burst = rate_limit.burst;
     const antfly_provider = if (semantic_binding) |binding|
         if (binding.embedded)
             options.antfly_provider orelse return error.InvalidEmbeddingArtifactProducer
@@ -3673,6 +3740,7 @@ fn buildManagedEmbeddingEntry(
         .bounded_http_request = options.bounded_http_request,
         .deadline_ns = options.deadline_ns,
         .cancellation = options.cancellation,
+        .progress = options.progress,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .embedding_names = owned_embedding_names,
@@ -3695,6 +3763,7 @@ fn buildManagedEmbeddingEntry(
         .dimensions = dimensions,
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
+        .rate_limit = rate_limit,
         .requests_per_minute = requests_per_minute,
         .burst = burst,
         .antfly_provider = antfly_provider,
@@ -3788,8 +3857,7 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
         else => return err,
     };
     defer managed.deinit(alloc);
-    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
-    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
+    try attachProviderQuota(&managed, options);
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -3806,8 +3874,7 @@ fn validateSparseEmbeddingForManagedConfig(
         else => return err,
     };
     defer managed.deinit(alloc);
-    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
-    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
+    try attachProviderQuota(&managed, options);
     try validateSparseEmbeddingForEntry(alloc, &managed);
 }
 
@@ -4291,8 +4358,17 @@ fn embedWithEntryPartsForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]f32 {
+    try embeddingRequestContext(entry, task_type).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
+    if (entry.rate_limit.tokens_per_minute != 0 and partsContainMedia(parts))
+        return error.UnsupportedMediaTokenBudget;
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
-        try waitForEntryPacer(entry);
+        try checkEntryDispatchDeadline(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
@@ -4300,6 +4376,7 @@ fn embedWithEntryPartsForTask(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
+            .attempt_observer = embeddingAttemptObserver(entry),
             .input_type = effectiveInputType(entry, task_type),
             .truncate = entry.truncate,
             .dimension = dims,
@@ -4319,7 +4396,7 @@ fn embedWithEntryPartsForTask(
         if (parts.len == 0) return error.EmptyEmbeddingResponse;
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
-                try waitForEntryPacer(entry);
+                try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_parts_with_context) |embed_parts_with_context|
@@ -4336,7 +4413,7 @@ fn embedWithEntryPartsForTask(
             }
             return error.UnsupportedEmbeddingProvider;
         }
-        try waitForEntryPacer(entry);
+        try checkEntryDispatchDeadline(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
@@ -4400,17 +4477,30 @@ fn embedSparseBatchWithEntry(
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
 ) ![]db_embedder.SparseEmbedding {
+    try embeddingRequestContext(entry, .retrieval_document).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
     switch (entry.provider) {
         .antfly => {
             if (entry.antfly_provider) |local| {
-                try waitForEntryPacer(entry);
-                const embeddings = AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts }) catch |err|
+                try checkEntryDispatchDeadline(entry);
+                const context = embeddingRequestContext(entry, .retrieval_document);
+                try context.check();
+                const embeddings = (if (local.embed_sparse_texts_with_context) |embed_with_context|
+                    AntflyProviderBoundary.call("embed_sparse_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
+                else
+                    AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
+                try context.check();
                 try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
             }
-            try waitForEntryPacer(entry);
+            try checkEntryDispatchDeadline(entry);
             var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
@@ -4729,6 +4819,13 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    try embeddingRequestContext(entry, task_type).request.updateDetail(
+        if (entry.provider == .antfly) .loading_model else .executing,
+        0,
+        1,
+        entry.model,
+        @tagName(entry.provider),
+    );
     switch (entry.provider) {
         .openai, .ollama => {
             if (entry.requests_per_minute > 0 and texts.len > entry.burst) {
@@ -4744,7 +4841,7 @@ fn embedBatchWithEntryForTask(
         .vertex => return try embedBatchWithVertex(alloc, entry, texts, dims, task_type),
         .antfly => {
             if (entry.antfly_provider) |local| {
-                try waitForEntryPacer(entry);
+                try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
@@ -4761,7 +4858,7 @@ fn embedBatchWithEntryForTask(
                 try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
-            try waitForEntryPacer(entry);
+            try checkEntryDispatchDeadline(entry);
             var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
@@ -4811,7 +4908,7 @@ fn embedBatchWithGemini(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    try waitForEntryPacer(entry);
+    try checkEntryDispatchDeadline(entry);
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
     const api_key_ref = if (entry.api_key) |*value| value else return error.MissingEmbeddingApiKey;
@@ -4840,14 +4937,20 @@ fn embedBatchWithVertex(
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     if (texts.len == 0) return error.EmptyEmbeddingResponse;
+    const auth_control = @import("antfly_google").RequestControl{
+        .deadline_ns = embeddingOperationDeadline(entry),
+        .cancellation = embeddingHttpCancellation(entry),
+    };
+    try auth_control.check();
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
     const token_source = if (entry.google_credentials) |manager|
-        manager.tokenSource(
+        manager.tokenSourceWithControl(
             if (entry.credentials_path.len > 0) entry.credentials_path else null,
             vertex_provider.vertex_auth_scope,
+            auth_control,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.Cancelled, error.Timeout => return err,
             else => return error.MissingVertexCredentials,
         }
     else
@@ -4858,6 +4961,7 @@ fn embedBatchWithVertex(
         .location = entry.location,
         .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
         .token_source = token_source,
+        .request_control = auth_control,
     });
     defer provider.deinit();
 
@@ -4871,7 +4975,7 @@ fn embedBatchWithVertex(
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = cappedEmbeddingBatchEnd(offset, texts.len, max_batch);
-        try waitForEntryPacer(entry);
+        try checkEntryDispatchDeadline(entry);
         var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
             .task_type = effectiveProviderTaskType(entry, task_type),
             .dimensions = if (dims > 0) dims else null,
@@ -4955,7 +5059,7 @@ fn embedBatchWithCohereRequest(
         .{ "content-type", "application/json" },
         .{ "authorization", auth_header },
     };
-    try waitForEntryPacer(entry);
+    try checkEntryDispatchDeadline(entry);
     var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer client.deinit();
     var response = try client.post(url, .{
@@ -5015,13 +5119,14 @@ fn embedBatchWithBedrockRequest(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    try waitForEntryPacer(entry);
+    try checkEntryDispatchDeadline(entry);
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
+        .attempt_observer = embeddingAttemptObserver(entry),
         .input_type = effectiveInputType(entry, task_type),
         .truncate = entry.truncate,
         .dimension = dims,
@@ -5102,7 +5207,7 @@ fn embedBatchWithOpenAiCompatible(
         headers_buf[1] = .{ "authorization", value };
     }
 
-    try waitForEntryPacer(entry);
+    try checkEntryDispatchDeadline(entry);
 
     var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer client.deinit();
@@ -5324,10 +5429,11 @@ fn appendExecutionObjectIfPresent(
     root: std.json.ObjectMap,
 ) !void {
     const execution = root.get("execution") orelse return;
-    if (execution != .object) return error.InvalidCreateTableRequest;
+    // Reject unsupported namespaces and policy fields with the public domain
+    // error before the generated parser can expose an incidental JSON error.
+    try validateIndexExecutionObjectForCreateTable(execution);
     var parsed = try std.json.parseFromValue(indexes_openapi.IndexExecutionConfig, alloc, execution, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    try validateIndexExecutionObjectForCreateTable(execution);
     const encoded = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, ",\"execution\":");
@@ -5842,12 +5948,22 @@ test "managed embedder preserves coverage policy in storage config" {
 
 test "managed embedder rejects unsupported execution namespaces" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":8}}}
-    , .{});
-    defer parsed.deinit();
-
-    try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+    for ([_][]const u8{
+        \\{"indexing":{"batch_items":8}}
+        ,
+        \\{"embedding":{"batch_items":8},"indexing":{}}
+        ,
+        \\{"embedding":{"unknown_option":8}}
+        ,
+    }) |execution| {
+        const json = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"type":"embeddings","field":"body","dimension":384,"embedder":{{"provider":"antfly","model":"antflydb/clipclap"}},"execution":{s}}}
+        , .{execution});
+        defer std.testing.allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+    }
 }
 
 pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
@@ -6184,14 +6300,24 @@ test "managed embedder rejects conflicting embedding name aliases" {
     , local.provider()));
 }
 
-test "managed embedder rejects index name and embedding name collisions with different configs" {
+test "managed embedder separates index and artifact lookup namespaces with different configs" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
-    try std.testing.expectError(error.InvalidManagedEmbeddingIndex, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
         \\{
         \\  "aliased_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
         \\  "document_vectors":{"type":"embeddings","field":"embedding","embedding_name":"document_vectors_v2","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/other"}}
         \\}
-    , local.provider()));
+    , local.provider());
+    defer managed.deinit();
+
+    // Neither namespace may depend on the catalog's insertion order.
+    for (0..2) |_| {
+        try std.testing.expectEqualStrings("antflydb/other", managed.findQueryEntry("document_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/clipclap", managed.findArtifactEntry("document_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/clipclap", managed.findQueryEntry("aliased_vectors").?.model);
+        try std.testing.expectEqualStrings("antflydb/other", managed.findArtifactEntry("document_vectors_v2").?.model);
+        std.mem.reverse(ManagedEmbeddingEntry, managed.entries);
+    }
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {
@@ -6235,9 +6361,20 @@ test "managed embedder validates sparse config with probe during normalization" 
     , .{});
     defer parsed.deinit();
 
-    const normalized = try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", parsed.value, .{ .antfly_provider = local.provider() });
-    try std.testing.expect(normalized == null);
+    const normalized = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", parsed.value, .{ .antfly_provider = local.provider() })) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(normalized);
     try std.testing.expectEqual(@as(usize, 1), local.sparse_calls);
+    var normalized_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized, .{});
+    defer normalized_parsed.deinit();
+    try std.testing.expect(normalized_parsed.value.object.get("dimension") == null);
+    const identity = normalized_parsed.value.object.get("semantic_producer") orelse return error.TestUnexpectedResult;
+    try ant_json.testing.expectSubsetJsonText(std.testing.allocator,
+        \\{"provider":"antfly","model":"antflydb/clipclap","sparse":true,"endpoint":"antfly:embedded"}
+    , identity.string);
+    // A normalized catalog entry preserves its admitted identity on replay.
+    const replay = try normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "sparse_idx", normalized_parsed.value, .{ .antfly_provider = local.provider() });
+    defer if (replay) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(replay == null);
 }
 
 test "managed embedder translates typed distance metric and embedder dimensions" {
@@ -7176,7 +7313,7 @@ test "managed embedder routes antfly without api_url to local provider" {
         fn dense(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqualStrings("", model);
+            try std.testing.expectEqualStrings("local-model", model);
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             for (texts, 0..) |_, i| {
@@ -7198,8 +7335,13 @@ test "managed embedder routes antfly without api_url to local provider" {
     };
 
     const indexes_json =
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}}}
     ;
+    // An omitted URL selects the embedded provider, but does not relax the
+    // schema's independently required model field.
+    try std.testing.expectError(error.MissingField, ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly"}}}
+    , provider));
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
 
@@ -7423,6 +7565,70 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
 
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
+}
+
+pub fn testBedrockCredentialTrafficBypassesModelQuota() !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var runtime = ProviderRuntime.init(alloc, io);
+    runtime.limits = &registry;
+    defer runtime.deinit();
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/sts", .respond = .{ .body = "<Credentials><AccessKeyId>test-access</AccessKeyId><SecretAccessKey>test-secret</SecretAccessKey><SessionToken>test-session</SessionToken></Credentials>" } },
+        .{ .method = .POST, .path = "/model/amazon.titan-embed-text-v2%3A0/invoke", .respond = .{ .body = "{\"embedding\":[0.1,0.2]}" } },
+    });
+    defer server.deinit();
+    const raw = try std.fmt.allocPrint(alloc,
+        \\{{"i":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":{f},"rate_limit":{{"requests_per_minute":1}}}}}}}}
+    , .{std.json.fmt(server.baseUrl(), .{})});
+    defer alloc.free(raw);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, raw, .{ .io = io, .provider_runtime = &runtime });
+    defer managed.deinit();
+    const entry = &managed.entries[0];
+    var config = try embeddingHttpClientConfig(entry);
+    try std.testing.expect(config.attempt_observer == null);
+    config.timeouts = httpx.Timeouts.uniform(500);
+    config.timeouts.request_ms = 500;
+    var client = httpx.Client.initWithConfig(alloc, io, config);
+    defer client.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "test-web-identity" });
+    const token_path = try tmp.dir.realPathFileAlloc(io, "token", alloc);
+    defer alloc.free(token_path);
+    const sts = try std.fmt.allocPrint(alloc, "{s}/sts", .{server.baseUrl()});
+    defer alloc.free(sts);
+    var provider = bedrock_provider.Provider.init(alloc, &client, .{
+        .region = "us-east-1",
+        .endpoint = server.baseUrl(),
+        .attempt_observer = embeddingAttemptObserver(entry),
+        .credential_source = .{ .web_identity = .{ .role_arn = "test-role", .token_file = token_path, .sts_endpoint = sts } },
+    });
+    defer provider.deinit();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, p: *bedrock_provider.Provider, err_out: *?anyerror) !void {
+            runInner(a, p) catch |err| {
+                err_out.* = err;
+            };
+        }
+        fn runInner(a: std.mem.Allocator, p: *bedrock_provider.Provider) !void {
+            var result = try p.embedText(a, "amazon.titan-embed-text-v2:0", &.{"hello"});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.vectors.len);
+            try std.testing.expectError(error.Timeout, p.embedText(a, "amazon.titan-embed-text-v2:0", &.{"again"}));
+        }
+    };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ alloc, &provider, &failure });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u32, 0), entry.quota.?.limiter().in_flight);
 }
 
 pub fn testBedrockRequestFormatConfiguration() !void {

@@ -14,14 +14,16 @@
 
 /// Runtime-status records are embedded in unframed StoreRecord transitions.
 /// Only released wire profiles are compatibility surfaces. V12 is the
-/// v0.2.0 profile; V15 is the current profile. Every other number belongs to
+/// v0.2.0 profile; V15 is the previous profile and V16 is current. Every other number belongs to
 /// an unreleased development format and must not be advertised, negotiated,
 /// read, or written.
 pub const v0_2_0_record_version: u16 = 12;
-pub const current_record_version: u16 = 15;
+pub const previous_record_version: u16 = 15;
+pub const current_record_version: u16 = 16;
 
 pub const Profile = enum(u16) {
     released_v0_2_0 = v0_2_0_record_version,
+    previous = previous_record_version,
     current = current_record_version,
 
     pub fn wireVersion(self: @This()) u16 {
@@ -41,6 +43,7 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
     const required = profileForVersion(required_version) orelse return false;
     return switch (required) {
         .released_v0_2_0 => true,
+        .previous => available == .previous or available == .current,
         .current => available == .current,
     };
 }
@@ -48,11 +51,12 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
 /// These facts form one current admission-safety profile. Keeping semantic
 /// aliases makes call sites state why V15 is required without inventing
 /// intermediate compatibility levels when new facts join that profile.
-pub const repair_status_record_version: u16 = current_record_version;
-pub const native_restore_identity_record_version: u16 = current_record_version;
-pub const artifact_source_status_record_version: u16 = current_record_version;
-pub const artifact_source_failure_status_record_version: u16 = current_record_version;
-pub const publication_target_record_version: u16 = current_record_version;
+pub const repair_status_record_version: u16 = previous_record_version;
+pub const native_restore_identity_record_version: u16 = previous_record_version;
+pub const artifact_source_status_record_version: u16 = previous_record_version;
+pub const artifact_source_failure_status_record_version: u16 = previous_record_version;
+pub const publication_target_record_version: u16 = previous_record_version;
+pub const inference_diagnostics_record_version: u16 = current_record_version;
 
 pub fn isSupported(version: u16) bool {
     return isNegotiable(version);
@@ -69,24 +73,31 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isSupported(0));
     try std.testing.expect(!isSupported(13));
     try std.testing.expect(!isSupported(14));
-    try std.testing.expect(!isSupported(16));
+    try std.testing.expect(isSupported(previous_record_version));
+    try std.testing.expect(isSupported(16));
+    try std.testing.expect(!isSupported(17));
 
     try std.testing.expect(isNegotiable(v0_2_0_record_version));
     try std.testing.expect(isNegotiable(current_record_version));
     try std.testing.expect(!isNegotiable(11));
     try std.testing.expect(!isNegotiable(13));
     try std.testing.expect(!isNegotiable(14));
+    try std.testing.expect(isNegotiable(15));
+    try std.testing.expect(isNegotiable(16));
     try std.testing.expectEqual(Profile.released_v0_2_0, profileForVersion(12).?);
-    try std.testing.expectEqual(Profile.current, profileForVersion(15).?);
+    try std.testing.expectEqual(Profile.previous, profileForVersion(15).?);
+    try std.testing.expectEqual(Profile.current, profileForVersion(16).?);
 
     try std.testing.expect(profileSatisfies(12, 12));
     try std.testing.expect(profileSatisfies(15, 12));
     try std.testing.expect(profileSatisfies(15, 15));
+    try std.testing.expect(profileSatisfies(16, 15));
+    try std.testing.expect(profileSatisfies(16, 16));
     try std.testing.expect(!profileSatisfies(12, 15));
     try std.testing.expect(!profileSatisfies(13, 12));
     try std.testing.expect(!profileSatisfies(14, 15));
-    try std.testing.expect(!profileSatisfies(16, 15));
     try std.testing.expect(!profileSatisfies(15, 16));
+    try std.testing.expect(!profileSatisfies(17, 16));
 }
 
 const std = @import("std");

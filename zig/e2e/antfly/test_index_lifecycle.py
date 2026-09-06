@@ -1607,9 +1607,18 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert recovered["backfill_progress"] == 1.0
 
 
+@pytest.mark.parametrize(
+    "pacing_config",
+    [
+        {"requests_per_minute": 6000, "burst": 1},
+        {"rate_limit": {"requests_per_minute": 6000, "pacing": "completion"}},
+    ],
+    ids=["legacy", "completion"],
+)
 def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
     stateful_api,
     pacing_sensitive_openai_embedder,
+    pacing_config,
 ):
     table_name = f"stateful_paced_managed_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
@@ -1626,8 +1635,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
             "provider": "openai",
             "model": "text-embedding-3-small",
             "url": pacing_sensitive_openai_embedder.url,
-            "requests_per_minute": 6000,
-            "burst": 1,
+            **pacing_config,
         },
     }
 
@@ -1671,7 +1679,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
 
     stats = pacing_sensitive_openai_embedder.stats()
     assert stats["successful_requests"] >= 3
-    assert stats["rate_limited_requests"] == 0
+    assert stats["rate_limited_requests"] == 0, stats
 
 
 def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(

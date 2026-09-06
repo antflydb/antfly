@@ -21,6 +21,7 @@
 // Inspired by llama.cpp's GGML: models build computation, backends execute.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
@@ -1344,6 +1345,15 @@ pub const WorkloadRegime = enum(u8) {
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Borrowed for one synchronous request. Architecture sessions install it
+    /// on their request-local backend wrapper, making weight acquisition a
+    /// universal bounded checkpoint even for architectures without a bespoke
+    /// `forwardWithControl` entry point.
+    execution_control: ?InferenceExecutionControl = null,
+
+    pub fn checkExecutionControl(self: *const ComputeBackend) !void {
+        if (self.execution_control) |control| try control.check();
+    }
 
     pub fn kind(self: *const ComputeBackend) BackendKind {
         return self.vtable.backendKind(self.ptr);
@@ -1365,6 +1375,7 @@ pub const ComputeBackend = struct {
     /// request-local execution plans use this boundary to discard captured
     /// addresses and other state that must never leak between requests.
     pub fn beginRequest(self: *const ComputeBackend) anyerror!void {
+        try self.checkExecutionControl();
         const op = self.vtable.beginRequest orelse return;
         return op(self.ptr);
     }
@@ -2729,6 +2740,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
         return self.vtable.getWeight(self.ptr, name);
     }
 

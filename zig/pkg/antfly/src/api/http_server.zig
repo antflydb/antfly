@@ -5166,7 +5166,15 @@ pub const ApiHttpServer = struct {
     ) db_mod.types.EnrichmentStats {
         var stats: db_mod.types.EnrichmentStats = .{};
         inline for (std.meta.fields(metadata_table_manager.RuntimeEnrichmentStatusReport)) |field| {
-            @field(stats, field.name) = @field(report, field.name);
+            if (comptime std.mem.eql(u8, field.name, "active_model")) {
+                stats.active_model = .init(report.active_model);
+            } else if (comptime std.mem.eql(u8, field.name, "active_backend")) {
+                stats.active_backend = .init(report.active_backend);
+            } else if (comptime std.mem.eql(u8, field.name, "active_phase")) {
+                stats.active_phase = if (report.active_phase.len > 0) report.active_phase else "idle";
+            } else {
+                @field(stats, field.name) = @field(report, field.name);
+            }
         }
         return stats;
     }
@@ -19807,6 +19815,8 @@ fn applyAuthenticatedIdentityToJoinRequest(
 
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
+        error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
+        error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,
@@ -23279,6 +23289,8 @@ test "api http server obtains query embedding policy from resource manager" {
 }
 
 test "api http query parsing preserves operational embedding failures" {
+    try std.testing.expectEqual(error.QueryEmbeddingInputTooLarge, normalizePublicQueryParseError(error.ProviderTokenBudgetExceeded));
+    try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.ProviderQuotaRegistryFull));
     try std.testing.expectEqual(error.QueryEmbeddingInputTooLarge, normalizePublicQueryParseError(error.QueryEmbeddingInputTooLarge));
     try std.testing.expectEqual(error.QueryEmbeddingOverloaded, normalizePublicQueryParseError(error.QueryEmbeddingOverloaded));
     try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));

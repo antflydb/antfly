@@ -17,6 +17,7 @@ const structlog = @import("structlog");
 const build_options = @import("build_options");
 const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -73,7 +74,12 @@ fn mainImpl(init: std.process.Init) !void {
         .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
         .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
-        .inference => return runRuntimeUnit(.inference, subcommand, init, &args),
+        .inference => {
+            var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+            defer worker_lifetime.deinit(init.io);
+            if (try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
+            return runRuntimeUnit(.inference, subcommand, init, &args);
+        },
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
         .serverless => return runRuntimeUnit(.serverless, subcommand, init, &args),
         .standalone => return runRuntimeUnit(.standalone, subcommand, init, &args),

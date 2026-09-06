@@ -31,6 +31,7 @@ const HeaderName = @import("../core/headers.zig").HeaderName;
 const Uri = @import("../core/uri.zig").Uri;
 const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
+const AttemptObserver = @import("../core/attempt_observer.zig").AttemptObserver;
 const Status = @import("../core/status.zig").Status;
 const socket_mod = @import("../net/socket.zig");
 const Socket = socket_mod.Socket;
@@ -77,6 +78,7 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
+    attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
     retry_policy: types.RetryPolicy = .{},
@@ -85,6 +87,11 @@ pub const ClientConfig = struct {
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
+    /// Default request lifetime for adapters whose provider interface does not
+    /// expose per-call HTTP options. An explicit RequestOptions cancellation
+    /// source takes precedence. The token is borrowed for the client's
+    /// lifetime.
+    request_cancellation: ?CancellationToken = null,
     verify_ssl: bool = true,
     /// Optional explicit CA bundle file. When set, system roots are not loaded.
     tls_ca_file: ?[]const u8 = null,
@@ -121,6 +128,7 @@ pub const ClientConfig = struct {
 
 /// Per-request options.
 pub const RequestOptions = struct {
+    attempt_observer: ?AttemptObserver = null,
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
     json: ?[]const u8 = null,
@@ -684,6 +692,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -724,7 +733,11 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
+        var response = try self.executeRequest(
+            &req,
+            reqOpts.timeout_ms,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -779,6 +792,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -818,7 +832,14 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
+        var response = try self.executeRequestToWriter(
+            &req,
+            reqOpts.timeout_ms,
+            writer,
+            progress_cb,
+            progress_ctx,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -1388,6 +1409,29 @@ pub const Client = struct {
     }
 
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
+        const observer = req.attempt_observer;
+        if (observer) |hook| try hook.before(hook.ptr, .{
+            .io = self.io,
+            .deadline_ms = deadline_ms,
+            .cancellation_ptr = interrupt,
+            .is_cancelled = attemptCancelled,
+            .body_bytes = if (req.body) |body| body.len else 0,
+            .output_tokens = hook.output_tokens,
+        });
+        var response = self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
+            if (observer) |hook| hook.after(hook.ptr, null);
+            return err;
+        };
+        if (observer) |hook| hook.after(hook.ptr, &response);
+        return response;
+    }
+
+    fn attemptCancelled(ptr: *const anyopaque) bool {
+        const interrupt: *const RequestInterrupt = @ptrCast(@alignCast(ptr));
+        return @constCast(interrupt).isCancellationRequested();
+    }
+
+    fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
@@ -1485,6 +1529,32 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         interrupt: *RequestInterrupt,
     ) !Response {
+        if (req.attempt_observer) |hook| try hook.before(hook.ptr, .{
+            .io = self.io,
+            .deadline_ms = deadline_ms,
+            .cancellation_ptr = interrupt,
+            .is_cancelled = attemptCancelled,
+            .body_bytes = if (req.body) |body| body.len else 0,
+            .output_tokens = hook.output_tokens,
+        });
+        var response = self.executeRequestToWriterOnceUnobserved(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, interrupt) catch |err| {
+            if (req.attempt_observer) |hook| hook.after(hook.ptr, null);
+            return err;
+        };
+        if (req.attempt_observer) |hook| hook.after(hook.ptr, &response);
+        return response;
+    }
+
+    fn executeRequestToWriterOnceUnobserved(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        interrupt: *RequestInterrupt,
+    ) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         const timeout_ms = timeout_override_ms orelse blk: {
@@ -1497,7 +1567,7 @@ pub const Client = struct {
         };
 
         if (shouldUseHttp2(self.config)) {
-            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt);
+            var res = try self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
@@ -3323,6 +3393,18 @@ test "Client rejects an already cancelled request" {
     try std.testing.expectError(
         error.Cancelled,
         client.get("http://127.0.0.1:1/never", .{ .cancellation = .fromAtomic(&cancellation) }),
+    );
+}
+
+test "ClientConfig supplies cancellation to provider adapters" {
+    var cancellation = std.atomic.Value(bool).init(true);
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .request_cancellation = .fromAtomic(&cancellation),
+    });
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{}),
     );
 }
 

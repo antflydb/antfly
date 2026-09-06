@@ -166,6 +166,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
+    "../specs/openapi/shared/provider.yaml",
     "../specs/openapi/antfly/schema.yaml",
     "../specs/openapi/antfly/indexes.yaml",
     "../specs/openapi/antfly/generated/graph_identifier.yaml",
@@ -750,6 +751,7 @@ const AntflyRootImports = struct {
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    credentials: *std.Build.Module,
     google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
@@ -820,6 +822,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_credentials", .field = "credentials" },
         .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
@@ -1289,6 +1292,7 @@ fn addOpenApiRegenRun(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", package_name });
     codegen.addArgs(&.{ "--generate", generate_what });
+    codegen.addArgs(&.{ "--import-mapping", "../shared/provider.yaml=antfly_provider_openapi", "--import-mapping", "./provider.yaml=antfly_provider_openapi", "--import-mapping", "specs/openapi/shared/provider.yaml=antfly_provider_openapi" });
     for (import_mappings) |mapping| {
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
@@ -1307,6 +1311,7 @@ fn addOpenApiRegenStep(
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
@@ -1509,6 +1514,8 @@ pub fn build(b: *std.Build) void {
         inference_enable_system_blas,
         inference_blas_root,
     );
+    const platform_tests = addDelegatedPackageStep(b, "platform", "lib/platform", "test", "lib/platform");
+    delegated_inference_steps.inference_test.dependOn(platform_tests.step);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
@@ -1561,9 +1568,15 @@ pub fn build(b: *std.Build) void {
     const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
     const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
     const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
+    const provider_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi");
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
     const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1649,12 +1662,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const google_mod = b.createModule(.{
         .root_source_file = b.path("lib/google/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_credentials", credentials_mod);
     google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
@@ -1670,6 +1694,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
     wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -2086,6 +2111,7 @@ pub fn build(b: *std.Build) void {
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .credentials = credentials_mod,
         .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
@@ -3467,11 +3493,24 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{ "generating backend", "asset producer runtime", "provider quotas", "vertex provider" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+
+    const lib_google_tests = b.addTest(.{ .root_module = google_mod });
+    const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
+    const lib_google_test_step = b.step("lib-google-test", "Run Google credential cache and transport tests");
+    lib_google_test_step.dependOn(&run_lib_google_tests.step);
+
+    const lib_managed_embedder_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"managed embedder"},
+    });
+    const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
+    const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
+    lib_managed_embedder_test_step.dependOn(&run_lib_managed_embedder_tests.step);
 
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
@@ -3680,6 +3719,10 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder rejects unsupported execution namespaces",
+        "managed embedder separates index and artifact lookup namespaces",
+        "managed embedder validates sparse config with probe during normalization",
+        "managed embedder routes antfly without api_url to local provider",
         "managed embedder artifact backed embedding translation",
         "managed embedder binds execution to catalog semantic producer identity",
         "managed embedder reuses an executable owner for producerless artifact consumers",
@@ -4938,6 +4981,11 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "context-aware embedder receives the request lifetime and fails closed when absent",
+            "inference timeout policy avoids inline retry storms",
+            "inference recovery is scoped by model and backend",
+            "asset inference recovery uses one identity from plan through provider call",
+            "post-provider deadline records timeout recovery before returning",
             "document extraction reserves PDF decoder peak memory atomically",
             "PDF decoder reservation composes with every live slice owner",
             "PDF decoder credit and OCR transient allocations compose without double charging",
@@ -7750,6 +7798,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_google_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
@@ -9704,6 +9753,7 @@ pub fn build(b: *std.Build) void {
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
+    quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
@@ -9725,6 +9775,38 @@ pub fn build(b: *std.Build) void {
     }
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
+
+    const run_bge_m3_native_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_native_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "native",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_native_managed.addArgs(args);
+    const bge_m3_native_managed_step = b.step(
+        "bench-bge-m3-native-managed-e2e",
+        "Benchmark BGE-M3 native through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_native_managed_step.dependOn(&run_bge_m3_native_managed.step);
+
+    const run_bge_m3_metal_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_metal_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "metal",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_metal_managed.addArgs(args);
+    const bge_m3_metal_managed_step = b.step(
+        "bench-bge-m3-metal-managed-e2e",
+        "Benchmark BGE-M3 Metal through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_metal_managed_step.dependOn(&run_bge_m3_metal_managed.step);
 
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("bench/compat_runner.zig"),
@@ -11022,6 +11104,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         role_mod.addImport("structlog", structlog_mod);
+        role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);

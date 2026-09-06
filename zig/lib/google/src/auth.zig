@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const credential_identity = @import("antfly_credentials");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 
@@ -48,7 +49,32 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8) anyerror!TransportResponse;
+/// One immutable budget for credential queueing, all exchanges, and the
+/// authenticated request. Never store borrowed cancellation in the cache.
+pub const RequestControl = struct {
+    deadline_ns: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
+
+    pub fn fromTimeout(timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) RequestControl {
+        return .{
+            .deadline_ns = if (timeout_ms) |ms| platform.time.monotonicNs() +| (ms *| std.time.ns_per_ms) else null,
+            .cancellation = cancellation,
+        };
+    }
+
+    pub fn check(self: RequestControl) !void {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.deadline_ns) |deadline| if (platform.time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    pub fn remainingTimeoutMs(self: RequestControl) !?u64 {
+        try self.check();
+        const deadline = self.deadline_ns orelse return null;
+        return @max(@as(u64, 1), std.math.divCeil(u64, deadline -| platform.time.monotonicNs(), std.time.ns_per_ms) catch 1);
+    }
+};
+
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, RequestControl) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
@@ -89,7 +115,9 @@ const HttpxTransport = struct {
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
+        control: RequestControl,
     ) !TransportResponse {
+        try control.check();
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
         var request_headers = std.ArrayListUnmanaged(HeaderPair).empty;
@@ -100,12 +128,17 @@ const HttpxTransport = struct {
         var response = try self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = control.cancellation,
         });
         defer response.deinit();
+        try control.check();
 
+        const response_body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0);
+        errdefer alloc.free(response_body);
         return .{
             .status = response.status.code,
-            .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
+            .body = response_body,
             .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
         };
     }
@@ -238,7 +271,7 @@ pub const CachedTokenSource = struct {
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
     io: ?std.Io,
-    mutex: std.Io.Mutex = .init,
+    mutex: std.atomic.Mutex = .unlocked,
     cached_token: ?AccessToken = null,
 
     pub fn init(alloc: Allocator, cfg: Config) !CachedTokenSource {
@@ -286,50 +319,72 @@ pub const CachedTokenSource = struct {
     }
 
     pub fn authorizationValueAlloc(self: *CachedTokenSource, alloc: Allocator) ![]u8 {
-        const token = try self.accessTokenAlloc(alloc);
+        return self.authorizationValueAllocWithControl(alloc, .{});
+    }
+
+    pub fn authorizationValueAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
+        const token = try self.accessTokenAllocWithControl(alloc, control);
         defer alloc.free(token);
         return try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
     }
 
     pub fn accessTokenAlloc(self: *CachedTokenSource, alloc: Allocator) ![]u8 {
-        const io = self.io;
-        if (io) |runtime_io| self.mutex.lockUncancelable(runtime_io);
-        defer if (io) |runtime_io| self.mutex.unlock(runtime_io);
-        return try self.accessTokenAllocLocked(alloc);
+        return self.accessTokenAllocWithControl(alloc, .{});
     }
 
-    fn accessTokenAllocLocked(self: *CachedTokenSource, alloc: Allocator) ![]u8 {
+    pub fn accessTokenAllocWithControl(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
+        try control.check();
+        while (!self.mutex.tryLock()) {
+            try control.check();
+            if (self.io) |io| {
+                try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+        defer self.mutex.unlock();
+        try control.check();
+        return self.accessTokenAllocLocked(alloc, control);
+    }
+
+    fn accessTokenAllocLocked(self: *CachedTokenSource, alloc: Allocator, control: RequestControl) ![]u8 {
         const now = nowSeconds();
-        var unexpired_fallback: ?[]const u8 = null;
         if (self.cached_token) |token| {
             if (token.expires_at_s > now + 30) return try alloc.dupe(u8, token.value);
-            if (token.expires_at_s > now) unexpired_fallback = token.value;
         }
 
-        var minted = self.mintTokenAlloc(self.alloc, now) catch |err| {
+        var minted = self.mintTokenAlloc(self.alloc, now, control) catch |err| {
+            try control.check();
+            if (err == error.Cancelled) return err;
             // A proactive refresh failure must not turn a still-valid token
             // into an outage. Once expired, fail closed and surface the auth
             // provider error.
-            if (unexpired_fallback) |token| return try alloc.dupe(u8, token);
+            if (self.cached_token) |token| {
+                if (token.expires_at_s > nowSeconds()) return try alloc.dupe(u8, token.value);
+            }
             return err;
         };
         errdefer minted.deinit(self.alloc);
+        try control.check();
 
+        // Finish fallible caller allocation before transferring ownership to
+        // the cache; minted's errdefer must never free a published token.
+        const result = try alloc.dupe(u8, minted.value);
         if (self.cached_token) |*existing| existing.deinit(self.alloc);
         self.cached_token = minted;
-        return try alloc.dupe(u8, self.cached_token.?.value);
+        return result;
     }
 
-    fn mintTokenAlloc(self: *CachedTokenSource, alloc: Allocator, now_s: u64) !AccessToken {
+    fn mintTokenAlloc(self: *CachedTokenSource, alloc: Allocator, now_s: u64, control: RequestControl) !AccessToken {
         return switch (self.cfg.credentials) {
-            .service_account => |account| try self.mintServiceAccountTokenAlloc(alloc, account, now_s),
-            .authorized_user => |user| try self.mintAuthorizedUserTokenAlloc(alloc, user, now_s),
-            .external_account => |account| try self.mintExternalAccountTokenAlloc(alloc, account, now_s),
-            .metadata => |metadata| try self.mintMetadataTokenAlloc(alloc, metadata, now_s),
+            .service_account => |account| try self.mintServiceAccountTokenAlloc(alloc, account, now_s, control),
+            .authorized_user => |user| try self.mintAuthorizedUserTokenAlloc(alloc, user, now_s, control),
+            .external_account => |account| try self.mintExternalAccountTokenAlloc(alloc, account, now_s, control),
+            .metadata => |metadata| try self.mintMetadataTokenAlloc(alloc, metadata, now_s, control),
         };
     }
 
-    fn mintServiceAccountTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ServiceAccount, now_s: u64) !AccessToken {
+    fn mintServiceAccountTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ServiceAccount, now_s: u64, control: RequestControl) !AccessToken {
         const assertion = try signedJwtAssertionAlloc(alloc, account, self.cfg.scope, now_s);
         defer alloc.free(assertion);
 
@@ -343,14 +398,14 @@ pub const CachedTokenSource = struct {
         const headers = [_]HeaderPair{
             .{ "Accept", "application/json" },
         };
-        var response = try self.request_fn(
-            self.request_ctx,
+        var response = try self.requestWithControl(
             alloc,
             .POST,
             account.token_uri,
             &headers,
             body,
             "application/x-www-form-urlencoded",
+            control,
         );
         defer response.deinit(alloc);
 
@@ -368,7 +423,7 @@ pub const CachedTokenSource = struct {
         };
     }
 
-    fn mintAuthorizedUserTokenAlloc(self: *CachedTokenSource, alloc: Allocator, user: AuthorizedUser, now_s: u64) !AccessToken {
+    fn mintAuthorizedUserTokenAlloc(self: *CachedTokenSource, alloc: Allocator, user: AuthorizedUser, now_s: u64, control: RequestControl) !AccessToken {
         const client_id = try httpx.uri.encode(alloc, user.client_id);
         defer alloc.free(client_id);
         const client_secret = try httpx.uri.encode(alloc, user.client_secret);
@@ -381,26 +436,26 @@ pub const CachedTokenSource = struct {
             .{ client_id, client_secret, refresh_token },
         );
         defer alloc.free(body);
-        return try self.exchangeTokenRequestAlloc(alloc, user.token_uri, &.{.{ "Accept", "application/json" }}, body, now_s);
+        return try self.exchangeTokenRequestAlloc(alloc, user.token_uri, &.{.{ "Accept", "application/json" }}, body, now_s, control);
     }
 
-    fn mintMetadataTokenAlloc(self: *CachedTokenSource, alloc: Allocator, metadata: MetadataCredentials, now_s: u64) !AccessToken {
-        var response = try self.request_fn(
-            self.request_ctx,
+    fn mintMetadataTokenAlloc(self: *CachedTokenSource, alloc: Allocator, metadata: MetadataCredentials, now_s: u64, control: RequestControl) !AccessToken {
+        var response = try self.requestWithControl(
             alloc,
             .GET,
             metadata.token_url,
             &.{.{ "Metadata-Flavor", "Google" }},
             null,
             null,
+            control,
         );
         defer response.deinit(alloc);
         if (response.status != 200) return error.UnexpectedHttpStatus;
         return try parseAccessTokenResponseAlloc(alloc, response.body, now_s);
     }
 
-    fn mintExternalAccountTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ExternalAccount, now_s: u64) !AccessToken {
-        const subject_token = try self.externalSubjectTokenAlloc(alloc, account);
+    fn mintExternalAccountTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ExternalAccount, now_s: u64, control: RequestControl) !AccessToken {
+        const subject_token = try self.externalSubjectTokenAlloc(alloc, account, control);
         defer alloc.free(subject_token);
         const audience = try httpx.uri.encode(alloc, account.audience);
         defer alloc.free(audience);
@@ -416,7 +471,7 @@ pub const CachedTokenSource = struct {
             .{ audience, subject, subject_token_type, scope },
         );
         defer alloc.free(body);
-        var federated = try self.exchangeTokenRequestAlloc(alloc, account.token_url, &.{.{ "Accept", "application/json" }}, body, now_s);
+        var federated = try self.exchangeTokenRequestAlloc(alloc, account.token_url, &.{.{ "Accept", "application/json" }}, body, now_s, control);
         if (account.service_account_impersonation_url == null) return federated;
         defer federated.deinit(alloc);
 
@@ -427,14 +482,14 @@ pub const CachedTokenSource = struct {
             .lifetime = "3600s",
         }, .{});
         defer alloc.free(impersonation_body);
-        var response = try self.request_fn(
-            self.request_ctx,
+        var response = try self.requestWithControl(
             alloc,
             .POST,
             account.service_account_impersonation_url.?,
             &.{ .{ "Accept", "application/json" }, .{ "Authorization", authorization } },
             impersonation_body,
             "application/json",
+            control,
         );
         defer response.deinit(alloc);
         if (response.status != 200) return error.UnexpectedHttpStatus;
@@ -451,32 +506,43 @@ pub const CachedTokenSource = struct {
         headers: []const HeaderPair,
         body: []const u8,
         now_s: u64,
+        control: RequestControl,
     ) !AccessToken {
-        var response = try self.request_fn(self.request_ctx, alloc, .POST, url, headers, body, "application/x-www-form-urlencoded");
+        var response = try self.requestWithControl(alloc, .POST, url, headers, body, "application/x-www-form-urlencoded", control);
         defer response.deinit(alloc);
         if (response.status != 200) return error.UnexpectedHttpStatus;
         return try parseAccessTokenResponseAlloc(alloc, response.body, now_s);
     }
 
-    fn externalSubjectTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ExternalAccount) ![]u8 {
+    fn requestWithControl(self: *CachedTokenSource, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, body: ?[]const u8, content_type: ?[]const u8, control: RequestControl) !TransportResponse {
+        try control.check();
+        var response = try self.request_fn(self.request_ctx, alloc, method, url, headers, body, content_type, control);
+        errdefer response.deinit(alloc);
+        try control.check();
+        return response;
+    }
+
+    fn externalSubjectTokenAlloc(self: *CachedTokenSource, alloc: Allocator, account: ExternalAccount, control: RequestControl) ![]u8 {
+        try control.check();
         const raw = if (account.subject_token_file) |path| blk: {
             const io = self.io orelse return error.MissingIoRuntime;
             break :blk try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1024 * 1024));
         } else if (account.subject_token_url) |url| blk: {
-            var response = try self.request_fn(
-                self.request_ctx,
+            var response = try self.requestWithControl(
                 alloc,
                 .GET,
                 url,
                 account.subject_token_headers,
                 null,
                 null,
+                control,
             );
             defer response.deinit(alloc);
             if (response.status != 200) return error.UnexpectedHttpStatus;
             break :blk try alloc.dupe(u8, response.body);
         } else return error.MissingSubjectTokenSource;
         defer alloc.free(raw);
+        try control.check();
         if (account.subject_token_field) |field| {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
             defer parsed.deinit();
@@ -496,7 +562,10 @@ pub const CredentialManager = struct {
     alloc: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    sources: std.StringHashMapUnmanaged(*CachedTokenSource) = .empty,
+    sources: std.AutoHashMapUnmanaged(
+        [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        *CachedTokenSource,
+    ) = .empty,
 
     pub fn init(alloc: Allocator, io: std.Io) CredentialManager {
         return .{ .alloc = alloc, .io = io };
@@ -508,7 +577,6 @@ pub const CredentialManager = struct {
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.alloc.destroy(entry.value_ptr.*);
-            self.alloc.free(entry.key_ptr.*);
         }
         self.sources.deinit(self.alloc);
         self.mutex.unlock(self.io);
@@ -520,53 +588,74 @@ pub const CredentialManager = struct {
         credentials_path: ?[]const u8,
         scope: []const u8,
     ) !*CachedTokenSource {
-        const key = try credentialSourceCacheKeyAlloc(self.alloc, credentials_path, scope);
-        errdefer self.alloc.free(key);
+        return self.tokenSourceWithControl(credentials_path, scope, .{});
+    }
 
-        self.mutex.lockUncancelable(self.io);
+    pub fn tokenSourceWithControl(
+        self: *CredentialManager,
+        credentials_path: ?[]const u8,
+        scope: []const u8,
+        control: RequestControl,
+    ) !*CachedTokenSource {
+        try control.check();
+        const key = credentialSourceCacheKey(credentials_path, scope);
+
+        while (!self.mutex.tryLock()) {
+            try control.check();
+            try self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
         defer self.mutex.unlock(self.io);
+        try control.check();
         if (self.sources.get(key)) |source| {
-            self.alloc.free(key);
             return source;
         }
 
-        var cfg = if (credentials_path) |path|
-            configFromFileAlloc(self.alloc, path, scope) catch return error.MissingGoogleCredentials
-        else
-            configFromEnvAlloc(self.alloc, scope) catch return error.MissingGoogleCredentials;
-        errdefer cfg.deinit(self.alloc);
         const source = try self.alloc.create(CachedTokenSource);
         errdefer self.alloc.destroy(source);
-        source.* = try CachedTokenSource.initWithIo(self.alloc, cfg, self.io);
+        source.* = blk: {
+            var cfg = if (credentials_path) |path|
+                configFromFileAlloc(self.alloc, path, scope) catch return error.MissingGoogleCredentials
+            else
+                configFromEnvAlloc(self.alloc, scope) catch return error.MissingGoogleCredentials;
+            errdefer cfg.deinit(self.alloc);
+            try control.check();
+            break :blk try CachedTokenSource.initWithIo(self.alloc, cfg, self.io);
+        };
+        errdefer source.deinit();
+        try control.check();
         try self.sources.put(self.alloc, key, source);
         return source;
     }
 };
 
-/// Build a tagged credential-source identity. A printable sentinel is not
-/// sufficient here because it can also be a valid user-supplied file path.
-fn credentialSourceCacheKeyAlloc(
-    alloc: Allocator,
+/// Build a typed, fixed-size credential-source key. The shared identity keeps
+/// ADC cache behavior aligned with Vertex execution/cache partitioning.
+fn credentialSourceCacheKey(
     credentials_path: ?[]const u8,
     scope: []const u8,
-) ![]u8 {
-    if (credentials_path) |path|
-        return try std.fmt.allocPrint(alloc, "file\x00{s}\x00{s}", .{ path, scope });
-    return try std.fmt.allocPrint(alloc, "default-adc\x00{s}", .{scope});
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    credential_identity.CredentialSourceIdentity.googleAdc(credentials_path).updateHash(&hasher);
+    credential_identity.updateField(&hasher, scope);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+pub fn testCredentialSourceCacheKeys() !void {
+    const default_adc = credentialSourceCacheKey(null, "scope");
+    const sentinel_file = credentialSourceCacheKey("<default-adc>", "scope");
+    const ordinary_file = credentialSourceCacheKey("credentials.json", "scope");
+    const other_scope = credentialSourceCacheKey(null, "other-scope");
+
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &sentinel_file));
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &ordinary_file));
+    try std.testing.expect(!std.mem.eql(u8, &sentinel_file, &ordinary_file));
+    try std.testing.expect(!std.mem.eql(u8, &default_adc, &other_scope));
 }
 
 test "google credential cache keys distinguish default ADC from every file path" {
-    const alloc = std.testing.allocator;
-    const default_adc = try credentialSourceCacheKeyAlloc(alloc, null, "scope");
-    defer alloc.free(default_adc);
-    const sentinel_file = try credentialSourceCacheKeyAlloc(alloc, "<default-adc>", "scope");
-    defer alloc.free(sentinel_file);
-    const ordinary_file = try credentialSourceCacheKeyAlloc(alloc, "credentials.json", "scope");
-    defer alloc.free(ordinary_file);
-
-    try std.testing.expect(!std.mem.eql(u8, default_adc, sentinel_file));
-    try std.testing.expect(!std.mem.eql(u8, default_adc, ordinary_file));
-    try std.testing.expect(!std.mem.eql(u8, sentinel_file, ordinary_file));
+    try testCredentialSourceCacheKeys();
 }
 
 test "google credential manager releases its mutex before invalidation" {
@@ -876,6 +965,11 @@ pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
 }
 
 pub fn projectIdFromDefaultCredentialsAlloc(alloc: Allocator) !?[]u8 {
+    return projectIdFromDefaultCredentialsAllocWithControl(alloc, .{});
+}
+
+pub fn projectIdFromDefaultCredentialsAllocWithControl(alloc: Allocator, control: RequestControl) !?[]u8 {
+    try control.check();
     if ((try envOwned(alloc, "GOOGLE_CLOUD_PROJECT")) orelse (try envOwned(alloc, "GCLOUD_PROJECT"))) |value| return value;
     var cfg = configFromEnvAlloc(alloc, default_scope) catch return null;
     defer cfg.deinit(alloc);
@@ -885,7 +979,11 @@ pub fn projectIdFromDefaultCredentialsAlloc(alloc: Allocator) !?[]u8 {
         .metadata => |metadata| blk: {
             var transport = HttpxTransport.init(alloc, null) catch break :blk null;
             defer transport.deinit();
-            var response = HttpxTransport.request(&transport, alloc, .GET, metadata.project_id_url, &.{.{ "Metadata-Flavor", "Google" }}, null, null) catch break :blk null;
+            var response = HttpxTransport.request(&transport, alloc, .GET, metadata.project_id_url, &.{.{ "Metadata-Flavor", "Google" }}, null, null, control) catch |err| {
+                try control.check();
+                if (err == error.Cancelled or err == error.Timeout) return err;
+                break :blk null;
+            };
             defer response.deinit(alloc);
             if (response.status != 200) break :blk null;
             const project = std.mem.trim(u8, response.body, &std.ascii.whitespace);
@@ -1113,6 +1211,7 @@ test "google auth token source exchanges and caches access token" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: RequestControl,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -1197,6 +1296,7 @@ test "google auth metadata credentials mint and cache a token" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: RequestControl,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -1240,6 +1340,7 @@ test "google auth authorized user credentials refresh and cache a token" {
             _: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: RequestControl,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -1283,6 +1384,7 @@ test "google auth external account credentials honor subject token headers" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: RequestControl,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -1316,4 +1418,112 @@ fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8
         }
     }
     return error.MissingHeader;
+}
+
+test "google auth cancellation interrupts refresh queueing without touching its owner" {
+    const alloc = std.testing.allocator;
+    const cfg = try configFromJsonAlloc(alloc, "{\"type\":\"authorized_user\",\"client_id\":\"client\",\"client_secret\":\"secret\",\"refresh_token\":\"refresh\"}", default_scope);
+    var source = try CachedTokenSource.initWithIo(alloc, cfg, std.testing.io);
+    defer source.deinit();
+    try std.testing.expect(source.mutex.tryLock());
+    defer source.mutex.unlock();
+    const Probe = struct {
+        checks: std.atomic.Value(usize) = .init(0),
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            return self.checks.fetchAdd(1, .monotonic) >= 3;
+        }
+    };
+    var probe = Probe{};
+    try std.testing.expectError(error.Cancelled, source.accessTokenAllocWithControl(alloc, .{
+        .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.cancelled },
+    }));
+    try std.testing.expect(!source.mutex.tryLock());
+    try std.testing.expectError(error.Timeout, source.accessTokenAllocWithControl(alloc, RequestControl.fromTimeout(2, null)));
+    try std.testing.expect(!source.mutex.tryLock());
+    try std.testing.expect(source.cached_token == null);
+
+    var manager = CredentialManager.init(alloc, std.testing.io);
+    defer manager.deinit();
+    try std.testing.expect(manager.mutex.tryLock());
+    defer manager.mutex.unlock(std.testing.io);
+    try std.testing.expectError(error.Timeout, manager.tokenSourceWithControl("unused.json", default_scope, RequestControl.fromTimeout(2, null)));
+    try std.testing.expect(!manager.mutex.tryLock());
+}
+
+test "google auth federation preserves one budget and never masks cancellation with cached tokens" {
+    const alloc = std.testing.allocator;
+    const cfg = try configFromJsonAlloc(alloc, "{\"type\":\"external_account\",\"audience\":\"pool\",\"subject_token_type\":\"jwt\",\"token_url\":\"https://sts.test/token\",\"service_account_impersonation_url\":\"https://iam.test/token\",\"credential_source\":{\"url\":\"https://identity.test/token\"}}", default_scope);
+    const Probe = struct {
+        cancelled: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        cancel_at: usize = 0,
+        deadline_ns: ?u64 = null,
+        fn request(raw: ?*anyopaque, a: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, control: RequestControl) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expectEqual(self.deadline_ns, control.deadline_ns);
+            try std.testing.expect(control.cancellation.?.ptr == @as(*const anyopaque, &self.cancelled));
+            if (self.calls == self.cancel_at) self.cancelled.store(true, .release);
+            return .{ .status = 200, .body = try a.dupe(u8, switch (self.calls) {
+                1 => "subject",
+                2 => "{\"access_token\":\"federated\",\"expires_in\":3600}",
+                3 => "{\"accessToken\":\"impersonated\"}",
+                else => return error.UnexpectedExchange,
+            }) };
+        }
+    };
+    var probe = Probe{};
+    var source = CachedTokenSource.initWithRequestFn(alloc, cfg, &probe, Probe.request);
+    defer source.deinit();
+    source.cached_token = .{ .value = try alloc.dupe(u8, "still-valid"), .expires_at_s = nowSeconds() + 10 };
+    const control = RequestControl.fromTimeout(10_000, httpx.CancellationToken.fromAtomic(&probe.cancelled));
+    probe.deadline_ns = control.deadline_ns;
+    // Cancellation at each exchange must stop the chain, free its response,
+    // retain the previous cache entry, and release the refresh lock.
+    for (1..4) |stage| {
+        probe.calls = 0;
+        probe.cancel_at = stage;
+        probe.cancelled.store(false, .release);
+        try std.testing.expectError(error.Cancelled, source.accessTokenAllocWithControl(alloc, control));
+        try std.testing.expectEqual(stage, probe.calls);
+        try std.testing.expectEqualStrings("still-valid", source.cached_token.?.value);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+    }
+    probe.calls = 0;
+    probe.cancel_at = 0;
+    probe.cancelled.store(false, .release);
+    const token = try source.accessTokenAllocWithControl(alloc, control);
+    defer alloc.free(token);
+    try std.testing.expectEqualStrings("impersonated", token);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+}
+
+test "google auth cache publishes tokens only after caller allocation succeeds" {
+    const Probe = struct {
+        fn request(_: ?*anyopaque, alloc: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: RequestControl) !TransportResponse {
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"access_token\":\"refreshed\",\"expires_in\":3600}") };
+        }
+        fn run(alloc: Allocator) !void {
+            var source = CachedTokenSource.initWithRequestFn(alloc, .{
+                .scope = &.{},
+                .credentials = .{ .metadata = .{ .token_url = &.{}, .project_id_url = &.{} } },
+            }, null, request);
+            defer source.deinit();
+            const token = try source.accessTokenAllocWithControl(alloc, .{});
+            defer alloc.free(token);
+            try std.testing.expectEqualStrings("refreshed", source.cached_token.?.value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "google auth remaining budget includes previous exchanges" {
+    const control = RequestControl.fromTimeout(10_000, null);
+    const before = (try control.remainingTimeoutMs()).?;
+    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    const after = (try control.remainingTimeoutMs()).?;
+    try std.testing.expect(after < before);
+    try std.testing.expectError(error.Timeout, projectIdFromDefaultCredentialsAllocWithControl(std.testing.allocator, .{ .deadline_ns = 0 }));
 }

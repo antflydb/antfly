@@ -291,6 +291,9 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
 }
 
 pub fn main(init: std.process.Init) !void {
+    var worker_lifetime = platform.inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (try platform.inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -615,6 +618,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        // Only the replaceable worker advertises process termination. The
+        // stable parent owns restart after a hard cancellation boundary fires.
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
@@ -655,7 +663,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
-    node.attachIo(io);
+    try node.attachIo(io);
 
     try node.warmConfiguredModelsBeforeServing(allocator);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();

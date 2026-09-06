@@ -36,12 +36,15 @@ pub const EmbedOptions = struct {
 pub const GeminiProvider = struct {
     allocator: Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     api_key_header: [2][]const u8,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
+    request_timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
         var provider = GeminiProvider{
@@ -100,6 +103,7 @@ pub const GeminiProvider = struct {
         defer self.allocator.free(url);
         const headers = [_][2][]const u8{self.api_key_header};
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = &headers,
             .timeout_ms = options.timeout_ms,
@@ -123,6 +127,11 @@ pub const GeminiProvider = struct {
         self.top_k = top_k;
     }
 
+    pub fn setRequestControl(self: *GeminiProvider, timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) void {
+        self.request_timeout_ms = timeout_ms;
+        self.cancellation = cancellation;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
 
@@ -138,9 +147,15 @@ pub const GeminiProvider = struct {
         defer alloc.free(json_body);
 
         const headers = [_][2][]const u8{self.api_key_header};
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = &headers });
+        var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = &headers,
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = self.cancellation,
+        });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse);
     }
 
@@ -156,6 +171,7 @@ pub const Options = struct {
     credentials_path: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    request_control: google_auth.RequestControl = .{},
 };
 
 pub const RerankOptions = struct {
@@ -166,6 +182,7 @@ pub const RerankOptions = struct {
 pub const Provider = struct {
     allocator: Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     project_id: []const u8,
     location: []const u8,
@@ -176,14 +193,17 @@ pub const Provider = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?i64 = null,
+    request_control: google_auth.RequestControl = .{},
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: Options) !Provider {
+        try options.request_control.check();
         var provider = Provider{
             .allocator = allocator,
             .http = http,
             .base_url = &.{},
             .project_id = &.{},
             .location = &.{},
+            .request_control = options.request_control,
         };
         errdefer provider.deinit();
 
@@ -191,7 +211,7 @@ pub const Provider = struct {
         provider.project_id = if (options.project_id) |value|
             try allocator.dupe(u8, value)
         else
-            (try vertexProjectIdFromConfigAlloc(allocator, options.credentials_path) orelse return error.MissingVertexCredentials);
+            (try vertexProjectIdFromConfigAllocWithControl(allocator, options.credentials_path, options.request_control) orelse return error.MissingVertexCredentials);
         provider.location = try allocator.dupe(u8, options.location);
 
         if (options.bearer_token) |token| {
@@ -203,6 +223,7 @@ pub const Provider = struct {
             provider.owns_token_source = true;
         }
 
+        try options.request_control.check();
         return provider;
     }
 
@@ -243,6 +264,8 @@ pub const Provider = struct {
         documents: []const []const u8,
         options: RerankOptions,
     ) ![]f32 {
+        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        try control.check();
         const Record = struct {
             id: []const u8,
             content: []const u8,
@@ -277,14 +300,15 @@ pub const Provider = struct {
         defer headers.deinit(alloc);
         var minted_auth: ?[]u8 = null;
         defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
         try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
 
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = request_body,
             .headers = headers.items,
-            .timeout_ms = options.timeout_ms,
-            .cancellation = options.cancellation,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = control.cancellation,
         });
         defer response.deinit();
         if (!response.ok()) return switch (response.status.code) {
@@ -311,6 +335,8 @@ pub const Provider = struct {
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
+        const control = google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation);
+        try control.check();
         if (texts.len == 0) return error.EmptyResponse;
 
         var vectors = std.ArrayListUnmanaged([]const f32).empty;
@@ -323,11 +349,12 @@ pub const Provider = struct {
         const max_inputs = provider_defaults.vertexMaxEmbeddingBatchSize(model);
         while (offset < texts.len) {
             const batch_len = @min(max_inputs, texts.len - offset);
-            var batch = try self.embedTextRequest(
+            var batch = try self.embedTextRequestWithControl(
                 alloc,
                 model,
                 texts[offset .. offset + batch_len],
                 options,
+                control,
             );
             defer batch.deinit();
             if (batch.vectors.len != batch_len) return error.InvalidEmbeddingResponse;
@@ -354,6 +381,18 @@ pub const Provider = struct {
         texts: []const []const u8,
         options: EmbedOptions,
     ) !inference.EmbedResult {
+        return self.embedTextRequestWithControl(alloc, model, texts, options, google_auth.RequestControl.fromTimeout(options.timeout_ms, options.cancellation));
+    }
+
+    fn embedTextRequestWithControl(
+        self: *Provider,
+        alloc: Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        options: EmbedOptions,
+        control: google_auth.RequestControl,
+    ) !inference.EmbedResult {
+        try control.check();
         if (texts.len == 0 or texts.len > provider_defaults.vertexMaxEmbeddingBatchSize(model))
             return error.InvalidEmbeddingBatchSize;
         const Instance = struct {
@@ -379,12 +418,13 @@ pub const Provider = struct {
         defer headers.deinit(alloc);
         var minted_auth: ?[]u8 = null;
         defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
         var response = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = headers.items,
-            .timeout_ms = options.timeout_ms,
-            .cancellation = options.cancellation,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = control.cancellation,
         });
         defer response.deinit();
         if (!response.ok()) return mapEmbeddingStatus(response.status.code);
@@ -412,8 +452,18 @@ pub const Provider = struct {
         self.top_k = top_k;
     }
 
+    pub fn setRequestControl(self: *Provider, timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) void {
+        self.request_control = google_auth.RequestControl.fromTimeout(timeout_ms, cancellation);
+    }
+
+    pub fn setAbsoluteRequestControl(self: *Provider, control: google_auth.RequestControl) void {
+        self.request_control = control;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
+        const control = self.request_control;
+        try control.check();
 
         const model_path = try self.vertexModelPathAlloc(self.allocator, model);
         defer self.allocator.free(model_path);
@@ -436,11 +486,17 @@ pub const Provider = struct {
         defer headers.deinit(alloc);
         var minted_auth: ?[]u8 = null;
         defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
 
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = headers.items });
+        var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = headers.items,
+            .timeout_ms = try control.remainingTimeoutMs(),
+            .cancellation = control.cancellation,
+        });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
 
         return try parseGenerateResponseAlloc(alloc, body);
@@ -462,13 +518,23 @@ pub const Provider = struct {
         alloc: Allocator,
         headers: *std.ArrayList([2][]const u8),
         minted_auth: *?[]u8,
+        control: google_auth.RequestControl,
     ) !void {
+        // Constructor/discovery and operation budgets both apply. Legacy
+        // callers can omit the inference transport watchdog without dropping
+        // the independently owned credential transport's request deadline.
+        var auth_control = control;
+        if (self.request_control.deadline_ns) |deadline| {
+            auth_control.deadline_ns = @min(deadline, auth_control.deadline_ns orelse std.math.maxInt(u64));
+        }
+        if (auth_control.cancellation == null) auth_control.cancellation = self.request_control.cancellation;
+        try auth_control.check();
         if (self.auth_header) |header| {
             try headers.append(alloc, header);
             return;
         }
         if (self.token_source) |source| {
-            minted_auth.* = try source.authorizationValueAlloc(alloc);
+            minted_auth.* = try source.authorizationValueAllocWithControl(alloc, auth_control);
             try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
         }
     }
@@ -725,10 +791,15 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
 }
 
 pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
+    return vertexProjectIdFromConfigAllocWithControl(alloc, credentials_path, .{});
+}
+
+fn vertexProjectIdFromConfigAllocWithControl(alloc: Allocator, credentials_path: ?[]const u8, control: google_auth.RequestControl) !?[]u8 {
+    try control.check();
     if (credentials_path) |path| {
         return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
     }
-    return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
+    return try google_auth.projectIdFromDefaultCredentialsAllocWithControl(alloc, control);
 }
 
 fn appendJsonString(
@@ -891,6 +962,74 @@ test "vertex provider exchanges service account credentials and generates conten
     if (run_err) |err| return err;
 
     try std.testing.expectEqualStrings("generated from vertex", result.?.content);
+}
+
+test "vertex provider cancels and times out a stalled credential exchange" {
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    for ([_]bool{ true, false }) |cancel| {
+        var server = try httpx.TestServer.start(alloc, io, &.{});
+        defer server.deinit();
+        const cfg = google_auth.Config{
+            .scope = try alloc.dupe(u8, google_auth.default_scope),
+            .credentials = .{ .metadata = .{
+                .token_url = try alloc.dupe(u8, server.baseUrl()),
+                .project_id_url = try alloc.dupe(u8, server.baseUrl()),
+            } },
+        };
+        var source = try google_auth.CachedTokenSource.initWithIo(alloc, cfg, io);
+        defer source.deinit();
+        var client = server.client();
+        defer client.deinit();
+        var provider = try Provider.init(alloc, &client, .{
+            .base_url = server.baseUrl(),
+            .project_id = "proj",
+            .token_source = &source,
+        });
+        defer provider.deinit();
+        var cancelled = std.atomic.Value(bool).init(false);
+        provider.setRequestControl(if (cancel) 5_000 else 1_000, httpx.CancellationToken.fromAtomic(&cancelled));
+        const Job = struct {
+            provider: *Provider,
+            err: ?anyerror = null,
+            fn run(self: *@This()) std.Io.Cancelable!void {
+                var result = self.provider.generator().generate(std.testing.allocator, "gemini-test", &.{}) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                result.deinit();
+            }
+        };
+        var job = Job{ .provider = &provider };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        try group.concurrent(io, Job.run, .{&job});
+        const connection = try server.listener.accept();
+        var socket = connection.socket;
+        defer socket.close();
+        var request: [4096]u8 = undefined;
+        const size = try socket.reader().read(&request);
+        try std.testing.expect(size > 0);
+        // Hold the socket open without a response. The caller must return
+        // while authentication is still stalled, not at the inference POST.
+        if (cancel) cancelled.store(true, .release);
+        try group.await(io);
+        try std.testing.expectEqual(if (cancel) error.Cancelled else error.Timeout, job.err.?);
+        try std.testing.expect(source.cached_token == null);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+    }
+}
+
+test "vertex provider checks the original deadline before credential discovery" {
+    var client = httpx.Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    try std.testing.expectError(error.Timeout, Provider.init(std.testing.allocator, &client, .{
+        .credentials_path = "missing-credentials.json",
+        .request_control = .{ .deadline_ns = 0 },
+    }));
 }
 
 test "gemini provider sends api key and generates content" {

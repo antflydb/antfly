@@ -1546,7 +1546,7 @@ pub const MetalPartitionExecutor = struct {
             );
         }
 
-        const chunk_ops = frameChunkOps();
+        const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         if (reservePartitionGraphPlanForExecution(chunk_ops)) {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
@@ -1838,6 +1838,7 @@ pub const MetalPartitionExecutor = struct {
 
         var node_pos: usize = 0;
         while (node_pos < node_ids.len) : (node_pos += 1) {
+            try exec_ctx.check();
             const node_id = node_ids[node_pos];
             if (collect_loop_profile) loop_profile.nodes += 1;
             const i: usize = @intCast(node_id);
@@ -2389,6 +2390,7 @@ pub const MetalPartitionExecutor = struct {
                     if (chunk_local_outputs) {
                         try chunk_local_pool.resetAfterChunk(allocator, cb, buffer_plan, values);
                     }
+                    try exec_ctx.check();
                     frame_active = try cb.decoderRuntimeBeginFrame();
                     planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
                         try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
@@ -3750,6 +3752,8 @@ fn metalPartitionFrameDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FRAME", false);
 }
 
+const controlled_frame_chunk_ops: usize = 32;
+
 /// Coarse frame chunking: when `TERMITE_METAL_FRAME_CHUNK_OPS=N` (N>0), the
 /// partition's single command-buffer frame is split — after every N executed
 /// nodes the executor closes the planned scope, submits+waits the frame (which
@@ -3760,9 +3764,17 @@ fn metalPartitionFrameDisabled() bool {
 /// allowed only when the consumer is provably inside the current chunk, so no
 /// deferred/lazy value straddles a submit boundary (regions already execute
 /// atomically within one iteration, so a node-boundary == a region boundary).
-/// 0 = disabled (single-frame, current behavior).
-fn frameChunkOps() usize {
-    return platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_OPS") orelse 0;
+/// An explicit 0 disables chunking. Without an override, controlled requests
+/// use a bounded chunk while offline/uncontrolled execution stays single-frame.
+fn frameChunkOpsForExecution(options: ?interpreter.ExecuteOptions) usize {
+    if (platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_OPS")) |configured| return configured;
+    const execution_options = options orelse return 0;
+    if (execution_options.execution_control == null) return 0;
+    // A controlled request needs real submit/wait boundaries: checking while
+    // merely encoding one giant command buffer cannot observe cancellation
+    // while the GPU is executing it. Preserve the single-frame fast path for
+    // unbounded/offline work.
+    return controlled_frame_chunk_ops;
 }
 
 fn deferredProducerConsumerStaysInFrameChunk(

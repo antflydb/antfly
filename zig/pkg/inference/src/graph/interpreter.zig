@@ -25,6 +25,7 @@
 // runtime data via ExecuteOptions side channels.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ml = @import("ml");
@@ -138,6 +139,12 @@ pub const CachedAnalysis = struct {
 /// (paged attention, embedding lookup, MoE routing) pull from these
 /// rather than from the graph, since their data varies per invocation.
 pub const ExecuteOptions = struct {
+    /// Request lifetime checked before graph setup and at every reachable node.
+    /// A backend operation that is already executing still owns its buffers and
+    /// must return before cleanup, but graph-scale work can no longer ignore a
+    /// cancelled request for the remainder of the graph.
+    execution_control: ?InferenceExecutionControl = null,
+
     /// Per-node CT overrides (e.g. pre-computed tensors).
     runtime_inputs: ?[]const RuntimeInput = null,
 
@@ -284,6 +291,15 @@ pub const CapturedValuesResult = struct {
 fn containsCt(values: []const CT, needle: CT) bool {
     for (values) |value| {
         if (value == needle) return true;
+    }
+    return false;
+}
+
+pub fn isBorrowedRuntimeValue(options: ExecuteOptions, needle: CT) bool {
+    const inputs = options.runtime_inputs orelse return false;
+    for (inputs, 0..) |input, index| {
+        const donated = if (options.donate) |flags| index < flags.len and flags[index] else false;
+        if (!donated and input.value == needle) return true;
     }
     return false;
 }
@@ -623,6 +639,7 @@ pub fn execute(
     cb: *const ComputeBackend,
     options: ExecuteOptions,
 ) !ExecutionResult {
+    if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
     const trace_nodes = graphExecTraceEnabled();
     const profile_ops = graphOpProfileEnabled();
@@ -676,6 +693,20 @@ pub fn execute(
     const values = try allocator.alloc(?CT, count);
     defer allocator.free(values);
     @memset(values, null);
+    errdefer {
+        for (values, 0..) |maybe_value, index| {
+            const value = maybe_value orelse continue;
+            if (isBorrowedRuntimeValue(options, value)) continue;
+            var duplicate = false;
+            for (values[0..index]) |prior| {
+                if (prior == value) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) cb.free(value);
+        }
+    }
 
     const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
     defer if (!have_cache) allocator.free(shape_capture);
@@ -700,9 +731,11 @@ pub fn execute(
         .last_use = donation_last_use,
         .runtime_shapes = runtime_shapes,
     };
+    defer exec_state.freeMoeState();
 
     for (0..count) |i| {
         if (!reachable[i]) continue;
+        if (options.execution_control) |control| try control.check();
 
         const node_id: NodeId = @intCast(i);
 
@@ -910,9 +943,6 @@ pub fn execute(
         nullCtAliases(values, ct);
         cb.free(ct);
     }
-
-    // 8. Free MoE routing state from the last layer.
-    exec_state.freeMoeState();
 
     if (trace_nodes) {
         graphExecDiag("done outputs={} rss={}", .{ outputs.len, currentResidentBytes() });
@@ -5683,6 +5713,40 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
 const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
 const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
 const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
+
+test "interpreter cancellation releases owned intermediates and preserves borrowed inputs" {
+    const Control = struct {
+        checks: usize = 0,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 4) return error.Cancelled;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", Shape.init(.f32, &.{1}));
+    const one = try builder.scalarConst(.f32, 1.0);
+    const output = try builder.add(input, one);
+    try graph.markOutput(output);
+
+    var compute = TestCompute.init(allocator);
+    defer compute.deinit();
+    var backend = compute.backend();
+    const input_value = try backend.fromFloat32(&.{2.0});
+    defer backend.free(input_value);
+    const runtime_inputs = [_]RuntimeInput{.{ .node_id = input, .value = input_value }};
+    var control = Control{};
+
+    try std.testing.expectError(error.Cancelled, execute(allocator, &graph, &backend, .{
+        .runtime_inputs = &runtime_inputs,
+        .execution_control = .{ .ptr = &control, .check_fn = Control.check },
+    }));
+}
 
 test "native interpreter does not donate a reshape view before a future sibling view" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;

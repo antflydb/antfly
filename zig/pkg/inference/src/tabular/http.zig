@@ -18,6 +18,7 @@
 const std = @import("std");
 const tabular = @import("ml_tabular");
 const registry_mod = @import("registry.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const max_batch_size: usize = 10_000;
 
@@ -46,7 +47,9 @@ pub fn predict(
     alloc: std.mem.Allocator,
     reg: *registry_mod.Registry,
     req: PredictRequest,
-) HttpError!PredictResponse {
+    control: InferenceExecutionControl,
+) anyerror!PredictResponse {
+    try control.check();
     if (req.input.len > max_batch_size) return HttpError.BatchTooLarge;
 
     const handle = reg.acquire(io, req.model) catch return HttpError.ModelNotFound;
@@ -62,14 +65,20 @@ pub fn predict(
 
     // Allocate flat output + per-row slices.
     const out_flat = try alloc.alloc(f32, req.input.len * p.numOutputs());
+    errdefer alloc.free(out_flat);
     const out_rows = try alloc.alloc([]f32, req.input.len);
+    errdefer alloc.free(out_rows);
     const row_len = p.numOutputs();
     for (out_rows, 0..) |*r, i| r.* = out_flat[i * row_len .. (i + 1) * row_len];
 
-    // Cast to [][]f32 for the predictor API.
-    p.predict(req.input, out_rows) catch return HttpError.LoadFailed;
+    for (req.input, out_rows, 0..) |row, out, i| {
+        try control.update(.executing, i, req.input.len);
+        p.predictSingle(row, out) catch return HttpError.LoadFailed;
+    }
+    try control.update(.serializing, req.input.len, req.input.len);
 
     const ro = try alloc.alloc([]const f32, out_rows.len);
+    errdefer alloc.free(ro);
     for (out_rows, 0..) |r, i| ro[i] = r;
 
     // Resolve task from registry info (the predictor doesn't carry it directly).
@@ -88,4 +97,16 @@ fn findModelInfo(alloc: std.mem.Allocator, reg: *registry_mod.Registry, name: []
     defer alloc.free(all);
     for (all) |info| if (std.mem.eql(u8, info.name, name)) return info;
     return null;
+}
+
+test "tabular prediction observes execution control before model acquisition" {
+    var registry: registry_mod.Registry = undefined;
+    const control = InferenceExecutionControl{ .deadline_ns = 0 };
+    try std.testing.expectError(
+        error.Timeout,
+        predict(std.testing.io, std.testing.allocator, &registry, .{
+            .model = "unused",
+            .input = &.{},
+        }, control),
+    );
 }
