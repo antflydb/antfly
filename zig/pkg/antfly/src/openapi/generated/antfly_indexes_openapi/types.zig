@@ -7279,6 +7279,13 @@ pub const IndexMilestones = struct {
     complete: IndexMilestoneStatus,
 };
 
+/// An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation.
+pub const IndexMutationConflictError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
 pub const IndexPublicationPolicy = enum {
     progressive,

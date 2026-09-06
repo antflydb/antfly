@@ -211,13 +211,6 @@ pub fn collectSearchRequestStatsAlloc(
     return summary;
 }
 
-fn preflightRequestNeedsPrimaryTextIndex(req: types.SearchRequest) bool {
-    return req.full_text != null or
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query));
-}
-
 fn collectTextIndexEstimatesAlloc(
     alloc: std.mem.Allocator,
     collector: PlanningStatsCollector,
@@ -229,7 +222,7 @@ fn collectTextIndexEstimatesAlloc(
         items.deinit(alloc);
     }
 
-    if (preflightRequestNeedsPrimaryTextIndex(req)) {
+    if (query_search.requestBindsRootTextIndex(req)) {
         var estimate = try collector.resolveTextIndexEstimate(alloc, req.index_name, req) orelse return error.IndexNotFound;
         errdefer estimate.deinit(alloc);
         try appendUniqueTextIndexEstimate(alloc, &items, &estimate);
