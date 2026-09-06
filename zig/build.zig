@@ -2960,7 +2960,10 @@ pub fn build(b: *std.Build) void {
 
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
-        .filters = &.{"H2 response serialization strips connection-specific headers"},
+        .filters = &.{
+            "H2 response serialization strips connection-specific headers",
+            "HTTP streaming headers and automatic preflight preserve middleware policy",
+        },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
 
@@ -7669,7 +7672,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
             "standalone inference middleware reuses public API authentication",
-            "standalone CORS middleware enforces dynamic configuration",
+            "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",

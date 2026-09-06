@@ -505,6 +505,25 @@ fn finishAgentResult(
     return try encodeAgentResult(alloc, format, result);
 }
 
+/// Every terminal failure uses the same delivery decision as completion.
+/// A live sink owns the wire; a buffered caller owns the encoded transcript.
+fn failAgentResult(
+    alloc: std.mem.Allocator,
+    format: ResponseFormat,
+    live: *LiveEmitter,
+    err: anyerror,
+    kind: enum { retrieval, generation },
+) !EncodedResponse {
+    if (format == .json) return err;
+    // Generation callbacks may originate in a separately compiled runtime.
+    const name = if (kind == .generation) "GenerationFailed" else @errorName(err);
+    try live.emitValue("error", .{ .@"error" = name });
+    return .{
+        .content_type = "text/event-stream",
+        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, name),
+    };
+}
+
 const QueryRefinementPass = enum {
     initial,
     followup,
@@ -872,13 +891,8 @@ fn executeInternal(
         );
         defer alloc.free(query_json);
 
-        const query_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, query_json, request.query, retrieval_query.tree_search != null, true) catch |err| switch (format) {
-            .sse => return .{
-                .content_type = "text/event-stream",
-                .body = try encodeSseError(alloc, @errorName(err)),
-            },
-            .json => return err,
-        };
+        const query_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, query_json, request.query, retrieval_query.tree_search != null, true) catch |err|
+            return failAgentResult(alloc, format, &live, err, .retrieval);
         var evaluation_hits = query_hits;
         previous_query_hits = query_hits;
         tool_calls_made += 1;
@@ -908,13 +922,8 @@ fn executeInternal(
             );
             defer alloc.free(followup_query_json);
 
-            const followup_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, followup_query_json, request.query, retrieval_query.tree_search != null, false) catch |err| switch (format) {
-                .sse => return .{
-                    .content_type = "text/event-stream",
-                    .body = try encodeSseError(alloc, @errorName(err)),
-                },
-                .json => return err,
-            };
+            const followup_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, followup_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
+                return failAgentResult(alloc, format, &live, err, .retrieval);
             evaluation_hits = followup_hits;
             previous_query_hits = followup_hits;
             tool_calls_made += 1;
@@ -1020,13 +1029,8 @@ fn executeInternal(
                 );
                 defer alloc.free(expanded_query_json);
 
-                const expanded_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, expanded_query_json, request.query, true, false) catch |err| switch (format) {
-                    .sse => return .{
-                        .content_type = "text/event-stream",
-                        .body = try encodeSseError(alloc, @errorName(err)),
-                    },
-                    .json => return err,
-                };
+                const expanded_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, expanded_query_json, request.query, true, false) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 const merged_hits = try mergeTreeHits(arena, request.query, evaluation_hits, expanded_hits);
                 evaluation_hits = merged_hits;
                 previous_query_hits = merged_hits;
@@ -1108,13 +1112,8 @@ fn executeInternal(
                 );
                 defer alloc.free(refined_query_json);
 
-                const refined_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, refined_query_json, request.query, retrieval_query.tree_search != null, false) catch |err| switch (format) {
-                    .sse => return .{
-                        .content_type = "text/event-stream",
-                        .body = try encodeSseError(alloc, @errorName(err)),
-                    },
-                    .json => return err,
-                };
+                const refined_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, refined_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 evaluation_hits = refined_hits;
                 previous_query_hits = refined_hits;
                 tool_calls_made += 1;
@@ -1329,19 +1328,8 @@ fn executeInternal(
     if (generation_cfg) |cfg| {
         const exec = generation_runner orelse return error.UnsupportedRetrievalAgentRequest;
         const messages = try buildGenerationMessages(arena, request.query, hit_list.items, cfg);
-        var result = exec.executeChain(alloc, cfg.chain, messages) catch |err| switch (format) {
-            .sse => {
-                // Generation runners may live in independently compiled
-                // runtime units, where Zig error integers are not stable.
-                // Never expose a coincidentally matching local error name.
-                try live.emitValue("error", .{ .@"error" = "GenerationFailed" });
-                return .{
-                    .content_type = "text/event-stream",
-                    .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseGenerationError(alloc, err),
-                };
-            },
-            .json => return err,
-        };
+        var result = exec.executeChain(alloc, cfg.chain, messages) catch |err|
+            return failAgentResult(alloc, format, &live, err, .generation);
         defer result.deinit();
         generated_content = try arena.dupe(u8, result.content);
         try live.emitTextChunks("generation", generated_content.?);
@@ -5381,10 +5369,6 @@ fn encodeSseError(
     defer out.deinit(alloc);
     try appendSseEventValue(alloc, &out, "error", .{ .@"error" = message });
     return try out.toOwnedSlice(alloc);
-}
-
-fn encodeSseGenerationError(alloc: std.mem.Allocator, _: anyerror) ![]u8 {
-    return encodeSseError(alloc, "GenerationFailed");
 }
 
 fn appendSseEventValue(

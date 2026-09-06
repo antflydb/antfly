@@ -459,6 +459,7 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         closed: bool = false,
         generated: bool = false,
         fail_generation: bool = false,
+        fail_query: bool = false,
         fail_write: bool = false,
         json_request: bool = false,
         forbidden: bool = false,
@@ -490,7 +491,9 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
             try std.testing.expect(!self.closed);
             self.closed = true;
         }
-        fn query(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_query) return error.TableNotFound;
             return .{ .json = try alloc.dupe(u8,
                 \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha"}}]}}]}
             ) };
@@ -508,8 +511,8 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         }
     };
     const alloc = std.testing.allocator;
-    for (0..6) |case| {
-        var state = State{ .fail_generation = case == 1, .fail_write = case == 2, .json_request = case == 3, .forbidden = case == 4, .cancelled = case == 5 };
+    for (0..8) |case| {
+        var state = State{ .fail_generation = case == 1, .fail_write = case == 2, .json_request = case == 3 or case == 7, .forbidden = case == 4, .cancelled = case == 5, .fail_query = case >= 6 };
         defer state.bytes.deinit(alloc);
         var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
         defer request.deinit();
@@ -523,6 +526,11 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         , .{if (state.json_request) "false" else "true"});
         defer alloc.free(body);
         const result = retrieval_agent.executeWithEventSink(alloc, .{ .ptr = &state, .vtable = &.{ .authorize_query = State.authorize, .run_query = State.query } }, .{ .ptr = &state, .vtable = &.{ .execute_chain = State.generate } }, body, sink.iface());
+        if (state.fail_query and state.json_request) {
+            try std.testing.expectError(error.TableNotFound, result);
+            try std.testing.expect(!state.started);
+            continue;
+        }
         if (state.forbidden or state.cancelled) {
             try std.testing.expectError(if (state.forbidden) error.Forbidden else error.Canceled, result);
             try std.testing.expect(!state.started);
@@ -538,6 +546,15 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         const encoded = try result;
         defer alloc.free(encoded.body);
         try sink.close();
+        if (state.fail_query) {
+            try std.testing.expect(!state.generated);
+            try std.testing.expect(state.closed);
+            try std.testing.expectEqual(@as(usize, 0), encoded.body.len);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, state.bytes.items, "event: error\n"));
+            try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "TableNotFound") != null);
+            try std.testing.expect(std.mem.indexOf(u8, state.bytes.items, "event: done\n") == null);
+            continue;
+        }
         try std.testing.expect(state.generated);
         if (state.json_request) {
             try std.testing.expect(!state.started);
