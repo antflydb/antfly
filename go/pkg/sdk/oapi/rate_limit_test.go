@@ -26,7 +26,7 @@ func TestRateLimitPresenceRoundTrip(t *testing.T) {
 		"reranker":  func() any { return &RerankerConfig{} },
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, policy := range []string{"", `{}`, `{"requests_per_minute":60,"max_concurrency":2}`} {
+			for _, policy := range []string{"", `{}`, `{"requests_per_minute":60,"max_concurrency":2}`, `{"requests_per_minute":6000,"pacing":"completion"}`, `{"requests_per_minute":6000,"pacing":"token_bucket"}`} {
 				input := `{"provider":"antfly","model":"test"`
 				if policy != "" {
 					input += `,"rate_limit":` + policy
@@ -49,7 +49,7 @@ func TestRateLimitPresenceRoundTrip(t *testing.T) {
 					t.Fatalf("policy %q changed presence: %s", policy, wire)
 				}
 				if policy != "" {
-					var actual, expected map[string]int64
+					var actual, expected map[string]any
 					if err := json.Unmarshal(raw, &actual); err != nil {
 						t.Fatal(err)
 					}
@@ -61,7 +61,7 @@ func TestRateLimitPresenceRoundTrip(t *testing.T) {
 					}
 					for k, v := range expected {
 						if actual[k] != v {
-							t.Fatalf("%s = %d, want %d", k, actual[k], v)
+							t.Fatalf("%s = %v, want %v", k, actual[k], v)
 						}
 					}
 				}

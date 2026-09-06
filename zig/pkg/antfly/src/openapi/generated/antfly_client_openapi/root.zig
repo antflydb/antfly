@@ -552,6 +552,7 @@ pub const ReplicationSource = types.ReplicationSource;
 pub const ReplicationSourceActionHint = types.ReplicationSourceActionHint;
 pub const ReplicationSourceStatus = types.ReplicationSourceStatus;
 pub const ReplicationTransformOp = types.ReplicationTransformOp;
+pub const RequestPacing = types.RequestPacing;
 pub const RerankerCandidateLimitExceededError = types.RerankerCandidateLimitExceededError;
 pub const RerankerConfig = types.RerankerConfig;
 pub const RerankerProfile = types.RerankerProfile;

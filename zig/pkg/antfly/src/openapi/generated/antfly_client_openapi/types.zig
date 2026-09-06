@@ -26083,6 +26083,8 @@ pub const QueryUnprocessableError = union(enum) {
 
 /// Outbound provider limits shared within one Antfly process by effective endpoint, operation, model, credential source, project and region/location. Conflicting policies for an active scope are rejected. These limits do not coordinate across replicas or infer the provider's account quota.
 pub const RateLimitConfig = struct {
+    /// Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing.
+    pacing: ?RequestPacing = null,
     requests_per_minute: ?i64 = null,
     burst: ?i64 = null,
     /// Conservative text budget: each HTTP attempt reserves its serialized UTF-8 body byte count plus the configured generation output cap. Reservations are not refunded. A request larger than this budget is rejected. This is not provider billing token accounting; media requests are not supported with this limit.
@@ -26092,6 +26094,7 @@ pub const RateLimitConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "pacing", "pacing", true },
         .{ "requests_per_minute", "requests_per_minute", true },
         .{ "burst", "burst", true },
         .{ "tokens_per_minute", "tokens_per_minute", true },
@@ -26108,6 +26111,10 @@ pub const RateLimitConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.pacing) |value| {
+            try jw.objectField("pacing");
+            try jw.write(value);
+        }
         if (self.requests_per_minute) |value| {
             try jw.objectField("requests_per_minute");
             try jw.write(value);
@@ -26699,6 +26706,32 @@ pub const ReplicationTransformOp = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// token_bucket limits admission rate while allowing overlapping attempts. completion serializes attempts and waits one RPM interval after each attempt finishes, including streamed writes and transport failures. This prevents delayed connection setup from compressing successful request spacing, at the cost of response latency plus one interval per request. Requires requests_per_minute and burst=1. Neither mode can guarantee zero upstream 429s or coordinate other processes.
+pub const RequestPacing = enum {
+    token_bucket,
+    completion,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .token_bucket => "token_bucket",
+            .completion => "completion",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "token_bucket", .token_bucket },
+            .{ "completion", .completion },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

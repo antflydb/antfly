@@ -51,6 +51,8 @@ pub const QuotaIdentity = struct {
 };
 
 pub const Policy = struct {
+    pub const Pacing = enum { token_bucket, completion };
+    pacing: Pacing = .token_bucket,
     requests_per_minute: u32 = 0,
     burst: u32 = 1,
     tokens_per_minute: u64 = 0,
@@ -62,12 +64,26 @@ pub const Policy = struct {
 
     pub fn fromConfig(maybe: anytype) !Policy {
         const config = maybe orelse return .{};
-        return .{
+        const policy = Policy{
+            .pacing = if (config.pacing) |value| std.meta.stringToEnum(Pacing, @tagName(value)).? else .token_bucket,
             .requests_per_minute = try positive(u32, config.requests_per_minute, 0),
             .burst = try positive(u32, config.burst, 1),
             .tokens_per_minute = try positive(u64, config.tokens_per_minute, 0),
             .max_concurrency = try positive(u32, config.max_concurrency, 0),
         };
+        try policy.validate();
+        return policy;
+    }
+
+    fn validate(self: Policy) !void {
+        if (self.burst == 0) return error.InvalidRateLimitPolicy;
+        if (self.pacing == .completion and (self.requests_per_minute == 0 or self.burst != 1))
+            return error.InvalidRateLimitPolicy;
+    }
+
+    fn intervalNs(self: Policy) u64 {
+        std.debug.assert(self.requests_per_minute > 0);
+        return std.math.divCeil(u64, 60 * std.time.ns_per_s, self.requests_per_minute) catch unreachable;
     }
 
     fn positive(comptime T: type, value: anytype, default: T) !T {
@@ -91,6 +107,7 @@ pub const Limiter = struct {
     tokens: f64,
     last_ns: u64,
     cooldown_ns: u64 = 0,
+    next_start_ns: u64 = 0,
     in_flight: u32 = 0,
 
     fn init(policy: Policy) Limiter {
@@ -134,6 +151,12 @@ pub const Limiter = struct {
         self.refill(now);
         const minute: f64 = 60 * std.time.ns_per_s;
         if (now < self.cooldown_ns) return self.cooldown_ns - now;
+        // An admission timestamp is not a send timestamp: connection setup,
+        // scheduler stalls and streaming can all delay the admitted request.
+        // Completion pacing never banks reservations during that uncertainty.
+        if (self.policy.pacing == .completion and self.in_flight != 0)
+            return std.time.ns_per_ms;
+        if (now < self.next_start_ns) return self.next_start_ns - now;
         if (self.policy.max_concurrency != 0 and self.in_flight >= self.policy.max_concurrency)
             return std.time.ns_per_ms;
         if (self.policy.requests_per_minute != 0 and self.requests < 1)
@@ -150,12 +173,18 @@ pub const Limiter = struct {
         const self: *Limiter = @ptrCast(@alignCast(ptr));
         sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        self.finishAt(response, nowNs(), wallSeconds());
+    }
+
+    fn finishAt(self: *Limiter, response: ?*const httpx.Response, now: u64, wall_seconds: u64) void {
         std.debug.assert(self.in_flight > 0);
         self.in_flight -= 1;
+        if (self.policy.pacing == .completion)
+            self.next_start_ns = @max(self.next_start_ns, now +| self.policy.intervalNs());
         if (response) |res| {
             if (res.status.code == 429) {
-                const seconds = retryAfterSeconds(res.header("Retry-After"), wallSeconds());
-                self.cooldown_ns = @max(self.cooldown_ns, nowNs() +| seconds *| std.time.ns_per_s);
+                const seconds = retryAfterSeconds(res.header("Retry-After"), wall_seconds);
+                self.cooldown_ns = @max(self.cooldown_ns, now +| seconds *| std.time.ns_per_s);
             }
         }
     }
@@ -182,7 +211,7 @@ pub const Registry = struct {
     }
 
     pub fn acquire(self: *Registry, identity: QuotaIdentity, policy: Policy) !Handle {
-        if (policy.burst == 0) return error.InvalidRateLimitPolicy;
+        try policy.validate();
         sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const key = identity.digest();
@@ -193,7 +222,7 @@ pub const Registry = struct {
             if (entry.refs == 0) entry.limiter.refill(now);
             // TTL alone cannot retire debt: a large burst at a low RPM can
             // take longer than the idle TTL to replenish.
-            if (entry.refs == 0 and now -| entry.released_ns >= idle_ttl and now >= entry.limiter.cooldown_ns and
+            if (entry.refs == 0 and now -| entry.released_ns >= idle_ttl and now >= entry.limiter.cooldown_ns and now >= entry.limiter.next_start_ns and
                 (entry.limiter.policy.requests_per_minute == 0 or entry.limiter.requests >= @as(f64, @floatFromInt(entry.limiter.policy.burst))) and
                 entry.limiter.tokens >= @as(f64, @floatFromInt(entry.limiter.policy.tokens_per_minute)))
             {
@@ -378,6 +407,97 @@ pub fn testProviderQuotas() !void {
 
 test "provider quotas share identity and enforce policy without leaking permits" {
     try testProviderQuotas();
+}
+
+test "provider quotas completion pacing anchors to finish without banking delayed dispatches" {
+    const ms = std.time.ns_per_ms;
+    var limiter = Limiter.init(.{ .pacing = .completion, .requests_per_minute = 6000 });
+    const start = limiter.last_ns;
+    try std.testing.expectEqual(@as(u64, 0), limiter.tryReserve(start, 0));
+    // DNS/TLS, scheduler stalls or streaming can outlast many RPM intervals.
+    // None of them may grant another attempt while this one is outstanding.
+    const finish = start + 1000 * ms;
+    try std.testing.expect(limiter.tryReserve(finish, 0) != 0);
+    try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
+    limiter.finishAt(null, finish, 0);
+    try std.testing.expectEqual(@as(u64, 10 * ms), limiter.tryReserve(finish, 0));
+    try std.testing.expectEqual(@as(u64, 1), limiter.tryReserve(finish + 10 * ms - 1, 0));
+    try std.testing.expectEqual(@as(u64, 0), limiter.tryReserve(finish + 10 * ms, 0));
+    var response = httpx.Response.init(std.testing.allocator, 429);
+    defer response.deinit();
+    try response.headers.set("Retry-After", "2");
+    limiter.finishAt(&response, finish + 11 * ms, 0);
+    try std.testing.expectEqual(@as(u64, 2000 * ms), limiter.tryReserve(finish + 11 * ms, 0));
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+
+    // Token-bucket mode intentionally permits overlap and has no hidden
+    // completion delay or fixed 50 ms safety margin.
+    var bucket = Limiter.init(.{ .requests_per_minute = 6000 });
+    const base = bucket.last_ns;
+    try std.testing.expectEqual(@as(u64, 0), bucket.tryReserve(base, 0));
+    try std.testing.expectEqual(@as(u64, 0), bucket.tryReserve(base + 10 * ms, 0));
+    try std.testing.expectEqual(@as(u32, 2), bucket.in_flight);
+    bucket.finishAt(null, base + 11 * ms, 0);
+    bucket.finishAt(null, base + 12 * ms, 0);
+    try std.testing.expectEqual(@as(u64, 0), bucket.next_start_ns);
+}
+
+test "provider quotas validate pacing and preserve completion debt across policy replacement" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    const identity = QuotaIdentity{ .operation = .generation, .endpoint = .{
+        .provider = .openai,
+        .endpoint = "https://example.test",
+        .model = "test",
+        .credentials = .none(),
+    } };
+    try std.testing.expectError(error.InvalidRateLimitPolicy, registry.acquire(identity, .{ .pacing = .completion }));
+    try std.testing.expectError(error.InvalidRateLimitPolicy, registry.acquire(identity, .{ .pacing = .completion, .requests_per_minute = 60, .burst = 2 }));
+    var first = try registry.acquire(identity, .{ .pacing = .completion, .requests_per_minute = 60 });
+    const limiter = first.limiter();
+    try std.testing.expectEqual(@as(u64, 0), limiter.tryReserve(nowNs(), 0));
+    Limiter.after(limiter, null);
+    const not_before = limiter.next_start_ns;
+    try std.testing.expectError(error.ConflictingRateLimitPolicy, registry.acquire(identity, .{ .requests_per_minute = 60 }));
+    first.release();
+    var replaced = try registry.acquire(identity, .{ .requests_per_minute = 6000 });
+    defer replaced.release();
+    try std.testing.expect(replaced.limiter() == limiter);
+    try std.testing.expectEqual(not_before, limiter.next_start_ns);
+    try std.testing.expect(limiter.tryReserve(not_before - 1, 0) != 0);
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
+}
+
+test "provider quotas completion wait honors deadlines and cancellation without stealing a permit" {
+    const Probe = struct {
+        checks: usize = 0,
+        cancel: bool = false,
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checks += 1;
+            return self.cancel and self.checks >= 2;
+        }
+    };
+    var limiter = Limiter.init(.{ .pacing = .completion, .requests_per_minute = 6000 });
+    try std.testing.expectEqual(@as(u64, 0), limiter.tryReserve(nowNs(), 0));
+    const hook = limiter.observer(0);
+    var probe = Probe{};
+    var context = httpx.AttemptObserver.Context{
+        .io = std.testing.io,
+        .deadline_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() + 5,
+        .cancellation_ptr = &probe,
+        .is_cancelled = Probe.cancelled,
+        .body_bytes = 0,
+        .output_tokens = 0,
+    };
+    try std.testing.expectError(error.Timeout, hook.before(hook.ptr, context));
+    try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
+    context.deadline_ms = null;
+    probe = .{ .cancel = true };
+    try std.testing.expectError(error.Cancelled, hook.before(hook.ptr, context));
+    try std.testing.expectEqual(@as(u32, 1), limiter.in_flight);
+    hook.after(hook.ptr, null);
+    try std.testing.expectEqual(@as(u32, 0), limiter.in_flight);
 }
 
 test "provider quotas observe every retry and retain the permit through streamed writes" {

@@ -9241,12 +9241,25 @@ export interface components {
             retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /**
+         * @description token_bucket limits admission rate while allowing overlapping attempts.
+         *     completion serializes attempts and waits one RPM interval after each
+         *     attempt finishes, including streamed writes and transport failures.
+         *     This prevents delayed connection setup from compressing successful
+         *     request spacing, at the cost of response latency plus one interval per
+         *     request. Requires requests_per_minute and burst=1. Neither mode can
+         *     guarantee zero upstream 429s or coordinate other processes.
+         * @enum {string}
+         */
+        RequestPacing: "token_bucket" | "completion";
+        /**
          * @description Outbound provider limits shared within one Antfly process by effective
          *     endpoint, operation, model, credential source, project and region/location.
          *     Conflicting policies for an active scope are rejected. These limits do
          *     not coordinate across replicas or infer the provider's account quota.
          */
         RateLimitConfig: {
+            /** @description Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing. */
+            pacing?: components["schemas"]["RequestPacing"];
             /** Format: int64 */
             requests_per_minute?: number;
             /**

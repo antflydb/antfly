@@ -815,6 +815,7 @@ from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_source_type import ReplicationSourceType
 from .replication_transform_op import ReplicationTransformOp
+from .request_pacing import RequestPacing
 from .reranker_candidate_limit_exceeded_error import RerankerCandidateLimitExceededError
 from .reranker_candidate_limit_exceeded_error_error import RerankerCandidateLimitExceededErrorError
 from .reranker_candidate_limit_exceeded_error_status import RerankerCandidateLimitExceededErrorStatus
@@ -1813,6 +1814,7 @@ __all__ = (
     "ReplicationSourceStatus",
     "ReplicationSourceType",
     "ReplicationTransformOp",
+    "RequestPacing",
     "RerankerCandidateLimitExceededError",
     "RerankerCandidateLimitExceededErrorError",
     "RerankerCandidateLimitExceededErrorStatus",

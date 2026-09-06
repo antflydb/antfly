@@ -21,6 +21,34 @@ must be positive. Legacy embedder `requests_per_minute` and `burst` remain
 supported, but cannot be combined with `rate_limit`. Nested configuration does
 not inherit the legacy environment-based request limit.
 
+## Pacing and concurrency
+
+`rate_limit.pacing` separates two request scheduling contracts:
+
+- `token_bucket` (default): RPM limits attempt admissions, permits configured
+  bursts, and allows overlap up to `max_concurrency`. It does not promise a
+  minimum interval between arrivals at a remote server.
+- `completion`: requires RPM and `burst: 1`. At most one attempt is active;
+  after it finishes, the scope waits `ceil(60 seconds / RPM)` before admitting
+  another. The interval starts after response consumption, including streaming,
+  or transport failure—not before DNS, TLS, or connection setup. Slow responses
+  reduce throughput: each request costs its latency plus the RPM interval.
+
+Legacy flat embedder RPM settings (including environment defaults) with
+`burst: 1` use completion pacing to preserve the non-bursting path without an
+arbitrary fixed safety margin. Legacy larger bursts use token-bucket pacing.
+For explicit configuration, for example:
+
+```json
+{"rate_limit":{"requests_per_minute":6000,"pacing":"completion"}}
+```
+
+Completion delay and 429 cooldowns are shared and survive drained policy
+replacement. Waiting remains deadline- and cancellation-aware. Completion
+pacing prevents delayed successful attempts from bunching up, but cannot
+guarantee zero 429s from account-wide limits, other processes, or requests whose
+remote execution outlives a transport failure. Both modes retain retry handling.
+
 ## Scope and lifecycle
 
 Within one Antfly process, callers share a quota when their effective provider,

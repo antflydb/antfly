@@ -166,6 +166,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
+    "../specs/openapi/shared/provider.yaml",
     "../specs/openapi/antfly/schema.yaml",
     "../specs/openapi/antfly/indexes.yaml",
     "../specs/openapi/antfly/generated/graph_identifier.yaml",

@@ -4,3 +4,4 @@
 pub const types = @import("types.zig");
 
 pub const RateLimitConfig = types.RateLimitConfig;
+pub const RequestPacing = types.RequestPacing;

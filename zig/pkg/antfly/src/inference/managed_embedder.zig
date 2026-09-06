@@ -3366,6 +3366,10 @@ fn buildManagedEmbeddingEntry(
     } else {
         rate_limit.requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
         rate_limit.burst = try resolveEmbedderBurst(embedder, provider);
+        // Legacy single-request pacing promised a non-bursting provider path.
+        // Anchor it to completion rather than an arbitrary transport margin.
+        if (rate_limit.requests_per_minute != 0 and rate_limit.burst == 1)
+            rate_limit.pacing = .completion;
     }
     if (rate_limit.tokens_per_minute != 0 and embedder_cfg.multimodal) return error.UnsupportedMediaTokenBudget;
     const requests_per_minute = rate_limit.requests_per_minute;

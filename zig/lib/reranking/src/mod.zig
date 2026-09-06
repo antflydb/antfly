@@ -436,6 +436,8 @@ test "reranking config preserves shared rate limits through cloning and JSON" {
     const alloc = std.testing.allocator;
     var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"test\",\"field\":\"body\",\"rate_limit\":{\"requests_per_minute\":120,\"burst\":2,\"tokens_per_minute\":1000,\"max_concurrency\":4}}");
     defer cfg.deinit(alloc);
+    cfg.rate_limit.?.pacing = .completion;
+    cfg.rate_limit.?.burst = 1;
     var cloned = try cfg.clone(alloc);
     defer cloned.deinit(alloc);
     const encoded = try stringifyAlloc(alloc, cloned);
@@ -443,5 +445,6 @@ test "reranking config preserves shared rate limits through cloning and JSON" {
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
     try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
+    try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
     try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
 }
