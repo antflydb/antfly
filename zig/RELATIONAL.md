@@ -251,18 +251,21 @@ Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
 **Columnar-index integration seam:** `TypedDocValuesWriter` is a segment-level
-accumulator (all docs in a segment → one `build()`), not a per-document store,
-so populating columns belongs in the segment builder that owns the write batch,
-not in the per-document `writeDocFacts`. The seam is: add
-`relational_columns: []const FieldConfig` to the index `Config`
-(`storage/db/algebraic/index.zig`), and at segment build collect, per column, a
-`TypedDocValuesWriter` fed by `projectRelationalRowJsonAlloc` for each document in
-the batch, plus a per-column null bitmap for explicit null document IDs, then
-persist each built section. The typed value stream identifies present values,
-the null bitmap identifies explicit nulls, and membership in neither means the
-column was absent. Segment reconstruction must pass that null state through
-`relational_row_codec.appendCellValue`. The authoritative base row already
-avoids a duplicate JSON blob; this seam adds a derived scan accelerator.
+accumulator (all rows in a segment → one `build()`), not a per-document store.
+The accelerator must therefore be table-owned hidden derived state, rather than
+being duplicated into whichever user text index happens to exist. Prepared rows
+feed per-column writers directly from their typed ordinal cells, alongside a
+null bitmap; no JSON projection or reparsing belongs in this path. The typed
+value stream identifies present values, the null bitmap identifies explicit
+nulls, and membership in neither means the column was absent.
+
+Column segments are bound to the table generation, schema layout version, and a
+covered primary-store sequence. Insert/update/delete publication uses the same
+durable replay boundary as the other derived families. A replacement generation
+is built in the background and becomes readable only after its coverage fence
+is durable; until then, reads fall back to AROW. This keeps one row authority,
+makes schema changes and crash recovery explicit, and prevents a user-visible
+index configuration from controlling SQL/relational scan performance.
 
 ### Query path
 
@@ -280,7 +283,7 @@ remote shard therefore holds one read transaction for the requested range and
 the caller applies byte-level backpressure while decoding rows. Custom request
 executors that do not implement streaming retain the bounded row-paged fallback.
 
-Segment `typed_doc_values` remain a complementary future accelerator for broad
+Table-owned `typed_doc_values` remain a complementary accelerator for broad
 range scans and aggregations. They are not required for direct AROW projection
 or filtering and never become a second row authority.
 
@@ -313,9 +316,10 @@ physical representation and backfill plan are compatible.
 - **Phase 3 — ordinal execution (complete).** Compiled predicate/projection
   plans, physical-header TTL, and direct-ordinal vector extraction avoid full
   document reconstruction on the relational hot paths.
-- **Phase 4 — segment typed-column persistence (optional accelerator).** Wire per-column
-  `TypedDocValuesWriter` accumulation into the segment builder and persist the
-  sections (see "Columnar-index integration seam" above).
+- **Phase 4 — table-owned typed-column persistence (optional accelerator).**
+  Feed per-column `TypedDocValuesWriter` accumulation from `PreparedRow` cells,
+  persist null bitmaps and coverage metadata, and publish through a durable
+  generation state machine (see "Columnar-index integration seam" above).
 - **Phase 5 — segment columnar scan + predicate pushdown.** Table-scan operator over
   `typed_doc_values`; route typed-column predicates to it; columnar projection
   on read.

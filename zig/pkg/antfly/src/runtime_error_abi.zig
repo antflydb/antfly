@@ -475,6 +475,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
         error.BackupManifestTooLarge => status(.invalid_argument, .backup_manifest_too_large),
+        // Reuse the stable wire detail: both errors tell a remote caller that
+        // the archive's metadata exceeds the accepted manifest envelope.
+        error.BackupSchemaHistoryTooLarge => status(.invalid_argument, .backup_manifest_too_large),
         error.BackupIntegrityFailure => status(.corrupt, .backup_integrity_failure),
         error.BackupArtifactIntegrityMismatch => status(.corrupt, .backup_artifact_integrity_mismatch),
         error.BackupRepositoryBusy => status(.retryable, .backup_repository_busy),
@@ -1006,6 +1009,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
+    const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), schema_history_status.code);
+    try std.testing.expectEqual(@intFromEnum(Detail.backup_manifest_too_large), schema_history_status.detail);
+    try std.testing.expectEqual(error.BackupManifestTooLarge, errorFromStatus(schema_history_status));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
     try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));

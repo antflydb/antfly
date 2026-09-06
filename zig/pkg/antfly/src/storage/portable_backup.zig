@@ -1554,6 +1554,9 @@ fn PortableArchiveReader(comptime RawReader: type) type {
     };
 }
 
+pub const default_max_schema_metadata_entries: usize = 4096;
+pub const default_max_schema_metadata_bytes: usize = 64 * 1024 * 1024;
+
 pub const ImportOptions = struct {
     pub const EmbeddingSourceField = struct {
         index_name: []const u8,
@@ -1573,6 +1576,11 @@ pub const ImportOptions = struct {
     progress_fn: ?*const fn (?*anyopaque, ImportProgress) void = null,
     cancel_context: ?*anyopaque = null,
     is_cancelled_fn: ?*const fn (?*anyopaque) bool = null,
+    /// Bound decoded schema history retained while validating an archive. AFB2
+    /// metadata is staged durably before rows, but validators and physical
+    /// layouts are deliberately kept in a bounded in-memory working set.
+    max_schema_metadata_entries: usize = default_max_schema_metadata_entries,
+    max_schema_metadata_bytes: usize = default_max_schema_metadata_bytes,
 };
 
 pub const ImportProgress = struct {
@@ -1776,7 +1784,11 @@ fn validateAndImportPortableStagingReader(
         return imported_identity;
     }
 
-    var archive: PortableArchiveValidation = .{ .format_version = header.format_version };
+    var archive: PortableArchiveValidation = .{
+        .format_version = header.format_version,
+        .max_schema_metadata_entries = opts.max_schema_metadata_entries,
+        .max_schema_metadata_bytes = opts.max_schema_metadata_bytes,
+    };
     defer archive.deinit(alloc);
     var imported_identity = false;
     var block_index: usize = 0;
@@ -1900,7 +1912,11 @@ fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: Import
 
 fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportOptions) !void {
     const header = try reader.readHeader();
-    var archive: PortableArchiveValidation = .{ .format_version = header.format_version };
+    var archive: PortableArchiveValidation = .{
+        .format_version = header.format_version,
+        .max_schema_metadata_entries = opts.max_schema_metadata_entries,
+        .max_schema_metadata_bytes = opts.max_schema_metadata_bytes,
+    };
     defer archive.deinit(alloc);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
@@ -1945,6 +1961,10 @@ const ArchiveSchemaLayout = struct {
 
 const PortableArchiveValidation = struct {
     format_version: u32,
+    max_schema_metadata_entries: usize = default_max_schema_metadata_entries,
+    max_schema_metadata_bytes: usize = default_max_schema_metadata_bytes,
+    schema_metadata_entries: usize = 0,
+    schema_metadata_bytes: usize = 0,
     saw_document_rows: bool = false,
     saw_relational_rows: bool = false,
     saw_document_block: bool = false,
@@ -1960,6 +1980,19 @@ const PortableArchiveValidation = struct {
     saw_index_catalog: bool = false,
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
+
+    fn accountSchemaMetadata(self: *PortableArchiveValidation, entry: backup_codec.KeyValueEntry) !void {
+        const next_entries = std.math.add(usize, self.schema_metadata_entries, 1) catch
+            return error.BackupSchemaHistoryTooLarge;
+        const entry_bytes = std.math.add(usize, entry.key.len, entry.value.len) catch
+            return error.BackupSchemaHistoryTooLarge;
+        const next_bytes = std.math.add(usize, self.schema_metadata_bytes, entry_bytes) catch
+            return error.BackupSchemaHistoryTooLarge;
+        if (next_entries > self.max_schema_metadata_entries or next_bytes > self.max_schema_metadata_bytes)
+            return error.BackupSchemaHistoryTooLarge;
+        self.schema_metadata_entries = next_entries;
+        self.schema_metadata_bytes = next_bytes;
+    }
 
     fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
         if (self.runtime_physical_layout) |*layout| layout.deinit();
@@ -2057,6 +2090,31 @@ const PortableArchiveValidation = struct {
         if (self.saw_document_rows and runtime_relational) return error.InvalidBackupRequest;
     }
 };
+
+test "portable archive schema history accounting is bounded" {
+    var by_count: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .max_schema_metadata_entries = 1,
+        .max_schema_metadata_bytes = 1024,
+    };
+    try by_count.accountSchemaMetadata(.{ .key = "schema:1", .value = "{}" });
+    try std.testing.expectError(
+        error.BackupSchemaHistoryTooLarge,
+        by_count.accountSchemaMetadata(.{ .key = "schema:2", .value = "{}" }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), by_count.schema_metadata_entries);
+
+    var by_bytes: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .max_schema_metadata_entries = 8,
+        .max_schema_metadata_bytes = 4,
+    };
+    try std.testing.expectError(
+        error.BackupSchemaHistoryTooLarge,
+        by_bytes.accountSchemaMetadata(.{ .key = "key", .value = "12" }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), by_bytes.schema_metadata_bytes);
+}
 
 fn validatePortableImportBlockPayload(
     alloc: Allocator,
@@ -2199,6 +2257,7 @@ fn validateMetadataEntries(
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
         if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
+            try archive.accountSchemaMetadata(entry);
             if (archive.runtime_schema != null) return error.InvalidMetadataBatch;
             const schema = storage_schema.deserializeSchema(alloc, entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -2213,6 +2272,7 @@ fn validateMetadataEntries(
             archive.runtime_schema = schema;
             schema_owned = false;
         } else if (std.mem.startsWith(u8, entry.key, schema_version_prefix)) {
+            try archive.accountSchemaMetadata(entry);
             const schema = storage_schema.deserializeSchema(alloc, entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
@@ -2243,6 +2303,7 @@ fn validateMetadataEntries(
             }
             inserted.value_ptr.* = archive_layout;
         } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+            try archive.accountSchemaMetadata(entry);
             if (archive.active_public_validator != null) return error.InvalidMetadataBatch;
             archive.active_public_validator = public_table_schema.CompiledTableValidator.init(alloc, entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -2252,6 +2313,7 @@ fn validateMetadataEntries(
             std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
             archive.active_public_digest = digest;
         } else if (std.mem.startsWith(u8, entry.key, public_table_schema.versioned_schema_key_prefix)) {
+            try archive.accountSchemaMetadata(entry);
             const suffix = entry.key[public_table_schema.versioned_schema_key_prefix.len..];
             const key_version = std.fmt.parseInt(u32, suffix, 10) catch return error.InvalidMetadataBatch;
             var validator = public_table_schema.CompiledTableValidator.init(alloc, entry.value) catch |err| switch (err) {

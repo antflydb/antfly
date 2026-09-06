@@ -284,6 +284,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         // arguments rather than opaque server faults.
         error.BackupBlockTooLarge,
         error.BackupManifestTooLarge,
+        error.BackupSchemaHistoryTooLarge,
         error.IncompleteBackupInventory,
         error.InvalidBackupDigest,
         error.InvalidBackupManifest,

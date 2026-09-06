@@ -3071,6 +3071,7 @@ pub fn build(b: *std.Build) void {
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
             "portable restore validates historical rows with their public schema epoch",
+            "portable archive schema history accounting is bounded",
             "ordinal rows bind layout support projection checksum and canonical bytes",
             "export and import chunk artifacts round trip with public artifact ids",
             "export and import asset artifacts round trip with public artifact ids",

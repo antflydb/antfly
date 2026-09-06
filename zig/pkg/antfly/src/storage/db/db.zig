@@ -31786,7 +31786,10 @@ pub const DB = struct {
         };
 
         const ScanState = struct {
+            const max_resident_schema_plans = 32;
             const SchemaPlan = struct {
+                version: u32,
+                access: u64,
                 view: schema_registry_mod.SchemaView,
                 filter: ?db_query_graph.PreparedOrdinalPatternFilter = null,
                 projection: ?relational_row_codec.OrdinalProjectionPlan = null,
@@ -31816,6 +31819,7 @@ pub const DB = struct {
             document_key_scratch: std.ArrayListUnmanaged(u8) = .empty,
             schema_plans: std.ArrayListUnmanaged(SchemaPlan) = .empty,
             schema_plan_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+            schema_plan_clock: u64 = 0,
             visitor: types.ScanVisitor,
             count: u32 = 0,
 
@@ -31835,8 +31839,15 @@ pub const DB = struct {
             }
 
             fn schemaPlan(state: *@This(), version: u32) !*SchemaPlan {
-                if (state.schema_plan_indexes.get(version)) |index|
+                state.schema_plan_clock +%= 1;
+                if (state.schema_plan_clock == 0) {
+                    for (state.schema_plans.items) |*resident| resident.access = 0;
+                    state.schema_plan_clock = 1;
+                }
+                if (state.schema_plan_indexes.get(version)) |index| {
+                    state.schema_plans.items[index].access = state.schema_plan_clock;
                     return &state.schema_plans.items[index];
+                }
 
                 try state.schema_plan_indexes.ensureUnusedCapacity(state.alloc, 1);
                 var view = (try state.db.core.acquireSchemaVersionView(version)) orelse
@@ -31866,16 +31877,36 @@ pub const DB = struct {
                     null;
                 var projection_owned = projection != null;
                 errdefer if (projection_owned) projection.?.deinit();
-                try state.schema_plans.append(state.alloc, .{
+                const new_plan = SchemaPlan{
+                    .version = version,
+                    .access = state.schema_plan_clock,
                     .view = view,
                     .filter = filter,
                     .projection = projection,
-                });
-                state.schema_plan_indexes.putAssumeCapacity(version, state.schema_plans.items.len - 1);
+                };
+                const plan_index = if (state.schema_plans.items.len < max_resident_schema_plans) blk: {
+                    try state.schema_plans.append(state.alloc, new_plan);
+                    break :blk state.schema_plans.items.len - 1;
+                } else blk: {
+                    var evicted_index: usize = 0;
+                    var oldest_access = state.schema_plans.items[0].access;
+                    for (state.schema_plans.items[1..], 1..) |candidate, index| {
+                        if (candidate.access < oldest_access) {
+                            oldest_access = candidate.access;
+                            evicted_index = index;
+                        }
+                    }
+                    var evicted = state.schema_plans.items[evicted_index];
+                    _ = state.schema_plan_indexes.remove(evicted.version);
+                    state.schema_plans.items[evicted_index] = new_plan;
+                    evicted.deinit();
+                    break :blk evicted_index;
+                };
+                state.schema_plan_indexes.putAssumeCapacity(version, plan_index);
                 view_owned = false;
                 filter_owned = false;
                 projection_owned = false;
-                return &state.schema_plans.items[state.schema_plans.items.len - 1];
+                return &state.schema_plans.items[plan_index];
             }
 
             fn scanEntry(raw_ctx: ?*anyopaque, store_key: []const u8, stored_value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
@@ -36333,7 +36364,10 @@ fn loadStoredSearchDocumentsMany(
         store_key: []u8,
     };
     const SearchSchemaPlans = struct {
+        const max_resident_historical_plans = 32;
         const HistoricalPlan = struct {
+            version: u32,
+            access: u64,
             view: schema_registry_mod.SchemaView,
             projection: ?relational_row_codec.OrdinalProjectionPlan,
 
@@ -36351,6 +36385,7 @@ fn loadStoredSearchDocumentsMany(
         pinned_projection: ?relational_row_codec.OrdinalProjectionPlan = null,
         historical: std.ArrayListUnmanaged(HistoricalPlan) = .empty,
         historical_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+        historical_clock: u64 = 0,
 
         fn deinit(plans: *@This()) void {
             if (plans.pinned_projection) |*projection| projection.deinit();
@@ -36360,8 +36395,15 @@ fn loadStoredSearchDocumentsMany(
         }
 
         fn historicalPlan(plans: *@This(), version: u32) !*HistoricalPlan {
-            if (plans.historical_indexes.get(version)) |index|
+            plans.historical_clock +%= 1;
+            if (plans.historical_clock == 0) {
+                for (plans.historical.items) |*resident| resident.access = 0;
+                plans.historical_clock = 1;
+            }
+            if (plans.historical_indexes.get(version)) |index| {
+                plans.historical.items[index].access = plans.historical_clock;
                 return &plans.historical.items[index];
+            }
 
             try plans.historical_indexes.ensureUnusedCapacity(plans.alloc, 1);
             var view = (try plans.db.core.acquireSchemaVersionView(version)) orelse
@@ -36380,14 +36422,34 @@ fn loadStoredSearchDocumentsMany(
                 null;
             var projection_owned = projection != null;
             errdefer if (projection_owned) projection.?.deinit();
-            try plans.historical.append(plans.alloc, .{
+            const new_plan = HistoricalPlan{
+                .version = version,
+                .access = plans.historical_clock,
                 .view = view,
                 .projection = projection,
-            });
-            plans.historical_indexes.putAssumeCapacity(version, plans.historical.items.len - 1);
+            };
+            const plan_index = if (plans.historical.items.len < max_resident_historical_plans) blk: {
+                try plans.historical.append(plans.alloc, new_plan);
+                break :blk plans.historical.items.len - 1;
+            } else blk: {
+                var evicted_index: usize = 0;
+                var oldest_access = plans.historical.items[0].access;
+                for (plans.historical.items[1..], 1..) |candidate, index| {
+                    if (candidate.access < oldest_access) {
+                        oldest_access = candidate.access;
+                        evicted_index = index;
+                    }
+                }
+                var evicted = plans.historical.items[evicted_index];
+                _ = plans.historical_indexes.remove(evicted.version);
+                plans.historical.items[evicted_index] = new_plan;
+                evicted.deinit();
+                break :blk evicted_index;
+            };
+            plans.historical_indexes.putAssumeCapacity(version, plan_index);
             view_owned = false;
             projection_owned = false;
-            return &plans.historical.items[plans.historical.items.len - 1];
+            return &plans.historical.items[plan_index];
         }
 
         fn materialize(
@@ -61034,6 +61096,8 @@ test "prepared relational batch uses bounded parallel workers safely" {
         try std.testing.expect(row != null);
         try std.testing.expectEqual(@as(u32, 3), row.?.schema_version);
         try std.testing.expectEqual(@as(u32, 3), try mapper.relationalRowSchemaVersion(row.?.packed_row));
+        try std.testing.expectEqual(@as(usize, 0), row.?.extracted.prepared_text_source_bytes);
+        try std.testing.expect(row.?.extracted.prepared_text_root == null);
     }
 }
 

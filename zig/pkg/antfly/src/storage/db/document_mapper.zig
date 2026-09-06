@@ -293,6 +293,7 @@ pub const PreparedRelationalWrite = struct {
             alloc,
             alloc,
             scratch,
+            false,
             key,
             document_json,
             validator,
@@ -310,6 +311,7 @@ pub const PreparedRelationalWrite = struct {
         alloc: Allocator,
         parse_alloc: Allocator,
         scratch: Allocator,
+        retain_text_root: bool,
         key: []const u8,
         document_json: []const u8,
         validator: ?schema_api.CompiledTableValidator,
@@ -329,7 +331,12 @@ pub const PreparedRelationalWrite = struct {
             true,
         );
         errdefer extracted.deinit(alloc);
-        extracted.prepared_text_source_bytes = estimateJsonValueRetainedBytes(parsed.value);
+        // This recursive retained-size estimate is used only to budget a parsed
+        // tree that survives into full-text publication. Most relational writes
+        // do not target a text index, so keep their preparation to validation,
+        // extraction, and row construction without an otherwise dead DOM walk.
+        if (retain_text_root)
+            extracted.prepared_text_source_bytes = estimateJsonValueRetainedBytes(parsed.value);
 
         const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
             alloc,
@@ -396,6 +403,7 @@ pub const PreparedRelationalWrite = struct {
             region.arena.allocator(),
             if (retain_text_root) region.arena.allocator() else scratch,
             scratch,
+            retain_text_root,
             key,
             document_json,
             validator,
