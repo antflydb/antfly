@@ -169,6 +169,13 @@ const BackendState = struct {
                     .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
+                    .request_control = if (request_context) |context| .{
+                        .deadline_ns = context.deadline_ns,
+                        .cancellation = if (context.cancellation) |token|
+                            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+                        else
+                            null,
+                    } else .{},
                 }) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
@@ -250,7 +257,10 @@ const BackendState = struct {
                     provider.setRequestTimeoutMs(timeout_ms);
                     provider.setRequestCancellation(context.cancellation);
                 },
-                .vertex => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .vertex => |*provider| provider.setAbsoluteRequestControl(.{
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = cancellation,
+                }),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
                 .embedded_antfly => {},
             }

@@ -1392,8 +1392,20 @@ pub const EmbeddingPipeline = struct {
             return null;
         }
 
-        var cb = try session_factory.getComputeBackend(self.session, self.allocator);
-        defer cb.deinit();
+        return self.embedTextResidentQwen3(cfg, mask, input_ids, batch, seq_len);
+    }
+
+    fn embedTextResidentQwen3(
+        self: *EmbeddingPipeline,
+        cfg: gpt_arch.Config,
+        mask: []const i32,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) !?[][]f32 {
+        var compute = try session_factory.getComputeBackendWithControl(self.session, self.allocator, self.execution_control);
+        defer compute.deinit();
+        const cb = &compute.backend;
         if (cb.kind() != .metal) {
             return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_metal_backend");
         }
@@ -1408,7 +1420,7 @@ pub const EmbeddingPipeline = struct {
             return self.residentProjectionFallback(.text, "text.prepare.qwen3.resident", batch, "prepare_failed");
         }
 
-        if (try self.tryEmbedTextResidentQwen3Graph(&cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
+        if (try self.tryEmbedTextResidentQwen3Graph(cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
             return graph_embeddings;
         }
 
@@ -1419,7 +1431,7 @@ pub const EmbeddingPipeline = struct {
         );
         const encoder_start = embedTimingStart(self.print_timing);
         const hidden = try gpt_arch.hiddenForwardResidentWithOverrides(
-            &cb,
+            cb,
             self.allocator,
             cfg,
             input_ids,
@@ -1436,7 +1448,7 @@ pub const EmbeddingPipeline = struct {
         output_storage[0] = hidden;
         var encoder_outputs = session_mod.ResidentOutputs{
             .outputs = output_storage,
-            .backend = &cb,
+            .backend = cb,
             .allocator = self.allocator,
         };
         defer encoder_outputs.deinit();
@@ -2851,6 +2863,47 @@ test "resident qwen3 embedding eligibility accepts dense metal qwen3 only" {
 
     cfg.sliding_window = 4096;
     try std.testing.expect(!residentQwen3EmbeddingEligibleForBackend(.metal, cfg, embedding_cfg));
+}
+
+test "resident qwen3 embedding requires a live guard before backend preparation" {
+    const Probe = struct {
+        armed: bool = false,
+        disarms: usize = 0,
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .metal;
+        }
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.armed = true;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.armed);
+            self.armed = false;
+            self.disarms += 1;
+        }
+    };
+    var probe = Probe{};
+    var vtable: backends.Session.VTable = undefined;
+    vtable.backend = Probe.backend;
+    vtable.interruption = null;
+    var pipeline = EmbeddingPipeline{
+        .allocator = std.testing.allocator,
+        .session = .{ .ptr = &probe, .vtable = &vtable },
+        .tok = undefined,
+        .config = .{ .resident_qwen3_embedding = true },
+        .execution_control = .{ .deadline_ns = 0 },
+    };
+    const cfg = gpt_arch.Config{ .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .intermediate_size = 8 };
+    try std.testing.expectError(error.Timeout, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    pipeline.execution_control = .{};
+    try std.testing.expectError(error.ProcessIsolationRequired, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    pipeline.execution_control = .{ .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm } };
+    // Even backend construction failure must release the pipeline's guard.
+    try std.testing.expectError(error.NotArchSession, pipeline.embedTextResidentQwen3(cfg, &.{1}, &.{1}, 1, 1));
+    try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+    try std.testing.expect(!probe.armed);
 }
 
 test "resident projected input selection supports 3d cls pooling" {

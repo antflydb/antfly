@@ -4937,14 +4937,20 @@ fn embedBatchWithVertex(
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
     if (texts.len == 0) return error.EmptyEmbeddingResponse;
+    const auth_control = @import("antfly_google").RequestControl{
+        .deadline_ns = embeddingOperationDeadline(entry),
+        .cancellation = embeddingHttpCancellation(entry),
+    };
+    try auth_control.check();
     var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
     defer http.deinit();
     const token_source = if (entry.google_credentials) |manager|
-        manager.tokenSource(
+        manager.tokenSourceWithControl(
             if (entry.credentials_path.len > 0) entry.credentials_path else null,
             vertex_provider.vertex_auth_scope,
+            auth_control,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+            error.OutOfMemory, error.Cancelled, error.Timeout => return err,
             else => return error.MissingVertexCredentials,
         }
     else
@@ -4955,6 +4961,7 @@ fn embedBatchWithVertex(
         .location = entry.location,
         .credentials_path = if (entry.credentials_path.len > 0) entry.credentials_path else null,
         .token_source = token_source,
+        .request_control = auth_control,
     });
     defer provider.deinit();
 

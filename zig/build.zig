@@ -3493,11 +3493,16 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend", "asset producer runtime", "provider quotas" },
+        .filters = &.{ "generating backend", "asset producer runtime", "provider quotas", "vertex provider" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+
+    const lib_google_tests = b.addTest(.{ .root_module = google_mod });
+    const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
+    const lib_google_test_step = b.step("lib-google-test", "Run Google credential cache and transport tests");
+    lib_google_test_step.dependOn(&run_lib_google_tests.step);
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -7793,6 +7798,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_google_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);

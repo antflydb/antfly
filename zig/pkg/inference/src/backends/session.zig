@@ -344,6 +344,7 @@ pub const Session = struct {
             null;
         errdefer if (resource_lease) |*lease| lease.release();
         const outputs = try self.vtable.run(self.ptr, inputs, allocator);
+        errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease);
     }
 
@@ -373,6 +374,8 @@ pub const Session = struct {
         return attachOutputAdmission(outputs, allocator, &resource_lease);
     }
 
+    /// Borrows outputs and the lease until success. On error the caller still
+    /// owns both; on success the tensors own the retained admission lease.
     fn attachOutputAdmission(
         outputs: []Tensor,
         allocator: std.mem.Allocator,
@@ -399,10 +402,7 @@ pub const Session = struct {
             .host_scratch_bytes = retained_output_bytes,
         }) catch {};
 
-        const output_admission = allocator.create(OutputAdmission) catch |err| {
-            deinitTensorSlice(outputs, allocator);
-            return err;
-        };
+        const output_admission = try allocator.create(OutputAdmission);
         output_admission.* = .{
             .allocator = allocator,
             .lease = resource_lease.*.?,
@@ -931,4 +931,30 @@ test "forced run admission denials are counted and recover" {
     for (outputs) |*output| output.deinit();
     std.testing.allocator.free(outputs);
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "session output admission has one owner on every allocation failure" {
+    const Probe = struct {
+        fn run(allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+            var controller = memory.AdmissionController{};
+            defer std.debug.assert(std.meta.eql(memory.AdmissionAmounts{}, controller.snapshot()));
+            var probe = AdmissionProbeSession{ .controller = &controller };
+            const session = Session{
+                .ptr = &probe,
+                .vtable = &AdmissionProbeSession.vtable,
+                .run_admission = .{
+                    .controller = &controller,
+                    .backend_class = .cpu,
+                    .limits = .{},
+                    .static_workspace_bytes = 1,
+                },
+            };
+            const outputs = try session.runWithControl(&.{}, allocator, control);
+            defer deinitTensorSlice(outputs, allocator);
+            try std.testing.expect(probe.observed_active_lease);
+            try std.testing.expect(controller.snapshot().host_scratch_bytes > 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, null)});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, .{})});
 }
