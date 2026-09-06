@@ -23,7 +23,7 @@ pub const OpenApiConfig = openapi.RerankerConfig;
 pub const max_candidate_count: u32 = 1000;
 pub const vertex_max_candidate_count: u32 = 200;
 
-pub const CredentialKind = enum { none, api_key, google_adc };
+pub const CredentialKind = enum { optional_api_key, api_key, google_adc };
 
 /// Executable provider behavior resolved before retrieval begins. Keeping
 /// defaults and cost ceilings together gives validation, SDK-facing defaults,
@@ -34,6 +34,7 @@ pub const ProviderCapabilities = struct {
     max_candidate_count: u32,
     model_required: bool,
     credential_kind: CredentialKind,
+    credential_env: ?[]const u8 = null,
 };
 
 pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
@@ -43,7 +44,8 @@ pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
             .default_url = "http://127.0.0.1:8082",
             .max_candidate_count = max_candidate_count,
             .model_required = false,
-            .credential_kind = .none,
+            .credential_kind = .optional_api_key,
+            .credential_env = "ANTFLY_INFERENCE_API_KEY",
         },
         .cohere => .{
             .default_model = "rerank-english-v3.0",
@@ -51,6 +53,7 @@ pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
             .max_candidate_count = max_candidate_count,
             .model_required = true,
             .credential_kind = .api_key,
+            .credential_env = "COHERE_API_KEY",
         },
         .vertex => .{
             .default_model = "semantic-ranker-default@latest",
@@ -130,6 +133,7 @@ pub fn defaultModelForProvider(provider: Provider) []const u8 {
 }
 
 pub const Config = struct {
+    rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     field: []const u8 = "",
     template: []const u8 = "",
@@ -143,6 +147,7 @@ pub const Config = struct {
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
+            .rate_limit = self.rate_limit,
             .provider = self.provider,
             .field = if (self.field.len > 0) try alloc.dupe(u8, self.field) else "",
             .template = if (self.template.len > 0) try alloc.dupe(u8, self.template) else "",
@@ -228,6 +233,7 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
 pub fn configFromOpenApi(alloc: Allocator, generated: openapi.RerankerConfig) !Config {
     const model = generated.model orelse defaultModelForProvider(generated.provider);
     var cfg = Config{
+        .rate_limit = generated.rate_limit,
         .provider = generated.provider,
         .field = if (generated.field) |field| try alloc.dupe(u8, field) else "",
         .template = if (generated.template) |template| try alloc.dupe(u8, template) else "",
@@ -254,7 +260,8 @@ test "external reranker models have executable defaults" {
     const antfly = providerCapabilities(.antfly);
     try std.testing.expectEqualStrings("", antfly.default_model);
     try std.testing.expectEqualStrings("http://127.0.0.1:8082", antfly.default_url);
-    try std.testing.expectEqual(CredentialKind.none, antfly.credential_kind);
+    try std.testing.expectEqual(CredentialKind.optional_api_key, antfly.credential_kind);
+    try std.testing.expectEqualStrings("ANTFLY_INFERENCE_API_KEY", antfly.credential_env.?);
     try std.testing.expect(!antfly.model_required);
 
     var cohere = try configFromOpenApi(std.testing.allocator, .{
@@ -279,6 +286,7 @@ test "external reranker models have executable defaults" {
 
 pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
     return .{
+        .rate_limit = cfg.rate_limit,
         .provider = cfg.provider,
         .field = if (cfg.field.len > 0) cfg.field else null,
         .template = if (cfg.template.len > 0) cfg.template else null,
@@ -422,4 +430,21 @@ test "antfly reranker config permits the inference default model" {
     try std.testing.expectEqual(Provider.antfly, cfg.provider);
     try std.testing.expectEqualStrings("", cfg.model);
     try std.testing.expectEqualStrings("body", cfg.field);
+}
+
+test "reranking config preserves shared rate limits through cloning and JSON" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"test\",\"field\":\"body\",\"rate_limit\":{\"requests_per_minute\":120,\"burst\":2,\"tokens_per_minute\":1000,\"max_concurrency\":4}}");
+    defer cfg.deinit(alloc);
+    cfg.rate_limit.?.pacing = .completion;
+    cfg.rate_limit.?.burst = 1;
+    var cloned = try cfg.clone(alloc);
+    defer cloned.deinit(alloc);
+    const encoded = try stringifyAlloc(alloc, cloned);
+    defer alloc.free(encoded);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
+    try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
+    try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
 }

@@ -49,8 +49,11 @@ pub const MultiStageMetadata = struct {
     }
 };
 
-pub fn isMultiStageModelDir(allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var metadata = loadFromDir(allocator, model_dir) catch return false;
+pub fn isMultiStageModelDir(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
+    var metadata = loadFromDir(allocator, model_dir) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
     defer metadata.deinit();
     return isMultiStage(&metadata);
 }
@@ -62,7 +65,10 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !MultiSt
     const bytes = try c_file.readFileMax(allocator, path, max_metadata_bytes);
     defer allocator.free(bytes);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidMetadata,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidMetadata;
 
