@@ -27,6 +27,7 @@ const runtime_mod = @import("runtime.zig");
 const operation = @import("../../api/operation.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
+const routing_cache = @import("graph_metric_routing_cache.zig");
 
 pub const Limits = struct {
     // Keep this aligned with the public query contract. The current wire stores this entire
@@ -467,13 +468,11 @@ fn scoresInto(
 
     const footer_len = try routingFooterLen(metric_artifact, control.header.version);
     const footer_offset = metric_artifact.byte_len - footer_len;
-    const footer = try fetchRoutingFooterAlloc(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len);
-    defer alloc.free(footer);
     const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
         @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
-    try session.chargeGraphMetricDecode(1, expected_blocks);
-    var routing = try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(alloc, footer, metric_artifact.byte_len, control.header.version, session.cancellation);
-    defer routing.deinit(alloc);
+    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len, expected_blocks);
+    defer routing_lease.deinit();
+    const routing = routing_lease.entry.routing;
     if (routing.entries.len != expected_blocks or routing.footer_offset != footer_offset or
         (routing.entries.len == 0 and routing.footer_offset != control.score_data_offset) or
         (routing.entries.len > 0 and routing.entries[0].offset != control.score_data_offset))
@@ -781,6 +780,68 @@ fn fetchRoutingFooterAlloc(
     };
 }
 
+fn acquireRouting(
+    session: *runtime_mod.QuerySession,
+    metric_index: usize,
+    artifact: manifest_mod.ArtifactRef,
+    version: u16,
+    offset: u64,
+    len: usize,
+    decode_work: usize,
+) !routing_cache.Lease {
+    try session.cancellation.check();
+    // Include all authentication and interpretation inputs, not merely a
+    // logical metric name (which can point at a new immutable publication).
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(artifact.artifact_id);
+    hash.update(&.{0});
+    hash.update(artifact.checksum);
+    hash.update(&artifact.graph_metric_routing_checksum);
+    var dimensions: [26]u8 = undefined;
+    std.mem.writeInt(u64, dimensions[0..8], artifact.byte_len, .little);
+    std.mem.writeInt(u64, dimensions[8..16], offset, .little);
+    std.mem.writeInt(u64, dimensions[16..24], len, .little);
+    std.mem.writeInt(u16, dimensions[24..26], version, .little);
+    hash.update(&dimensions);
+    var key: [32]u8 = undefined;
+    hash.final(&key);
+    if (session.cache) |cache| {
+        if (cache.graph_metric_routing.acquire(key)) |cached| {
+            var lease = cached;
+            errdefer lease.deinit();
+            try session.chargeGraphMetricRetained(lease.entry.bytes());
+            try session.chargeGraphMetricDecode(0, 1);
+            return lease;
+        }
+    }
+    // Reserve transient decode memory before fetching/duplicating the footer.
+    // The bounded top tier contributes at most 40 ranked routing entries.
+    const routing_bytes = std.math.mul(usize, decode_work, @sizeOf(metric_segment.codec.RoutingEntry)) catch return error.GraphMetricQueryBudgetExceeded;
+    const footer_bytes = std.math.mul(usize, len, 2) catch return error.GraphMetricQueryBudgetExceeded;
+    const overhead = @sizeOf(routing_cache.Entry) +
+        (metric_segment.codec.max_persisted_top_entries / metric_segment.codec.ranked_score_block_entries + 1) * @sizeOf(metric_segment.codec.RankedRoutingEntry);
+    const reservation = std.math.add(usize, footer_bytes, routing_bytes) catch return error.GraphMetricQueryBudgetExceeded;
+    try session.chargeGraphMetricRetained(std.math.add(usize, reservation, overhead) catch return error.GraphMetricQueryBudgetExceeded);
+    const footer = try fetchRoutingFooterAlloc(session, metric_index, artifact, version, offset, len);
+    var owns_footer = true;
+    defer if (owns_footer) session.alloc.free(footer);
+    try session.chargeGraphMetricDecode(1, decode_work);
+    const owner = if (session.cache) |cache| cache.alloc else session.alloc;
+    const owned = if (owner.ptr == session.alloc.ptr and owner.vtable == session.alloc.vtable) blk: {
+        owns_footer = false;
+        break :blk footer;
+    } else try owner.dupe(u8, footer);
+    errdefer owner.free(owned);
+    var routing = try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(owner, owned, artifact.byte_len, version, session.cancellation);
+    errdefer routing.deinit(owner);
+    const entry = try owner.create(routing_cache.Entry);
+    errdefer owner.destroy(entry);
+    entry.* = .{ .key = key, .alloc = owner, .footer = owned, .routing = routing };
+    try session.cancellation.check();
+    if (session.cache) |cache| return cache.graph_metric_routing.adopt(entry, cache.cfg.max_graph_metric_routing_bytes);
+    return .{ .entry = entry };
+}
+
 fn fetchScoreRangeAlloc(
     alloc: Allocator,
     session: *runtime_mod.QuerySession,
@@ -1047,16 +1108,14 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     // tier without touching the score vector.
     const footer_len = try routingFooterLen(metric_artifact, control.header.version);
     const footer_offset = metric_artifact.byte_len - footer_len;
-    const footer = try fetchRoutingFooterAlloc(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len);
-    defer alloc.free(footer);
     const expected_blocks = @as(usize, control.score_count) / metric_segment.score_block_entries +
         @intFromBool(@as(usize, control.score_count) % metric_segment.score_block_entries != 0);
     const expected_top_count = @min(@as(usize, control.score_count), metric_segment.codec.max_persisted_top_entries);
     const expected_ranked_blocks = expected_top_count / metric_segment.codec.ranked_score_block_entries +
         @intFromBool(expected_top_count % metric_segment.codec.ranked_score_block_entries != 0);
-    try session.chargeGraphMetricDecode(1, expected_blocks + expected_ranked_blocks);
-    var routing = try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(alloc, footer, metric_artifact.byte_len, control.header.version, session.cancellation);
-    defer routing.deinit(alloc);
+    var routing_lease = try acquireRouting(session, metric_index, metric_artifact, control.header.version, footer_offset, footer_len, expected_blocks + expected_ranked_blocks);
+    defer routing_lease.deinit();
+    const routing = routing_lease.entry.routing;
     if (routing.entries.len != expected_blocks or routing.footer_offset != footer_offset or
         (routing.entries.len == 0 and routing.footer_offset != control.score_data_offset) or
         (routing.entries.len > 0 and routing.entries[0].offset != control.score_data_offset))
@@ -1609,6 +1668,25 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
     // can reach the backend. The counter is shared by every later metric read
     // performed through this pinned request session.
     try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/routing", .{tmp.sub_path});
+    defer alloc.free(cache_root);
+    var cache = try @import("cache.zig").QueryCache.init(alloc, cache_root);
+    defer cache.deinit();
+    session.cache = &cache;
+    defer session.cache = null;
+    session.graph_metric_read_budget = .{};
+    var first_cached = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
+    defer first_cached.deinit(alloc);
+    // A warm lookup needs one score-block decode, not a routing-index decode.
+    session.graph_metric_read_budget = .{ .limits = .{ .max_decoded_blocks = 1 } };
+    var second_cached = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
+    defer second_cached.deinit(alloc);
+    try std.testing.expectEqual(@as(?f64, 1024), second_cached.scores[0]);
+    try std.testing.expectEqual(@as(u64, 1), cache.graph_metric_routing.hits);
+    try std.testing.expectEqual(@as(u64, 1), session.graph_metric_read_budget.decoded_blocks);
 }
 
 test "serverless graph metric ranked blocks reject cross-boundary inversions and duplicates" {

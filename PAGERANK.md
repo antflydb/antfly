@@ -565,14 +565,35 @@ an asynchronous child.
 
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible
-limit. Iterative kernels also accept authenticated, ordinal-aligned seeds from
+limit. PageRank accepts authenticated, ordinal-aligned seeds from
 the last compatible publication. Reconciliation linearly maps the prior
 node-sorted vector onto the new projection, assigns zero to new nodes, skips
 deleted nodes, and lets the kernel validate and normalize the result. A
 disjoint, rejected, over-budget, or incompatible prior artifact cold-starts;
-corrupt object identity still fails closed. Native iterative metrics use the
-same policy against their prior published generations. This preserves exact convergence
-semantics while avoiding a cold restart after small topology changes.
+corrupt object identity still fails closed. Seed admission covers both preparation
+(including decoded routing memory) and execution alongside kernel/output memory.
+An optional seed never turns an admissible cold build into a budget rejection.
+Native PageRank pins its seed generation and configuration for the job and computes
+the surviving seed mass through the bounded, checkpointed initialization summary.
+Every worker uses that same scalar before writing ranks and source factors. Zero
+surviving mass falls back to the uniform vector. Execution epoch 3 rejects older
+in-flight jobs: rebuild them with upgraded workers. Their previously published
+score generation remains readable; partially computed old seeds are not resumed.
+Warm starts preserve PageRank's probability normalization, but finite-iteration
+results and tolerance-based stopping can depend on the seed.
+
+Eigenvector and HITS always use canonical cold seeds in both runtimes. An old
+spectral vector may have zero support on a newly dominant disconnected component;
+normalization alone cannot make that a safe warm start. A future spectral restart
+policy needs component/support guarantees and oracle tests for topology changes.
+
+Serverless query caches retain authenticated decoded metric routing indexes under
+an independent 16 MiB process-memory budget (configurable with
+`max_graph_metric_routing_bytes`). Identity includes the immutable artifact,
+checksums, footer extent, and wire version. Leases keep borrowed IDs alive;
+eviction skips pinned entries and saturated caches bypass retention. Warm point
+and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
+misses, and retained bytes are exposed in query-cache statistics.
 
 Ordinal dictionaries are scoped to an exact edge-filter projection; graph-wide
 ordinals are not interchangeable because filters change the active node set.

@@ -15,10 +15,11 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 5 introduces algorithm-specific work admission shared with the kernel.
+// Epoch 6 makes warm starts PageRank-only and admits both preparation and
+// execution memory before loading an optional prior vector.
 // Rebuild older sidecars so admission decisions and output remain tied to one
 // explicit materializer contract.
-pub const materializer_epoch: u32 = 5;
+pub const materializer_epoch: u32 = 6;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

@@ -3980,8 +3980,9 @@ pub const GraphIndex = struct {
         completed_units: u64,
         total_units: u64,
         rank_sum: f64,
+        seed_mass: f64,
     ) !GraphMetricBuildPage {
-        if (!std.math.isFinite(rank_sum)) return error.InvalidGraphMetricScore;
+        if (!std.math.isFinite(rank_sum) or !std.math.isFinite(seed_mass) or seed_mass < 0) return error.InvalidGraphMetricScore;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, 0) orelse return error.GraphMetricBuildPageNotFound;
@@ -3992,6 +3993,7 @@ pub const GraphIndex = struct {
         page.completed_units = completed_units;
         page.total_units = if (total_units != 0) total_units else page.total_units;
         page.rank_sum = rank_sum;
+        page.total_delta = seed_mass;
         page.last_error = "";
         try self.putGraphMetricBuildPageInBatch(&batch, metric_name, page);
         try batch.commit();
@@ -6801,7 +6803,10 @@ pub const GraphIndex = struct {
         total_units: u64 = 0,
     };
 
-    const graph_metric_build_execution_schema_version: u64 = 2;
+    // v3 pins seed identity and stores initialization seed mass separately
+    // from node count. Restart older in-flight jobs; never reinterpret a v2
+    // partially completed summary as a normalized seed contract.
+    const graph_metric_build_execution_schema_version: u64 = 3;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -7419,7 +7424,7 @@ pub const GraphIndex = struct {
         var offset: usize = 0;
         const version = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
-        if (version != 1 and version != graph_metric_build_execution_schema_version) return null;
+        if (version == 0 or version > graph_metric_build_execution_schema_version) return null;
         const job_id = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const target_generation = std.mem.readInt(u64, raw[offset..][0..8], .little);
@@ -8811,6 +8816,7 @@ pub const GraphIndex = struct {
         var prior_completed_units: u64 = 0;
         var total_units = page.total_units;
         var prior_sum: f64 = 0.0;
+        var seed_mass = metric_kernels.warm_start.Mass{};
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
@@ -8821,6 +8827,7 @@ pub const GraphIndex = struct {
             prior_completed_units = current.completed_units;
             total_units = current.total_units;
             prior_sum = current.rank_sum;
+            try seed_mass.add(current.total_delta);
         }
 
         var nodes = std.ArrayListUnmanaged([]u8).empty;
@@ -8854,11 +8861,23 @@ pub const GraphIndex = struct {
         };
 
         var partial_sum: f64 = 0.0;
+        const seed_generation = if (cfg.kind == .pagerank and page.phase == .initialize_ranks)
+            try self.pinPageRankSeedGeneration(metric_name, job, page)
+        else
+            0;
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
             switch (page.phase) {
-                .initialize_ranks => partial_sum = @floatFromInt(nodes.items.len),
+                .initialize_ranks => {
+                    partial_sum = @floatFromInt(nodes.items.len);
+                    if (seed_generation != 0) {
+                        try self.validatePageRankSeedGeneration(&txn, metric_name, seed_generation);
+                        const scores = try self.graphMetricScoresInTxnAlloc(&txn, metric_name, seed_generation, nodes.items);
+                        defer self.alloc.free(scores);
+                        for (scores) |score| try seed_mass.add(score orelse 0);
+                    }
+                },
                 .reduce_ranks => switch (cfg.kind) {
                     // Each node appears once even when several scan partitions
                     // emitted incident-degree partials.
@@ -8907,6 +8926,7 @@ pub const GraphIndex = struct {
                 completed_units,
                 total_units,
                 accumulated,
+                try seed_mass.total(),
             );
             return nodes.items.len;
         }
@@ -8916,6 +8936,7 @@ pub const GraphIndex = struct {
         graphMetricConfigFingerprintHashU64(&hasher, page.iteration);
         graphMetricConfigFingerprintHashU64(&hasher, completed_units);
         graphMetricConfigFingerprintHashU64(&hasher, @bitCast(accumulated));
+        graphMetricConfigFingerprintHashU64(&hasher, @bitCast(try seed_mass.total()));
         _ = try self.completeGraphMetricBuildPageWithConvergenceForAttempt(
             metric_name,
             job.job_id,
@@ -8927,7 +8948,7 @@ pub const GraphIndex = struct {
             completed_units,
             hasher.final(),
             0.0,
-            0.0,
+            try seed_mass.total(),
             accumulated,
             false,
         );
@@ -8947,6 +8968,81 @@ pub const GraphIndex = struct {
         if (page.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
         if (!std.math.isFinite(page.rank_sum)) return error.InvalidGraphMetricScore;
         return page;
+    }
+
+    fn validatePageRankSeedGeneration(self: *GraphIndex, txn: anytype, metric_name: []const u8, generation: u64) !void {
+        if (generation != 0 and try self.metricPublishedGeneration(txn, metric_name) != generation)
+            return error.GraphMetricBuildSuperseded;
+    }
+
+    /// Freeze the seed identity once per job, including an explicit cold-start
+    /// marker. Summary checkpoints and initialization pages must never mix
+    /// publications or configurations. The key is reclaimed with job state.
+    fn pinPageRankSeedGeneration(self: *GraphIndex, metric_name: []const u8, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage) !u64 {
+        var job_buf: [20]u8 = undefined;
+        const key = try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job.job_id}), "seed_generation" });
+        defer self.alloc.free(key);
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            if (txn.get(key)) |raw| {
+                if (raw.len != 8) return error.InvalidGraphMetricBuildManifest;
+                const generation = std.mem.readInt(u64, raw[0..8], .little);
+                try self.validatePageRankSeedGeneration(&txn, metric_name, generation);
+                return generation;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const current = try self.metricBuildPage(&batch, metric_name, job.job_id, claimed.phase, claimed.iteration, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
+        try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
+        var generation = try self.metricPublishedGeneration(&batch, metric_name);
+        if (generation != 0) {
+            const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+            const fingerprint_key = try self.graphMetricMetaConfigFingerprintKeyAlloc(metric_name, generation);
+            defer self.alloc.free(fingerprint_key);
+            if (batch.get(fingerprint_key)) |raw| {
+                if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) != graphMetricConfigFingerprint(cfg)) generation = 0;
+            } else |err| switch (err) {
+                error.NotFound => generation = 0,
+                else => return err,
+            }
+        }
+        // A competing page may have pinned the job while we acquired the
+        // writer; its decision wins even if it selected a cold start.
+        if (batch.get(key)) |raw| {
+            if (raw.len != 8) return error.InvalidGraphMetricBuildManifest;
+            generation = std.mem.readInt(u64, raw[0..8], .little);
+            try self.validatePageRankSeedGeneration(&batch, metric_name, generation);
+        } else |err| switch (err) {
+            error.NotFound => try putU64(&batch, key, generation),
+            else => return err,
+        }
+        try batch.commit();
+        return generation;
+    }
+
+    fn pageRankSeedMass(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, generation: u64) !f64 {
+        if (generation == 0) return 0;
+        try self.validatePageRankSeedGeneration(txn, metric_name, generation);
+        if (try self.graphMetricReduceSummaryValue(txn, metric_name, job_id, .initialize_ranks, 0)) |summary| return summary.total_delta;
+        // Only the single-page case reaches this path. Larger graphs use the
+        // resumable dependency page above, never one O(V) rescan per worker.
+        var nodes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (nodes.items) |node| self.alloc.free(node);
+            nodes.deinit(self.alloc);
+        }
+        const complete = try self.collectPageRankScannedNodesInRange(txn, metric_name, job_id, "", "", "", graph_metric_build_target_reduce_page_units, &nodes);
+        if (!complete) return error.InvalidGraphMetricBuildManifest;
+        const scores = try self.graphMetricScoresInTxnAlloc(txn, metric_name, generation, nodes.items);
+        defer self.alloc.free(scores);
+        var mass = metric_kernels.warm_start.Mass{};
+        for (scores) |score| try mass.add(score orelse 0);
+        return try mass.total();
     }
 
     fn graphMetricBuildNodeCount(self: *GraphIndex, metric_name: []const u8, job_id: u64) !usize {
@@ -9238,6 +9334,7 @@ pub const GraphIndex = struct {
 
         const total_nodes = try self.graphMetricBuildNodeCount(metric_name, job.job_id);
         const initial_rank = if (total_nodes == 0) 0.0 else 1.0 / @as(f64, @floatFromInt(total_nodes));
+        const seed_generation = try self.pinPageRankSeedGeneration(metric_name, job, page);
         var initialized_nodes: usize = 0;
         var out_degree_total: u64 = 0;
         var rank_sum: f64 = 0.0;
@@ -9248,19 +9345,15 @@ pub const GraphIndex = struct {
             defer read_txn.abort();
             const out_degrees = try self.pageRankOutDegreesForNodesAlloc(&read_txn, metric_name, job.job_id, nodes.items);
             defer self.alloc.free(out_degrees);
-            const prior_generation = try self.metricPublishedGeneration(&read_txn, metric_name);
+            const prior_generation = seed_generation;
+            const seed_mass = try self.pageRankSeedMass(&read_txn, metric_name, job.job_id, seed_generation);
             const prior_scores: ?[]?f64 = if (prior_generation == 0)
                 null
             else
                 try self.graphMetricScoresInTxnAlloc(&read_txn, metric_name, prior_generation, nodes.items);
             defer if (prior_scores) |scores| self.alloc.free(scores);
             for (nodes.items, out_degrees, 0..) |node, out_degree, node_index| {
-                // A prior published vector is an excellent seed after a small
-                // topology delta. Missing/new nodes retain the uniform seed;
-                // PageRank's teleport term normalizes the vector as it
-                // converges. Invalid stored values fail closed in the snapshot
-                // reader instead of entering the iteration.
-                const seed = if (prior_scores) |scores| scores[node_index] orelse initial_rank else initial_rank;
+                const seed = try metric_kernels.warm_start.normalized(if (prior_scores) |scores| scores[node_index] orelse 0 else 0, seed_mass, total_nodes);
                 out_degree_total += out_degree;
                 initialized_nodes += 1;
                 rank_sum += seed;
@@ -9792,16 +9885,10 @@ pub const GraphIndex = struct {
         var initialized = std.ArrayListUnmanaged(PageRankInitializeNode).empty;
         defer initialized.deinit(self.alloc);
         {
-            var read_txn = try self.beginReadReverseTxn();
-            defer read_txn.abort();
-            const prior_generation = try self.metricPublishedGeneration(&read_txn, metric_name);
-            const prior_scores: ?[]?f64 = if (prior_generation == 0)
-                null
-            else
-                try self.graphMetricScoresInTxnAlloc(&read_txn, metric_name, prior_generation, nodes.items);
-            defer if (prior_scores) |scores| self.alloc.free(scores);
-            for (nodes.items, 0..) |node, node_index| {
-                const seed = if (prior_scores) |scores| scores[node_index] orelse initial_rank else initial_rank;
+            // Spectral seeds must cover components that previously had zero
+            // score; use the same canonical cold start as the shared kernel.
+            for (nodes.items) |node| {
+                const seed = initial_rank;
                 initialized_nodes += 1;
                 rank_sum += seed;
                 try initialized.append(self.alloc, .{ .node = node, .initial_rank = seed });
@@ -10155,33 +10242,9 @@ pub const GraphIndex = struct {
         var initialized = std.ArrayListUnmanaged(PageRankInitializeNode).empty;
         defer initialized.deinit(self.alloc);
         {
-            var read_txn = try self.beginReadReverseTxn();
-            defer read_txn.abort();
-            const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
-            const pair_cfg = self.pairedHitsMetricConfig(cfg);
-            const authority_metric = if (cfg.kind == .hits_authority) cfg.name else if (pair_cfg) |pair| pair.name else cfg.name;
-            const hub_metric = if (cfg.kind == .hits_hub) cfg.name else if (pair_cfg) |pair| pair.name else cfg.name;
-            const authority_generation = if (cfg.kind == .hits_authority or pair_cfg != null)
-                try self.metricPublishedGeneration(&read_txn, authority_metric)
-            else
-                0;
-            const hub_generation = if (cfg.kind == .hits_hub or pair_cfg != null)
-                try self.metricPublishedGeneration(&read_txn, hub_metric)
-            else
-                0;
-            const authority_scores: ?[]?f64 = if (authority_generation == 0)
-                null
-            else
-                try self.graphMetricScoresInTxnAlloc(&read_txn, authority_metric, authority_generation, nodes.items);
-            defer if (authority_scores) |scores| self.alloc.free(scores);
-            const hub_scores: ?[]?f64 = if (hub_generation == 0)
-                null
-            else
-                try self.graphMetricScoresInTxnAlloc(&read_txn, hub_metric, hub_generation, nodes.items);
-            defer if (hub_scores) |scores| self.alloc.free(scores);
-            for (nodes.items, 0..) |node, node_index| {
-                const authority_seed = if (authority_scores) |scores| scores[node_index] orelse initial_rank else initial_rank;
-                const hub_seed = if (hub_scores) |scores| scores[node_index] orelse initial_rank else initial_rank;
+            for (nodes.items) |node| {
+                const authority_seed = initial_rank;
+                const hub_seed = initial_rank;
                 initialized_nodes += 1;
                 rank_sum += authority_seed + hub_seed;
                 try initialized.append(self.alloc, .{ .node = node, .initial_rank = authority_seed, .secondary_rank = hub_seed });
@@ -18292,6 +18355,90 @@ test "graph pagerank planned build publishes scores matching local runner" {
         try std.testing.expectEqualStrings(local.node, planned.node);
         try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
     }
+}
+
+test "graph pagerank warm rebuild normalizes changed node sets across summary pages" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 2, 66 }) |old_count| {
+        var store_buf: [256]u8 = undefined;
+        const store_path = tmpPath(&store_buf, "store-pagerank-normalized-warm");
+        defer cleanupTmp(store_path);
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "rev-pagerank-normalized-warm");
+        defer cleanupTmp(rev_path);
+        var store = try docstore.DocStore.open(alloc, store_path, .{});
+        defer store.close();
+        const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual, .damping = 0.999999, .tolerance = 1e-6, .max_iterations = 1 }};
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+        defer graph.close();
+        for (0..old_count) |index| {
+            var from_buf: [32]u8 = undefined;
+            var to_buf: [32]u8 = undefined;
+            const from = try std.fmt.bufPrint(&from_buf, "node:{d:0>4}", .{index});
+            const to = try std.fmt.bufPrint(&to_buf, "node:{d:0>4}", .{(index + 1) % old_count});
+            try graph.addEdge(from, to, "cites", 1, 0, 0, "");
+        }
+        var original = try graph.runPageRankMetricPlanned("rank");
+        original.deinit(alloc);
+        try graph.addEdge("new:a", "new:b", "cites", 1, 0, 0, "");
+        try graph.addEdge("new:b", "new:a", "cites", 1, 0, 0, "");
+        var rebuilt = try graph.runPageRankMetricPlanned("rank");
+        defer rebuilt.deinit(alloc);
+        try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, rebuilt.state);
+        try std.testing.expect(rebuilt.delta > 0); // Proves this was a mapped warm seed, not a uniform cold run.
+        const scores = try graph.graphMetricTopK("rank", old_count + 2);
+        defer {
+            for (scores) |*score| score.deinit(alloc);
+            alloc.free(scores);
+        }
+        try std.testing.expectEqual(old_count + 2, scores.len);
+        var mass = metric_kernels.warm_start.Mass{};
+        for (scores) |score| try mass.add(score.score);
+        try std.testing.expectApproxEqAbs(@as(f64, 1), try mass.total(), 1e-12);
+    }
+}
+
+test "graph metric execution epoch fences old jobs without hiding published scores" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-metric-execution-epoch");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-metric-execution-epoch");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 1 }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    var published = try graph.runPageRankMetricPlanned("rank");
+    defer published.deinit(alloc);
+    try graph.acquireGraphMetricBuildLease("rank", graph.edge_generation);
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const job = (try graph.metricBuildJob(&batch, "rank")).?;
+        var manifest = (try graph.metricBuildManifest(&batch, "rank", job.job_id)).?;
+        manifest.execution_schema_version = 2;
+        const key = try graph.graphMetricBuildManifestKeyAlloc("rank", job.job_id);
+        defer alloc.free(key);
+        var encoded: [GraphIndex.graph_metric_build_manifest_encoded_len]u8 = undefined;
+        GraphIndex.encodeGraphMetricBuildManifest(manifest, &encoded);
+        try std.testing.expectEqual(@as(u64, 2), GraphIndex.decodeGraphMetricBuildManifest(&encoded).?.execution_schema_version);
+        try batch.put(key, &encoded);
+        try batch.commit();
+    }
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.runGraphMetricPlannedWorkerPageStepAt("rank", configs[0], "worker", 1));
+    var current = try graph.graphMetricStatus("rank");
+    defer current.deinit(alloc);
+    try std.testing.expectEqual(published.published_generation, current.published_generation);
+    const top = try graph.graphMetricTopK("rank", 2);
+    defer {
+        for (top) |*score| score.deinit(alloc);
+        alloc.free(top);
+    }
+    try std.testing.expectEqual(@as(usize, 2), top.len);
 }
 
 test "graph pagerank failed planned build preserves prior published generation" {

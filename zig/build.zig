@@ -8265,6 +8265,8 @@ pub fn build(b: *std.Build) void {
         "graph metric coordinator reports expired exhausted page lease",
         "graph planned metric build retires a superseded generation without poisoning newer work",
         "graph pagerank planned build publishes scores matching local runner",
+        "graph pagerank warm rebuild normalizes changed node sets across summary pages",
+        "graph metric execution epoch fences old jobs without hiding published scores",
         "graph pagerank reclaimed contribution and reduce pages overwrite partial output",
         "graph pagerank scan adoption maintains one idempotent out-degree total",
         "graph eigenvector reclaimed contribution and reduce pages overwrite stale output",

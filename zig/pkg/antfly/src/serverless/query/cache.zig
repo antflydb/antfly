@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
+const graph_metric_routing_cache = @import("graph_metric_routing_cache.zig");
 
 // v2 invalidates range/block entries written before provider identities were
 // pinned across verification and fetch. Full entries remain cheap to rebuild
@@ -41,6 +42,8 @@ const abandoned_cache_write_suffix = ".abandoned";
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
     max_payload_bytes: u64 = 0,
+    /// Independent process-memory budget; disk-cache capacity is unchanged.
+    max_graph_metric_routing_bytes: usize = 16 * 1024 * 1024,
 };
 
 pub const AuthenticatedSubrange = struct {
@@ -50,6 +53,9 @@ pub const AuthenticatedSubrange = struct {
 };
 
 pub const QueryCacheStats = struct {
+    decoded_graph_metric_routing_hits: u64 = 0,
+    decoded_graph_metric_routing_misses: u64 = 0,
+    decoded_graph_metric_routing_bytes: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     writes: u64 = 0,
@@ -202,6 +208,7 @@ pub const QueryCache = struct {
     maintenance_mu: std.atomic.Mutex = .unlocked,
     usage: CacheUsage = .{},
     stats: QueryCacheStats = .{},
+    graph_metric_routing: graph_metric_routing_cache.Cache = .{},
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !QueryCache {
         return try initWithConfig(alloc, root_dir, .{});
@@ -260,6 +267,7 @@ pub const QueryCache = struct {
     }
 
     pub fn deinit(self: *QueryCache) void {
+        self.graph_metric_routing.deinit();
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const coordination_locked = blk: {
@@ -285,7 +293,12 @@ pub const QueryCache = struct {
     pub fn statsSnapshot(self: *QueryCache) QueryCacheStats {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
-        return self.stats;
+        var stats = self.stats;
+        const routing = self.graph_metric_routing.snapshot();
+        stats.decoded_graph_metric_routing_hits = routing.hits;
+        stats.decoded_graph_metric_routing_misses = routing.misses;
+        stats.decoded_graph_metric_routing_bytes = routing.bytes;
+        return stats;
     }
 
     pub fn getOrFetchAlloc(self: *QueryCache, artifacts: *artifacts_mod.ArtifactStore, artifact_id: []const u8) ![]u8 {

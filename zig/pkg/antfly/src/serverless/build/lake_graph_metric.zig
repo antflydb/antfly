@@ -509,25 +509,10 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
             var options = group_options;
             options.config = candidate;
             const projection_resident_bytes = try projectionResidentMemoryBytes(projection.*);
+            const cold_peak_bytes = try estimatedPeakMemoryBytes(projection.*, options, 1);
             if (findCompatibleHitsPairIndex(configs, processed, candidate_index)) |pair_index| {
-                var authority_seed: ?[]f64 = null;
-                defer if (authority_seed) |seed| alloc.free(seed);
-                var hub_seed: ?[]f64 = null;
-                defer if (hub_seed) |seed| alloc.free(seed);
-                if (prior_artifacts.len != 0) {
-                    const first_seed = try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[candidate_index], projection.node_ids.items, candidate, cancellation, limits, projection_resident_bytes);
-                    if (candidate.kind == .hits_authority) authority_seed = first_seed else hub_seed = first_seed;
-                    const first_seed_bytes = if (first_seed) |seed|
-                        std.math.mul(usize, seed.len, @sizeOf(f64)) catch return error.GraphMetricBuildBudgetExceeded
-                    else
-                        0;
-                    const resident_with_first_seed = std.math.add(usize, projection_resident_bytes, first_seed_bytes) catch
-                        return error.GraphMetricBuildBudgetExceeded;
-                    const pair_seed = try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[pair_index], projection.node_ids.items, configs[pair_index], cancellation, limits, resident_with_first_seed);
-                    if (configs[pair_index].kind == .hits_authority) authority_seed = pair_seed else hub_seed = pair_seed;
-                }
-                options.initial_authorities = authority_seed;
-                options.initial_hubs = hub_seed;
+                // The pair still shares one topology and kernel execution,
+                // but spectral vectors always use canonical cold seeds.
                 const pair_refs = publishHitsPairFromProjectionAlloc(
                     alloc,
                     artifacts,
@@ -558,7 +543,7 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
             const warm_seed: ?[]f64 = if (prior_artifacts.len == 0)
                 null
             else
-                try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[candidate_index], projection.node_ids.items, candidate, cancellation, limits, projection_resident_bytes);
+                try warmStartVectorAlloc(alloc, artifacts, prior_artifacts[candidate_index], projection.node_ids.items, candidate, cancellation, limits, projection_resident_bytes, cold_peak_bytes);
             defer if (warm_seed) |seed| alloc.free(seed);
             switch (candidate.kind) {
                 .pagerank, .eigenvector => options.initial_scores = warm_seed,
@@ -1551,16 +1536,24 @@ fn warmStartVectorAlloc(
     cancellation: CancellationToken,
     limits: Limits,
     existing_resident_bytes: usize,
+    execution_peak_bytes: usize,
 ) !?[]f64 {
-    if (config.kind == .degree or prior_artifact == null or current_node_ids.len == 0) return null;
+    if (!metrics.warm_start.supported(config.kind) or prior_artifact == null or current_node_ids.len == 0) return null;
     const prior = prior_artifact.?;
     if (prior.kind != .graph_metric_segment or prior.metadata_version != metric_segment.wire_version or
         prior.byte_len == 0 or prior.byte_len > limits.max_metric_payload_bytes or
         prior.graph_metric_materialization_state != .ready or
         prior.graph_metric_config_fingerprint != configFingerprint(config)) return null;
     const seed_bytes = std.math.mul(usize, current_node_ids.len, @sizeOf(f64)) catch return error.GraphMetricBuildBudgetExceeded;
+    // Admit both lifetimes before doing optional I/O. A seed that fits during
+    // preparation may not fit alongside the kernel and encoded output.
+    if (execution_peak_bytes > limits.max_peak_memory_bytes or
+        seed_bytes > limits.max_peak_memory_bytes - execution_peak_bytes) return null;
     var retained = std.math.add(u64, prior.byte_len, seed_bytes) catch return error.GraphMetricBuildBudgetExceeded;
     retained = std.math.add(u64, retained, existing_resident_bytes) catch return error.GraphMetricBuildBudgetExceeded;
+    // Decoding borrows IDs but allocates primary/ranked routing structs. Their
+    // layout is bounded by twice the encoded footer size.
+    retained = std.math.add(u64, retained, @as(u64, prior.graph_metric_routing_footer_len) * 2) catch return null;
     if (retained > limits.max_peak_memory_bytes) return null;
 
     const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
@@ -1580,13 +1573,17 @@ fn warmStartVectorAlloc(
         payload.len,
         payload[payload.len - metric_segment.routing_trailer_len ..],
     ) catch return null;
+    if (footer_len != prior.graph_metric_routing_footer_len) return null;
     var routing = metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(
         alloc,
         payload[payload.len - footer_len ..],
         payload.len,
         header.version,
         cancellation,
-    ) catch return null;
+    ) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => return null,
+    };
     defer routing.deinit(alloc);
 
     const expected_blocks = control.score_count / metric_segment.score_block_entries +
@@ -1603,9 +1600,15 @@ fn warmStartVectorAlloc(
         if (block_index % 32 == 0) try cancellation.check();
         const offset = std.math.cast(usize, entry.offset) orelse return null;
         if (offset > payload.len or entry.len > payload.len - offset) return null;
-        const decoded = metric_segment.decodeScoreBlockWithCancellation(payload[offset..][0..entry.len], cancellation) catch return null;
+        const decoded = metric_segment.decodeScoreBlockWithCancellation(payload[offset..][0..entry.len], cancellation) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => return null,
+        };
         var old_index: usize = 0;
+        var comparisons: usize = 0;
         while (current_index < current_node_ids.len and old_index < decoded.len) {
+            if (comparisons % 4096 == 0) try cancellation.check();
+            comparisons += 1;
             switch (decoded.scores[old_index].orderNode(decoded.node_prefix, current_node_ids[current_index])) {
                 .lt => old_index += 1,
                 .gt => current_index += 1,
@@ -1978,11 +1981,20 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
     defer freeArtifactRef(alloc, prior);
 
     const current_nodes = [_][]const u8{ "a", "b", "c" };
-    const seed = (try warmStartVectorAlloc(alloc, &artifacts, prior, &current_nodes, config, .none, .{}, 0)).?;
+    const seed = (try warmStartVectorAlloc(alloc, &artifacts, prior, &current_nodes, config, .none, .{}, 0, 0)).?;
     defer alloc.free(seed);
     try std.testing.expect(seed[0] > 0);
     try std.testing.expect(seed[1] > 0);
     try std.testing.expectEqual(@as(f64, 0), seed[2]);
+
+    // Optional preparation must fall back before fetching an artifact if its
+    // retained vector would crowd out otherwise admissible cold execution.
+    var unavailable = prior;
+    unavailable.artifact_id = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, config, .none, .{}, 0, (Limits{}).max_peak_memory_bytes)) == null);
+    var spectral = config;
+    spectral.kind = .eigenvector;
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, unavailable, &current_nodes, spectral, .none, .{}, 0, 0)) == null);
 
     // A content-addressed but semantically malformed score block is not a
     // usable seed. The nullable fallback must also release the dense vector it
@@ -2015,6 +2027,7 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
         config,
         .none,
         .{},
+        0,
         0,
     )) == null);
 }
