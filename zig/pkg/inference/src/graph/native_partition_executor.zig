@@ -145,6 +145,7 @@ pub const NativePartitionExecutor = struct {
         defer exec_state.freeMoeState();
 
         for (node_ids) |node_id| {
+            try exec_ctx.check();
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
 

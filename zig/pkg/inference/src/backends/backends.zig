@@ -20,6 +20,7 @@ const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
+const Interruption = @import("../execution_control.zig").Interruption;
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -87,6 +88,28 @@ pub const BackendType = enum {
         return self == .metal or self == .cuda;
     }
 
+    /// Strongest cancellation mechanism available once execution has crossed
+    /// into the backend. GPU driver and PJRT calls have no portable per-call
+    /// abort primitive, so they may execute only in a supervised worker.
+    pub fn executionInterruption(self: BackendType) Interruption {
+        return switch (self) {
+            .native, .wasm => .cooperative,
+            .onnx => .native_terminable,
+            .metal, .cuda, .pjrt => .process_required,
+        };
+    }
+
+    /// Model/session construction does not have the per-call termination
+    /// handle that ONNX execution exposes. Any constructor which enters a
+    /// native runtime or device driver therefore belongs to the replaceable
+    /// worker, even when later execution can be terminated in-process.
+    pub fn loadInterruption(self: BackendType) Interruption {
+        return switch (self) {
+            .native, .wasm => .cooperative,
+            .onnx, .metal, .cuda, .pjrt => .process_required,
+        };
+    }
+
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
@@ -110,6 +133,16 @@ pub const BackendRuntime = struct {
             else => false,
         };
     }
+
+    pub fn executionInterruption(self: BackendRuntime) Interruption {
+        if (self.backend == .onnx and self.onnx_execution_provider == .cuda)
+            return .process_required;
+        return self.backend.executionInterruption();
+    }
+
+    pub fn loadInterruption(self: BackendRuntime) Interruption {
+        return self.backend.loadInterruption();
+    }
 };
 
 test "backend runtime classifies external ONNX CUDA as GPU hosted" {
@@ -117,10 +150,49 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
         .backend = .onnx,
         .onnx_execution_provider = .cpu,
     }).usesGpuHostedSession());
+    try std.testing.expectEqual(
+        Interruption.native_terminable,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).executionInterruption(),
+    );
+    try std.testing.expectEqual(
+        Interruption.process_required,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cuda }).executionInterruption(),
+    );
     try std.testing.expect((BackendRuntime{
         .backend = .onnx,
         .onnx_execution_provider = .cuda,
     }).usesGpuHostedSession());
+}
+
+test "backend interruption policy isolates unabortable driver calls" {
+    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.executionInterruption());
+    try std.testing.expectEqual(Interruption.native_terminable, BackendType.onnx.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.executionInterruption());
+}
+
+test "backend load policy isolates native runtime construction" {
+    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.onnx.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.loadInterruption());
+    try std.testing.expectEqual(
+        Interruption.process_required,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).loadInterruption(),
+    );
+}
+
+test "embedded session policy fails before selecting an uninterruptible backend" {
+    if (!BackendType.metal.available()) return error.SkipZigTest;
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .metal;
+    manager.required_backend_invalid = false;
+    manager.process_isolation_available = false;
+    try std.testing.expectError(
+        error.ProcessIsolationRequired,
+        manager.validateRequiredBackendPolicy(),
+    );
 }
 
 const backend_order_capacity = std.meta.fields(BackendType).len;
@@ -153,6 +225,10 @@ pub const SessionManager = struct {
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
     io: ?std.Io = null,
+    /// True for CLI tools and supervised inference workers. Server nodes set
+    /// this explicitly so embedded database runtimes cannot even load a
+    /// backend whose driver requires process-level recovery.
+    process_isolation_available: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         const required = requiredBackendFromEnv();
@@ -196,6 +272,9 @@ pub const SessionManager = struct {
         const backend = self.required_backend orelse return;
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
+        const backend_runtime = try self.resolveBackendRuntime(backend);
+        if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required)
+            return error.ProcessIsolationRequired;
     }
 
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
@@ -283,6 +362,10 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
+            if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required) {
+                first_err = first_err orelse error.ProcessIsolationRequired;
+                continue;
+            }
             const effective_model_path = switch (backend) {
                 .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
@@ -844,6 +927,36 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
         man.audio_projection_path == null;
 }
 
+pub const bge_m3_metal_min_managed_embeddings_per_second: f64 = 1.0;
+
+fn bgeM3MetalThroughputQualifies(raw: []const u8) bool {
+    const measured = std.fmt.parseFloat(f64, raw) catch return false;
+    return std.math.isFinite(measured) and
+        measured >= bge_m3_metal_min_managed_embeddings_per_second;
+}
+
+fn bgeM3MetalQualified() bool {
+    if (build_options.enable_wasm or !build_options.link_libc) return false;
+    const value = std.c.getenv("ANTFLY_BGE_M3_METAL_MANAGED_EMBEDDINGS_PER_SECOND") orelse return false;
+    return bgeM3MetalThroughputQualifies(std.mem.span(value));
+}
+
+test "BGE-M3 Metal qualification enforces measured managed throughput" {
+    try std.testing.expect(!bgeM3MetalThroughputQualifies("true"));
+    try std.testing.expect(!bgeM3MetalThroughputQualifies("0.999"));
+    try std.testing.expect(bgeM3MetalThroughputQualifies("1.0"));
+    try std.testing.expect(bgeM3MetalThroughputQualifies("4.25"));
+}
+
+fn shouldPreferNativeBgeM3(man: manifest_mod.ModelManifest) bool {
+    return !bgeM3MetalQualified() and man.model_type == .embedder and
+        std.mem.eql(u8, man.config_model_arch, "xlm-roberta") and
+        man.bert_model_type == .roberta and
+        man.bert_vocab_size == 250002 and man.hidden_size == 1024 and
+        man.num_hidden_layers == 24 and man.num_attention_heads == 16 and
+        man.intermediate_size == 4096 and man.max_position_embeddings == 8194;
+}
+
 fn effectiveBackendOrder(
     allocator: std.mem.Allocator,
     scratch: *[backend_order_capacity]BackendType,
@@ -852,6 +965,9 @@ fn effectiveBackendOrder(
 ) []const BackendType {
     const prefer_blas_before_gpu = shouldPreferBlasBeforeGpu(allocator, manifest);
     if (manifest) |man| {
+        if (shouldPreferNativeBgeM3(man)) {
+            return reorderNativeAheadOfOnnx(scratch, preferred, true);
+        }
         if (shouldPreferNativeTextEncoder(man)) {
             return reorderNativeAheadOfOnnx(scratch, preferred, true);
         }
@@ -980,6 +1096,26 @@ test "effective backend order preserves order for non-gguf models" {
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
+}
+
+test "unqualified BGE-M3 prefers native ahead of Metal" {
+    const preferred = [_]BackendType{ .metal, .native };
+    var scratch: [backend_order_capacity]BackendType = undefined;
+    const manifest: manifest_mod.ModelManifest = .{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .config_model_arch = "xlm-roberta",
+        .bert_model_type = .roberta,
+        .bert_vocab_size = 250002,
+        .hidden_size = 1024,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .intermediate_size = 4096,
+        .max_position_embeddings = 8194,
+        .safetensors_path = "model.safetensors",
+    };
+    const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
+    try std.testing.expectEqualSlices(BackendType, &.{ .native, .metal }, effective);
 }
 
 test "effective backend order prefers native layoutlmv3 before onnx" {

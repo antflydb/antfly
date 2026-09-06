@@ -443,12 +443,15 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     });
     defer node.deinit();
 
     // Bind the caller-owned runtime before warmup so model loading, tokenizer
     // work, and backend sessions all compose with the same executor.
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     node.startReadinessInventory(io);
@@ -523,7 +526,7 @@ pub fn spawnServerProcess(
     errdefer alloc.free(host_dup);
 
     try node.validateHttpBind(host_dup);
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.startReadinessInventory(io);
 

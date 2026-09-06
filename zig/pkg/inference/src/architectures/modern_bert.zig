@@ -313,9 +313,11 @@ pub fn forwardCT(
     //    ModernBERT has no absolute position embeddings; RoPE is applied in each
     //    attention layer instead.
     var hidden = try embeddingsBlock(cb, config, zero_bias, input_ids, batch * seq_len);
+    errdefer cb.free(hidden);
 
     // 2. Encoder layers
     for (0..config.num_hidden_layers) |layer_idx| {
+        try cb.checkExecutionControl();
         const new_hidden = try encoderLayer(
             cb,
             allocator,
@@ -330,6 +332,14 @@ pub fn forwardCT(
         );
         cb.free(hidden);
         hidden = new_hidden;
+        if (cb.execution_control != null and encoder_frame_active and
+            (layer_idx + 1) % 2 == 0 and layer_idx + 1 < config.num_hidden_layers)
+        {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            encoder_frame_active = false;
+            try cb.checkExecutionControl();
+            encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+        }
     }
 
     // 3. Final layer norm
@@ -344,11 +354,13 @@ pub fn forwardCT(
         break :blk try cb.layerNorm(hidden, fn_w, fn_b, @intCast(config.hidden_size), config.layer_norm_eps);
     };
     cb.free(hidden);
+    hidden = normed_final;
     if (encoder_frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         encoder_frame_active = false;
     }
-    return normed_final;
+    try cb.checkExecutionControl();
+    return hidden;
 }
 
 // ---------------------------------------------------------------------------

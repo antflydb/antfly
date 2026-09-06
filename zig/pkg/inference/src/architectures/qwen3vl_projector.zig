@@ -351,6 +351,7 @@ const WeightCache = struct {
     }
 
     fn weight(self: *WeightCache, name: []const u8) !CT {
+        try self.cb.checkExecutionControl();
         const key = try std.fmt.allocPrint(self.allocator, "weight:{s}", .{name});
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
@@ -367,6 +368,7 @@ const WeightCache = struct {
     }
 
     fn linear(self: *WeightCache, name: []const u8, in_dim: usize, out_dim: usize) !CT {
+        try self.cb.checkExecutionControl();
         const key = try std.fmt.allocPrint(self.allocator, "linear:{d}:{d}:{s}", .{ in_dim, out_dim, name });
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
@@ -689,6 +691,7 @@ fn encodeProjectedImagesQualified(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !ProjectedImages {
+    try cb.checkExecutionControl();
     var store = try tensor_store_mod.GgufStore.initAbsolute(allocator, projector_path);
     defer store.tensorStore().deinit();
     return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, collect_preprocess_evidence);
@@ -784,8 +787,10 @@ fn encodeProjectedImagesFromWeightsQualified(
     errdefer preprocess_spatial_patches.deinit(allocator);
 
     for (images) |bytes| {
+        try cb.checkExecutionControl();
         var encoded = try encodeSingleImage(cb, allocator, weights, cfg, bytes, limits, collect_preprocess_evidence);
         defer encoded.deinit(allocator);
+        try cb.checkExecutionControl();
         try embeddings.appendSlice(allocator, encoded.embeddings);
         // Reserve the list slot before duplicating the feature payload so a
         // failed list growth cannot orphan a large per-image allocation.
@@ -973,6 +978,7 @@ fn encodeSingleImage(
     failed_stage = "decode";
     const decoded = try image.decode(allocator, bytes);
     defer decoded.deinit(allocator);
+    try cb.checkExecutionControl();
     const decode_ns = profileLap(profile, &stage_started_at);
     const decoded_pixels = std.math.mul(usize, decoded.width, decoded.height) catch return error.VisionAdmissionExceeded;
     if (decoded_pixels == 0 or decoded_pixels > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
@@ -1095,6 +1101,9 @@ fn encodeSingleImage(
     var blocks_ns: u64 = 0;
     var deepstack_ns: u64 = 0;
     for (0..cfg.block_count) |layer| {
+        // GGUF-backed projector weights bypass ComputeBackend.getWeight, so
+        // retain explicit bounded checkpoints even when those weights cache.
+        try cb.checkExecutionControl();
         failed_stage = "vision_block";
         failed_layer = layer;
         const block_started_at = if (profile) monotonicNowNs() else 0;
@@ -1127,6 +1136,7 @@ fn encodeSingleImage(
     }
 
     failed_stage = "post_norm";
+    try cb.checkExecutionControl();
     const post_norm = try layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
     cb.free(hidden);
     hidden = post_norm;
@@ -1931,6 +1941,48 @@ test "Qwen3-VL still-image temporal patch expansion matches Conv3D CTHW order" {
     const actual = try duplicateStillImageTemporalPatches(std.testing.allocator, &spatial, 2, 1);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6 }, actual);
+}
+
+test "Qwen3-VL projector cancellation unwinds live vision intermediates with cached weights" {
+    const native_compute = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.weight_reservations.deinit(allocator);
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute.vtable_impl };
+    // The first layer norm really executes. Cancellation at its following
+    // projection must release that intermediate even when weights are cached.
+    var weights = WeightCache.initGguf(allocator, &cb, undefined);
+    defer weights.deinit();
+    _ = try weights.insert("weight:v.blk.0.ln1.weight", try cb.fromFloat32(&.{ 1, 1, 1, 1 }));
+    _ = try weights.insert("weight:v.blk.0.ln1.bias", try cb.fromFloat32(&.{ 0, 0, 0, 0 }));
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer cb.free(input);
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 3) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    cb.execution_control = .{ .ptr = &probe, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, encoderBlock(&cb, allocator, &weights, .{
+        .text_hidden = 4,
+        .vision_hidden = 4,
+        .intermediate = 8,
+        .block_count = 1,
+        .head_count = 1,
+        .image_size = 2,
+        .patch_size = 1,
+        .spatial_merge = 2,
+        .layer_norm_eps = 1e-5,
+        .image_mean = .{ 0, 0, 0 },
+        .image_std = .{ 1, 1, 1 },
+    }, input, &.{ 0, 0 }, 1, 0));
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
 }
 
 test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {
