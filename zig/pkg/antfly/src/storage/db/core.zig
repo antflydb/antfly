@@ -1392,8 +1392,8 @@ pub const DBCore = struct {
 
     pub fn acquireSchemaVersionView(self: *DBCore, version: u32) !?schema_registry_mod.SchemaView {
         if (self.schema_registry.acquireVersion(version)) |view| return view;
-        self.schema_registry.lockHistoricalFault();
-        defer self.schema_registry.unlockHistoricalFault();
+        self.schema_registry.lockHistoricalFault(version);
+        defer self.schema_registry.unlockHistoricalFault(version);
         // Another reader may have completed the immutable fault while this
         // fiber waited. Recheck before touching durable metadata.
         if (self.schema_registry.acquireVersion(version)) |view| return view;

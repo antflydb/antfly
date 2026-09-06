@@ -217,6 +217,7 @@ test "standalone resource manager derives elastic storage cache envelopes" {
 const schema_mod = @import("../schema.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const schema_registry_mod = @import("schema_registry.zig");
+const SchemaCacheAdmission = @import("schema_cache_admission.zig").Admission;
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -31820,10 +31821,13 @@ pub const DB = struct {
             schema_plans: std.ArrayListUnmanaged(SchemaPlan) = .empty,
             schema_plan_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
             schema_plan_clock: u64 = 0,
+            schema_admission: SchemaCacheAdmission = .{},
+            transient_schema_plan: ?SchemaPlan = null,
             visitor: types.ScanVisitor,
             count: u32 = 0,
 
             fn deinit(state: *@This()) void {
+                if (state.transient_schema_plan) |*plan| plan.deinit();
                 state.ttl_key_scratch.deinit(state.alloc);
                 state.document_key_scratch.deinit(state.alloc);
                 for (state.schema_plans.items) |*plan| plan.deinit();
@@ -31839,6 +31843,7 @@ pub const DB = struct {
             }
 
             fn schemaPlan(state: *@This(), version: u32) !*SchemaPlan {
+                state.schema_admission.record(version);
                 state.schema_plan_clock +%= 1;
                 if (state.schema_plan_clock == 0) {
                     for (state.schema_plans.items) |*resident| resident.access = 0;
@@ -31891,10 +31896,20 @@ pub const DB = struct {
                     var evicted_index: usize = 0;
                     var oldest_access = state.schema_plans.items[0].access;
                     for (state.schema_plans.items[1..], 1..) |candidate, index| {
-                        if (candidate.access < oldest_access) {
+                        const frequency = state.schema_admission.frequency(candidate.version);
+                        const victim_frequency = state.schema_admission.frequency(state.schema_plans.items[evicted_index].version);
+                        if (frequency < victim_frequency or (frequency == victim_frequency and candidate.access < oldest_access)) {
                             oldest_access = candidate.access;
                             evicted_index = index;
                         }
+                    }
+                    if (!state.schema_admission.admits(version, state.schema_plans.items[evicted_index].version)) {
+                        if (state.transient_schema_plan) |*plan| plan.deinit();
+                        state.transient_schema_plan = new_plan;
+                        view_owned = false;
+                        filter_owned = false;
+                        projection_owned = false;
+                        return &state.transient_schema_plan.?;
                     }
                     var evicted = state.schema_plans.items[evicted_index];
                     _ = state.schema_plan_indexes.remove(evicted.version);
@@ -36386,8 +36401,11 @@ fn loadStoredSearchDocumentsMany(
         historical: std.ArrayListUnmanaged(HistoricalPlan) = .empty,
         historical_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty,
         historical_clock: u64 = 0,
+        admission: SchemaCacheAdmission = .{},
+        transient: ?HistoricalPlan = null,
 
         fn deinit(plans: *@This()) void {
+            if (plans.transient) |*plan| plan.deinit();
             if (plans.pinned_projection) |*projection| projection.deinit();
             for (plans.historical.items) |*plan| plan.deinit();
             plans.historical.deinit(plans.alloc);
@@ -36395,6 +36413,7 @@ fn loadStoredSearchDocumentsMany(
         }
 
         fn historicalPlan(plans: *@This(), version: u32) !*HistoricalPlan {
+            plans.admission.record(version);
             plans.historical_clock +%= 1;
             if (plans.historical_clock == 0) {
                 for (plans.historical.items) |*resident| resident.access = 0;
@@ -36435,10 +36454,19 @@ fn loadStoredSearchDocumentsMany(
                 var evicted_index: usize = 0;
                 var oldest_access = plans.historical.items[0].access;
                 for (plans.historical.items[1..], 1..) |candidate, index| {
-                    if (candidate.access < oldest_access) {
+                    const frequency = plans.admission.frequency(candidate.version);
+                    const victim_frequency = plans.admission.frequency(plans.historical.items[evicted_index].version);
+                    if (frequency < victim_frequency or (frequency == victim_frequency and candidate.access < oldest_access)) {
                         oldest_access = candidate.access;
                         evicted_index = index;
                     }
+                }
+                if (!plans.admission.admits(version, plans.historical.items[evicted_index].version)) {
+                    if (plans.transient) |*plan| plan.deinit();
+                    plans.transient = new_plan;
+                    view_owned = false;
+                    projection_owned = false;
+                    return &plans.transient.?;
                 }
                 var evicted = plans.historical.items[evicted_index];
                 _ = plans.historical_indexes.remove(evicted.version);
@@ -70566,6 +70594,9 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
+        // Inspect only the replicated apply record. An independent enrichment
+        // worker may legitimately append a second record immediately afterward.
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-a",
             .dense_embedder = deterministic_dense.interface(),

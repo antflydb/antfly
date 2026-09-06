@@ -294,6 +294,27 @@ then atomically switch the catalog's active version. Requests keep their pinned
 epoch alive through reference counting; point reads use an RCU acquisition fast
 path, and historical versions load lazily when old rows are encountered.
 
+Historical caches use an aging frequency sketch for admission. An interleaved
+scan spanning more than 32 epochs must not flush every resident query plan or
+layout on each row. Scan, search, index-backfill, and shared-registry caches
+apply that policy; a request-owned transient entry serves non-admitted epochs.
+Sixteen `std.Io` fault lanes coalesce same-version misses while unrelated
+versions can load concurrently. Whole-store replacement acquires all lanes
+before replacing the registry namespace.
+
+Portable export and restore share a 16 MiB decoded historical-epoch budget
+(configurable through `ImportOptions.schema_cache_bytes` for restore). Export
+faults serialized layouts from its immutable snapshot. Staged restore faults
+from its unpublished metadata store; validation-only paths spill serialized
+history to a private host file. A compact version/offset/digest directory remains
+in memory. Archives are not rejected based on total schema-history size.
+Arena capacity accounts for decoded layouts and validators; one transient or
+oversized epoch and the active schema are additional working memory. The compact
+directory remains O(schema versions), and validation-only freestanding calls
+without a filesystem retain the serialized spool in memory. Canonical row and cross-schema
+validation still run before staging publication. Export uses compiled physical
+offsets, keeping dense-row column traversal linear in schema width.
+
 `schema_capability.classifyChange` already distinguishes additive changes
 (new algebraic field → no rebuild) from breaking algebraic changes (removed or
 type-changed field → rebuild). A relational-specific lifecycle classifier is a

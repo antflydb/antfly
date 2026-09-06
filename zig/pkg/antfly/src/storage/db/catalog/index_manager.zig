@@ -2746,8 +2746,8 @@ pub const IndexManager = struct {
     fn acquireSchemaVersionView(self: *IndexManager, version: u32) !schema_registry_mod.SchemaView {
         const registry = self.schema_registry orelse return error.SchemaRegistryUnavailable;
         if (registry.acquireVersion(version)) |view| return view;
-        registry.lockHistoricalFault();
-        defer registry.unlockHistoricalFault();
+        registry.lockHistoricalFault(version);
+        defer registry.unlockHistoricalFault(version);
         if (registry.acquireVersion(version)) |view| return view;
         const store = self.primary_store orelse return error.SchemaRegistryUnavailable;
         const historical = try schema_mod.loadSchemaVersion(store, self.alloc, version) orelse
@@ -2760,7 +2760,7 @@ pub const IndexManager = struct {
         return try registry.installHistorical(epoch);
     }
 
-    /// Pins a bounded LRU of schema epochs encountered by a scan/backfill.
+    /// Pins a bounded, scan-resistant cache of epochs encountered by a backfill.
     /// Historical rows are common immediately after schema evolution; this
     /// avoids per-row registry traffic without letting an adversarial archive
     /// or long-lived scan retain every schema generation it encounters.
@@ -2774,12 +2774,15 @@ pub const IndexManager = struct {
         manager: *IndexManager,
         views: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
         clock: u64 = 0,
+        admission: @import("../schema_cache_admission.zig").Admission = .{},
+        transient: ?schema_registry_mod.SchemaView = null,
 
         pub fn init(manager: *IndexManager) @This() {
             return .{ .manager = manager };
         }
 
         pub fn deinit(self: *@This()) void {
+            if (self.transient) |*view| view.release();
             var values = self.views.valueIterator();
             while (values.next()) |entry| entry.view.release();
             self.views.deinit(self.manager.alloc);
@@ -2787,6 +2790,7 @@ pub const IndexManager = struct {
         }
 
         pub fn get(self: *@This(), version: u32) !*const schema_registry_mod.SchemaView {
+            self.admission.record(version);
             self.clock +%= 1;
             if (self.clock == 0) self.clock = 1;
             if (self.views.getPtr(version)) |entry| {
@@ -2800,10 +2804,19 @@ pub const IndexManager = struct {
                 var candidate_access: u64 = std.math.maxInt(u64);
                 var iterator = self.views.iterator();
                 while (iterator.next()) |entry| {
-                    if (candidate_version == null or entry.value_ptr.access < candidate_access) {
+                    const frequency = self.admission.frequency(entry.key_ptr.*);
+                    const candidate_frequency = if (candidate_version) |candidate| self.admission.frequency(candidate) else 255;
+                    if (candidate_version == null or frequency < candidate_frequency or
+                        (frequency == candidate_frequency and entry.value_ptr.access < candidate_access))
+                    {
                         candidate_version = entry.key_ptr.*;
                         candidate_access = entry.value_ptr.access;
                     }
+                }
+                if (!self.admission.admits(version, candidate_version.?)) {
+                    if (self.transient) |*previous| previous.release();
+                    self.transient = view;
+                    return &self.transient.?;
                 }
                 if (candidate_version) |evicted_version| {
                     var evicted = self.views.fetchRemove(evicted_version).?.value;

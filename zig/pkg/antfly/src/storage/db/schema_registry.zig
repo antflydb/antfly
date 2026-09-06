@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const schema_mod = @import("../schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const row_codec = @import("algebraic/relational_row_codec.zig");
+const Admission = @import("schema_cache_admission.zig").Admission;
 
 const Allocator = std.mem.Allocator;
 
@@ -139,10 +140,9 @@ pub const Registry = struct {
     alloc: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    /// Serializes durable cache misses. Faulting is rare and potentially does
-    /// storage I/O; one fiber-aware lane prevents concurrent readers from
-    /// repeating the same metadata read and immutable-layout deserialization.
-    historical_fault_mutex: std.Io.Mutex = .init,
+    /// Coalesce same-version faults without serializing unrelated epochs.
+    /// Whole-store publication acquires all lanes in index order.
+    historical_fault_mutexes: [16]std.Io.Mutex = [_]std.Io.Mutex{.init} ** 16,
     current: std.atomic.Value(?*Epoch) = .init(null),
     /// Readers publish a short acquisition hazard without entering a mutex or
     /// suspending the current std.Io task. Replacement flips banks, then waits
@@ -156,6 +156,7 @@ pub const Registry = struct {
     namespace_generation: std.atomic.Value(u64) = .init(0),
     pending_publications: usize = 0,
     historical_clock: u64 = 0,
+    historical_admission: Admission = .{},
     /// The map owns the active epoch plus a bounded, refcount-aware cache of
     /// historical layouts. Evicted versions remain durable and are faulted back
     /// through DBCore.acquireSchemaVersionView when an old row needs them.
@@ -235,12 +236,12 @@ pub const Registry = struct {
         return .{ .epoch = epoch };
     }
 
-    pub fn lockHistoricalFault(self: *Registry) void {
-        self.historical_fault_mutex.lockUncancelable(self.io);
+    pub fn lockHistoricalFault(self: *Registry, version: u32) void {
+        self.historical_fault_mutexes[version % self.historical_fault_mutexes.len].lockUncancelable(self.io);
     }
 
-    pub fn unlockHistoricalFault(self: *Registry) void {
-        self.historical_fault_mutex.unlock(self.io);
+    pub fn unlockHistoricalFault(self: *Registry, version: u32) void {
+        self.historical_fault_mutexes[version % self.historical_fault_mutexes.len].unlock(self.io);
     }
 
     fn touchHistoricalLocked(self: *Registry, epoch: *Epoch) void {
@@ -248,9 +249,12 @@ pub const Registry = struct {
         self.historical_clock +%= 1;
         if (self.historical_clock == 0) self.historical_clock = 1;
         epoch.historical_access = self.historical_clock;
+        self.historical_admission.record(epoch.schema.version);
     }
 
-    /// Remove one least-recently-used historical cache entry. Cache membership
+    /// Remove one low-frequency historical cache entry, favoring residents over
+    /// equally frequent newcomers so cyclic scans cannot flush the cache.
+    /// Cache membership
     /// is independent of object lifetime: a pinned SchemaView keeps the epoch
     /// alive after the registry drops its reference. A later lookup may fault a
     /// new immutable epoch for the same historical version, which is safe
@@ -260,14 +264,19 @@ pub const Registry = struct {
         if (self.epochs.count() <= max_resident_historical_epochs + active_allowance) return null;
         const active = self.current.load(.acquire);
         var candidate_version: ?u32 = null;
-        var candidate_access: u64 = std.math.maxInt(u64);
+        var candidate_access: u64 = 0;
+        var candidate_frequency: u8 = 255;
         var iterator = self.epochs.iterator();
         while (iterator.next()) |entry| {
             const epoch = entry.value_ptr.*;
             if (epoch == active) continue;
-            if (candidate_version == null or epoch.historical_access < candidate_access) {
+            const frequency = self.historical_admission.frequency(epoch.schema.version);
+            if (candidate_version == null or frequency < candidate_frequency or
+                (frequency == candidate_frequency and epoch.historical_access > candidate_access))
+            {
                 candidate_version = entry.key_ptr.*;
                 candidate_access = epoch.historical_access;
+                candidate_frequency = frequency;
             }
         }
         const version = candidate_version orelse return null;
@@ -474,11 +483,12 @@ pub const Registry = struct {
         // historical fault from the retiring namespace. The fault lane is
         // acquired first everywhere, so replacement and cache installation
         // have one deadlock-free ordering point.
-        self.historical_fault_mutex.lockUncancelable(self.io);
-        defer self.historical_fault_mutex.unlock(self.io);
+        for (&self.historical_fault_mutexes) |*lane| lane.lockUncancelable(self.io);
+        defer for (&self.historical_fault_mutexes) |*lane| lane.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         var retired_epochs = self.epochs;
         self.epochs = replacement.epochs;
+        self.historical_admission = .{};
         self.current.store(replacement.current, .release);
         // See acquire(): the seq_cst flip and counter observations form the
         // acquisition grace-period handshake across distinct atomics.
@@ -587,6 +597,34 @@ test "same-version publication preserves immutable epoch identity" {
     var current = registry.acquire().?;
     defer current.release();
     try std.testing.expectEqual(schema_mod.StorageMode.document, current.storageMode());
+}
+
+test "historical schema cache survives a cyclic over-capacity working set" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1000 });
+    defer registry.deinit();
+    var faults: usize = 0;
+    for (0..3300) |index| {
+        const version: u32 = @intCast(index % 33);
+        var view = registry.acquireVersion(version) orelse blk: {
+            faults += 1;
+            break :blk try registry.installHistorical(try Epoch.createCloned(alloc, .{ .version = version }));
+        };
+        try std.testing.expectEqual(version, view.version());
+        view.release();
+    }
+    // A pair of ordinary 32-entry LRUs faults all 3300 requests here.
+    try std.testing.expect(faults < 200);
+}
+
+test "historical schema fault lanes coalesce same versions independently" {
+    var registry = try Registry.initCloned(std.testing.allocator, std.testing.io, null);
+    defer registry.deinit();
+    registry.lockHistoricalFault(1);
+    defer registry.unlockHistoricalFault(1);
+    try std.testing.expect(!registry.historical_fault_mutexes[1].tryLock());
+    try std.testing.expect(registry.historical_fault_mutexes[2].tryLock());
+    registry.historical_fault_mutexes[2].unlock(std.testing.io);
 }
 
 test "historical epoch residency is bounded while pinned views remain valid" {

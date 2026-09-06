@@ -3071,7 +3071,7 @@ pub fn build(b: *std.Build) void {
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
             "portable restore validates historical rows with their public schema epoch",
-            "portable archive schema history accounting is bounded",
+            "portable archive accepts long history with a bounded decoded working set",
             "ordinal rows bind layout support projection checksum and canonical bytes",
             "export and import chunk artifacts round trip with public artifact ids",
             "export and import asset artifacts round trip with public artifact ids",
@@ -4594,6 +4594,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{
             "storage.db.db.test.",
+            "schema_registry.test.",
+            "schema_cache_admission.test.",
             "storage.db.promotion_runtime.test.",
             "unsupported transforms fail atomically instead of reporting success",
             "supported transform on a missing document remains a no-op without upsert",
