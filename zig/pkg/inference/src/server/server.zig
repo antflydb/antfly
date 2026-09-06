@@ -4022,6 +4022,17 @@ pub const Node = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) ![]u8 {
+        return self.generateTextDirectMaxTokens(allocator, model_name, roles, contents, 256);
+    }
+
+    fn generateTextDirectMaxTokens(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        max_tokens: i32,
+    ) ![]u8 {
         if (roles.len != contents.len) return error.InvalidGenerationRequest;
         if (roles.len == 0) return error.InvalidGenerationRequest;
 
@@ -4034,7 +4045,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, max_tokens, null, false, null, false, null);
     }
 
     pub fn generateTextDirectForProvider(
@@ -4043,8 +4054,9 @@ pub const Node = struct {
         model_name: []const u8,
         roles: []const []const u8,
         contents: []const []const u8,
+        max_tokens: i32,
     ) !ProviderGenerationOutcome {
-        return providerGenerationOutcome(self.generateTextDirect(allocator, model_name, roles, contents));
+        return providerGenerationOutcome(self.generateTextDirectMaxTokens(allocator, model_name, roles, contents, max_tokens));
     }
 
     pub fn generateMessagesDirect(

@@ -3482,7 +3482,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -4184,6 +4184,7 @@ pub fn build(b: *std.Build) void {
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
+        "httpx retrieval SSE",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
         "inference invocation remaining deadline rounds up and expires",
         "inference connection ABI reclaims partial responses on target failure",

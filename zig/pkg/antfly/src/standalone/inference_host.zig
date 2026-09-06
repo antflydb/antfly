@@ -155,16 +155,8 @@ const RerankTextsRequest = struct {
     documents: []const []const u8,
 };
 
-const GenerateTextRequest = struct {
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-};
-
-const GenerateMessagesRequest = struct {
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-};
+const GenerateTextRequest = antfly.inference.types.GenerateTextRequest;
+const GenerateMessagesRequest = antfly.inference.types.GenerateMessagesRequest;
 
 const ReadImagesRequest = struct {
     model: []const u8,
@@ -532,6 +524,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parsed.value.roles,
                 parsed.value.contents,
+                parsed.value.options.max_tokens,
             );
             const result = try providerGenerationContent(outcome);
             defer alloc.free(result);
@@ -545,6 +538,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parsed.value.messages,
+                parsed.value.options,
             );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -1169,11 +1163,12 @@ fn localAntflyGenerateMessages(
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
+    options: antfly.inference.GenerationOptions,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
     const preflight = try preflightLocalGenerateMessages(messages);
-    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    var admission = try node.beginDirectGenerateAdmission(preflight, options.max_tokens);
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);

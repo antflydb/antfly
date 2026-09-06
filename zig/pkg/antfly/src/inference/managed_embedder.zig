@@ -159,12 +159,14 @@ pub const AntflyProvider = struct {
         model: []const u8,
         roles: []const []const u8,
         contents: []const []const u8,
+        options: inference_types.GenerationOptions,
     ) anyerror![]u8 = null,
     generate_messages: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+        options: inference_types.GenerationOptions,
     ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,

@@ -221,8 +221,9 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
+                const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
                 if (local.generate_messages) |generate_messages| {
-                    const content = try generate_messages(local.ptr, alloc, model, messages);
+                    const content = try generate_messages(local.ptr, alloc, model, messages, options);
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
@@ -237,7 +238,7 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = try generate_text(local.ptr, alloc, model, roles, contents);
+                const content = try generate_text(local.ptr, alloc, model, roles, contents, options);
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,
@@ -473,6 +474,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
             model: []const u8,
             roles: []const []const u8,
             contents: []const []const u8,
+            options: inference.GenerationOptions,
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -480,6 +482,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
             try std.testing.expectEqual(@as(usize, 1), roles.len);
             try std.testing.expectEqualStrings("user", roles[0]);
             try std.testing.expectEqualStrings("hello", contents[0]);
+            try std.testing.expectEqual(@as(i32, 128), options.max_tokens);
             return try a.dupe(u8, "local ok");
         }
     };
@@ -498,6 +501,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
             .provider = .antfly,
             .model = "local-model",
             .url = "",
+            .max_tokens = 128,
         },
     }};
     var antfly_result = try executeChainWithAntflyProvider(alloc, &client, &antfly_chain, local_provider, &messages);
@@ -532,10 +536,12 @@ test "generating backend passes multimodal messages to local provider callback" 
             a: std.mem.Allocator,
             model: []const u8,
             messages: []const ChatMessage,
+            options: inference.GenerationOptions,
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(@as(i32, 37), options.max_tokens);
             try std.testing.expectEqual(@as(usize, 1), messages.len);
             const content = messages[0].content orelse return error.TestUnexpectedResult;
             const parts = switch (content) {
@@ -572,6 +578,7 @@ test "generating backend passes multimodal messages to local provider callback" 
             .provider = .antfly,
             .model = "local-model",
             .url = "",
+            .max_tokens = 37,
         },
     }};
     var result = try executeChainWithAntflyProvider(alloc, &client, &chain, local_provider, &messages);

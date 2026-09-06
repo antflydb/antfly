@@ -5366,11 +5366,13 @@ fn inferenceProviderGenerateText(
     model: []const u8,
     roles: []const []const u8,
     contents: []const []const u8,
+    options: antfly.inference.GenerationOptions,
 ) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, .{
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, antfly.inference.types.GenerateTextRequest{
         .model = model,
         .roles = roles,
         .contents = contents,
+        .options = options,
     }, null);
 }
 
@@ -5379,10 +5381,12 @@ fn inferenceProviderGenerateMessages(
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
+    options: antfly.inference.GenerationOptions,
 ) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, .{
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, antfly.inference.types.GenerateMessagesRequest{
         .model = model,
         .messages = messages,
+        .options = options,
     }, null);
 }
 

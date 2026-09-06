@@ -104,6 +104,9 @@ pub const EncodedResponse = struct {
 };
 
 pub const EventSink = struct {
+    /// HTTP retrieval emits events only for SSE requests. Other consumers
+    /// (e.g. A2A) may observe execution even when requesting a JSON result.
+    sse_only: bool = false,
     ptr: *anyopaque,
     emit_json_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!void,
 
@@ -357,7 +360,9 @@ const LiveEmitter = struct {
         const chunk_len: usize = 80;
         var start: usize = 0;
         while (start < text.len) {
-            const end = @min(start + chunk_len, text.len);
+            var end = @min(start + chunk_len, text.len);
+            // A JSON string must not end inside a UTF-8 code point.
+            while (end < text.len and (text[end] & 0xc0) == 0x80) end += 1;
             try self.emitValue(event_name, text[start..end]);
             start = end;
         }
@@ -492,6 +497,11 @@ fn finishAgentResult(
     live: *LiveEmitter,
 ) !EncodedResponse {
     try live.emitDone(result);
+    if (format == .sse and live.sink != null) {
+        // Events were written under transport backpressure. Do not retain or
+        // serialize a second full transcript after terminal completion.
+        return .{ .content_type = "text/event-stream", .body = try alloc.dupe(u8, "") };
+    }
     return try encodeAgentResult(alloc, format, result);
 }
 
@@ -575,7 +585,10 @@ fn executeInternal(
     const raw_queries = raw_queries_value.array.items;
 
     const format: ResponseFormat = if (request.stream orelse true) .sse else .json;
-    var live = LiveEmitter{ .sink = event_sink, .alloc = alloc };
+    var live = LiveEmitter{
+        .sink = if (event_sink) |sink| if (!sink.sse_only or format == .sse) sink else null else null,
+        .alloc = alloc,
+    };
     const tool_policy = try parseToolPolicy(request);
     const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
     if (max_internal_iterations < 0) return error.InvalidRetrievalAgentRequest;
@@ -1317,12 +1330,15 @@ fn executeInternal(
         const exec = generation_runner orelse return error.UnsupportedRetrievalAgentRequest;
         const messages = try buildGenerationMessages(arena, request.query, hit_list.items, cfg);
         var result = exec.executeChain(alloc, cfg.chain, messages) catch |err| switch (format) {
-            .sse => return .{
-                .content_type = "text/event-stream",
+            .sse => {
                 // Generation runners may live in independently compiled
                 // runtime units, where Zig error integers are not stable.
                 // Never expose a coincidentally matching local error name.
-                .body = try encodeSseGenerationError(alloc, err),
+                try live.emitValue("error", .{ .@"error" = "GenerationFailed" });
+                return .{
+                    .content_type = "text/event-stream",
+                    .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseGenerationError(alloc, err),
+                };
             },
             .json => return err,
         };
