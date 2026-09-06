@@ -650,7 +650,7 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 12), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 13), info.@"struct".fields.len);
 }
 
 const AdmissionProbeSession = struct {
