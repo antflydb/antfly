@@ -3832,6 +3832,9 @@ pub const ModelManager = struct {
     /// cancel independently without invalidating shared work.
     load_group: std.Io.Group = .init,
     load_io: ?std.Io = null,
+    /// Lazily allocated at a stable address for offline/direct callers. Never
+    /// borrow a request's Io: shared loads and resident sessions outlive it.
+    owned_load_runtime: ?*std.Io.Threaded = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
     in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
@@ -5591,6 +5594,12 @@ pub const ModelManager = struct {
     }
 
     pub fn deinit(self: *ModelManager) void {
+        // Sessions can retain the load runtime. Join work and destroy all
+        // resident resources before tearing down the manager-owned fallback.
+        defer if (self.owned_load_runtime) |owned| {
+            owned.deinit();
+            self.allocator.destroy(owned);
+        };
         if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
@@ -6418,6 +6427,20 @@ pub const ModelManager = struct {
         return .{ .handle = handle, .err = maybe_err };
     }
 
+    /// Called under load_lock. Once selected, the group's runtime never changes,
+    /// including when attachIo is called after an offline load has started.
+    fn loadCoordinationIoLocked(self: *ModelManager) !std.Io {
+        if (self.load_io) |io| return io;
+        const io = self.session_manager.io orelse blk: {
+            const owned = try self.allocator.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(self.allocator, .{});
+            self.owned_load_runtime = owned;
+            break :blk owned.io();
+        };
+        self.load_io = io;
+        return io;
+    }
+
     fn loadFromDirCoordinated(
         self: *ModelManager,
         model_dir: []const u8,
@@ -6466,17 +6489,14 @@ pub const ModelManager = struct {
             return self.waitForLoadFlight(flight_key, flight, control);
         }
 
+        const coordination_io = self.loadCoordinationIoLocked() catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
         const flight = self.allocator.create(LoadFlight) catch |err| {
             self.unlockLoadedModels();
             return err;
         };
-        // Antfly injects BackendRuntime.io through Node.attachIo. Keep the
-        // inference package coupled only to the std.Io capability so standalone
-        // and embedded owners can provide different runtime implementations.
-        // The process-local fallback is only for offline callers that do not
-        // attach a runtime.
-        const coordination_io = self.load_io orelse self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
         flight.* = .{
             .io = coordination_io,
             .hard_cancellation = if (control) |active| active.hard_cancellation else null,
@@ -6543,7 +6563,6 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return err;
         };
-        if (self.load_io == null) self.load_io = coordination_io;
         self.unlockLoadedModels();
         if (control != null) {
             self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
@@ -8376,6 +8395,81 @@ const LoadCancellationTrace = struct {
         return .{ .ptr = self, .check_fn = check, .progress = .{ .ptr = self, .update_fn = progress } };
     }
 };
+
+test "cold direct loads own a concurrent runtime beyond the request lifetime" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    {
+        var request_io = std.Io.Threaded.init(allocator, .{});
+        defer request_io.deinit();
+        var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{ .io = request_io.io() });
+        defer handle.release();
+        try std.testing.expect(manager.owned_load_runtime != null);
+        try std.testing.expect(manager.load_io.?.userdata != request_io.io().userdata);
+    }
+    // The request runtime has been destroyed. Both cached access and another
+    // cold load must still work; retiring the first handle forces the latter.
+    {
+        var cached = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+        cached.retire();
+    }
+    var reloaded = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer reloaded.release();
+    // A late attachment must not move an existing Group to a different Io.
+    const owned_io = manager.load_io.?;
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+}
+
+test "cold load coordination reuses an attached runtime without a fallback" {
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+    try std.testing.expect(manager.owned_load_runtime == null);
+}
+
+test "ColQwen query forward observes managed backend cancellation after tokenization" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer handle.release();
+    var trace = LoadCancellationTrace{};
+    var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+    defer compute.deinit();
+    trace.fail_at = trace.checks + 1;
+    // No pipeline-level control: only the managed backend can stop this
+    // forward after tokenization, at its first weight operation.
+    try std.testing.expectError(error.Cancelled, @import("../pipelines/multimodal_reranker_colqwen_impl.zig").encodeQuery(
+        &compute.backend,
+        allocator,
+        handle.get().getTokenizer(),
+        .{},
+        .{ .hidden_size = 4, .vocab_size = 16, .num_hidden_layers = 1, .num_attention_heads = 2 },
+        "a",
+        16,
+        false,
+        null,
+    ));
+    try std.testing.expectEqual(trace.fail_at.?, trace.checks);
+}
 
 test "cold load rollback owns manifest and constructed session before cancellation checkpoints" {
     const allocator = std.testing.allocator;

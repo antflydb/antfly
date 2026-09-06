@@ -7251,31 +7251,36 @@ pub const Node = struct {
             // accelerator runtime. Serialize their complete lifetime while
             // leaving request parsing and media admission outside the lane.
             const execution_mutex = model.targetInferenceExecutionMutex();
-            if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+            if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+                return inferenceFailureResponse(ctx, err);
             defer if (execution_mutex) |mutex| mutex.unlock();
 
-            var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
-                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
-            defer cb.deinit();
+            var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            defer compute.deinit();
             var qwen_pipeline = qwen3vl_multimodal_reranker.Pipeline.init(
                 ctx.allocator,
-                &cb,
+                &compute.backend,
                 model.getTokenizer(),
                 gpt_cfg,
                 projector_path,
                 .{
                     .max_length = @min(model.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length),
                 },
-            ) catch |err|
-                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+            ) catch |err| switch (err) {
+                error.InvalidRerankerConfiguration => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
+            };
 
             const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
             defer ctx.allocator.free(scores);
             var prompt_tokens: usize = 0;
             for (parsed_docs.items, 0..) |doc, idx| {
+                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
                 if (doc.images.len == 0) {
                     var text_pipeline = model.rerankingPipeline(ctx.allocator);
                     text_pipeline.execution_lock = null;
+                    text_pipeline.execution_control = execution_control;
                     const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
                         return inferenceFailureResponse(ctx, err);
                     defer ctx.allocator.free(text_scores);
@@ -7349,13 +7354,13 @@ pub const Node = struct {
             return inferenceFailureResponse(ctx, err);
         defer if (execution_mutex) |mutex| mutex.unlock();
 
-        var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
-        defer cb.deinit();
+        var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        defer compute.deinit();
 
         var mm_pipeline = multimodal_reranker.Pipeline.init(
             ctx.allocator,
-            &cb,
+            &compute.backend,
             vision_session,
             model.getTokenizer(),
             gpt_cfg,
