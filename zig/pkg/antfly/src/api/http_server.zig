@@ -23425,6 +23425,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         catalog_request,
@@ -23436,6 +23437,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", unknown_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         unknown_request,
@@ -23450,6 +23452,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_primary_text_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_primary_text_request,
@@ -23464,6 +23467,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", text_catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         text_catalog_request,
@@ -23497,6 +23501,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", graph_catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         graph_catalog_request,
@@ -23514,6 +23519,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_graph_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_graph_request,
@@ -23539,6 +23545,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_request,

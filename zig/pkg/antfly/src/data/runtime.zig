@@ -34726,6 +34726,9 @@ test "production DataServer replicated merge actions run on VoprIo" {
 
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
+        // Each production-shaped node keeps its LSM files on the host-backed
+        // differential boundary while scheduling runtime work through VoprIo.
+        .filesystem_io = std.testing.io,
         .borrowed_io = .{
             .general = io,
             .raft_inbound = io,
@@ -35216,6 +35219,9 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
+        // Each production-shaped node keeps its LSM files on the host-backed
+        // differential boundary while scheduling runtime work through VoprIo.
+        .filesystem_io = std.testing.io,
         .borrowed_io = .{
             .general = io,
             .raft_inbound = io,
