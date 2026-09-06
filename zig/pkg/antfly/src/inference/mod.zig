@@ -56,6 +56,7 @@ test "inference module compiles" {
 }
 
 test "bedrock provider request helpers" {
+    try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
@@ -79,6 +80,7 @@ test "bedrock provider request helpers" {
 }
 
 test "embedding provider request helpers" {
+    try @import("../common/provider_limits.zig").testProviderQuotas();
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
     try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();

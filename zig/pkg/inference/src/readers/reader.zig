@@ -275,7 +275,7 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
-        if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
+        if (try multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
             return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,
                 model_path,
@@ -288,7 +288,7 @@ pub const LoadedReader = union(enum) {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind == .moondream) {
             if (try session_manager.allowsDirectBackend(.onnx)) {
-                if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
+                if (try onnx_decoder_only_vlm.probeModelDir(allocator, model_path)) {
                     return .{ .vlm = try VlmLoadedReader.loadFromDirWithControl(allocator, model_path, control) };
                 }
                 if (build_options.enable_onnx) {
@@ -305,7 +305,7 @@ pub const LoadedReader = union(enum) {
                 }
             }
         }
-        if (parser_kind == .pix2struct and !vision_reader_mod.isSupportedModelDir(allocator, model_path)) {
+        if (parser_kind == .pix2struct and !try vision_reader_mod.isSupportedModelDir(allocator, model_path)) {
             return error.NativePix2StructNotYetSupported;
         }
 
@@ -459,47 +459,53 @@ fn validateVisionReadOptions(parser_kind: ParserKind, options: ReadOptions) !voi
     }
 }
 
-pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
-    if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;
+pub const ReaderKind = enum { multistage, decoder_only, encoder_decoder, native_vision };
+pub const UnsupportedReason = enum { no_reader_artifacts, invalid_metadata };
+pub const ReaderSupport = union(enum) {
+    supported: ReaderKind,
+    unsupported: UnsupportedReason,
 
-    const parser_kind = detectParserKind(allocator, model_path) catch return false;
-    if (parser_kind == .moondream) {
-        return onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path);
+    pub fn isSupported(self: ReaderSupport) bool {
+        return self == .supported;
     }
+};
 
-    return vision_reader_mod.isSupportedModelDir(allocator, model_path);
+pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) !bool {
+    var man = try manifest_mod.loadListingFromDir(allocator, model_path);
+    defer man.deinit();
+    return (try probeManifest(allocator, model_path, man)).isSupported();
 }
 
-/// Same check, reusing a manifest the caller already loaded.
-///
-/// The directory-based form ends in a full `manifest.loadFromDir`, which parses GGUF
-/// tokenizer metadata. Running that once per model made `/ai/v1/models` take about a
-/// second per GGUF model even though the listing never needed those fields.
-pub fn isSupportedManifest(
+/// Fallible capability probe; no weights or GGUF tokenizer tables are loaded.
+/// Unsupported artifacts are a normal result. Operational failures remain errors.
+pub fn probeManifest(
     allocator: std.mem.Allocator,
     model_path: []const u8,
     man: manifest_mod.ModelManifest,
-) bool {
-    if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;
-
-    const parser_kind = detectParserKind(allocator, model_path) catch return false;
+) !ReaderSupport {
+    const multistage = multistage_metadata.isMultiStageModelDir(allocator, model_path) catch |err| switch (err) {
+        error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop => return .{ .unsupported = .invalid_metadata },
+        else => return err,
+    };
+    if (multistage) return .{ .supported = .multistage };
+    const parser_kind = try detectParserKind(allocator, model_path);
     if (parser_kind == .moondream) {
-        return onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path);
+        return if (try onnx_decoder_only_vlm.probeModelDir(allocator, model_path))
+            .{ .supported = .decoder_only }
+        else
+            .{ .unsupported = .no_reader_artifacts };
     }
-
-    if (enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man)) return true;
-
-    return vision_reader_mod.isSupportedManifest(man);
+    if (try enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man))
+        return .{ .supported = .encoder_decoder };
+    if (vision_reader_mod.isSupportedManifest(man)) return .{ .supported = .native_vision };
+    return .{ .unsupported = .no_reader_artifacts };
 }
 
 fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !ParserKind {
-    const lower = try std.ascii.allocLowerString(allocator, model_path);
-    defer allocator.free(lower);
-
-    if (std.mem.indexOf(u8, lower, "donut") != null) return .donut;
-    if (std.mem.indexOf(u8, lower, "florence") != null) return .florence;
-    if (std.mem.indexOf(u8, lower, "moondream") != null) return .moondream;
-    if (std.mem.indexOf(u8, lower, "pix2struct") != null) return .pix2struct;
+    _ = allocator;
+    inline for (.{ "donut", "florence", "moondream", "pix2struct" }) |name| {
+        if (std.ascii.indexOfIgnoreCase(model_path, name) != null) return @field(ParserKind, name);
+    }
     return .default;
 }
 
@@ -1038,4 +1044,28 @@ test "moondream parser extracts description and fields from json" {
     try std.testing.expectEqualStrings("receipt,table", result.fields[2].value);
     try std.testing.expect(result.structured != null);
     try std.testing.expect(result.structured.? == .object);
+}
+
+test "reader capability probe distinguishes unsupported metadata and preserves allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator };
+    try std.testing.expect(!(try probeManifest(allocator, model_dir, man)).isSupported());
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "[]" });
+    try std.testing.expectEqual(UnsupportedReason.invalid_metadata, (try probeManifest(allocator, model_dir, man)).unsupported);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder_model.onnx", .data = "encoder" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model.onnx", .data = "decoder" });
+    const Check = struct {
+        fn run(a: std.mem.Allocator, path: []const u8) !void {
+            const manifest = manifest_mod.ModelManifest{ .allocator = a };
+            const support = try probeManifest(a, path, manifest);
+            try std.testing.expect(support.isSupported());
+            try std.testing.expectEqual(ReaderKind.encoder_decoder, support.supported);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
 }
