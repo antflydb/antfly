@@ -344,6 +344,7 @@ pub const Detail = enum(c_int) {
     // inference runtime; do not reinterpret compilation-local error integers.
     incompatible_model,
     unsupported_generator_provider,
+    schema_in_use,
 };
 
 pub const Status = extern struct {
@@ -388,6 +389,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.Conflict => status(.conflict, .conflict),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
+        error.SchemaInUse => status(.conflict, .schema_in_use),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -738,6 +740,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
         .table_transition_active => "TableTransitionActive",
+        .schema_in_use => "SchemaInUse",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1006,6 +1009,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
     };
+}
+
+test "schema epoch conflicts retain a retryable public status" {
+    const value = statusFromError(error.SchemaInUse);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+    try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
 }
 
 test "stable status preserves public boundary semantics" {

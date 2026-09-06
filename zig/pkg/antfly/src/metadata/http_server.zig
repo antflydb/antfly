@@ -2942,6 +2942,7 @@ pub const MetadataHttpServer = struct {
     fn metadataUpdateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         self.tableOperations().updateSchema(ctx.allocator, requestContext(ctx), table_name, (try ctx.body()) orelse "") catch |err| switch (err) {
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
@@ -2979,6 +2980,7 @@ pub const MetadataHttpServer = struct {
         ) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.SchemaVersionChanged, error.TableGenerationChanged => return ctx.status(409).text("schema version changed"),
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),

@@ -50,6 +50,10 @@ const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
 // Resolution deletes this sidecar atomically with the intents; terminal
 // history uses TxnRecord.intents_resolved instead.
 const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
+// Durable epoch leases. A prepare vote and its schema identity are one atomic
+// mutation; resolution retires both. Historical immutable schemas remain
+// usable after a new active epoch is published and after participant restart.
+const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
 const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
@@ -170,6 +174,14 @@ pub const ResolutionExtraBatch = struct {
 pub const MutationExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
+    /// DB preparation supplies a binding (including explicit schemaless).
+    /// Generic transaction-manager callers cannot infer a table's schema.
+    schema_binding: ?SchemaBinding = null,
+};
+
+pub const SchemaBinding = struct {
+    // null explicitly binds a schemaless document table, not the future tip.
+    version: ?u32 = null,
 };
 
 pub const ResolutionOutcome = struct {
@@ -205,8 +217,19 @@ pub const IntentBatch = struct {
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
     revision: u64 = 0,
+    schema_binding: ?SchemaBinding = null,
+    // Primary slices borrow this owned snapshot. Do not duplicate every
+    // payload merely to strip the one-byte intent envelope.
+    owned_entries: ?[]backend_scan.OwnedKVPair = null,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
+        if (self.owned_entries) |entries| {
+            backend_scan.freeResults(alloc, entries);
+            alloc.free(self.writes);
+            alloc.free(self.deletes);
+            self.* = undefined;
+            return;
+        }
         for (self.writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));
@@ -466,6 +489,20 @@ pub const TxnManager = struct {
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
 
+        const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
+        var schema_lease_value: [5]u8 = @splat(0);
+        const binding = extra_batch.schema_binding orelse SchemaBinding{};
+        schema_lease_value[0] = @intFromBool(binding.version != null);
+        if (binding.version) |version|
+            std.mem.writeInt(u32, schema_lease_value[1..5], version, .little);
+        const previous_lease = self.getAlloc(self.alloc, &schema_lease_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (previous_lease) |value| self.alloc.free(value);
+        if (previous_lease) |value| if (extra_batch.schema_binding != null and !std.mem.eql(u8, value, &schema_lease_value))
+            return error.SchemaInUse;
+
         // Emit CheckPredicates before checks: TLA+ spec models this as an
         // always-succeeding snapshot step; WriteIntentFails detects conflicts.
         if (self.trace_writer) |tw| {
@@ -485,23 +522,24 @@ pub const TxnManager = struct {
             return err;
         };
 
-        var intent_keys = try self.loadIntentKeysForWrite(self.alloc, txn_id, record.intent_revision);
-        defer freeParticipantList(self.alloc, intent_keys);
-        for (intents) |intent| {
-            var found = false;
-            for (intent_keys) |existing| {
-                if (std.mem.eql(u8, existing, intent.key)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) continue;
-            const owned_key = try self.alloc.dupe(u8, intent.key);
-            errdefer self.alloc.free(owned_key);
-            intent_keys = try self.alloc.realloc(intent_keys, intent_keys.len + 1);
-            intent_keys[intent_keys.len - 1] = owned_key;
+        const existing_keys = try self.loadIntentKeysForWrite(self.alloc, txn_id, record.intent_revision);
+        var intent_keys = std.ArrayListUnmanaged([]u8){ .items = existing_keys, .capacity = existing_keys.len };
+        defer {
+            for (intent_keys.items) |key| self.alloc.free(key);
+            intent_keys.deinit(self.alloc);
         }
-        std.mem.sort([]u8, intent_keys, {}, struct {
+        var key_set = std.StringHashMapUnmanaged(void).empty;
+        defer key_set.deinit(self.alloc);
+        const capacity = std.math.add(usize, existing_keys.len, intents.len) catch return error.InvalidBatchRequest;
+        try key_set.ensureTotalCapacity(self.alloc, std.math.cast(u32, capacity) orelse return error.InvalidBatchRequest);
+        for (existing_keys) |key| key_set.putAssumeCapacity(key, {});
+        try intent_keys.ensureTotalCapacity(self.alloc, capacity);
+        for (intents) |intent| {
+            if (key_set.getOrPutAssumeCapacity(intent.key).found_existing) continue;
+            const owned_key = try self.alloc.dupe(u8, intent.key);
+            intent_keys.appendAssumeCapacity(owned_key);
+        }
+        std.mem.sort([]u8, intent_keys.items, {}, struct {
             fn lessThan(_: void, left: []u8, right: []u8) bool {
                 return std.mem.order(u8, left, right) == .lt;
             }
@@ -557,9 +595,11 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
 
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
-        const intent_keys_value = try encodeParticipantList(self.alloc, intent_keys);
+        const intent_keys_value = try encodeParticipantList(self.alloc, intent_keys.items);
         try write_vals.append(self.alloc, intent_keys_value);
         try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
+        if (extra_batch.schema_binding != null)
+            try writes.append(self.alloc, .{ .key = &schema_lease_key, .value = &schema_lease_value });
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
@@ -584,6 +624,7 @@ pub const TxnManager = struct {
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
+        const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
@@ -660,7 +701,10 @@ pub const TxnManager = struct {
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
         const intent_entries = if (extra_batch.known_intent_keys) |keys|
-            try self.loadIntentEntriesByKeys(self.alloc, scan_prefix, keys)
+            if (extra_batch.skip_all_intent_application and extra_batch.expected_intent_revision != null)
+                try intentRetirementEntries(self.alloc, scan_prefix, keys)
+            else
+                try self.loadIntentEntriesByKeys(self.alloc, scan_prefix, keys)
         else
             try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer backend_scan.freeResults(self.alloc, intent_entries);
@@ -685,6 +729,7 @@ pub const TxnManager = struct {
             var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer completion_deletes.deinit(self.alloc);
             try completion_deletes.append(self.alloc, &stale_manifest_key);
+            try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try self.applyBatch(completion_writes.items, completion_deletes.items, null);
             return .{
@@ -723,6 +768,7 @@ pub const TxnManager = struct {
         }
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
         try deletes.append(self.alloc, &intent_keys_key);
+        try deletes.append(self.alloc, &schema_lease_key);
         if (status == .committed) {
             // Apply intents to real keys
             for (intent_entries) |entry| {
@@ -800,6 +846,7 @@ pub const TxnManager = struct {
         // revision and intent rows in one backend batch, so validation under
         // the DB apply lock detects any prepare that raced with this snapshot.
         const record = try self.loadTransactionRecord(txn_id);
+        const schema_binding = try self.loadSchemaBinding(alloc, txn_id);
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
@@ -807,42 +854,57 @@ pub const TxnManager = struct {
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
         const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
-        defer backend_scan.freeResults(alloc, intent_entries);
+        errdefer backend_scan.freeResults(alloc, intent_entries);
 
         var write_count: usize = 0;
         for (intent_entries) |entry| {
             if (!(entry.value.len > 0 and entry.value[0] == 1)) write_count += 1;
         }
         const writes = try alloc.alloc(docstore.KVPair, write_count);
-        var writes_initialized: usize = 0;
-        errdefer {
-            for (writes[0..writes_initialized]) |write| {
-                alloc.free(@constCast(write.key));
-                alloc.free(@constCast(write.value));
-            }
-            if (writes.len > 0) alloc.free(writes);
-        }
+        errdefer alloc.free(writes);
         const deletes = try alloc.alloc([]const u8, intent_entries.len - write_count);
+        errdefer alloc.free(deletes);
+        var writes_initialized: usize = 0;
         var deletes_initialized: usize = 0;
-        errdefer {
-            for (deletes[0..deletes_initialized]) |key| alloc.free(@constCast(key));
-            if (deletes.len > 0) alloc.free(deletes);
-        }
 
         for (intent_entries) |entry| {
             const user_key = entry.key[intents_prefix.len + 17 ..];
             if (entry.value.len > 0 and entry.value[0] == 1) {
-                deletes[deletes_initialized] = try alloc.dupe(u8, user_key);
+                deletes[deletes_initialized] = user_key;
                 deletes_initialized += 1;
             } else {
-                const key = try alloc.dupe(u8, user_key);
-                errdefer alloc.free(key);
-                const value = try alloc.dupe(u8, if (entry.value.len > 1) entry.value[1..] else "");
-                writes[writes_initialized] = .{ .key = key, .value = value };
+                writes[writes_initialized] = .{ .key = user_key, .value = if (entry.value.len > 1) entry.value[1..] else "" };
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes, .revision = record.intent_revision };
+        return .{ .writes = writes, .deletes = deletes, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
+    }
+
+    pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
+        const key = makeSidecarKey(schema_leases_prefix, txn_id);
+        const raw = self.getAlloc(alloc, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != 5 or raw[0] > 1) return error.InvalidTxnRecord;
+        if (raw[0] == 0 and std.mem.readInt(u32, raw[1..5], .little) != 0) return error.InvalidTxnRecord;
+        return .{ .version = if (raw[0] == 1) std.mem.readInt(u32, raw[1..5], .little) else null };
+    }
+
+    /// Called under the same apply fence as schema publication. A current
+    /// cursor holds a short read lease, without cloning the mutable memtable.
+    pub fn hasSchemaLeases(self: *TxnManager) !bool {
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(schema_leases_prefix)) |entry|
+            if (std.mem.startsWith(u8, entry.key, schema_leases_prefix)) return true;
+        // Existing document databases may have unresolved intents predating
+        // relational epoch binding. They also fence a storage-mode switch.
+        const entry = (try cursor.seekAtOrAfter(intents_prefix)) orelse return false;
+        return std.mem.startsWith(u8, entry.key, intents_prefix);
     }
 
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
@@ -1293,7 +1355,8 @@ pub const TxnManager = struct {
                 const upgraded_value = try self.encodeRecord(upgraded);
                 defer self.alloc.free(upgraded_value);
                 const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
-                try self.applyBatch(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{&stale_manifest_key}, null);
+                const stale_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
+                try self.applyBatch(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{ &stale_manifest_key, &stale_lease_key }, null);
             }
 
             const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -1634,6 +1697,22 @@ pub const TxnManager = struct {
         return entries;
     }
 
+    /// A revision-fenced caller has already materialized these intents. Only
+    /// their keys are needed to atomically retire intent rows and locks.
+    fn intentRetirementEntries(alloc: Allocator, prefix: []const u8, keys: []const []const u8) ![]backend_scan.OwnedKVPair {
+        const entries = try alloc.alloc(backend_scan.OwnedKVPair, keys.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |entry| alloc.free(entry.key);
+            alloc.free(entries);
+        }
+        for (keys, 0..) |key, i| {
+            entries[i] = .{ .key = try std.mem.concat(alloc, u8, &.{ prefix, key }), .value = &.{} };
+            initialized += 1;
+        }
+        return entries;
+    }
+
     fn scanPrefix(self: *TxnManager, alloc: Allocator, prefix: []const u8) ![]backend_scan.OwnedKVPair {
         return try backend_scan.scanPrefix(alloc, &self.store, prefix);
     }
@@ -1653,9 +1732,10 @@ pub const TxnManager = struct {
         const ha_batch_key = makeTransactionHABatchOutboxKey(txn_id);
         const ha_replay_key = makeTransactionHAReplayOutboxKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
+        const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
-        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key });
+        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try self.applyBatch(extra_batch.writes, deletes.items, null);
     }
@@ -2333,6 +2413,58 @@ test "transaction record preserves begin timestamp separately from commit versio
     try std.testing.expectEqual(commit_ts, record.commit_version);
     try std.testing.expectEqual(commit_ts, record.visibleVersion());
     try std.testing.expectEqual(commit_ts, record.finalized_at);
+}
+
+test "transaction intent snapshot owns one payload copy and retirement reads only keys" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-owned-snapshot");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = @splat(17);
+    try mgr.initTransaction(txn_id, 100);
+    const payload = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    try mgr.writeIntentsExtraBatch(txn_id, &.{.{ .key = "row", .value = payload }}, &.{}, .{ .schema_binding = .{ .version = 1 } });
+    try std.testing.expect(try mgr.hasSchemaLeases());
+    try std.testing.expectError(error.SchemaInUse, mgr.writeIntentsExtraBatch(txn_id, &.{}, &.{}, .{ .schema_binding = .{ .version = 2 } }));
+
+    const scratch = try alloc.alloc(u8, payload.len + 32 * 1024);
+    defer alloc.free(scratch);
+    var fixed = std.heap.FixedBufferAllocator.init(scratch);
+    var snapshot = try mgr.collectIntentBatch(fixed.allocator(), txn_id);
+    try std.testing.expectEqualSlices(u8, payload, snapshot.writes[0].value);
+    try std.testing.expectEqual(snapshot.owned_entries.?[0].value.ptr + 1, snapshot.writes[0].value.ptr);
+    try std.testing.expectEqual(@as(?u32, 1), snapshot.schema_binding.?.version);
+    const revision = snapshot.revision;
+    snapshot.deinit(fixed.allocator());
+
+    const Check = struct {
+        fn run(failing: Allocator, manager: *TxnManager, id: TxnId) !void {
+            var captured = try manager.collectIntentBatch(failing, id);
+            defer captured.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &mgr, txn_id });
+
+    // Even a 256 KiB intent can retire in a 32 KiB working set: no payload
+    // reads/copies are permitted once the caller supplies a fenced snapshot.
+    var retirement = std.heap.FixedBufferAllocator.init(scratch[0 .. 32 * 1024]);
+    mgr.alloc = retirement.allocator();
+    defer mgr.alloc = alloc;
+    _ = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 200, .{
+        .expected_intent_revision = revision,
+        .known_intent_keys = &.{"row"},
+        .skip_all_intent_application = true,
+        .writes = &.{.{ .key = "resolved", .value = "ok" }},
+    });
+    try std.testing.expect(!try mgr.hasSchemaLeases());
+    try std.testing.expect(!try mgr.hasIntents(txn_id));
 }
 
 test "transaction protocol fences begin prepare snapshot and idempotent resolution" {

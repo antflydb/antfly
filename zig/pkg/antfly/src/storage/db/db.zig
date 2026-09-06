@@ -2770,6 +2770,8 @@ const TransactionResolution = struct {
     expected_intent_revision: u64,
     intent_keys: []const []const u8,
     resolved_participant: ?[]const u8 = null,
+    schema_binding: ?transactions_mod.SchemaBinding = null,
+    schema_namespace_generation: ?u64 = null,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -8455,6 +8457,11 @@ pub const DB = struct {
         generated_memo: *GeneratedEmbeddingMemo,
         prepared_row_allocator: *PreparedRowAllocator,
     ) anyerror!void {
+        const schema_namespace = if (opts.transaction_resolution) |resolution|
+            resolution.schema_namespace_generation orelse self.core.schemaNamespaceGeneration()
+        else
+            self.core.schemaNamespaceGeneration();
+        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
         var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
@@ -8558,7 +8565,8 @@ pub const DB = struct {
         // parse/extract/hash/encode work before entering the serialized apply
         // section. A concurrent schema/index publication or transform-base
         // mutation is detected after admission by comparing pinned epochs.
-        var request_schema_view = self.core.acquireSchemaView();
+        const transaction_schema_binding = if (opts.transaction_resolution) |resolution| resolution.schema_binding else null;
+        var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, transaction_schema_binding);
         defer if (request_schema_view) |*view| view.release();
         // Row side effects outlive speculative preparation but are consumed as
         // borrowed slices by the serialized commit. A batch arena turns their
@@ -8631,7 +8639,7 @@ pub const DB = struct {
                 // while holding only the catalog read lease. Schema/index
                 // publication may proceed after this short phase; the commit
                 // fence validates both generations before consuming the plan.
-                if (!self.core.isSchemaViewCurrent(view) or
+                if ((transaction_schema_binding == null and !self.core.isSchemaViewCurrent(view)) or
                     self.core.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
                     return error.PreparedGenerationChanged;
                 {
@@ -8794,6 +8802,9 @@ pub const DB = struct {
         var apply_mutex_held = true;
         var apply_lock_acquired_ns = monotonicTimeNs();
         errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+        // A durable epoch survives active-schema publication, not replacement
+        // of the entire database namespace with reused version/transaction IDs.
+        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
 
         if (opts.raft_applied_entry_marker) |identity| {
             switch (try raftAppliedEntryDisposition(
@@ -8864,10 +8875,11 @@ pub const DB = struct {
         // Validate the final post-transform rows at the storage boundary. API
         // preflight remains useful for early UX feedback, but every embedded,
         // replicated, recovery, and direct DB caller gets the same contract.
+        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         const use_preprepared_rows = blk: {
             const rows = preprepared_rows orelse break :blk false;
             const pinned = request_schema_view orelse break :blk false;
-            if (!self.core.isSchemaViewCurrent(pinned) or
+            if ((transaction_schema_binding == null and !self.core.isSchemaViewCurrent(pinned)) or
                 rows.len != effective_req.writes.len) break :blk false;
             const expected_plan_generation = prepared_write_plan_generation orelse break :blk false;
             if (self.core.index_manager.writePlanGeneration() != expected_plan_generation) break :blk false;
@@ -8883,7 +8895,10 @@ pub const DB = struct {
         // serialized fallback; AROW v2 never encodes without its compiled
         // physical layout.
         var apply_schema_view: ?schema_registry_mod.SchemaView = if (!use_preprepared_rows and relationalColumns(self) != null)
-            self.core.acquireSchemaView()
+            if (transaction_schema_binding != null)
+                if (request_schema_view) |view| view.clone() else null
+            else
+                self.core.acquireSchemaView()
         else
             null;
         defer if (apply_schema_view) |*view| view.release();
@@ -22881,6 +22896,7 @@ pub const DB = struct {
         predicates: []const transactions_mod.VersionPredicate,
         preparation_alloc: Allocator,
     ) !void {
+        const schema_namespace = self.core.schemaNamespaceGeneration();
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(preparation_alloc);
         var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -22890,15 +22906,19 @@ pub const DB = struct {
             try identity_upsert_keys.append(preparation_alloc, intent.key);
             try writes.append(preparation_alloc, .{ .key = intent.key, .value = intent.value.? });
         }
-        var view = self.core.acquireSchemaView();
+        const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
+        var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
         try validateRelationalWritesWithSchemaView(preparation_alloc, writes.items, view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.validatePreparedSchemaViewLocked(view);
+        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        try self.core.writeIntents(txn_id, intents, predicates);
+        try self.core.writeIntentsExtraBatch(txn_id, intents, predicates, .{
+            .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
+        });
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
@@ -22950,6 +22970,7 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         preparation_alloc: Allocator,
     ) !void {
+        const schema_namespace = self.core.schemaNamespaceGeneration();
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
         // validates both that read set and the immutable schema epoch.
@@ -23010,13 +23031,15 @@ pub const DB = struct {
             try identity_upsert_keys.append(preparation_alloc, intent.key);
         }
 
-        var prepared_schema_view = self.core.acquireSchemaView();
+        const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
+        var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
         try validateRelationalWritesWithSchemaView(preparation_alloc, effective_ops.writes, prepared_schema_view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+        if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         try self.validateTransformReadSnapshot(transform_snapshot);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         if (raft_entry) |identity| {
@@ -23030,11 +23053,21 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker} },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null } },
             );
         } else {
-            try self.core.writeIntents(txn_id, intents.items, predicates.items);
+            try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
+            });
         }
+    }
+
+    fn acquireTransactionSchemaView(self: *DB, alloc: Allocator, binding: ?transactions_mod.SchemaBinding) !?schema_registry_mod.SchemaView {
+        if (binding) |pinned| return if (pinned.version) |version|
+            try self.core.acquireSchemaVersionWriteView(alloc, version)
+        else
+            null;
+        return self.core.acquireSchemaView();
     }
 
     fn validatePreparedSchemaViewLocked(self: *DB, prepared: ?schema_registry_mod.SchemaView) !void {
@@ -23155,6 +23188,33 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
     ) !void {
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        self.resolveTransactionIntentsPrepared(
+            txn_id,
+            status,
+            commit_version,
+            sync_level,
+            visibility_cancellation,
+            raft_entry,
+            resolved_participant,
+            &preparation.guard,
+        ) catch |err| return preparation.mapError(err);
+    }
+
+    fn resolveTransactionIntentsPrepared(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+        visibility_cancellation: types.CancellationToken,
+        raft_entry: ?RaftAppliedEntryIdentity,
+        resolved_participant: ?[]const u8,
+        preparation: *PreparedRowAllocator,
+    ) !void {
+        const alloc = preparation.allocator();
         var ha_mutation = if (raft_entry == null) self.acquireHAMutationShared() else null;
         defer if (ha_mutation) |*lease| lease.release();
         if (raft_entry == null) try self.enforceHAWriteGate();
@@ -23187,14 +23247,19 @@ pub const DB = struct {
 
         var attempts: usize = 0;
         while (attempts < 8) : (attempts += 1) {
-            var intents = try self.core.collectTransactionIntentBatch(self.alloc, txn_id);
-            defer intents.deinit(self.alloc);
-            const intent_keys = try self.alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
-            defer self.alloc.free(intent_keys);
+            const schema_namespace = self.core.schemaNamespaceGeneration();
+            var intents = try self.core.collectTransactionIntentBatch(alloc, txn_id);
+            defer intents.deinit(alloc);
+            const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
+            defer alloc.free(intent_keys);
             for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
             for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
                 try self.lockApplyForPortableRuntime();
+                if (schema_namespace != self.core.schemaNamespaceGeneration()) {
+                    self.core.unlockApply();
+                    return error.PreparedGenerationChanged;
+                }
                 var marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
                     switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
@@ -23227,10 +23292,10 @@ pub const DB = struct {
                 return;
             }
 
-            const writes = try self.alloc.alloc(types.BatchWrite, intents.writes.len);
-            defer self.alloc.free(writes);
+            const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
+            defer alloc.free(writes);
             for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
-            self.batchInternal(.{
+            self.batchInternalWithPreparationAllocator(.{
                 .writes = writes,
                 .deletes = intents.deletes,
                 .timestamp_ns = commit_version,
@@ -23246,8 +23311,10 @@ pub const DB = struct {
                     .expected_intent_revision = intents.revision,
                     .intent_keys = intent_keys,
                     .resolved_participant = resolved_participant,
+                    .schema_binding = intents.schema_binding,
+                    .schema_namespace_generation = schema_namespace,
                 },
-            }) catch |err| {
+            }, preparation) catch |err| {
                 if (err == error.IntentSnapshotChanged) continue;
                 return err;
             };
@@ -61253,10 +61320,127 @@ test "relational direct intents share preparation admission before the apply fen
     reservation.release();
     try db.writeIntents(txn_id, &intents, &.{});
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    reservation = try manager.reserve(.relational_preparation_working_set, hard_limit);
+    const before_commit = db.snapshotApplyLockStats();
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.commitTransaction(txn_id, 200));
+    try std.testing.expectEqualDeep(before_commit, db.snapshotApplyLockStats());
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
+    reservation.release();
     try db.commitTransaction(txn_id, 200);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
     const row = (try db.get(alloc, "row")).?;
     defer alloc.free(row);
     try std.testing.expectEqualStrings("{\"id\":\"ok\"}", row);
+}
+
+test "relational transaction epoch survives schema publication and participant restart" {
+    const alloc = std.testing.allocator;
+    const v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer","minimum":0}},"required":["amount"],"additionalProperties":false}}}}
+    ;
+    const v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"string"}},"required":["amount"],"additionalProperties":false}}}}
+    ;
+    for ([_]bool{ false, true }) |public| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var txn_ids: [2]transactions_mod.TxnId = undefined;
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+            defer db.close();
+            const columns = [_]schema_mod.RelationalColumn{.{ .name = "amount", .path = "amount", .column_type = .integer, .required = true }};
+            if (public) try db.setSchemaJson(alloc, v1) else try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+            txn_ids[0] = try db.beginTransaction(100);
+            txn_ids[1] = try db.beginTransaction(101);
+            try db.writeIntents(txn_ids[0], &.{.{ .key = "direct", .value = "{\"amount\":3}" }}, &.{});
+            try db.writeTransaction(txn_ids[1], .{ .writes = &.{.{ .key = "transaction", .value = "{\"amount\":4}" }} });
+            const changed = [_]schema_mod.RelationalColumn{.{ .name = "amount", .path = "amount", .column_type = .string, .required = true }};
+            if (public) try db.setSchemaJson(alloc, v2) else try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &changed });
+            // Retrying/expanding an already prepared participant keeps v1.
+            if (public) try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(txn_ids[0], &.{.{ .key = "invalid", .value = "{\"amount\":-1}" }}, &.{}));
+            try db.writeIntents(txn_ids[0], &.{.{ .key = "direct", .value = "{\"amount\":5}" }}, &.{});
+            try db.writeTransaction(txn_ids[1], .{ .writes = &.{.{ .key = "transaction", .value = "{\"amount\":6}" }} });
+        }
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.commitTransaction(txn_ids[0], 200);
+        try db.commitTransaction(txn_ids[1], 201);
+        // Idempotent terminal retries must not re-apply v1 over future rows.
+        try db.commitTransaction(txn_ids[0], 200);
+        try db.batch(.{ .writes = &.{.{ .key = "direct", .value = "{\"amount\":\"replaced\"}" }} });
+        try db.commitTransaction(txn_ids[0], 200);
+        const replaced = (try db.get(alloc, "direct")).?;
+        defer alloc.free(replaced);
+        try std.testing.expectEqualStrings("{\"amount\":\"replaced\"}", replaced);
+        try db.batch(.{ .writes = &.{.{ .key = "current", .value = "{\"amount\":\"new\"}" }} });
+        for ([_][]const u8{ "direct", "transaction", "current" }, 0..) |key, i| {
+            const store_key = try relational_store.keyAlloc(alloc, key);
+            defer alloc.free(store_key);
+            const row = try db.core.store.get(alloc, store_key);
+            defer alloc.free(row);
+            try std.testing.expectEqual(@as(u32, if (i == 1) 1 else 2), try relational_store.rowSchemaVersion(row));
+        }
+        try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+    }
+}
+
+test "relational durable transaction epoch does not cross whole namespace replacement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "amount", .path = "amount", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const txn = try db.beginTransaction(100);
+    const writes = [_]types.BatchWrite{.{ .key = "row", .value = "{\"amount\":3}" }};
+    try db.writeIntents(txn, &.{.{ .key = "row", .value = writes[0].value }}, &.{});
+    const namespace = db.core.schemaNamespaceGeneration();
+    var snapshot = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer snapshot.deinit(alloc);
+    // Restore/reload may reuse schema versions. Namespace identity, not just
+    // the durable version or intent revision, must invalidate old preparation.
+    lockApply(&db);
+    db.core.reloadSchemaFromStore() catch |err| {
+        db.core.unlockApply();
+        return err;
+    };
+    db.core.unlockApply();
+    try std.testing.expect(namespace != db.core.schemaNamespaceGeneration());
+    try std.testing.expectError(error.PreparedGenerationChanged, db.batchInternal(.{ .writes = &writes }, null, .{
+        .transaction_resolution = .{
+            .txn_id = txn,
+            .status = .committed,
+            .commit_version = 200,
+            .expected_intent_revision = snapshot.revision,
+            .intent_keys = &.{"row"},
+            .schema_binding = snapshot.schema_binding,
+            .schema_namespace_generation = namespace,
+        },
+    }));
+    try std.testing.expect((try db.get(alloc, "row")) == null);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn));
+    try db.commitTransaction(txn, 200);
+}
+
+test "relational initial storage mode cannot strand schemaless transaction intents" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const txn = try db.beginTransaction(100);
+    try db.writeIntents(txn, &.{.{ .key = "row", .value = "{\"amount\":3}" }}, &.{});
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "amount", .path = "amount", .column_type = .integer }};
+    const schema = schema_mod.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    try std.testing.expectError(error.SchemaInUse, db.setSchema(schema));
+    try std.testing.expect(db.core.schema == null);
+    try db.abortTransaction(txn, 200);
+    try db.abortTransaction(txn, 200);
+    try db.setSchema(schema);
 }
 
 test "relational preparation budget rejects contention before commit and releases on retry" {
@@ -62958,6 +63142,11 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
     try db.writeTransaction(txn_id, .{
         .writes = &.{.{ .key = "row:one_shot_recovered", .value = "{\"title\":\"one shot\",\"amount\":21.5}" }},
     });
+    // A metadata refresh before recovery must not reinterpret the durable
+    // prepare vote under a different physical type or public validator.
+    try db.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"string"}},"required":["title"],"additionalProperties":false}}}}
+    );
 
     const record_key = blk: {
         const prefix = "\x00\x00__txn_records__:";
@@ -62994,6 +63183,7 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
     defer alloc.free(raw_row);
     try std.testing.expect(mapper.isRelationalRowValue(raw_row));
     try std.testing.expectEqual(@as(u32, 1), try mapper.relationalRowSchemaVersion(raw_row));
+    try std.testing.expectEqual(commit_ts, try relational_store.rowWriteTimestampNs(raw_row));
 
     const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
     defer alloc.free(primary_key);

@@ -6919,7 +6919,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
 
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
@@ -7191,7 +7191,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         try db.writeTransaction(txn_id, req);
     }
@@ -19996,7 +19996,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, cached.db, apply_req))
+                    try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
                 runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
@@ -20040,7 +20041,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, &db, apply_req))
+                    try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
                 runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
@@ -20464,7 +20466,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try cached.db.writeTransaction(txn_id, req);
             lockAtomic(&self.local_db_mutex);
@@ -20474,7 +20476,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try db.writeTransaction(txn_id, req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -23044,7 +23046,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         // epoch check and making the transaction durable.
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
+        if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
+            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
@@ -30034,13 +30037,36 @@ fn validateTableBatchAgainstLocalSchema(
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, effective_writes);
 }
 
+// API preflight is advisory. Once a participant has a durable epoch/decision,
+// validating a retry against the latest catalog can reject an already accepted
+// write. DB preparation validates the pinned contract with its admission
+// ledger; terminal retries resolve the existing decision instead of its input.
+fn transactionUsesDurableContract(alloc: std.mem.Allocator, db: *db_mod.DB, txn_id: db_mod.types.TxnId) !bool {
+    if (try db.core.transactionSchemaBinding(alloc, txn_id) != null) return true;
+    const status = db.getTransactionStatus(txn_id) catch |err| switch (err) {
+        error.TxnNotFound => return false,
+        else => return err,
+    };
+    return status != .pending;
+}
+
+fn batchUsesDurableTransactionContract(alloc: std.mem.Allocator, db: *db_mod.DB, req: db_mod.types.BatchRequest) !bool {
+    const mutation = req.transaction orelse return false;
+    return switch (mutation) {
+        .prepare => |prepare| try transactionUsesDurableContract(alloc, db, prepare.txn_id),
+        else => false,
+    };
+}
+
 fn validateTransactionAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, deletes, transforms);
@@ -30595,11 +30621,13 @@ fn validateTransactionAgainstCatalogSchema(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     table_name: []const u8,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
@@ -30901,6 +30929,47 @@ test "bound table write source resolves internal group transactions into visible
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "relational table API retries use the durable transaction epoch and decision" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-epoch-retries", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer","minimum":0}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    var source = BoundTableWriteSource.init("docs", &db);
+    const prepared_id: db_mod.types.TxnId = @splat(31);
+    const terminal_id: db_mod.types.TxnId = @splat(32);
+    const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7);
+    defer alloc.free(participant);
+    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", prepared_id, 10_000, 0, false, &.{participant});
+    const writes = [_]db_mod.types.TransactionWrite{.{ .key = "prepared", .value = "{\"amount\":3}" }};
+    _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+    const request = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "terminal", .value = "{\"amount\":4}" }} }};
+    const committed = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+    try std.testing.expect(committed == .committed);
+    try db.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"string"}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+    try std.testing.expectError(error.InvalidBatchRequest, source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{
+        .writes = &.{.{ .key = "invalid", .value = "{\"amount\":-1}" }},
+    }));
+    try std.testing.expect(try batchUsesDurableTransactionContract(alloc, &db, .{
+        .transaction = .{ .prepare = .{ .txn_id = prepared_id, .topology_epoch = 0 } },
+    }));
+    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", prepared_id, .committed, 10_001, 0, .propose);
+    const retried = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+    try std.testing.expect(retried == .committed);
+    const row = (try db.get(alloc, "prepared")).?;
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount\":3}", row);
+    try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
 }
 
 test "bound stable single-group transaction retry does not reapply transforms" {

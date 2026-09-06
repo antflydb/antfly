@@ -243,7 +243,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
 pub fn mapError(err: anyerror) ErrorCode {
     return switch (err) {
         error.VersionConflict => .version_conflict,
-        error.IntentConflict, error.DecisionConflict => .intent_conflict,
+        error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound => .not_found,
         error.InvalidArgument,

@@ -1279,6 +1279,11 @@ pub const DBCore = struct {
             if (current.version == table_schema.version and !same_active_epoch)
                 return error.InvalidSchemaUpdateRequest;
         }
+        if (self.schema == null and table_schema.storage_mode == .relational) {
+            var manager = try self.initTxnManager();
+            defer manager.deinit();
+            if (try manager.hasSchemaLeases()) return error.SchemaInUse;
+        }
         try self.validateImmutablePublicSchemaMetadata(
             table_schema.version,
             same_active_epoch,
@@ -1388,6 +1393,10 @@ pub const DBCore = struct {
         return self.schema_registry.acquire();
     }
 
+    pub fn schemaNamespaceGeneration(self: *DBCore) u64 {
+        return self.schema_registry.namespace_generation.load(.acquire);
+    }
+
     pub fn isSchemaViewCurrent(self: *const DBCore, view: schema_registry_mod.SchemaView) bool {
         return self.schema_registry.isCurrent(view);
     }
@@ -1413,6 +1422,24 @@ pub const DBCore = struct {
 
     pub fn refreshSchemaIndexes(self: *DBCore) !void {
         try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
+    }
+
+    /// Durable transaction pins may outlive the active epoch. Compile a
+    /// request-owned validator for this uncommon path; ordinary historical
+    /// reads continue to cache only layouts. Charge compilation to the request.
+    pub fn acquireSchemaVersionWriteView(self: *DBCore, alloc: Allocator, version: u32) !schema_registry_mod.SchemaView {
+        if (self.acquireSchemaView()) |view| {
+            if (view.version() == version) return view;
+            var old = view;
+            old.release();
+        }
+        return try loadTransactionSchemaVersionView(alloc, self.store, version);
+    }
+
+    pub fn transactionSchemaBinding(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !?transactions_mod.SchemaBinding {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.loadSchemaBinding(alloc, txn_id);
     }
 
     pub fn persistCatalogIndexState(self: *DBCore, state: table_catalog_mod.IndexState) !void {
@@ -1828,9 +1855,7 @@ pub const DBCore = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
-        var manager = try self.initTxnManager();
-        defer manager.deinit();
-        try manager.writeIntents(txn_id, intents, predicates);
+        try self.writeIntentsExtraBatch(txn_id, intents, predicates, .{});
     }
 
     pub fn writeIntentsExtraBatch(
@@ -1842,7 +1867,10 @@ pub const DBCore = struct {
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.writeIntentsExtraBatch(txn_id, intents, predicates, extra_batch);
+        var bound = extra_batch;
+        if (bound.schema_binding == null)
+            bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
+        try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
     }
 
     pub fn checkVersionPredicates(
@@ -2062,6 +2090,21 @@ pub const DBCore = struct {
     }
 };
 
+fn loadTransactionSchemaVersionView(alloc: Allocator, store: *docstore_mod.DocStore, version: u32) !schema_registry_mod.SchemaView {
+    const schema = try schema_mod.loadSchemaVersion(store, alloc, version) orelse return error.UnknownSchemaVersion;
+    errdefer schema_mod.freeSchema(alloc, schema);
+    const key = try public_schema_mod.versionedSchemaKeyAlloc(alloc, version);
+    defer alloc.free(key);
+    const json = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (json) |value| alloc.free(value);
+    var validator = if (json) |value| try public_schema_mod.CompiledTableValidator.init(alloc, value) else null;
+    errdefer if (validator) |*compiled| compiled.deinit(alloc);
+    return .{ .epoch = try schema_registry_mod.Epoch.createOwnedValidated(alloc, schema, validator) };
+}
+
 pub const TransactionRecoveryIdentityContext = struct {
     store: *docstore_mod.DocStore,
     identity_namespace: doc_identity.Namespace,
@@ -2201,6 +2244,18 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     lockAtomic(&identity_ctx.mutex);
     defer identity_ctx.mutex.unlock();
     const alloc = identity_ctx.alloc;
+    const binding = try manager.loadSchemaBinding(alloc, txn_id);
+    var pinned = if (binding) |lease|
+        if (lease.version) |version| try loadTransactionSchemaVersionView(alloc, identity_ctx.store, version) else null
+    else
+        null;
+    defer if (pinned) |*view| view.release();
+    const relational_schema: ?schema_mod.TableSchema = if (binding != null)
+        if (pinned) |view| if (view.storageMode() == .relational) view.tableSchema().* else null else null
+    else if (identity_ctx.relational_base_rows)
+        .{ .version = identity_ctx.relational_schema_version, .storage_mode = .relational, .relational_columns = identity_ctx.relational_columns }
+    else
+        null;
 
     var raw_upserts = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -2270,7 +2325,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         skip_intent_keys.deinit(alloc);
     }
     var skip_all_intent_application = false;
-    if (identity_ctx.relational_base_rows) {
+    if (relational_schema) |schema| {
         const mutations = try manager.collectIntentMutations(alloc, txn_id);
         defer {
             for (mutations) |*mutation| mutation.deinit(alloc);
@@ -2307,13 +2362,15 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             var row_key_owned = true;
             errdefer if (row_key_owned) alloc.free(row_key);
             if (mutation.value) |value| {
-                const row_value = try relational_store.encodeValueForSchemaAlloc(alloc, value, .{
-                    .version = identity_ctx.relational_schema_version,
-                    .storage_mode = .relational,
-                    .relational_columns = identity_ctx.relational_columns,
-                });
+                const row_value = if (pinned) |view| blk: {
+                    var row = try mapper.PreparedRelationalWrite.init(alloc, mutation.key, value, view.validator(), schema, view.physicalLayout());
+                    defer row.deinit(alloc);
+                    try row.finalizeMetadata(timestamp);
+                    break :blk row.takePackedRow();
+                } else try relational_store.encodeValueForSchemaAlloc(alloc, value, schema);
                 var row_value_owned = true;
                 errdefer if (row_value_owned) alloc.free(row_value);
+                if (pinned == null) try @import("algebraic/relational_row_codec.zig").setOrdinalWriteTimestampNs(row_value, timestamp);
                 try identity_writes.append(alloc, .{ .key = row_key, .value = row_value });
                 row_key_owned = false;
                 row_value_owned = false;

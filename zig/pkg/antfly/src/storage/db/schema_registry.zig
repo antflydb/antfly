@@ -112,6 +112,11 @@ pub const Epoch = struct {
 pub const SchemaView = struct {
     epoch: *Epoch,
 
+    pub fn clone(self: SchemaView) SchemaView {
+        self.epoch.retain();
+        return self;
+    }
+
     pub fn tableSchema(self: SchemaView) *const schema_mod.TableSchema {
         return &self.epoch.schema;
     }

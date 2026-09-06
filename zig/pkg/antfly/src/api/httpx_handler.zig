@@ -474,9 +474,10 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
             return self.cancelled;
         }
 
-        fn start(raw: ?*anyopaque, status: u16) !void {
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", content_type);
             try std.testing.expect(!self.started);
             self.started = true;
         }

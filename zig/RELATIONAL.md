@@ -199,9 +199,25 @@ memory while retaining a partial batch. Slice usage and limits are observable
 through the standard resource metrics.
 
 Direct transaction intents use this same admission ledger and validate before
-the exclusive apply fence. Publication checks the pinned epoch and retries a
-bounded number of times if it changed; intent ordering and predicates retain
-their transaction semantics.
+the exclusive apply fence. The first prepare atomically persists a schema-epoch
+lease with the intents and prepare vote. Later prepares, commit, and recovery
+use that immutable epoch and its public validator, even after a newer schema
+is published or the participant restarts. Historical write validators are
+request-owned and budgeted; the normal read cache remains layout-only. The
+lease is retired atomically with intent resolution. Choosing relational mode
+on a previously schemaless table is fenced while document intents remain.
+API preflight defers to the durable contract for prepared and terminal retries;
+it must not reject an accepted transaction using the latest catalog schema.
+
+Commit's intent snapshot and prepared rows share one admission ledger across
+retries. Snapshot rows borrow their owned intent envelopes, avoiding a second
+payload copy. Once the intent revision is checked under the apply fence,
+relational commit retires only the known intent/lock keys without rereading
+payloads. Schema and index generation checks still apply to ordinary writes;
+index-plan checks also apply to transactions pinned to an older schema.
+Intent-key manifests use a hash set and one capacity reservation when merging
+new keys, followed by deterministic sorting, instead of quadratic membership
+checks and per-key array reallocations.
 
 Field-backed dense indexes consume the prepared row's typed ordinal view.
 Decimal vector elements round directly to f32 once, so foreground indexing,
