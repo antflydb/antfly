@@ -2521,6 +2521,7 @@ fn prepareRelationalRows(
     retain_text_roots: bool,
     preparation_timestamp_ns: u64,
     rows: []?mapper.PreparedRelationalWrite,
+    durable_rows: ?*const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     if (writes.len != rows.len) return error.InvalidArgument;
     const Context = struct {
@@ -2535,6 +2536,7 @@ fn prepareRelationalRows(
         retain_text_roots: bool,
         preparation_timestamp_ns: u64,
         rows: []?mapper.PreparedRelationalWrite,
+        durable_rows: ?*const std.StringHashMapUnmanaged([]const u8),
         next: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
         io: std.Io,
@@ -2562,7 +2564,7 @@ fn prepareRelationalRows(
             while (!ctx.failed.load(.acquire)) {
                 const index = ctx.next.fetchAdd(1, .monotonic);
                 if (index >= ctx.writes.len) return;
-                var prepared = mapper.PreparedRelationalWrite.initInSharedRegion(
+                var prepared = mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
                     region,
                     scratch_arena.allocator(),
                     ctx.retain_text_roots,
@@ -2571,6 +2573,7 @@ fn prepareRelationalRows(
                     ctx.validator,
                     ctx.table_schema,
                     ctx.physical_layout,
+                    if (ctx.durable_rows) |durable| durable.get(ctx.writes[index].key) else null,
                 ) catch |err| {
                     ctx.fail(err);
                     return;
@@ -2677,6 +2680,7 @@ fn prepareRelationalRows(
         .retain_text_roots = retain_text_roots,
         .preparation_timestamp_ns = preparation_timestamp_ns,
         .rows = rows,
+        .durable_rows = durable_rows,
         .io = io orelse std.Options.debug_io,
     };
     if (!parallel) {
@@ -2707,6 +2711,7 @@ const BatchExecutionOptions = struct {
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     transaction_resolution: ?TransactionResolution = null,
+    durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
@@ -6658,6 +6663,8 @@ pub const DB = struct {
             if (self.core.schema) |schema| schema.version else 0,
         );
         errdefer identity_ctx.deinit();
+        identity_ctx.resource_manager = self.core.index_manager.resource_manager;
+        identity_ctx.io = self.backend_runtime.io() orelse std.Options.debug_io;
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
 
@@ -8634,6 +8641,7 @@ pub const DB = struct {
                     retainPreparedTextRoots(req.sync_level, write_plan_snapshot.?.plan().has_text_consumers, splitShadowRequiresMaterializedDerivedBatch(self)),
                     preparation_timestamp_ns,
                     rows,
+                    opts.durable_rows,
                 );
                 // Copy every borrowed catalog input into request-owned effects
                 // while holding only the catalog read lease. Schema/index
@@ -22897,26 +22905,27 @@ pub const DB = struct {
         preparation_alloc: Allocator,
     ) !void {
         const schema_namespace = self.core.schemaNamespaceGeneration();
+        const prepared_intents = try preparation_alloc.dupe(transactions_mod.WriteIntent, intents);
+        defer preparation_alloc.free(prepared_intents);
+        for (prepared_intents) |*intent| intent.prepared_row = null;
+        defer freePreparedIntentRows(preparation_alloc, prepared_intents);
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(preparation_alloc);
-        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-        defer writes.deinit(preparation_alloc);
         for (intents) |intent| {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
             try identity_upsert_keys.append(preparation_alloc, intent.key);
-            try writes.append(preparation_alloc, .{ .key = intent.key, .value = intent.value.? });
         }
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (view) |*pinned| pinned.release();
-        try validateRelationalWritesWithSchemaView(preparation_alloc, writes.items, view);
+        try prepareTransactionRows(preparation_alloc, prepared_intents, view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        try self.core.writeIntentsExtraBatch(txn_id, intents, predicates, .{
+        try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, predicates, .{
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
         });
     }
@@ -23034,7 +23043,8 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
-        try validateRelationalWritesWithSchemaView(preparation_alloc, effective_ops.writes, prepared_schema_view);
+        defer freePreparedIntentRows(preparation_alloc, intents.items);
+        try prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -23080,37 +23090,24 @@ pub const DB = struct {
         }
     }
 
-    fn validateRelationalWritesWithSchemaView(
+    fn freePreparedIntentRows(alloc: Allocator, intents: []const transactions_mod.WriteIntent) void {
+        for (intents) |intent| if (intent.prepared_row) |row| alloc.free(@constCast(row));
+    }
+
+    fn prepareTransactionRows(
         alloc: Allocator,
-        writes: anytype,
+        intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
         const view = schema_view orelse return;
-        if (view.storageMode() != .relational or writes.len == 0) return;
-        if (view.validator()) |validator| {
-            var metadata_count: usize = 0;
-            for (writes) |write| metadata_count += @intFromBool(isMetadataKey(write.key));
-            if (metadata_count == 0) {
-                try validator.validateWrites(alloc, writes);
-                return;
-            }
-            var document_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-            defer document_writes.deinit(alloc);
-            try document_writes.ensureTotalCapacity(alloc, writes.len - metadata_count);
-            for (writes) |write| {
-                if (isMetadataKey(write.key)) continue;
-                document_writes.appendAssumeCapacity(.{ .key = write.key, .value = write.value });
-            }
-            try validator.validateWrites(alloc, document_writes.items);
-            return;
-        }
-
-        // Runtime-only embedders have no richer public constraints to cache.
-        // Still validate through the sole schema-bound AROW v2 encoder.
-        for (writes) |write| {
-            if (isMetadataKey(write.key)) continue;
-            const encoded = try relational_store.encodeValueForSchemaAlloc(alloc, write.value, view.tableSchema().*);
-            alloc.free(encoded);
+        if (view.storageMode() != .relational) return;
+        for (intents) |*intent| {
+            if (isMetadataKey(intent.key)) continue;
+            const value = intent.value orelse continue;
+            var row = try mapper.PreparedRelationalWrite.init(alloc, intent.key, value, view.validator(), view.tableSchema().*, view.physicalLayout());
+            defer row.deinit(alloc);
+            try row.finalizeMetadata(0);
+            intent.prepared_row = row.takePackedRow();
         }
     }
 
@@ -23295,6 +23292,11 @@ pub const DB = struct {
             const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
             defer alloc.free(writes);
             for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+            var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
+            defer durable_rows.deinit(alloc);
+            for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
+                try durable_rows.put(alloc, intents.writes[i].key, row);
+            };
             self.batchInternalWithPreparationAllocator(.{
                 .writes = writes,
                 .deletes = intents.deletes,
@@ -23304,6 +23306,7 @@ pub const DB = struct {
                 .visibility_cancellation = visibility_cancellation,
                 .bypass_ha_write_gate = raft_entry != null,
                 .raft_applied_entry_marker = raft_entry,
+                .durable_rows = &durable_rows,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
                     .status = status,
@@ -61298,6 +61301,69 @@ test "relational public schema provenance rejects missing validators on reopen" 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false }));
 }
 
+test "relational prepared intents reject physical overflow before voting and persist canonical rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"embedding":{"type":"embedding"}},"additionalProperties":false}}}}
+    );
+    const txn = try db.beginTransaction(100);
+    try std.testing.expectError(error.InvalidBatchRequest, db.writeIntents(txn, &.{.{ .key = "bad", .value = "{\"embedding\":[1e100]}" }}, &.{}));
+    try std.testing.expectEqual(@as(?transactions_mod.SchemaBinding, null), try db.core.transactionSchemaBinding(alloc, txn));
+    try std.testing.expectError(error.InvalidBatchRequest, db.writeTransaction(txn, .{ .writes = &.{.{ .key = "bad", .value = "{\"embedding\":[-1e100]}" }} }));
+    try db.writeIntents(txn, &.{.{ .key = "ok", .value = "{\"embedding\":[1,2]}" }}, &.{});
+    var captured = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer captured.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), captured.writes.len);
+    const packed_bytes = captured.prepared_rows[0].?;
+    try std.testing.expectEqual(@as(u32, 1), try mapper.relationalRowSchemaVersion(packed_bytes));
+    const digest = try relational_row_codec.rowSemanticHash(packed_bytes);
+    try db.commitTransaction(txn, 200);
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "ok");
+    defer alloc.free(row_key);
+    const stored = try db.core.store.get(alloc, row_key);
+    defer alloc.free(stored);
+    try std.testing.expectEqual(digest, try relational_row_codec.rowSemanticHash(stored));
+}
+
+test "relational cumulative prepares remain committable within the preparation envelope" {
+    const alloc = std.testing.allocator;
+    var options = resource_manager_mod.Options{ .identity_allocator = alloc };
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(options);
+    defer resources.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const payload: [1024]u8 = @splat('x');
+    const document = try std.fmt.allocPrint(alloc, "{{\"body\":\"{s}\"}}", .{payload});
+    defer alloc.free(document);
+    const txn = try db.beginTransaction(100);
+    var admitted: usize = 0;
+    while (admitted < 64) : (admitted += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "row:{d}", .{admitted});
+        db.writeIntents(txn, &.{.{ .key = key, .value = document }}, &.{}) catch |err| switch (err) {
+            error.TransactionTooLarge => break,
+            else => return err,
+        };
+    }
+    try std.testing.expect(admitted > 1 and admitted < 64);
+    var snapshot = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(admitted, snapshot.writes.len);
+    try db.commitTransaction(txn, 200);
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
+}
+
 test "relational direct intents share preparation admission before the apply fence" {
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
@@ -61594,6 +61660,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         retainPreparedTextRoots(.full_index, false, false),
         0,
         &rows,
+        null,
     );
     for (rows) |row| {
         try std.testing.expect(row != null);
@@ -63124,12 +63191,14 @@ test "portable import scratch scavenging removes abandoned stages and preserves 
 
 test "db relational one-shot recovery resolves orphaned intents into packed rows" {
     const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
     defer db.close();
 
     const schema_json =
@@ -63164,6 +63233,17 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
     try db.core.store.put(&record_key, &record_value);
 
     var recorder = TxnResolverRecorder{};
+    const capacity = resources.sliceStats(.relational_preparation_working_set).hard_limit_bytes;
+    var competing = try resources.reserve(.relational_preparation_working_set, capacity);
+    defer competing.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .cutoff_ns = 1,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    }));
+    try std.testing.expect(try db.core.transactionHasIntents(txn_id));
+    competing.release();
     const recovery = try db.runTransactionRecoveryOnce(.{
         .enabled = true,
         .cutoff_ns = 1,
@@ -63171,6 +63251,7 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
         .resolve_participant_fn = TxnResolverRecorder.resolve,
     });
     try std.testing.expect(recovery.resolved_finalized >= 1);
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.relational_preparation_working_set).used_bytes);
 
     const raw = (try db.get(alloc, "row:one_shot_recovered")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);

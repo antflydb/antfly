@@ -267,6 +267,24 @@ pub const PreparedRelationalWrite = struct {
         return try PreparedRowRegion.create(backing);
     }
 
+    /// Recovery needs only the authoritative row, not transient index effects.
+    /// Reuse the durable physical representation without parsing API JSON.
+    pub fn copyDurableIntentRowAlloc(
+        alloc: Allocator,
+        bytes: []const u8,
+        schema: runtime_schema.TableSchema,
+        layout: *const relational_row_codec.PhysicalLayout,
+        timestamp_ns: u64,
+    ) ![]u8 {
+        if (try relationalRowSchemaVersion(bytes) != schema.version) return error.InvalidTxnRecord;
+        const digest = try relational_row_codec.rowSemanticHash(bytes);
+        _ = try relational_row_codec.ordinalRowViewTrusted(bytes, schema, layout);
+        const out = try alloc.dupe(u8, bytes);
+        errdefer alloc.free(out);
+        try relational_row_codec.finalizeOrdinalMetadata(out, digest, timestamp_ns);
+        return out;
+    }
+
     pub fn init(
         alloc: Allocator,
         key: []const u8,
@@ -299,6 +317,7 @@ pub const PreparedRelationalWrite = struct {
             validator,
             table_schema,
             physical_layout,
+            null,
         );
     }
 
@@ -317,10 +336,11 @@ pub const PreparedRelationalWrite = struct {
         validator: ?schema_api.CompiledTableValidator,
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
+        durable_row: ?[]const u8,
     ) !PreparedRelationalWrite {
         var parsed = try std.json.parseFromSlice(std.json.Value, parse_alloc, document_json, .{ .parse_numbers = false });
         errdefer parsed.deinit();
-        if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
+        if (durable_row == null) if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
 
         var extracted = try extractWriteFromParsedPrepared(
             alloc,
@@ -338,6 +358,21 @@ pub const PreparedRelationalWrite = struct {
         if (retain_text_root)
             extracted.prepared_text_source_bytes = estimateJsonValueRetainedBytes(parsed.value);
 
+        // Durable intents have already crossed the schema/physical boundary.
+        // Verify their checksum and identity, but do not validate, hash, or
+        // encode their logical content again during commit/recovery.
+        if (durable_row) |bytes| {
+            if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
+            const digest = try relational_row_codec.rowSemanticHash(bytes);
+            _ = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
+            return .{
+                .parsed = parsed,
+                .extracted = extracted,
+                .packed_row = try alloc.dupe(u8, bytes),
+                .semantic_hash = digest,
+                .schema_version = table_schema.version,
+            };
+        }
         const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
             alloc,
             scratch,
@@ -405,6 +440,32 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
+        return try initInSharedRegionFromIntent(region, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null);
+    }
+
+    pub fn initFromIntent(
+        alloc: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+        durable_row: ?[]const u8,
+    ) !PreparedRelationalWrite {
+        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row);
+    }
+
+    pub fn initInSharedRegionFromIntent(
+        region: *PreparedRowRegion,
+        scratch: Allocator,
+        retain_text_root: bool,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+        durable_row: ?[]const u8,
+    ) !PreparedRelationalWrite {
         var prepared = try initWithAllocators(
             region.arena.allocator(),
             if (retain_text_root) region.arena.allocator() else scratch,
@@ -415,6 +476,7 @@ pub const PreparedRelationalWrite = struct {
             validator,
             table_schema,
             physical_layout,
+            durable_row,
         );
         region.retain();
         prepared.owned_region = region;

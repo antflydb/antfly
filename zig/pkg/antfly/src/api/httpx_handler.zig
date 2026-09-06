@@ -2861,6 +2861,7 @@ pub const AntflyApiHandler = struct {
             try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
+            error.TransactionTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
             error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
@@ -3375,6 +3376,7 @@ pub const AntflyApiHandler = struct {
             .transaction => source.commitTransactionWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
             .multi_batch => source.commitBatchWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
+            error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -4102,6 +4104,10 @@ pub const AntflyApiHandler = struct {
             session.sync_level,
             commit_request.cancellation,
         ) catch |err| switch (err) {
+            error.TransactionTooLarge => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
+            },
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -7080,6 +7086,19 @@ test "typed internal HTTP errors preserve conflict semantics" {
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+}
+
+test "internal transaction HTTP size rejection is actionable without claiming not proposed" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.TransactionTooLarge, .prepare);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    // The rejection can originate from an applied Raft command; do not claim
+    // that no proposal was sent just because no prepare vote was written.
+    try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
 }
 
 test "internal transaction HTTP responses prove not-proposed only before decision" {

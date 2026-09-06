@@ -345,6 +345,7 @@ pub const Detail = enum(c_int) {
     incompatible_model,
     unsupported_generator_provider,
     schema_in_use,
+    transaction_too_large,
 };
 
 pub const Status = extern struct {
@@ -390,6 +391,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
+        error.TransactionTooLarge => status(.invalid_argument, .transaction_too_large),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -741,6 +743,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .decision_conflict => "DecisionConflict",
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
+        .transaction_too_large => "TransactionTooLarge",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1015,6 +1018,12 @@ test "schema epoch conflicts retain a retryable public status" {
     const value = statusFromError(error.SchemaInUse);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
     try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
+}
+
+test "transaction capacity rejection retains a permanent public status" {
+    const value = statusFromError(error.TransactionTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
 }
 
 test "stable status preserves public boundary semantics" {

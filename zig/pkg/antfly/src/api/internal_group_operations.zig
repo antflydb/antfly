@@ -47,6 +47,7 @@ pub const Error = operation.ApiError || error{
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
+    TransactionTooLarge,
     EnrichmentWaitCanceled,
     EnrichmentWaitTimeout,
     EnrichmentRetryInProgress,
@@ -436,6 +437,8 @@ pub const Operations = struct {
             .deadline_ns = request.deadline_ns,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
+            error.TransactionTooLarge => return error.TransactionTooLarge,
+            error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {

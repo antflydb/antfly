@@ -52,6 +52,7 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const transactions_mod = @import("../transactions.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const types = @import("types.zig");
 
 const store_snapshot_file_name = "store.bin";
@@ -1130,6 +1131,8 @@ pub const DBCore = struct {
             if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
         );
         defer identity_ctx.deinit();
+        identity_ctx.resource_manager = self.index_manager.resource_manager;
+        identity_ctx.io = self.index_manager.checkpointIo();
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
         return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
@@ -1868,6 +1871,16 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         var bound = extra_batch;
+        if (bound.max_intent_admission_bytes == 0) {
+            const capacity = if (self.index_manager.resource_manager) |resources|
+                resources.memoryHardLimitForSlice(.relational_preparation_working_set)
+            else
+                256 * 1024 * 1024;
+            // Leave half the slice for immutable schema compilation, replay,
+            // and effects selected by the current index plan. Zero is the
+            // ResourceManager convention for an unlimited slice.
+            bound.max_intent_admission_bytes = @max(1, if (capacity == 0) 128 * 1024 * 1024 else capacity / 2);
+        }
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
         try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
@@ -2082,6 +2095,8 @@ pub const DBCore = struct {
             if (self.schema) |schema| if (schema.storage_mode == .relational) schema.version else 0 else 0,
         );
         defer identity_ctx.deinit();
+        identity_ctx.resource_manager = self.index_manager.resource_manager;
+        identity_ctx.io = self.index_manager.checkpointIo();
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
             resolution_timestamp,
@@ -2109,7 +2124,9 @@ pub const TransactionRecoveryIdentityContext = struct {
     store: *docstore_mod.DocStore,
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    io: std.Io = std.Options.debug_io,
+    mutex: std.Io.Mutex = .init,
     relational_base_rows: bool = false,
     relational_schema_version: u32 = 0,
     relational_columns: []const schema_mod.RelationalColumn = &.{},
@@ -2148,20 +2165,20 @@ pub const TransactionRecoveryIdentityContext = struct {
 
     pub fn installPreparedRelationalState(self: *TransactionRecoveryIdentityContext, prepared: *PreparedRecoveryRelationalState) void {
         std.debug.assert(prepared.alloc.ptr == self.alloc.ptr and prepared.alloc.vtable == self.alloc.vtable);
-        lockAtomic(&self.mutex);
+        self.mutex.lockUncancelable(self.io);
         const previous = self.relational_columns;
         self.relational_columns = prepared.columns;
         self.relational_base_rows = prepared.enabled;
         self.relational_schema_version = prepared.schema_version;
         prepared.columns = &.{};
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         freeRelationalColumns(self.alloc, previous);
     }
 
     pub fn updateIdentityNamespace(self: *TransactionRecoveryIdentityContext, namespace: doc_identity.Namespace) void {
-        lockAtomic(&self.mutex);
+        self.mutex.lockUncancelable(self.io);
         self.identity_namespace = namespace;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
     }
 };
 
@@ -2241,10 +2258,62 @@ fn buildTransactionRecoveryIdentityExtraBatch(
 ) anyerror!transactions_mod.ResolutionExtraBatch {
     if (status != .committed) return .{};
     const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
-    lockAtomic(&identity_ctx.mutex);
-    defer identity_ctx.mutex.unlock();
-    const alloc = identity_ctx.alloc;
-    const binding = try manager.loadSchemaBinding(alloc, txn_id);
+    const owner = try identity_ctx.alloc.create(RecoveryIntentOwner);
+    owner.* = .{
+        .backing = identity_ctx.alloc,
+        .budget = if (identity_ctx.resource_manager) |resources|
+            resource_manager_mod.BudgetedAllocator.init(resources, .relational_preparation_working_set, identity_ctx.alloc, 1)
+        else
+            null,
+    };
+    errdefer owner.deinit();
+    return buildRecoveryIntentBatch(identity_ctx, owner, manager, txn_id, timestamp) catch |err| {
+        if (err == error.OutOfMemory) if (owner.budget) |*budget|
+            if (budget.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+}
+
+const RecoveryIntentOwner = struct {
+    backing: Allocator,
+    budget: ?resource_manager_mod.BudgetedAllocator,
+    snapshot: transactions_mod.IntentBatch = .{},
+
+    fn allocator(self: *@This()) Allocator {
+        return if (self.budget) |*budget| budget.allocator() else self.backing;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.snapshot.deinit(self.allocator());
+        if (self.budget) |*budget| {
+            std.debug.assert(budget.live_bytes == 0);
+            budget.deinit();
+        }
+        self.backing.destroy(self);
+    }
+};
+
+fn buildRecoveryIntentBatch(
+    identity_ctx: *TransactionRecoveryIdentityContext,
+    owner: *RecoveryIntentOwner,
+    manager: *transactions_mod.TxnManager,
+    txn_id: transactions_mod.TxnId,
+    timestamp: u64,
+) !transactions_mod.ResolutionExtraBatch {
+    const alloc = owner.allocator();
+    owner.snapshot = try manager.collectIntentBatch(alloc, txn_id);
+    const binding = owner.snapshot.schema_binding;
+    const context_snapshot = blk: {
+        identity_ctx.mutex.lockUncancelable(identity_ctx.io);
+        defer identity_ctx.mutex.unlock(identity_ctx.io);
+        break :blk .{
+            .namespace = identity_ctx.identity_namespace,
+            .enabled = identity_ctx.relational_base_rows,
+            .version = identity_ctx.relational_schema_version,
+            .columns = if (binding == null) try cloneRelationalColumns(alloc, identity_ctx.relational_columns) else &.{},
+        };
+    };
+    defer freeRelationalColumns(alloc, context_snapshot.columns);
     var pinned = if (binding) |lease|
         if (lease.version) |version| try loadTransactionSchemaVersionView(alloc, identity_ctx.store, version) else null
     else
@@ -2252,31 +2321,19 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     defer if (pinned) |*view| view.release();
     const relational_schema: ?schema_mod.TableSchema = if (binding != null)
         if (pinned) |view| if (view.storageMode() == .relational) view.tableSchema().* else null else null
-    else if (identity_ctx.relational_base_rows)
-        .{ .version = identity_ctx.relational_schema_version, .storage_mode = .relational, .relational_columns = identity_ctx.relational_columns }
+    else if (context_snapshot.enabled)
+        .{ .version = context_snapshot.version, .storage_mode = .relational, .relational_columns = context_snapshot.columns }
     else
         null;
-
-    var raw_upserts = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (raw_upserts.items) |key| alloc.free(@constCast(key));
-        raw_upserts.deinit(alloc);
-    }
-    var raw_deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (raw_deletes.items) |key| alloc.free(@constCast(key));
-        raw_deletes.deinit(alloc);
-    }
-    try manager.collectIntentDocumentKeys(alloc, txn_id, &raw_upserts, &raw_deletes);
 
     var identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
     defer identity_upserts.deinit(alloc);
     var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer identity_deletes.deinit(alloc);
-    for (raw_upserts.items) |key| {
-        if (!transactionIdentityMetadataKey(key)) try identity_upserts.append(alloc, key);
+    for (owner.snapshot.writes) |write| {
+        if (!transactionIdentityMetadataKey(write.key)) try identity_upserts.append(alloc, write.key);
     }
-    for (raw_deletes.items) |key| {
+    for (owner.snapshot.deletes) |key| {
         if (!transactionIdentityMetadataKey(key)) try identity_deletes.append(alloc, key);
     }
 
@@ -2297,7 +2354,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
-        identity_ctx.identity_namespace,
+        context_snapshot.namespace,
         identity_ctx.store.lastReplaySequence(0),
         &identity_writes,
         &identity_visibility_deletes,
@@ -2326,11 +2383,14 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     }
     var skip_all_intent_application = false;
     if (relational_schema) |schema| {
-        const mutations = try manager.collectIntentMutations(alloc, txn_id);
-        defer {
-            for (mutations) |*mutation| mutation.deinit(alloc);
-            if (mutations.len > 0) alloc.free(mutations);
-        }
+        const mutations = try alloc.alloc(transactions_mod.WriteIntent, owner.snapshot.writes.len + owner.snapshot.deletes.len);
+        defer alloc.free(mutations);
+        for (owner.snapshot.writes, 0..) |write, i| mutations[i] = .{
+            .key = write.key,
+            .value = write.value,
+            .prepared_row = owner.snapshot.prepared_rows[i],
+        };
+        for (owner.snapshot.deletes, owner.snapshot.writes.len..) |key, i| mutations[i] = .{ .key = key, .value = null };
         var requires_selective_filter = false;
         for (mutations) |mutation| {
             if (transactionIdentityMetadataKey(mutation.key)) {
@@ -2363,7 +2423,9 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             errdefer if (row_key_owned) alloc.free(row_key);
             if (mutation.value) |value| {
                 const row_value = if (pinned) |view| blk: {
-                    var row = try mapper.PreparedRelationalWrite.init(alloc, mutation.key, value, view.validator(), schema, view.physicalLayout());
+                    if (mutation.prepared_row) |bytes|
+                        break :blk try mapper.PreparedRelationalWrite.copyDurableIntentRowAlloc(alloc, bytes, schema, view.physicalLayout(), timestamp);
+                    var row = try mapper.PreparedRelationalWrite.initFromIntent(alloc, mutation.key, value, view.validator(), schema, view.physicalLayout(), mutation.prepared_row);
                     defer row.deinit(alloc);
                     try row.finalizeMetadata(timestamp);
                     break :blk row.takePackedRow();
@@ -2399,7 +2461,11 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     if (identity_writes.items.len == 0 and
         identity_visibility_deletes.items.len == 0 and
         skip_intent_keys.items.len == 0 and
-        !skip_all_intent_application) return .{};
+        !skip_all_intent_application) return .{
+        .cleanup_context = owner,
+        .captured_intents = owner.snapshot.owned_entries,
+        .expected_intent_revision = owner.snapshot.revision,
+    };
     const owned_writes = try identity_writes.toOwnedSlice(alloc);
     errdefer {
         for (owned_writes) |item| {
@@ -2417,6 +2483,9 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     }
     const owned_skip_intent_keys = try skip_intent_keys.toOwnedSlice(alloc);
     return .{
+        .cleanup_context = owner,
+        .captured_intents = owner.snapshot.owned_entries,
+        .expected_intent_revision = owner.snapshot.revision,
         .writes = owned_writes,
         .deletes = owned_deletes,
         .skip_all_intent_application = skip_all_intent_application,
@@ -2426,7 +2495,9 @@ fn buildTransactionRecoveryIdentityExtraBatch(
 
 fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transactions_mod.ResolutionExtraBatch) void {
     const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
-    const alloc = identity_ctx.alloc;
+    const owner: ?*RecoveryIntentOwner = if (batch.cleanup_context) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    defer if (owner) |owned| owned.deinit();
+    const alloc = if (owner) |owned| owned.allocator() else identity_ctx.alloc;
     for (batch.writes) |item| {
         alloc.free(@constCast(item.key));
         alloc.free(@constCast(item.value));

@@ -215,9 +215,37 @@ payload copy. Once the intent revision is checked under the apply fence,
 relational commit retires only the known intent/lock keys without rereading
 payloads. Schema and index generation checks still apply to ordinary writes;
 index-plan checks also apply to transactions pinned to an older schema.
-Intent-key manifests use a hash set and one capacity reservation when merging
-new keys, followed by deterministic sorting, instead of quadratic membership
-checks and per-key array reallocations.
+
+Prepare persists the canonical AROW alongside the original logical request in
+a tagged intent envelope. Physical representability (including finite f32
+embeddings) is checked before the durable vote. Commit reuses that row instead
+of repeating schema validation, semantic hashing, and physical encoding. The
+JSON is retained only for effects selected by the current index plan; it is
+not a second authoritative document. Recovery copies the verified AROW and
+finalizes its timestamp without parsing JSON. Both paths own a single intent
+snapshot through revision-fenced resolution and charge the same resource slice.
+The recovery-context mutex uses `std.Io` and protects only a short context copy,
+not intent loading, validation, or encoding.
+
+Transaction admission is cumulative and durable. Each intent has a point-read
+membership/credit record; a fixed 16-byte header stores count and total credits.
+A prepare updates only touched members and the header in the same atomic batch
+as the vote. Replacements subtract the previous credits; repeated prepares do
+not double-charge. This removes whole-manifest rewrites across incremental
+prepares. Released document transactions with the previous manifest pay one
+conversion pass; there is no compatibility format for earlier PR-only rows.
+
+Credits conservatively allow 64 bytes of working space per retained JSON/AROW
+byte, 16 per key byte, and 4096 per row. The transaction ceiling is half the
+smaller configured node/preparation hard limit (128 MiB of credits when neither
+is configured), leaving headroom for schemas and commit effects. Admission
+uses configured capacity, not transient free memory. Oversized additions fail
+before voting with `TransactionTooLarge` (HTTP 413); shrinking and identical
+retries remain allowed after a limit reduction. Temporary contention still
+returns retryable `ResourceBudgetExceeded`. These are conservative admission
+credits, not a guarantee against arbitrary generated-index expansion or a
+subsequent reduction of the node memory limit. Larger transactions require a
+larger resource envelope; spillable atomic commit remains future work.
 
 Field-backed dense indexes consume the prepared row's typed ordinal view.
 Decimal vector elements round directly to f32 once, so foreground indexing,

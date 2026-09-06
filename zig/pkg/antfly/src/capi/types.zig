@@ -248,6 +248,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.NotFound => .not_found,
         error.InvalidArgument,
         error.InvalidBatchRequest,
+        error.TransactionTooLarge,
         error.UnsupportedBatchRequestEncoding,
         error.ValueTooLong,
         error.InvalidQueryRequest,

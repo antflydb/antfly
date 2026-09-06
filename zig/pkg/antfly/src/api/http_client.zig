@@ -2787,6 +2787,8 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            400 => return error.InvalidBatchRequest,
+            413 => return error.TransactionTooLarge,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -3806,6 +3808,17 @@ test "api http client encodes lookup route and query components" {
         "title,owner&admin",
     );
     defer response.deinit(std.testing.allocator);
+}
+
+test "api http client preserves transaction size admission failures" {
+    const Executor = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            return .{ .status = 413, .body = try alloc.dupe(u8, "transaction exceeds preparation capacity") };
+        }
+    };
+    var marker: u8 = 0;
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &marker, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.TransactionTooLarge, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "docs", "{}"));
 }
 
 test "api http client preserves retryable group transaction unavailability" {
