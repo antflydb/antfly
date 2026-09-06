@@ -115,6 +115,7 @@ components:
         - type: object
           properties:
             rate_limit:
+              x-go-type-skip-optional-pointer: false
               $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/RerankerProvider"

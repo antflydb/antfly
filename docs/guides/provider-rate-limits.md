@@ -37,6 +37,9 @@ coordination across replicas require an external quota authority; these limits
 do not discover a provider's quota or merge separate models' budgets.
 
 Admission happens for each HTTP attempt, including retries and redirects.
+Single and batched asset generation use the same admission scope. Bedrock
+credential refresh (STS/ECS/IMDS) is separate from model invocation and does
+not consume the model's quota.
 Concurrency permits are released after the response finishes, including writes
 to a streamed-response consumer, or on transport failure. Waiting honors the
 request's deadline and cancellation. A 429 response shares its `Retry-After`
@@ -46,7 +49,8 @@ cooldown (seconds or HTTP date) with the scope's other callers.
 
 `tokens_per_minute` is a conservative text admission budget, not billing-token
 accounting. Each attempt reserves its serialized UTF-8 request body size plus
-the configured generation output-token cap. Failed attempts are not refunded;
+the configured generation output-token cap (summed across all items in a
+generation batch). Failed attempts are not refunded;
 retries reserve again. Requests larger than the entire per-minute budget fail
 immediately. Generation requires a positive output cap (the generator default
 is used when omitted). Media requests are rejected when a token budget is set.

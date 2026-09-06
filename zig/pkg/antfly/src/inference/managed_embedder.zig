@@ -1194,11 +1194,17 @@ fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     if (monotonicNowNs() >= deadline) return error.Timeout;
 }
 
+fn embeddingAttemptObserver(entry: *const ManagedEmbeddingEntry) ?httpx.AttemptObserver {
+    return if (entry.quota) |quota| quota.limiter().observer(0) else null;
+}
+
 fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientConfig {
     var config = httpx.ClientConfig{
         .keep_alive = false,
         .max_response_size = 4 << 20,
-        .attempt_observer = if (entry.quota) |quota| quota.limiter().observer(0) else null,
+        // Bedrock's client also resolves credentials. Model admission belongs
+        // only on InvokeModel, never on STS/ECS/IMDS traffic.
+        .attempt_observer = if (entry.provider == .bedrock) null else embeddingAttemptObserver(entry),
     };
     const timeout_ms = try embeddingRemainingTimeoutMs(entry);
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
@@ -4089,6 +4095,7 @@ fn embedWithEntryPartsForTask(
             .region = entry.region,
             .endpoint = entry.base_url,
             .request_format = entry.bedrock_request_format,
+            .attempt_observer = embeddingAttemptObserver(entry),
             .input_type = effectiveInputType(entry, task_type),
             .truncate = entry.truncate,
             .dimension = dims,
@@ -4811,6 +4818,7 @@ fn embedBatchWithBedrockRequest(
         .region = entry.region,
         .endpoint = entry.base_url,
         .request_format = entry.bedrock_request_format,
+        .attempt_observer = embeddingAttemptObserver(entry),
         .input_type = effectiveInputType(entry, task_type),
         .truncate = entry.truncate,
         .dimension = dims,
@@ -7212,6 +7220,70 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
 
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
+}
+
+pub fn testBedrockCredentialTrafficBypassesModelQuota() !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var registry = provider_limits.Registry.init(alloc);
+    defer registry.deinit();
+    var runtime = ProviderRuntime.init(alloc, io);
+    runtime.limits = &registry;
+    defer runtime.deinit();
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/sts", .respond = .{ .body = "<Credentials><AccessKeyId>test-access</AccessKeyId><SecretAccessKey>test-secret</SecretAccessKey><SessionToken>test-session</SessionToken></Credentials>" } },
+        .{ .method = .POST, .path = "/model/amazon.titan-embed-text-v2%3A0/invoke", .respond = .{ .body = "{\"embedding\":[0.1,0.2]}" } },
+    });
+    defer server.deinit();
+    const raw = try std.fmt.allocPrint(alloc,
+        \\{{"i":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"bedrock","model":"amazon.titan-embed-text-v2:0","region":"us-east-1","url":{f},"rate_limit":{{"requests_per_minute":1}}}}}}}}
+    , .{std.json.fmt(server.baseUrl(), .{})});
+    defer alloc.free(raw);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, raw, .{ .io = io, .provider_runtime = &runtime });
+    defer managed.deinit();
+    const entry = &managed.entries[0];
+    var config = try embeddingHttpClientConfig(entry);
+    try std.testing.expect(config.attempt_observer == null);
+    config.timeouts = httpx.Timeouts.uniform(500);
+    config.timeouts.request_ms = 500;
+    var client = httpx.Client.initWithConfig(alloc, io, config);
+    defer client.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "test-web-identity" });
+    const token_path = try tmp.dir.realPathFileAlloc(io, "token", alloc);
+    defer alloc.free(token_path);
+    const sts = try std.fmt.allocPrint(alloc, "{s}/sts", .{server.baseUrl()});
+    defer alloc.free(sts);
+    var provider = bedrock_provider.Provider.init(alloc, &client, .{
+        .region = "us-east-1",
+        .endpoint = server.baseUrl(),
+        .attempt_observer = embeddingAttemptObserver(entry),
+        .credential_source = .{ .web_identity = .{ .role_arn = "test-role", .token_file = token_path, .sts_endpoint = sts } },
+    });
+    defer provider.deinit();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, p: *bedrock_provider.Provider, err_out: *?anyerror) !void {
+            runInner(a, p) catch |err| {
+                err_out.* = err;
+            };
+        }
+        fn runInner(a: std.mem.Allocator, p: *bedrock_provider.Provider) !void {
+            var result = try p.embedText(a, "amazon.titan-embed-text-v2:0", &.{"hello"});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.vectors.len);
+            try std.testing.expectError(error.Timeout, p.embedText(a, "amazon.titan-embed-text-v2:0", &.{"again"}));
+        }
+    };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ alloc, &provider, &failure });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u32, 0), entry.quota.?.limiter().in_flight);
 }
 
 pub fn testBedrockRequestFormatConfiguration() !void {

@@ -29,6 +29,7 @@ components:
             - $ref: "#/components/schemas/OpenAIGeneratorConfig"
         - properties:
             rate_limit:
+              x-go-type-skip-optional-pointer: false
               $ref: "./provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/GeneratorProvider"

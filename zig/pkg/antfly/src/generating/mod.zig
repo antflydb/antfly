@@ -42,6 +42,7 @@ pub const ChainLink = lib.ChainLink;
 pub const GeneratorFactory = lib.GeneratorFactory;
 pub const default_max_tokens = lib.default_max_tokens;
 pub const parseConfigFromSlice = lib.parseConfigFromSlice;
+pub const parseConfigFromValue = lib.parseConfigFromValue;
 
 pub const BackendFactory = struct {
     alloc: std.mem.Allocator,
@@ -248,7 +249,7 @@ const BackendState = struct {
             try self.limits.acquire(self.quotaIdentity(model), policy);
         defer if (temporary) |*handle| handle.release();
         const quota = temporary orelse self.quota.?;
-        const observer = quota.limiter().observer(@intCast(@max(0, self.cfg.max_tokens)));
+        const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
             .embedded_antfly => {},
@@ -733,4 +734,154 @@ test "generating antfly backend treats missing default api key env as optional" 
     if (run_err) |err| return err;
 
     try std.testing.expectEqualStrings("no auth ok", content orelse return error.TestUnexpectedResult);
+}
+
+/// Text-only batch dispatch shares BackendState's quota identity and credential
+/// resolution with single generation. The caller owns the returned response.
+pub fn generateAntflyTextBatchResponse(
+    alloc: std.mem.Allocator,
+    http: *httpx.Client,
+    cfg: GeneratorConfig,
+    options: BackendFactory.Options,
+    texts: []const []const u8,
+) !httpx.Response {
+    try cfg.validate();
+    if (cfg.provider != .antfly or cfg.url.len == 0 or texts.len == 0)
+        return error.InvalidGeneratorConfig;
+    if (cfg.tools_json != null or cfg.tool_choice_json != null) return error.InvalidGeneratorConfig;
+    var factory = BackendFactory.initWithOptions(alloc, http, options);
+    var generator = try factory.factory().create(alloc, cfg);
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    const output_tokens = try generationOutputBudget(cfg, texts.len);
+    const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, texts);
+    defer alloc.free(body);
+    const url = try std.fmt.allocPrint(alloc, "{s}/generate/batch", .{std.mem.trimEnd(u8, state.provider.remote_antfly.base_url, "/")});
+    defer alloc.free(url);
+    const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
+    defer if (authorization) |value| alloc.free(value);
+    var headers: [1][2][]const u8 = undefined;
+    if (authorization) |value| headers[0] = .{ "Authorization", value };
+    return http.post(url, .{
+        .json = body,
+        .headers = if (authorization != null) &headers else null,
+        .timeout_ms = 300_000,
+        .attempt_observer = state.quota.?.limiter().observer(output_tokens),
+    });
+}
+
+test "generating backend batch reserves all output caps before dispatch" {
+    const alloc = std.testing.allocator;
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "budget", .url = "http://127.0.0.1:1" });
+    cfg.max_tokens = 100;
+    const texts = [_][]const u8{ "one", "two" };
+    const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, &texts);
+    defer alloc.free(body);
+    // A budget that fits one output cap must still reject a two-item batch.
+    cfg.rate_limit = .{ .tokens_per_minute = @intCast(body.len + 100) };
+    try std.testing.expectError(error.ProviderTokenBudgetExceeded, generateAntflyTextBatchResponse(alloc, &client, cfg, .{ .limits = &limits }, &texts));
+}
+
+test "generating backend batch shares single-request quotas and credentials" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer batch-test", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+    };
+    var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/generate/batch", .assert_request = Check.request, .respond = .{ .status = 429 } }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "shared", .url = server.baseUrl() });
+    cfg.api_key = "batch-test";
+    cfg.rate_limit = .{ .requests_per_minute = 1, .max_concurrency = 1 };
+    var factory = BackendFactory.initWithOptions(alloc, &client, .{ .limits = &limits });
+    var single = try factory.factory().create(alloc, cfg);
+    defer single.deinit();
+    var conflicting = cfg;
+    conflicting.rate_limit.?.requests_per_minute = 2;
+    try std.testing.expectError(error.ConflictingRateLimitPolicy, generateAntflyTextBatchResponse(alloc, &client, conflicting, .{ .limits = &limits }, &.{"hello"}));
+    const Run = struct {
+        fn run(a: std.mem.Allocator, h: *httpx.Client, c: GeneratorConfig, r: *provider_limits.Registry, err_out: *?anyerror) !void {
+            var response = generateAntflyTextBatchResponse(a, h, c, .{ .limits = r }, &.{ "one", "two" }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            defer response.deinit();
+            std.testing.expectEqual(@as(u16, 429), response.status.code) catch |err| {
+                err_out.* = err;
+            };
+        }
+    };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ alloc, &client, cfg, &limits, &failure });
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    const state: *BackendState = @ptrCast(@alignCast(single.ptr));
+    try std.testing.expect(state.quota.?.limiter().requests < 1);
+    try std.testing.expect(state.quota.?.limiter().cooldown_ns != 0);
+    try std.testing.expectEqual(@as(u32, 0), state.quota.?.limiter().in_flight);
+}
+
+fn generationOutputBudget(cfg: GeneratorConfig, count: usize) !u64 {
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+    if (policy.tokens_per_minute != 0 and cfg.max_tokens <= 0) return error.InvalidRateLimitPolicy;
+    return std.math.mul(u64, @intCast(@max(0, cfg.max_tokens)), @intCast(count)) catch error.ProviderTokenBudgetExceeded;
+}
+
+fn antflyGenerateBatchRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    cfg: GeneratorConfig,
+    texts: []const []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "{\"mode\":\"sync\",\"requests\":[");
+    for (texts, 0..) |text, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const item = try std.fmt.allocPrint(
+            alloc,
+            "{{\"custom_id\":\"{d}\",\"body\":{{\"model\":{f},\"messages\":[{{\"role\":\"user\",\"content\":{f}}}],\"mode\":\"eager\"",
+            .{
+                i,
+                std.json.fmt(cfg.model, .{}),
+                std.json.fmt(text, .{}),
+            },
+        );
+        defer alloc.free(item);
+        try out.appendSlice(alloc, item);
+        try appendBatchI64Field(alloc, &out, "max_tokens", cfg.max_tokens);
+        if (cfg.temperature) |temperature| try appendBatchFloatField(alloc, &out, "temperature", temperature);
+        if (cfg.top_p) |top_p| try appendBatchFloatField(alloc, &out, "top_p", top_p);
+        if (cfg.top_k) |top_k| try appendBatchI64Field(alloc, &out, "top_k", top_k);
+        if (cfg.frequency_penalty) |frequency_penalty| try appendBatchFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
+        if (cfg.presence_penalty) |presence_penalty| try appendBatchFloatField(alloc, &out, "presence_penalty", presence_penalty);
+        try out.appendSlice(alloc, "}}");
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendBatchI64Field(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ name, value });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
+}
+
+fn appendBatchFloatField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: f32) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
 }

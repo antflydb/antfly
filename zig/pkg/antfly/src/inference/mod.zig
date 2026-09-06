@@ -56,6 +56,7 @@ test "inference module compiles" {
 }
 
 test "bedrock provider request helpers" {
+    try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();

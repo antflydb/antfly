@@ -6,6 +6,8 @@ components:
   schemas:
     RateLimitConfig:
       type: object
+      # Absence inherits legacy defaults; an explicit empty object opts out.
+      x-go-type-skip-optional-pointer: false
       additionalProperties: false
       description: |
         Outbound provider limits shared within one Antfly process by effective

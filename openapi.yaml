@@ -9202,6 +9202,7 @@ components:
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
             rate_limit:
+              x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/EmbedderProvider'
@@ -18328,6 +18329,7 @@ components:
         api_url: http://localhost:8082
     RateLimitConfig:
       type: object
+      x-go-type-skip-optional-pointer: false
       additionalProperties: false
       description: >
         Outbound provider limits shared within one Antfly process by effective
@@ -19193,6 +19195,7 @@ components:
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
         - properties:
             rate_limit:
+              x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/GeneratorProvider'
@@ -23758,6 +23761,7 @@ components:
         - type: object
           properties:
             rate_limit:
+              x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/RerankerProvider'
