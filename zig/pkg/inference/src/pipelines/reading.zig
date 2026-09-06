@@ -108,7 +108,8 @@ pub const ReadingPipeline = struct {
     decoder: backends.Session,
     tokenizer: tokenizer_mod.Tokenizer,
     config: ReadConfig,
-    florence_final_logits_bias_zero_cache: ?*?bool = null,
+    /// Immutable capability resolved for the loaded model generation.
+    florence_final_logits_bias_zero: ?bool = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -116,7 +117,7 @@ pub const ReadingPipeline = struct {
         decoder: backends.Session,
         tokenizer: tokenizer_mod.Tokenizer,
         config: ReadConfig,
-        florence_final_logits_bias_zero_cache: ?*?bool,
+        florence_final_logits_bias_zero: ?bool,
     ) ReadingPipeline {
         return .{
             .allocator = allocator,
@@ -124,7 +125,7 @@ pub const ReadingPipeline = struct {
             .decoder = decoder,
             .tokenizer = tokenizer,
             .config = config,
-            .florence_final_logits_bias_zero_cache = florence_final_logits_bias_zero_cache,
+            .florence_final_logits_bias_zero = florence_final_logits_bias_zero,
         };
     }
 
@@ -143,6 +144,15 @@ pub const ReadingPipeline = struct {
         );
         defer self.allocator.free(prompt_ids);
         return prompt_ids.len;
+    }
+
+    fn florenceFinalLogitsBiasIsZero(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        vocab_size: usize,
+    ) !bool {
+        if (self.florence_final_logits_bias_zero) |value| return value;
+        return florence_arch.decoderFinalLogitsBiasIsZero(cb, self.allocator, vocab_size);
     }
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
@@ -628,6 +638,15 @@ pub const ReadingPipeline = struct {
         for (active_rows, 0..) |*row, index| row.* = index;
         var active_count = batch;
         var row_compaction_supported = true;
+        const fused_lm_head_allowed = if (self.config.no_repeat_ngram_size == 0)
+            try self.florenceFinalLogitsBiasIsZero(cb, florence_cfg.vocab_size)
+        else
+            false;
+        if (!fused_lm_head_allowed and last_read_telemetry.lm_head_path == null)
+            last_read_telemetry.lm_head_path = if (self.config.no_repeat_ngram_size == 0)
+                "batch_full_logits_bias"
+            else
+                "batch_full_logits_no_repeat";
         for (0..dec_len) |idx| {
             for (0..batch) |b| step_tokens[b] = dec_ids[b * max_len + idx];
             const prefix_step_start = nowNs();
@@ -656,25 +675,19 @@ pub const ReadingPipeline = struct {
                 var hidden_live = true;
                 errdefer if (hidden_live) cb.free(hidden);
 
-                const logits_tensor = try florence_arch.decoderLmHeadLogitsRowsFromFinalHiddenTensor(
-                    cb,
-                    allocator,
-                    florence_cfg,
-                    hidden,
-                    active_count,
-                );
-                hidden_live = false;
-                defer cb.free(logits_tensor);
                 var selected_on_device = false;
-                if (self.config.no_repeat_ngram_size == 0) {
-                    if (try cb.argmaxRows(
-                        logits_tensor,
-                        0,
-                        active_count,
-                        florence_cfg.vocab_size,
+                if (fused_lm_head_allowed) {
+                    if (try florence_arch.decoderFusedTokensFromFinalHiddenTensor(
+                        cb,
                         allocator,
+                        florence_cfg,
+                        hidden,
+                        active_count,
+                        &.{},
                     )) |selected_tokens| {
                         defer allocator.free(selected_tokens);
+                        cb.free(hidden);
+                        hidden_live = false;
                         finished_count += try applyFlorenceBatchSelectedTokensActive(
                             dec_ids,
                             max_len,
@@ -688,28 +701,69 @@ pub const ReadingPipeline = struct {
                             step_tokens[0..active_count],
                         );
                         selected_on_device = true;
+                        if (last_read_telemetry.lm_head_path == null)
+                            last_read_telemetry.lm_head_path = "batch_fused_argmax";
                     }
                 }
                 if (!selected_on_device) {
-                    const logits = try cb.toFloat32(logits_tensor, allocator);
-                    defer allocator.free(logits);
-
-                    finished_count += try applyFlorenceBatchGreedyStepActive(
-                        dec_ids,
-                        max_len,
-                        dec_len,
-                        finished,
-                        lengths,
-                        logits,
-                        florence_cfg.vocab_size,
-                        0,
-                        florence_cfg.vocab_size,
-                        active_rows[0..active_count],
-                        self.config.eos_token_id,
-                        self.config.pad_token_id,
-                        self.config.no_repeat_ngram_size,
-                        step_tokens[0..active_count],
+                    const logits_tensor = try florence_arch.decoderLmHeadLogitsRowsFromFinalHiddenTensor(
+                        cb,
+                        allocator,
+                        florence_cfg,
+                        hidden,
+                        active_count,
                     );
+                    hidden_live = false;
+                    defer cb.free(logits_tensor);
+                    if (self.config.no_repeat_ngram_size == 0) {
+                        if (try cb.argmaxRows(
+                            logits_tensor,
+                            0,
+                            active_count,
+                            florence_cfg.vocab_size,
+                            allocator,
+                        )) |selected_tokens| {
+                            defer allocator.free(selected_tokens);
+                            finished_count += try applyFlorenceBatchSelectedTokensActive(
+                                dec_ids,
+                                max_len,
+                                dec_len,
+                                finished,
+                                lengths,
+                                selected_tokens,
+                                active_rows[0..active_count],
+                                self.config.eos_token_id,
+                                self.config.pad_token_id,
+                                step_tokens[0..active_count],
+                            );
+                            selected_on_device = true;
+                            if (last_read_telemetry.lm_head_path == null)
+                                last_read_telemetry.lm_head_path = "batch_logits_argmax";
+                        }
+                    }
+                    if (!selected_on_device) {
+                        const logits = try cb.toFloat32(logits_tensor, allocator);
+                        defer allocator.free(logits);
+
+                        finished_count += try applyFlorenceBatchGreedyStepActive(
+                            dec_ids,
+                            max_len,
+                            dec_len,
+                            finished,
+                            lengths,
+                            logits,
+                            florence_cfg.vocab_size,
+                            0,
+                            florence_cfg.vocab_size,
+                            active_rows[0..active_count],
+                            self.config.eos_token_id,
+                            self.config.pad_token_id,
+                            self.config.no_repeat_ngram_size,
+                            step_tokens[0..active_count],
+                        );
+                        if (last_read_telemetry.lm_head_path == null)
+                            last_read_telemetry.lm_head_path = "batch_full_logits";
+                    }
                 }
             }
 
@@ -1267,19 +1321,9 @@ pub const ReadingPipeline = struct {
         last_read_telemetry.kv_cache_mode = if (cache.self.preallocated) "preallocated" else "concat";
         logReadProfile("florence_decoder_kv_cache_build", cache_start);
 
-        const fused_lm_head_allowed = if (self.florence_final_logits_bias_zero_cache) |cache_ptr| blk: {
-            if (cache_ptr.*) |cached| break :blk cached;
-            const bias_check_start = nowNs();
-            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
-            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
-            cache_ptr.* = value;
-            break :blk value;
-        } else blk: {
-            const bias_check_start = nowNs();
-            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
-            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
-            break :blk value;
-        };
+        const bias_check_start = nowNs();
+        const fused_lm_head_allowed = try self.florenceFinalLogitsBiasIsZero(cb, florence_cfg.vocab_size);
+        logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
         if (!fused_lm_head_allowed and last_read_telemetry.lm_head_path == null) {
             last_read_telemetry.lm_head_path = "full_logits_bias";
         }

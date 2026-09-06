@@ -36,11 +36,13 @@ const gguf_writer = @import("../gguf/writer.zig");
 const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
 const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
+const florence_arch = @import("../architectures/florence.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
 const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
+const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
@@ -2353,6 +2355,9 @@ pub const LoadedModel = struct {
     /// Borrowed from the serving BackendRuntime and valid for the model's
     /// loaded lifetime. Offline model owners leave this null.
     executor_io: ?std.Io = null,
+    /// Immutable Florence reader sidecars, parsed before this generation is
+    /// published so request microbatches perform no filesystem discovery.
+    florence_reader_config: ?vision_config.RuntimeConfig = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
@@ -6338,6 +6343,24 @@ pub const ModelManager = struct {
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const florence_reader_config: ?vision_config.RuntimeConfig = if (session_factory.getFlorenceConfig(session)) |florence| blk: {
+            const config_path = man.config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor_path = man.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor = try vision_config.loadPreprocessorConfigFile(self.allocator, preprocessor_path);
+            if (preprocessor.image_size != @as(usize, florence.image_size))
+                return error.InvalidPreprocessorConfig;
+            var cb = try session_factory.getComputeBackend(session, self.allocator);
+            defer cb.deinit();
+            break :blk .{
+                .decoder = try encoder_decoder.loadDecoderConfigFile(self.allocator, config_path),
+                .preprocessor = preprocessor,
+                .final_logits_bias_zero = try florence_arch.decoderFinalLogitsBiasIsZero(
+                    &cb,
+                    self.allocator,
+                    florence.vocab_size,
+                ),
+            };
+        } else null;
         const owned_model_dir = try self.allocator.dupe(u8, model_dir);
         var owned_model_dir_owned = true;
         errdefer if (owned_model_dir_owned) self.allocator.free(owned_model_dir);
@@ -6354,6 +6377,7 @@ pub const ModelManager = struct {
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .executor_io = self.session_manager.io,
+            .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
             .whisper_prompt_cache = whisper_prompt_cache,
             .chat_template_failed = chat_template_failed,

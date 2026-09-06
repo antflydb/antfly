@@ -3753,7 +3753,7 @@ pub fn build(b: *std.Build) void {
         "attachment transport separates wire and peak resident representations",
         "bounded invocation allocator",
         "inline data URI parser validates canonical metadata",
-        "antfly embed parts streams binary base64 into one request body",
+        "antfly embed parts uses the framed attachment transport",
         "antfly embed parts request sizing is exact for escaped strings",
         "antfly dense JSON response cleanup is allocation-failure safe",
         "remote generator batch streams attachments into one exact JSON body",

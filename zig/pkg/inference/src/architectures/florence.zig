@@ -882,6 +882,28 @@ pub fn decoderFusedTokenFromFinalHiddenTensor(
     return try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, try lmHeadWeight(cb), 1, config.d_model, config.vocab_size, suppress_tokens);
 }
 
+/// Project one final-hidden row per active batch item and return only the
+/// selected token ids. Backends implementing this avoid materializing the
+/// `[rows, vocab_size]` logits tensor on every autoregressive step.
+pub fn decoderFusedTokensFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    rows: usize,
+    suppress_tokens: []const i32,
+) !?[]u32 {
+    return try cb.linearNoBiasArgmaxRowsSuppress(
+        hidden,
+        try lmHeadWeight(cb),
+        rows,
+        config.d_model,
+        config.vocab_size,
+        suppress_tokens,
+        allocator,
+    );
+}
+
 pub fn decoderFinalLogitsBiasIsZero(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1211,7 +1233,7 @@ fn visionEncoderForwardTensorTail(
     pixel_values: []const f32,
     batch: usize,
 ) !?VisionForwardTensorResult {
-    if (!useDeviceVisionTail(cb, config, batch)) return null;
+    if (!useDeviceVisionTail(cb, config)) return null;
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     const profile = readProfileEnabled();
@@ -1304,9 +1326,8 @@ fn visionEncoderForwardTensorTail(
     return null;
 }
 
-fn useDeviceVisionTail(cb: *const ComputeBackend, config: Config, batch: usize) bool {
+fn useDeviceVisionTail(cb: *const ComputeBackend, config: Config) bool {
     return cb.kind() == .cuda and
-        batch == 1 and
         !florenceDeviceVisionTailDisabled() and
         config.image_feature_source_count == 2 and
         config.image_feature_sources[0] == .spatial_avg_pool and

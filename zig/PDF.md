@@ -3773,10 +3773,22 @@ fused kernel/provider operation may advertise `native`.
 
 The post-implementation performance review resulted in these concrete changes:
 
-- Florence's ordinary greedy batch decoder performs row-wise argmax on the
-  backend and transfers only one token id per row. Host materialization of
-  `batch * vocabulary` logits remains only for no-repeat-ngram filtering or a
-  backend without row argmax.
+- Florence's ordinary greedy batch decoder fuses the LM-head projection and
+  row-wise argmax on capable Metal/CUDA backends, returning only one token id
+  per active row. It therefore avoids creating the `batch * vocabulary` logits
+  tensor on every output-token step. Full logits remain only for a non-zero
+  final-logits bias, no-repeat-ngram filtering, or a backend without the fused
+  primitive.
+- CUDA Florence batches keep the final vision stage, positional/temporal
+  source expansion, image projection, and image normalization device-resident
+  for every admitted batch size. The underlying kernel was already batch-aware;
+  removing the single-item policy gate eliminates a large device-to-host-to-
+  device round trip for batched OCR.
+- Florence decoder/preprocessor sidecars and the final-logits-bias capability
+  are resolved once before an immutable model generation is published, not
+  once per executed microbatch. Lightweight reader wrappers copy that immutable
+  metadata, so hot batches perform neither filesystem discovery, synchronization,
+  nor repeated device-to-host bias scans.
 - Encoded visual embedding now allocates normalized model input once and
   adopts that allocation into the tensor. Image and borrowed-raster decode,
   resize, and normalization happen before the model execution lock; only
@@ -3882,8 +3894,14 @@ shortcuts:
   cancellation, and provenance in the wire descriptors. Until that version is
   negotiated, v1 intentionally retains one bounded envelope body. A proxy must
   not infer either version from logical model modalities.
-- Worker-affine reader/font caches now remove repeated initialization within a
-  render batch. Reuse across worker lanes or independent preparations would
+- Logical render-lane reader/font caches now remove repeated initialization
+  across joined waves within a render batch even when fixed-executor arena
+  scratch resets after each callback. Each reader uses a private, freeing lane
+  heap backed by the shared byte-budget allocator, so page scratch reuses
+  already-admitted pages without paying one system allocation per object. The
+  reader is never accessed concurrently, so a logical lane may resume on
+  another physical worker without retaining resettable executor memory.
+  Reuse across independent render windows would
   still need a byte-bounded immutable resource cache owned by
   `PreparedDocument`, with forks borrowing only frozen entries. Mutable reader
   caches must never cross threads or escape into resettable backend-lane
@@ -4079,7 +4097,10 @@ The following remain qualification work rather than architectural blockers:
 ## Open decisions
 
 - Whether immutable font program parsing should eventually be frozen and
-  shared. The safe implementation keeps font and image caches task-local.
+  shared across render windows. The safe implementation retains a private font
+  cache only for the joined waves of one bounded batch and keeps image caches
+  task-local. Cross-window reuse needs explicit document-lifetime byte
+  admission; it must not hide persistent allocations in executor scratch.
 - Whether the conservative source-size, decode-working-set, and
   bytes-per-pixel reservation can be tightened with measured high-water data.
 - Whether profiling justifies splitting the lazily activated inference lane
