@@ -2,6 +2,7 @@
 // Package: antfly_generating_openapi
 
 const std = @import("std");
+const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference generative AI provider.
 pub const AntflyGeneratorConfig = struct {
@@ -561,6 +562,7 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
+    rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -579,6 +581,7 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
+        .{ "rate_limit", "rate_limit", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -650,6 +653,13 @@ pub const GeneratorConfig = struct {
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
             try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("rate_limit");
+            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1024,6 +1034,8 @@ pub const OpenRouterGeneratorConfig = struct {
         try jw.endObject();
     }
 };
+
+pub const RateLimitConfig = antfly_provider_openapi.RateLimitConfig;
 
 /// Retry configuration for generator calls
 pub const RetryConfig = struct {

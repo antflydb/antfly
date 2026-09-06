@@ -3474,6 +3474,7 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
              * @description Declare that this model supports non-text content (images, audio, video, PDFs),
@@ -9250,6 +9251,48 @@ export interface components {
             retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /**
+         * @description token_bucket limits admission rate while allowing overlapping attempts.
+         *     completion serializes attempts and waits one RPM interval after each
+         *     attempt finishes, including streamed writes and transport failures.
+         *     This prevents delayed connection setup from compressing successful
+         *     request spacing, at the cost of response latency plus one interval per
+         *     request. Requires requests_per_minute and burst=1. Neither mode can
+         *     guarantee zero upstream 429s or coordinate other processes.
+         * @enum {string}
+         */
+        RequestPacing: "token_bucket" | "completion";
+        /**
+         * @description Outbound provider limits shared within one Antfly process by effective
+         *     endpoint, operation, model, credential source, project and region/location.
+         *     Conflicting policies for an active scope are rejected. These limits do
+         *     not coordinate across replicas or infer the provider's account quota.
+         */
+        RateLimitConfig: {
+            /** @description Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing. */
+            pacing?: components["schemas"]["RequestPacing"];
+            /** Format: int64 */
+            requests_per_minute?: number;
+            /**
+             * Format: int64
+             * @default 1
+             */
+            burst?: number;
+            /**
+             * Format: int64
+             * @description Conservative text budget: each HTTP attempt reserves its serialized
+             *     UTF-8 body byte count plus the configured generation output cap.
+             *     Reservations are not refunded. A request larger than this budget
+             *     is rejected. This is not provider billing token accounting; media
+             *     requests are not supported with this limit.
+             */
+            tokens_per_minute?: number;
+            /**
+             * Format: int64
+             * @description Maximum in-flight HTTP attempts, held through response completion.
+             */
+            max_concurrency?: number;
+        };
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -9748,6 +9791,7 @@ export interface components {
          *     }
          */
         GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
         /** @description Configuration for a specific edge type */
@@ -12411,6 +12455,8 @@ export interface components {
         AntflyRerankerConfig: {
             /** @enum {string} */
             provider: "antfly";
+            /** @description Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials. */
+            api_key?: string;
             /** @description Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed. */
             model?: string;
             /**
@@ -12487,6 +12533,7 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;

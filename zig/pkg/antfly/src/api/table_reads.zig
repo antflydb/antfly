@@ -17708,6 +17708,11 @@ fn applyReranker(
             documents,
         );
     const owned_scores = scores catch |err| switch (err) {
+        error.InvalidRateLimitPolicy,
+        error.ConflictingRateLimitPolicy,
+        error.ProviderTokenBudgetExceeded,
+        error.UnsupportedMediaTokenBudget,
+        error.UnsupportedLocalRateLimit,
         error.InvalidRerankerConfig,
         error.UnsupportedRerankerProvider,
         error.MissingVertexCredentials,
