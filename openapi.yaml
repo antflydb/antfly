@@ -23653,6 +23653,11 @@ components:
           type: string
           enum:
             - antfly
+        api_key:
+          type: string
+          description: Optional bearer API key for remote Antfly inference. Supports secret references
+            and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound
+            credentials.
         model:
           type: string
           description: Optional reranking model name. When omitted, Antfly inference selects a model from

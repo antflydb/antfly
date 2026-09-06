@@ -1823,6 +1823,8 @@ pub const AntflyGeneratorConfig = struct {
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
     provider: []const u8,
+    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
+    api_key: ?[]const u8 = null,
     /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -1831,6 +1833,7 @@ pub const AntflyRerankerConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
         .{ "model", "model", true },
         .{ "url", "url", true },
     };
@@ -1847,6 +1850,10 @@ pub const AntflyRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -26720,10 +26727,10 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
+    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
+    api_key: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
@@ -26738,8 +26745,8 @@ pub const RerankerConfig = struct {
         .{ "model", "model", true },
         .{ "candidate_count", "candidate_count", true },
         .{ "top_n", "top_n", true },
-        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -26780,12 +26787,12 @@ pub const RerankerConfig = struct {
             try jw.objectField("top_n");
             try jw.write(value);
         }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
             try jw.write(value);
         }
         if (self.project_id) |value| {

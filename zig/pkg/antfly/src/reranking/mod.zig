@@ -225,6 +225,42 @@ pub const Options = struct {
     execution_context: ?inference_request_context.RequestContext = null,
 };
 
+/// One request-owned authentication snapshot drives both the wire credential
+/// and quota identity. Keep source ownership until the quota lease is released;
+/// secret rotation changes the token, not the source identity.
+const RequestAuthentication = struct {
+    secret: ?common_secrets.SecretValue,
+    token: ?[]u8,
+
+    fn init(alloc: std.mem.Allocator, cfg: Config, store: ?*common_secrets.FileStore) !RequestAuthentication {
+        const capabilities = providerCapabilities(cfg.provider);
+        var secret = if (capabilities.credential_env) |env_name|
+            try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, env_name)
+        else
+            try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
+        errdefer if (secret) |*value| value.deinit(alloc);
+        const token = if (secret) |value| try value.resolveOwned(alloc, store) else null;
+        errdefer if (token) |value| alloc.free(value);
+        if (token) |value| {
+            if (value.len == 0) return error.InvalidRerankerConfig;
+        } else if (capabilities.credential_kind == .api_key) return error.InvalidRerankerConfig;
+        return .{ .secret = secret, .token = token };
+    }
+
+    fn identity(self: *const RequestAuthentication, cfg: Config) credential_identity.CredentialSourceIdentity {
+        if (self.token != null) return credential_identity.fromSecretValue(self.secret);
+        if (cfg.provider == .vertex)
+            return credential_identity.CredentialSourceIdentity.googleAdc(if (cfg.credentials_path.len > 0) cfg.credentials_path else null);
+        return credential_identity.CredentialSourceIdentity.none();
+    }
+
+    fn deinit(self: *RequestAuthentication, alloc: std.mem.Allocator) void {
+        if (self.token) |value| alloc.free(value);
+        if (self.secret) |*value| value.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub fn rerankDocumentsWithOptions(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -235,41 +271,36 @@ pub fn rerankDocumentsWithOptions(
 ) ![]f32 {
     try cfg.validate();
     if (options.execution_context) |context| try context.check();
-    const capabilities = providerCapabilities(cfg.provider);
-    var configured_secret = switch (capabilities.credential_kind) {
-        .api_key => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "COHERE_API_KEY"),
-        .none, .google_adc => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
-    };
-    defer if (configured_secret) |*secret| secret.deinit(alloc);
-    const api_key = if (configured_secret) |secret_value| try secret_value.resolveOwned(alloc, options.secret_store) else null;
-    defer if (api_key) |value| alloc.free(value);
-    const source = if (cfg.provider == .vertex and configured_secret == null)
-        credential_identity.CredentialSourceIdentity.googleAdc(if (cfg.credentials_path.len > 0) cfg.credentials_path else null)
-    else
-        credential_identity.fromSecretValue(configured_secret);
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
-
-    switch (cfg.provider) {
-        .antfly => {
-            if (cfg.url.len == 0) {
-                if (options.antfly_provider) |local| {
-                    if (policy.enabled()) return error.UnsupportedLocalRateLimit;
-                    if (options.execution_context) |context| {
-                        if (local.rerank_texts_with_context) |rerank| {
-                            const scores = try rerank(local.ptr, alloc, cfg.model, query, documents, context);
-                            try context.check();
-                            return scores;
-                        }
-                    }
-                    if (local.rerank_texts) |rerank| {
-                        const scores = try rerank(local.ptr, alloc, cfg.model, query, documents);
-                        if (options.execution_context) |context| try context.check();
-                        return scores;
-                    }
+    // Select embedded execution before touching outbound credentials. Local
+    // callbacks have no bearer credential or outbound quota scope.
+    if (cfg.provider == .antfly and cfg.url.len == 0) {
+        if (options.antfly_provider) |local| {
+            if (policy.enabled()) return error.UnsupportedLocalRateLimit;
+            if (options.execution_context) |context| {
+                if (local.rerank_texts_with_context) |rerank| {
+                    const scores = try rerank(local.ptr, alloc, cfg.model, query, documents, context);
+                    try context.check();
+                    return scores;
                 }
             }
+            if (local.rerank_texts) |rerank| {
+                const scores = try rerank(local.ptr, alloc, cfg.model, query, documents);
+                if (options.execution_context) |context| try context.check();
+                return scores;
+            }
+        }
+    }
+
+    var auth = try RequestAuthentication.init(alloc, cfg, options.secret_store);
+    defer auth.deinit(alloc);
+    const source = auth.identity(cfg);
+    const api_key = auth.token;
+    switch (cfg.provider) {
+        .antfly => {
             var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
             defer provider.deinit();
+            if (api_key) |token| try provider.setApiKey(token);
             var quota = try acquireQuota(cfg, options, source, "", "", policy);
             defer quota.release();
             provider.attempt_observer = quota.limiter().observer(0);
@@ -457,8 +488,13 @@ test "reranking runtime delegates to antfly provider" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer explicit-test-token", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+    };
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/rerank", .respond = .{
+        .{ .method = .POST, .path = "/rerank", .assert_request = Check.request, .respond = .{
             .body = "{\"object\":\"list\",\"data\":[{\"object\":\"rerank.score\",\"index\":0,\"score\":0.9},{\"object\":\"rerank.score\",\"index\":1,\"score\":0.25}],\"model\":\"cross-encoder/ms-marco-MiniLM-L-6-v2\",\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":0,\"total_tokens\":4}}",
         } },
     });
@@ -488,6 +524,7 @@ test "reranking runtime delegates to antfly provider" {
                 .provider = .antfly,
                 .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
                 .url = reranker_url,
+                .api_key = "explicit-test-token",
                 .field = "body",
             };
             out.* = rerankDocuments(a, test_client, cfg, "query", &.{ "doc1", "doc2" }) catch |err| {
@@ -547,9 +584,169 @@ test "reranking runtime routes antfly provider to local antfly" {
     const cfg = Config{
         .provider = .antfly,
         .field = "body",
+        // Embedded execution must not attempt to resolve an outbound secret.
+        .api_key = "${secret:missing.embedded.reranker.key}",
     };
     const scores = try rerankDocumentsWithAntflyProvider(alloc, &client, cfg, local, "query", &.{ "doc1", "doc2" });
     defer alloc.free(scores);
     try std.testing.expect(state.called);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), scores[1], 0.0001);
+}
+
+test "reranking runtime authentication owns wire credentials and stable quota sources" {
+    const alloc = std.testing.allocator;
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            inline for (.{ Provider.antfly, Provider.cohere, Provider.vertex }) |provider| {
+                const cfg = Config{ .provider = provider, .api_key = "explicit", .field = "body" };
+                var auth = try RequestAuthentication.init(a, cfg, null);
+                defer auth.deinit(a);
+                try std.testing.expectEqualStrings("explicit", auth.token.?);
+                try std.testing.expect(auth.identity(cfg).eql(credential_identity.CredentialSourceIdentity.literalSecret("explicit")));
+            }
+            const adc_cfg = Config{ .provider = .vertex, .field = "body", .credentials_path = "test-adc.json" };
+            var adc = try RequestAuthentication.init(a, adc_cfg, null);
+            defer adc.deinit(a);
+            try std.testing.expect(adc.token == null);
+            try std.testing.expect(adc.identity(adc_cfg).eql(credential_identity.CredentialSourceIdentity.googleAdc("test-adc.json")));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{});
+    inline for (.{ Provider.antfly, Provider.cohere, Provider.vertex }) |provider| {
+        try std.testing.expectError(error.InvalidRerankerConfig, RequestAuthentication.init(alloc, .{ .provider = provider, .api_key = "", .field = "body" }, null));
+    }
+}
+
+test "reranking runtime remote Antfly secret rotation changes headers without resetting quota" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "secrets.json", .data = "{\"secrets\":[]}" });
+    const path = try tmp.dir.realPathFileAlloc(io, "secrets.json", alloc);
+    defer alloc.free(path);
+    var store = try common_secrets.FileStore.init(alloc, path);
+    defer store.deinit();
+    var initial = try store.put(alloc, "reranker.key", "first");
+    defer initial.deinit(alloc);
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    const Check = struct {
+        fn first(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer first", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+        fn second(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer second", req.header("Authorization") orelse return error.TestUnexpectedResult);
+        }
+    };
+    var routes = [_]httpx.testing_mod.Route{.{ .method = .POST, .path = "/rerank", .assert_request = Check.first, .respond = .{ .body = "{\"scores\":[0.9]}" } }};
+    var server = try httpx.TestServer.start(alloc, io, &routes);
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .{ .request_ms = 500 } });
+    defer client.deinit();
+    const cfg = Config{ .provider = .antfly, .model = "test", .field = "body", .url = server.baseUrl(), .api_key = "${secret:reranker.key}", .rate_limit = .{ .requests_per_minute = 1, .burst = 2, .max_concurrency = 1 } };
+    const options = Options{ .limits = &limits, .secret_store = &store };
+    var auth = try RequestAuthentication.init(alloc, cfg, &store);
+    defer auth.deinit(alloc);
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+    var held = try acquireQuota(cfg, options, auth.identity(cfg), "", "", policy);
+    defer held.release();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, http: *httpx.Client, config: Config, opts: Options, err_out: *?anyerror) !void {
+            const scores = rerankDocumentsWithOptions(a, http, config, opts, "query", &.{"document"}) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            defer a.free(scores);
+            std.testing.expectEqual(@as(usize, 1), scores.len) catch |err| {
+                err_out.* = err;
+            };
+        }
+    };
+    for (0..2) |i| {
+        if (i == 1) {
+            var rotated = try store.put(alloc, "reranker.key", "second");
+            defer rotated.deinit(alloc);
+            routes[0].assert_request = Check.second;
+        }
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.run, .{ alloc, &client, cfg, options, &failure });
+        try server.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+    try std.testing.expect(held.limiter().requests < 1);
+    try std.testing.expectEqual(@as(u32, 0), held.limiter().in_flight);
+    // No server handler: the third attempt must expire before dispatch.
+    try std.testing.expectError(error.Timeout, rerankDocumentsWithOptions(alloc, &client, cfg, options, "query", &.{"document"}));
+    var rotated_auth = try RequestAuthentication.init(alloc, cfg, &store);
+    defer rotated_auth.deinit(alloc);
+    try std.testing.expect(auth.identity(cfg).eql(rotated_auth.identity(cfg)));
+    var conflicting = cfg;
+    conflicting.rate_limit.?.requests_per_minute = 2;
+    try std.testing.expectError(error.ConflictingRateLimitPolicy, rerankDocumentsWithOptions(alloc, &client, conflicting, options, "query", &.{"document"}));
+    // A genuinely different credential source owns independent capacity.
+    var literal_cfg = cfg;
+    literal_cfg.api_key = "second";
+    var literal_auth = try RequestAuthentication.init(alloc, literal_cfg, &store);
+    defer literal_auth.deinit(alloc);
+    var independent = try acquireQuota(literal_cfg, options, literal_auth.identity(literal_cfg), "", "", policy);
+    defer independent.release();
+    try std.testing.expect(independent.limiter() != held.limiter());
+    try std.testing.expectEqual(@as(f64, 2), independent.limiter().requests);
+}
+
+test "reranking runtime remote Antfly defaults match anonymous or environment authentication" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const a = std.testing.allocator;
+            const token = common_secrets.envValueOwned(a, "ANTFLY_INFERENCE_API_KEY");
+            defer if (token) |value| a.free(value);
+            if (token) |value| {
+                const expected = try std.fmt.allocPrint(a, "Bearer {s}", .{value});
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, req.header("Authorization") orelse return error.TestUnexpectedResult);
+            } else try std.testing.expect(req.header("Authorization") == null);
+        }
+    };
+    var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/rerank", .assert_request = Check.request, .respond = .{ .body = "{\"scores\":[0.9]}" } }});
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    const options = Options{ .limits = &limits };
+    const cfg = Config{ .provider = .antfly, .url = server.baseUrl(), .field = "body", .rate_limit = .{ .requests_per_minute = 1 } };
+    var auth = try RequestAuthentication.init(alloc, cfg, null);
+    defer auth.deinit(alloc);
+    try std.testing.expectEqualStrings("ANTFLY_INFERENCE_API_KEY", auth.secret.?.env_var);
+    const expected_source = if (auth.token != null)
+        credential_identity.CredentialSourceIdentity.environmentVariable("ANTFLY_INFERENCE_API_KEY")
+    else
+        credential_identity.CredentialSourceIdentity.none();
+    try std.testing.expect(auth.identity(cfg).eql(expected_source));
+    var held = try acquireQuota(cfg, options, expected_source, "", "", try provider_limits.Policy.fromConfig(cfg.rate_limit));
+    defer held.release();
+    const Run = struct {
+        fn run(a: std.mem.Allocator, http: *httpx.Client, config: Config, opts: Options, err_out: *?anyerror) !void {
+            const scores = rerankDocumentsWithOptions(a, http, config, opts, "query", &.{"document"}) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            a.free(scores);
+        }
+    };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ alloc, &client, cfg, options, &failure });
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expect(held.limiter().requests < 1);
+    try std.testing.expectEqual(@as(u32, 0), held.limiter().in_flight);
 }

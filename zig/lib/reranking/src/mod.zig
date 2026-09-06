@@ -23,7 +23,7 @@ pub const OpenApiConfig = openapi.RerankerConfig;
 pub const max_candidate_count: u32 = 1000;
 pub const vertex_max_candidate_count: u32 = 200;
 
-pub const CredentialKind = enum { none, api_key, google_adc };
+pub const CredentialKind = enum { optional_api_key, api_key, google_adc };
 
 /// Executable provider behavior resolved before retrieval begins. Keeping
 /// defaults and cost ceilings together gives validation, SDK-facing defaults,
@@ -34,6 +34,7 @@ pub const ProviderCapabilities = struct {
     max_candidate_count: u32,
     model_required: bool,
     credential_kind: CredentialKind,
+    credential_env: ?[]const u8 = null,
 };
 
 pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
@@ -43,7 +44,8 @@ pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
             .default_url = "http://127.0.0.1:8082",
             .max_candidate_count = max_candidate_count,
             .model_required = false,
-            .credential_kind = .none,
+            .credential_kind = .optional_api_key,
+            .credential_env = "ANTFLY_INFERENCE_API_KEY",
         },
         .cohere => .{
             .default_model = "rerank-english-v3.0",
@@ -51,6 +53,7 @@ pub fn providerCapabilities(provider: Provider) ProviderCapabilities {
             .max_candidate_count = max_candidate_count,
             .model_required = true,
             .credential_kind = .api_key,
+            .credential_env = "COHERE_API_KEY",
         },
         .vertex => .{
             .default_model = "semantic-ranker-default@latest",
@@ -257,7 +260,8 @@ test "external reranker models have executable defaults" {
     const antfly = providerCapabilities(.antfly);
     try std.testing.expectEqualStrings("", antfly.default_model);
     try std.testing.expectEqualStrings("http://127.0.0.1:8082", antfly.default_url);
-    try std.testing.expectEqual(CredentialKind.none, antfly.credential_kind);
+    try std.testing.expectEqual(CredentialKind.optional_api_key, antfly.credential_kind);
+    try std.testing.expectEqualStrings("ANTFLY_INFERENCE_API_KEY", antfly.credential_env.?);
     try std.testing.expect(!antfly.model_required);
 
     var cohere = try configFromOpenApi(std.testing.allocator, .{

@@ -90,3 +90,40 @@ func TestLegacyEmbedderRateLimitDoesNotAcquireNestedPolicy(t *testing.T) {
 		t.Fatalf("lost legacy settings: %s", wire)
 	}
 }
+
+func TestAntflyRerankerCredentialsAndQuotaRoundTrip(t *testing.T) {
+	for _, key := range []string{"", "literal-test-key", "${secret:reranker.key}"} {
+		t.Run(key, func(t *testing.T) {
+			cfg := RerankerConfig{}
+			if err := cfg.FromAntflyRerankerConfig(AntflyRerankerConfig{
+				Provider: "antfly", ApiKey: key, Model: "test", Url: "http://localhost:8082",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Provider = "antfly"
+			cfg.RateLimit = &RateLimitConfig{}
+			wire, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded RerankerConfig
+			if err := json.Unmarshal(wire, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			provider, err := decoded.AsAntflyRerankerConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if provider.ApiKey != key || decoded.RateLimit == nil {
+				t.Fatalf("lost credential or quota configuration: %s", wire)
+			}
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal(wire, &object); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := object["api_key"]; present != (key != "") {
+				t.Fatalf("changed credential presence: %s", wire)
+			}
+		})
+	}
+}

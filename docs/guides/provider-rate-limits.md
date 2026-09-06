@@ -36,6 +36,12 @@ even when they happen to resolve to the same token. Account-wide limits and
 coordination across replicas require an external quota authority; these limits
 do not discover a provider's quota or merge separate models' budgets.
 
+Remote Antfly reranking uses `api_key` (including secret references), falling
+back to `ANTFLY_INFERENCE_API_KEY`, for bearer authentication. The same resolved
+credential supplies its quota identity; anonymous requests share an anonymous
+scope. Embedded reranking does not resolve outbound credentials. Empty explicit
+reranker keys are rejected; omit the key to use the provider's default source.
+
 Admission happens for each HTTP attempt, including retries and redirects.
 Single and batched asset generation use the same admission scope. Bedrock
 credential refresh (STS/ECS/IMDS) is separate from model invocation and does
