@@ -58,7 +58,7 @@ const RestoreIoScope = struct {
             if (runtime.filesystemIo()) |runtime_io|
                 return .{ .alloc = alloc, .io_value = runtime_io };
         }
-        if (restore.open_options.io orelse restore.io) |shared_io| {
+        if (restore.open_options.filesystem_io orelse restore.io) |shared_io| {
             return .{ .alloc = alloc, .io_value = shared_io };
         }
         if (restore.backend_runtime != null) return error.BackendRuntimeIoUnavailable;
@@ -113,7 +113,7 @@ fn openRestoreLocation(
         },
     };
     options.required_capability = "restore.read";
-    options.io = io;
+    if (options.filesystem_io == null) options.filesystem_io = io;
     return try backups_api.openBackupLocationWithOptions(alloc, restore.location, options);
 }
 

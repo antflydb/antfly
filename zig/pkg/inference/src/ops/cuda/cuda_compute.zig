@@ -65,6 +65,7 @@ pub const CudaTensor = struct {
     quant_type: ?gguf_tensor_types.TensorType = null,
     tc_quant: ?CudaTensorCoreQuantBuffer = null,
     owns_buffer: bool = true,
+    owns_tc_quant: bool = true,
     owns_bf16_mirror: bool = true,
     owns_training_upload_host: bool = true,
     owns_shape: bool = true,
@@ -398,6 +399,8 @@ pub const CapabilityProfile = enum {
     gliner2_training,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 
 pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
@@ -410,7 +413,20 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .gliner2, .gliner2_training => .gliner2,
         .florence2 => .florence2,
         .gemma4 => .gemma4,
+        .qwen3_embedding => .qwen3_embedding,
+        .qwen3_vl_generation => .qwen3_vl_generation,
     };
+}
+
+fn qwen3VlAutomaticPrefillForProfile(profile: ?CapabilityProfile) bool {
+    return profile != null and profile.? == .qwen3_vl_generation;
+}
+
+test "Qwen3-VL automatic prefill is model scoped" {
+    try std.testing.expect(qwen3VlAutomaticPrefillForProfile(.qwen3_vl_generation));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.gemma4));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.qwen3_embedding));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(null));
 }
 
 fn kernelJitRouteCount(routes: kernels_mod.JitProductionRoutes) usize {
@@ -1216,7 +1232,10 @@ pub const RuntimeStats = struct {
     launch_norm_rms_bare: usize = 0,
     launch_norm_head_rope: usize = 0,
     launch_rope: usize = 0,
+    launch_qwen3vl_mrope: usize = 0,
+    launch_qwen3vl_vision_rope: usize = 0,
     launch_attention: usize = 0,
+    launch_qwen3vl_vision_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
     launch_attention_gqa_decode_generated: usize = 0,
     launch_attention_gqa_decode_splitk_online_sm89: usize = 0,
@@ -2216,7 +2235,7 @@ pub const CudaCompute = struct {
         }
         var ctx = try context_mod.CudaContext.initDefault();
         errdefer ctx.deinit();
-        const kernels = if (profile) |value|
+        var kernels = if (profile) |value|
             kernels_mod.KernelModule.loadWithKernelJitForScopeAndLoadContext(
                 &ctx,
                 allocator,
@@ -2235,6 +2254,7 @@ pub const CudaCompute = struct {
                 jit_config,
                 load_context,
             );
+        kernels.qwen3vl_automatic_prefill = qwen3VlAutomaticPrefillForProfile(profile);
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -2464,6 +2484,8 @@ pub const CudaCompute = struct {
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
+            .qwen3_embedding => self.kernels.hasQwen3EmbeddingPrimitives(),
+            .qwen3_vl_generation => self.kernels.hasQwen3VlGenerationPrimitives(),
         };
     }
 
@@ -3239,7 +3261,7 @@ pub const CudaCompute = struct {
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
-            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, storage.raw_bytes);
+            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var bf16_mirror = buffer_mod.DeviceBuffer{};
             errdefer bf16_mirror.free(&self.ctx);
@@ -3318,6 +3340,7 @@ pub const CudaCompute = struct {
         self: *CudaCompute,
         tensor_type: gguf_tensor_types.TensorType,
         shape: []const i64,
+        raw_device: buffer_mod.DeviceBuffer,
         raw_bytes: []const u8,
     ) !?CudaTensorCoreQuantBuffer {
         if (!cudaTensorCoreQuantRequested()) return null;
@@ -3336,6 +3359,46 @@ pub const CudaCompute = struct {
             if (!isQ4_0TcHmmaShape(in_dim, out_dim)) return null;
         } else if (!isTensorCoreQuantLinearShape(in_dim, out_dim)) {
             return null;
+        }
+
+        // Q8_0's tensor-core representation has the same byte count as GGUF,
+        // but separates each block's two-byte scale from its 32 quant bytes.
+        // Repacking on CUDA avoids the block-at-a-time host copy and duplicate
+        // H2D upload that otherwise dominate lazy Qwen3-VL projector setup.
+        // Keep the host implementation as a compatibility fallback for older
+        // artifact bundles that do not contain the optional repack symbol.
+        if (known == .Q8_0 and cudaDeviceQ8TensorCorePackEnabled()) device_pack: {
+            const row_blocks = in_dim / Q8_0_VALUES_PER_BLOCK;
+            const block_count = try checkedMul(out_dim, row_blocks);
+            const packed_bytes = try checkedMul(block_count, Q8_0_BLOCK_BYTES);
+            if (raw_bytes.len != packed_bytes) return error.InvalidShape;
+            var device = try allocDeviceBuffer(self, packed_bytes);
+            errdefer device.free(&self.ctx);
+            self.kernels.launchPackQ8_0TensorCore(&self.ctx, device, raw_device, block_count) catch |err| switch (err) {
+                error.CudaKernelUnavailable => {
+                    device.free(&self.ctx);
+                    break :device_pack;
+                },
+                else => return err,
+            };
+            self.dispatch_stats.note(
+                self.allocator,
+                .tc_pack,
+                .q8_0,
+                .tc_pack,
+                .none,
+                .none,
+                0,
+                in_dim,
+                out_dim,
+                packed_bytes,
+            );
+            return .{
+                .buffer = device,
+                .layout = .q8_0_hmma,
+                .row_blocks = row_blocks,
+                .bytes = packed_bytes,
+            };
         }
 
         const packed_quant = switch (known) {
@@ -4505,6 +4568,10 @@ fn cudaQ8TiledKernelsEnabled() bool {
     return !platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q8_TILED");
 }
 
+fn cudaDeviceQ8TensorCorePackEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DEVICE_Q8_TC_PACK", true);
+}
+
 fn cudaQ4FusionKernelsEnabled() bool {
     if (platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q4_FUSIONS")) return false;
     return platform.env.getenvBool("ANTFLY_CUDA_ENABLE_Q4_FUSIONS");
@@ -4823,10 +4890,12 @@ fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
-    if (cuda_tensor.tc_quant) |*tc_quant| {
-        var packed_buffer = tc_quant.buffer;
-        releaseDeviceBuffer(self, &packed_buffer);
-        cuda_tensor.tc_quant = null;
+    if (cuda_tensor.owns_tc_quant) {
+        if (cuda_tensor.tc_quant) |*tc_quant| {
+            var packed_buffer = tc_quant.buffer;
+            releaseDeviceBuffer(self, &packed_buffer);
+            cuda_tensor.tc_quant = null;
+        }
     }
     if (cuda_tensor.owns_bf16_mirror) releaseDeviceBuffer(self, &cuda_tensor.bf16_mirror);
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
@@ -4835,12 +4904,14 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
 }
 
 fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
-    if (cuda_tensor.tc_quant) |*tc_quant| {
-        if (tc_quant.buffer.ptr != 0) {
-            self.stats.device_free_calls += 1;
-            tc_quant.buffer.free(&self.ctx);
+    if (cuda_tensor.owns_tc_quant) {
+        if (cuda_tensor.tc_quant) |*tc_quant| {
+            if (tc_quant.buffer.ptr != 0) {
+                self.stats.device_free_calls += 1;
+                tc_quant.buffer.free(&self.ctx);
+            }
+            cuda_tensor.tc_quant = null;
         }
-        cuda_tensor.tc_quant = null;
     }
     if (cuda_tensor.owns_bf16_mirror and cuda_tensor.bf16_mirror.ptr != 0) {
         self.stats.device_free_calls += 1;
@@ -8506,6 +8577,7 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
 fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     var borrowed = tensor.*;
     borrowed.owns_buffer = false;
+    borrowed.owns_tc_quant = false;
     borrowed.owns_bf16_mirror = false;
     borrowed.owns_training_upload_host = false;
     borrowed.owns_shape = false;
@@ -11884,6 +11956,18 @@ fn ensureF32F16Bf16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
 }
 
+test "CUDA biased dense linear dtype gate accepts resident BF16 weights" {
+    var shape = [_]i64{ 3072, 1024 };
+    const weight = CudaTensor{
+        .buffer = .{},
+        .dtype = .bf16,
+        .shape = &shape,
+        .elem_count = 3072 * 1024,
+    };
+    try ensureF32F16Bf16OrQuantized(&weight);
+    try std.testing.expect(isBf16Weight(&weight));
+}
+
 fn ensureF32F16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.quant_type != null) return;
     if (tensor.dtype != .f32 and tensor.dtype != .f16) return error.UnsupportedTensorType;
@@ -12853,7 +12937,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     const weight_tensor = tensorFromCt(weight);
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
-    try ensureF32F16OrQuantized(weight_tensor);
+    try ensureF32F16Bf16OrQuantized(weight_tensor);
     try ensureF32(bias_tensor);
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) {
@@ -12889,6 +12973,14 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         const result_tensor = tensorFromCt(result);
         try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        return result;
+    }
+    if (isBf16Weight(weight_tensor)) {
+        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, result);
+        const result_tensor = tensorFromCt(result);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
         return result;
     }
 
@@ -17640,6 +17732,53 @@ fn sdpaFull(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, ba
     return try sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim);
 }
 
+fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.stats.launch_qwen3vl_vision_attention += 1;
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN3VL_VISION_ATTENTION_TC_BF16", true)) {
+        return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    const q_tensor = tensorFromCt(q_ct);
+    const k_tensor = tensorFromCt(k_ct);
+    const v_tensor = tensorFromCt(v_ct);
+    try ensureF32(q_tensor);
+    try ensureF32(k_tensor);
+    try ensureF32(v_tensor);
+    const hidden = try checkedMul(num_heads, head_dim);
+    const count = try checkedMul(try checkedMul(batch, seq_len), hidden);
+    try ensureCount(q_tensor, count);
+    try ensureCount(k_tensor, count);
+    try ensureCount(v_tensor, count);
+
+    const shape = try dupeShape(self.allocator, q_tensor.shape);
+    var shape_owned = true;
+    errdefer if (shape_owned) self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+    var device_owned = true;
+    errdefer if (device_owned) device.free(&self.ctx);
+    const launched = try self.kernels.launchQwen3VlVisionAttentionTcBf16M32N16(
+        &self.ctx,
+        device,
+        q_tensor.buffer,
+        k_tensor.buffer,
+        v_tensor.buffer,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    if (!launched) {
+        device_owned = false;
+        shape_owned = false;
+        device.free(&self.ctx);
+        self.allocator.free(shape);
+        return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
+    }
+    self.stats.launch_attention += 1;
+    return createTensor(self, device, shape, count);
+}
+
 fn causalSelfAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const q_tensor = tensorFromCt(q_ct);
@@ -19646,6 +19785,96 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn mrope(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    positions: []const u32,
+    sections: [3]u32,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (token_count == 0 or head_dim == 0 or head_dim % 2 != 0 or theta <= 0) return error.InvalidShape;
+    if (positions.len != try checkedMul(3, token_count)) return error.InvalidShape;
+    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
+    const rotary_pairs = head_dim / 2;
+    if (@as(usize, sections[0]) + @as(usize, sections[1]) + @as(usize, sections[2]) != rotary_pairs) return error.InvalidShape;
+    const total_chunks = input_tensor.elem_count / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidShape;
+    const chunks_per_token = total_chunks / token_count;
+    if (chunks_per_token == 0) return error.InvalidShape;
+
+    const positions_device = try uploadTempU32(self, positions);
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
+    defer if (rope_profile_scope) |*scope| scope.end();
+    try self.kernels.launchQwen3VlMropeF32(
+        &self.ctx,
+        device,
+        input_tensor.buffer,
+        positions_device,
+        total_chunks,
+        token_count,
+        chunks_per_token,
+        head_dim,
+        theta,
+        freq_scale,
+        sections,
+    );
+    self.stats.launch_rope += 1;
+    self.stats.launch_qwen3vl_mrope += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn visionRope(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    positions: []const u32,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (token_count == 0 or head_dim == 0 or head_dim % 4 != 0 or theta <= 0) return error.InvalidShape;
+    if (positions.len != try checkedMul(2, token_count)) return error.InvalidShape;
+    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
+    const total_chunks = input_tensor.elem_count / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidShape;
+    const heads_per_token = total_chunks / token_count;
+    if (heads_per_token == 0) return error.InvalidShape;
+
+    const positions_device = try uploadTempU32(self, positions);
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
+    defer if (rope_profile_scope) |*scope| scope.end();
+    try self.kernels.launchQwen3VlVisionRopeF32(
+        &self.ctx,
+        device,
+        input_tensor.buffer,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads_per_token,
+        head_dim,
+        theta,
+    );
+    self.stats.launch_rope += 1;
+    self.stats.launch_qwen3vl_vision_rope += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
 fn rmsNormHeadsRope(ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (cudaDisableHeadNormRopeFusion()) {
@@ -19732,8 +19961,10 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     defer self.allocator.free(query_lengths_u32);
     const position_offsets_u32 = try usizeSliceToU32(self.allocator, position_offsets);
     defer self.allocator.free(position_offsets_u32);
-    const query_lengths_device = try uploadTempU32(self, query_lengths_u32);
-    const position_offsets_device = try uploadTempU32(self, position_offsets_u32);
+    // Both arrays remain live for the same launch. Two uploadTempU32 calls
+    // would alias temp_ids_masks and the second upload would overwrite the
+    // query lengths, collapsing every rotary position to zero.
+    const params_device = try uploadTempU32Pair(self, query_lengths_u32, position_offsets_u32);
 
     const shape = try dupeShape(self.allocator, input_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -19741,7 +19972,7 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     errdefer device.free(&self.ctx);
     var rope_profile_scope = beginPrefillProfile(self, .rope, row_count);
     defer if (rope_profile_scope) |*scope| scope.end();
-    self.kernels.launchRopePerItemF32(&self.ctx, device, input_tensor.buffer, query_lengths_device, position_offsets_device, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, consecutive_pairs) catch |err| {
+    self.kernels.launchRopePerItemF32(&self.ctx, device, input_tensor.buffer, params_device.first, params_device.second, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, consecutive_pairs) catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return ropePerItemHostFallback(self, input_tensor, batch, max_seq_len, head_dim, rope_dim, theta, freq_scale, query_lengths, position_offsets, consecutive_pairs);
         }
@@ -22327,6 +22558,7 @@ const vtable = ops.ComputeBackend.VTable{
     .add = &add,
     .addBiasRowsConsume = &addBiasRowsConsume,
     .scaledDotProductAttention = &sdpa,
+    .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,
     .crossAttention = &crossAttention,
@@ -22342,6 +22574,8 @@ const vtable = ops.ComputeBackend.VTable{
     .conv1d = &conv1d,
     .conv2d = &conv2d,
     .rope = &rope,
+    .mrope = &mrope,
+    .visionRope = &visionRope,
     .ropeScaled = &ropeScaled,
     .ropePerItem = &ropePerItem,
     .runAttentionResidual = &runAttentionResidualOp,

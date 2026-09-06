@@ -922,6 +922,7 @@ pub const RuntimeEnrichmentStatusReport = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
     checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -933,6 +934,16 @@ pub const RuntimeEnrichmentStatusReport = struct {
     worker_failed: bool = false,
     worker_started: bool = false,
     stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "",
+    active_model: []const u8 = "",
+    active_backend: []const u8 = "",
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -1158,6 +1169,15 @@ pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
         }
     }
     return false;
+}
+
+pub fn runtimeEnrichmentHasInferenceDiagnostics(enrichment: RuntimeEnrichmentStatusReport) bool {
+    return !enrichment.projection_checkpoint_identity_consistent or
+        enrichment.stall_reason.len > 0 or enrichment.active_phase.len > 0 or
+        enrichment.active_model.len > 0 or enrichment.active_backend.len > 0 or
+        enrichment.active_deadline_ms != 0 or enrichment.last_progress_ms != 0 or
+        enrichment.active_progress_completed != 0 or enrichment.active_progress_total != 0 or
+        enrichment.inference_timeout_count != 0 or enrichment.inference_cancel_count != 0;
 }
 
 pub const RuntimeIndexSourceReplayStatusReport = struct {
@@ -2528,6 +2548,28 @@ test "raft voter set fingerprint is canonical and includes required local voter"
     try std.testing.expectEqual(@as(usize, 3), normalizedVoterCount(&.{ 101, 102 }, 104));
 }
 
+pub fn cloneRuntimeEnrichmentStatusReport(alloc: std.mem.Allocator, record: RuntimeEnrichmentStatusReport) !RuntimeEnrichmentStatusReport {
+    var result = record;
+    result.projection_checkpoint_status = try alloc.dupe(u8, record.projection_checkpoint_status);
+    errdefer alloc.free(result.projection_checkpoint_status);
+    result.stall_reason = try alloc.dupe(u8, record.stall_reason);
+    errdefer alloc.free(result.stall_reason);
+    result.active_phase = try alloc.dupe(u8, record.active_phase);
+    errdefer alloc.free(result.active_phase);
+    result.active_model = try alloc.dupe(u8, record.active_model);
+    errdefer alloc.free(result.active_model);
+    result.active_backend = try alloc.dupe(u8, record.active_backend);
+    return result;
+}
+
+pub fn freeRuntimeEnrichmentStatusReport(alloc: std.mem.Allocator, record: RuntimeEnrichmentStatusReport) void {
+    alloc.free(record.projection_checkpoint_status);
+    if (record.stall_reason.len > 0) alloc.free(record.stall_reason);
+    if (record.active_phase.len > 0) alloc.free(record.active_phase);
+    if (record.active_model.len > 0) alloc.free(record.active_model);
+    if (record.active_backend.len > 0) alloc.free(record.active_backend);
+}
+
 pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGroupStatusReport) !RuntimeGroupStatusReport {
     const table_name = try alloc.dupe(u8, record.table_name);
     errdefer alloc.free(table_name);
@@ -2535,11 +2577,11 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, record.freshness);
     errdefer alloc.free(freshness);
-    const projection_checkpoint_status = try alloc.dupe(u8, record.enrichment.projection_checkpoint_status);
-    errdefer alloc.free(projection_checkpoint_status);
+    const enrichment = try cloneRuntimeEnrichmentStatusReport(alloc, record.enrichment);
+    errdefer freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     const indexes = try cloneRuntimeIndexStatusReports(alloc, record.indexes);
     errdefer freeRuntimeIndexStatusReports(alloc, indexes);
-    var result: RuntimeGroupStatusReport = .{
+    const result: RuntimeGroupStatusReport = .{
         .table_id = record.table_id,
         .table_name = table_name,
         .group_id = record.group_id,
@@ -2558,7 +2600,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .disk_bytes_known = record.disk_bytes_known,
         .created_at_millis = record.created_at_millis,
         .index_count = record.index_count,
-        .enrichment = record.enrichment,
+        .enrichment = enrichment,
         .async_indexing_active = record.async_indexing_active,
         .async_startup_active = record.async_startup_active,
         .async_dense_catch_up_active = record.async_dense_catch_up_active,
@@ -2567,7 +2609,6 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .doc_set_planning = record.doc_set_planning,
         .indexes = indexes,
     };
-    result.enrichment.projection_checkpoint_status = projection_checkpoint_status;
     return result;
 }
 
@@ -2575,7 +2616,7 @@ pub fn freeRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGro
     alloc.free(record.table_name);
     alloc.free(record.source);
     alloc.free(record.freshness);
-    alloc.free(record.enrichment.projection_checkpoint_status);
+    freeRuntimeEnrichmentStatusReport(alloc, record.enrichment);
     freeRuntimeIndexStatusReports(alloc, record.indexes);
 }
 

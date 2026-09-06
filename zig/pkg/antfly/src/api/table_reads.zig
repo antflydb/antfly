@@ -18078,6 +18078,11 @@ fn applyReranker(
             documents,
         );
     const owned_scores = scores catch |err| switch (err) {
+        error.InvalidRateLimitPolicy,
+        error.ConflictingRateLimitPolicy,
+        error.ProviderTokenBudgetExceeded,
+        error.UnsupportedMediaTokenBudget,
+        error.UnsupportedLocalRateLimit,
         error.InvalidRerankerConfig,
         error.UnsupportedRerankerProvider,
         error.MissingVertexCredentials,
@@ -23715,6 +23720,7 @@ test "provisioned query db installs asset producer from indexes_json and replays
             model: []const u8,
             roles: []const []const u8,
             contents: []const []const u8,
+            _: @import("../inference/types.zig").GenerationOptions,
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;

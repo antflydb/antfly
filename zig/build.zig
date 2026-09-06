@@ -166,6 +166,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
+    "../specs/openapi/shared/provider.yaml",
     "../specs/openapi/antfly/schema.yaml",
     "../specs/openapi/antfly/indexes.yaml",
     "../specs/openapi/antfly/generated/graph_identifier.yaml",
@@ -187,6 +188,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-gliner2-native",
     "gliner2-entity-training-readiness",
     "test-finetune",
+    "test-cancellation-e2e",
     "test",
     "wasm",
 };
@@ -751,6 +753,7 @@ const AntflyRootImports = struct {
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    credentials: *std.Build.Module,
     google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
@@ -822,6 +825,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_credentials", .field = "credentials" },
         .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
@@ -1291,6 +1295,7 @@ fn addOpenApiRegenRun(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", package_name });
     codegen.addArgs(&.{ "--generate", generate_what });
+    codegen.addArgs(&.{ "--import-mapping", "../shared/provider.yaml=antfly_provider_openapi", "--import-mapping", "./provider.yaml=antfly_provider_openapi", "--import-mapping", "specs/openapi/shared/provider.yaml=antfly_provider_openapi" });
     for (import_mappings) |mapping| {
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
@@ -1309,6 +1314,7 @@ fn addOpenApiRegenStep(
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
@@ -1513,6 +1519,8 @@ pub fn build(b: *std.Build) void {
         inference_enable_system_blas,
         inference_blas_root,
     );
+    const platform_tests = addDelegatedPackageStep(b, "platform", "lib/platform", "test", "lib/platform");
+    delegated_inference_steps.inference_test.dependOn(platform_tests.step);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
@@ -1565,9 +1573,15 @@ pub fn build(b: *std.Build) void {
     const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
     const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
     const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
+    const provider_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi");
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
     const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1653,12 +1667,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const google_mod = b.createModule(.{
         .root_source_file = b.path("lib/google/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_credentials", credentials_mod);
     google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
@@ -1674,6 +1699,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
     wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -2091,6 +2117,7 @@ pub fn build(b: *std.Build) void {
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .credentials = credentials_mod,
         .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
@@ -2945,7 +2972,10 @@ pub fn build(b: *std.Build) void {
 
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
-        .filters = &.{"H2 response serialization strips connection-specific headers"},
+        .filters = &.{
+            "H2 response serialization strips connection-specific headers",
+            "HTTP streaming headers and automatic preflight preserve middleware policy",
+        },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
 
@@ -3476,11 +3506,24 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+
+    const lib_google_tests = b.addTest(.{ .root_module = google_mod });
+    const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
+    const lib_google_test_step = b.step("lib-google-test", "Run Google credential cache and transport tests");
+    lib_google_test_step.dependOn(&run_lib_google_tests.step);
+
+    const lib_managed_embedder_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"managed embedder"},
+    });
+    const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
+    const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
+    lib_managed_embedder_test_step.dependOn(&run_lib_managed_embedder_tests.step);
 
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
@@ -3658,6 +3701,7 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
+        "embedding provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3689,6 +3733,10 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder rejects unsupported execution namespaces",
+        "managed embedder separates index and artifact lookup namespaces",
+        "managed embedder validates sparse config with probe during normalization",
+        "managed embedder routes antfly without api_url to local provider",
         "managed embedder artifact backed embedding translation",
         "managed embedder binds execution to catalog semantic producer identity",
         "managed embedder reuses an executable owner for producerless artifact consumers",
@@ -3748,6 +3796,9 @@ pub fn build(b: *std.Build) void {
         "backend runtime rejects API lane leases after shutdown begins",
         "backend runtime control lane leases are isolated from API leases",
         "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime separates native operation IO from outbound network IO",
+        "backend runtime native API lane preserves filesystem errors across executors",
+        "backend runtime exposes native API filesystem IO separately",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "table runtime snapshot cache preserves active managed admission proof",
@@ -4136,6 +4187,7 @@ pub fn build(b: *std.Build) void {
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
+        "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
         "api http query budget rejection response exposes stable sort reason",
@@ -4159,6 +4211,10 @@ pub fn build(b: *std.Build) void {
         "api http server marks every proven table mutation pre-admission failure",
         "api http server retries only pre-admission public table drop failures",
         "ambiguous mutation response is explicitly non-retryable",
+        "authoritative catalog mutation boundaries reject orphaned semantic producers",
+        "stamped catalog mutations retain their commit stamp when the post-commit round fails",
+        "public index mutations preserve an explicit outcome-unknown contract",
+        "api http server exposes ambiguous index mutations without a replay signal",
         "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "api http server drop table observes metadata absence before local cleanup",
@@ -4183,6 +4239,9 @@ pub fn build(b: *std.Build) void {
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
+        "httpx retrieval SSE",
+        "retrieval agent sse",
+        "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
         "inference invocation remaining deadline rounds up and expires",
         "inference connection ABI reclaims partial responses on target failure",
@@ -4275,6 +4334,7 @@ pub fn build(b: *std.Build) void {
             "cmd.cli.backup",
             "cmd.cli.index",
             "cmd.cli.query",
+            "cmd.cli.agents",
             "cmd.cli.table",
             "cmd.cli.mod",
             "cmd.cli.data.test.mutation parser",
@@ -4312,7 +4372,7 @@ pub fn build(b: *std.Build) void {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.agents", "cmd.cli.table", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4757,7 +4817,7 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
-        "data runtime startup catch-up clears no-debt busy writer groups",
+        "data runtime startup catch-up retains deferred inspection despite clean cached status",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
@@ -4971,6 +5031,9 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db terminal enrichment marker retirement is bounded and fences stale generations",
             "storage.db.db.test.db enrichment reconfigure refreshes durable state after old worker joins",
             "storage.db.db.test.db enrichment retry makes monotonic progress across provider batches",
+            "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
+            "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
+            "asset preparation is lazy and byte bounded across retryable provider batches",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
@@ -5001,6 +5064,11 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "context-aware embedder receives the request lifetime and fails closed when absent",
+            "inference timeout policy avoids inline retry storms",
+            "inference recovery is scoped by model and backend",
+            "asset inference recovery uses one identity from plan through provider call",
+            "post-provider deadline records timeout recovery before returning",
             "document extraction reserves PDF decoder peak memory atomically",
             "PDF decoder reservation composes with every live slice owner",
             "PDF decoder credit and OCR transient allocations compose without double charging",
@@ -5046,6 +5114,8 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db computeEnrichments",
             "storage.db.db.test.db leased enrichment worker",
             "storage.db.db.test.db shared embedding enrichment",
+            "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
+            "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
             "storage.db.db.test.db dense index can reference existing",
             "storage.db.db.test.db persists shorthand chunk enrichment",
             "storage.db.db.test.db listEnrichments",
@@ -5961,6 +6031,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_connections_test_mod,
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
+            "connection filesystem probes use the explicit filesystem authority",
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
@@ -6001,7 +6072,6 @@ pub fn build(b: *std.Build) void {
             "cluster backup and restore reject duplicate table selectors",
             "backup API requests reject unknown operational fields",
             "backup manifest round trips through metadata path",
-            "backup manifest round trips through remote objectstore location",
             "current Go portable metadata envelope materializes into a verified Zig manifest",
             "current Go portable metadata parsing is allocation failure safe",
             "current Go portable cluster envelope resolves table metadata ids",
@@ -6064,7 +6134,11 @@ pub fn build(b: *std.Build) void {
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
             "owned backup runtime has a finite worker ceiling",
+            "remote backup connection retains network io instead of filesystem io",
+            "dynamic gcs credentials borrow distinct network and filesystem authorities",
+            "dynamic s3 profile and web identity retain explicit credential authorities",
             "backup staging uses configured storage authority and exclusive generations",
+            "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
         },
@@ -6744,6 +6818,15 @@ pub fn build(b: *std.Build) void {
             "readiness completion fences include every observation dimension",
             "chunked dense completion follows the physical publication target",
             "runtime status best effort overlay cannot clear readiness under apply contention",
+            "db source commit publishes exact target observation sequence",
+            "db generated downstream indexes are exact convergence targets at source commit",
+            "db chunked dense enrichment skips unchanged chunks and deletes stale chunk artifacts",
+            "db chunk deletion replay targets only matching vector sources",
+            "db chunk retirement removes dense and sparse members from generated and artifact projections",
+            "db reopened chunked dense HBC deletes stale vectors through artifact loader",
+            "embedding artifact replay deletes only the consuming vector projection",
+            "collectManagedSyncTargets includes graph index for graph artifact journal changes",
+            "visibility targets include graph replay blocked by a missing dependency",
             "index status exposes compact repair state without internal diagnostics",
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "rebuild quarantine remains an explicit failed public index status",
@@ -6755,17 +6838,60 @@ pub fn build(b: *std.Build) void {
             "live writer artifact regression keeps authoritative source deletions",
             "same owner stale serving revision cannot regress an exact incarnation",
             "owner replacement cannot regress serving facts at the same accepted source target",
+            "owner replacement cannot regress serving facts but a new non-vector incarnation may reset them",
+            "irrelevant broad replay cursor cannot regress exact index serving or coverage facts",
+            "exact additive target advance preserves serving facts while delete authority permits reduction",
+            "publication stamps order revisions and require recovery across owners",
+            "db vector status revalidates stale repair admission without a query",
+            "owner publication stamps order all index kinds independently of counts and callbacks",
+            "target and reducing watermarks commute across every callback permutation",
+            "runtime status group batches reject duplicate group ids before publication",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache batch publication is table epoch atomic",
             "table runtime snapshot cache publication fence preserves the last snapshot",
             "targeted publication fence preserves only untouched siblings during catch up",
-            "targeted publication fence waits for every overlapping owner",
+            "new targeted transition supersedes delayed controls from an older owner",
             "targeted catch up hands off same incarnation serving authority",
+            "target authority settles only after every group acknowledges the exact incarnation",
+            "target authority uses bound catalog groups instead of cached group count",
+            "resident serving acknowledgement hands off a separate coordinator cache",
+            "failed exact handoff accepts identity without fabricating serving authority",
+            "targeted publication rejects a completed stale incarnation until structural acknowledgement",
+            "settled target authority preserves the accepted incarnation against late publishers",
+            "accepted authority requires identity containment not equal cardinality",
+            "accepted group identity survives late predecessor before global handoff",
+            "catalog identity rejects a wrong first structural observation",
+            "exact target advances fence only their index incarnation",
+            "exact target advance before first status remains index scoped",
+            "exact target advance allocation failure remains fail closed",
+            "batched target advance stops after fallback invalidates cached state",
+            "per-index delta merge stays bounded across many accepted authorities",
+            "bulk target handoff reduces per-group acknowledgements linearly",
+            "incremental group acknowledgement sync is linear with one global handoff",
+            "multi-group delta allocation failure is atomic and leak free",
+            "multi-group commit uses preflight group capacity without allocation",
+            "prepared index delta commit performs no allocation",
+            "targeted authority binding is monotonic under reversed publication order",
+            "wholly stale targeted publication cannot bind unknown authority",
+            "targeted deletion hands off only after authoritative absence",
             "synthetic refresh cannot outrank targeted structural owner observation",
+            "background refresh completes exact multi-group target handoff incrementally",
+            "background refresh exact target allocation failure is atomic and leak free",
+            "background refresh completes absent multi-group target handoff incrementally",
             "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
             "runtime status cache stable absence removal retires the old table epoch",
+            "runtime status snapshots never wait for mutable cache ownership",
+            "group read payload preparation and retirement stay off the global cache mutex",
+            "blocked read payload preparation does not convoy an unrelated table",
+            "blocked table refresh preparation does not convoy unrelated publication",
+            "activation failure projection preserves every stable failure code",
+            "terminal activation failure precedes and binds its exact catalog row",
+            "terminal drop failure never acknowledges absence and remains actionable",
+            "terminal failure result distinguishes supersession and reserved storage",
+            "target invalidation retires only its table read view",
+            "lifecycle mirror failure cannot expose the retired generation",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "complete partial embeddings coverage is ready after active generation proof",
@@ -6778,6 +6904,7 @@ pub fn build(b: *std.Build) void {
             "identity-proven embeddings stay current during sibling startup catch-up",
             "opening embeddings observation requires explicit serviceability authority",
             "cached owner observation preserves serving authority without convergence authority",
+            "index-local convergence fence does not revoke a completed sibling",
             "single group synthetic publication preserves owner runtime authority",
             "target-scoped stale full text observation cannot publish old readiness",
             "targeted full text sibling remains authoritative during table catch up",
@@ -6803,11 +6930,38 @@ pub fn build(b: *std.Build) void {
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
             "api http maps missing physical index only for rebuilding lifecycle",
-            "api http missing index classification requires active rebuild evidence",
-            "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
+            "api http classifies catalog-to-serving index convergence without runtime status",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index installs exact visible config and defers lagging projection",
             "api http server create index expands schema-derived algebraic config",
+            "hosted index lifecycle callback hands exact target to persistent control plane",
+            "committed activation receipt rejects delayed drop after newer create",
+            "committed activation receipt rejects delayed create after newer drop and coalesces exact duplicate",
+            "committed activation watermark stays bounded across completed scope churn",
+            "index activation client preserves progress and transport classifications",
+            "resident activation journal rejects a delayed lower metadata epoch",
+            "resident activation requeue cannot displace a newer queued epoch",
+            "activation scheduler key includes complete storage identity",
+            "whole table reconcile cannot absorb exact resident activation",
+            "active structural key coalesces duplicate and requeues allocation free",
+            "all structural workers retain allocation-free requeue capacity during admission bursts",
+            "structural scheduler burst uses keyed coalescing and FIFO deadlines",
+            "structural scheduler capacity includes active ownership",
+            "yielded structural work advances under sustained new admission",
+            "exact activation dual worker admission failure leaves no orphan",
+            "duplicate activation cannot observe accepted before admission commits",
+            "completed activation ring evicts oldest and records completion once",
+            "discard retires unreferenced scope revisions under churn",
+            "newer completed activation makes retained older result stale",
+            "discarded newer activation cannot resurrect an older terminal result",
+            "activation progress preserves every terminal failure class",
+            "hosted index lifecycle owner retries transient activation failure",
+            "structural activation dispatch does not convoy unrelated groups",
+            "hosted index lifecycle backs off repeated stale resident observation",
+            "hosted activation revalidates topology after final resident RPC",
+            "hosted index lifecycle durable wake repairs worker admission failure",
+            "structural reconcile retains ordered constant-time repair wake membership across plan resets",
+            "startup configured indexes separate physical indexes from reserved metadata",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6888,7 +7042,7 @@ pub fn build(b: *std.Build) void {
             "targeted index reconciliation stales only the named cached index",
             "targeted repair visibility edge preserves exact sibling cache authority",
             "unrelated repair visibility edge invalidates during targeted reconciliation",
-            "repair edge after target authority release fails closed",
+            "repair edge after target release retains target authority until handoff",
             "initial build edge after target authority release preserves runtime observation",
             "fenced blocking status publication preserves accepted serving snapshot",
             "ownerless blocking publication preserves serving facts and fences convergence",
@@ -6907,6 +7061,31 @@ pub fn build(b: *std.Build) void {
             "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
+            "hosted index lifecycle callback hands exact target to persistent control plane",
+            "committed activation receipt rejects delayed drop after newer create",
+            "committed activation receipt rejects delayed create after newer drop and coalesces exact duplicate",
+            "committed activation watermark stays bounded across completed scope churn",
+            "resident activation journal rejects a delayed lower metadata epoch",
+            "resident activation requeue cannot displace a newer queued epoch",
+            "activation scheduler key includes complete storage identity",
+            "whole table reconcile cannot absorb exact resident activation",
+            "active structural key coalesces duplicate and requeues allocation free",
+            "structural scheduler burst uses keyed coalescing and FIFO deadlines",
+            "structural scheduler capacity includes active ownership",
+            "yielded structural work advances under sustained new admission",
+            "exact activation dual worker admission failure leaves no orphan",
+            "duplicate activation cannot observe accepted before admission commits",
+            "completed activation ring evicts oldest and records completion once",
+            "discard retires unreferenced scope revisions under churn",
+            "newer completed activation makes retained older result stale",
+            "discarded newer activation cannot resurrect an older terminal result",
+            "activation progress preserves every terminal failure class",
+            "hosted index lifecycle owner retries transient activation failure",
+            "structural activation dispatch does not convoy unrelated groups",
+            "hosted index lifecycle backs off repeated stale resident observation",
+            "hosted activation revalidates topology after final resident RPC",
+            "hosted index lifecycle durable wake repairs worker admission failure",
+            "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "resident DB retry preparation waits outside admission for writer publication",
             "resident DB retry preparation does not block a borrowed std.Io scheduler",
             "admitted resident DB lease never waits for an in-flight writer publication",
@@ -6972,7 +7151,13 @@ pub fn build(b: *std.Build) void {
             "status publication fence does not suppress structural work re-drive",
             "table runtime snapshot cache live publication does not starve structural refresh",
             "runtime owner retirement preserves serving snapshot and fences convergence",
+            "failed exact handoff accepts identity without fabricating serving authority",
+            "target authority uses bound catalog groups instead of cached group count",
             "synthetic refresh preserves post-fence target facts before serving handoff",
+            "read mirror allocation failure cannot attach replacement authority to predecessor identity",
+            "background refresh completes exact multi-group target handoff incrementally",
+            "background refresh exact target allocation failure is atomic and leak free",
+            "background refresh completes absent multi-group target handoff incrementally",
             "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "catching up observation preserves same-incarnation published visibility",
             "catching up observation cannot preserve a same-config replacement incarnation",
@@ -6984,6 +7169,14 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache table fences isolate unrelated invalidations",
             "runtime status cache publishes unaffected tables and retries only invalidated tables",
             "runtime status cache stable absence removal retires the old table epoch",
+            "group read payload preparation and retirement stay off the global cache mutex",
+            "blocked read payload preparation does not convoy an unrelated table",
+            "blocked table refresh preparation does not convoy unrelated publication",
+            "activation failure projection preserves every stable failure code",
+            "terminal activation failure precedes and binds its exact catalog row",
+            "terminal drop failure never acknowledges absence and remains actionable",
+            "terminal failure result distinguishes supersession and reserved storage",
+            "incremental group acknowledgement sync is linear with one global handoff",
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
@@ -7229,6 +7422,7 @@ pub fn build(b: *std.Build) void {
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
             "metadata http client rejects invalid forwarded table names before I/O",
@@ -7238,6 +7432,8 @@ pub fn build(b: *std.Build) void {
             "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
             "metadata http client does not replay unmarked table mutation rejection proof",
             "metadata http client round-trips server endpoints",
+            "stamped definition replacement falls back to v0.2 text route",
+            "definition replacement does not replay an ambiguous admitted request",
             "routed table mutation",
             "forwarded create body limit",
             "table mutation names preserve the public contract",
@@ -7245,6 +7441,7 @@ pub fn build(b: *std.Build) void {
             "raft mutation ",
             "table topology mutation ",
             "metadata http server preserves extension-owned table drop conflicts",
+            "metadata http server replaces a table definition through compare-and-swap",
             "extension lifecycle proposal",
         },
         .test_runner = .{
@@ -7300,6 +7497,8 @@ pub fn build(b: *std.Build) void {
         "coherent linearizable snapshot retries a torn capture and preserves request context",
         "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
+        "stamped definition replacement falls back to v0.2 text route",
+        "definition replacement does not replay an ambiguous admitted request",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
         "metadata http server returns 400 for invalid internal restore backup locations",
@@ -8982,7 +9181,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
             "standalone inference middleware reuses public API authentication",
-            "standalone CORS middleware enforces dynamic configuration",
+            "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
@@ -9089,6 +9288,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_google_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
@@ -9640,6 +9840,8 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
+    unit_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+    unit_test_step.dependOn(&run_lib_api_connections_tests.step);
     unit_test_step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
@@ -9815,6 +10017,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.ownership.",
             "storage.db.planning_stats.",
             "storage.db.promotion_runtime.",
+            "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
             "storage.db.resolution_handoff.",
@@ -11095,6 +11298,7 @@ pub fn build(b: *std.Build) void {
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
+    quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
@@ -11116,6 +11320,38 @@ pub fn build(b: *std.Build) void {
     }
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
+
+    const run_bge_m3_native_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_native_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "native",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_native_managed.addArgs(args);
+    const bge_m3_native_managed_step = b.step(
+        "bench-bge-m3-native-managed-e2e",
+        "Benchmark BGE-M3 native through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_native_managed_step.dependOn(&run_bge_m3_native_managed.step);
+
+    const run_bge_m3_metal_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_metal_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "metal",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_metal_managed.addArgs(args);
+    const bge_m3_metal_managed_step = b.step(
+        "bench-bge-m3-metal-managed-e2e",
+        "Benchmark BGE-M3 Metal through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_metal_managed_step.dependOn(&run_bge_m3_metal_managed.step);
 
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("bench/compat_runner.zig"),
@@ -12342,17 +12578,14 @@ pub fn build(b: *std.Build) void {
                 // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // 19.51 GB (18.17 GiB) with the platform frameworks enabled.
                 // A clean native aarch64-linux-musl production container build
                 // reached 19.89 GB (18.52 GiB) for the current production
-                // graph. Reserve 20 GiB on Linux so Zig's scheduler does
+                // graph. Reserve 20 GiB on both targets so Zig's scheduler does
                 // not discard a successfully compiled production artifact.
                 // Use the same Linux-target claim for native and cross builds;
                 // the target artifact determines the dominant codegen shape.
-                .distributed => @as(usize, if (target.result.os.tag == .macos)
-                    18
-                else
-                    20) * 1024 * 1024 * 1024,
+                .distributed => 20 * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
@@ -12413,6 +12646,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         role_mod.addImport("structlog", structlog_mod);
+        role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);

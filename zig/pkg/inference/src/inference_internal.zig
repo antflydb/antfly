@@ -16,6 +16,8 @@ const build_options = @import("build_options");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
+pub const execution_control = @import("execution_control.zig");
+pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
@@ -81,6 +83,9 @@ pub const architectures = struct {
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
     pub const bert_graph = @import("architectures/bert_graph.zig");
     pub const qwen2_graph = @import("architectures/qwen2_graph.zig");
+    pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
+    pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
+    pub const qwen3vl_reranker = @import("architectures/qwen3vl_reranker.zig");
     pub const gemma_graph = @import("architectures/gemma_graph.zig");
     pub const modern_bert_graph = @import("architectures/modern_bert_graph.zig");
     pub const layoutlmv3_graph = @import("architectures/layoutlmv3_graph.zig");

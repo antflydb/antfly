@@ -18,6 +18,7 @@ const std = @import("std");
 const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;
@@ -44,6 +45,12 @@ pub fn main(init: std.process.Init) void {
 
 fn mainImpl(init: std.process.Init) anyerror!void {
     structlog.init(.{ .formatter = .json, .level = .info });
+
+    var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (comptime role_options.role == .inference) {
+        if (try inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
+    }
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();

@@ -2930,6 +2930,10 @@ test "quant kernel metal runtime generated counter snapshot order matches C" {
     );
     try std.testing.expectEqual(
         @offsetOf(Stats, "q6_k_linear_reduce_f16_input") + @sizeOf(u64),
+        @offsetOf(Stats, "q6_k_high_row_mm_matrix_dispatches"),
+    );
+    try std.testing.expectEqual(
+        @offsetOf(Stats, "q6_k_high_row_mm_matrix_dispatches") + @sizeOf(u64),
         @offsetOf(Stats, "lm_head_q4_q6_refine_dispatches"),
     );
     try std.testing.expectEqual(

@@ -25,6 +25,7 @@ const inference = @import("types.zig");
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
@@ -35,6 +36,8 @@ pub const Provider = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+    request_timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -90,6 +93,11 @@ pub const Provider = struct {
         self.presence_penalty = presence_penalty;
     }
 
+    pub fn setRequestControl(self: *Provider, timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) void {
+        self.request_timeout_ms = timeout_ms;
+        self.cancellation = cancellation;
+    }
+
     pub fn embedder(self: *Provider) inference.Embedder {
         return .{
             .ptr = @ptrCast(self),
@@ -118,7 +126,13 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = self.cancellation,
+        });
         defer resp.deinit();
         if (!resp.ok()) return mapEmbedStatus(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
@@ -182,9 +196,15 @@ pub const Provider = struct {
             .presence_penalty = self.presence_penalty,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = self.cancellation,
+        });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();

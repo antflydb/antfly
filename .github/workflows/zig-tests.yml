@@ -361,6 +361,13 @@ jobs:
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
 
+      - name: Run Qwen model parity and promotion contract tests
+        working-directory: zig/pkg/inference
+        run: >-
+          uv run --with numpy==2.4.2 python
+          scripts/run_model_contract_tests.py
+          qwen3_embedding qwen3vl
+
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
@@ -1152,7 +1159,6 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly

@@ -4,11 +4,15 @@ description: Install Antfly, load data, and run your first queries
 prerequisites:
   - "curl and jq (for sample data)"
 difficulty: beginner
-estimatedTime: "15 min"
+estimatedTime: "45–90 min"
 tags: [getting-started, setup, quickstart]
 ---
 
 This guide walks you through installing Antfly, loading data, and running your first queries — from full-text search to semantic search to AI-powered RAG.
+
+Allow 45–90 minutes on a laptop, excluding a source build. The basic full-text
+check takes seconds; model downloads and background indexing take most of the
+time. Slower hardware may need longer timeouts.
 
 ## Install Antfly
 
@@ -89,14 +93,19 @@ stop here and use [Troubleshooting](#troubleshooting).
 
 ### Install the text embedding model
 
-Now pull BGE-M3 for high-quality text-to-text search. [Antfly
-inference](/docs/guides/inference) runs the model locally without an external
-API:
+Now pull the text embedding model used for semantic search. [Antfly
+inference](/docs/guides/inference) runs models locally without an external API:
 
 ```bash
-antfly inference pull hf:BAAI/bge-m3 --tasks embed
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
 antfly inference list
 ```
+
+Qwen3-Embedding uses an instruction for search queries but embeds indexed
+documents without it. Antfly applies that distinction automatically: index and
+artifact writes use the document role, while semantic searches use the query
+role. The Q8_0 bundle runs on native CPU on Linux and macOS, and uses Metal
+automatically when it is available.
 
 If the running standalone process does not detect the newly installed model,
 restart it once before creating the embeddings index.
@@ -142,7 +151,7 @@ antfly table create --table wikipedia \
     "template": "{{title}} {{body}}",
     "embedder": {
       "provider": "antfly",
-      "model": "BAAI/bge-m3"
+      "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
     },
     "chunker": {
       "provider": "antfly",
@@ -166,7 +175,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
         "template": "{{title}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "BAAI/bge-m3"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -196,7 +205,7 @@ await client.tables.create('wikipedia', {
       template: '{{title}} {{body}}',
       embedder: {
         provider: 'antfly',
-        model: 'BAAI/bge-m3',
+        model: 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
       },
       chunker: {
         provider: 'antfly',
@@ -222,7 +231,7 @@ client.create_table(
             'template': '{{title}} {{body}}',
             'embedder': {
                 'provider': 'antfly',
-                'model': 'BAAI/bge-m3',
+                'model': 'Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1',
             },
             'chunker': {
                 'provider': 'antfly',
@@ -252,8 +261,8 @@ if err != nil {
 	log.Fatal(err)
 }
 
-embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
-	Model: "BAAI/bge-m3",
+embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
+	Model: "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
 })
 if err != nil { log.Fatal(err) }
 
@@ -291,7 +300,7 @@ client.create_table("wikipedia", &json!({
             "template": "{{title}} {{body}}",
             "embedder": {
                 "provider": "antfly",
-                "model": "BAAI/bge-m3"
+                "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
             },
             "chunker": {
                 "provider": "antfly",
@@ -337,52 +346,26 @@ that need to own ingestion should use the SDK [Batch Operations](/docs/api/data-
 workflow with bounded batches and retries.
 </Callout>
 
-Embedding generation runs in the background. Managed embeddings indexes use
-progressive publication by default, so a safely checkpointed partial generation
-can serve semantic queries while source coverage continues in the background.
-To continue once 10% of the source documents have durable, query-visible
-embedding outcomes, run:
+Embedding generation runs in the background. Wait until 10% of documents
+have searchable embeddings; skipped documents are excluded:
 
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
   --until source-covered=10% \
-  --timeout 20m
+  --timeout 45m
 ```
 
-Continue as soon as this command succeeds. The examples below search a meaningful,
-safely published slice of the corpus while the remaining documents continue
-indexing, so result counts and rankings can improve as coverage grows. When an
-application requires a fixed, fully covered corpus, use `--until complete` to
-wait for the stronger `ready` state instead.
+Continue when this succeeds. Results improve as the remaining documents are
+indexed. To wait for the full corpus instead, use `--until complete`.
 
-Use `antfly index list --table wikipedia` for a compact progress summary, or
-add `--output json` for the complete diagnostic payload.
-Model startup and time-to-first-result depend on hardware. The wait command
-reports bounded periodic progress and enforces the timeout; do not continue if
-it times out before the index reaches 10% source coverage. Use `publication_policy:
-atomic` when a replacement generation must remain unavailable until fully built
-and validated. See [Troubleshooting](#troubleshooting) below.
+Use `antfly index list --table wikipedia` to check progress. Timing depends on
+hardware; if the wait times out, see [Troubleshooting](#troubleshooting) before
+continuing.
 
 <Callout type="info">
-For chunked indexes, `INDEXED` and `SEARCHABLE` describe
-physical chunks or vector records, not source documents, so they can exceed
-10,000. Embeddings status keeps these dimensions separate: `source_coverage`
-reports durable source outcomes, `searchable_vectors` reports query-visible
-physical entries, and `activity` reports incarnation-scoped chunk and embedding
-work. Activity explains current speed but never changes readiness.
-Its phase is reported by the worker that owns preparation, embedding,
-publication, or retry work; incomplete coverage alone never implies
-`embedding`. If the metadata leader has not received a fresh owner heartbeat,
-`activity` is `null` and the CLI reports activity as unavailable. A transient
-status-sampling miss retains the last matching owner sample for up to 90 seconds,
-so normal lifecycle contention does not make progress flicker.
-Status reads never inspect or wait for the resident writer. If a newly accepted
-target has not yet been observed by its owner, the last published incarnation
-and searchable counts remain available and `queryable_partial`; only
-`complete` gains a `target_observation` blocker until the next publication.
-`queryable_partial` means the active generation is safe to query but incomplete;
-`ready` means coverage is complete.
+Articles can produce multiple chunks, so `SEARCHABLE` may exceed the document
+count. `avg_embeddings` measures chunk embeddings per second, not documents.
 </Callout>
 
 ## Search
@@ -615,17 +598,21 @@ You've loaded 10,000 documents and run your first full-text and semantic searche
 
 ## Hybrid Search & Reranking
 
-Hybrid search combines full-text and semantic search using Reciprocal Rank Fusion (RRF). Adding a reranker further improves relevance by re-scoring results with a cross-encoder model.
+Hybrid search combines full-text and semantic search using Reciprocal Rank Fusion (RRF). The Qwen3 text reranker jointly scores each query-document pair to improve the ordering of those candidates.
 
 Pull the reranker model:
 
 ```bash
-antfly inference pull --tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 ```
 
 <Callout type="info">
 If Antfly doesn't detect the new model, restart `antfly standalone`.
 </Callout>
+
+The Q8 model is about 610 MiB and runs on native CPU or Metal. The first query
+loads it; reranking full articles can take tens of seconds, especially while
+indexing continues.
 
 <Tabs defaultValue="cli">
   <TabsList>
@@ -647,7 +634,7 @@ antfly query --table wikipedia \
   --limit 10 \
   --reranker '{
       "provider": "antfly",
-      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
       "field": "body"
     }' \
   --pruner '{"min_score_ratio": 0.01}'
@@ -667,7 +654,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
     "limit": 10,
     "reranker": {
       "provider": "antfly",
-      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
       "field": "body"
     },
     "pruner": {"min_score_ratio": 0.01}
@@ -686,7 +673,7 @@ const results = await client.query({
   limit: 10,
   reranker: {
     provider: 'antfly',
-    model: 'cross-encoder/ms-marco-MiniLM-L6-v2',
+    model: 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
     field: 'body',
   },
   pruner: { min_score_ratio: 0.01 },
@@ -705,7 +692,7 @@ results = client.query(
     limit=10,
     reranker={
         'provider': 'antfly',
-        'model': 'cross-encoder/ms-marco-MiniLM-L6-v2',
+        'model': 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
         'field': 'body',
     },
     pruner={'min_score_ratio': 0.01},
@@ -716,7 +703,7 @@ results = client.query(
   <TabsContent value="go">
 ```go
 reranker, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
-	Model: "cross-encoder/ms-marco-MiniLM-L6-v2",
+	Model: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
 })
 if err != nil { log.Fatal(err) }
 reranker.Field = "body"
@@ -751,7 +738,7 @@ let resp = client
         limit: Some(10),
         reranker: Some(json!({
             "provider": "antfly",
-            "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+            "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
             "field": "body"
         })),
         pruner: Some(json!({"min_score_ratio": 0.01})),
@@ -764,7 +751,7 @@ let resp = client
 
 <Callout type="info">
 **Reranking vs Pruning:**
-- **Reranking** uses a cross-encoder model to re-score results based on query-document relevance. It improves ordering but keeps the same number of results.
+- **Reranking** re-scores each query-document pair for relevance. It improves ordering but keeps the same number of results.
 - **Pruning** filters out low-relevance results based on score quality. Use `min_score_ratio` to keep only results scoring at least N% of the top result, or `max_score_gap_percent` to detect "elbows" in score distribution.
 </Callout>
 
@@ -907,13 +894,14 @@ Antfly probes the selected embedding model during creation and stores its
 dimension in the normalized index definition. Specify `dimension` only when
 you also want creation to verify an explicit expected size.
 
-Adding an index to a table with existing data triggers background embedding generation. The `partial` coverage policy treats articles without a `thumbnail_url` as intentional skips while still requiring every article to reach a durable outcome. Wait until the image index has durable, query-visible embeddings for 10% of the source corpus before continuing:
+Adding an index starts background image indexing. Articles without thumbnails
+are skipped; wait for 250 searchable images before continuing.
 
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
-  --until source-covered=10% \
-  --timeout 20m
+  --until searchable-artifacts=250 \
+  --timeout 45m
 ```
 
 Use `antfly index list --table wikipedia` to monitor detailed progress.
@@ -1021,22 +1009,28 @@ Multimodal image search responds best to concrete visual descriptions ("red spor
 
 ## RAG (Retrieval-Augmented Generation)
 
-Combine search with LLM-powered classification and generation using the retrieval agent.
+Combine search with local LLM answer generation using the retrieval agent.
 
 <Steps>
 ### Pull a generation model
 
 ```bash
-antfly inference pull ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_K_M
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
+  --tasks generate \
+  --projector auto
 ```
 
 <Callout type="info">
-`ggml-org/gemma-4-E4B-it-GGUF` runs locally via Antfly inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. The generator config caps output at 128 tokens for predictable local latency. For alternative providers, see the [next step](#rag-with-alternative-providers).
+`--projector auto` includes image and audio support. Try a local file with
+`antfly inference generate <model-dir> "Describe this input" --image ./photo.jpg`
+or `--audio ./clip.wav`. Use `--projector none` for a smaller, text-only download.
+The RAG example below uses text and limits output to 128 tokens.
+For other providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
-### Classify and generate
+### Generate an answer
 
-Use the Gemma model to classify a query and generate an answer from search results:
+Use Gemma to generate an answer from search results:
 
 <Tabs defaultValue="cli">
   <TabsList>
@@ -1057,7 +1051,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --reranker '{
       "provider": "antfly",
-      "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
       "field": "body"
     }' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
@@ -1067,15 +1061,18 @@ antfly agents retrieval --table wikipedia \
     "max_tokens": 128
   }' \
   --max-context-tokens 512 \
-  --classify --reasoning --generate --followup
+  --streaming \
+  --generate
 ```
   </TabsContent>
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
+curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
   -d '{
+    "query": "What are the major events in Korean history?",
     "queries": [{
       "table": "wikipedia",
       "semantic_search": "What are the major events in Korean history?",
@@ -1084,7 +1081,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
       "limit": 5,
       "reranker": {
         "provider": "antfly",
-        "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
         "field": "body"
       },
       "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
@@ -1095,10 +1092,10 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
       "max_tokens": 128
     },
     "max_context_tokens": 512,
-    "classify": true,
-    "reasoning": true,
-    "generate": true,
-    "followup": true
+    "stream": true,
+    "steps": {
+      "generation": {"enabled": true}
+    }
   }'
 ```
   </TabsContent>
@@ -1106,6 +1103,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   <TabsContent value="typescript">
 ```typescript
 const result = await client.agents.retrieval({
+  query: 'What are the major events in Korean history?',
   queries: [{
     table: 'wikipedia',
     semantic_search: 'What are the major events in Korean history?',
@@ -1114,7 +1112,7 @@ const result = await client.agents.retrieval({
     limit: 5,
     reranker: {
       provider: 'antfly',
-      model: 'cross-encoder/ms-marco-MiniLM-L6-v2',
+      model: 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
       field: 'body',
     },
     pruner: { min_score_ratio: 0.6, max_score_gap_percent: 40 },
@@ -1125,10 +1123,10 @@ const result = await client.agents.retrieval({
     max_tokens: 128,
   },
   max_context_tokens: 512,
-  classify: true,
-  reasoning: true,
-  generate: true,
-  followup: true,
+  stream: false,
+  steps: {
+    generation: { enabled: true },
+  },
 });
 ```
   </TabsContent>
@@ -1136,6 +1134,7 @@ const result = await client.agents.retrieval({
   <TabsContent value="python">
 ```python
 result = client.agents.retrieval(
+    query='What are the major events in Korean history?',
     queries=[{
         'table': 'wikipedia',
         'semantic_search': 'What are the major events in Korean history?',
@@ -1144,7 +1143,7 @@ result = client.agents.retrieval(
         'limit': 5,
         'reranker': {
             'provider': 'antfly',
-            'model': 'cross-encoder/ms-marco-MiniLM-L6-v2',
+            'model': 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
             'field': 'body',
         },
         'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
@@ -1155,10 +1154,10 @@ result = client.agents.retrieval(
         'max_tokens': 128,
     },
     max_context_tokens=512,
-    classify=True,
-    reasoning=True,
-    generate=True,
-    followup=True,
+    stream=False,
+    steps={
+        'generation': {'enabled': True},
+    },
 )
 ```
   </TabsContent>
@@ -1172,6 +1171,7 @@ generator, err := antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
 if err != nil { log.Fatal(err) }
 fields := []string{"title", "body"}
 result, err := client.RetrievalAgent(ctx, antfly.RetrievalAgentRequest{
+	Query: "What are the major events in Korean history?",
 	Queries: []antfly.RetrievalQueryRequest{{
 		Table:          "wikipedia",
 		SemanticSearch: "What are the major events in Korean history?",
@@ -1187,9 +1187,7 @@ result, err := client.RetrievalAgent(ctx, antfly.RetrievalAgentRequest{
 	Generator:        *generator,
 	MaxContextTokens: 512,
 	Steps: antfly.RetrievalAgentSteps{
-		Classification: antfly.ClassificationStepConfig{Enabled: true, WithReasoning: true},
 		Generation:     antfly.GenerationStepConfig{Enabled: true},
-		Followup:       antfly.FollowupStepConfig{Enabled: true},
 	},
 })
 if err != nil { log.Fatal(err) }
@@ -1201,6 +1199,7 @@ fmt.Printf("%+v\n", result)
 ```rust
 let resp = client
     .retrieval_agent(&json!({
+        "query": "What are the major events in Korean history?",
         "queries": [{
             "table": "wikipedia",
             "semantic_search": "What are the major events in Korean history?",
@@ -1209,7 +1208,7 @@ let resp = client
             "limit": 5,
             "reranker": {
                 "provider": "antfly",
-                "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+                "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
                 "field": "body"
             },
             "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
@@ -1220,17 +1219,22 @@ let resp = client
             "max_tokens": 128
         },
         "max_context_tokens": 512,
-        "classify": true,
-        "reasoning": true,
-        "generate": true,
-        "followup": true
+        "stream": false,
+        "steps": {
+            "generation": {"enabled": true}
+        }
     }))
     .await?;
 ```
   </TabsContent>
 </Tabs>
 
-This command searches for semantically similar articles, reranks and prunes results for quality, classifies the query, generates a capped answer with reasoning, and suggests follow-up questions — all using the local Gemma model.
+The CLI and cURL commands stream Server-Sent Events as each step completes. A
+terminal `event: done` marks success; an error or incomplete stream makes the
+CLI exit nonzero. The SDK examples request structured JSON instead. Each
+example searches for semantically similar articles, reranks and prunes results
+with Qwen3, and uses Gemma to generate a capped answer from the retrieved context.
+The example keeps the original retrieval query and requests only an answer.
 
 <Callout type="tip">
 **Pruning for RAG:** Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
@@ -1260,7 +1264,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \
   --max-context-tokens 2048 \
-  --classify --reasoning --generate --followup
+  --generate
 ```
   </TabsContent>
 
@@ -1277,7 +1281,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --generator '{"provider": "openai", "model": "gpt-4.1-mini"}' \
   --max-context-tokens 2048 \
-  --classify --reasoning --generate --followup
+  --generate
 ```
   </TabsContent>
 
@@ -1294,7 +1298,7 @@ antfly agents retrieval --table wikipedia \
   --limit 5 \
   --generator '{"provider": "ollama", "model": "gemma3:4b-it-qat"}' \
   --max-context-tokens 2048 \
-  --classify --reasoning --generate --followup
+  --generate
 ```
   </TabsContent>
 
@@ -1386,9 +1390,9 @@ Pull the missing model again, or pass the intended directory explicitly with
 ### An index remains pending or `index wait` times out
 
 Do not continue to semantic, image, or RAG steps until the relevant index has
-reached the guide's source-coverage threshold. `queryable_partial` is safe to
+reached the guide's readiness threshold. `queryable_partial` is safe to
 use while coverage grows, but an empty published generation cannot produce
-results. If `index wait --until source-covered=10%` times out, capture the full
+results. If `index wait` times out, capture the full
 status and recent watchdog messages:
 
 ```bash

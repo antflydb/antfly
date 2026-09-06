@@ -1003,12 +1003,20 @@ pub const Context = struct {
             try delegate.start(delegate.ptr, status_code);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
+        // Middleware has already established response policy (e.g. CORS).
+        // Copy it before committing headers, then let the transport own SSE
+        // content type and framing. Never reuse a buffered Content-Length.
+        var headers = try self.response.headers.clone(self.allocator);
+        defer headers.deinit();
+        _ = headers.remove(HeaderName.CONTENT_LENGTH);
+        _ = headers.remove(HeaderName.TRANSFER_ENCODING);
+        try headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {
-            // HTTP/2 path — delegate to existing streamH2
-            const h2w = try self.streamH2(status_code, &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-                .{ .name = "cache-control", .value = "no-cache" },
-            });
+            var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+            defer extra.deinit(self.allocator);
+            try appendH2ResponseHeaders(self.allocator, &extra, &headers);
+            const h2w = try self.streamH2(status_code, extra.items);
             return .{ .h1_sock = null, .h2_writer = h2w };
         }
 
@@ -1018,8 +1026,9 @@ pub const Context = struct {
         // Build and send headers-only response
         var resp = Response.init(self.allocator, status_code);
         defer resp.deinit();
-        try resp.headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
-        try resp.headers.set(HeaderName.CACHE_CONTROL, "no-cache");
+        resp.headers.deinit();
+        resp.headers = headers;
+        headers = Headers.init(self.allocator);
         try resp.headers.set(HeaderName.CONNECTION, "keep-alive");
         try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
 
@@ -1848,22 +1857,22 @@ pub const Server = struct {
 
         var allow_methods: [16]types.Method = undefined;
         const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
-        if (req.method == .OPTIONS and allow_count > 0) {
-            var response = Response.init(self.allocator, 204);
-            errdefer response.deinit();
-            try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            return .{ .response = response };
-        }
         if (allow_count > 0) {
-            var response = Response.init(self.allocator, 405);
-            errdefer response.deinit();
-            try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            return .{ .response = response };
+            return .{ .response = try self.executeMiddleware(ctx, Handler.bind(self, automaticMethodResponse)) };
         }
         if (self.global_handler) |global_handler| {
             return .{ .response = try self.executeMiddleware(ctx, global_handler) };
         }
         return .{ .status = 404 };
+    }
+
+    /// Automatic OPTIONS/405 responses are application responses too. Run
+    /// them through middleware so preflight authorization cannot be bypassed.
+    fn automaticMethodResponse(self: *Self, ctx: *Context) !Response {
+        var methods: [16]types.Method = undefined;
+        const count = self.router.allowedMethods(ctx.request.uri.path, &methods);
+        try self.setAllowHeader(&ctx.response.headers, methods[0..count]);
+        return ctx.status(if (ctx.request.method == .OPTIONS) 204 else 405).response.build();
     }
 
     /// Handles a single connection.
@@ -2884,14 +2893,15 @@ pub const Server = struct {
             // 204 for OPTIONS, 404 otherwise.
             var allow_methods: [16]types.Method = undefined;
             const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
-            if (req.method == .OPTIONS and allow_count > 0) {
-                response = Response.init(self.allocator, 204);
-                errdefer response.deinit();
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            } else if (allow_count > 0) {
-                response = Response.init(self.allocator, 405);
-                errdefer response.deinit();
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+            if (allow_count > 0) {
+                response = self.executeMiddleware(&ctx, Handler.bind(self, automaticMethodResponse)) catch |err| {
+                    const status = self.routeErrorResponseStatus(err) orelse {
+                        cancelH2Stream(h2, sock, stream_id);
+                        return;
+                    };
+                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    return;
+                };
             } else if (self.global_handler) |global_handler| {
                 response = self.executeMiddleware(&ctx, global_handler) catch |err| {
                     const status = self.routeErrorResponseStatus(err) orelse {
@@ -4024,6 +4034,120 @@ test "H1 oversized content length returns 413 before handler admission" {
         try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 200 ") != null);
         try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 413 ") != null);
         try std.testing.expectEqual(@as(usize, 1), State.handled.load(.acquire));
+    }
+}
+
+test "HTTP streaming headers and automatic preflight preserve middleware policy" {
+    const State = struct {
+        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8) !Response {
+            if (!http2) {
+                var client = @import("../client/client.zig").Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .uniform(5000) });
+                defer client.deinit();
+                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/stream", .{address.getPort()});
+                defer alloc.free(url);
+                const headers = [_][2][]const u8{.{ "Origin", origin orelse "" }};
+                return client.request(method, url, .{ .headers = if (origin != null) &headers else null });
+            }
+            // A synchronous frame peer keeps this server regression independent
+            // of the production client's pooled H2 receive-fiber lifecycle.
+            var socket = try Socket.connect(address, io);
+            defer socket.close();
+            try socket.setRecvTimeout(5000);
+            try socket.setSendTimeout(5000);
+            var h2 = H2Connection.initClient(alloc, io);
+            defer h2.deinit();
+            try h2.sendClientPreface(&socket);
+            const stream = try h2.stream_manager.createStream();
+            const extra = [_]hpack.HeaderEntry{.{ .name = "origin", .value = origin orelse "" }};
+            const headers = try H2Connection.buildRequestHeaders(method.toString(), "/stream", "http", "localhost", if (origin != null) &extra else &.{}, alloc);
+            defer alloc.free(headers);
+            try h2.sendHeaders(&socket, stream.id, headers, true);
+            while (!stream.completed) _ = try h2.processOneFrame(&socket, &socket);
+            if (stream.stream_error) |err| return err;
+            var response = Response.init(alloc, 200);
+            errdefer response.deinit();
+            for (stream.request_headers orelse return error.MissingHeaders) |header| {
+                if (mem.eql(u8, header.name, ":status")) {
+                    response.status = @TypeOf(response.status).fromCode(try std.fmt.parseInt(u16, header.value, 10));
+                } else {
+                    try response.headers.append(header.name, header.value);
+                }
+            }
+            response.body = try alloc.dupe(u8, stream.data_buf.items);
+            response.body_owned = true;
+            return response;
+        }
+
+        fn policy(ctx: *Context, next: *middleware_mod.Next) anyerror!Response {
+            const origin = ctx.header("Origin") orelse return next.call(ctx);
+            if (!mem.eql(u8, origin, "https://allowed.example")) return ctx.status(403).text("denied");
+            try ctx.setHeader("Access-Control-Allow-Origin", origin);
+            try ctx.setHeader("Access-Control-Allow-Credentials", "true");
+            try ctx.setHeader("Vary", "Origin");
+            try ctx.setHeader("X-Request-ID", "stream-request");
+            if (ctx.request.method == .OPTIONS) {
+                try ctx.setHeader("Access-Control-Allow-Methods", "GET");
+                return ctx.status(204).text("");
+            }
+            return next.call(ctx);
+        }
+        fn handler(ctx: *Context) anyerror!Response {
+            // Streaming owns framing even if a handler used a JSON builder
+            // before selecting SSE. Repeated headers must remain repeated.
+            try ctx.setHeader("Content-Length", "999");
+            try ctx.setHeader("Content-Type", "application/json");
+            try ctx.response.headers.append("Set-Cookie", "one=1");
+            try ctx.response.headers.append("Set-Cookie", "two=2");
+            var writer = try ctx.streamResponse(200);
+            try writer.writeEvent("done", "{}");
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(alloc, io_impl.io(), .{ .host = "127.0.0.1", .port = 0, .h1_disconnect_cancellation = .disabled });
+    defer server.deinit();
+    try server.use(.{ .name = "policy", .handler = State.policy });
+    try server.get("/stream", State.handler);
+    try server.bind();
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("header test listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    for ([_]bool{ false, true }) |http2| {
+        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example");
+        defer stream.deinit();
+        try std.testing.expectEqualStrings("https://allowed.example", stream.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("true", stream.headers.get("Access-Control-Allow-Credentials").?);
+        try std.testing.expectEqualStrings("Origin", stream.headers.get("Vary").?);
+        try std.testing.expectEqualStrings("stream-request", stream.headers.get("X-Request-ID").?);
+        try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", stream.contentType().?);
+        try std.testing.expectEqualStrings("event: done\ndata: {}\n\n", stream.body.?);
+        var cookies: usize = 0;
+        for (stream.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Set-Cookie")) cookies += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), cookies);
+        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example");
+        defer preflight.deinit();
+        try std.testing.expectEqual(@as(u16, 204), preflight.status.code);
+        try std.testing.expectEqualStrings("GET", preflight.headers.get("Access-Control-Allow-Methods").?);
+        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example");
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+        try std.testing.expect(denied.headers.get("Access-Control-Allow-Origin") == null);
+        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null);
+        defer automatic.deinit();
+        try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
+        try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);
     }
 }
 

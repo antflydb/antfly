@@ -2269,6 +2269,32 @@ pub const TTLCleanupStats = struct {
     last_acquired_ms: u64 = 0,
 };
 
+pub fn InlineStatusText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        len: u16 = 0,
+
+        pub fn init(value: []const u8) @This() {
+            var result: @This() = .{};
+            const copy_len = @min(value.len, capacity);
+            @memcpy(result.bytes[0..copy_len], value[0..copy_len]);
+            result.len = @intCast(copy_len);
+            return result;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.slice());
+        }
+    };
+}
+
+pub const EnrichmentActiveModel = InlineStatusText(256);
+pub const EnrichmentActiveBackend = InlineStatusText(32);
+
 pub const EnrichmentStats = struct {
     enabled: bool = false,
     lease_owned: bool = true,
@@ -2295,6 +2321,16 @@ pub const EnrichmentStats = struct {
     worker_failed: bool = false,
     worker_started: bool = false,
     stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "idle",
+    active_model: EnrichmentActiveModel = .{},
+    active_backend: EnrichmentActiveBackend = .{},
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -3132,6 +3168,22 @@ pub const DBIndexStats = struct {
     // continuity, this proof can retain authority across table-level opening
     // metadata and applies to every index kind. It is never persisted.
     runtime_observation_targeted_sibling: bool = false,
+    // Cache-local convergence authority for this exact index incarnation.
+    // Ordinary target advances clear only the affected identities; an
+    // unknown-scope advance is represented by the enclosing table metadata.
+    // This is deliberately independent of serving authority and is never
+    // persisted or exposed as a separate public field.
+    runtime_target_observation_complete: bool = true,
+    // Replay witnesses belonging to retained serving/coverage payloads, not a
+    // newer progress overlay. Live owners issue these with publication stamps;
+    // incomplete/status-only observations may leave them unknown. Neither
+    // metadata relabeling nor cloning may manufacture a witness.
+    runtime_serving_applied_sequence: ?u64 = null,
+    runtime_coverage_applied_sequence: ?u64 = null,
+    // Owner-issued local payload authority. Null means unknown, not revision
+    // zero. These are never synthesized by metadata overlays or serialized.
+    serving_publication: ?@import("publication.zig").Stamp = null,
+    coverage_publication: ?@import("publication.zig").Stamp = null,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -3148,9 +3200,15 @@ pub const DBIndexStats = struct {
     // Authoritative O(1) projection of the resident search-admission gate for
     // this exact dense incarnation. Zero members is still a valid snapshot.
     serving_snapshot_ready: bool = false,
-    // Process-local immutable serving revision. It is ordered only when the
-    // enclosing DBStats observations have the same nonzero runtime_owner_id.
+    // Dense storage's process-local immutable serving revision. Zero is
+    // unavailable, not a comparable revision for another index kind. Generic
+    // owner-observation ordering uses serving_publication instead.
     serving_snapshot_revision: u64 = 0,
+    // Process-local owner of the immutable serving snapshot above. This is
+    // index-scoped because targeted structural observations can retain a
+    // sibling's serving payload while the enclosing DBStats comes from a
+    // different temporary DB owner.
+    serving_snapshot_owner_id: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -3805,55 +3863,57 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
+pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    alloc.free(item.name);
+    for (item.source_replay) |source| alloc.free(source.artifact_name);
+    if (item.source_replay.len > 0) alloc.free(item.source_replay);
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
+    if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
+    if (item.algebraic_last_error_reason) |value| alloc.free(value);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+    if (item.algebraic_planner_last_decision) |value| alloc.free(value);
+    if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
+    if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
+    if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
+    if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+    if (item.algebraic_top_candidate) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_active_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    for (item.algebraic_candidates) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+    for (item.algebraic_candidate_decision_history) |entry| {
+        alloc.free(entry.recommendation);
+        alloc.free(entry.materialization_id);
+        alloc.free(entry.lifecycle);
+        alloc.free(entry.previous_decision);
+        alloc.free(entry.decision);
+    }
+    if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
+    for (item.algebraic_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
-    for (stats.indexes) |item| {
-        alloc.free(item.name);
-        for (item.source_replay) |source| alloc.free(source.artifact_name);
-        if (item.source_replay.len > 0) alloc.free(item.source_replay);
-        if (item.load_error) |value| alloc.free(value);
-        if (item.index_repair_last_error) |value| alloc.free(value);
-        if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-        if (item.algebraic_last_error_reason) |value| alloc.free(value);
-        if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-        if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-        if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-        if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-        if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-        if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-        if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-        if (item.algebraic_top_candidate) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_active_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        for (item.algebraic_candidates) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-        for (item.algebraic_candidate_decision_history) |entry| {
-            alloc.free(entry.recommendation);
-            alloc.free(entry.materialization_id);
-            alloc.free(entry.lifecycle);
-            alloc.free(entry.previous_decision);
-            alloc.free(entry.decision);
-        }
-        if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-        for (item.algebraic_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-    }
+    for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
 }

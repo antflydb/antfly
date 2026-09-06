@@ -15,8 +15,46 @@
 """Fast regression tests for the standalone inference test harness."""
 
 import pytest
+import requests
+from types import SimpleNamespace
 
+import conftest as e2e_conftest
+import helpers
 import test_standalone as standalone
+
+
+@pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])
+def test_storage_preflight_matches_absolute_and_fractional_safety_floor(
+    monkeypatch, tmp_path, total
+):
+    floor = max(1024**3, total // 20)
+    required = floor + 256 * 1024**2
+    observation = SimpleNamespace(total=total, free=required - 1)
+    paths = []
+
+    def disk_usage(path):
+        paths.append(path)
+        return observation
+
+    monkeypatch.setattr(e2e_conftest.shutil, "disk_usage", disk_usage)
+    with pytest.raises(
+        RuntimeError, match="Insufficient E2E storage headroom"
+    ) as error:
+        e2e_conftest.require_standalone_storage_headroom(tmp_path)
+    assert f"safety_floor_bytes={floor}" in str(error.value)
+    assert "TMPDIR" in str(error.value)
+    observation.free = required
+    e2e_conftest.require_standalone_storage_headroom(tmp_path)
+    assert paths == [tmp_path, tmp_path]
+
+
+def test_storage_preflight_does_not_hide_observation_failure(monkeypatch, tmp_path):
+    def unavailable(_):
+        raise OSError("capacity observation failed")
+
+    monkeypatch.setattr(e2e_conftest.shutil, "disk_usage", unavailable)
+    with pytest.raises(OSError, match="capacity observation failed"):
+        e2e_conftest.require_standalone_storage_headroom(tmp_path)
 
 
 def test_model_preflight_recognizes_atomic_variant_publication(tmp_path):
@@ -133,3 +171,71 @@ def test_cleanup_failure_is_primary_after_successful_test():
         standalone._finish_standalone_server(server, None)
 
     assert server.stop_calls == 1
+
+
+def test_request_failure_attaches_one_bounded_server_log_tail():
+    logs = "old-log-entry\n" + ("x" * 25_000) + "\nactionable-tail"
+
+    class Server:
+        def debug_logs(self) -> str:
+            return logs
+
+    original = requests.HTTPError(
+        "503 Service Unavailable body=index_rebuilding\n"
+        "server logs:\nprevious-unbounded-copy"
+    )
+
+    with pytest.raises(requests.HTTPError) as raised:
+        e2e_conftest.raise_request_error_with_logs(original, Server())
+
+    message = str(raised.value)
+    assert raised.value is original
+    assert message.count("server logs:") == 1
+    assert "previous-unbounded-copy" not in message
+    assert "old-log-entry" not in message
+    omitted = len(logs) - e2e_conftest.FAILURE_LOG_TAIL_LIMIT
+    assert f"omitted {omitted} earlier server-log characters" in message
+    assert message.endswith("actionable-tail")
+    assert raised.value.__cause__ is None
+
+
+def _http_error(status: int, body: bytes, **headers: str) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    response._content = body
+    response.headers.update(headers)
+    return requests.HTTPError(response=response)
+
+
+def test_wait_until_retries_structured_retryable_service_unavailable():
+    calls = 0
+
+    def probe() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _http_error(
+                503,
+                b'{"code":"index_rebuilding","retryable":true}',
+                **{"Content-Type": "application/json", "Retry-After": "0"},
+            )
+        return "ready"
+
+    assert helpers.wait_until(probe, timeout_s=1.0, interval_s=0) == "ready"
+    assert calls == 2
+
+
+def test_wait_until_preserves_nonretryable_service_unavailable():
+    expected = _http_error(
+        503,
+        b'{"code":"storage_failed","retryable":false}',
+        **{"Content-Type": "application/json"},
+    )
+
+    def probe() -> None:
+        raise expected
+
+    with pytest.raises(requests.HTTPError) as raised:
+        helpers.wait_until(probe, timeout_s=1.0)
+
+    assert raised.value is expected

@@ -80,6 +80,7 @@ pub const Context = struct {
     models_dir: []const u8,
     session_manager: *backends_mod.SessionManager,
     model_manager: *model_manager_mod.ModelManager,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
     reader_discovery_override: if (builtin.is_test) ?ReaderDiscoveryOverride else void = if (builtin.is_test) null else {},
     reader_text_override: if (builtin.is_test) ?ReaderTextOverride else void = if (builtin.is_test) null else {},
@@ -433,13 +434,17 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        var model_handle = if (ctx.execution_control) |control|
+            try ctx.model_manager.acquireFromDirWithControl(self.model_path, control)
+        else
+            try ctx.model_manager.acquireFromDir(self.model_path);
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
         var gliner = model.glinerPipeline(ctx.allocator);
+        gliner.execution_control = ctx.execution_control;
         var extraction_config = config;
         extraction_config.cleanup_model = try model.getCleanupHead();
         return extraction_mod.extractBatch(ctx.allocator, &gliner, texts, schemas, extraction_config);
@@ -477,15 +482,18 @@ const ReaderExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        var reader = try readers_mod.LoadedReader.loadFromDir(
+        var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
+            ctx.execution_control,
         );
         defer reader.deinit();
 
-        const results = try reader.readBatch(image_datas, read_options);
+        var controlled_options = read_options;
+        controlled_options.execution_control = ctx.execution_control;
+        const results = try reader.readBatch(image_datas, controlled_options);
         defer {
             for (results) |*result| result.deinit();
             ctx.allocator.free(results);
@@ -572,11 +580,12 @@ fn readTextsWithReader(
     image_datas: []const []const u8,
     read_options: readers_mod.ReadOptions,
 ) ![][]const u8 {
-    var reader = readers_mod.LoadedReader.loadFromDir(
+    var reader = readers_mod.LoadedReader.loadFromDirWithControl(
         ctx.allocator,
         model_path,
         ctx.session_manager,
         ctx.model_manager,
+        ctx.execution_control,
     ) catch |err| return err;
     defer reader.deinit();
 
@@ -587,8 +596,10 @@ fn readTextsWithReader(
         ctx.allocator.free(texts);
     }
 
+    var controlled_options = read_options;
+    controlled_options.execution_control = ctx.execution_control;
     for (image_datas, 0..) |image_data, i| {
-        var result = try reader.read(image_data, read_options);
+        var result = try reader.read(image_data, controlled_options);
         defer result.deinit();
         texts[i] = try ctx.allocator.dupe(u8, result.text);
         initialized += 1;
@@ -717,11 +728,11 @@ fn discoverReaderModelPathFromRegistry(
     for (discovered) |entry| {
         if (excluded_paths.contains(entry.path)) continue;
 
-        var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, entry.path);
+        var manifest = (try manifest_mod.loadListingCandidateFromDir(ctx.allocator, entry.path)) orelse continue;
         defer manifest.deinit();
         if (manifest.model_type != .reader and entry.kind != .reader) continue;
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) continue;
-        if (!readers_mod.isSupportedManifest(ctx.allocator, entry.path, manifest)) continue;
+        if (!(try readers_mod.probeManifest(ctx.allocator, entry.path, manifest)).isSupported()) continue;
 
         const rank = extractionReaderPreference(entry.name, extractor_model_name);
         if (best_name == null or rank < best_rank or (rank == best_rank and std.mem.lessThan(u8, entry.name, best_name.?))) {
@@ -794,7 +805,7 @@ fn resolveSupportedNamedReaderPath(ctx: Context, requested_name: []const u8) ![]
     var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
     defer manifest.deinit();
     if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) return error.ModelNotFound;
-    if (!readers_mod.isSupportedManifest(ctx.allocator, path, manifest)) return error.ModelNotFound;
+    if (!(try readers_mod.probeManifest(ctx.allocator, path, manifest)).isSupported()) return error.ModelNotFound;
     return path;
 }
 
@@ -998,6 +1009,33 @@ test "image extraction caches a supported fallback reader selection" {
     try std.testing.expectEqual(@as(?[]u8, null), failed_entry.path);
     try std.testing.expectEqual(@as(usize, 1), resolver.failed_candidates.count());
     try std.testing.expect(resolver.failed_candidates.contains(first));
+}
+
+test "image extraction reader discovery skips invalid unrelated models" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestManifest(
+        tmp.dir,
+        "embedders/acme/broken",
+        "{\"type\":\"embedder\",\"pooling\":\"lasst\"}",
+    );
+    try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+    const no_failed_paths = FailedReaderPathSet.empty;
+
+    const selected = try discoverReaderModelPathFromRegistry(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = models_dir,
+        .session_manager = undefined,
+        .model_manager = undefined,
+    }, "fastino/gliner2-base-v1", &no_failed_paths);
+    defer allocator.free(selected);
+
+    try std.testing.expect(std.mem.endsWith(u8, selected, "readers/antflydb/florence-2-base"));
 }
 
 test "image extraction caches unavailable reader discovery for a bounded ttl" {

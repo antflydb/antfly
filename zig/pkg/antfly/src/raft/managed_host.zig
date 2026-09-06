@@ -1383,7 +1383,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             },
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
@@ -1418,7 +1418,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             },
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },

@@ -23,6 +23,16 @@ const s3 = @import("s3.zig");
 const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
+
+test "standalone objectstore wires Google credential identity dependencies" {
+    var manager = google_auth.CredentialManager.init(std.testing.allocator, std.testing.io);
+    defer manager.deinit();
+    try std.testing.expectError(
+        error.MissingGoogleCredentials,
+        manager.tokenSource("__antfly_missing_google_credentials__.json", google_auth.default_scope),
+    );
+}
+
 const resumable_upload_threshold: u64 = 64 * 1024 * 1024;
 const resumable_upload_min_chunk_bytes: u64 = 16 * 1024 * 1024;
 const resumable_upload_max_chunk_bytes: u64 = 512 * 1024 * 1024;
@@ -941,12 +951,25 @@ pub fn jsonApiClientConfigWithBearerTokenAlloc(
 }
 
 pub fn jsonApiClientConfigFromEnvAlloc(alloc: Allocator) !JsonApiConfig {
-    return try jsonApiClientConfigFromEnvWithScopeAlloc(alloc, null);
+    return try jsonApiClientConfigFromEnvWithAuthoritiesAlloc(alloc, null, null, null);
 }
 
 pub fn jsonApiClientConfigFromEnvWithScopeAlloc(alloc: Allocator, configured_scope: ?[]const u8) !JsonApiConfig {
+    return try jsonApiClientConfigFromEnvWithAuthoritiesAlloc(alloc, configured_scope, null, null);
+}
+
+/// Build ADC-backed JSON API configuration with distinct long-lived network
+/// and local credential-file authorities. Supplying them prevents the auth
+/// source and object client from allocating private threaded runtimes.
+pub fn jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
+    alloc: Allocator,
+    configured_scope: ?[]const u8,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
+) !JsonApiConfig {
     var cfg = try jsonApiClientConfigAlloc(alloc);
     errdefer cfg.deinit(alloc);
+    cfg.io = network_io;
 
     if ((try envOwned(alloc, "GCS_BEARER_TOKEN")) orelse (try envOwned(alloc, "GOOGLE_OAUTH_ACCESS_TOKEN"))) |token| {
         defer alloc.free(token);
@@ -957,7 +980,12 @@ pub fn jsonApiClientConfigFromEnvWithScopeAlloc(alloc: Allocator, configured_sco
         else
             (try envOwned(alloc, "GCS_OAUTH_SCOPE")) orelse try alloc.dupe(u8, google_auth.default_scope);
         defer alloc.free(scope);
-        cfg.auth = .{ .google_token_source = try google_auth.tokenSourceFromEnvAlloc(alloc, scope) };
+        cfg.auth = .{ .google_token_source = try google_auth.tokenSourceFromEnvWithAuthoritiesAlloc(
+            alloc,
+            scope,
+            network_io,
+            filesystem_io,
+        ) };
     }
 
     const explicit_project_id = (try envOwned(alloc, "GOOGLE_CLOUD_PROJECT")) orelse try envOwned(alloc, "GCLOUD_PROJECT");

@@ -235,6 +235,7 @@ pub const MetadataServer = struct {
                 cfg.api_server_cfg.internal_service_secret,
                 cfg.api_server_cfg.internal_service_issuer,
             );
+            _ = public_write_source.withIndexActivationAdapter(owned_hosted_shard_db.?.adapter());
             _ = public_write_source.withDestinationAuthorization(.{
                 .manager = cfg.api_server_cfg.user_manager,
                 .auth_enabled = cfg.api_server_cfg.auth_enabled,
@@ -1242,8 +1243,19 @@ fn metadataLocalShardDbAdapter(svc: *service.MetadataHttpService) metadata_mod.S
         .vtable = &.{
             .fetch_median_key = fetchMedianKey,
             .schema_index_ready = schemaIndexReady,
+            .activate_index = activateIndex,
         },
     };
+}
+
+fn activateIndex(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    target: metadata_mod.IndexActivationTarget,
+) !metadata_mod.IndexActivationProgress {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const adapter = svc.local_shard_db_adapter orelse return error.GroupLeaderUnavailable;
+    return try adapter.activateIndex(alloc, target);
 }
 
 fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {

@@ -28,6 +28,7 @@ const ResidentTextEmbeddingRequest = @import("../backends/session.zig").Resident
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -82,6 +83,8 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gliner2,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
@@ -1392,7 +1395,11 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
             model_manifest.gguf_path orelse return error.A4bCudaPackedStoreUnavailable,
         );
     }
-    const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
+    const cuda_profile = cudaProfileForArch(
+        native_impl.arch_config,
+        native_impl.task,
+        &model_manifest,
+    ) orelse return error.UnsupportedCudaArchitecture;
     const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
         cuda_profile,
         &native_impl.backend_data.native.resident_weights,
@@ -1571,38 +1578,69 @@ pub fn verifyCudaA4bPreparedPack(
     );
 }
 
-fn cudaSupportsArch(arch_config: ArchConfig) bool {
-    return cudaProfileForArch(arch_config) != null;
+fn cudaSupportsArch(arch_config: ArchConfig, model_manifest: *const manifest_mod.ModelManifest) bool {
+    return cudaProfileForArch(arch_config, .generic, model_manifest) != null;
 }
 
-fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
+fn cudaProfileForArch(
+    arch_config: ArchConfig,
+    task: SessionTask,
+    model_manifest: *const manifest_mod.ModelManifest,
+) ?CudaCapabilityProfile {
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
-        .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
+        .gpt => |cfg| switch (cfg.family) {
+            .gemma => .gemma4,
+            .qwen3 => if (task == .generic and model_manifest.isLastTokenDecoderEmbedder()) .qwen3_embedding else null,
+            .qwen3_vl => if (task == .generic and
+                model_manifest.model_type == .generator and
+                model_manifest.isQwen3VlGenerationSafetensorsBundle())
+                .qwen3_vl_generation
+            else
+                null,
+            else => null,
+        },
         else => null,
     };
 }
 
-test "cuda support gate admits only supported encoder architectures" {
-    try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
-    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
-    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
-    try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
+test "cuda support gate admits only supported model roles" {
+    const generic_manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    const qwen3_embedder = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .pooling = .last,
+        .embedding_style = .qwen3_embedding,
+    };
+    const qwen3_vl_generator = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_safetensors_bundle_family,
+    };
+    try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
     if (comptime build_options.enable_cuda) {
-        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }, .classifier, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }, .recognizer, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }, .generic, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.qwen3_embedding, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3 } }, .generic, &qwen3_embedder).?);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3 } }, .generic, &generic_manifest) == null);
+        try std.testing.expectEqual(CudaCapabilityProfile.qwen3_vl_generation, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .generic, &qwen3_vl_generator).?);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .generic, &generic_manifest) == null);
+        try std.testing.expect(cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_vl } }, .classifier, &qwen3_vl_generator) == null);
     }
 }
 
@@ -2755,7 +2793,7 @@ fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8,
     if (!std.mem.eql(u8, raw_name, normalized_name)) return false;
     return switch (arch_config) {
         .gpt => |cfg| switch (cfg.family) {
-            .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
+            .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
             else => false,
         },
         else => false,
@@ -2848,6 +2886,10 @@ fn collectMissingRequiredGptWeights(
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.input_layernorm.bias", .{layer});
         }
         try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
+        if (config.family == .qwen3 or config.family == .qwen3_vl) {
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+        }
         if (config.family == .qwen2 or config.family == .phi) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.bias", .{layer});
         }
@@ -4322,6 +4364,37 @@ fn recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(
     };
 }
 
+/// Large dense safetensors models have two independently real residency
+/// domains in GPU-hosted execution: the lazily faulted source mapping and the
+/// prepared backend weights. The generic GPU cache is intentionally too small
+/// for a complete 2B BF16 model, so qualified bundle families need an explicit
+/// floor sized from their immutable weight artifact rather than failing midway
+/// through the decoder after a partial publication.
+fn recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(
+    model_weight_bytes: u64,
+) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes()) return .{};
+    const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(6));
+    const backend_floor = clampBytes(total_bytes +| mib(512), gib(4), gib(8));
+    const combined_floor = clampBytes(host_floor +| backend_floor +| gib(1), gib(8), gib(14));
+    return .{
+        .host_limit_bytes = host_floor,
+        .backend_limit_bytes = backend_floor,
+        .combined_limit_bytes = combined_floor,
+    };
+}
+
+fn recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(
+    model_weight_bytes: u64,
+) runtime.tier.cache.Budget {
+    const floor = recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(model_weight_bytes);
+    return .{
+        .host_limit_bytes = floor.host_limit_bytes,
+        .backend_limit_bytes = floor.backend_limit_bytes,
+    };
+}
+
 fn isBgeM3DenseEncoder(manifest: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
     if (!std.mem.eql(u8, manifest.config_model_arch, "xlm-roberta")) return false;
     return switch (arch_config) {
@@ -4356,10 +4429,9 @@ fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.me
     // The official dense BGE-M3 checkpoint is F32 and mmap-backed. Metal keeps
     // those source views alive while preparing reusable F16 projection slots
     // (or the explicit F32 rollback), so the host cache must be able to account
-    // for the complete artifact. The
-    // ordinary GPU defaults already cover the prepared projections and the
-    // persistent embedding table on supported machines; these are minimums,
-    // not an override of an explicit serving limit.
+    // for the complete artifact. The ordinary GPU defaults already cover the
+    // prepared projections and the persistent embedding table on supported
+    // machines; these are minimums, not an override of an explicit limit.
     const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(4));
     const backend_floor = clampBytes((total_bytes *| 3) / 4 +| gib(1), gib(3), gib(6));
     const combined_floor = clampBytes(host_floor +| backend_floor +| mib(512), gib(6), gib(10));
@@ -4623,6 +4695,23 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(model_weight_bytes, prefer_f32_dense_tensors)
     else
         runtime.tier.cache.Budget{};
+    const dense_safetensors_budget_floor = if (shouldUseLargeQwen3VlRerankerSafetensorsBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(model_weight_bytes)
+    else
+        runtime.tier.memory.Limits{};
+    const dense_safetensors_shared_cache_floor = if (shouldUseLargeQwen3VlRerankerSafetensorsBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedLargeDenseSafetensorsSharedCacheBudget(model_weight_bytes)
+    else
+        runtime.tier.cache.Budget{};
+    // Qwen3-VL's external projector is mapped only by an image rerank request,
+    // not by the decoder session. Reserve a host envelope for that mapped GGUF
+    // and bounded preprocessing before request-time admission; otherwise a
+    // correctly loaded Q8 reranker can fail every qualified 2 MP image with a
+    // generic 2 GiB host-cache limit.
+    const qwen3vl_reranker_gguf_budget_floor = if (shouldUseQwen3VlRerankerGgufBudgets(model_weight_bytes, manifest, arch_config))
+        recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(model_weight_bytes)
+    else
+        runtime.tier.memory.Limits{};
     const bge_m3_budget_floor = if (isBgeM3DenseEncoder(manifest, arch_config))
         recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes)
     else
@@ -4631,10 +4720,28 @@ fn sharedGpuHostedBudgetPolicy(
         recommendedGpuHostedBgeM3SharedCacheBudget(model_weight_bytes)
     else
         runtime.tier.cache.Budget{};
-    const budget_floor = widenLimits(widenLimits(lazy_quant_budget_floor, gemma_budget_floor), bge_m3_budget_floor);
+    const budget_floor = widenLimits(
+        widenLimits(
+            widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
+            widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
+        ),
+        bge_m3_budget_floor,
+    );
     const shared_cache_floor = runtime.tier.cache.Budget{
-        .host_limit_bytes = @max(@max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes), bge_m3_shared_cache_floor.host_limit_bytes),
-        .backend_limit_bytes = @max(@max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes), bge_m3_shared_cache_floor.backend_limit_bytes),
+        .host_limit_bytes = @max(
+            @max(
+                @max(lazy_quant_shared_cache_floor.host_limit_bytes, gemma_shared_cache_floor.host_limit_bytes),
+                dense_safetensors_shared_cache_floor.host_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.host_limit_bytes,
+        ),
+        .backend_limit_bytes = @max(
+            @max(
+                @max(lazy_quant_shared_cache_floor.backend_limit_bytes, gemma_shared_cache_floor.backend_limit_bytes),
+                dense_safetensors_shared_cache_floor.backend_limit_bytes,
+            ),
+            bge_m3_shared_cache_floor.backend_limit_bytes,
+        ),
     };
     const plan_context: runtime.tier.planner.PlanContext = blk: {
         var ctx = defaultPlanContextForBackend(.gpu);
@@ -4696,6 +4803,46 @@ fn shouldUseLargeGpuHostedMultimodalGemmaBudgets(
     return switch (arch_config) {
         .gpt => |cfg| cfg.family == .gemma and !cfg.usesMoe() and cfg.isMultimodal(),
         else => false,
+    };
+}
+
+fn shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) bool {
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes() or
+        !manifest.isQwen3VlRerankerSafetensorsBundle()) return false;
+    return switch (arch_config) {
+        .gpt => |cfg| cfg.family == .qwen3_vl and !cfg.usesMoe(),
+        else => false,
+    };
+}
+
+fn shouldUseQwen3VlRerankerGgufBudgets(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) bool {
+    if (model_weight_bytes == 0 or !manifest.isQwen3VlRerankerGgufBundle()) return false;
+    return switch (arch_config) {
+        .gpt => |cfg| cfg.family == .qwen3_vl and !cfg.usesMoe(),
+        else => false,
+    };
+}
+
+/// A Qwen3-VL reranker keeps its decoder resident, then maps the external
+/// Q8 projector for image requests. The host bucket must fit both artifacts
+/// plus bounded image preprocessing. This is a limit floor rather than a
+/// permanent reservation; per-run admission still charges the projector and
+/// scratch exactly, and an explicit operator limit remains authoritative.
+fn recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(
+    model_weight_bytes: u64,
+) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0) return .{};
+    const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    return .{
+        .host_limit_bytes = clampBytes(total_bytes +| gib(1), gib(3), gib(6)),
     };
 }
 
@@ -5995,13 +6142,60 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 
 const arch_vtable = Session.VTable{
     .run = &archRun,
+    .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
+    .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .backend = &archBackend,
     .close = &archClose,
 };
+
+fn archRunResidentWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .classifier or self.task == .recognizer) return null;
+    const cfg = switch (self.arch_config) {
+        .bert => |cfg| cfg,
+        // Returning null forces the caller through runWithControl. Never
+        // advertise a controlled resident fast path by delegating to an
+        // implementation that cannot observe the request lifetime.
+        else => return null,
+    };
+    const bert_inputs = try parseBertRunInputs(inputs);
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
+    errdefer cb.deinit();
+    const hidden = try bert_arch.forwardCtWithControl(
+        cb,
+        allocator,
+        cfg,
+        bert_inputs.input_ids,
+        bert_inputs.attention_mask,
+        bert_inputs.token_type_ids,
+        bert_inputs.batch,
+        bert_inputs.seq_len,
+        control,
+    );
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    errdefer allocator.free(outputs);
+    outputs[0] = hidden;
+    return .{
+        .outputs = outputs,
+        .backend = cb,
+        .allocator = allocator,
+        .backend_owner = cb,
+        .deinit_backend_owner = &deinitResidentComputeBackend,
+    };
+}
 
 fn deinitResidentComputeBackend(owner: *anyopaque, allocator: std.mem.Allocator) void {
     const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
@@ -6548,6 +6742,40 @@ pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.Co
     return cb;
 }
 
+/// Direct compute paths bypass Session.runWithControl. This owner binds their
+/// cooperative checks and holds process protection from backend creation until
+/// backend cleanup completes, including on cancellation and constructor errors.
+pub const ManagedComputeBackend = struct {
+    backend: ops.ComputeBackend,
+    guard: @import("../execution_control.zig").UninterruptibleGuard,
+    owns_backend: bool = true,
+
+    pub fn deinit(self: *ManagedComputeBackend) void {
+        if (!self.owns_backend) return;
+        self.owns_backend = false;
+        defer self.guard.deinit();
+        self.backend.deinit();
+    }
+};
+
+pub fn getComputeBackendWithControl(
+    session: Session,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !ManagedComputeBackend {
+    if (control) |active| try active.check();
+    var guard = if (control) |active|
+        try active.enterUninterruptible(session.interruption())
+    else
+        @import("../execution_control.zig").UninterruptibleGuard{};
+    errdefer guard.deinit();
+    var cb = try getComputeBackend(session, allocator);
+    errdefer cb.deinit();
+    cb.execution_control = control;
+    if (control) |active| try active.check();
+    return .{ .backend = cb, .guard = guard };
+}
+
 pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: LoadedWeight) !void {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -6561,6 +6789,62 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
     }
 
     try self.backend_data.native.resident_weights.put(self.allocator, try self.allocator.dupe(u8, name), weight);
+}
+
+test "managed direct compute guards construction and cleanup" {
+    const Probe = struct {
+        armed: bool = false,
+        disarms: usize = 0,
+        closes: usize = 0,
+        fn backend(_: *anyopaque) BackendType {
+            return .metal;
+        }
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.armed);
+            self.armed = true;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.armed);
+            self.armed = false;
+            self.disarms += 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.armed);
+            self.closes += 1;
+        }
+    };
+    var probe = Probe{};
+    var vtable: Session.VTable = undefined;
+    vtable.backend = Probe.backend;
+    vtable.interruption = null;
+    const session = Session{ .ptr = &probe, .vtable = &vtable };
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Timeout, getComputeBackendWithControl(session, allocator, .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.ProcessIsolationRequired, getComputeBackendWithControl(session, allocator, .{}));
+    const control = InferenceExecutionControl{
+        .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm },
+    };
+    // A non-architecture session fails construction only after arming, then
+    // unwinds the guard without retaining the borrowed control.
+    try std.testing.expectError(error.NotArchSession, getComputeBackendWithControl(session, allocator, control));
+    try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+    try std.testing.expect(!probe.armed);
+
+    var compute_vtable: ops.ComputeBackend.VTable = undefined;
+    compute_vtable.deinitBackend = Probe.close;
+    var managed = ManagedComputeBackend{
+        .backend = .{ .ptr = &probe, .vtable = &compute_vtable },
+        .guard = try control.enterUninterruptible(.process_required),
+    };
+    managed.deinit();
+    managed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.closes);
+    try std.testing.expectEqual(@as(usize, 2), probe.disarms);
+    try std.testing.expect(!probe.armed);
 }
 
 pub fn getComputeBackendWithBudget(
@@ -6719,12 +7003,32 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
 }
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, null);
+}
+
+fn archRunWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    return archRunImpl(ptr, inputs, allocator, control);
+}
+
+fn archRunImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) ![]Tensor {
+    if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
 
     // Create the appropriate ComputeBackend
     var cb = try makeComputeBackend(self, allocator, null);
+    cb.execution_control = control;
     if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
     defer cb.deinit();
 
@@ -6734,7 +7038,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const bert_inputs = try parseBertRunInputs(inputs);
             const batch = bert_inputs.batch;
             const seq_len = bert_inputs.seq_len;
-            const hidden = try bert_arch.forward(
+            const hidden = try bert_arch.forwardWithControl(
                 &cb,
                 allocator,
                 cfg,
@@ -6743,6 +7047,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 bert_inputs.token_type_ids,
                 batch,
                 seq_len,
+                control,
             );
             defer allocator.free(hidden);
 
@@ -6982,6 +7287,29 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const batch: usize = @intCast(input_ids_tensor.shape[0]);
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
+
+            if (self.task == .classifier and (cfg.family == .qwen3_vl or cfg.family == .qwen3)) {
+                if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
+                    return error.MissingInputs;
+                }
+                const attention_mask = inputs[1].asInt64();
+                const logits = try gpt_arch.qwen3VlRerankerLogits(
+                    &cb,
+                    allocator,
+                    cfg,
+                    input_ids,
+                    attention_mask,
+                    batch,
+                    seq_len,
+                );
+                defer allocator.free(logits);
+                const shape = [_]i64{ @intCast(batch), 1 };
+                var output_tensor = try Tensor.initFloat32(allocator, "logits", &shape, logits);
+                errdefer output_tensor.deinit();
+                const result = try allocator.alloc(Tensor, 1);
+                result[0] = output_tensor;
+                return result;
+            }
 
             // Return hidden states (not logits) — used for embedding extraction.
             const hidden = try gpt_arch.hiddenForward(&cb, allocator, cfg, input_ids, batch, seq_len, null);
@@ -7758,6 +8086,13 @@ fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
 
 fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .classifier and self.arch_config == .gpt and
+        self.arch_config.gpt.family == .qwen3_vl)
+    {
+        return &.{
+            .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } },
+        };
+    }
     if (self.task == .classifier and (self.arch_config == .bert or self.arch_config == .deberta or self.arch_config == .layoutlmv3)) {
         return &.{
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1 } },
@@ -7899,6 +8234,50 @@ test "large multimodal gemma gpu_hosted budget floor widens dense limits" {
     try std.testing.expect(floor.host_limit_bytes >= 2 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.backend_limit_bytes);
+}
+
+test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
+    const weight_bytes = gib(4);
+    const floor = recommendedGpuHostedLargeDenseSafetensorsBudgetFloor(weight_bytes);
+    try std.testing.expectEqual(weight_bytes + mib(256), floor.host_limit_bytes);
+    try std.testing.expectEqual(weight_bytes + mib(512), floor.backend_limit_bytes);
+    try std.testing.expectEqual(weight_bytes * 2 + gib(1) + mib(768), floor.combined_limit_bytes);
+
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_safetensors_bundle_family,
+    };
+    try std.testing.expect(shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+        weight_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3_vl } },
+    ));
+    try std.testing.expect(!shouldUseLargeQwen3VlRerankerSafetensorsBudgets(
+        weight_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen2 } },
+    ));
+}
+
+test "Qwen3-VL reranker GGUF budget reserves image projector host envelope" {
+    const decoder_bytes = @as(u64, 1_834_438_720);
+    const floor = recommendedGpuHostedQwen3VlRerankerGgufBudgetFloor(decoder_bytes);
+    try std.testing.expectEqual(gib(3), floor.host_limit_bytes);
+
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family,
+    };
+    try std.testing.expect(shouldUseQwen3VlRerankerGgufBudgets(
+        decoder_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3_vl } },
+    ));
+    try std.testing.expect(!shouldUseQwen3VlRerankerGgufBudgets(
+        decoder_bytes,
+        manifest,
+        .{ .gpt = .{ .family = .qwen3 } },
+    ));
 }
 
 test "session budget widening preserves higher explicit limits" {

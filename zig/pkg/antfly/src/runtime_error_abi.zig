@@ -333,6 +333,17 @@ pub const Detail = enum(c_int) {
     rerank_rate_limited,
     rerank_transient_failure,
     rerank_upstream_failure,
+    invalid_rate_limit_policy,
+    conflicting_rate_limit_policy,
+    provider_token_budget_exceeded,
+    provider_quota_registry_full,
+    unsupported_media_token_budget,
+    unsupported_local_rate_limit,
+    // Append after published main values to preserve their wire identities.
+    // Model compatibility is decided inside the independently generated
+    // inference runtime; do not reinterpret compilation-local error integers.
+    incompatible_model,
+    unsupported_generator_provider,
 };
 
 pub const Status = extern struct {
@@ -515,6 +526,14 @@ pub fn statusFromError(err: anyerror) Status {
         error.RerankRateLimited => status(.retryable, .rerank_rate_limited),
         error.RerankTransientFailure => status(.retryable, .rerank_transient_failure),
         error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
+        error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
+        error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
+        error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
+        error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
+        error.ProviderTokenBudgetExceeded => status(.invalid_argument, .provider_token_budget_exceeded),
+        error.ProviderQuotaRegistryFull => status(.retryable, .provider_quota_registry_full),
+        error.UnsupportedMediaTokenBudget => status(.unsupported, .unsupported_media_token_budget),
+        error.UnsupportedLocalRateLimit => status(.unsupported, .unsupported_local_rate_limit),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -975,6 +994,14 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .rerank_rate_limited => "RerankRateLimited",
         .rerank_transient_failure => "RerankTransientFailure",
         .rerank_upstream_failure => "RerankUpstreamFailure",
+        .incompatible_model => "IncompatibleModel",
+        .unsupported_generator_provider => "UnsupportedGeneratorProvider",
+        .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
+        .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
+        .provider_token_budget_exceeded => "ProviderTokenBudgetExceeded",
+        .provider_quota_registry_full => "ProviderQuotaRegistryFull",
+        .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
+        .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
     };
 }
 
@@ -1004,6 +1031,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
     try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
     try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
+    try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
+    try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -1061,4 +1090,13 @@ test "unknown wire values fail closed" {
         .code = @intFromEnum(Code.invalid_argument),
         .detail = @intFromEnum(Detail.table_not_found),
     }));
+}
+
+test "provider quota errors retain stable boundary details" {
+    try std.testing.expectEqual(error.InvalidRateLimitPolicy, errorFromStatus(statusFromError(error.InvalidRateLimitPolicy)));
+    try std.testing.expectEqual(error.ConflictingRateLimitPolicy, errorFromStatus(statusFromError(error.ConflictingRateLimitPolicy)));
+    try std.testing.expectEqual(error.ProviderTokenBudgetExceeded, errorFromStatus(statusFromError(error.ProviderTokenBudgetExceeded)));
+    try std.testing.expectEqual(error.ProviderQuotaRegistryFull, errorFromStatus(statusFromError(error.ProviderQuotaRegistryFull)));
+    try std.testing.expectEqual(error.UnsupportedMediaTokenBudget, errorFromStatus(statusFromError(error.UnsupportedMediaTokenBudget)));
+    try std.testing.expectEqual(error.UnsupportedLocalRateLimit, errorFromStatus(statusFromError(error.UnsupportedLocalRateLimit)));
 }

@@ -1,0 +1,483 @@
+{
+  "base_url": "http://127.0.0.1:18099",
+  "gates": [
+    {
+      "case": "doc_cjk",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "cosine=0.999670 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "cosine=0.999730 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "cosine=0.998499 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "cosine=0.999759 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "cosine=0.999627 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "cosine=0.999833 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "cosine=0.999688 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "cosine=0.999568 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "cosine=0.999696 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "cosine=0.999662 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "got 1024, want 1024",
+      "gate": "dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "cosine=0.999569 min=0.995",
+      "gate": "oracle_cosine",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "got 256, want 256",
+      "gate": "mrl_dimensions",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "|v|=1.000000 tol=0.001",
+      "gate": "mrl_unit_norm",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "cosine=1.0000000 min=0.99999",
+      "gate": "mrl_truncate_renormalize",
+      "pass": true
+    },
+    {
+      "case": "doc_cjk",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_emoji",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_english",
+      "detail": "cosine=0.999999 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_long_truncation",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_shared_text",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_single_token",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "doc_whitespace",
+      "detail": "cosine=1.000000 min=0.9999",
+      "gate": "batch_vs_single",
+      "pass": true
+    },
+    {
+      "case": "query_custom",
+      "detail": "oracle=doc_cjk server=doc_cjk",
+      "gate": "retrieval_top1_agreement",
+      "pass": true
+    },
+    {
+      "case": "query_default",
+      "detail": "oracle=doc_english server=doc_english",
+      "gate": "retrieval_top1_agreement",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text",
+      "detail": "oracle=doc_shared_text server=doc_shared_text",
+      "gate": "retrieval_top1_agreement",
+      "pass": true
+    },
+    {
+      "case": "query_short",
+      "detail": "oracle=doc_emoji server=doc_emoji",
+      "gate": "retrieval_top1_agreement",
+      "pass": true
+    },
+    {
+      "case": "query_shared_text/doc_shared_text",
+      "detail": "query and document embeddings of identical text must differ",
+      "gate": "shared_text_role_distinct",
+      "pass": true
+    }
+  ],
+  "min_cosine": 0.995,
+  "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1",
+  "oracle": {
+    "cases": 11,
+    "path": "/private/tmp/claude-501/-Users-timkaye-Documents-af-antfly/c41d7e48-3ed1-428c-b8b3-c709d9f3f6af/scratchpad/qwen3_embedding_oracle.json",
+    "schema": "antfly.qwen3_embedding.transformers_oracle.v1"
+  },
+  "pass": true,
+  "schema": "antfly.qwen3_embedding.metal_qualification.v1",
+  "tier": "q8_0"
+}

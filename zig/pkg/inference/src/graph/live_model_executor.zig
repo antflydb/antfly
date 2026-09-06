@@ -101,6 +101,7 @@ const RuntimeContext = struct {
             pool_id,
             shared_moe_cache,
         );
+        ctx.decode_runtime.configureForGptConfig(gpt_config);
         return ctx;
     }
 
@@ -112,6 +113,7 @@ const RuntimeContext = struct {
             self.pool_id,
             self.shared_moe_cache,
         );
+        self.decode_runtime.configureForGptConfig(self.gpt_config);
     }
 
     fn deinit(self: *RuntimeContext) void {
@@ -246,12 +248,12 @@ fn executorDeinit(ctx: *anyopaque) void {
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
-    _ = runtime_ctx;
     return .{
         .supports_decode = true,
         .supports_sample_decode = true,
         .supports_greedy_decode = true,
         .state_ownership = .runtime_owned_host_cache,
+        .interruption = if (runtime_ctx.cb.kind() == .metal) .process_required else .cooperative,
     };
 }
 
@@ -271,10 +273,12 @@ fn runtimePrefill(
     request: model_runtime.PrefillRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
     if (request.query_seq_len > request.seq_len) return error.UnsupportedShape;
     const decode_context = try runtime_ctx.preparePrefill(request.seq_len, request.query_seq_len, request.attention_mode);
+    try request.check();
     return .{
         .logits = try forwardLastLogits(
             runtime_ctx,
@@ -293,7 +297,9 @@ fn runtimeDecode(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
+    try request.check();
     const input_ids = [_]i64{request.token_id};
     return .{ .logits = try forwardLastLogits(runtime_ctx, allocator, input_ids[0..], step.seq_len, 1, &step.decode_context) };
 }
@@ -303,6 +309,7 @@ fn runtimeDecodeSample(
     allocator: std.mem.Allocator,
     request: model_runtime.SampledDecodeRequest,
 ) !model_runtime.SampledDecodeOutput {
+    try request.decode.check();
     if (request.sampling.isPureGreedy()) {
         const greedy = try runtimeDecodeGreedy(ctx, allocator, request.decode);
         return .{ .token_id = greedy.token_id };
@@ -326,7 +333,9 @@ fn runtimeDecodeGreedy(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.GreedyDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
+    try request.check();
     const input_ids = [_]i64{request.token_id};
     return .{
         .token_id = @intCast(try gpt_arch.forwardGreedyLastToken(

@@ -925,10 +925,33 @@ pub const IndexRepairVisibility = struct {
     action_required: bool = false,
 };
 
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
+    index_name: []const u8,
+    kind: types.IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
+};
+
 pub const QueryVisibilityEvent = struct {
     change: QueryVisibilityChange,
     repair: ?IndexRepairVisibility = null,
     target_sequence: ?u64 = null,
+    target_indexes: []const IndexTargetVisibility = &.{},
+    target_scope_known: bool = false,
     /// An exact clear may leave other durable lifecycle work in the group.
     /// This is a scheduling/replay fact, not an unknown-scope visibility
     /// edge: consumers must audit the group without fencing unrelated index
@@ -1012,6 +1035,10 @@ const IndexRepairScheduleRecord = struct {
     durable_next_retry_at_ms: u64,
     next_retry_at_ms: u64,
     progress_wait_until_sequence: ?u64 = null,
+    // Process-local grace period for an already-queryable initial build.
+    // Once its deadline is selected, the repair owner receives one explicit
+    // audit authority instead of blindly rearming the same grace period.
+    audit_wait_armed: bool = false,
     heap_position: ?usize = null,
 };
 
@@ -1149,6 +1176,7 @@ const IndexRepairSchedulerDirectory = struct {
         if (record.revision != expected_revision or record.class != .runnable) return false;
         if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
         record.progress_wait_until_sequence = wake_at_sequence;
+        record.audit_wait_armed = false;
         record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
         self.rescheduleRunnable(repair_id);
         return true;
@@ -1173,6 +1201,7 @@ const IndexRepairSchedulerDirectory = struct {
             record.progress_wait_until_sequence = null;
             self.progress_waiters -= 1;
         }
+        record.audit_wait_armed = true;
         record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
         self.rescheduleRunnable(repair_id);
         return true;
@@ -1196,6 +1225,7 @@ const IndexRepairSchedulerDirectory = struct {
         const wake_at = record.progress_wait_until_sequence orelse return null;
         if (applied_sequence < wake_at) return null;
         record.progress_wait_until_sequence = null;
+        record.audit_wait_armed = false;
         self.progress_waiters -= 1;
         record.next_retry_at_ms = record.durable_next_retry_at_ms;
         self.rescheduleRunnable(record.repair_id);
@@ -1292,6 +1322,7 @@ const IndexRepairSchedulerDirectory = struct {
             record.root_generation = intent.root_generation;
             if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
             record.progress_wait_until_sequence = null;
+            record.audit_wait_armed = false;
             record.phase_terminal = intent.phase == .terminal;
             record.revision = persisted_revision;
             if (schedule_changed and class == .runnable) {
@@ -2094,14 +2125,29 @@ const TransactionRecoveryLocalContext = struct {
 const ManagedSyncTargets = struct {
     full_text_indexes: []const []const u8 = &.{},
     all_indexes: []const []const u8 = &.{},
+    // Visibility targets are broader than synchronous wait targets: a record
+    // with a missing dependency, or source work that schedules a generated
+    // downstream artifact, still advances that index's convergence target.
+    // Each identity owns its name so target collection does not need a second
+    // parallel allocation solely to manage name lifetime.
+    target_identities: []const IndexTargetVisibility = &.{},
+    target_scope_known: bool = false,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.full_text_indexes) |name| alloc.free(@constCast(name));
         if (self.full_text_indexes.len > 0) alloc.free(self.full_text_indexes);
         for (self.all_indexes) |name| alloc.free(@constCast(name));
         if (self.all_indexes.len > 0) alloc.free(self.all_indexes);
+        for (self.target_identities) |identity| alloc.free(@constCast(identity.index_name));
+        if (self.target_identities.len > 0) alloc.free(self.target_identities);
         self.* = undefined;
     }
+};
+
+const ManagedIndexCandidate = struct {
+    ref: index_manager_mod.ManagedIndexRef,
+    config: *const types.IndexConfig,
+    consumes_generated_enrichment: bool,
 };
 
 fn cloneManagedSyncTargetsAll(
@@ -3984,6 +4030,9 @@ pub const DB = struct {
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
+    status_owner_epoch: u64 = 0,
+    status_publication_mutex: std.atomic.Mutex = .unlocked,
+    status_publication_revision: u64 = 0,
     repair_cleanup_owner_id: u64,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
@@ -4086,7 +4135,8 @@ pub const DB = struct {
 
     const IndexRepairAdvanceLeaseTestHook = struct {
         ptr: *anyopaque,
-        after_acquire: *const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void,
+        after_acquire: ?*const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void = null,
+        after_reload: ?*const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void = null,
     };
     var test_index_repair_advance_lease_hook: ?IndexRepairAdvanceLeaseTestHook = null;
 
@@ -4482,6 +4532,7 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
+                .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
@@ -5027,15 +5078,40 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityTargetAdvanced(ctx: *AsyncContext, target_sequence: u64) void {
+        notifyQueryVisibilityTargetAdvancedScoped(ctx, target_sequence, &.{}, false);
+    }
+
+    fn notifyQueryVisibilityTargetAdvancedScoped(
+        ctx: *AsyncContext,
+        target_sequence: u64,
+        target_indexes: []const IndexTargetVisibility,
+        target_scope_known: bool,
+    ) void {
         notifyQueryVisibilityEvent(ctx, .{
             .change = .target_advanced,
             .target_sequence = target_sequence,
+            .target_indexes = target_indexes,
+            .target_scope_known = target_scope_known,
         });
     }
 
     fn notifyQueryVisibilityTargetAdvancedContext(ctx: *const BatchExecutionContext, target_sequence: u64) void {
         if (ctx.async_context) |async_ctx|
             notifyQueryVisibilityTargetAdvanced(async_ctx, target_sequence);
+    }
+
+    fn notifyQueryVisibilityTargetAdvancedScopedContext(
+        ctx: *const BatchExecutionContext,
+        target_sequence: u64,
+        targets: ManagedSyncTargets,
+    ) void {
+        if (ctx.async_context) |async_ctx|
+            notifyQueryVisibilityTargetAdvancedScoped(
+                async_ctx,
+                target_sequence,
+                targets.target_identities,
+                targets.target_scope_known,
+            );
     }
 
     fn notifyIndexRepairVisibilityHook(
@@ -7170,7 +7246,12 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
-        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+        notifyQueryVisibilityTargetAdvancedScoped(
+            self.async_context,
+            sequence,
+            sync_targets.target_identities,
+            sync_targets.target_scope_known,
+        );
 
         var pressure_ctx = self.batchContext();
         try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
@@ -7873,6 +7954,8 @@ pub const DB = struct {
                 derived_changed_flags,
                 sequence,
                 include_generated_enrichment_hint,
+                self.core.index_manager,
+                &sync_targets,
             )
         else blk: {
             materialized_derived_batch = try buildDerivedBatch(
@@ -8164,7 +8247,12 @@ pub const DB = struct {
         apply_mutex_held = false;
         snapshot_mutation.release();
         if (append_derived_replay)
-            notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+            notifyQueryVisibilityTargetAdvancedScoped(
+                self.async_context,
+                sequence,
+                sync_targets.target_identities,
+                sync_targets.target_scope_known,
+            );
         releaseHAMutationShared(&ha_mutation);
         if (!opts.bypass_ha_write_gate) {
             const ha_ctx = self.batchContext();
@@ -13222,7 +13310,33 @@ pub const DB = struct {
             repair_id,
             update,
             .retain,
+            null,
         );
+    }
+
+    /// Consume a scheduler audit grant by advancing exactly the durable
+    /// revision selected by that scheduler turn. This is a real control
+    /// transition, not a read-then-act check: the control mutex plus the
+    /// checkpoint CAS linearize the grant against pause/resume, owner handoff,
+    /// replay, and retry mutations. The returned revision is the owned turn's
+    /// new authority for any wait it publishes after the audit.
+    fn consumeIndexRepairAuditGrant(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        expected_revision: u64,
+    ) !?u64 {
+        self.updateIndexRepairIntentWithBindingEffect(
+            alloc,
+            repair_id,
+            .{},
+            .retain,
+            expected_revision,
+        ) catch |err| switch (err) {
+            error.RepairTransitionConflict => return null,
+            else => return err,
+        };
+        return expected_revision +| 1;
     }
 
     const IndexRepairBindingEffect = enum { retain, release };
@@ -13233,6 +13347,7 @@ pub const DB = struct {
         repair_id: u128,
         update: IndexRepairIntentUpdate,
         binding_effect: IndexRepairBindingEffect,
+        required_revision: ?u64,
     ) !void {
         lockAtomic(&self.async_context.index_repair_control_mutex);
         var control_locked = true;
@@ -13246,6 +13361,11 @@ pub const DB = struct {
             }
             return error.IndexRepairIntentNotFound;
         };
+        if (required_revision) |revision| {
+            if (state.entries.items[i].intent.revision != revision) {
+                return error.RepairTransitionConflict;
+            }
+        }
         var entry = try state.entries.items[i].clone(alloc);
         defer entry.deinit(alloc);
         const effective_phase = indexRepairIntentEffectivePhase(entry.intent.phase, update);
@@ -14382,6 +14502,7 @@ pub const DB = struct {
                 },
             },
             if (terminal) .release else .retain,
+            null,
         );
     }
 
@@ -14662,6 +14783,7 @@ pub const DB = struct {
                 repair_id,
                 terminal,
                 .release,
+                null,
             );
         } else {
             try self.updateIndexRepairIntent(alloc, repair_id, reset);
@@ -15458,6 +15580,17 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
     ) anyerror!IndexRepairAdvanceResult {
+        return try self.advanceScheduledIndexRepairIntent(alloc, repair_id, options, null, false);
+    }
+
+    fn advanceScheduledIndexRepairIntent(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        options: types.ArtifactRepairRunOptions,
+        scheduled_revision: ?u64,
+        audit_due: bool,
+    ) anyerror!IndexRepairAdvanceResult {
         // Resolve the durable name before taking the process-local lease, then
         // reload after acquisition. A pause or terminal transition which wins
         // between those operations must be observed by this owner; using the
@@ -15475,6 +15608,11 @@ pub const DB = struct {
         }
         defer self.endIndexRepairLease(locator.intent.index_name);
 
+        if (comptime builtin.is_test) {
+            if (test_index_repair_advance_lease_hook) |hook| {
+                if (hook.after_acquire) |after_acquire| try after_acquire(hook.ptr, self, repair_id);
+            }
+        }
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
         if (!std.mem.eql(u8, locator.intent.index_name, entry.intent.index_name)) {
@@ -15482,9 +15620,21 @@ pub const DB = struct {
         }
         if (comptime builtin.is_test) {
             if (test_index_repair_advance_lease_hook) |hook| {
-                try hook.after_acquire(hook.ptr, self, repair_id);
+                if (hook.after_reload) |after_reload| try after_reload(hook.ptr, self, repair_id);
             }
         }
+        // An audit grant is a process-local acceleration token for one exact
+        // durable revision. Selection releases the scheduler mutex before the
+        // repair lease is acquired, so a source-replay, retry, pause/resume, or
+        // concurrent owner transition may supersede it in that interval. The
+        // reloaded durable entry is authoritative; never let a stale token skip
+        // the newly revised generation's bounded convergence wait.
+        const audit_revision = if (audit_due and
+            scheduled_revision != null and
+            entry.intent.revision == scheduled_revision.?)
+            scheduled_revision
+        else
+            null;
         var run_control = DurableIndexRepairRunControl{
             .db = self,
             .index_name = entry.intent.index_name,
@@ -15501,6 +15651,7 @@ pub const DB = struct {
             repair_id,
             owned_options,
             &entry,
+            audit_revision,
         );
     }
 
@@ -15513,6 +15664,7 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
         entry: *index_repair_state.Entry,
+        audit_revision: ?u64,
     ) anyerror!IndexRepairAdvanceResult {
         var result = IndexRepairAdvanceResult{ .repair_id = repair_id };
         var effective_options = options;
@@ -15639,7 +15791,7 @@ pub const DB = struct {
             // to this durable bounded owner. Append one primary-store page,
             // then publish its cursor. A crash before the cursor repeats an
             // idempotent page; a crash after it can never skip source rows.
-            const artifact_names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(
+            const artifact_names = try self.core.index_manager.artifactProducerNamesForIndexAlloc(
                 alloc,
                 entry.intent.index_name,
             );
@@ -15714,6 +15866,7 @@ pub const DB = struct {
                         .phase = .waiting_for_convergence,
                     });
                     entry.intent.phase = .waiting_for_convergence;
+                    entry.intent.revision +|= 1;
                 },
                 .prior_generation_restored => {
                     // Yield after the rollback quantum. The restored generation
@@ -15770,22 +15923,36 @@ pub const DB = struct {
         // it once coverage and replay converge.
         if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
             const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
-            if (!try self.deferIndexRepairUntilTargetOrAudit(
-                alloc,
-                repair_id,
-                entry.intent.revision,
-                entry.intent.index_name,
-                observed_sequence,
-                entry.intent.target_sequence,
-            )) {
-                // A concurrent durable transition invalidated this observation.
-                // Consume one bounded slot and let its newer schedule decide
-                // the next wake instead of publishing a stale progress wait.
-                result.busy = true;
+            // Selection's slow-audit grant is authority for one exact durable
+            // revision, not for the whole owned turn. Claim it with a durable
+            // CAS immediately before using the queryable shortcut. Besides
+            // closing the selection/reload and reload/use races, the revision
+            // advance visibly consumes the process-local audit token so a
+            // retry must receive a fresh scheduler grant.
+            const consumed_audit_revision = if (audit_revision) |expected_revision|
+                try self.consumeIndexRepairAuditGrant(alloc, repair_id, expected_revision)
+            else
+                null;
+            const audit_due = consumed_audit_revision != null;
+            if (consumed_audit_revision) |revision| entry.intent.revision = revision;
+            if (!audit_due or observed_sequence < entry.intent.target_sequence) {
+                if (!try self.deferIndexRepairUntilTargetOrAudit(
+                    alloc,
+                    repair_id,
+                    entry.intent.revision,
+                    entry.intent.index_name,
+                    observed_sequence,
+                    entry.intent.target_sequence,
+                )) {
+                    // A concurrent durable transition invalidated this observation.
+                    // Consume one bounded slot and let its newer schedule decide
+                    // the next wake instead of publishing a stale progress wait.
+                    result.busy = true;
+                    return result;
+                }
+                result.deferred = true;
                 return result;
             }
-            result.deferred = true;
-            return result;
         }
 
         if (entry.intent.phase == .detected and entry.intent.source_replay_state == .complete) {
@@ -16187,7 +16354,13 @@ pub const DB = struct {
     }
 
     const IndexRepairSchedulerSelection = struct {
-        repair_ids: std.ArrayListUnmanaged(u128) = .empty,
+        const Repair = struct {
+            repair_id: u128,
+            revision: u64,
+            audit_due: bool,
+        };
+
+        repairs: std.ArrayListUnmanaged(Repair) = .empty,
         inspected: usize = 0,
         deferred: usize = 0,
         terminal: usize = 0,
@@ -16195,7 +16368,7 @@ pub const DB = struct {
         next_retry_at_ms: u64 = 0,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
-            self.repair_ids.deinit(alloc);
+            self.repairs.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -16220,7 +16393,7 @@ pub const DB = struct {
             execution_limit,
             @intCast(directory.cursor),
         );
-        try selection.repair_ids.ensureTotalCapacity(alloc, inspection.budget);
+        try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
@@ -16247,7 +16420,11 @@ pub const DB = struct {
                     self.async_context.index_repair_progress_wait_pending.store(false, .release);
                 }
             }
-            selection.repair_ids.appendAssumeCapacity(record.repair_id);
+            selection.repairs.appendAssumeCapacity(.{
+                .repair_id = record.repair_id,
+                .revision = record.revision,
+                .audit_due = record.audit_wait_armed,
+            });
         }
         return selection;
     }
@@ -16278,9 +16455,15 @@ pub const DB = struct {
         result.inspected = selection.inspected;
         result.remaining = selection.remaining;
         var consumed_slots: usize = 0;
-        for (selection.repair_ids.items) |repair_id| {
+        for (selection.repairs.items) |scheduled| {
             if (consumed_slots >= limit) break;
-            const advanced = try self.advanceIndexRepairIntent(alloc, repair_id, options);
+            const advanced = try self.advanceScheduledIndexRepairIntent(
+                alloc,
+                scheduled.repair_id,
+                options,
+                scheduled.revision,
+                scheduled.audit_due,
+            );
             result.attempted += @intFromBool(advanced.attempted);
             result.repaired += @intFromBool(advanced.repaired);
             result.degraded += @intFromBool(advanced.indexes_degraded_after != 0);
@@ -23639,14 +23822,14 @@ pub const DB = struct {
                 .enrichments => {},
                 .full_text => {
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
-                        try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     }
                 },
                 .full_index => {
-                    try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                    try appendOwnedManagedIndexName(self.alloc, &all_indexes, index_ref.name);
                     if (index_ref.kind == .full_text) {
-                        try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
+                        try appendOwnedManagedIndexName(self.alloc, &full_text_indexes, index_ref.name);
                     }
                 },
             }
@@ -26827,6 +27010,10 @@ pub const DB = struct {
     fn textIndexTermCount(entry: anytype) u64 {
         const snap = entry.acquireSnapshot();
         defer snap.release();
+        return textSnapshotTermCount(snap);
+    }
+
+    fn textSnapshotTermCount(snap: anytype) u64 {
         var terms: u64 = 0;
         for (snap.segments) |*seg| {
             terms +|= seg.layoutStats(false).inverted_term_count;
@@ -27261,6 +27448,14 @@ pub const DB = struct {
     }
 
     fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
+        // This compatibility overlay is not an owner capture. It must never
+        // edit facts while retaining the stamp of a different observation.
+        for (runtime_stats.indexes) |*item| {
+            item.serving_publication = null;
+            item.coverage_publication = null;
+            item.runtime_serving_applied_sequence = null;
+            item.runtime_coverage_applied_sequence = null;
+        }
         // Coverage outcomes and identity totals are one status invariant. A
         // cached status may predate the write whose generated artifact is
         // being overlaid, so refresh the maintained O(1) identity summary at
@@ -27574,6 +27769,13 @@ pub const DB = struct {
     }
 
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
+        // Serialize owner captures, not HTTP reads. A stamp orders the whole
+        // coherent capture; concurrent captures cannot assign a newer revision
+        // to an older payload. Individual index snapshots retain their own
+        // publication locks and replay prefixes are sampled before their facts.
+        lockAtomic(&self.status_publication_mutex);
+        defer self.status_publication_mutex.unlock();
+        self.status_publication_revision += 1;
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         var durable_index_repairs = try self.loadIndexRepairStateForStats(alloc);
@@ -27651,13 +27853,15 @@ pub const DB = struct {
             item.repair_scan_issue_count = index_repair_summary.repair_scan_count;
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
 
+            var serving_observed = false;
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
                         item.doc_count = text_snapshot.liveDocCount();
-                        item.term_count = textIndexTermCount(entry);
+                        item.term_count = textSnapshotTermCount(text_snapshot);
+                        serving_observed = true;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
@@ -27672,6 +27876,8 @@ pub const DB = struct {
                         item.node_count = hbc_stats.node_count;
                         item.root_node = hbc_stats.root_node;
                         item.serving_snapshot_revision = published.generation;
+                        item.serving_snapshot_owner_id = self.backend_owner_id;
+                        serving_observed = true;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
@@ -27702,6 +27908,7 @@ pub const DB = struct {
                         else
                             sparse_snapshot.doc_count;
                         item.term_count = sparse_snapshot.term_count;
+                        serving_observed = true;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
@@ -27709,16 +27916,23 @@ pub const DB = struct {
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
                         graph_stats: {
-                            const graph_snapshot = entry.index.stats(alloc) catch break :graph_stats;
+                            const graph_snapshot = entry.index.stats(alloc) catch {
+                                serving_observed = false;
+                                break :graph_stats;
+                            };
                             item.edge_count = graph_snapshot.edge_count;
                             item.node_count = graph_snapshot.node_count;
                             item.doc_count = graph_snapshot.node_count;
+                            serving_observed = true;
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
                     }
                 },
-                .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
+                .algebraic => {
+                    try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false);
+                    serving_observed = self.core.index_manager.algebraicIndex(cfg.name) != null;
+                },
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
@@ -27729,6 +27943,7 @@ pub const DB = struct {
                 );
             }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
+            self.stampIndexObservation(cfg, &item, if (durable_index_repairs) |*state| state else null, serving_observed);
             index_stats[index_count] = item;
             index_count += 1;
         }
@@ -27758,6 +27973,32 @@ pub const DB = struct {
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
         };
+    }
+
+    fn stampIndexObservation(self: *DB, cfg: types.IndexConfig, item: *types.DBIndexStats, repairs: ?*const index_repair_state.State, serving_observed: bool) void {
+        // Read-only and status-only DBs are observers, not successor writers.
+        if (self.open_mode != .writer and self.open_mode != .writer_no_replay) return;
+        if (!item.coverage_identity_ready or item.load_error != null) return;
+        if (!serving_observed and !item.coverage_summary_ready) return;
+        const recovered = self.observeResidentIndexAdmission(self.alloc, item.name, repairs) == .admitted and
+            !item.repair_degraded and !item.index_repair_action_required and
+            (std.mem.eql(u8, item.projection_checkpoint_status, "clean") or item.index_repair_active_generation_serviceable) and
+            item.projection_checkpoint_config_hash == types.indexConfigHash(cfg) and
+            item.projection_checkpoint_applied_sequence <= item.replay_applied_sequence;
+        const stamp = @import("publication.zig").Stamp{
+            .owner_epoch = self.status_owner_epoch,
+            .revision = self.status_publication_revision,
+            .applied_through = item.replay_applied_sequence,
+            .recovered_through = if (recovered) item.projection_checkpoint_applied_sequence else null,
+        };
+        if (serving_observed) {
+            item.serving_publication = stamp;
+            item.runtime_serving_applied_sequence = stamp.applied_through;
+        }
+        if (item.coverage_summary_ready) {
+            item.coverage_publication = stamp;
+            item.runtime_coverage_applied_sequence = stamp.applied_through;
+        }
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -33413,7 +33654,10 @@ fn encodeThinReplayRecordPayload(
     derived_changed_flags: []const bool,
     sequence: u64,
     include_generated_enrichment_hint: bool,
+    index_manager: ?*index_manager_mod.IndexManager,
+    sync_targets_out: ?*ManagedSyncTargets,
 ) ![]u8 {
+    if ((index_manager == null) != (sync_targets_out == null)) return error.InvalidArgument;
     if (derived_changed_flags.len != req.writes.len) return error.InvalidArgument;
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     var changed_doc_key_set = std.StringHashMapUnmanaged(void).empty;
@@ -33553,6 +33797,8 @@ fn encodeThinReplayRecordPayload(
         .target_hints = try target_hints.toOwnedSlice(alloc),
     };
     defer change_journal_mod.deinitRecord(alloc, &record);
+    if (sync_targets_out) |out|
+        out.* = try collectManagedSyncTargetsForRecord(alloc, index_manager.?, record);
     return try change_journal_mod.encodeRecord(alloc, record);
 }
 
@@ -41649,6 +41895,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     };
     var derived_batch = try buildDerivedBatch(ctx.alloc, req, &.{}, deleted_artifact_keys.items, &.{});
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
+    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
+    defer sync_targets.deinit(ctx.alloc);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
     const identity_live_before = (try doc_identity.fastStatsFromStore(ctx.store)).live_ordinals;
@@ -41715,11 +41963,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
     snapshot_mutation = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
-    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
-    defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
@@ -41775,6 +42021,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 }
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
+    var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
+    defer sync_targets.deinit(ctx.alloc);
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
@@ -41794,7 +42042,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     apply_mutex_held = false;
     if (snapshot_replay) |*lease| lease.release();
     snapshot_replay = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -44161,6 +44409,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     defer batch_ctx.alloc.free(replay_deleted_keys);
     var replay_batch = batch;
     replay_batch.deleted_keys = replay_deleted_keys;
+    var sync_targets = try collectManagedSyncTargets(batch_ctx.alloc, batch_ctx.index_manager, replay_batch);
+    defer sync_targets.deinit(batch_ctx.alloc);
 
     batch_ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
@@ -44203,7 +44453,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
-    DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
+    DB.notifyQueryVisibilityTargetAdvancedScopedContext(&batch_ctx, sequence, sync_targets);
     releaseHAMutationShared(&ha_mutation);
     try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -46460,13 +46710,13 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 batch.deleted_keys,
             );
             defer freeOwnedKeySlice(ctx.alloc, replay_delete_keys);
-            // A dense upsert is a replacement only inside the index named by
-            // the embedding write. Deriving the delete after per-index
-            // filtering keeps that intent out of the batch-wide delete lane.
-            const replacement_keys = try collectDenseEmbeddingReplacementKeys(ctx.alloc, dense_embeddings.writes);
-            defer if (replacement_keys.len > 0) ctx.alloc.free(replacement_keys);
             try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replay_delete_keys, batch_options);
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replacement_keys, batch_options);
+            // Dense apply is already an exact-member upsert: it retains the
+            // existing vector id, skips identical payloads, and replaces a
+            // changed payload in one HBC mutation batch. A separate pre-delete
+            // would publish an artificial lower-cardinality checkpoint from a
+            // streaming replay session before the upsert restores the member.
+            // Reserve the delete lane for actual source/artifact removals.
             const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
                 entry.chunk_name != null
             else
@@ -46736,6 +46986,91 @@ const ManagedIndexBatchApplicability = enum {
     missing_dependency,
 };
 
+fn vectorIndexConsumesChunkKey(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    key: []const u8,
+) bool {
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name, const embedding_names = switch (index_ref.kind) {
+        .dense_vector => blk: {
+            const entry = index_manager.denseIndex(index_ref.name) orelse return false;
+            break :blk .{ entry.chunk_name, entry.embedding_names };
+        },
+        .sparse_vector => blk: {
+            const entry = index_manager.sparseIndex(index_ref.name) orelse return false;
+            break :blk .{ entry.chunk_name, entry.embedding_names };
+        },
+        else => return false,
+    };
+    if (chunk_name) |name| {
+        if (internal_keys.matchesChunkArtifactName(key, name)) return true;
+    }
+    // Multi-source indexes cache only their first source's chunk name. Resolve
+    // the remaining configured producers, without inspecting artifact storage:
+    // the chunk and its embedding rows may already have been deleted.
+    for (embedding_names) |name| {
+        const producer = index_manager.getEnrichment(.embedding, name) orelse continue;
+        if (producer.source_artifact_name.len > 0 and
+            internal_keys.matchesChunkArtifactName(key, producer.source_artifact_name)) return true;
+    }
+    return false;
+}
+
+fn managedIndexDeleteKeyAffectsProjection(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    key: []const u8,
+) bool {
+    // Public document identities are carried unencoded in ordinary replay;
+    // primary-store document keys may appear in replicated/internal paths.
+    // Either form can remove a member from every document-backed projection.
+    if (isMetadataKey(key) or internal_keys.isInternalMetadataKey(key)) return false;
+    if (!internal_keys.isInternalUserKey(key) or internal_keys.isPrimaryDocumentKey(key)) return true;
+
+    // Internal cleanup keys are not generic document deletions. Only the
+    // projection that consumes the exact artifact may treat one as reduction
+    // authority; manifests, retry state, and sibling artifacts are no-ops.
+    return switch (index_ref.kind) {
+        .full_text => index_manager.textIndexAcceptsArtifactKey(index_ref.name, key),
+        // Chunk retirement removes its logical members even when the surviving
+        // embeddings are cache hits and publish no replacement writes.
+        .dense_vector, .sparse_vector => vectorIndexConsumesChunkKey(index_manager, index_ref, key) or batchHasEmbeddingArtifactForManagedIndex(
+            index_manager,
+            index_ref,
+            &.{key},
+        ),
+        .algebraic => false,
+        .graph => blk: {
+            if (internal_keys.isGraphEdgeArtifactKey(key)) {
+                const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, key) catch break :blk false) orelse break :blk false;
+                defer {
+                    index_manager.alloc.free(parsed.doc_key);
+                    index_manager.alloc.free(parsed.index_name);
+                    index_manager.alloc.free(parsed.edge_type);
+                    index_manager.alloc.free(parsed.target_doc_key);
+                }
+                if (std.mem.eql(u8, parsed.index_name, index_ref.name)) break :blk true;
+            }
+            for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                if (graphArtifactSourceConsumesArtifactKey(index_manager, source, key)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+fn managedIndexDeleteKeysAffectProjection(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    keys: []const []const u8,
+) bool {
+    for (keys) |key| {
+        if (managedIndexDeleteKeyAffectsProjection(index_manager, index_ref, key)) return true;
+    }
+    return false;
+}
+
 fn managedIndexBatchApplicability(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
@@ -46743,14 +47078,16 @@ fn managedIndexBatchApplicability(
 ) ManagedIndexBatchApplicability {
     switch (index_ref.kind) {
         .full_text, .algebraic => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             for (batch.documents) |doc| {
                 if (doc.action == .upsert) return .relevant;
             }
             return .irrelevant;
         },
         .dense_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -46767,7 +47104,8 @@ fn managedIndexBatchApplicability(
             return .irrelevant;
         },
         .sparse_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+                batch.overwritten_doc_keys.len > 0) return .relevant;
             const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_ref.name);
             if (!uses_artifact_members) {
                 for (batch.documents) |doc| {
@@ -46784,7 +47122,7 @@ fn managedIndexBatchApplicability(
             return .irrelevant;
         },
         .graph => {
-            if (batch.deleted_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys)) return .relevant;
             for (batch.graph_doc_clears) |clear| {
                 for (clear.index_names) |index_name| {
                     if (std.mem.eql(u8, index_name, index_ref.name)) return .relevant;
@@ -46903,12 +47241,13 @@ fn managedIndexRecordApplicability(
     switch (index_ref.kind) {
         .full_text, .algebraic => {
             if (record.changed_doc_keys.len > 0 or
-                record.deleted_doc_keys.len > 0 or
+                managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
                 record.overwritten_doc_keys.len > 0) return .relevant;
             return .irrelevant;
         },
         .dense_vector => {
-            if (record.deleted_doc_keys.len > 0 or record.overwritten_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
+                record.overwritten_doc_keys.len > 0) return .relevant;
             // Artifact-backed indexes consume generated artifact records, not
             // the source document record that scheduled enrichment. Treating
             // that source record as perpetually applicable prevents a clean
@@ -46924,13 +47263,13 @@ fn managedIndexRecordApplicability(
         },
         .sparse_vector => {
             if (record.changed_doc_keys.len > 0 or
-                record.deleted_doc_keys.len > 0 or
+                managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
                 record.overwritten_doc_keys.len > 0) return .relevant;
             if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
         .graph => {
-            if (record.deleted_doc_keys.len > 0) return .relevant;
+            if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys)) return .relevant;
             for (record.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
                     for (index_manager.graphArtifactSources(index_ref.name)) |source| {
@@ -47712,9 +48051,28 @@ fn collectVectorReplayDeleteKeys(
     }
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
+    const embedding_names: []const []const u8 = switch (index_ref.kind) {
+        .dense_vector => if (index_manager.denseIndex(index_ref.name)) |entry| entry.embedding_names else &.{},
+        .sparse_vector => if (index_manager.sparseIndex(index_ref.name)) |entry| entry.embedding_names else &.{},
+        else => unreachable,
+    };
 
     for (deleted_keys) |key| {
         if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+            if (!managedIndexDeleteKeyAffectsProjection(index_manager, index_ref, key)) continue;
+            if (embedding_names.len > 0 and internal_keys.isChunkArtifactRecordKey(key)) {
+                // Multi-source projections key members by embedding artifact,
+                // not by chunk. Derive the retired identities from the bound
+                // producers; the source rows no longer exist at replay time.
+                for (embedding_names) |name| {
+                    const producer = index_manager.getEnrichment(.embedding, name) orelse continue;
+                    if (!internal_keys.matchesChunkArtifactName(key, producer.source_artifact_name)) continue;
+                    const member_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, key, name);
+                    defer alloc.free(member_key);
+                    try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, member_key);
+                }
+                continue;
+            }
             try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, key);
             continue;
         }
@@ -47725,22 +48083,7 @@ fn collectVectorReplayDeleteKeys(
         } orelse continue;
         defer identity.deinit(alloc);
         if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) continue;
-        try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, identity.doc_key);
-    }
-    return try keys.toOwnedSlice(alloc);
-}
-
-fn collectDenseEmbeddingReplacementKeys(
-    alloc: Allocator,
-    embeddings: []const mapper.DenseEmbeddingWrite,
-) ![]const []const u8 {
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer keys.deinit(alloc);
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(alloc);
-
-    for (embeddings) |embedding| {
-        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, embedding.doc_key);
+        try appendUniqueOwnedKeyIndexed(alloc, &keys, &seen, if (embedding_names.len > 0) key else identity.doc_key);
     }
     return try keys.toOwnedSlice(alloc);
 }
@@ -50223,16 +50566,141 @@ fn collectGraphMutationsForArtifacts(
     };
 }
 
+const GeneratedEnrichmentNameLookup = struct {
+    all: std.StringHashMapUnmanaged(void) = .empty,
+    embeddings: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        index_manager: *const index_manager_mod.IndexManager,
+    ) !GeneratedEnrichmentNameLookup {
+        var lookup = GeneratedEnrichmentNameLookup{};
+        errdefer lookup.deinit(alloc);
+        try lookup.all.ensureTotalCapacity(alloc, @intCast(index_manager.enrichments.items.len));
+        try lookup.embeddings.ensureTotalCapacity(alloc, @intCast(index_manager.enrichments.items.len));
+        for (index_manager.enrichments.items) |entry| {
+            lookup.all.putAssumeCapacity(entry.name, {});
+            if (entry.kind == .embedding) lookup.embeddings.putAssumeCapacity(entry.name, {});
+        }
+        return lookup;
+    }
+
+    fn deinit(self: *GeneratedEnrichmentNameLookup, alloc: Allocator) void {
+        self.all.deinit(alloc);
+        self.embeddings.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn artifactSourcesContainGeneratedEnrichment(
+    lookup: *const std.StringHashMapUnmanaged(void),
+    names: []const []const u8,
+) bool {
+    for (names) |name| {
+        if (lookup.contains(name)) return true;
+    }
+    return false;
+}
+
+fn collectManagedIndexCandidates(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    classify_generated_dependencies: bool,
+) ![]ManagedIndexCandidate {
+    var generated_names = if (classify_generated_dependencies)
+        try GeneratedEnrichmentNameLookup.init(alloc, index_manager)
+    else
+        GeneratedEnrichmentNameLookup{};
+    defer generated_names.deinit(alloc);
+
+    var candidates = std.ArrayListUnmanaged(ManagedIndexCandidate).empty;
+    errdefer candidates.deinit(alloc);
+    try candidates.ensureTotalCapacity(alloc, index_manager.count());
+
+    for (index_manager.text_indexes.items) |*entry| {
+        const generated = (entry.chunk_name != null and generated_names.all.contains(entry.chunk_name.?)) or
+            artifactSourcesContainGeneratedEnrichment(&generated_names.all, entry.source_artifact_names);
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .full_text },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.dense_indexes.items) |*entry| {
+        const generated = artifactSourcesContainGeneratedEnrichment(
+            &generated_names.embeddings,
+            entry.embedding_names,
+        ) or
+            (!entry.external and entry.embedding_name != null and
+                generated_names.embeddings.contains(entry.embedding_name.?));
+        candidates.appendAssumeCapacity(.{
+            .ref = .{
+                .name = entry.config.name,
+                .kind = .dense_vector,
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+            },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.sparse_indexes.items) |*entry| {
+        const generated = artifactSourcesContainGeneratedEnrichment(
+            &generated_names.embeddings,
+            entry.embedding_names,
+        ) or
+            (!entry.external and entry.embedding_name != null and
+                generated_names.embeddings.contains(entry.embedding_name.?));
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .sparse_vector },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.graph_indexes.items) |*entry| {
+        var generated = false;
+        for (entry.artifact_sources) |source| {
+            if (generated_names.all.contains(source.artifact_name)) {
+                generated = true;
+                break;
+            }
+        }
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .graph },
+            .config = &entry.config,
+            .consumes_generated_enrichment = generated,
+        });
+    }
+    for (index_manager.algebraic_indexes.items) |*entry| {
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = entry.config.name, .kind = .algebraic },
+            .config = &entry.config,
+            .consumes_generated_enrichment = false,
+        });
+    }
+    for (index_manager.status_only_index_configs) |*cfg| {
+        if (index_manager.loadFailure(cfg.name) != null) continue;
+        candidates.appendAssumeCapacity(.{
+            .ref = .{ .name = cfg.name, .kind = cfg.kind },
+            .config = cfg,
+            .consumes_generated_enrichment = false,
+        });
+    }
+    return try candidates.toOwnedSlice(alloc);
+}
+
 fn collectManagedSyncTargets(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
 ) !ManagedSyncTargets {
-    const managed_indexes = try index_manager.managedIndexes(alloc);
-    defer {
-        for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
-        alloc.free(managed_indexes);
-    }
+    const generated_source_advanced = batchContainsSourceUpsert(batch) and
+        index_manager.hasGeneratedEnrichmentTargets();
+    const managed_indexes = try collectManagedIndexCandidates(
+        alloc,
+        index_manager,
+        generated_source_advanced,
+    );
+    defer alloc.free(managed_indexes);
 
     var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -50244,30 +50712,225 @@ fn collectManagedSyncTargets(
         for (all_indexes.items) |name| alloc.free(@constCast(name));
         all_indexes.deinit(alloc);
     }
+    var target_identities = std.ArrayListUnmanaged(IndexTargetVisibility).empty;
+    errdefer {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+    }
 
-    for (managed_indexes) |index_ref| {
-        if (!batchAffectsManagedIndex(index_manager, batch, index_ref)) continue;
-        try appendUniqueOwnedName(alloc, &all_indexes, index_ref.name);
-        if (index_ref.kind == .full_text) {
-            try appendUniqueOwnedName(alloc, &full_text_indexes, index_ref.name);
+    var target_scope_known = true;
+    for (managed_indexes) |candidate| {
+        const applicability = managedIndexBatchApplicability(index_manager, batch, candidate.ref);
+        switch (applicability) {
+            .irrelevant, .missing_dependency => {},
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &all_indexes, candidate.ref.name);
+                if (candidate.ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, candidate.ref.name);
+            },
+        }
+        if (applicability != .irrelevant or
+            (generated_source_advanced and candidate.consumes_generated_enrichment))
+        {
+            try appendManagedTargetIdentity(
+                alloc,
+                &target_identities,
+                candidate.config,
+                managedIndexBatchServingSetEffect(index_manager, batch, candidate.ref),
+                &target_scope_known,
+            );
         }
     }
 
+    return try finishManagedSyncTargets(
+        alloc,
+        &full_text_indexes,
+        &all_indexes,
+        &target_identities,
+        target_scope_known,
+    );
+}
+
+fn collectManagedSyncTargetsForRecord(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+) !ManagedSyncTargets {
+    const generated_source_advanced = replayRecordHasTargetHint(record, .enrichment);
+    const managed_indexes = try collectManagedIndexCandidates(
+        alloc,
+        index_manager,
+        generated_source_advanced,
+    );
+    defer alloc.free(managed_indexes);
+
+    var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (full_text_indexes.items) |name| alloc.free(@constCast(name));
+        full_text_indexes.deinit(alloc);
+    }
+    var all_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (all_indexes.items) |name| alloc.free(@constCast(name));
+        all_indexes.deinit(alloc);
+    }
+    var target_identities = std.ArrayListUnmanaged(IndexTargetVisibility).empty;
+    errdefer {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+    }
+
+    var target_scope_known = true;
+    for (managed_indexes) |candidate| {
+        const applicability = managedIndexRecordApplicability(index_manager, record, candidate.ref);
+        switch (applicability) {
+            .irrelevant, .missing_dependency => {},
+            .relevant => {
+                try appendOwnedManagedIndexName(alloc, &all_indexes, candidate.ref.name);
+                if (candidate.ref.kind == .full_text)
+                    try appendOwnedManagedIndexName(alloc, &full_text_indexes, candidate.ref.name);
+            },
+        }
+        if (applicability != .irrelevant or
+            (generated_source_advanced and candidate.consumes_generated_enrichment))
+        {
+            try appendManagedTargetIdentity(
+                alloc,
+                &target_identities,
+                candidate.config,
+                managedIndexRecordServingSetEffect(index_manager, record, candidate.ref),
+                &target_scope_known,
+            );
+        }
+    }
+
+    return try finishManagedSyncTargets(
+        alloc,
+        &full_text_indexes,
+        &all_indexes,
+        &target_identities,
+        target_scope_known,
+    );
+}
+
+fn finishManagedSyncTargets(
+    alloc: Allocator,
+    full_text_indexes: *std.ArrayListUnmanaged([]const u8),
+    all_indexes: *std.ArrayListUnmanaged([]const u8),
+    target_identities: *std.ArrayListUnmanaged(IndexTargetVisibility),
+    target_scope_known: bool,
+) !ManagedSyncTargets {
+    const owned_full_text = try full_text_indexes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_full_text) |name| alloc.free(@constCast(name));
+        if (owned_full_text.len > 0) alloc.free(owned_full_text);
+    }
+    const owned_all = try all_indexes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_all) |name| alloc.free(@constCast(name));
+        if (owned_all.len > 0) alloc.free(owned_all);
+    }
+    var identities: []IndexTargetVisibility = &.{};
+    if (target_scope_known) {
+        identities = try target_identities.toOwnedSlice(alloc);
+    } else {
+        for (target_identities.items) |identity| alloc.free(@constCast(identity.index_name));
+        target_identities.deinit(alloc);
+        target_identities.* = .empty;
+    }
+
     return .{
-        .full_text_indexes = try full_text_indexes.toOwnedSlice(alloc),
-        .all_indexes = try all_indexes.toOwnedSlice(alloc),
+        .full_text_indexes = owned_full_text,
+        .all_indexes = owned_all,
+        .target_identities = identities,
+        .target_scope_known = target_scope_known,
     };
 }
 
-fn appendUniqueOwnedName(
+fn appendManagedTargetIdentity(
+    alloc: Allocator,
+    identities: *std.ArrayListUnmanaged(IndexTargetVisibility),
+    cfg: *const types.IndexConfig,
+    serving_set_effect: IndexTargetVisibility.ServingSetEffect,
+    scope_known: *bool,
+) !void {
+    if (!scope_known.*) return;
+    const fingerprint = cfg.coverage_config_fingerprint orelse {
+        scope_known.* = false;
+        return;
+    };
+    const owned_name = try alloc.dupe(u8, cfg.name);
+    errdefer alloc.free(owned_name);
+    try identities.append(alloc, .{
+        .index_name = owned_name,
+        .kind = cfg.kind,
+        .incarnation = internal_keys.derivedCoverageGenerationForConfig(
+            cfg.coverage_generation,
+            cfg.config_json,
+        ),
+        .config_hash = fingerprint,
+        .serving_set_effect = serving_set_effect,
+    });
+}
+
+fn managedIndexBatchServingSetEffect(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) IndexTargetVisibility.ServingSetEffect {
+    if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, batch.deleted_keys) or
+        batch.overwritten_doc_keys.len != 0)
+        return .may_reduce;
+    if (index_ref.kind == .graph and
+        (batch.graph_doc_clears.len != 0 or batch.graph_deletes.len != 0))
+        return .may_reduce;
+    return .additive_only;
+}
+
+fn managedIndexRecordServingSetEffect(
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) IndexTargetVisibility.ServingSetEffect {
+    if (managedIndexDeleteKeysAffectProjection(index_manager, index_ref, record.deleted_doc_keys) or
+        record.overwritten_doc_keys.len != 0)
+        return .may_reduce;
+    // The compact replay record intentionally coalesces graph writes and
+    // deletes into changed artifact identities. Without the original batch's
+    // operation tags a relevant graph mutation must remain conservative.
+    if (index_ref.kind == .graph and record.changed_artifact_keys.len != 0)
+        return .may_reduce;
+    return .additive_only;
+}
+
+fn replayRecordHasTargetHint(
+    record: change_journal_mod.Record,
+    hint: change_journal_mod.TargetHint,
+) bool {
+    for (record.target_hints) |candidate| {
+        if (candidate == hint) return true;
+    }
+    return false;
+}
+
+fn batchContainsSourceUpsert(batch: derived_types.DerivedBatch) bool {
+    for (batch.documents) |doc| {
+        if (doc.action == .upsert) return true;
+    }
+    return false;
+}
+
+fn appendOwnedManagedIndexName(
     alloc: Allocator,
     items: *std.ArrayListUnmanaged([]const u8),
     value: []const u8,
 ) !void {
-    for (items.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
-    try items.append(alloc, try alloc.dupe(u8, value));
+    // IndexManager.managedIndexes() returns one entry per index name, so each
+    // filtered projection is already unique. Preserve that invariant here
+    // instead of turning target discovery into an O(indexes^2) duplicate scan.
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try items.append(alloc, owned);
 }
 
 fn waitForManagedIndexesApplied(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -54275,6 +54938,69 @@ const GateDenseEmbedder = struct {
             .blocked_requests = self.blocked_requests.load(.acquire),
             .successful_requests = self.successful_requests.load(.acquire),
         };
+    }
+};
+
+const SelectiveGateDenseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+    blocked_embedding_name: []const u8,
+    blocked: std.atomic.Value(bool) = .init(true),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+
+    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        const self: *SelectiveGateDenseEmbedder = @ptrCast(@alignCast(ptr));
+        if (self.blocked.load(.acquire) and std.mem.eql(u8, embedding_name, self.blocked_embedding_name)) {
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return error.EmbedRateLimited;
+        }
+        _ = self.successful_requests.fetchAdd(1, .monotonic);
+        return try embedder_mod.DeterministicDenseEmbedder.embedDense(
+            &self.deterministic,
+            alloc,
+            embedding_name,
+            text,
+            dims,
+        );
+    }
+
+    fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+            .deinit_fn = null,
+        };
+    }
+
+    fn allowAll(self: *@This()) void {
+        self.blocked.store(false, .release);
+    }
+};
+
+const GateAssetProducer = struct {
+    blocked: std.atomic.Value(bool) = .init(true),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *GateAssetProducer = @ptrCast(@alignCast(ptr));
+        if (self.blocked.load(.acquire)) {
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return error.EmbedRateLimited;
+        }
+        _ = self.successful_requests.fetchAdd(1, .monotonic);
+        return try std.fmt.allocPrint(alloc, "asset:{s}", .{request.source_text});
+    }
+
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .produce = produce },
+        };
+    }
+
+    fn allowAll(self: *@This()) void {
+        self.blocked.store(false, .release);
     }
 };
 
@@ -60312,16 +61038,38 @@ test "db source commit publishes exact target observation sequence" {
         .executor = .{ .backend = .manual },
     });
     defer db.close();
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
 
     const HookCtx = struct {
         target_calls: u64 = 0,
         target_sequence: u64 = 0,
+        target_scope_known: bool = false,
+        target_count: usize = 0,
+        target_kind: ?types.IndexKind = null,
+        target_incarnation: u64 = 0,
+        target_config_hash: u64 = 0,
+        target_name_matches: bool = false,
+        target_effect: ?IndexTargetVisibility.ServingSetEffect = null,
 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.change != .target_advanced) return;
             self.target_calls += 1;
             self.target_sequence = event.target_sequence orelse 0;
+            self.target_scope_known = event.target_scope_known;
+            self.target_count = event.target_indexes.len;
+            if (event.target_indexes.len == 1) {
+                const target = event.target_indexes[0];
+                self.target_kind = target.kind;
+                self.target_incarnation = target.incarnation;
+                self.target_config_hash = target.config_hash;
+                self.target_name_matches = std.mem.eql(u8, target.index_name, "full_text_index_v0");
+                self.target_effect = target.serving_set_effect;
+            }
         }
     };
     var hook_ctx = HookCtx{};
@@ -60341,6 +61089,214 @@ test "db source commit publishes exact target observation sequence" {
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.target_calls);
     try std.testing.expectEqual(db.core.nextDerivedSequence(), hook_ctx.target_sequence);
     try std.testing.expect(hook_ctx.target_sequence > 0);
+    try std.testing.expect(hook_ctx.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), hook_ctx.target_count);
+    try std.testing.expectEqual(types.IndexKind.full_text, hook_ctx.target_kind.?);
+    try std.testing.expect(hook_ctx.target_name_matches);
+    try std.testing.expect(hook_ctx.target_incarnation > 0);
+    try std.testing.expect(hook_ctx.target_config_hash > 0);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, hook_ctx.target_effect.?);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replacement\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 2), hook_ctx.target_calls);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, hook_ctx.target_effect.?);
+}
+
+test "db generated downstream indexes are exact convergence targets at source commit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    var replay_targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.enrichment},
+    });
+    defer replay_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), replay_targets.all_indexes.len);
+    try std.testing.expect(replay_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
+    for (replay_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+
+    var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .documents = &.{.{ .key = "doc:a", .cleaned_value = "{}" }},
+    });
+    defer materialized_targets.deinit(alloc);
+    // Whole-document dense generation can be applied directly by the
+    // materialized path; graph production remains asynchronous. Both still
+    // belong to the commit-time visibility target set.
+    try std.testing.expectEqual(@as(usize, 1), materialized_targets.all_indexes.len);
+    try std.testing.expectEqualStrings("semantic", materialized_targets.all_indexes[0]);
+    try std.testing.expect(materialized_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), materialized_targets.target_identities.len);
+    for (materialized_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+
+    var deletion_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{"doc:a"},
+    });
+    defer deletion_targets.deinit(alloc);
+    try std.testing.expect(deletion_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), deletion_targets.target_identities.len);
+    for (deletion_targets.target_identities) |target|
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
+
+    // Internal replay/control cleanup is not a user deletion and must not
+    // grant every index permission to replace a newer serving snapshot with a
+    // lower one. An exact consumed artifact deletion remains reducing.
+    var metadata_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{internal_keys.replay_meta_next_sequence_key[0..]},
+    });
+    defer metadata_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), metadata_delete_targets.target_identities.len);
+
+    var storage_metadata_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{"\x00\x00__metadata__:manifest"},
+    });
+    defer storage_metadata_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), storage_metadata_delete_targets.target_identities.len);
+
+    const unrelated_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "unrelated");
+    defer alloc.free(unrelated_artifact);
+    var unrelated_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{unrelated_artifact},
+        .changed_artifact_keys = &.{unrelated_artifact},
+    });
+    defer unrelated_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), unrelated_delete_targets.all_indexes.len);
+
+    const consumed_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic");
+    defer alloc.free(consumed_artifact);
+    var consumed_delete_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
+        .deleted_keys = &.{consumed_artifact},
+        .changed_artifact_keys = &.{consumed_artifact},
+    });
+    defer consumed_delete_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), consumed_delete_targets.target_identities.len);
+    try std.testing.expectEqualStrings("semantic", consumed_delete_targets.target_identities[0].index_name);
+    try std.testing.expectEqual(
+        IndexTargetVisibility.ServingSetEffect.may_reduce,
+        consumed_delete_targets.target_identities[0].serving_set_effect,
+    );
+
+    const HookCtx = struct {
+        calls: usize = 0,
+        target_scope_known: bool = false,
+        target_count: usize = 0,
+        saw_dense: bool = false,
+        saw_graph: bool = false,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.change != .target_advanced) return;
+            self.calls += 1;
+            self.target_scope_known = event.target_scope_known;
+            self.target_count = event.target_indexes.len;
+            for (event.target_indexes) |target| {
+                if (std.mem.eql(u8, target.index_name, "semantic")) {
+                    self.saw_dense = target.kind == .dense_vector and
+                        target.incarnation != 0 and target.config_hash != 0;
+                }
+                if (std.mem.eql(u8, target.index_name, "relations_graph")) {
+                    self.saw_graph = target.kind == .graph and
+                        target.incarnation != 0 and target.config_hash != 0;
+                }
+            }
+        }
+    };
+    var hook_ctx = HookCtx{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = HookCtx.onChange,
+    });
+
+    // Both indexes are complete for the empty source before this write. The
+    // source commit must fence their exact convergence identities immediately;
+    // waiting for the later generated artifact commit leaves a false-complete
+    // window for status and backup consumers.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha\",\"relations\":[]}",
+        }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), hook_ctx.calls);
+    try std.testing.expect(hook_ctx.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 2), hook_ctx.target_count);
+    try std.testing.expect(hook_ctx.saw_dense);
+    try std.testing.expect(hook_ctx.saw_graph);
+}
+
+test "db generated downstream indexes are exact convergence targets at source commit including implicit chunk deletion" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "default", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+        .full_text_index = true,
+    });
+    const key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks", 0);
+    defer alloc.free(key);
+    var context = try db.core.index_manager.acquireTextPublicationContext(alloc, "default");
+    defer context.deinit();
+    try std.testing.expect(try db.core.index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked("default", context, key));
+    const batch: derived_types.DerivedBatch = .{ .deleted_keys = &.{key} };
+    var targets = try collectManagedSyncTargets(alloc, db.core.index_manager, batch);
+    defer targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), targets.all_indexes.len);
+    try std.testing.expectEqualStrings("default", targets.all_indexes[0]);
+    try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, targets.target_identities[0].serving_set_effect);
+    var replay_targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{ .sequence = 7, .deleted_doc_keys = &.{key} });
+    defer replay_targets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay_targets.all_indexes.len);
+    const deletes = try collectTextReplayDeleteKeys(alloc, db.core.index_manager, batch, "default", context);
+    defer alloc.free(deletes);
+    try std.testing.expectEqual(@as(usize, 1), deletes.len);
+    try std.testing.expectEqualStrings(key, deletes[0]);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -63270,15 +64226,26 @@ test "db vector status revalidates stale repair admission without a query" {
         if (std.mem.eql(u8, index_stats.name, "dense_status")) {
             observed_dense = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(db.backend_owner_id, index_stats.serving_snapshot_owner_id);
+            try std.testing.expectEqual(db.status_owner_epoch, index_stats.serving_publication.?.owner_epoch);
         } else if (std.mem.eql(u8, index_stats.name, "sparse_status")) {
             observed_sparse = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(db.status_owner_epoch, index_stats.serving_publication.?.owner_epoch);
         }
     }
     try std.testing.expect(observed_dense);
     try std.testing.expect(observed_sparse);
     try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_status"));
     try std.testing.expect(!db.core.index_manager.repairUnavailable("sparse_status"));
+    var refreshed = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, refreshed);
+    try std.testing.expect(refreshed.indexes[0].serving_publication.?.revision > stats.indexes[0].serving_publication.?.revision);
+    try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &refreshed));
+    for (refreshed.indexes) |item| {
+        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.serving_publication);
+        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.coverage_publication);
+    }
 }
 
 test "db resolver catalog persists across reopen" {
@@ -70714,6 +71681,176 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+test "db retryable chunked producer does not block independent dense publication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = SelectiveGateDenseEmbedder{
+        .blocked_embedding_name = "body_chunk_dense",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // Register the throttled chunked producer first. Request ordering must not
+    // be the mechanism that lets the direct title producer make progress.
+    try db.addIndex(.{
+        .name = "body_chunks",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","chunk_size":8,"chunk_overlap":2,"embedding_name":"body_chunk_dense"}}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"abcdefghijklmno\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    var sibling_published = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        if (gated.blocked_requests.load(.acquire) != 0) {
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+                sibling_published = index_stats.doc_count == 1 and
+                    index_stats.coverage_produced_count == 1 and
+                    index_stats.replay_applied_sequence != 0;
+                break;
+            }
+        }
+        if (sibling_published) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(gated.blocked_requests.load(.acquire) != 0);
+    try std.testing.expect(gated.successful_requests.load(.acquire) != 0);
+    try std.testing.expect(sibling_published);
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+}
+
+test "db retryable asset producer batches do not block independent dense publication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated_asset = GateAssetProducer{};
+    var dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = gated_asset.interface(),
+            .dense_embedder = dense.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    // Register the unavailable asset producer first so request ordering cannot
+    // be the mechanism that lets the dense producer make progress.
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    // A distinct producer configuration forces a second native batch. Batch
+    // partitioning must remain deferred so the first outage cannot perform
+    // provider I/O while later producer classes are still being planned.
+    try db.addEnrichment(.{
+        .name = "summary_v2",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock-secondary\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"unavailable summary source\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    var sibling_published = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        if (gated_asset.blocked_requests.load(.acquire) != 0) {
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+                sibling_published = index_stats.doc_count == 1 and
+                    index_stats.coverage_produced_count == 1 and
+                    index_stats.replay_applied_sequence != 0;
+                break;
+            }
+        }
+        if (sibling_published) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(gated_asset.blocked_requests.load(.acquire) >= 2);
+    try std.testing.expect(sibling_published);
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    gated_asset.allowAll();
+    try db.runUntilIdle();
+    try std.testing.expect(gated_asset.successful_requests.load(.acquire) != 0);
+}
+
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 
@@ -73430,6 +74567,44 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
 
     try std.testing.expectEqual(@as(usize, 1), sync_targets.all_indexes.len);
     try std.testing.expectEqualStrings("gr_v1", sync_targets.all_indexes[0]);
+    try std.testing.expect(sync_targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), sync_targets.target_identities.len);
+    try std.testing.expectEqualStrings("gr_v1", sync_targets.target_identities[0].index_name);
+    try std.testing.expectEqual(types.IndexKind.graph, sync_targets.target_identities[0].kind);
+    try std.testing.expect(sync_targets.target_identities[0].incarnation > 0);
+    try std.testing.expect(sync_targets.target_identities[0].config_hash > 0);
+}
+
+test "visibility targets include graph replay blocked by a missing dependency" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "missing_resolver");
+    defer alloc.free(resolution_key);
+    var targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    });
+    defer targets.deinit(alloc);
+
+    // Missing dependencies are not foreground sync targets, but the graph's
+    // replay target still advanced and completion must be fenced exactly.
+    try std.testing.expectEqual(@as(usize, 0), targets.all_indexes.len);
+    try std.testing.expect(targets.target_scope_known);
+    try std.testing.expectEqual(@as(usize, 1), targets.target_identities.len);
+    try std.testing.expectEqualStrings("gr_v1", targets.target_identities[0].index_name);
+    try std.testing.expectEqual(types.IndexKind.graph, targets.target_identities[0].kind);
 }
 
 test "db full_index supports dense parent search for template chunked embeddings" {
@@ -74951,6 +76126,152 @@ test "artifact text replay deletes only keys owned by its source projection" {
 
     try std.testing.expectEqual(@as(usize, 1), keys.len);
     try std.testing.expectEqualStrings(body_key, keys[0]);
+}
+
+test "db chunk retirement removes dense and sparse members from generated and artifact projections" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var dense = embedder_mod.DeterministicDenseEmbedder{};
+    var sparse = embedder_mod.DeterministicSparseEmbedder{};
+    const options: OpenOptions = .{
+        .enrichment = .{ .owner_id = "chunk-retirement", .dense_embedder = dense.interface(), .sparse_embedder = sparse.interface() },
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"dense_chunks\"}}",
+        });
+        try db.addIndex(.{
+            .name = "sparse",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"sparse_chunks\"}}",
+        });
+        try db.addIndex(.{
+            .name = "dense_artifacts",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"dense_chunks\"}]}",
+        });
+        try db.addIndex(.{
+            .name = "sparse_artifacts",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"sparse_chunks\"}]}",
+        });
+        const bodies = [_][]const u8{ "abcdefghijklmno", "abcdefgh", "xyzuvw", "" };
+        for (bodies, [_]u64{ 3, 1, 1, 0 }) |body, count| {
+            const value = try std.json.Stringify.valueAlloc(alloc, .{ .body = body }, .{});
+            defer alloc.free(value);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .write });
+            try db.runUntilIdle();
+            for ([_][]const u8{ "dense", "dense_artifacts" }) |name|
+                try std.testing.expectEqual(count, db.core.index_manager.denseIndex(name).?.index.metadata.active_count);
+            for ([_][]const u8{ "sparse", "sparse_artifacts" }) |name|
+                try std.testing.expectEqual(count, db.core.index_manager.sparseIndex(name).?.index.stats().doc_count);
+        }
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), options);
+    defer reopened.close();
+    try reopened.runUntilIdle();
+    for ([_][]const u8{ "dense", "dense_artifacts" }) |name|
+        try std.testing.expectEqual(@as(u64, 0), reopened.core.index_manager.denseIndex(name).?.index.metadata.active_count);
+    for ([_][]const u8{ "sparse", "sparse_artifacts" }) |name|
+        try std.testing.expectEqual(@as(u64, 0), reopened.core.index_manager.sparseIndex(name).?.index.stats().doc_count);
+}
+
+test "db chunk deletion replay targets only matching vector sources" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    for ([_][]const u8{ "body", "notes" }) |source| {
+        const name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
+        defer alloc.free(name);
+        try db.addEnrichment(.{ .name = name, .kind = .chunk, .field = source, .chunk_size = 64 });
+    }
+    for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_][]const u8{ "body", "notes" }) |source| {
+            const name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ @tagName(kind), source });
+            defer alloc.free(name);
+            const chunk_name = try std.fmt.allocPrint(alloc, "{s}_chunks", .{source});
+            defer alloc.free(chunk_name);
+            try db.addEnrichment(.{
+                .name = name,
+                .kind = .embedding,
+                .field = source,
+                .source_artifact_name = chunk_name,
+                .expected_dims = if (kind == .dense_vector) 3 else 0,
+                .producer_json = if (kind == .dense_vector)
+                    "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-test\",\"dimensions\":3}"
+                else
+                    "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}",
+            });
+            const config = try std.fmt.allocPrint(
+                alloc,
+                "{{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"{s}\"}}",
+                .{name},
+            );
+            defer alloc.free(config);
+            try db.addIndex(.{ .name = name, .kind = kind, .config_json = config });
+        }
+    }
+    const body = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "body_chunks", 1);
+    defer alloc.free(body);
+    const notes = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc-a", "notes_chunks", "page:1", 1);
+    defer alloc.free(notes);
+    const unrelated = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc-a", "unrelated", 1);
+    defer alloc.free(unrelated);
+
+    for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_][]const u8{ "body", "notes" }, [_][]const u8{ body, notes }) |source, owned_key| {
+            const name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ @tagName(kind), source });
+            defer alloc.free(name);
+            const ref = index_manager_mod.ManagedIndexRef{ .name = name, .kind = kind };
+            const sibling = if (std.mem.eql(u8, source, "body")) notes else body;
+            for ([_][]const u8{ sibling, unrelated }) |foreign| {
+                try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexBatchApplicability(db.core.index_manager, .{ .deleted_keys = &.{foreign} }, ref));
+                try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .deleted_doc_keys = &.{foreign} }, ref));
+            }
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexBatchApplicability(db.core.index_manager, .{ .deleted_keys = &.{owned_key} }, ref));
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{ .sequence = 1, .deleted_doc_keys = &.{owned_key} }, ref));
+            const keys = try collectVectorReplayDeleteKeys(alloc, db.core.index_manager, ref, &.{ sibling, owned_key, unrelated, owned_key });
+            defer freeOwnedKeySlice(alloc, keys);
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings(owned_key, keys[0]);
+        }
+        const name = try std.fmt.allocPrint(alloc, "{s}_multi", .{@tagName(kind)});
+        defer alloc.free(name);
+        const config = try std.fmt.allocPrint(
+            alloc,
+            "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}_body\"}},{{\"artifact\":\"{s}_notes\"}}]}}",
+            .{ @tagName(kind), @tagName(kind) },
+        );
+        defer alloc.free(config);
+        try db.addIndex(.{ .name = name, .kind = kind, .config_json = config });
+        const ref = index_manager_mod.ManagedIndexRef{ .name = name, .kind = kind };
+        try std.testing.expect(vectorIndexConsumesChunkKey(db.core.index_manager, ref, body));
+        try std.testing.expect(vectorIndexConsumesChunkKey(db.core.index_manager, ref, notes));
+        try std.testing.expect(!vectorIndexConsumesChunkKey(db.core.index_manager, ref, unrelated));
+        const body_name = try std.fmt.allocPrint(alloc, "{s}_body", .{@tagName(kind)});
+        defer alloc.free(body_name);
+        const notes_name = try std.fmt.allocPrint(alloc, "{s}_notes", .{@tagName(kind)});
+        defer alloc.free(notes_name);
+        const body_member = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, body, body_name);
+        defer alloc.free(body_member);
+        const notes_member = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, notes, notes_name);
+        defer alloc.free(notes_member);
+        const keys = try collectVectorReplayDeleteKeys(alloc, db.core.index_manager, ref, &.{ body, notes, unrelated, body_member, notes_member });
+        defer freeOwnedKeySlice(alloc, keys);
+        try std.testing.expectEqual(@as(usize, 2), keys.len);
+        try std.testing.expectEqualStrings(body_member, keys[0]);
+        try std.testing.expectEqualStrings(notes_member, keys[1]);
+    }
 }
 
 test "embedding artifact replay deletes only the consuming vector projection" {
@@ -81761,6 +83082,8 @@ test "db encodeThinReplayRecordPayload preserves async write replay contract" {
         &.{true},
         42,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81807,6 +83130,8 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
         &.{true},
         43,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81841,6 +83166,8 @@ test "db thin replay marks artifact-derived target hints" {
         &.{},
         44,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81869,6 +83196,8 @@ test "db thin replay marks document deletes for managed index replay" {
         &.{},
         45,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81901,6 +83230,8 @@ test "db thin replay marks artifact deletes for managed index replay" {
         &.{},
         46,
         false,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81939,6 +83270,8 @@ test "db encodeThinReplayRecordPayload marks generated enrichment replay for asy
         &.{true},
         7,
         true,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -81971,6 +83304,8 @@ test "db thin replay omits derived work for an unchanged source write" {
         &.{false},
         8,
         true,
+        null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -85486,6 +86821,101 @@ test "db managed vector admission captures writes while durable repair is pendin
     try std.testing.expect(target.replay_target_sequence > target.replay_applied_sequence);
 }
 
+test "db managed full text admission replays transitive artifact producers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    // Model the catalog-to-resident handoff: the source write commits through
+    // the old schema immediately before the new generated index is admitted.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+
+    const cfg = types.IndexConfig{
+        .name = "document_text",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}",
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+
+    const direct_sources = try db.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, cfg.name);
+    defer {
+        for (direct_sources) |name| alloc.free(name);
+        if (direct_sources.len > 0) alloc.free(direct_sources);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_sources.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", direct_sources[0]);
+
+    const producer_path = try db.core.index_manager.artifactProducerNamesForIndexAlloc(alloc, cfg.name);
+    defer {
+        for (producer_path) |name| alloc.free(name);
+        if (producer_path.len > 0) alloc.free(producer_path);
+    }
+    try std.testing.expectEqual(@as(usize, 2), producer_path.len);
+    try std.testing.expect(containsName(producer_path, "document_chunks_v1"));
+    try std.testing.expect(containsName(producer_path, "document_units_v1"));
+
+    var admitted = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer admitted.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, admitted.intent.source_replay_state);
+
+    const replay = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(replay.attempted);
+    try std.testing.expect(replay.deferred);
+    try std.testing.expectEqual(@as(u64, 1), replay.documents_reprocessed);
+    try db.runUntilIdle();
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+        try db.runUntilIdle();
+    }
+    try std.testing.expect(repaired);
+
+    var result = try db.search(alloc, .{
+        .index_name = cfg.name,
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].artifact_ref.?.document_id);
+}
+
 test "db managed vector admission discovers artifacts committed before resident activation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -85834,17 +87264,19 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
     var first = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), first.inspected);
-    try std.testing.expectEqual(@as(usize, 0), first.repair_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.repairs.items.len);
 
     var second = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer second.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), second.inspected);
-    try std.testing.expectEqual(@as(usize, 0), second.repair_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), second.repairs.items.len);
 
     var third = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer third.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), third.inspected);
-    try std.testing.expectEqualSlices(u128, &.{18}, third.repair_ids.items);
+    try std.testing.expectEqual(@as(usize, 1), third.repairs.items.len);
+    try std.testing.expectEqual(@as(u128, 18), third.repairs.items[0].repair_id);
+    try std.testing.expect(!third.repairs.items[0].audit_due);
 }
 
 test "resident index repair scheduler maintains exact aggregate wake precedence" {
@@ -86373,7 +87805,122 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // target continues moving as normal embeddings arrive, but that must
         // not arm a next-sequence repair wake for each batch.
         try std.testing.expectEqual(@as(?u64, null), partial_record.progress_wait_until_sequence);
+        try std.testing.expect(partial_record.audit_wait_armed);
         try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
+    }
+    {
+        // Model the bounded audit deadline expiring. Selection must carry
+        // that authority and the exact durable revision into one scheduled
+        // execution; otherwise the queryable shortcut either rearms another
+        // deadline forever or applies stale authority to a newer intent.
+        {
+            lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+            defer db.async_context.index_repair_scheduler_mutex.unlock();
+            const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+                return error.TestUnexpectedResult;
+            const partial_record = &db.async_context.index_repair_scheduler.records.items[partial_record_index];
+            partial_record.next_retry_at_ms = 0;
+            db.async_context.index_repair_scheduler.rescheduleRunnable(repair_id);
+        }
+
+        var audit_selection = try db.selectIndexRepairSchedulerQuantum(alloc, 2);
+        defer audit_selection.deinit(alloc);
+        var selected_due_audit: ?DB.IndexRepairSchedulerSelection.Repair = null;
+        for (audit_selection.repairs.items) |scheduled| {
+            if (scheduled.repair_id == repair_id) selected_due_audit = scheduled;
+        }
+        const stale_audit = selected_due_audit orelse return error.TestUnexpectedResult;
+        try std.testing.expect(stale_audit.audit_due);
+
+        const RevisionRace = struct {
+            selected_revision: u64,
+            revised_revision: u64 = 0,
+
+            fn afterAcquire(raw: *anyopaque, target_db: *DB, observed_repair_id: u128) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var before = try target_db.loadIndexRepairEntryById(std.testing.allocator, observed_repair_id);
+                defer before.deinit(std.testing.allocator);
+                try std.testing.expectEqual(self.selected_revision, before.intent.revision);
+                try target_db.updateIndexRepairIntent(std.testing.allocator, observed_repair_id, .{
+                    .next_retry_at_ms = 0,
+                });
+                var after = try target_db.loadIndexRepairEntryById(std.testing.allocator, observed_repair_id);
+                defer after.deinit(std.testing.allocator);
+                self.revised_revision = after.intent.revision;
+            }
+        };
+        var revision_race = RevisionRace{ .selected_revision = stale_audit.revision };
+        DB.test_index_repair_advance_lease_hook = .{
+            .ptr = &revision_race,
+            .after_acquire = RevisionRace.afterAcquire,
+        };
+        defer DB.test_index_repair_advance_lease_hook = null;
+        const stale_attempt = try db.advanceScheduledIndexRepairIntent(
+            alloc,
+            stale_audit.repair_id,
+            repair_completion_test_options,
+            stale_audit.revision,
+            stale_audit.audit_due,
+        );
+        DB.test_index_repair_advance_lease_hook = null;
+        try std.testing.expect(revision_race.revised_revision > stale_audit.revision);
+        try std.testing.expect(stale_attempt.deferred);
+        try std.testing.expect(!stale_attempt.attempted);
+        {
+            lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+            defer db.async_context.index_repair_scheduler_mutex.unlock();
+            const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+                return error.TestUnexpectedResult;
+            const partial_record = db.async_context.index_repair_scheduler.records.items[partial_record_index];
+            try std.testing.expectEqual(revision_race.revised_revision, partial_record.revision);
+            try std.testing.expect(partial_record.audit_wait_armed);
+            try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
+        }
+
+        // A transition can also win after the repair owner has reloaded its
+        // entry. Audit authority is consumed later, at the queryable shortcut,
+        // so that boundary must revalidate the durable revision rather than
+        // trusting the owned turn's earlier snapshot.
+        {
+            lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+            defer db.async_context.index_repair_scheduler_mutex.unlock();
+            const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+                return error.TestUnexpectedResult;
+            const partial_record = &db.async_context.index_repair_scheduler.records.items[partial_record_index];
+            partial_record.next_retry_at_ms = 0;
+            db.async_context.index_repair_scheduler.rescheduleRunnable(repair_id);
+        }
+        var after_reload_selection = try db.selectIndexRepairSchedulerQuantum(alloc, 2);
+        defer after_reload_selection.deinit(alloc);
+        var selected_after_reload: ?DB.IndexRepairSchedulerSelection.Repair = null;
+        for (after_reload_selection.repairs.items) |scheduled| {
+            if (scheduled.repair_id == repair_id) selected_after_reload = scheduled;
+        }
+        const after_reload_audit = selected_after_reload orelse return error.TestUnexpectedResult;
+        try std.testing.expect(after_reload_audit.audit_due);
+        var after_reload_race = RevisionRace{ .selected_revision = after_reload_audit.revision };
+        DB.test_index_repair_advance_lease_hook = .{
+            .ptr = &after_reload_race,
+            .after_reload = RevisionRace.afterAcquire,
+        };
+        const superseded_attempt = try db.advanceScheduledIndexRepairIntent(
+            alloc,
+            after_reload_audit.repair_id,
+            repair_completion_test_options,
+            after_reload_audit.revision,
+            after_reload_audit.audit_due,
+        );
+        DB.test_index_repair_advance_lease_hook = null;
+        try std.testing.expect(after_reload_race.revised_revision > after_reload_audit.revision);
+        try std.testing.expect(superseded_attempt.busy);
+        try std.testing.expect(!superseded_attempt.attempted);
+        const rearm_after_reload_race = try db.advanceIndexRepairIntent(
+            alloc,
+            repair_id,
+            repair_completion_test_options,
+        );
+        try std.testing.expect(rearm_after_reload_race.deferred);
+        try std.testing.expect(!rearm_after_reload_race.attempted);
     }
     if (try db.indexRepairIdForIndex(alloc, "damaged_idx")) |remaining_repair_id| {
         try std.testing.expectEqual(damaged_repair_id, remaining_repair_id);
@@ -86417,6 +87964,123 @@ test "db progressive managed admission serves a checkpointed partial generation"
     for (restart_plan.targets) |target| {
         const planned = db.core.index_manager.dense_indexes.items[target.dense_index_idx].config.name;
         try std.testing.expect(!std.mem.eql(u8, planned, cfg.name));
+    }
+
+    // A managed owner can claim a newer Raft/root epoch during the same turn
+    // that received an audit grant. The ownership write must invalidate the
+    // prior revision's grant and preserve the progressive publication.
+    const ownership_audit_rearm = try db.advanceIndexRepairIntent(
+        alloc,
+        repair_id,
+        repair_completion_test_options,
+    );
+    try std.testing.expect(ownership_audit_rearm.deferred);
+    try std.testing.expect(!ownership_audit_rearm.attempted);
+    {
+        lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+        defer db.async_context.index_repair_scheduler_mutex.unlock();
+        const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+            return error.TestUnexpectedResult;
+        const partial_record = &db.async_context.index_repair_scheduler.records.items[partial_record_index];
+        partial_record.next_retry_at_ms = 0;
+        db.async_context.index_repair_scheduler.rescheduleRunnable(repair_id);
+    }
+    var ownership_selection = try db.selectIndexRepairSchedulerQuantum(alloc, 2);
+    defer ownership_selection.deinit(alloc);
+    var selected_ownership_audit: ?DB.IndexRepairSchedulerSelection.Repair = null;
+    for (ownership_selection.repairs.items) |scheduled| {
+        if (scheduled.repair_id == repair_id) selected_ownership_audit = scheduled;
+    }
+    const ownership_audit = selected_ownership_audit orelse return error.TestUnexpectedResult;
+    const AlwaysCurrentOwner = struct {
+        fn current(_: *anyopaque) anyerror!bool {
+            return true;
+        }
+    };
+    var owner_context: u8 = 0;
+    var owned_audit_options = repair_completion_test_options;
+    owned_audit_options.owner_epoch = 17;
+    owned_audit_options.activation_check = .{
+        .ptr = &owner_context,
+        .is_current_owner = AlwaysCurrentOwner.current,
+    };
+    const ownership_handoff = blk: {
+        // A producer runtime normally supplies another deferral edge after a
+        // valid audit. Remove it for this one synchronous turn so stale audit
+        // authority would observably fall through into shadow construction.
+        const saved_enrichment_runtime = db.enrichment_runtime;
+        db.enrichment_runtime = null;
+        defer db.enrichment_runtime = saved_enrichment_runtime;
+        break :blk try db.advanceScheduledIndexRepairIntent(
+            alloc,
+            ownership_audit.repair_id,
+            owned_audit_options,
+            ownership_audit.revision,
+            ownership_audit.audit_due,
+        );
+    };
+    try std.testing.expect(ownership_handoff.deferred);
+    try std.testing.expect(!ownership_handoff.attempted);
+    {
+        var owned_entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer owned_entry.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 17), owned_entry.intent.owner_epoch);
+        try std.testing.expect(owned_entry.intent.revision > ownership_audit.revision);
+    }
+    // Keep a real producer fence outstanding while the index cursor is
+    // already at that replay boundary. This lets the exact audit execution
+    // consume the queryable-generation token and then rearm specifically on
+    // producer completion, without starting a shadow generation in this
+    // restart-focused regression.
+    const pending_enrichment = (db.enrichment_runtime orelse return error.TestUnexpectedResult).stats();
+    try std.testing.expect(pending_enrichment.applied_sequence < pending_enrichment.target_sequence);
+    const producer_fence = pending_enrichment.target_sequence;
+    var producer_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    producer_checkpoint.applied_sequence = @max(producer_checkpoint.applied_sequence, producer_fence);
+    try db.core.saveProjectionCheckpoint(cfg.name, producer_checkpoint);
+    try db.updateIndexRepairIntent(alloc, repair_id, .{ .target_sequence = producer_fence });
+    const rearmed = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+    try std.testing.expect(rearmed.deferred);
+    try std.testing.expect(!rearmed.attempted);
+    var exact_audit_revision: u64 = 0;
+    {
+        lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+        defer db.async_context.index_repair_scheduler_mutex.unlock();
+        const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+            return error.TestUnexpectedResult;
+        const partial_record = &db.async_context.index_repair_scheduler.records.items[partial_record_index];
+        try std.testing.expect(partial_record.audit_wait_armed);
+        exact_audit_revision = partial_record.revision;
+        partial_record.next_retry_at_ms = 0;
+        db.async_context.index_repair_scheduler.rescheduleRunnable(repair_id);
+    }
+    var exact_selection = try db.selectIndexRepairSchedulerQuantum(alloc, 2);
+    defer exact_selection.deinit(alloc);
+    var selected_exact_audit: ?DB.IndexRepairSchedulerSelection.Repair = null;
+    for (exact_selection.repairs.items) |scheduled| {
+        if (scheduled.repair_id == repair_id) selected_exact_audit = scheduled;
+    }
+    const exact_audit = selected_exact_audit orelse return error.TestUnexpectedResult;
+    try std.testing.expect(exact_audit.audit_due);
+    try std.testing.expectEqual(exact_audit_revision, exact_audit.revision);
+    const exact_attempt = try db.advanceScheduledIndexRepairIntent(
+        alloc,
+        exact_audit.repair_id,
+        repair_completion_test_options,
+        exact_audit.revision,
+        exact_audit.audit_due,
+    );
+    try std.testing.expect(exact_attempt.deferred);
+    try std.testing.expect(!exact_attempt.attempted);
+    {
+        lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+        defer db.async_context.index_repair_scheduler_mutex.unlock();
+        const partial_record_index = db.async_context.index_repair_scheduler.by_id.get(repair_id) orelse
+            return error.TestUnexpectedResult;
+        const partial_record = db.async_context.index_repair_scheduler.records.items[partial_record_index];
+        try std.testing.expectEqual(exact_audit_revision +| 1, partial_record.revision);
+        try std.testing.expect(partial_record.audit_wait_armed);
+        try std.testing.expect(partial_record.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms);
     }
 
     // The durable checkpoint and repair ownership are sufficient to restore

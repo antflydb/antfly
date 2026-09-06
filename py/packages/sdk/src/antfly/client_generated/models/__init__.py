@@ -210,6 +210,7 @@ from .embedder_config import EmbedderConfig
 from .embedder_provider import EmbedderProvider
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_retrieval_config import EmbeddingRetrievalConfig
 from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
@@ -224,6 +225,8 @@ from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
+from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
+from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -489,6 +492,8 @@ from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
 from .index_milestone_status import IndexMilestoneStatus
 from .index_milestones import IndexMilestones
+from .index_mutation_conflict_error import IndexMutationConflictError
+from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
 from .index_publication_policy import IndexPublicationPolicy
@@ -800,6 +805,7 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
@@ -813,6 +819,7 @@ from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_source_type import ReplicationSourceType
 from .replication_transform_op import ReplicationTransformOp
+from .request_pacing import RequestPacing
 from .reranker_candidate_limit_exceeded_error import RerankerCandidateLimitExceededError
 from .reranker_candidate_limit_exceeded_error_error import RerankerCandidateLimitExceededErrorError
 from .reranker_candidate_limit_exceeded_error_status import RerankerCandidateLimitExceededErrorStatus
@@ -1210,6 +1217,7 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
+    "EmbeddingRetrievalConfig",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
@@ -1224,6 +1232,8 @@ __all__ = (
     "EnrichmentConfig",
     "EnrichmentKind",
     "EnrichmentRuntimeStatus",
+    "EnrichmentRuntimeStatusActivePhase",
+    "EnrichmentRuntimeStatusStallReason",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -1489,6 +1499,8 @@ __all__ = (
     "IndexExecutionConfig",
     "IndexMilestones",
     "IndexMilestoneStatus",
+    "IndexMutationConflictError",
+    "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
     "IndexPublicationPolicy",
@@ -1796,6 +1808,7 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "RateLimitConfig",
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
@@ -1809,6 +1822,7 @@ __all__ = (
     "ReplicationSourceStatus",
     "ReplicationSourceType",
     "ReplicationTransformOp",
+    "RequestPacing",
     "RerankerCandidateLimitExceededError",
     "RerankerCandidateLimitExceededErrorError",
     "RerankerCandidateLimitExceededErrorStatus",

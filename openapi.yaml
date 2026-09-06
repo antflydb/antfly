@@ -5397,7 +5397,7 @@ paths:
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/IndexMutationConflict'
         '422':
           description: Graph resolver destinations cannot be bound to this credential type
           content:
@@ -5424,6 +5424,12 @@ paths:
           description: Index dropped successfully
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/IndexMutationConflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -9202,6 +9208,9 @@ components:
             - $ref: '#/components/schemas/CohereEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/EmbedderProvider'
             multimodal:
@@ -9212,18 +9221,16 @@ components:
                 even if the model isn't in Antfly's built-in model registry yet.
 
 
-                When `true`, Antfly treats the model as multimodal and will send binary content
+                When `true`, Antfly treats the model as multimodal and sends binary content
 
-                (images, audio, etc.) to the provider instead of extracting text. The provider's
+                (images, audio, etc.) through an embedding adapter that supports content parts.
 
-                API is still responsible for accepting the content — this flag just tells Antfly
+                Antfly currently provides that contract for local Antfly inference and Bedrock;
 
-                not to strip it.
+                text-only provider adapters reject media rather than silently discarding it.
 
 
-                Not needed for models already in the registry (e.g., `multimodalembedding`,
-
-                `gemini-embedding-2-preview`, `clip-*`, `clipclap`).
+                Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
 
 
                 **Example:**
@@ -9231,12 +9238,41 @@ components:
                 ```json
 
                 {
-                  "provider": "vertex",
+                  "provider": "antfly",
                   "model": "some-future-multimodal-model",
                   "multimodal": true
                 }
 
                 ```
+            query_input_type:
+              type: string
+              deprecated: true
+              description: >-
+                Deprecated compatibility form of
+
+                `retrieval.query_input_type`. New configurations should use the
+
+                nested `retrieval` object.
+            document_input_type:
+              type: string
+              deprecated: true
+              description: >-
+                Deprecated compatibility form of
+
+                `retrieval.document_input_type`. New configurations should use
+
+                the nested `retrieval` object.
+            query_instruction:
+              type: string
+              deprecated: true
+              description: >-
+                Deprecated compatibility form of
+
+                `retrieval.query_instruction`. New configurations should use the
+
+                nested `retrieval` object.
+            retrieval:
+              $ref: '#/components/schemas/EmbeddingRetrievalConfig'
           required:
             - provider
       example:
@@ -9255,6 +9291,9 @@ components:
         - $ref: '#/components/schemas/OllamaEmbedderConfig'
         - $ref: '#/components/schemas/OpenAIEmbedderConfig'
         - $ref: '#/components/schemas/BedrockEmbedderConfig'
+        - $ref: '#/components/schemas/CohereEmbedderConfig'
+        - $ref: '#/components/schemas/GoogleEmbedderConfig'
+        - $ref: '#/components/schemas/VertexEmbedderConfig'
         - $ref: '#/components/schemas/AntflyEmbedderConfig'
       discriminator:
         propertyName: provider
@@ -9262,6 +9301,9 @@ components:
           ollama: '#/components/schemas/OllamaEmbedderConfig'
           openai: '#/components/schemas/OpenAIEmbedderConfig'
           bedrock: '#/components/schemas/BedrockEmbedderConfig'
+          cohere: '#/components/schemas/CohereEmbedderConfig'
+          gemini: '#/components/schemas/GoogleEmbedderConfig'
+          vertex: '#/components/schemas/VertexEmbedderConfig'
           antfly: '#/components/schemas/AntflyEmbedderConfig'
     ClusterHealth:
       type: string
@@ -17838,6 +17880,42 @@ components:
 
         - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
         be in [0,1].
+    EmbeddingRetrievalConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Advanced retrieval-role overrides. Antfly assigns canonical task intent
+
+        automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+
+        and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+
+        how a provider or instruction-aware model represents that intent.
+      properties:
+        query_input_type:
+          type: string
+          description: >-
+            Provider-specific query role, such as `search_query` for Cohere.
+
+            When omitted, the provider adapter derives it from
+
+            `RETRIEVAL_QUERY`.
+        document_input_type:
+          type: string
+          description: >-
+            Provider-specific document role, such as `search_document` for
+
+            Cohere. When omitted, the provider adapter derives it from
+
+            `RETRIEVAL_DOCUMENT`.
+        query_instruction:
+          type: string
+          description: >-
+            Optional instruction sent only with retrieval-query embeddings by
+
+            instruction-aware Antfly inference models. Provider adapters that
+
+            do not support free-form instructions reject this field.
     GoogleEmbedderConfig:
       type: object
       description: >-
@@ -17880,6 +17958,8 @@ components:
           type: string
           format: uri
           description: The URL of the Google API endpoint (optional, uses default if not specified).
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
         - model
@@ -17897,7 +17977,12 @@ components:
         Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
 
 
-        **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video)
+        **Example Model:** gemini-embedding-001 (default, 3072 dims)
+
+
+        Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+
+        instead of being flattened or silently discarded.
 
 
         **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
@@ -17926,9 +18011,10 @@ components:
             Alternative to the default ADC chain.
         dimension:
           type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001;
-            128-1408 for multimodalembedding).
+          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
           default: 3072
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
         - model
@@ -18074,7 +18160,7 @@ components:
         roles, and EC2 instance roles.
 
 
-        **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
+        **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
 
 
         **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
@@ -18085,9 +18171,9 @@ components:
             - bedrock
         model:
           type: string
-          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
+          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0',
             'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
-          example: cohere.embed-v4
+          example: cohere.embed-v4:0
         request_format:
           type: string
           enum:
@@ -18130,12 +18216,14 @@ components:
           type: integer
           description: The batch size for embedding requests to optimize throughput.
           default: 1
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
         - model
       example:
         provider: bedrock
-        model: cohere.embed-v4
+        model: cohere.embed-v4:0
         request_format: cohere_v4
         region: us-east-1
     CohereEmbedderConfig:
@@ -18167,13 +18255,18 @@ components:
           description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
         input_type:
           type: string
-          description: Specifies the type of input for optimized embeddings.
+          deprecated: true
+          description: >-
+            Legacy fixed input type applied to every embedding operation. When omitted,
+
+            Antfly derives `search_query` for semantic searches and `search_document`
+
+            for indexed documents. Prefer the role-specific fields under `retrieval`.
           enum:
             - search_document
             - search_query
             - classification
             - clustering
-          default: search_document
         truncate:
           type: string
           description: How to handle inputs longer than the max token length.
@@ -18182,6 +18275,8 @@ components:
             - START
             - END
           default: END
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
         - model
@@ -18230,6 +18325,8 @@ components:
           description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
             environment variable.
           example: http://localhost:8082
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
         - model
@@ -18237,6 +18334,73 @@ components:
         provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
+    RequestPacing:
+      type: string
+      enum:
+        - token_bucket
+        - completion
+      description: >
+        token_bucket limits admission rate while allowing overlapping attempts.
+
+        completion serializes attempts and waits one RPM interval after each
+
+        attempt finishes, including streamed writes and transport failures.
+
+        This prevents delayed connection setup from compressing successful
+
+        request spacing, at the cost of response latency plus one interval per
+
+        request. Requires requests_per_minute and burst=1. Neither mode can
+
+        guarantee zero upstream 429s or coordinate other processes.
+    RateLimitConfig:
+      type: object
+      x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: >
+        Outbound provider limits shared within one Antfly process by effective
+
+        endpoint, operation, model, credential source, project and region/location.
+
+        Conflicting policies for an active scope are rejected. These limits do
+
+        not coordinate across replicas or infer the provider's account quota.
+      properties:
+        pacing:
+          $ref: '#/components/schemas/RequestPacing'
+          description: Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1
+            uses completion pacing.
+        requests_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+        burst:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          default: 1
+        tokens_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >
+            Conservative text budget: each HTTP attempt reserves its serialized
+
+            UTF-8 body byte count plus the configured generation output cap.
+
+            Reservations are not refunded. A request larger than this budget
+
+            is rejected. This is not provider billing token accounting; media
+
+            requests are not supported with this limit.
+        max_concurrency:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          description: Maximum in-flight HTTP attempts, held through response completion.
     EnrichmentKind:
       type: string
       enum:
@@ -19060,6 +19224,9 @@ components:
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
         - properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/GeneratorProvider'
           required:
@@ -20774,6 +20941,16 @@ components:
         - worker_failed
         - worker_started
         - stalled
+        - stall_reason
+        - active_phase
+        - active_model
+        - active_backend
+        - active_deadline_ms
+        - last_progress_ms
+        - active_progress_completed
+        - active_progress_total
+        - inference_timeout_count
+        - inference_cancel_count
         - skip_by_hash_count
         - skipped_source_count
         - codec_decode_failures
@@ -20851,8 +21028,47 @@ components:
           description: Whether the background enrichment worker is currently running.
         stalled:
           type: boolean
-          description: Whether work is pending with no running worker, retry, or terminal failure explaining
-            the backlog.
+          description: Whether pending work has no worker or has exceeded its execution/progress deadline.
+        stall_reason:
+          type: string
+          enum:
+            - ''
+            - worker_missing
+            - model_loading
+            - embedding_overdue
+            - publishing_overdue
+        active_phase:
+          type: string
+          enum:
+            - idle
+            - loading_model
+            - tokenizing
+            - executing
+            - serializing
+            - publishing
+        active_model:
+          type: string
+        active_backend:
+          type: string
+        active_deadline_ms:
+          type: integer
+          format: uint64
+          description: Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+        last_progress_ms:
+          type: integer
+          format: uint64
+        active_progress_completed:
+          type: integer
+          format: uint64
+        active_progress_total:
+          type: integer
+          format: uint64
+        inference_timeout_count:
+          type: integer
+          format: uint64
+        inference_cancel_count:
+          type: integer
+          format: uint64
         skip_by_hash_count:
           type: integer
           format: uint64
@@ -23516,6 +23732,11 @@ components:
           type: string
           enum:
             - antfly
+        api_key:
+          type: string
+          description: Optional bearer API key for remote Antfly inference. Supports secret references
+            and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound
+            credentials.
         model:
           type: string
           description: Optional reranking model name. When omitted, Antfly inference selects a model from
@@ -23623,6 +23844,9 @@ components:
       allOf:
         - type: object
           properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/RerankerProvider'
             field:
@@ -25484,6 +25708,27 @@ components:
         $ref: '#/components/schemas/StatefulGraphResult'
       description: Stateful graph results keyed by operation name. Legacy values are possible only when
         the corresponding request used graph_searches.
+    IndexMutationConflictError:
+      type: object
+      additionalProperties: false
+      description: An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the
+        mutation may already have committed and callers must observe index state before deciding whether
+        to issue another mutation.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - table_mutation_conflict
+            - artifact_dependency_conflict
+            - metadata_mutation_outcome_unknown
+        message:
+          type: string
+        retryable:
+          type: boolean
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true
@@ -25724,12 +25969,16 @@ components:
         dimensions:
           type: integer
           description: Optional truncation size for dense embeddings. Must be a positive integer no larger
-            than the model embedding size. Not supported for sparse models.
+            than the model embedding size. For normalized models the truncated vector is L2-re-normalized
+            (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse
+            models.
         task_type:
           type: string
           description: Optional embedding task type using Google embedding task-type names. For Jina v5
             text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document
-            prefix.
+            prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval
+            instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit
+            instruction.
           enum:
             - RETRIEVAL_QUERY
             - RETRIEVAL_DOCUMENT
@@ -25739,6 +25988,12 @@ components:
             - CLASSIFICATION
             - CLUSTERING
             - SEMANTIC_SIMILARITY
+        instruction:
+          type: string
+          description: 'Task description for instruction-aware embedding models (Qwen3-Embedding), rendered
+            inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional
+            for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task
+            types; rejected for document tasks and models without instruction support.'
         input_type:
           type: string
           deprecated: true
@@ -28587,6 +28842,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationConflict:
+      description: The index mutation conflicts with current state, or its commit outcome could not be
+        proven.
+      headers:
+        X-Antfly-Raft-Mutation-Outcome:
+          required: false
+          description: Present with value `unknown-v1` only when the mutation may already have committed
+            and must not be blindly retried.
+          schema:
+            type: string
+            enum:
+              - unknown-v1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IndexMutationConflictError'
     MethodNotAllowed:
       description: Method not allowed for this resource
       content:

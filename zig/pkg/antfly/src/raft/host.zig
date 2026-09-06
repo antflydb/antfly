@@ -2705,7 +2705,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
         .replica_root_dir = replica_root,
         .open_options = .{
             .node_config = &node_config,
-            .io = io_impl.io(),
+            .filesystem_io = io_impl.io(),
         },
     };
     var host = Host.init(std.testing.allocator, .{
@@ -2847,7 +2847,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
         .replica_root_dir = replica_root,
         .open_options = .{
             .node_config = &node_config,
-            .io = io_impl.io(),
+            .filesystem_io = io_impl.io(),
         },
     };
 

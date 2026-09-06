@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
@@ -1547,7 +1548,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     });
     try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.current_record_version,
+        runtime_status_protocol.previous_record_version,
         try source.getRuntimeStatusProtocolActivationVersion(group_id),
     );
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
@@ -1561,7 +1562,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, reopened_cursor.metadata_incarnation.?);
     try std.testing.expectEqual(@as(u64, 2), reopened_cursor.revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.current_record_version,
+        runtime_status_protocol.previous_record_version,
         try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
     );
 
@@ -1573,7 +1574,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, installed_cursor.metadata_incarnation.?);
     try std.testing.expectEqual(@as(u64, 2), installed_cursor.revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.current_record_version,
+        runtime_status_protocol.previous_record_version,
         try target.getRuntimeStatusProtocolActivationVersion(group_id),
     );
 }
@@ -1853,6 +1854,45 @@ pub const CommittedKeySignal = struct {
     key: []const u8,
 };
 
+/// Stable ownership token for one atomically registered projection/key
+/// listener pair. The token is process-local and deliberately opaque to
+/// callers; teardown uses it to detach exactly the pair it owns while the
+/// apply store is still alive.
+pub const LifecycleListenerRegistration = struct {
+    id: u64,
+};
+
+const RegisteredProjectionListener = struct {
+    registration_id: ?u64 = null,
+    listener: ProjectionListener,
+};
+
+const RegisteredCommittedKeyListener = struct {
+    registration_id: ?u64 = null,
+    listener: CommittedKeyListener,
+};
+
+const TestLifecycleDetachLockBarrier = struct {
+    entered: *std.Io.Event,
+    resume_event: *std.Io.Event,
+    contended: *std.atomic.Value(bool),
+};
+
+var test_lifecycle_detach_lock_barrier: ?TestLifecycleDetachLockBarrier = null;
+
+fn lockLifecycleDetachApplyMutex(mutex: *std.Io.Mutex, io: std.Io) void {
+    if (comptime builtin.is_test) {
+        if (test_lifecycle_detach_lock_barrier) |barrier| {
+            const acquired = mutex.tryLock();
+            barrier.contended.store(!acquired, .release);
+            barrier.entered.set(std.Options.debug_io);
+            barrier.resume_event.waitUncancelable(std.Options.debug_io);
+            if (acquired) return;
+        }
+    }
+    mutex.lockUncancelable(io);
+}
+
 pub const CommittedKeyListener = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -2001,8 +2041,9 @@ pub const RaftApplyStore = struct {
     batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
     projected_placement_intents: std.ArrayListUnmanaged(ProjectedPlacementIntent) = .empty,
     loaded_placement_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    projection_listeners: std.ArrayListUnmanaged(ProjectionListener) = .empty,
-    committed_key_listeners: std.ArrayListUnmanaged(CommittedKeyListener) = .empty,
+    projection_listeners: std.ArrayListUnmanaged(RegisteredProjectionListener) = .empty,
+    committed_key_listeners: std.ArrayListUnmanaged(RegisteredCommittedKeyListener) = .empty,
+    next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     active_outcome: ?*CommittedApplyOutcome = null,
 
@@ -2101,21 +2142,21 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.projection_listeners.append(self.alloc, listener);
+        try self.projection_listeners.append(self.alloc, .{ .listener = listener });
     }
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.committed_key_listeners.append(self.alloc, listener);
+        try self.committed_key_listeners.append(self.alloc, .{ .listener = listener });
     }
 
     pub fn addLifecycleListeners(
         self: *RaftApplyStore,
         projection_listener: ProjectionListener,
         committed_key_listener: CommittedKeyListener,
-    ) !void {
+    ) !LifecycleListenerRegistration {
         try projection_listener.validate();
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -2123,8 +2164,60 @@ pub const RaftApplyStore = struct {
 
         try self.projection_listeners.ensureUnusedCapacity(self.alloc, 1);
         try self.committed_key_listeners.ensureUnusedCapacity(self.alloc, 1);
-        self.projection_listeners.appendAssumeCapacity(projection_listener);
-        self.committed_key_listeners.appendAssumeCapacity(committed_key_listener);
+        const id = self.next_lifecycle_listener_registration_id;
+        if (id == 0 or id == std.math.maxInt(u64))
+            return error.LifecycleListenerRegistrationExhausted;
+        self.next_lifecycle_listener_registration_id = id + 1;
+        self.projection_listeners.appendAssumeCapacity(.{
+            .registration_id = id,
+            .listener = projection_listener,
+        });
+        self.committed_key_listeners.appendAssumeCapacity(.{
+            .registration_id = id,
+            .listener = committed_key_listener,
+        });
+        return .{ .id = id };
+    }
+
+    /// Atomically closes callback admission for one lifecycle listener pair.
+    /// `apply_mutex` also covers synchronous callback dispatch, so returning
+    /// proves that an already-admitted callback has drained. Removal is rare
+    /// teardown work; ordered removal preserves commit-barrier nesting order.
+    pub fn removeLifecycleListeners(
+        self: *RaftApplyStore,
+        registration: LifecycleListenerRegistration,
+    ) bool {
+        const io = self.io_impl.io();
+        // The test path reports actual lock contention before falling back to
+        // the same blocking acquisition used in production. This proves that
+        // detach drains an in-flight callback rather than merely racing it.
+        lockLifecycleDetachApplyMutex(&self.apply_mutex, io);
+        defer self.apply_mutex.unlock(io);
+
+        var projection_index: ?usize = null;
+        for (self.projection_listeners.items, 0..) |registered, index| {
+            if (registered.registration_id == registration.id) {
+                projection_index = index;
+                break;
+            }
+        }
+        var committed_key_index: ?usize = null;
+        for (self.committed_key_listeners.items, 0..) |registered, index| {
+            if (registered.registration_id == registration.id) {
+                committed_key_index = index;
+                break;
+            }
+        }
+        if (projection_index == null or committed_key_index == null) {
+            // Registration and removal are atomic pairs. A half-present pair
+            // is an internal ownership violation, not a state to repair by
+            // silently removing the remaining callback.
+            std.debug.assert(projection_index == null and committed_key_index == null);
+            return false;
+        }
+        _ = self.projection_listeners.orderedRemove(projection_index.?);
+        _ = self.committed_key_listeners.orderedRemove(committed_key_index.?);
+        return true;
     }
 
     pub fn getMetadataIncarnation(
@@ -6491,7 +6584,7 @@ pub const RaftApplyStore = struct {
             outcome.appendProjection(signal) catch |err| outcome.recordFailure(err);
             return;
         }
-        for (self.projection_listeners.items) |listener| listener.onProjectionSignal(signal);
+        for (self.projection_listeners.items) |registered| registered.listener.onProjectionSignal(signal);
     }
 
     fn notifyCommittedKeyListeners(self: *RaftApplyStore, signal: CommittedKeySignal) void {
@@ -6499,7 +6592,7 @@ pub const RaftApplyStore = struct {
             outcome.appendCommittedKey(signal) catch |err| outcome.recordFailure(err);
             return;
         }
-        for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+        for (self.committed_key_listeners.items) |registered| registered.listener.onCommittedKey(signal);
     }
 
     fn notifyCommittedTransition(self: *RaftApplyStore, delta: CommittedTransitionDelta) void {
@@ -6514,14 +6607,14 @@ pub const RaftApplyStore = struct {
     fn dispatchCommittedOutcome(self: *RaftApplyStore, outcome: *const CommittedApplyOutcome) void {
         std.debug.assert(outcome.failure == null);
         for (outcome.projection_signals.items) |owned| {
-            for (self.projection_listeners.items) |listener| listener.onProjectionSignal(owned.signal);
+            for (self.projection_listeners.items) |registered| registered.listener.onProjectionSignal(owned.signal);
         }
         for (outcome.committed_keys.items) |owned| {
             const signal = CommittedKeySignal{
                 .metadata_group_id = owned.metadata_group_id,
                 .key = owned.key,
             };
-            for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+            for (self.committed_key_listeners.items) |registered| registered.listener.onCommittedKey(signal);
         }
     }
 
@@ -6536,7 +6629,8 @@ pub const RaftApplyStore = struct {
         self: *RaftApplyStore,
         outcome: *const CommittedApplyOutcome,
     ) void {
-        for (self.projection_listeners.items) |listener| {
+        for (self.projection_listeners.items) |registered| {
+            const listener = registered.listener;
             const kind = listener.commit_barrier_kind orelse continue;
             if (!outcomeContainsProjectionKind(outcome, kind)) continue;
             listener.beginCommitBarrier();
@@ -6552,7 +6646,7 @@ pub const RaftApplyStore = struct {
         var index = self.projection_listeners.items.len;
         while (index > 0) {
             index -= 1;
-            const listener = self.projection_listeners.items[index];
+            const listener = self.projection_listeners.items[index].listener;
             const kind = listener.commit_barrier_kind orelse continue;
             if (!outcomeContainsProjectionKind(outcome, kind)) continue;
             listener.endCommitBarrier();
@@ -6667,7 +6761,10 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     pos += @sizeOf(u16);
     if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
     const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
-    if (runtime_status_record_version != runtime_status_protocol.current_record_version) {
+    if (!runtime_status_protocol.profileSatisfies(
+        runtime_status_record_version,
+        runtime_status_protocol.previous_record_version,
+    )) {
         return error.InvalidMetadataIncarnation;
     }
     return .{
@@ -6681,7 +6778,7 @@ test "metadata incarnation rejects unsupported runtime status activation profile
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
     const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
 
-    inline for ([_]u16{ 13, 14, 16 }) |unsupported_version| {
+    inline for ([_]u16{ 13, 14, 17 }) |unsupported_version| {
         var encoded: [encoded_len]u8 = undefined;
         @memcpy(encoded[0..incarnation_len], &incarnation);
         var pos: usize = incarnation_len;
@@ -6713,9 +6810,16 @@ fn activateRuntimeStatusProtocolTxn(
         else => return err,
     };
     const decoded = try decodeMetadataIncarnationRecord(existing);
-    if (target_version != runtime_status_protocol.current_record_version)
+    if (!runtime_status_protocol.profileSatisfies(
+        target_version,
+        runtime_status_protocol.previous_record_version,
+    ))
         return error.InvalidMetadataTransitionEncoding;
-    if (decoded.runtime_status_record_version == target_version) return;
+    if (decoded.runtime_status_record_version != 0 and
+        runtime_status_protocol.profileSatisfies(
+            decoded.runtime_status_record_version,
+            target_version,
+        )) return;
 
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
     const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
@@ -6731,8 +6835,12 @@ fn activateRuntimeStatusProtocolTxn(
 }
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
+    for (record.runtime_statuses) |status| {
+        if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(status.enrichment))
+            return runtime_status_protocol.inference_diagnostics_record_version;
+    }
     if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
-        return runtime_status_protocol.current_record_version;
+        return runtime_status_protocol.previous_record_version;
     return null;
 }
 
@@ -7911,7 +8019,7 @@ fn appendRuntimeGroupStatusRecord(
     try appendInt(alloc, out, u64, record.topology_generation);
     try appendInt(alloc, out, u64, record.lsm_root_generation);
     try appendInt(alloc, out, u64, record.status_generation);
-    if (version == runtime_status_protocol.current_record_version) {
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) {
         try appendInt(alloc, out, u64, record.target_observation_revision);
         try out.append(alloc, if (record.target_observation_complete) 1 else 0);
     }
@@ -7920,7 +8028,7 @@ fn appendRuntimeGroupStatusRecord(
     try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
     try appendInt(alloc, out, u64, record.created_at_millis);
     try appendInt(alloc, out, u32, record.index_count);
-    try appendRuntimeEnrichmentStatusRecord(alloc, out, record.enrichment);
+    try appendRuntimeEnrichmentStatusRecord(alloc, out, record.enrichment, version);
     try out.append(alloc, if (record.async_indexing_active) 1 else 0);
     try out.append(alloc, if (record.async_startup_active) 1 else 0);
     try out.append(alloc, if (record.async_dense_catch_up_active) 1 else 0);
@@ -7935,6 +8043,7 @@ fn appendRuntimeEnrichmentStatusRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.RuntimeEnrichmentStatusReport,
+    version: u16,
 ) !void {
     try out.append(alloc, if (record.enabled) 1 else 0);
     try out.append(alloc, if (record.lease_owned) 1 else 0);
@@ -7981,12 +8090,26 @@ fn appendRuntimeEnrichmentStatusRecord(
     try appendInt(alloc, out, u64, record.sparse_artifact_bytes_written);
     try appendInt(alloc, out, u64, record.chunk_artifact_bytes_written);
     try appendInt(alloc, out, u64, record.artifact_bytes_written);
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.inference_diagnostics_record_version)) {
+        try out.append(alloc, if (record.projection_checkpoint_identity_consistent) 1 else 0);
+        try appendRequiredString(alloc, out, record.stall_reason);
+        try appendRequiredString(alloc, out, record.active_phase);
+        try appendRequiredString(alloc, out, record.active_model);
+        try appendRequiredString(alloc, out, record.active_backend);
+        try appendInt(alloc, out, u64, record.active_deadline_ms);
+        try appendInt(alloc, out, u64, record.last_progress_ms);
+        try appendInt(alloc, out, u64, record.active_progress_completed);
+        try appendInt(alloc, out, u64, record.active_progress_total);
+        try appendInt(alloc, out, u64, record.inference_timeout_count);
+        try appendInt(alloc, out, u64, record.inference_cancel_count);
+    }
 }
 
 fn readRuntimeEnrichmentStatusRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
+    version: u16,
 ) !metadata.RuntimeEnrichmentStatusReport {
     if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const enabled = encoded[pos.*] != 0;
@@ -8022,7 +8145,7 @@ fn readRuntimeEnrichmentStatusRecord(
     pos.* += 1;
     const stalled = encoded[pos.*] != 0;
     pos.* += 1;
-    return .{
+    var result: metadata.RuntimeEnrichmentStatusReport = .{
         .enabled = enabled,
         .lease_owned = lease_owned,
         .has_lease = has_lease,
@@ -8069,6 +8192,26 @@ fn readRuntimeEnrichmentStatusRecord(
         .chunk_artifact_bytes_written = try readInt(encoded, pos, u64),
         .artifact_bytes_written = try readInt(encoded, pos, u64),
     };
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.inference_diagnostics_record_version)) {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        result.projection_checkpoint_identity_consistent = encoded[pos.*] != 0;
+        pos.* += 1;
+        result.stall_reason = try readRequiredString(alloc, encoded, pos);
+        errdefer if (result.stall_reason.len > 0) alloc.free(result.stall_reason);
+        result.active_phase = try readRequiredString(alloc, encoded, pos);
+        errdefer if (result.active_phase.len > 0) alloc.free(result.active_phase);
+        result.active_model = try readRequiredString(alloc, encoded, pos);
+        errdefer if (result.active_model.len > 0) alloc.free(result.active_model);
+        result.active_backend = try readRequiredString(alloc, encoded, pos);
+        errdefer if (result.active_backend.len > 0) alloc.free(result.active_backend);
+        result.active_deadline_ms = try readInt(encoded, pos, u64);
+        result.last_progress_ms = try readInt(encoded, pos, u64);
+        result.active_progress_completed = try readInt(encoded, pos, u64);
+        result.active_progress_total = try readInt(encoded, pos, u64);
+        result.inference_timeout_count = try readInt(encoded, pos, u64);
+        result.inference_cancel_count = try readInt(encoded, pos, u64);
+    }
+    return result;
 }
 
 fn readRuntimeGroupStatusRecord(
@@ -8107,11 +8250,11 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     const topology_generation = try readInt(encoded, pos, u64);
     const lsm_root_generation = try readInt(encoded, pos, u64);
     const status_generation = try readInt(encoded, pos, u64);
-    const target_observation_revision = if (version == runtime_status_protocol.current_record_version)
+    const target_observation_revision = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
         try readInt(encoded, pos, u64)
     else
         0;
-    const target_observation_complete = if (version == runtime_status_protocol.current_record_version) blk: {
+    const target_observation_complete = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*] != 0;
         pos.* += 1;
@@ -8124,8 +8267,8 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     pos.* += 1;
     const created_at_millis = try readInt(encoded, pos, u64);
     const index_count = try readInt(encoded, pos, u32);
-    const enrichment = try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos);
-    errdefer alloc.free(enrichment.projection_checkpoint_status);
+    const enrichment = try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos, version);
+    errdefer metadata_table_manager.freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const async_indexing_active = encoded[pos.*] != 0;
     pos.* += 1;
@@ -8327,7 +8470,7 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
-    if (version == runtime_status_protocol.current_record_version) {
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) {
         // V15 is one atomic profile: safety-critical repair state and
         // publication target, and per-source replay state must never be
         // projected independently.
@@ -8390,25 +8533,25 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = try readOptionalString(alloc, encoded, pos);
     errdefer if (load_error) |value| alloc.free(value);
-    const publication_target_count = if (version == runtime_status_protocol.current_record_version)
+    const publication_target_count = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
         try readInt(encoded, pos, u64)
     else
         0;
-    const publication_target_ready = if (version == runtime_status_protocol.current_record_version) blk: {
+    const publication_target_ready = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const serving_snapshot_ready = if (version == runtime_status_protocol.current_record_version) blk: {
+    const serving_snapshot_ready = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const lifecycle_work_class: metadata.IndexLifecycleWorkClass = if (version == runtime_status_protocol.current_record_version) blk: {
+    const lifecycle_work_class: metadata.IndexLifecycleWorkClass = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -8419,7 +8562,7 @@ fn readRuntimeIndexStatusRecord(
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else .none;
-    const repair_status: ?metadata.IndexRepairStatus = if (version == runtime_status_protocol.current_record_version) blk: {
+    const repair_status: ?metadata.IndexRepairStatus = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -8434,14 +8577,14 @@ fn readRuntimeIndexStatusRecord(
     } else null;
     if ((repair_status != null) != (lifecycle_work_class == .repair))
         return error.InvalidMetadataTransitionEncoding;
-    const repair_active_generation_serviceable = if (version == runtime_status_protocol.current_record_version) blk: {
+    const repair_active_generation_serviceable = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const source_replay_count = if (version == runtime_status_protocol.current_record_version)
+    const source_replay_count = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
         try readInt(encoded, pos, u16)
     else
         0;
@@ -8456,7 +8599,7 @@ fn readRuntimeIndexStatusRecord(
         errdefer alloc.free(artifact_name);
         const published_sequence = try readInt(encoded, pos, u64);
         const target_sequence = try readInt(encoded, pos, u64);
-        const failed = if (version == runtime_status_protocol.current_record_version) blk: {
+        const failed = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
             if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
             const value = encoded[pos.*];
             pos.* += 1;
@@ -12656,6 +12799,137 @@ test "metadata raft apply store notifies projection listeners for committed tabl
     try std.testing.expectEqual(@as(u64, 1001), capture.last_range_group_id);
 }
 
+test "lifecycle listener detach drains callbacks and preserves unrelated listeners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-lifecycle-listener-detach",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        projection_calls: std.atomic.Value(usize) = .init(0),
+        committed_key_calls: std.atomic.Value(usize) = .init(0),
+        block_projection: std.atomic.Value(bool) = .init(false),
+
+        fn onProjection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.projection_calls.fetchAdd(1, .acq_rel);
+            if (!self.block_projection.load(.acquire)) return;
+            self.entered.set(std.Options.debug_io);
+            self.release.waitUncancelable(std.Options.debug_io);
+        }
+
+        fn matchesCommittedKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onCommittedKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.committed_key_calls.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Dispatch = struct {
+        store: *RaftApplyStore,
+
+        fn run(self: *@This()) void {
+            const io = self.store.io_impl.io();
+            self.store.apply_mutex.lockUncancelable(io);
+            defer self.store.apply_mutex.unlock(io);
+            for (self.store.projection_listeners.items) |registered| {
+                registered.listener.onProjectionSignal(.{
+                    .kind = .table,
+                    .metadata_group_id = 1,
+                });
+            }
+        }
+    };
+    const Detach = struct {
+        store: *RaftApplyStore,
+        registration: LifecycleListenerRegistration,
+        started: std.Io.Event = .unset,
+        finished: std.atomic.Value(bool) = .init(false),
+        removed: bool = false,
+
+        fn run(self: *@This()) void {
+            self.started.set(std.Options.debug_io);
+            self.removed = self.store.removeLifecycleListeners(self.registration);
+            self.finished.store(true, .release);
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var unrelated = Capture{};
+    try store.addProjectionListener(.{
+        .ptr = &unrelated,
+        .vtable = &.{ .on_projection_signal = Capture.onProjection },
+    });
+    try store.addCommittedKeyListener(.{
+        .ptr = &unrelated,
+        .vtable = &.{
+            .matches_key = Capture.matchesCommittedKey,
+            .on_committed_key = Capture.onCommittedKey,
+        },
+    });
+
+    var owned = Capture{};
+    owned.block_projection.store(true, .release);
+    const registration = try store.addLifecycleListeners(
+        .{ .ptr = &owned, .vtable = &.{ .on_projection_signal = Capture.onProjection } },
+        .{ .ptr = &owned, .vtable = &.{
+            .matches_key = Capture.matchesCommittedKey,
+            .on_committed_key = Capture.onCommittedKey,
+        } },
+    );
+
+    var dispatch = Dispatch{ .store = &store };
+    var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});
+    owned.entered.waitUncancelable(std.Options.debug_io);
+
+    var detach = Detach{ .store = &store, .registration = registration };
+    var detach_lock_entered: std.Io.Event = .unset;
+    var detach_lock_resume: std.Io.Event = .unset;
+    var detach_lock_contended: std.atomic.Value(bool) = .init(false);
+    test_lifecycle_detach_lock_barrier = .{
+        .entered = &detach_lock_entered,
+        .resume_event = &detach_lock_resume,
+        .contended = &detach_lock_contended,
+    };
+    defer test_lifecycle_detach_lock_barrier = null;
+    var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});
+    detach.started.waitUncancelable(std.Options.debug_io);
+    detach_lock_entered.waitUncancelable(std.Options.debug_io);
+    // The detach call reached the exact apply-lock boundary while the callback
+    // owns that lock. Resume it, then release the callback; it cannot return
+    // until synchronous dispatch has drained.
+    const blocked_at_lock_boundary = !detach.finished.load(.acquire);
+    const apply_lock_was_contended = detach_lock_contended.load(.acquire);
+    detach_lock_resume.set(std.Options.debug_io);
+    owned.release.set(std.Options.debug_io);
+    dispatch_thread.join();
+    detach_thread.join();
+    try std.testing.expect(blocked_at_lock_boundary);
+    try std.testing.expect(apply_lock_was_contended);
+    try std.testing.expect(detach.removed);
+    try std.testing.expect(detach.finished.load(.acquire));
+
+    owned.block_projection.store(false, .release);
+    store.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = 1 });
+    store.notifyCommittedKeyListeners(.{ .metadata_group_id = 1, .key = "table/1" });
+    try std.testing.expectEqual(@as(usize, 1), owned.projection_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owned.committed_key_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), unrelated.projection_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), unrelated.committed_key_calls.load(.acquire));
+    test_lifecycle_detach_lock_barrier = null;
+    try std.testing.expect(!store.removeLifecycleListeners(registration));
+}
+
 test "placement projection commit barrier brackets durability and notification" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12796,7 +13070,7 @@ test "atomic table topology lifecycle notifications stay constant at the initial
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
     var capture = Capture{};
-    try store.addLifecycleListeners(
+    _ = try store.addLifecycleListeners(
         .{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } },
         .{ .ptr = &capture, .vtable = &.{
             .matches_key = Capture.matchesCommittedKey,
@@ -14875,7 +15149,7 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
         alloc,
         &encoded,
         status,
-        runtime_status_protocol.current_record_version,
+        runtime_status_protocol.repair_status_record_version,
     );
     version_pos = 0;
     try std.testing.expectEqual(
@@ -15012,6 +15286,71 @@ test "current runtime status profile preserves convergence authority" {
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(u64, 0), legacy.target_observation_revision);
     try std.testing.expect(legacy.target_observation_complete);
+}
+
+test "current runtime status profile preserves inference diagnostics" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    const status = metadata.RuntimeGroupStatusReport{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 7,
+        .store_id = 3,
+        .node_id = 4,
+        .enrichment = .{
+            .projection_checkpoint_identity_consistent = false,
+            .stalled = true,
+            .stall_reason = "inference_timeout",
+            .active_phase = "embedding",
+            .active_model = "BAAI/bge-m3",
+            .active_backend = "metal",
+            .active_deadline_ms = 101,
+            .last_progress_ms = 99,
+            .active_progress_completed = 7,
+            .active_progress_total = 11,
+            .inference_timeout_count = 3,
+            .inference_cancel_count = 5,
+        },
+    };
+    try appendRuntimeGroupStatusRecord(
+        alloc,
+        &encoded,
+        status,
+        runtime_status_protocol.current_record_version,
+    );
+    var pos: usize = 0;
+    const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expect(!decoded.enrichment.projection_checkpoint_identity_consistent);
+    try std.testing.expectEqualStrings("inference_timeout", decoded.enrichment.stall_reason);
+    try std.testing.expectEqualStrings("embedding", decoded.enrichment.active_phase);
+    try std.testing.expectEqualStrings("BAAI/bge-m3", decoded.enrichment.active_model);
+    try std.testing.expectEqualStrings("metal", decoded.enrichment.active_backend);
+    try std.testing.expectEqual(@as(u64, 101), decoded.enrichment.active_deadline_ms);
+    try std.testing.expectEqual(@as(u64, 99), decoded.enrichment.last_progress_ms);
+    try std.testing.expectEqual(@as(u64, 7), decoded.enrichment.active_progress_completed);
+    try std.testing.expectEqual(@as(u64, 11), decoded.enrichment.active_progress_total);
+    try std.testing.expectEqual(@as(u64, 3), decoded.enrichment.inference_timeout_count);
+    try std.testing.expectEqual(@as(u64, 5), decoded.enrichment.inference_cancel_count);
+
+    encoded.clearRetainingCapacity();
+    try appendRuntimeGroupStatusRecord(
+        alloc,
+        &encoded,
+        status,
+        runtime_status_protocol.previous_record_version,
+    );
+    pos = 0;
+    const previous = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, previous);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expect(previous.enrichment.projection_checkpoint_identity_consistent);
+    try std.testing.expectEqualStrings("", previous.enrichment.stall_reason);
+    try std.testing.expectEqualStrings("", previous.enrichment.active_phase);
+    try std.testing.expectEqual(@as(u64, 0), previous.enrichment.inference_timeout_count);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

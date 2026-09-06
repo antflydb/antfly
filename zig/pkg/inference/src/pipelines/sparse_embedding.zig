@@ -69,13 +69,18 @@ pub const SparseEmbeddingPipeline = struct {
     config: SparseEmbeddingConfig,
     /// Optional owner-provided gate for stateful backend sessions.
     execution_lock: ?*std.atomic.Mutex = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     /// Generate sparse embeddings for a batch of texts.
     /// Caller owns the returned SparseVectors and must call deinit on each.
     pub fn embed(self: *SparseEmbeddingPipeline, texts: []const []const u8) ![]SparseVector {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, @intCast(texts.len));
         if (texts.len == 0) return try self.allocator.alloc(SparseVector, 0);
         if (self.execution_lock) |mutex| {
-            platform.sync.lockYielding(mutex);
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
         }
         defer if (self.execution_lock) |mutex| mutex.unlock();
         if (embedding_mod.textSessionBatchPlan(self.session, texts.len)) |plan| {
@@ -191,7 +196,7 @@ pub const SparseEmbeddingPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         // Run inference
-        var outputs = try run_permit.run(inputs, alloc);
+        var outputs = try run_permit.runWithControl(inputs, alloc, self.execution_control);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

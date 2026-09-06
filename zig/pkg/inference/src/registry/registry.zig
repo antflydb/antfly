@@ -18,9 +18,14 @@ const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
 const build_options = @import("build_options");
+const projector_format = @import("../architectures/projector_format.zig");
+const gguf_format = @import("../gguf/format.zig");
+const gguf_writer = @import("../gguf/writer.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
+pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
+pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -49,6 +54,8 @@ const DiscoverKindMode = enum {
 
 test {
     _ = download;
+    _ = qwen3vl_catalog;
+    _ = qwen3_embedding_catalog;
 }
 
 /// Friendly short names accepted by user-facing commands in place of a full
@@ -71,6 +78,15 @@ pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "qwen3-vl-2b", .ref = "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-2b-bf16", .ref = "Qwen/Qwen3-VL-2B-Instruct:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-vl-4b", .ref = "Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-8b", .ref = "Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1" },
+    .{ .alias = "qwen3-vl-reranker-2b", .ref = "Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-embedding", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
+    .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its pinned `owner/name:variant` reference.
@@ -114,7 +130,43 @@ test "friendly alias refs parse as explicit model refs" {
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
         try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
+        if (std.mem.eql(u8, entry.alias, "qwen3-vl-reranker-2b")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, ref.variant);
+        } else if (std.mem.eql(u8, entry.alias, "qwen3-vl-2b-bf16")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-vl-")) {
+            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, ref.variant);
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-embedding")) {
+            try std.testing.expect(
+                qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
+            );
+        } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
+            try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
+        } else {
+            try std.testing.expectEqualStrings("gguf", ref.variant);
+        }
     }
+}
+
+fn parseModelRefOrAlias(value: []const u8) !ModelRef {
+    return ModelRef.parse(resolveFriendlyRef(value) orelse value);
+}
+
+test "pull model refs accept friendly Qwen aliases" {
+    const generation = try parseModelRefOrAlias("qwen3-vl-2b");
+    try std.testing.expectEqualStrings("Qwen", generation.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", generation.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, generation.variant);
+
+    const bf16_generation = try parseModelRefOrAlias("qwen3-vl-2b-bf16");
+    try std.testing.expectEqualStrings("Qwen", bf16_generation.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct", bf16_generation.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, bf16_generation.variant);
+
+    const reranker = try parseModelRefOrAlias("QWEN3-VL-RERANKER-2B");
+    try std.testing.expectEqualStrings("Qwen", reranker.owner);
+    try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
+    try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -466,10 +518,70 @@ pub const ModelRegistry = struct {
         defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
+        const progress_sink: download.ProgressSink = .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
-        });
+        };
+        if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3VlGenerationSafetensorsBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant)) {
+            try download.downloadPinnedQwen3VlRerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else {
+            try download.downloadModel(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                transaction.staging,
+                hub_config,
+                projector_selection,
+                progress_sink,
+            );
+        }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);
@@ -989,15 +1101,38 @@ fn appendInferredInputs(
     effective_type: manifest_mod.ModelType,
     inputs: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    const gguf_projector_kind = if (manifest.gguf_projector_path) |projector_path|
+        projector_format.detectPath(allocator, projector_path) catch .unknown
+    else
+        .unknown;
+    const gguf_projector_has_image = switch (gguf_projector_kind) {
+        .antfly_gemma3, .clip_qwen3vl_image, .clip_gemma4_image, .clip_gemma4_image_audio => true,
+        else => false,
+    };
+    const gguf_projector_has_audio = switch (gguf_projector_kind) {
+        .clip_gemma4_audio, .clip_gemma4_image_audio => true,
+        else => false,
+    };
+
     if (manifest.inputs.len > 0 and effective_type == manifest.model_type) {
         for (manifest.inputs) |input| try appendUniqueOwnedString(allocator, inputs, input);
+        // Refresh manifests synthesized by older Antfly versions, which
+        // treated every GGUF projector as image-only. Recognized projector
+        // metadata is authoritative about the modalities it can serve.
+        if (effective_type == .embedder or effective_type == .generator) {
+            if (gguf_projector_has_image) try appendUniqueOwnedString(allocator, inputs, "image");
+            if (gguf_projector_has_audio) try appendUniqueOwnedString(allocator, inputs, "audio");
+        }
         return;
     }
 
     const has_visual = manifest.visual_model_path != null or
         manifest.visual_projection_path != null or
-        manifest.gguf_projector_path != null;
-    const has_audio = manifest.audio_model_path != null or manifest.audio_projection_path != null;
+        gguf_projector_has_image or
+        (manifest.gguf_projector_path != null and gguf_projector_kind == .unknown);
+    const has_audio = manifest.audio_model_path != null or
+        manifest.audio_projection_path != null or
+        gguf_projector_has_audio;
 
     switch (effective_type) {
         .embedder => {
@@ -1583,6 +1718,59 @@ test "synthesized pulled manifest keeps generate read gguf as generator" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\"]") != null);
 }
 
+test "synthesized pulled manifest infers a multimodal decoder GGUF as generator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/ggml-org/gemma-4-E4B-it-GGUF");
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+    };
+    var layout = try gguf_writer.buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf",
+        .data = layout.header_bytes,
+    });
+    const projector_metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4v" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4a" } },
+    };
+    var projector_layout = try gguf_writer.buildLayout(allocator, &projector_metadata, &.{});
+    defer projector_layout.deinit(allocator);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/mmproj-gemma-4-E4B-it-Q8_0.gguf",
+        .data = projector_layout.header_bytes,
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "models/ggml-org/gemma-4-E4B-it-GGUF",
+    });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, null, null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"generator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"generate\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\",\"audio\"]") != null);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"tasks\":[\"generate\"],\"inputs\":[\"text\",\"image\"]}",
+    });
+    const upgraded_json = try synthesizePulledModelManifestJson(allocator, model_dir, "generate", null);
+    defer allocator.free(upgraded_json);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_json, "\"inputs\":[\"text\",\"image\",\"audio\"]") != null);
+}
+
 test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1663,9 +1851,25 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
 }
 
-/// Resolve a model name by variant suffix.
+fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8) bool {
+    const marker = "--antfly-";
+    if (!std.mem.startsWith(u8, candidate, requested_name) or
+        candidate.len != requested_name.len + marker.len + 16 or
+        !std.mem.eql(u8, candidate[requested_name.len..][0..marker.len], marker))
+    {
+        return false;
+    }
+    for (candidate[candidate.len - 16 ..]) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return false;
+    }
+    return true;
+}
+
+/// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
 /// prefixed with "requested-" and returns the shortest deterministic match.
+/// Managed variant directories are deliberately excluded: their suffix is an
+/// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
 /// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
@@ -1698,7 +1902,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
             else => return err,
         };
         if (entry_kind != .directory) continue;
-        if (std.mem.startsWith(u8, entry.name, prefix)) {
+        if (std.mem.startsWith(u8, entry.name, prefix) and
+            !isManagedVariantInstallLeaf(requested_name, entry.name))
+        {
             if (best_name == null or entry.name.len < best_name.?.len or
                 (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
             {
@@ -1786,7 +1992,7 @@ test "explicit model variants use distinct stable install directories" {
     try std.testing.expectEqualStrings("/models/owner/model", auto);
 }
 
-test "resolveVariant finds nested explicit variant install" {
+test "resolveVariant ignores opaque managed variant install hashes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1796,11 +2002,24 @@ test "resolveVariant finds nested explicit variant install" {
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
+    try std.testing.expect(try resolveVariant(allocator, io, models_dir, "owner/model") == null);
+}
+
+test "resolveVariant retains legacy suffix resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
     const resolved = (try resolveVariant(allocator, io, models_dir, "owner/model")) orelse
         return error.ExpectedVariantResolution;
     defer allocator.free(resolved);
 
-    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model-q4_0" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }
