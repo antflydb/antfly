@@ -55,6 +55,7 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const shared_vector = @import("antfly_vector").vector;
+var traced_local_batches = std.atomic.Value(u64).init(0);
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -166,6 +167,7 @@ pub const AntflyProvider = struct {
         model: []const u8,
         roles: []const []const u8,
         contents: []const []const u8,
+        options: inference_types.GenerationOptions,
     ) anyerror![]u8 = null,
     generate_text_with_context: ?*const fn (
         ptr: *anyopaque,
@@ -173,6 +175,7 @@ pub const AntflyProvider = struct {
         model: []const u8,
         roles: []const []const u8,
         contents: []const []const u8,
+        options: inference_types.GenerationOptions,
         context: RequestContext,
     ) anyerror![]u8 = null,
     generate_messages: ?*const fn (
@@ -180,12 +183,14 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+        options: inference_types.GenerationOptions,
     ) anyerror![]u8 = null,
     generate_messages_with_context: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+        options: inference_types.GenerationOptions,
         context: RequestContext,
     ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
@@ -4819,6 +4824,19 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
+    const trace_batch = entry.provider == .antfly and entry.antfly_provider != null and
+        getenv("ANTFLY_EMBED_TRACE_DIR") != null and traced_local_batches.fetchAdd(1, .monotonic) < 64;
+    const trace_started = if (trace_batch) monotonicNowNs() else 0;
+    var provider_started: u64 = 0;
+    var provider_finished: u64 = 0;
+    var trace_success = false;
+    defer if (trace_batch) {
+        const finished = monotonicNowNs();
+        std.log.info("managed embed trace items={d} started_ns={d} provider_started_ns={d} provider_finished_ns={d} total_ns={d} pacer_context_ns={d} success={}", .{
+            texts.len,                 trace_started,                                                                              provider_started, provider_finished,
+            finished -| trace_started, if (provider_started > 0) provider_started -| trace_started else finished -| trace_started, trace_success,
+        });
+    };
     try embeddingRequestContext(entry, task_type).request.updateDetail(
         if (entry.provider == .antfly) .loading_model else .executing,
         0,
@@ -4844,11 +4862,13 @@ fn embedBatchWithEntryForTask(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
+                if (trace_batch) provider_started = monotonicNowNs();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
                 else
                     AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
                     return normalizeLocalEmbeddingError(err);
+                if (trace_batch) provider_finished = monotonicNowNs();
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 // The errdefer is the sole owner of failure cleanup. Native
                 // kernels may return successfully after lifecycle cancellation;
@@ -4856,6 +4876,7 @@ fn embedBatchWithEntryForTask(
                 // allocator-owned result while unwinding the cancellation.
                 try context.check();
                 try validateDenseBatch(vectors, texts.len, dims);
+                trace_success = true;
                 return vectors;
             }
             try checkEntryDispatchDeadline(entry);

@@ -131,6 +131,8 @@ test {
     _ = architectures.qwen3vl_reranker;
     _ = @import("architectures/gpt.zig");
     _ = @import("architectures/gemma4_runtime.zig");
+    _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("embedding_trace.zig");
     _ = @import("server/model_manager.zig");
     _ = finetune;
     _ = finetune_cli;

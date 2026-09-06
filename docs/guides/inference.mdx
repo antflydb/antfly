@@ -1,6 +1,6 @@
 ---
 title: Antfly inference
-description: Use Antfly inference for local ML inference — embeddings, chunking, and reranking
+description: Use Antfly inference for local embeddings, chunking, reranking, and multimodal generation
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -12,16 +12,19 @@ tags: [inference, embeddings, reranking, models]
 - What is Antfly inference?
 - How do I download models for Antfly inference?
 - What models are available?
-- How do I use Antfly inference for embeddings, chunking, and reranking?
+- How do I use Antfly inference for embeddings, chunking, reranking, and generation?
 </Questions>
 
-Antfly inference is Antfly's local ML inference service for embeddings, chunking, and reranking. It runs ONNX-optimized models for fast CPU inference without external API dependencies.
+Antfly inference is Antfly's local ML inference service for embeddings, chunking,
+reranking, and text generation from text, image, and audio prompts. It supports
+optimized ONNX and native GGUF execution without external API dependencies.
 
 ## Features
 
 - **Embedding Generation** - Text and multimodal (CLIP) embedding models
 - **Text Chunking** - Semantic chunking with ONNX models or fixed-size fallback
 - **Reranking** - Relevance re-scoring for search results
+- **Local Generation** - Text, image, and audio prompts with supported GGUF models
 - **Privacy** - Data never leaves your infrastructure
 
 ## Model Management
@@ -41,16 +44,20 @@ without an owner is rejected.
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
-antfly inference pull hf:mixedbread-ai/mxbai-rerank-base-v1 --tasks rerank
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 Use `--tasks` to record what the model is for, which determines where it is discovered
 and which endpoints will serve it.
 
+`--projector auto` is the default. Gemma 4's unified projector enables image and audio
+inputs and is recorded in the generated model manifest. Use `--projector none` for a
+text-only installation.
+
 Verified starting points:
 - **Embedders**: `BAAI/bge-small-en-v1.5`, `antflydb/clipclap` (text + image + audio)
-- **Rerankers**: `mixedbread-ai/mxbai-rerank-base-v1`
+- **Rerankers**: `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`
 - **Generators**: `ggml-org/gemma-4-E4B-it-GGUF` — see [Supported models](/docs/guides/supported-models)
 - **Transcribers**: `openai/whisper-tiny`
 - **Readers**: `antflydb/Florence-2-base`
@@ -81,13 +88,12 @@ antfly inference pull hf:BAAI/bge-small-en-v1.5:i8 --tasks embed
 
 ## Model Storage
 
-Models are stored in `~/.antfly/inference/models/` by default, organized by type:
-- `~/.antfly/inference/models/embedders/` - Embedding models
-- `~/.antfly/inference/models/chunkers/` - Chunking models
-- `~/.antfly/inference/models/rerankers/` - Reranking models
-- `~/.antfly/inference/models/generators/` - Generation models
-
-Antfly inference auto-discovers and loads models from these directories when Antfly starts in standalone mode. Use `--models-dir` to override the default location.
+Models are stored in `~/.antfly/inference/models/` by default, under their
+HuggingFace owner and repository name. Explicit variants use distinct internal
+leaf names so quantizations cannot be mixed accidentally. Antfly inference
+auto-discovers these models, as well as legacy role-specific directories, when
+Antfly starts in standalone mode. Use `--models-dir` to override the default
+location.
 
 Traditional ML predictors use the parallel `~/.antfly/inference/ml/` directory.
 Use `--ml-dir` to override it. Neither inference asset directory follows the
@@ -136,7 +142,7 @@ advertised because Antfly does not implement a compatible Ollama rerank API.
 ```json
 {
   "provider": "antfly",
-  "model": "mixedbread-ai/mxbai-rerank-base-v1",
+  "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
   "field": "body"
 }
 ```
