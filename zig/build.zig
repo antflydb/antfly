@@ -188,6 +188,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-gliner2-native",
     "gliner2-entity-training-readiness",
     "test-finetune",
+    "test-cancellation-e2e",
     "test",
     "wasm",
 };
