@@ -2905,7 +2905,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
+            if (std.mem.eql(u8, task, "readers") and !try readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
             if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
                 incrementModelCount(&counts, task);
             }
@@ -2977,7 +2977,7 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedManifest(allocator, entry.path, man)) continue;
+            if (std.mem.eql(u8, task, "readers") and !(try readers_mod.probeManifest(allocator, entry.path, man)).isSupported()) continue;
             if (taskMatchesModelListing(
                 task,
                 @tagName(man.model_type),
@@ -12066,6 +12066,7 @@ pub const Node = struct {
         try discovered_listings.ensureTotalCapacity(a, discovered.len);
         for (discovered, 0..) |entry, entry_index| {
             var manifest = (try manifest_mod.loadListingCandidateFromDir(a, entry.path)) orelse continue;
+            errdefer manifest.deinit();
             if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
                 manifest.deinit();
                 continue;
@@ -12087,7 +12088,7 @@ pub const Node = struct {
             discovered_listings.appendAssumeCapacity(.{
                 .entry_index = entry_index,
                 .manifest = manifest,
-                .reader_supported = reader_candidate and readers_mod.isSupportedManifest(a, entry.path, manifest),
+                .reader_supported = reader_candidate and (try readers_mod.probeManifest(a, entry.path, manifest)).isSupported(),
                 .kind = model_kind,
                 .compatibility_level = @tagName(compatibility_summary.level),
             });

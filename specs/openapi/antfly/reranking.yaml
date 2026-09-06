@@ -5,6 +5,8 @@ info:
   version: "0.0.1"
 components:
   schemas:
+    RateLimitConfig:
+      $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
     RerankerProvider:
       type: string
       enum:
@@ -20,6 +22,9 @@ components:
         provider:
           type: string
           enum: [antfly]
+        api_key:
+          type: string
+          description: "Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials."
         model:
           type: string
           description: "Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed."
@@ -112,6 +117,9 @@ components:
       allOf:
         - type: object
           properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
             provider:
               $ref: "#/components/schemas/RerankerProvider"
             field:
