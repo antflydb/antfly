@@ -148,6 +148,7 @@ pub const IndexConfig = types.IndexConfig;
 pub const IndexExecutionConfig = types.IndexExecutionConfig;
 pub const IndexMilestoneStatus = types.IndexMilestoneStatus;
 pub const IndexMilestones = types.IndexMilestones;
+pub const IndexMutationConflictError = types.IndexMutationConflictError;
 pub const IndexPublicationPolicy = types.IndexPublicationPolicy;
 pub const IndexReadinessReason = types.IndexReadinessReason;
 pub const IndexReadinessState = types.IndexReadinessState;

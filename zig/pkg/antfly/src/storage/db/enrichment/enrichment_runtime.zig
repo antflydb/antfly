@@ -3151,12 +3151,6 @@ fn assetProducerBatchItemBytes(item: AssetProducerBatchItem) usize {
     );
 }
 
-fn assetProducerBatchBytes(items: []const AssetProducerBatchItem) usize {
-    var total: usize = 0;
-    for (items) |item| total = addUsizeSaturating(total, assetProducerBatchItemBytes(item));
-    return total;
-}
-
 fn workerChunkCacheKey(
     alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -3243,10 +3237,7 @@ fn getOrCreateRequestChunks(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const raw = try storeGetOptionalAllocWithRetry(runtime, doc_store_key);
     if (raw == null) {
         const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
         try cache.append(runtime.alloc, .{
@@ -3587,11 +3578,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         defer deferred_plain_dense.deinit(self.alloc);
         var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         defer deferred_chunked_dense.deinit(self.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
-        defer {
-            clearAssetProducerBatchItems(self.alloc, &deferred_assets);
-            deferred_assets.deinit(self.alloc);
-        }
+        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_assets.deinit(self.alloc);
         var window = GeneratedReplayWindow{ .alloc = self.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
@@ -5805,11 +5793,8 @@ fn runForegroundCatchUpPassOwned(
         defer deferred_plain_dense.deinit(runtime.alloc);
         var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         defer deferred_chunked_dense.deinit(runtime.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
-        defer {
-            clearAssetProducerBatchItems(runtime.alloc, &deferred_assets);
-            deferred_assets.deinit(runtime.alloc);
-        }
+        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_assets.deinit(runtime.alloc);
         var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
@@ -5916,7 +5901,7 @@ fn processPendingDocumentGroup(
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     window: *GeneratedReplayWindow,
     processed_request_count: *u64,
     guard: ForegroundCatchUpGuard,
@@ -5942,7 +5927,7 @@ fn processPendingDocumentGroup(
         }
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
         switch (request.kind) {
-            .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
+            .asset => processAssetOrDefer(runtime, request, deferred_assets, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
@@ -5976,34 +5961,65 @@ fn flushDeferredGeneratedWork(
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     window: *GeneratedReplayWindow,
 ) !void {
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try flushAssetProducerBatch(runtime, deferred_assets, window);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
+    processDeferredAssets(runtime, deferred_assets.items, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        deferred_retry_error = err;
+        deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+    };
+    deferred_assets.clearRetainingCapacity();
+    // Each producer class is an independent availability domain. Publish a
+    // completed class before invoking the next provider so a retryable outage
+    // cannot discard useful sibling output accumulated in this replay
+    // quantum. The source cursor remains unchanged until every class has been
+    // visited, so the failed request is retried and successful writes remain
+    // crash-idempotent.
+    try flushGeneratedReplayWindow(runtime, window);
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try processPlainDenseWindow(runtime, deferred_plain_dense.items, window);
+    processPlainDenseWindow(runtime, deferred_plain_dense.items, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        if (deferred_retry_error == null) {
+            deferred_retry_error = err;
+            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+    };
     deferred_plain_dense.clearRetainingCapacity();
+    try flushGeneratedReplayWindow(runtime, window);
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    try processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window);
+    processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+            return err;
+        if (deferred_retry_error == null) {
+            deferred_retry_error = err;
+            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+        }
+    };
     deferred_chunked_dense.clearRetainingCapacity();
     try flushGeneratedReplayWindow(runtime, window);
     clearWorkerChunkCache(runtime.alloc, chunk_cache);
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
+    if (deferred_retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
+    }
 }
 
 fn processAsset(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    deferred_assets: *PreparedAssetBatch,
     window: *GeneratedReplayWindow,
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     var raw_owned = true;
     defer if (raw_owned) runtime.alloc.free(raw);
 
@@ -6085,10 +6101,7 @@ fn processAsset(
     var state_value_owned = true;
     defer if (state_value_owned) runtime.alloc.free(state_value);
     if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
-        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
-            std.mem.Allocator.Error.OutOfMemory => return err,
-            else => null,
-        };
+        const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
             try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
@@ -6102,7 +6115,7 @@ fn processAsset(
     var config_json_owned = true;
     errdefer if (config_json_owned and config_json.len > 0) runtime.alloc.free(config_json);
 
-    try appendAssetProducerBatchItem(runtime, deferred_assets, window, .{
+    try deferred_assets.append(runtime, window, .{
         .request = request,
         .producer_type = producer_cfg.type,
         .config_json = @constCast(config_json),
@@ -6122,24 +6135,106 @@ fn processAsset(
     state_value_owned = false;
 }
 
-fn appendAssetProducerBatchItem(
-    runtime: *EnrichmentRuntime,
-    items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
-    window: *GeneratedReplayWindow,
-    item: AssetProducerBatchItem,
-) !void {
-    const policy = requestGeneratedTextBatchPolicy(runtime.alloc, item.request);
-    if (items.items.len > 0) {
-        const current_bytes = assetProducerBatchBytes(items.items);
-        const item_bytes = assetProducerBatchItemBytes(item);
-        if (!sameAssetProducerBatchKey(items.items[0], item) or
-            items.items.len >= policy.max_items or
-            addUsizeSaturating(current_bytes, item_bytes) > policy.max_bytes)
-        {
-            try flushAssetProducerBatch(runtime, items, window);
+// Planning retains only borrowed requests. Materialization owns at most one
+// byte-bounded provider batch plus the candidate currently being inspected.
+// A single oversized source is dispatched alone; it cannot accumulate with
+// the next source. Retryable failures are remembered while sibling work runs.
+const PreparedAssetBatch = struct {
+    items: std.ArrayListUnmanaged(AssetProducerBatchItem) = .empty,
+    retained_bytes: usize = 0,
+    retry_error: ?anyerror = null,
+    retry_fingerprint: u64 = 0,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        clearAssetProducerBatchItems(alloc, &self.items);
+        self.items.deinit(alloc);
+    }
+
+    fn retainRetry(self: *@This(), runtime: *EnrichmentRuntime, err: anyerror) !void {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+        if (self.retry_error == null) {
+            self.retry_error = err;
+            self.retry_fingerprint = runtime.active_failure_fingerprint;
         }
     }
-    try items.append(runtime.alloc, item);
+
+    fn flush(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow) !void {
+        defer self.retained_bytes = 0;
+        flushAssetProducerBatch(runtime, &self.items, window) catch |err| try self.retainRetry(runtime, err);
+        try flushGeneratedReplayWindow(runtime, window);
+    }
+
+    fn append(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem) !void {
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, item.request);
+        const item_bytes = assetProducerRetainedBytes(item);
+        if (self.items.items.len > 0 and
+            (!sameAssetProducerBatchKey(self.items.items[0], item) or
+                self.items.items.len >= policy.max_items or
+                addUsizeSaturating(self.retained_bytes, item_bytes) > policy.max_bytes))
+            try self.flush(runtime, window);
+        try self.items.append(runtime.alloc, item);
+        self.retained_bytes = addUsizeSaturating(self.retained_bytes, item_bytes);
+    }
+
+    fn flushIfFull(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow) !void {
+        if (self.items.items.len == 0) return;
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, self.items.items[0].request);
+        if (self.items.items.len >= policy.max_items or self.retained_bytes >= policy.max_bytes)
+            try self.flush(runtime, window);
+    }
+};
+
+fn assetProducerRetainedBytes(item: AssetProducerBatchItem) usize {
+    var bytes = assetProducerBatchItemBytes(item);
+    for ([_][]const u8{ item.raw_doc, item.artifact_key, item.state_key, item.state_value }) |part|
+        bytes = addUsizeSaturating(bytes, part.len);
+    return bytes;
+}
+
+fn processAssetOrDefer(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    deferred: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    window: *GeneratedReplayWindow,
+) !void {
+    var config = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer config.deinit(runtime.alloc);
+    if (config.type != .copy and config.type != .document_extraction) {
+        try deferred.append(runtime.alloc, request);
+        return;
+    }
+    // Copy/extraction establish dependencies for subsequent requests and own
+    // their existing bounded execution paths; they do not queue provider input.
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(runtime.alloc);
+    try processAsset(runtime, request, &batch, window);
+    std.debug.assert(batch.items.items.len == 0);
+}
+
+fn processDeferredAssets(
+    runtime: *EnrichmentRuntime,
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
+) !void {
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(runtime.alloc);
+    for (requests) |request| {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
+        processAsset(runtime, request, &batch, window) catch |err| {
+            if (shouldYieldRequestError(runtime, err)) {
+                try batch.retainRetry(runtime, err);
+            } else {
+                try recordIsolatedRequestError(runtime, window, request, err);
+            }
+        };
+        try batch.flushIfFull(runtime, window);
+    }
+    try batch.flush(runtime, window);
+    if (batch.retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, batch.retry_fingerprint);
+        return err;
+    }
 }
 
 fn flushAssetProducerBatch(
@@ -6149,22 +6244,63 @@ fn flushAssetProducerBatch(
 ) !void {
     if (items.items.len == 0) return;
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
 
+    // The materializer bounds retained bytes before dispatch. Partition any
+    // callers' mixed inputs into compatible provider batches as well.
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
+    var start: usize = 0;
+    while (start < items.items.len) {
+        const policy = requestGeneratedTextBatchPolicy(runtime.alloc, items.items[start].request);
+        var end = start;
+        var batch_bytes: usize = 0;
+        while (end < items.items.len) : (end += 1) {
+            const item = items.items[end];
+            if (end > start and !sameAssetProducerBatchKey(items.items[start], item)) break;
+            const item_bytes = assetProducerBatchItemBytes(item);
+            if (end > start and
+                (end - start >= policy.max_items or
+                    addUsizeSaturating(batch_bytes, item_bytes) > policy.max_bytes)) break;
+            batch_bytes = addUsizeSaturating(batch_bytes, item_bytes);
+        }
+        std.debug.assert(end > start);
+        flushAssetProducerBatchItems(runtime, items.items[start..end], window) catch |err| {
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                return err;
+            if (deferred_retry_error == null) {
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+            }
+        };
+        start = end;
+    }
+    if (deferred_retry_error) |err| {
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
+    }
+}
+
+fn flushAssetProducerBatchItems(
+    runtime: *EnrichmentRuntime,
+    items: []AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+) !void {
+    std.debug.assert(items.len > 0);
+    setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items));
     yieldToInteractiveGeneration(runtime);
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);
+    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.len);
     defer runtime.alloc.free(requests);
-    for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+    for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     };
     if (!can_batch)
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
 
     var produced = assetProducerProduceBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
@@ -6172,14 +6308,14 @@ fn flushAssetProducerBatch(
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
         // fingerprints across worker passes.
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     };
-    if (produced.len != items.items.len) {
+    if (produced.len != items.len) {
         for (produced) |output| {
             if (output.len > 0) runtime.alloc.free(output);
         }
         runtime.alloc.free(produced);
-        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+        return try flushAssetProducerBatchSequential(runtime, producer, items, window);
     }
 
     defer runtime.alloc.free(produced);
@@ -6189,7 +6325,7 @@ fn flushAssetProducerBatch(
         }
     }
 
-    for (items.items, produced, 0..) |*item, output, idx| {
+    for (items, produced, 0..) |*item, output, idx| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
             runtime.alloc.free(output);
@@ -6269,15 +6405,9 @@ fn processDocumentExtractionAsset(
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
     defer runtime.alloc.free(state_key);
-    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_state = try storeGetOptionalAllocWithRetry(runtime, state_key);
     defer if (existing_state) |value| runtime.alloc.free(value);
-    const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_manifest = try storeGetOptionalAllocWithRetry(runtime, manifest_key);
     defer if (existing_manifest) |value| runtime.alloc.free(value);
     var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
     defer freeDocumentArtifactChildRanges(runtime.alloc, previous_child_ranges);
@@ -6917,10 +7047,7 @@ fn deleteDocumentExtractionForRuntime(
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
     try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, manifest_key);
 
-    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_state = try storeGetOptionalAllocWithRetry(runtime, state_key);
     defer if (existing_state) |value| runtime.alloc.free(value);
     if (existing_state) |state| {
         var previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
@@ -9542,10 +9669,7 @@ fn runtimeReconcileGraphEdgeContenders(
 
     const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
     defer alloc.free(count_key);
-    const raw_count = storeGetAlloc(runtime, count_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const raw_count = try storeGetOptionalAllocWithRetry(runtime, count_key);
     defer if (raw_count) |raw| alloc.free(raw);
     const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
     result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
@@ -10753,10 +10877,7 @@ fn collectPlainDenseBatchItem(
     const embedding_artifact_name = requestEmbeddingName(request);
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return null;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -10947,9 +11068,11 @@ fn processChunkedDenseWindow(
     const processed = try runtime.alloc.alloc(bool, requests.len);
     defer runtime.alloc.free(processed);
     @memset(processed, false);
+    var deferred_retry_error: ?anyerror = null;
+    var deferred_retry_fingerprint: u64 = 0;
 
     var i: usize = 0;
-    while (i < requests.len) : (i += 1) {
+    request_key: while (i < requests.len) : (i += 1) {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         if (processed[i]) continue;
         processed[i] = true;
@@ -10990,7 +11113,19 @@ fn processChunkedDenseWindow(
             const chunk_artifact_name = requestArtifactName(request);
             if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
                 processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window) catch |err| {
-                    if (shouldYieldRequestError(runtime, err)) return err;
+                    if (shouldYieldRequestError(runtime, err)) {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    }
                     try recordIsolatedRequestError(runtime, window, request, err);
                 };
                 continue;
@@ -11023,7 +11158,19 @@ fn processChunkedDenseWindow(
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                 {
-                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+                    _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    };
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                 }
@@ -11043,7 +11190,19 @@ fn processChunkedDenseWindow(
                 });
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                            return err;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+                        }
+                        var remaining = i + 1;
+                        while (remaining < requests.len) : (remaining += 1) {
+                            if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+                        }
+                        continue :request_key;
+                    };
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
                     // The failed batch already parked this logical request.
@@ -11055,8 +11214,25 @@ fn processChunkedDenseWindow(
         }
 
         if (chunk_items.items.len == 0) continue;
-        _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true);
+        _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true) catch |err| {
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                return err;
+            if (deferred_retry_error == null) {
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+            }
+            var remaining = i + 1;
+            while (remaining < requests.len) : (remaining += 1) {
+                if (sameChunkedDenseBatchKey(seed, requests[remaining])) processed[remaining] = true;
+            }
+            continue :request_key;
+        };
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
+    }
+    if (deferred_retry_error) |err| {
+        try flushGeneratedReplayWindow(runtime, window);
+        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        return err;
     }
 }
 
@@ -11074,16 +11250,13 @@ fn getOrCreatePlannedRequests(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => {
-            const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
-            try request_plan_cache.append(runtime.alloc, .{
-                .doc_key = owned_doc_key,
-                .requests = empty,
-            });
-            return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
-        },
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse {
+        const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
+        try request_plan_cache.append(runtime.alloc, .{
+            .doc_key = owned_doc_key,
+            .requests = empty,
+        });
+        return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
     };
     defer runtime.alloc.free(raw);
 
@@ -11516,10 +11689,7 @@ fn processDenseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
@@ -11656,10 +11826,7 @@ fn processSparseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -12098,10 +12265,7 @@ fn embeddingArtifactKey(runtime: *EnrichmentRuntime, base_key: []const u8, artif
 }
 
 fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, source_hash: u64) !bool {
-    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, artifact_key)) orelse return false;
     defer runtime.alloc.free(raw);
     const existing_hash = enrichment_artifact_codec.sourceHash(raw) catch {
         runtime.codec_decode_failures += 1;
@@ -12115,10 +12279,7 @@ fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []cons
 }
 
 fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, value: []const u8) !bool {
-    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, artifact_key)) orelse return false;
     defer runtime.alloc.free(raw);
     if (std.mem.eql(u8, raw, value)) {
         runtime.skip_by_hash_count += 1;
@@ -12128,10 +12289,7 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
 }
 
 fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return false,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return false;
     defer runtime.alloc.free(raw);
     if (std.mem.eql(u8, raw, expected_state)) {
         runtime.skip_by_hash_count += 1;
@@ -12517,10 +12675,7 @@ fn ensureRuntimeDocumentExtractionNavigationIndex(
 ) !bool {
     const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(runtime.alloc, doc_key, artifact_name);
     defer runtime.alloc.free(summary_key);
-    const existing_summary = storeGetAlloc(runtime, summary_key) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
-    };
+    const existing_summary = try storeGetOptionalAllocWithRetry(runtime, summary_key);
     defer if (existing_summary) |summary| runtime.alloc.free(summary);
     if (existing_summary) |summary| {
         if (try hierarchy_navigation.indexMetadataMatches(runtime.alloc, state, summary, generation)) {
@@ -13646,10 +13801,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
     state_key: []const u8,
     deletes: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return;
     defer runtime.alloc.free(raw);
     if (try graph_asset_state.format(raw) != .v5) return;
     const root = try graph_asset_state.segmentedRoot(raw);
@@ -13665,10 +13817,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
 
 fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]u8 {
     const alloc = runtime.alloc;
-    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, state_key)) orelse return null;
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
     return switch (try graph_asset_state.format(raw)) {
@@ -13685,7 +13834,14 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
             for (0..root.segment_count) |segment_index| {
                 const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
                 defer alloc.free(segment_key);
-                const segment_raw = storeGetAlloc(runtime, segment_key) catch return error.InvalidGraphAssetState;
+                const segment_raw = storeGetAllocWithRetry(runtime, segment_key) catch |err| switch (err) {
+                    // A committed segmented root makes a missing segment a
+                    // durable format violation. Operational read failures are
+                    // not corruption evidence and must remain retryable at the
+                    // supervised worker boundary.
+                    error.NotFound => return error.InvalidGraphAssetState,
+                    else => return err,
+                };
                 defer alloc.free(segment_raw);
                 encoded_bytes = std.math.add(usize, encoded_bytes, segment_raw.len) catch return error.ResourceLimitExceeded;
                 if (encoded_bytes > graph_asset_state.hard_max_manifest_bytes) return error.ResourceLimitExceeded;
@@ -13827,10 +13983,7 @@ fn deleteStaleChunkArtifacts(
 }
 
 fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
-    const raw = storeGetAlloc(runtime, chunk_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => return null,
-    };
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, chunk_key)) orelse return null;
     defer runtime.alloc.free(raw);
 
     const source = try chunk_artifact_mod.artifactTextAlloc(runtime.alloc, raw, source_field) orelse return null;
@@ -14526,12 +14679,10 @@ fn clearQueuedCoverageTransitions(
 }
 
 fn loadDerivedCoverageOutcomeCounter(runtime: *EnrichmentRuntime, counter_key: []const u8) !?u64 {
-    const raw = storeGetAlloc(runtime, counter_key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    defer runtime.alloc.free(raw);
-    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, counter_key);
+    if (raw == null) return null;
+    defer runtime.alloc.free(raw.?);
+    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw.?);
 }
 
 fn scanDerivedCoverageOutcome(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64, outcome: CoverageOutcome) !u64 {
@@ -14762,10 +14913,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             _ = try counterState(runtime, &counter_states, &counter_indexes, transition, candidate_outcome);
         }
 
-        const existing_value = storeGetAlloc(runtime, transition.marker_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing_value = try storeGetOptionalAllocWithRetry(runtime, transition.marker_key);
         defer if (existing_value) |value| runtime.alloc.free(value);
         const existing_outcome: ?CoverageOutcome = if (existing_value) |value|
             std.meta.stringToEnum(CoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
@@ -15156,18 +15304,69 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return try runtime.alloc.dupe(u8, raw);
 }
 
-fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+fn readAllocWithRetry(context: anytype, key: []const u8, comptime read_fn: anytype) ![]u8 {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        return storeGetAlloc(runtime, key) catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
+        return read_fn(context, key) catch |err| {
+            if (err != error.WriterLocked) return err;
+            if (attempt >= writer_locked_retry_count) return err;
+            backoffWriterLockRetry();
+            continue;
         };
     }
+}
+
+fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    return readAllocWithRetry(runtime, key, storeGetAlloc);
+}
+
+/// `NotFound` is the only absence proof. In particular, writer contention is
+/// not evidence that a source document or previously published artifact was
+/// deleted: callers use optional reads to decide whether to retire derived
+/// state, so laundering `WriterLocked` into null can destructively publish an
+/// empty replacement. Retry bounded contention and propagate every remaining
+/// operational failure to the supervised worker boundary.
+fn storeGetOptionalAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) !?[]u8 {
+    return storeGetAllocWithRetry(runtime, key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+test "optional enrichment reads never classify contention as source absence" {
+    const Reader = struct {
+        attempts: usize = 0,
+        value: [5]u8 = "value".*,
+
+        fn get(self: *@This(), _: []const u8) anyerror![]u8 {
+            self.attempts += 1;
+            if (self.attempts == 1) return error.WriterLocked;
+            return &self.value;
+        }
+
+        fn missing(_: *@This(), _: []const u8) anyerror![]u8 {
+            return error.NotFound;
+        }
+
+        fn failed(_: *@This(), _: []const u8) anyerror![]u8 {
+            return error.ReadFailed;
+        }
+    };
+
+    var reader = Reader{};
+    const value = readAllocWithRetry(&reader, "source", Reader.get) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    try std.testing.expectEqualStrings("value", value.?);
+    try std.testing.expectEqual(@as(usize, 2), reader.attempts);
+
+    const missing = readAllocWithRetry(&reader, "source", Reader.missing) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), missing);
+    try std.testing.expectError(error.ReadFailed, readAllocWithRetry(&reader, "source", Reader.failed));
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
@@ -15901,6 +16100,127 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
     const second = try storeGetAlloc(&runtime, "artifact:two");
     defer alloc.free(second);
     try std.testing.expectEqualStrings("ok:two", second);
+}
+
+test "asset preparation is lazy and byte bounded across retryable provider batches" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        publications: u64 = 0,
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (std.mem.eql(u8, request.source_text, "blocked")) return error.EmbedRateLimited;
+            return try a.dupe(u8, "generated");
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn write(ptr: *anyopaque, _: derived_types.DerivedBatch, _: []const []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return self.publications;
+        }
+        fn notify(_: *anyopaque, _: u64) void {}
+        fn item(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, source: []const u8) !AssetProducerBatchItem {
+            return .{
+                .request = request,
+                .producer_type = .generator,
+                .config_json = try a.dupe(u8, "{}"),
+                .raw_doc = try a.dupe(u8, "{\"body\":\"large retained document\"}"),
+                .source_text = try a.dupe(u8, source),
+                .source_parts_json = try a.dupe(u8, "[]"),
+                .artifact_key = try a.dupe(u8, request.doc_key),
+                .state_key = try std.fmt.allocPrint(a, "state:{s}", .{request.doc_key}),
+                .state_value = try a.dupe(u8, "state"),
+            };
+        }
+    };
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer manager.deinit();
+    var harness = Harness{};
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = &harness,
+        .write_fn = Harness.write,
+        .notify_ctx = &harness,
+        .notify_fn = Harness.notify,
+        .config = .{ .asset_producer = .{ .ptr = &harness, .vtable = &.{ .produce = Harness.produce, .can_produce_batch = Harness.canBatch } }, .inline_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+    defer clearPublishedGeneratedArtifacts(&runtime);
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    var queued = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+    defer queued.deinit(alloc);
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .asset,
+        .index_name = "asset_idx",
+        .artifact_name = "generated",
+        .doc_key = "blocked",
+        .source_field = "body",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
+        .sequence = 7,
+    };
+    // There is deliberately no document in the store. Planning must retain
+    // the request, not read/materialize it or invoke the provider.
+    try processAssetOrDefer(&runtime, request, &queued, &window);
+    try std.testing.expectEqual(@as(usize, 1), queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(alloc);
+    for ([_][]const u8{ "blocked", "healthy-a", "healthy-b" }) |source| {
+        var next = request;
+        next.doc_key = source;
+        const item = try Harness.item(alloc, next, source);
+        try std.testing.expect(assetProducerRetainedBytes(item) > assetProducerBatchItemBytes(item));
+        try batch.append(&runtime, &window, item);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+        try batch.flushIfFull(&runtime, &window);
+        try std.testing.expectEqual(@as(usize, 0), batch.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), batch.retained_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(@as(u64, 2), harness.publications);
+    try std.testing.expectEqual(error.EmbedRateLimited, batch.retry_error.?);
+    try std.testing.expectEqual(requestFailureFingerprint(request), batch.retry_fingerprint);
+    // Two individually admissible items must flush at the byte boundary even
+    // though the item-count limit allows eight. Account for raw/state bytes,
+    // not just the much smaller text sent to the provider.
+    for ([_][]const u8{ "bounded-a", "bounded-b" }, 0..) |source, i| {
+        var next = request;
+        next.doc_key = source;
+        next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128}";
+        const item = try Harness.item(alloc, next, source);
+        try std.testing.expect(assetProducerRetainedBytes(item) < 128);
+        try std.testing.expect(assetProducerRetainedBytes(item) * 2 > 128);
+        try batch.append(&runtime, &window, item);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.items.len);
+        try std.testing.expectEqual(@as(usize, 3) + i, harness.calls);
+        try std.testing.expect(batch.retained_bytes < 128);
+    }
+    try batch.flush(&runtime, &window);
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqual(@as(u64, 4), harness.publications);
 }
 
 test "asset batch fallback keeps the logical request retry budget" {

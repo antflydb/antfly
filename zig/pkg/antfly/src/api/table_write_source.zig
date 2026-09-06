@@ -25,6 +25,7 @@ const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
+const metadata_api = @import("../metadata/api.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const runtime_error_abi = @import("../runtime_error_abi.zig");
@@ -461,6 +462,18 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             deadline_ns: u64,
         ) anyerror!?db_mod.types.TxnStatus = null,
+        /// Offers one exact consensus-committed index mutation to the
+        /// process-lifetime activation owner. `index_json == null` is an
+        /// authoritative drop. Sources without a persistent owner leave this
+        /// capability null and use their synchronous create/drop callbacks.
+        accept_committed_index_mutation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            index_json: ?[]const u8,
+            stamp: metadata_api.CatalogMutationStamp,
+        ) anyerror!?void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1138,6 +1151,18 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
         return try BoundaryAbi.call("request_table_index_structural_reconcile", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
+    }
+
+    pub fn acceptCommittedIndexMutation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: ?[]const u8,
+        stamp: metadata_api.CatalogMutationStamp,
+    ) !?void {
+        const fn_ptr = self.vtable.accept_committed_index_mutation orelse return null;
+        return try BoundaryAbi.call("accept_committed_index_mutation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, index_json, stamp });
     }
 };
 

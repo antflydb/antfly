@@ -39,6 +39,10 @@ const backup_contract = @import("backup_contract.zig");
 const internal_service_auth = @import("internal_service_auth.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
+// Activation acknowledgement performs bounded in-memory admission only. A
+// slower peer is unhealthy or no longer the leader; retrying through routing
+// is preferable to convoying unrelated index lifecycle work.
+const index_activation_rpc_timeout_ms: u32 = 1_000;
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
@@ -2855,6 +2859,32 @@ pub const ApiHttpClient = struct {
             null;
     }
 
+    pub fn activateGroupIndex(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        target: metadata_mod.IndexActivationTarget,
+    ) !metadata_mod.IndexActivationProgress {
+        const body = try jsonStringifyAlloc(self.alloc, target);
+        defer self.alloc.free(body);
+        const response_body = try fetchInternalGroupPostWithTimeout(
+            self,
+            base_uri,
+            target.group_id,
+            routes.Routes.group_db_index_activation_suffix,
+            body,
+            index_activation_rpc_timeout_ms,
+        );
+        defer self.alloc.free(response_body);
+        const parsed = try std.json.parseFromSlice(
+            metadata_mod.IndexActivationProgress,
+            self.alloc,
+            response_body,
+            .{ .ignore_unknown_fields = false },
+        );
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn fetchGroupShardObserveMerge(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2937,6 +2967,24 @@ pub const ApiHttpClient = struct {
         suffix_name: []const u8,
         body: []const u8,
     ) ![]u8 {
+        return try fetchInternalGroupPostWithTimeout(
+            self,
+            base_uri,
+            group_id,
+            suffix_name,
+            body,
+            transition_control_rpc_timeout_ms,
+        );
+    }
+
+    fn fetchInternalGroupPostWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        suffix_name: []const u8,
+        body: []const u8,
+        timeout_ms: u32,
+    ) ![]u8 {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix_name });
         defer self.alloc.free(path);
         const uri = try self.joinRoute(base_uri, path);
@@ -2950,14 +2998,16 @@ pub const ApiHttpClient = struct {
             // accepts a connection but never responds must not monopolize that
             // loop indefinitely; TransitionService retries idempotent actions
             // with bounded backoff after this deadline.
-            .timeout_ms = transition_control_rpc_timeout_ms,
+            .timeout_ms = timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => return try self.alloc.dupe(u8, resp.body),
+            400 => return remotePreflightError(resp.body),
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
+            408, 504 => return error.TimedOut,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -3234,6 +3284,73 @@ test "transaction status keeps client-side response reserve" {
             txn_contract.status_server_response_reserve_ms,
         ),
     );
+}
+
+test "index activation client preserves progress and transport classifications" {
+    const Executor = struct {
+        status: u16,
+        body: []const u8,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqual(@as(?u32, index_activation_rpc_timeout_ms), req.timeout_ms);
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "7001") != null);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.group_db_index_activation_suffix));
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+
+    const target = metadata_mod.IndexActivationTarget{
+        .metadata_group_id = 1,
+        .metadata_incarnation = "11111111111111111111111111111111".*,
+        .metadata_epoch = 2,
+        .table_id = 7,
+        .group_id = 7001,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        .table_name = "docs",
+        .index_name = "semantic_idx",
+        .indexes_json = "{}",
+        .indexes_digest = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length,
+    };
+    var executor = Executor{ .status = 200, .body = "{\"state\":\"accepted\",\"serviceable\":false,\"error_code\":null}" };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.iface());
+    try std.testing.expectEqual(
+        metadata_mod.IndexActivationProgress.State.accepted,
+        (try client.activateGroupIndex("http://127.0.0.1:8080", target)).state,
+    );
+
+    executor.body = "{\"state\":\"observed\",\"serviceable\":true,\"error_code\":null}";
+    const observed = try client.activateGroupIndex("http://127.0.0.1:8080", target);
+    try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.observed, observed.state);
+    try std.testing.expect(observed.serviceable);
+
+    inline for (std.meta.fields(metadata_mod.IndexActivationProgress.FailureCode)) |field| {
+        executor.body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"state\":\"action_required\",\"serviceable\":false,\"error_code\":\"{s}\"}}",
+            .{field.name},
+        );
+        defer std.testing.allocator.free(@constCast(executor.body));
+        const progress = try client.activateGroupIndex("http://127.0.0.1:8080", target);
+        try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.action_required, progress.state);
+        try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, field.name), progress.error_code.?);
+    }
+
+    executor = .{ .status = 400, .body = "InvalidArgument" };
+    try std.testing.expectError(error.InvalidArgument, client.activateGroupIndex("http://127.0.0.1:8080", target));
+    executor = .{ .status = 409, .body = "topology changed" };
+    try std.testing.expectError(error.TopologyChanged, client.activateGroupIndex("http://127.0.0.1:8080", target));
+    executor = .{ .status = 503, .body = "group leader unavailable" };
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.activateGroupIndex("http://127.0.0.1:8080", target));
+    executor = .{ .status = 408, .body = "request canceled" };
+    try std.testing.expectError(error.TimedOut, client.activateGroupIndex("http://127.0.0.1:8080", target));
+    executor = .{ .status = 504, .body = "request deadline exceeded" };
+    try std.testing.expectError(error.TimedOut, client.activateGroupIndex("http://127.0.0.1:8080", target));
 }
 
 const EncodedTransitionAction = struct {

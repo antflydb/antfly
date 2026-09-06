@@ -40,6 +40,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -72,6 +73,8 @@ CLIPCLAP_GGUF_FILES = (
     "termite_variants.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
+FAILURE_LOG_TAIL_LIMIT = 20_000
+SERVER_LOG_DIAGNOSTIC_MARKER = "\nserver logs:\n"
 
 # Distributed binaries fail fast without an isolated internal RPC identity.
 # Every subprocess launched by this pytest tree inherits this test-only key;
@@ -560,26 +563,41 @@ def raise_request_error_with_logs(
     logs = ""
     proc_statuses: list[str] = []
     if server_ref is not None:
-        logs = server_ref.debug_logs().strip()
+        logs = _bounded_failure_log_tail(server_ref.debug_logs().strip())
         for name, proc in _server_processes(server_ref):
             proc_statuses.append(f"{name}: {proc.poll()}")
     if not logs and not proc_statuses:
-        raise err
-    message = f"{err}\nserver logs:\n{logs}"
+        raise err from None
+
+    # Some response decoders historically attached the complete server log
+    # before their request wrapper reached this shared diagnostic boundary.
+    # Normalize such errors so a failure contains one bounded log tail rather
+    # than two full copies rendered again through exception chaining.
+    message = str(err).split(SERVER_LOG_DIAGNOSTIC_MARKER, 1)[0].rstrip()
+    if logs:
+        message += f"{SERVER_LOG_DIAGNOSTIC_MARKER}{logs}"
     if proc_statuses:
         message += "\nserver exit status:\n" + "\n".join(proc_statuses)
-    raise err.__class__(
-        message,
-        request=getattr(err, "request", None),
-        response=getattr(err, "response", None),
-    ) from err
+    err.args = (message, *err.args[1:])
+    raise err from None
+
+
+def _bounded_failure_log_tail(logs: str, *, limit: int = FAILURE_LOG_TAIL_LIMIT) -> str:
+    if len(logs) <= limit:
+        return logs
+    omitted = len(logs) - limit
+    return f"... omitted {omitted} earlier server-log characters ...\n{logs[-limit:]}"
 
 
 def raise_if_server_process_exited(server_ref: Any) -> None:
     statuses = _dead_process_statuses(_server_processes(server_ref))
     if not statuses:
         return
-    logs = server_ref.debug_logs().strip() if server_ref is not None else ""
+    logs = (
+        _bounded_failure_log_tail(server_ref.debug_logs().strip())
+        if server_ref is not None
+        else ""
+    )
     message = "server process exited during request retry"
     if logs:
         message += f"\nserver logs:\n{logs}"
@@ -1124,6 +1142,27 @@ class StatefulAntflyServer:
             self.tempdir.cleanup()
 
 
+def require_standalone_storage_headroom(root: Path) -> None:
+    """Fail before launch when production disk admission cannot run fixtures.
+
+    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    safety floor, plus 256 MiB for the small local fixtures. This is a test
+    environment requirement, not an override of the server's disk guard.
+    """
+    usage = shutil.disk_usage(root)
+    safety_floor = max(1024**3, usage.total // 20)
+    required = safety_floor + 256 * 1024**2
+    if usage.free < required:
+        raise RuntimeError(
+            "Insufficient E2E storage headroom: "
+            f"path={root} available_bytes={usage.free} "
+            f"safety_floor_bytes={safety_floor} required_bytes={required}. "
+            "Repairs, schema rebuilds, and native backups would wait for disk "
+            "admission. Free space or set TMPDIR to a volume with sufficient "
+            "headroom; production disk safeguards have not been disabled."
+        )
+
+
 class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
@@ -1140,6 +1179,7 @@ class StandaloneAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            require_standalone_storage_headroom(self.root)
             self.replica_root = self.root / "replicas"
             self.log_path = self.root / "server.log"
             self.log_file = setup.enter_context(self.log_path.open("w"))
@@ -2609,22 +2649,9 @@ def stateful_api(request: pytest.FixtureRequest):
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:
                 body = response.text.strip()
-                logs = ""
-                if self._server is not None:
-                    logs = self._server.debug_logs().strip()
                 if body:
-                    if logs:
-                        raise requests.HTTPError(
-                            f"{response.status_code} {response.reason} for url: {response.url} body={body}\nserver logs:\n{logs}",
-                            response=response,
-                        )
                     raise requests.HTTPError(
                         f"{response.status_code} {response.reason} for url: {response.url} body={body}",
-                        response=response,
-                    )
-                if logs:
-                    raise requests.HTTPError(
-                        f"{response.status_code} {response.reason} for url: {response.url}\nserver logs:\n{logs}",
                         response=response,
                     )
                 response.raise_for_status()
@@ -3268,22 +3295,9 @@ def backup_api(request: pytest.FixtureRequest):
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:
                 body = response.text.strip()
-                logs = ""
-                if self._server is not None:
-                    logs = self._server.debug_logs().strip()
                 if body:
-                    if logs:
-                        raise requests.HTTPError(
-                            f"{response.status_code} {response.reason} for url: {response.url} body={body}\nserver logs:\n{logs}",
-                            response=response,
-                        )
                     raise requests.HTTPError(
                         f"{response.status_code} {response.reason} for url: {response.url} body={body}",
-                        response=response,
-                    )
-                if logs:
-                    raise requests.HTTPError(
-                        f"{response.status_code} {response.reason} for url: {response.url}\nserver logs:\n{logs}",
                         response=response,
                     )
                 response.raise_for_status()

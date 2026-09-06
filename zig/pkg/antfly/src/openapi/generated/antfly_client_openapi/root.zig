@@ -363,6 +363,7 @@ pub const IndexEmbedderConfig = types.IndexEmbedderConfig;
 pub const IndexExecutionConfig = types.IndexExecutionConfig;
 pub const IndexMilestoneStatus = types.IndexMilestoneStatus;
 pub const IndexMilestones = types.IndexMilestones;
+pub const IndexMutationConflictError = types.IndexMutationConflictError;
 pub const IndexMutationServiceUnavailableError = types.IndexMutationServiceUnavailableError;
 pub const IndexPublicationPolicy = types.IndexPublicationPolicy;
 pub const IndexReadinessReason = types.IndexReadinessReason;
