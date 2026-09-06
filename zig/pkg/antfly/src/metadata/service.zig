@@ -2088,6 +2088,24 @@ fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreS
     return false;
 }
 
+fn reportsHaveRuntimeInferenceDiagnostics(reports: []const metadata_table_manager.StoreStatusReport) bool {
+    for (reports) |report| {
+        for (report.runtime_statuses) |runtime_status| {
+            if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(runtime_status.enrichment)) return true;
+        }
+    }
+    return false;
+}
+
+fn storesHaveRuntimeInferenceDiagnostics(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        for (store.runtime_statuses) |runtime_status| {
+            if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(runtime_status.enrichment)) return true;
+        }
+    }
+    return false;
+}
+
 fn storesHaveRuntimeRepairStatus(stores: []const metadata_table_manager.StoreRecord) bool {
     for (stores) |store| {
         if (storeHasRuntimeRepairStatus(store)) return true;
@@ -2180,8 +2198,13 @@ fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
 }
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
+    for (record.runtime_statuses) |status| {
+        if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(status.enrichment)) {
+            return metadata_runtime_status_protocol.inference_diagnostics_record_version;
+        }
+    }
     if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
-        return metadata_runtime_status_protocol.current_record_version;
+        return metadata_runtime_status_protocol.previous_record_version;
     return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
@@ -2189,7 +2212,30 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
 /// and cannot be erased merely to cross an older proposal boundary. Embedding
 /// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    return runtimeStatusRequiredRecordVersion(record);
+    if (metadata_table_manager.storeRequiresCurrentRuntimeStatusProfile(record))
+        return metadata_runtime_status_protocol.previous_record_version;
+    return metadata_runtime_status_protocol.v0_2_0_record_version;
+}
+
+fn stripRuntimeInferenceDiagnostics(alloc: std.mem.Allocator, record: *metadata_table_manager.StoreRecord) void {
+    for (record.runtime_statuses) |*status| {
+        const enrichment = &status.enrichment;
+        if (enrichment.stall_reason.len > 0) alloc.free(enrichment.stall_reason);
+        if (enrichment.active_phase.len > 0) alloc.free(enrichment.active_phase);
+        if (enrichment.active_model.len > 0) alloc.free(enrichment.active_model);
+        if (enrichment.active_backend.len > 0) alloc.free(enrichment.active_backend);
+        enrichment.projection_checkpoint_identity_consistent = true;
+        enrichment.stall_reason = &.{};
+        enrichment.active_phase = &.{};
+        enrichment.active_model = &.{};
+        enrichment.active_backend = &.{};
+        enrichment.active_deadline_ms = 0;
+        enrichment.last_progress_ms = 0;
+        enrichment.active_progress_completed = 0;
+        enrichment.active_progress_total = 0;
+        enrichment.inference_timeout_count = 0;
+        enrichment.inference_cancel_count = 0;
+    }
 }
 
 fn stripRuntimeStatusAboveVersion(
@@ -2198,6 +2244,8 @@ fn stripRuntimeStatusAboveVersion(
     supported_version: u16,
 ) void {
     if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    stripRuntimeInferenceDiagnostics(alloc, record);
+    if (supported_version == metadata_runtime_status_protocol.previous_record_version) return;
     stripRuntimePublicationStatus(record);
     stripRuntimeRepairStatus(record);
     stripRuntimeArtifactSourceStatus(alloc, record);
@@ -2226,6 +2274,8 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
     if (required_version == metadata_runtime_status_protocol.current_record_version and
         runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.current_record_version))
         return metadata_runtime_status_protocol.current_record_version;
+    if (runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.previous_record_version))
+        return metadata_runtime_status_protocol.previous_record_version;
     return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
@@ -2996,7 +3046,9 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
             for (record.runtime_statuses) |status| {
                 out.estimated_bytes += status.table_name.len + status.source.len + status.freshness.len +
-                    status.enrichment.projection_checkpoint_status.len +
+                    status.enrichment.projection_checkpoint_status.len + status.enrichment.stall_reason.len +
+                    status.enrichment.active_phase.len + status.enrichment.active_model.len +
+                    status.enrichment.active_backend.len +
                     @sizeOf(metadata_table_manager.RuntimeIndexStatusReport) * status.indexes.len;
                 for (status.indexes) |index| out.estimated_bytes += index.name.len + index.kind.len;
             }
@@ -6923,7 +6975,7 @@ pub const MetadataHttpService = struct {
         if (cached == metadata_runtime_status_protocol.current_record_version) return cached;
         const store = self.projectedStore() orelse return cached;
         const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return cached;
-        if (version == metadata_runtime_status_protocol.current_record_version) {
+        if (metadata_runtime_status_protocol.isNegotiable(version)) {
             self.runtime_status_protocol_activated_version.store(version, .release);
             return version;
         }
@@ -7169,7 +7221,7 @@ pub const MetadataHttpService = struct {
         defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
         if (required_node_ids.len == 0) return null;
 
-        var all_voters_current = true;
+        var common_version = metadata_runtime_status_protocol.current_record_version;
 
         var client = metadata_http_client.MetadataHttpClient.init(
             self.alloc,
@@ -7212,13 +7264,8 @@ pub const MetadataHttpService = struct {
                 );
                 return null;
             }
-            if (peer_status.runtime_status_record_version != metadata_runtime_status_protocol.current_record_version)
-                all_voters_current = false;
+            common_version = @min(common_version, peer_status.runtime_status_record_version);
         }
-        const common_version = if (all_voters_current)
-            metadata_runtime_status_protocol.current_record_version
-        else
-            metadata_runtime_status_protocol.v0_2_0_record_version;
         if (common_version < required_version) {
             std.log.info(
                 "runtime-status protocol activation awaiting upgrade: requested={d} common={d}",
@@ -11830,15 +11877,22 @@ fn reportStoreStatusesWithProjected(
         storesHaveRuntimeArtifactSourceStatus(projected);
     const reporter_fence_transition_possible = reportsHaveRuntimeReporterFence(reports) or
         storesHaveRuntimeReporterFence(projected);
-    const required_version = if (storesHaveNativeGenerationRestoreCapability(projected) or
+    const inference_diagnostics_transition_possible = reportsHaveRuntimeInferenceDiagnostics(reports) or
+        storesHaveRuntimeInferenceDiagnostics(projected);
+    const required_version = if (inference_diagnostics_transition_possible)
+        metadata_runtime_status_protocol.inference_diagnostics_record_version
+    else if (storesHaveNativeGenerationRestoreCapability(projected) or
         repair_status_transition_possible or artifact_source_transition_possible or
         reporter_fence_transition_possible)
-        metadata_runtime_status_protocol.current_record_version
+        metadata_runtime_status_protocol.previous_record_version
     else
         metadata_runtime_status_protocol.v0_2_0_record_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
     const include_repair_status = !repair_status_transition_possible or
-        supported_version == metadata_runtime_status_protocol.current_record_version;
+        metadata_runtime_status_protocol.profileSatisfies(
+            supported_version,
+            metadata_runtime_status_protocol.previous_record_version,
+        );
     var changed_indices = std.ArrayListUnmanaged(usize).empty;
     defer changed_indices.deinit(service.alloc);
     for (reports) |report| {

@@ -323,11 +323,19 @@ pub fn rerankDocumentsWithOptions(
             return scores;
         },
         .vertex => {
+            const auth_control = @import("antfly_google").RequestControl{
+                .deadline_ns = if (options.execution_context) |context| context.deadline_ns else null,
+                .cancellation = httpCancellation(if (options.execution_context) |context| context.cancellation else null),
+            };
             const token_source = if (api_key == null and options.runtime != null)
-                options.runtime.?.credentials.tokenSource(
+                options.runtime.?.credentials.tokenSourceWithControl(
                     if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
                     "https://www.googleapis.com/auth/cloud-platform",
-                ) catch return error.InvalidRerankerConfig
+                    auth_control,
+                ) catch |err| switch (err) {
+                    error.Cancelled, error.Timeout, error.OutOfMemory => return err,
+                    else => return error.InvalidRerankerConfig,
+                }
             else
                 null;
             var provider = try vertex_provider.Provider.init(alloc, http, .{
@@ -336,6 +344,7 @@ pub fn rerankDocumentsWithOptions(
                 .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
                 .bearer_token = api_key,
                 .token_source = token_source,
+                .request_control = auth_control,
             });
             defer provider.deinit();
             var quota = try acquireQuota(cfg, options, source, provider.project_id, "global", policy);

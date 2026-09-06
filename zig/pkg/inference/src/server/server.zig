@@ -85,6 +85,32 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+
+fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
+    const Check = struct {
+        fn check(raw: ?*anyopaque) !void {
+            const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+            if (request.cancellation) |cancelled| {
+                if (cancelled.load(.acquire)) return error.Cancelled;
+            }
+            if (request.cancellation_probe) |probe| {
+                if (probe.requested()) return error.Cancelled;
+            }
+        }
+    };
+    return .{
+        .io = ctx.io,
+        .deadline_ns = ctx.application_deadline_ns,
+        .ptr = ctx,
+        .check_fn = Check.check,
+        .hard_cancellation = if (node.hard_cancellation_watchdog) |watchdog|
+            watchdog.boundary()
+        else
+            null,
+    };
+}
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1065,6 +1091,112 @@ fn rawGenerateChatTemplateKwargsAreValid(
     return true;
 }
 
+/// Watches only calls which declared that cooperative or native termination is
+/// insufficient. Expiry is process-fatal by design: the supervisor owns the
+/// replacement generation, while continuing in this address space could reuse
+/// buffers still retained by a wedged driver.
+const HardCancellationWatchdog = struct {
+    const Entry = struct {
+        token: u64,
+        control: execution_control_mod.MonitorControl,
+    };
+
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    next_token: u64 = 1,
+    stopping: std.atomic.Value(bool) = .init(false),
+    io: ?std.Io = null,
+    group: std.Io.Group = .init,
+
+    fn create(allocator: std.mem.Allocator) !*HardCancellationWatchdog {
+        const self = try allocator.create(HardCancellationWatchdog);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+
+    fn start(self: *HardCancellationWatchdog, io: std.Io) !void {
+        if (self.io != null) return;
+        self.io = io;
+        errdefer self.io = null;
+        try self.group.concurrent(io, run, .{ self, io });
+    }
+
+    fn destroy(self: *HardCancellationWatchdog) void {
+        self.stopping.store(true, .release);
+        if (self.io) |io| {
+            self.group.cancel(io);
+            self.group.await(io) catch {};
+        }
+        spinLock(&self.mutex);
+        std.debug.assert(self.entries.items.len == 0);
+        self.entries.deinit(self.allocator);
+        self.mutex.unlock();
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    fn boundary(self: *HardCancellationWatchdog) execution_control_mod.HardCancellationBoundary {
+        return .{
+            .ptr = self,
+            .arm_fn = armOpaque,
+            .disarm_fn = disarmOpaque,
+        };
+    }
+
+    fn armOpaque(raw: *anyopaque, control: execution_control_mod.MonitorControl) !u64 {
+        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
+        try control.check();
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.stopping.load(.acquire)) return error.InferenceWorkerShuttingDown;
+        if (self.io == null) return error.HardCancellationWatchdogNotStarted;
+        const token = self.next_token;
+        self.next_token +%= 1;
+        if (self.next_token == 0) self.next_token = 1;
+        try self.entries.append(self.allocator, .{ .token = token, .control = control });
+        return token;
+    }
+
+    fn disarmOpaque(raw: *anyopaque, token: u64) void {
+        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items, 0..) |entry, index| {
+            if (entry.token != token) continue;
+            _ = self.entries.swapRemove(index);
+            return;
+        }
+        // A missing token is an ownership violation. Do not silently leave a
+        // borrowed request pointer in the monitor.
+        @panic("hard cancellation watchdog token was not armed");
+    }
+
+    fn run(self: *HardCancellationWatchdog, io: std.Io) std.Io.Cancelable!void {
+        while (!self.stopping.load(.acquire)) {
+            var fatal: ?anyerror = null;
+            spinLock(&self.mutex);
+            for (self.entries.items) |entry| {
+                entry.control.check() catch |err| {
+                    fatal = err;
+                    break;
+                };
+            }
+            self.mutex.unlock();
+            if (fatal) |err| {
+                std.log.err(
+                    "uninterruptible inference request expired; terminating supervised worker err={s}",
+                    .{@errorName(err)},
+                );
+                platform.inference_process_supervisor.restartWorker();
+            }
+            try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+        }
+    }
+};
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -1104,6 +1236,11 @@ pub const NodeConfig = struct {
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
     allow_unknown_models: bool = false,
+    /// True only when this Node owns its whole process and may terminate it to
+    /// interrupt a wedged driver. Production sets this in a supervised worker;
+    /// disposable CLI tools may opt in directly. Embedded database nodes must
+    /// remain false because termination would also kill their owner.
+    process_termination_available: bool = false,
 };
 
 fn isLoopbackBindHost(host: []const u8) bool {
@@ -1528,12 +1665,15 @@ fn embedTimingNowNs() u128 {
     };
 }
 
-const DenseEmbedRequestContext = struct {
+/// Couples request-scoped execution control to the I/O runtime used by a
+/// synchronous media fetch. Keep this transport-neutral: scraping adapts the
+/// callback to HTTP, S3, and file implementations.
+const InferenceDownloadRequestContext = struct {
     io: std.Io,
-    deadline_ns: ?u64 = null,
+    control: InferenceExecutionControl = .{},
 };
 
-fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
+fn remainingInferenceDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
     const deadline: u128 = deadline_ns orelse return null;
     if (now_ns >= deadline) return error.Timeout;
     const remaining_ns = deadline - now_ns;
@@ -1541,15 +1681,53 @@ fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
     return @intCast(timeout_ms);
 }
 
-fn denseEmbedDownloadContext(context: DenseEmbedRequestContext) !scraping.DownloadContext {
+fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !scraping.DownloadContext {
+    try context.control.check();
+    const CancellationAdapter = struct {
+        fn isCancelled(raw: *const anyopaque) bool {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            request.control.check() catch return true;
+            return false;
+        }
+    };
     return .{
         .io = context.io,
-        .timeout_ms = try remainingDirectEmbeddingDeadlineMs(context.deadline_ns, embedTimingNowNs()),
+        .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
+        .cancellation = .{
+            .ptr = context,
+            .is_cancelled_fn = CancellationAdapter.isCancelled,
+        },
     };
 }
 
+fn downloadContentForInferenceRequest(
+    alloc: std.mem.Allocator,
+    request_context: ?InferenceDownloadRequestContext,
+    url: []const u8,
+    security: *const scraping.ContentSecurityConfig,
+    s3_credentials: ?*const scraping.S3CredentialsConfig,
+) !scraping.DownloadedContent {
+    const download_context = if (request_context) |*context|
+        try inferenceDownloadContext(context)
+    else
+        null;
+    const downloaded = (if (download_context) |context|
+        scraping.downloadContentAllocWithContext(alloc, context, url, security, s3_credentials)
+    else
+        scraping.downloadContentAlloc(alloc, url, security, s3_credentials)) catch |err| {
+        if (request_context) |context| context.control.check() catch |control_err| return control_err;
+        return err;
+    };
+    errdefer {
+        var owned = downloaded;
+        owned.deinit(alloc);
+    }
+    if (request_context) |context| try context.control.check();
+    return downloaded;
+}
+
 fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
-    _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
+    _ = try remainingInferenceDeadlineMs(deadline_ns, embedTimingNowNs());
 }
 
 fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
@@ -1570,6 +1748,7 @@ const LoadedEmbeddingRecoveryOptions = struct {
     cache_default_alias: bool = true,
     pin_on_success: bool = false,
     failure_stage: ?*EmbeddingRuntimeFailureStage = null,
+    execution_control: ?InferenceExecutionControl = null,
 };
 
 const EmbeddingRuntimeFailureStage = enum { acquire, execute };
@@ -1588,6 +1767,10 @@ fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
                     continue;
                 }
             }
+            // A request deadline can expire during tokenization, admission, or
+            // while waiting for the model lane. It is not evidence that the
+            // backend runtime is corrupt, so release it normally. Backends that
+            // detect runtime corruption must report a specific integrity error.
             return err;
         };
         adapter.succeed(&handle);
@@ -1611,12 +1794,23 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
 
         fn acquire(self: *@This()) !model_manager_mod.ModelHandle {
             if (self.options.failure_stage) |stage| stage.* = .acquire;
+            if (self.options.execution_control) |control| try control.check();
             return if (self.options.preferred_backends) |preferred_backends|
-                try self.node.model_manager.acquireFromDirWithPreferredBackends(
-                    self.model_path,
-                    preferred_backends,
-                    self.options.cache_default_alias,
-                )
+                if (self.options.execution_control) |control|
+                    try self.node.model_manager.acquireFromDirWithPreferredBackendsAndControl(
+                        self.model_path,
+                        preferred_backends,
+                        self.options.cache_default_alias,
+                        control,
+                    )
+                else
+                    try self.node.model_manager.acquireFromDirWithPreferredBackends(
+                        self.model_path,
+                        preferred_backends,
+                        self.options.cache_default_alias,
+                    )
+            else if (self.options.execution_control) |control|
+                try self.node.model_manager.acquireFromDirWithControl(self.model_path, control)
             else
                 try self.node.model_manager.acquireFromDir(self.model_path);
         }
@@ -1655,7 +1849,7 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
 
 test "embedding runtime recovery retries once and retires every corrupt runtime" {
     const Probe = struct {
-        const FailureMode = enum { first_missing, persistent_missing, capacity };
+        const FailureMode = enum { first_missing, persistent_missing, capacity, timeout };
         const Handle = struct { active: bool = true };
 
         mode: FailureMode,
@@ -1676,6 +1870,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
                 .first_missing => if (self.execute_count == 1) return error.MissingWeight,
                 .persistent_missing => return error.MissingWeight,
                 .capacity => return error.ResourceTemporarilyUnavailable,
+                .timeout => return error.Timeout,
             }
         }
 
@@ -1715,6 +1910,12 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), capacity.acquire_count);
     try std.testing.expectEqual(@as(usize, 0), capacity.retire_count);
     try std.testing.expectEqual(@as(usize, 1), capacity.release_count);
+
+    var timeout = Probe{ .mode = .timeout };
+    try std.testing.expectError(error.Timeout, runEmbeddingRuntimeRecoveryLoop(&timeout));
+    try std.testing.expectEqual(@as(usize, 1), timeout.acquire_count);
+    try std.testing.expectEqual(@as(usize, 0), timeout.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), timeout.release_count);
 }
 
 test "embedding runtime recovery is limited to weight integrity failures" {
@@ -1728,13 +1929,31 @@ test "embedding runtime recovery is limited to weight integrity failures" {
     try std.testing.expect(!shouldAbortDensePartialFallback(error.ResourceTemporarilyUnavailable));
 }
 
-test "dense embed download deadline is a nonzero remaining ceiling" {
-    try std.testing.expect((try remainingDirectEmbeddingDeadlineMs(null, 100)) == null);
-    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(100, 100));
-    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(99, 100));
-    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(101, 100));
-    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms, 0));
-    try std.testing.expectEqual(@as(?u64, 2), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms + 1, 0));
+test "inference download deadline is a nonzero remaining ceiling" {
+    try std.testing.expect((try remainingInferenceDeadlineMs(null, 100)) == null);
+    try std.testing.expectError(error.Timeout, remainingInferenceDeadlineMs(100, 100));
+    try std.testing.expectError(error.Timeout, remainingInferenceDeadlineMs(99, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingInferenceDeadlineMs(101, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingInferenceDeadlineMs(std.time.ns_per_ms, 0));
+    try std.testing.expectEqual(@as(?u64, 2), try remainingInferenceDeadlineMs(std.time.ns_per_ms + 1, 0));
+}
+
+test "inference download context carries request cancellation" {
+    const State = struct {
+        cancelled: bool,
+        fn isCancelled(raw: ?*anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.cancelled;
+        }
+    };
+    var state = State{ .cancelled = true };
+    const request_context = InferenceDownloadRequestContext{
+        .io = std.testing.io,
+        .control = .{
+            .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
+        },
+    };
+    try std.testing.expectError(error.Cancelled, inferenceDownloadContext(&request_context));
 }
 
 test "dense embed parser contexts reject expired image fetches" {
@@ -1746,7 +1965,10 @@ test "dense embed parser contexts reject expired image fetches" {
         .model_type = .embedder,
         .visual_model_path = "visual.onnx",
     };
-    const context = DenseEmbedRequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+    const context = InferenceDownloadRequestContext{
+        .io = std.testing.io,
+        .control = .{ .deadline_ns = 0 },
+    };
 
     var fail_fast_input = try std.json.parseFromSlice(
         std.json.Value,
@@ -2618,6 +2840,10 @@ fn rejectDisallowedModel(
 const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
+fn isTransientInferenceCapacityError(err: anyerror) bool {
+    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable;
+}
+
 fn transientCapacityFailureResponse(
     ctx: *httpx.Context,
     code: []const u8,
@@ -2655,7 +2881,18 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
+        error.Timeout => ctx.status(504).json(.{
+            .@"error" = "INFERENCE_TIMEOUT",
+            .message = "the inference deadline expired while loading the model",
+            .retryable = true,
+        }),
+        error.Canceled, error.Cancelled => ctx.status(408).json(.{
+            .@"error" = "INFERENCE_CANCELLED",
+            .message = "the inference request was cancelled",
+            .retryable = false,
+        }),
         error.UnknownModelCompatibility => ctx.status(400).json(.{
             .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
             .message = "model compatibility is unknown; restart with --allow-unknown-models to opt in",
@@ -2668,10 +2905,14 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "model resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
         => modelArtifactsChangingResponse(ctx),
+        error.ProcessIsolationRequired => ctx.status(503).json(.{
+            .@"error" = "PROCESS_ISOLATION_REQUIRED",
+            .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
+            .retryable = false,
+        }),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -2680,12 +2921,27 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 }
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
+        error.Timeout => ctx.status(504).json(.{
+            .@"error" = "INFERENCE_TIMEOUT",
+            .message = "the inference deadline expired",
+            .retryable = true,
+        }),
+        error.Canceled, error.Cancelled => ctx.status(408).json(.{
+            .@"error" = "INFERENCE_CANCELLED",
+            .message = "the inference request was cancelled",
+            .retryable = false,
+        }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         }),
-        error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
+        error.ProcessIsolationRequired => ctx.status(503).json(.{
+            .@"error" = "PROCESS_ISOLATION_REQUIRED",
+            .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
+            .retryable = false,
+        }),
         else => ctx.status(500).json(.{
             .@"error" = "INFERENCE_FAILED",
             .message = @errorName(err),
@@ -3256,6 +3512,7 @@ pub const Node = struct {
     readiness_refresh_group: std.Io.Group = .init,
     readiness_refresh_io: ?std.Io = null,
     readiness_refresh_started: bool = false,
+    hard_cancellation_watchdog: ?*HardCancellationWatchdog = null,
     /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
     /// Set after configured preloads, including declared optional sessions,
@@ -3295,8 +3552,10 @@ pub const Node = struct {
         expected: DirectGeneratePreflight,
         max_tokens: i32,
         prepared: bool = false,
+        execution_control: ?InferenceExecutionControl = null,
 
         fn prepareMessages(self: *DirectGenerateAdmission, messages: []const generation.Message) !void {
+            if (self.execution_control) |control| try control.check();
             const node = self.node orelse return error.InvalidGenerationAdmission;
             if (self.prepared) return error.InvalidGenerationAdmission;
 
@@ -3355,6 +3614,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        session_manager.process_isolation_available = config.process_termination_available;
         try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
@@ -3375,6 +3635,11 @@ pub const Node = struct {
                 );
             }
         }
+        const hard_cancellation_watchdog = if (config.process_termination_available)
+            try HardCancellationWatchdog.create(allocator)
+        else
+            null;
+        errdefer if (hard_cancellation_watchdog) |watchdog| watchdog.destroy();
         var node: Node = .{
             .config = config,
             .allocator = allocator,
@@ -3387,6 +3652,7 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
             .compatibility_cache = .empty,
+            .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(
@@ -3494,7 +3760,14 @@ pub const Node = struct {
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
+        // Manager-owned loads can outlive their request and retain watchdog
+        // guards. Drain those tasks (including guard cleanup) while their
+        // hard-cancellation boundary is still alive.
         self.model_manager.deinit();
+        if (self.hard_cancellation_watchdog) |watchdog| {
+            watchdog.destroy();
+            self.hard_cancellation_watchdog = null;
+        }
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
         self.tabular_registry.deinit();
@@ -3640,9 +3913,27 @@ pub const Node = struct {
         return error.ModelArtifactsChanging;
     }
 
-    pub fn attachIo(self: *Node, io: std.Io) void {
+    pub fn attachIo(self: *Node, io: std.Io) !void {
+        if (self.hard_cancellation_watchdog) |watchdog| try watchdog.start(io);
         self.session_manager.io = io;
         self.model_manager.attachIo(io);
+    }
+
+    /// Completes a caller-supplied request contract with Node-owned execution
+    /// capabilities. Direct callers should not need access to the private
+    /// watchdog merely to get the same cancellation guarantees as HTTP.
+    fn bindExecutionControl(
+        self: *Node,
+        io: ?std.Io,
+        supplied: InferenceExecutionControl,
+    ) InferenceExecutionControl {
+        var control = supplied;
+        if (control.io == null) control.io = io orelse self.session_manager.io;
+        if (control.hard_cancellation == null) {
+            if (self.hard_cancellation_watchdog) |watchdog|
+                control.hard_cancellation = watchdog.boundary();
+        }
+        return control;
     }
 
     fn refreshReadinessInventory(self: *Node, io: std.Io) !void {
@@ -3715,15 +4006,24 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
-        return self.embedDenseTextsDirectWithContextAndTask(
+        return self.embedDenseTextsDirectWithExecutionControl(
             allocator,
             io,
-            deadline_ns,
+            .{ .deadline_ns = deadline_ns },
             model_name,
             texts,
-            null,
-            null,
         );
+    }
+
+    pub fn embedDenseTextsDirectWithExecutionControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        control: InferenceExecutionControl,
+        model_name: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        return self.embedDenseTextsDirectWithExecutionControlAndTask(allocator, io, control, model_name, texts, null, null);
     }
 
     pub fn embedDenseTextsDirectWithContextAndTask(
@@ -3736,27 +4036,85 @@ pub const Node = struct {
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        return self.embedDenseTextsDirectWithExecutionControlAndTask(
+            allocator,
+            io,
+            .{ .deadline_ns = deadline_ns },
+            model_name,
+            texts,
+            task_type_name,
+            instruction,
+        );
+    }
+
+    pub fn embedDenseTextsDirectWithExecutionControlAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
+        const control = self.bindExecutionControl(io, supplied_control);
+        try control.check();
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
+        return self.embedDenseTextsFromPathWithExecutionControlAndTask(
+            allocator,
+            control,
+            model_path,
+            texts,
+            task_type_name,
+            instruction,
+        );
+    }
+
+    /// Production managed-operation boundary for callers that have already
+    /// resolved and authorized an immutable model directory. Benchmarks use
+    /// this entry point so they include request admission, coordinated cold
+    /// load, tokenization, forward execution, and output ownership.
+    pub fn embedDenseTextsFromPathWithExecutionControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        control: InferenceExecutionControl,
+        model_path: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        return self.embedDenseTextsFromPathWithExecutionControlAndTask(allocator, control, model_path, texts, null, null);
+    }
+
+    pub fn embedDenseTextsFromPathWithExecutionControlAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        supplied_control: InferenceExecutionControl,
+        model_path: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
+        const control = self.bindExecutionControl(null, supplied_control);
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
         const task_type = if (task_type_name) |name|
             parseEmbeddingTaskType(name) orelse return error.UnsupportedEmbeddingTaskType
         else
             EmbeddingTaskType.RETRIEVAL_DOCUMENT;
-        try ensureDirectEmbeddingDeadline(deadline_ns);
+        try control.check();
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
+        try control.check();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
-        defer self.allocator.free(model_path);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
+        try control.update(.loading_model, 0, 1);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
-            deadline_ns: ?u64,
+            control: InferenceExecutionControl,
             texts: []const []const u8,
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
@@ -3769,7 +4127,7 @@ pub const Node = struct {
                 defer asset_lease.release();
                 const vectors = try embedDenseTextsOnLoadedModel(
                     attempt.allocator,
-                    attempt.deadline_ns,
+                    attempt.control,
                     model,
                     attempt.texts,
                     attempt.task_type,
@@ -3777,32 +4135,35 @@ pub const Node = struct {
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
-                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                try attempt.control.update(.serializing, 0, 1);
                 attempt.vectors = vectors;
             }
         };
         var attempt = Attempt{
             .allocator = allocator,
-            .deadline_ns = deadline_ns,
+            .control = control,
             .texts = texts,
             .task_type = task_type,
             .instruction = instruction,
         };
-        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
     }
 
     fn embedDenseTextsOnLoadedModel(
         allocator: std.mem.Allocator,
-        deadline_ns: ?u64,
+        control: InferenceExecutionControl,
         model: *model_manager_mod.LoadedModel,
         texts: []const []const u8,
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) ![][]f32 {
-        try model.ensureEmbeddingAssets(true, false, false);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        var pipeline = model.embeddingPipeline(allocator);
+        var pipeline = blk: {
+            try model.lockEmbeddingAssetsWithControl(control);
+            defer model.unlockEmbeddingAssets();
+            try model.ensurePrimaryEmbeddingAssetsLockedWithControl(true, false, control);
+            break :blk model.embeddingPipelineLocked(allocator);
+        };
         const owned_prefix = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{
             .model = "",
             .input = .null,
@@ -3812,6 +4173,7 @@ pub const Node = struct {
             .instruction = instruction,
         });
         defer if (owned_prefix) |prefix| allocator.free(prefix);
+        pipeline.execution_control = control;
         return pipeline.embed(texts);
     }
 
@@ -3821,6 +4183,18 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![]DirectSparseEmbedding {
+        return self.embedSparseTextsDirectWithControl(allocator, model_name, texts, .{});
+    }
+
+    pub fn embedSparseTextsDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        supplied_control: InferenceExecutionControl,
+    ) ![]DirectSparseEmbedding {
+        const control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
@@ -3835,6 +4209,7 @@ pub const Node = struct {
         const Attempt = struct {
             allocator: std.mem.Allocator,
             texts: []const []const u8,
+            control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -3846,12 +4221,13 @@ pub const Node = struct {
                     .tok = model.getTokenizer(),
                     .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
                     .execution_lock = model.embeddingExecutionLock(),
+                    .execution_control = attempt.control,
                 };
                 attempt.vectors = try pipeline.embed(attempt.texts);
             }
         };
-        var attempt = Attempt{ .allocator = allocator, .texts = texts };
-        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        var attempt = Attempt{ .allocator = allocator, .texts = texts, .control = control };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
     }
 
@@ -3891,10 +4267,6 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        var pipeline = model.rerankingPipeline(allocator);
         const DeadlineControl = struct {
             deadline_ns: ?u64,
             upstream: ?reranking_pipeline.ExecutionControl,
@@ -3906,10 +4278,17 @@ pub const Node = struct {
             }
         };
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
-        pipeline.execution_control = .{
+        const execution_control = self.bindExecutionControl(request_io, .{
+            .io = if (upstream_control) |control| control.io else null,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
-        };
+            .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
+        });
+        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
+        defer model_handle.release();
+        const model = model_handle.get();
+        var pipeline = model.rerankingPipeline(allocator);
+        pipeline.execution_control = execution_control;
         const scores = try pipeline.rerank(query, documents);
         errdefer allocator.free(scores);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -3938,6 +4317,21 @@ pub const Node = struct {
         return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
+    pub fn generateTextDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        control: InferenceExecutionControl,
+    ) ![]u8 {
+        if (roles.len != contents.len or roles.len == 0) return error.InvalidGenerationRequest;
+        var messages = try allocator.alloc(generation.Message, roles.len);
+        defer allocator.free(messages);
+        for (roles, contents, 0..) |role, content, i| messages[i] = .{ .role = role, .content = content };
+        return self.generateMessagesDirectWithControl(allocator, model_name, messages, control);
+    }
+
     pub fn generateMessagesDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -3945,6 +4339,33 @@ pub const Node = struct {
         messages: []const generation.Message,
     ) ![]u8 {
         return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
+    }
+
+    pub fn generateMessagesDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        supplied_control: InferenceExecutionControl,
+    ) ![]u8 {
+        if (messages.len == 0) return error.InvalidGenerationRequest;
+        const control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
+        const preflight = try directGeneratePreflightForMessages(messages);
+        var admission = try self.beginDirectGenerateAdmission(preflight, 256);
+        admission.execution_control = control;
+        defer admission.deinit();
+        return self.generateMessagesDirectWithAdmission(
+            allocator,
+            model_name,
+            messages,
+            &admission,
+            null,
+            false,
+            null,
+            false,
+            null,
+        );
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -4131,6 +4552,11 @@ pub const Node = struct {
         if (admitted_node != self) return error.InvalidGenerationAdmission;
         try admission.prepareMessages(messages);
         const max_tokens = admission.max_tokens;
+        const execution_control = if (admission.execution_control) |control|
+            self.bindExecutionControl(null, control)
+        else
+            null;
+        if (execution_control) |control| try control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -4145,16 +4571,32 @@ pub const Node = struct {
         const resolved_at_ns = embedTimingNowNs();
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
-                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
-                    model_path,
-                    backends,
-                    cache_default_alias,
-                    request,
-                )
+                if (execution_control) |control|
+                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+                        model_path,
+                        backends,
+                        cache_default_alias,
+                        request,
+                        control,
+                    )
+                else
+                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                        model_path,
+                        backends,
+                        cache_default_alias,
+                        request,
+                    )
+            else if (execution_control) |control|
+                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, control)
             else
                 try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
         else if (preferred_backends) |backends|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
+            if (execution_control) |control|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, control)
+            else
+                try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
+        else if (execution_control) |control|
+            try self.model_manager.acquireFromDirWithControl(model_path, control)
         else
             try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
@@ -4163,7 +4605,10 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        model.lockNativeGeneration(io);
+        if (execution_control) |control|
+            try control.lock(model.nativeGenerationMutex())
+        else
+            model.lockNativeGeneration(io);
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -4297,6 +4742,7 @@ pub const Node = struct {
             .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
             .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
             .compiled_attachment_target = if (use_metal_whole_model) .whole_model else .partitioned,
+            .execution_control = execution_control,
         };
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
@@ -4703,7 +5149,7 @@ pub const Node = struct {
             &admission_manifest,
             input,
             &media_budget,
-            .{ .io = io, .deadline_ns = deadline_ns },
+            .{ .io = io, .control = .{ .deadline_ns = deadline_ns } },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -4712,7 +5158,7 @@ pub const Node = struct {
             media_admission,
             &parsed,
             &reserved_units,
-            deadline_ns,
+            .{ .deadline_ns = deadline_ns },
             .RETRIEVAL_DOCUMENT,
             null,
         );
@@ -4758,8 +5204,41 @@ pub const Node = struct {
         task_type_raw: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        return self.embedDensePartsDirectWithExecutionControlAndTask(
+            allocator,
+            io,
+            .{ .deadline_ns = deadline_ns },
+            model_name,
+            parts,
+            task_type_raw,
+            instruction,
+        );
+    }
+
+    pub fn embedDensePartsDirectWithExecutionControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        control: InferenceExecutionControl,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+    ) ![][]f32 {
+        return self.embedDensePartsDirectWithExecutionControlAndTask(allocator, io, control, model_name, parts, null, null);
+    }
+
+    pub fn embedDensePartsDirectWithExecutionControlAndTask(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+        task_type_raw: ?[]const u8,
+        instruction: ?[]const u8,
+    ) ![][]f32 {
+        const control = self.bindExecutionControl(io, supplied_control);
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
+        try control.check();
 
         const task_type = if (task_type_raw) |raw|
             parseEmbeddingTaskType(raw) orelse return error.UnsupportedEmbeddingTaskType
@@ -4793,7 +5272,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
+        try control.update(.loading_model, 0, 1);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
@@ -4805,7 +5284,7 @@ pub const Node = struct {
             &admission_manifest,
             parts,
             &media_budget,
-            .{ .io = io, .deadline_ns = deadline_ns },
+            .{ .io = io, .control = control },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -4814,7 +5293,7 @@ pub const Node = struct {
             media_admission,
             &parsed,
             &reserved_units,
-            deadline_ns,
+            control,
             task_type,
             instruction,
         );
@@ -4827,12 +5306,12 @@ pub const Node = struct {
         media_admission: ReadRequestAdmission,
         parsed: *ParsedDenseEmbedInputs,
         reserved_units: *usize,
-        deadline_ns: ?u64,
+        control: InferenceExecutionControl,
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
+        try control.check();
 
         var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
 
@@ -4856,7 +5335,7 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             parsed: *ParsedDenseEmbedInputs,
             audio_decode_working_bytes: usize,
-            deadline_ns: ?u64,
+            control: InferenceExecutionControl,
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
             vectors: ?[][]f32 = null,
@@ -4866,8 +5345,9 @@ pub const Node = struct {
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
                 defer asset_lease.release();
-                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
-                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
+                try attempt.control.check();
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed, attempt.control);
+                pipeline.execution_control = attempt.control;
                 pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
                 const owned_prefix = try applyDenseEmbeddingRequestOptions(attempt.allocator, &pipeline, &model.manifest, .{
                     .model = "",
@@ -4893,7 +5373,7 @@ pub const Node = struct {
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
-                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                try attempt.control.check();
                 attempt.vectors = vectors;
             }
         };
@@ -4901,11 +5381,11 @@ pub const Node = struct {
             .allocator = allocator,
             .parsed = parsed,
             .audio_decode_working_bytes = audio_decode_working_bytes,
-            .deadline_ns = deadline_ns,
+            .control = control,
             .task_type = task_type,
             .instruction = instruction,
         };
-        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
     }
 
@@ -4915,6 +5395,18 @@ pub const Node = struct {
         model_name: []const u8,
         request: readers_api.Request,
     ) ![]readers_api.Result {
+        return self.readImagesDirectWithControl(allocator, model_name, request, .{});
+    }
+
+    pub fn readImagesDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.Request,
+        supplied_control: InferenceExecutionControl,
+    ) ![]readers_api.Result {
+        const control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
@@ -4933,7 +5425,8 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        const request_io = io_impl.io();
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
 
         const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
@@ -4949,11 +5442,20 @@ pub const Node = struct {
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (request.images, 0..) |image_url, i| {
+            try control.update(.tokenizing, @intCast(i), @intCast(request.images.len));
             const inline_content_trust: InlineContentTrust = switch (request.inline_content_trust) {
                 .untrusted => .untrusted,
                 .trusted_internal => .trusted_internal,
             };
-            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes, inline_content_trust);
+            var item = try downloadReadBatchContentWithContext(
+                self,
+                allocator,
+                image_url,
+                batch_byte_cap,
+                batch_bytes,
+                inline_content_trust,
+                .{ .io = request_io, .control = control },
+            );
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
             try decoded_budget.addImage(item.data);
@@ -4966,8 +5468,15 @@ pub const Node = struct {
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
 
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
+            allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+            control,
+        );
         defer reader.deinit();
+        try control.update(.loading_model, 1, 1);
 
         const out = try allocator.alloc(readers_api.Result, request.images.len);
         var initialized: usize = 0;
@@ -4980,6 +5489,7 @@ pub const Node = struct {
             .prompt = normalizeReadPrompt(request.prompt),
             .max_tokens = max_tokens,
             .source_fingerprint = request.source_fingerprint,
+            .execution_control = control,
         });
         defer {
             for (results) |result| {
@@ -5009,6 +5519,18 @@ pub const Node = struct {
         model_name: []const u8,
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
+        return self.transcribeAudioDirectWithControl(allocator, model_name, request, .{});
+    }
+
+    pub fn transcribeAudioDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: transcribing_api.Request,
+        supplied_control: InferenceExecutionControl,
+    ) !transcribing_api.Response {
+        const control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
         var media_shape: RequestMediaAdmissionShape = .{};
         if (std.mem.startsWith(u8, request.url, "data:"))
             media_shape.addInline(request.url.len, false)
@@ -5024,11 +5546,18 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+        const request_io = io_impl.io();
+        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "transcribers");
         defer self.allocator.free(model_path);
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        var downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, request.url, &media_budget);
+        var downloaded = try downloadRemoteContentWithBudgetForRequestWithContext(
+            self,
+            allocator,
+            .{ .io = request_io, .control = control },
+            request.url,
+            &media_budget,
+        );
         defer downloaded.deinit(allocator);
         const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
         const resident_bytes = if (std.mem.startsWith(u8, request.url, "data:"))
@@ -5055,8 +5584,9 @@ pub const Node = struct {
             else => return error.UnsupportedAudioInput,
         };
         defer decoded.deinit();
+        try control.update(.tokenizing, 1, 1);
 
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
         defer model_handle.release();
         const model = model_handle.get();
         const whisper_config = session_factory.getWhisperConfig(model.session) orelse return error.UnsupportedTranscriberProvider;
@@ -5084,6 +5614,7 @@ pub const Node = struct {
                 .language_tokens = prompt_cache.language_tokens,
             },
         );
+        pipeline.execution_control = control;
 
         var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
         defer result.deinit();
@@ -5099,7 +5630,17 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
     ) !extracting_api.Response {
-        return self.extractWithAdmission(allocator, model_name, request, .direct);
+        return self.extractWithAdmission(allocator, model_name, request, .direct, null);
+    }
+
+    pub fn extractDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: extracting_api.Request,
+        control: InferenceExecutionControl,
+    ) !extracting_api.Response {
+        return self.extractWithAdmission(allocator, model_name, request, .direct, control);
     }
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
@@ -5110,7 +5651,13 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
+        supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        const execution_control = if (supplied_control) |control|
+            self.bindExecutionControl(null, control)
+        else
+            null;
+        if (execution_control) |control| try control.check();
         switch (admission_owner) {
             .direct => try self.acquireAdmissionUnits(1),
             .http_route => try self.reserveAdmissionUnits(1),
@@ -5149,6 +5696,7 @@ pub const Node = struct {
                     typed_options.value,
                     request.inputs,
                     parsed_inputs.texts.items,
+                    execution_control,
                 ),
                 .classifications => try self.extractClassificationsDirectJsonAlloc(
                     allocator,
@@ -5157,6 +5705,7 @@ pub const Node = struct {
                     typed_options.value,
                     request.inputs,
                     parsed_inputs.texts.items,
+                    execution_control,
                 ),
                 .structures => unreachable,
             };
@@ -5194,6 +5743,7 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .execution_control = execution_control,
         };
         // Resolve the cheap manifest/path surface before any remote fetch or
         // media decode. The extractor itself does not load model weights until
@@ -5209,6 +5759,7 @@ pub const Node = struct {
             options.prompt,
             options.max_tokens,
             media_admission.byte_cap,
+            .{ .io = io_impl.io(), .control = execution_control orelse .{} },
         );
         defer parsed_inputs.deinit();
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
@@ -5250,7 +5801,9 @@ pub const Node = struct {
         options: extraction_api.ExtractionOptions,
         inputs: []const extracting_api.Input,
         texts: []const []const u8,
+        execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
+        if (execution_control) |control| try control.check();
         if (schema.entities) |labels| {
             for (labels) |label| if (!isCanonicalLabelSegment(label)) return error.InvalidEntitySchema;
         }
@@ -5287,16 +5840,21 @@ pub const Node = struct {
                 texts,
                 want_relations,
                 &failure_stage,
+                execution_control,
             );
         }
 
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        var model_handle = if (execution_control) |control|
+            try self.model_manager.acquireFromDirWithControl(model_path, control)
+        else
+            try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         try validateTextEntityExtractionManifest(&model.manifest);
 
         if (model.isGlinerModel()) {
             var pipeline = model.glinerPipeline(allocator);
+            pipeline.execution_control = execution_control;
             pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
             pipeline.config.flat_ner = options.flat_ner orelse pipeline.config.flat_ner;
             const labels: ?[]const []const u8 = if (schema.entities) |values|
@@ -5346,6 +5904,7 @@ pub const Node = struct {
 
         if (want_relations) return error.UnsupportedRelationExtraction;
         var pipeline = model.nerPipeline(allocator);
+        pipeline.execution_control = execution_control;
         pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
         const all_entities = try pipeline.recognizeBatch(texts);
         defer freeBorrowedLabelEntityBatches(allocator, all_entities);
@@ -5368,12 +5927,17 @@ pub const Node = struct {
         options: extraction_api.ExtractionOptions,
         inputs: []const extracting_api.Input,
         texts: []const []const u8,
+        execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
+        if (execution_control) |control| try control.check();
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveClassificationRequestModelPath(allocator, io_impl.io(), model_name);
         defer allocator.free(model_path);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        var model_handle = if (execution_control) |control|
+            try self.model_manager.acquireFromDirWithControl(model_path, control)
+        else
+            try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.supportsClassification()) return error.UnsupportedClassificationExtraction;
@@ -5391,6 +5955,7 @@ pub const Node = struct {
 
             if (model.isGlinerModel()) {
                 var pipeline = model.glinerPipeline(allocator);
+                pipeline.execution_control = execution_control;
                 const multi_label = classification_schema.multi_label orelse false;
                 const results = try pipeline.classifyBatch(texts, classification_schema.labels, .{
                     .threshold = options.threshold orelse 0.0,
@@ -5416,6 +5981,7 @@ pub const Node = struct {
                 .multi_label = classification_schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
+            pipeline.execution_control = execution_control;
             var schema_prompt_tokens: usize = 0;
             const results = try pipeline.classifyBatchWithPromptTokens(texts, classification_schema.labels, &schema_prompt_tokens);
             defer freeClassificationBatch(allocator, results);
@@ -6113,6 +6679,8 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(std.json.Value)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6184,6 +6752,7 @@ pub const Node = struct {
                 allocator: std.mem.Allocator,
                 io: ?std.Io,
                 texts: []const []const u8,
+                execution_control: InferenceExecutionControl,
                 vectors: ?[]DirectSparseEmbedding = null,
                 prompt_tokens: usize = 0,
 
@@ -6196,6 +6765,7 @@ pub const Node = struct {
                         .tok = model.getTokenizer(),
                         .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
                         .execution_lock = model.embeddingExecutionLock(),
+                        .execution_control = attempt.execution_control,
                     };
                     const vectors = try pipeline.embed(attempt.texts);
                     errdefer {
@@ -6210,8 +6780,9 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .execution_control = execution_control,
             };
-            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err|
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = execution_control }, &attempt, Attempt.run) catch |err|
                 return inferenceFailureResponse(ctx, err);
             const sparse_vecs = attempt.vectors.?;
             defer {
@@ -6226,13 +6797,16 @@ pub const Node = struct {
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        const download_context = DenseEmbedRequestContext{ .io = ctx.io };
+        const download_context = InferenceDownloadRequestContext{
+            .io = ctx.io,
+            .control = execution_control,
+        };
         var inputs = switch (request.error_policy) {
             .fail_fast => parseDenseEmbedInputsWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
             .per_item => parseDenseEmbedInputsPerItemWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
         } catch |err| {
             if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
-            if (isDenseEmbedRequestAbort(err)) return err;
+            if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedInputParseErrorMessage(err),
@@ -6274,6 +6848,7 @@ pub const Node = struct {
             inputs: *ParsedDenseEmbedInputs,
             request: ParsedEmbedRequest,
             audio_decode_working_bytes: usize,
+            execution_control: InferenceExecutionControl,
             result: ?ExecutionResult = null,
             prompt_tokens: usize = 0,
 
@@ -6282,7 +6857,8 @@ pub const Node = struct {
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
                 defer asset_lease.release();
-                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs);
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs, attempt.execution_control);
+                pipeline.execution_control = attempt.execution_control;
                 var audio_asset_guard = AudioEmbeddingAssetGuard.init(
                     model,
                     attempt.inputs.audio.items.len > 0,
@@ -6334,11 +6910,13 @@ pub const Node = struct {
             .inputs = &inputs,
             .request = request,
             .audio_decode_working_bytes = audio_decode_working_bytes,
+            .execution_control = execution_control,
         };
         var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
         runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .failure_stage = &failure_stage,
+            .execution_control = execution_control,
         }, &attempt, Attempt.run) catch |err| {
             if (isEmbedRequestOptionError(err)) {
                 return ctx.status(400).json(.{
@@ -6486,6 +7064,7 @@ pub const Node = struct {
     }
 
     pub fn rerankPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6500,12 +7079,13 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
@@ -6517,6 +7097,7 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed_body = (try ctx.parseJson(api.RerankMultimodalRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
@@ -6563,7 +7144,13 @@ pub const Node = struct {
         var image_count: usize = 0;
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.documents) |doc| {
-            const parsed = parseChatMessageContentToTextAndImagesWithBudget(self, ctx.allocator, doc.content, &media_budget) catch |err| switch (err) {
+            const parsed = parseChatMessageContentToTextAndImagesWithBudgetAndContext(
+                self,
+                ctx.allocator,
+                doc.content,
+                &media_budget,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| switch (err) {
                 error.InvalidImageDataUri => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid image data URI" }),
                 error.RemoteContentTooLarge,
                 error.RemoteContentNotAllowed,
@@ -6572,7 +7159,8 @@ pub const Node = struct {
                 error.RemoteContentUnavailable,
                 => return remoteContentErrorResponse(ctx, err),
                 error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "multimodal rerank documents only support text and image content parts" }),
-                error.OutOfMemory, error.Timeout, error.Canceled => return err,
+                error.OutOfMemory => return err,
+                error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
                 else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
             };
             image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
@@ -6588,7 +7176,7 @@ pub const Node = struct {
             reserved_units = required_units;
         }
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -6599,6 +7187,7 @@ pub const Node = struct {
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
+            pipeline.execution_control = execution_control;
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
@@ -6662,31 +7251,36 @@ pub const Node = struct {
             // accelerator runtime. Serialize their complete lifetime while
             // leaving request parsing and media admission outside the lane.
             const execution_mutex = model.targetInferenceExecutionMutex();
-            if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+            if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+                return inferenceFailureResponse(ctx, err);
             defer if (execution_mutex) |mutex| mutex.unlock();
 
-            var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
-                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
-            defer cb.deinit();
+            var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            defer compute.deinit();
             var qwen_pipeline = qwen3vl_multimodal_reranker.Pipeline.init(
                 ctx.allocator,
-                &cb,
+                &compute.backend,
                 model.getTokenizer(),
                 gpt_cfg,
                 projector_path,
                 .{
                     .max_length = @min(model.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length),
                 },
-            ) catch |err|
-                return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+            ) catch |err| switch (err) {
+                error.InvalidRerankerConfiguration => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
+            };
 
             const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
             defer ctx.allocator.free(scores);
             var prompt_tokens: usize = 0;
             for (parsed_docs.items, 0..) |doc, idx| {
+                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
                 if (doc.images.len == 0) {
                     var text_pipeline = model.rerankingPipeline(ctx.allocator);
                     text_pipeline.execution_lock = null;
+                    text_pipeline.execution_control = execution_control;
                     const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
                         return inferenceFailureResponse(ctx, err);
                     defer ctx.allocator.free(text_scores);
@@ -6740,7 +7334,7 @@ pub const Node = struct {
             });
         }
 
-        model.ensureVisionSession() catch |err|
+        model.ensureVisionSessionWithControl(execution_control) catch |err|
             return inferenceFailureResponse(ctx, err);
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
@@ -6756,16 +7350,17 @@ pub const Node = struct {
         // complete lifetime; request parsing and image preparation remain
         // outside it.
         const execution_mutex = model.targetInferenceExecutionMutex();
-        if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+        if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+            return inferenceFailureResponse(ctx, err);
         defer if (execution_mutex) |mutex| mutex.unlock();
 
-        var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
-        defer cb.deinit();
+        var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        defer compute.deinit();
 
         var mm_pipeline = multimodal_reranker.Pipeline.init(
             ctx.allocator,
-            &cb,
+            &compute.backend,
             vision_session,
             model.getTokenizer(),
             gpt_cfg,
@@ -6774,6 +7369,7 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             .{ .distributed = runtime.distributed.configFromEnv() },
         );
+        mm_pipeline.execution_control = execution_control;
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -6787,6 +7383,7 @@ pub const Node = struct {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 // This request already owns the non-reentrant model lane.
                 text_pipeline.execution_lock = null;
+                text_pipeline.execution_control = execution_control;
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
@@ -6815,6 +7412,8 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         // Single JSON parse per request: only bodies that can carry
@@ -6890,7 +7489,12 @@ pub const Node = struct {
         var draft_model_path_storage: ?[]const u8 = null;
         defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
 
-        var owned_messages = self.parseGenerateMessagesWithBudget(ctx.allocator, body, &media_budget) catch |err| {
+        var owned_messages = self.parseGenerateMessagesWithBudgetAndContext(
+            ctx.allocator,
+            body,
+            &media_budget,
+            .{ .io = ctx.io, .control = execution_control },
+        ) catch |err| {
             if (err == error.InvalidImageUrl) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -7255,10 +7859,11 @@ pub const Node = struct {
                 }
             }
 
-            var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
+            var pipeline = onnx_decoder_only_vlm.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
+            pipeline.execution_control = execution_control;
 
             if (requiresNativeChannelProjection(pipeline.gpt_config)) {
                 return ctx.status(400).json(.{
@@ -7331,6 +7936,7 @@ pub const Node = struct {
                 result.tokens_used,
                 0,
                 parsed_tool_calls,
+                null,
             );
         }
 
@@ -7396,15 +8002,17 @@ pub const Node = struct {
                     );
                 }
 
-                var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
+                var gen_model = ortgenai.GenAiModel.loadWithControl(ctx.allocator, prepared_model_dir, execution_control) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
+                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
 
                 var pipeline = generation.GenerationPipeline{
                     .allocator = ctx.allocator,
                     .model = &gen_model,
                     .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
                     .prompt_override = if (prompt_override) |prompt| prompt else null,
+                    .execution_control = execution_control,
                 };
 
                 if (config.grammar != null) {
@@ -7471,6 +8079,7 @@ pub const Node = struct {
                     result.tokens_used,
                     0,
                     parsed_tool_calls,
+                    null,
                 );
             }
         }
@@ -7479,9 +8088,9 @@ pub const Node = struct {
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+            break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-        } else self.model_manager.acquireFromDir(model_path) catch |err|
+        } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -7693,14 +8302,14 @@ pub const Node = struct {
                 draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
                     var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                     configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                    break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err| {
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(draft_model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
                         if (draft_was_discovered) {
                             draft_degraded = true;
                             break :draft_setup;
                         }
                         return modelLoadFailureResponse(ctx, err);
                     };
-                } else self.model_manager.acquireFromDir(draft_model_path) catch |err| {
+                } else self.model_manager.acquireFromDirWithControl(draft_model_path, execution_control) catch |err| {
                     if (draft_was_discovered) {
                         draft_degraded = true;
                         break :draft_setup;
@@ -7984,17 +8593,19 @@ pub const Node = struct {
         } else 1;
         var admission_lease = self.model_manager.acquireRunResourceEstimates(
             admission_requests[0..admission_request_count],
-        ) catch |err| switch (err) {
-            error.ResourceLimitExceeded => return ctx.status(400).json(.{
-                .@"error" = "MODEL_RESOURCE_LIMIT",
-                .message = "request exceeds the configured inference resource budget",
-            }),
-            error.ResourceTemporarilyUnavailable => return modelResourceBusyResponse(ctx),
-            // Ownership configuration errors should have failed startup before
-            // request surfaces were published. Keep the HTTP boundary total so
-            // a violated invariant is reported as an internal failure instead
-            // of widening this inferred error set into a compile failure.
-            else => return inferenceFailureResponse(ctx, err),
+        ) catch |err| {
+            if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+            return switch (err) {
+                error.ResourceLimitExceeded => ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
+                    .message = "request exceeds the configured inference resource budget",
+                }),
+                // Ownership configuration errors should have failed startup before
+                // request surfaces were published. Keep the HTTP boundary total so
+                // a violated invariant is reported as an internal failure instead
+                // of widening this inferred error set into a compile failure.
+                else => inferenceFailureResponse(ctx, err),
+            };
         };
         defer admission_lease.release();
 
@@ -8013,8 +8624,12 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        first_locked_model.lockNativeGeneration(ctx.io);
-        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
+            first_locked_model.unlockNativeGeneration();
+            return inferenceFailureResponse(ctx, err);
+        };
         defer {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
@@ -8201,6 +8816,7 @@ pub const Node = struct {
             .compiled_partition_backend = effective_compiled_partition_backend,
             .compiled_attachment_target = effective_compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
+            .execution_control = execution_control,
         };
 
         if (want_stream) {
@@ -8310,6 +8926,26 @@ pub const Node = struct {
         body: api.GenerateRequest,
         media_budget: *RequestMediaBudget,
     ) !OwnedGenerateMessages {
+        return self.parseGenerateMessagesWithBudgetOptionalContext(allocator, body, media_budget, null);
+    }
+
+    fn parseGenerateMessagesWithBudgetAndContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+        request_context: InferenceDownloadRequestContext,
+    ) !OwnedGenerateMessages {
+        return self.parseGenerateMessagesWithBudgetOptionalContext(allocator, body, media_budget, request_context);
+    }
+
+    fn parseGenerateMessagesWithBudgetOptionalContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+        request_context: ?InferenceDownloadRequestContext,
+    ) !OwnedGenerateMessages {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         errdefer {
             for (messages.items) |msg| allocator.free(msg.content);
@@ -8374,7 +9010,10 @@ pub const Node = struct {
                                     } else if (iu == .string) break :blk iu.string;
                                     return error.InvalidImageUrl;
                                 };
-                                const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url_str, media_budget);
+                                const downloaded = if (request_context) |context|
+                                    try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url_str, media_budget)
+                                else
+                                    try downloadRemoteContentWithBudgetForRequest(self, allocator, url_str, media_budget);
                                 defer allocator.free(downloaded.content_type);
                                 var owns_downloaded_data = true;
                                 errdefer if (owns_downloaded_data) allocator.free(downloaded.data);
@@ -8688,6 +9327,12 @@ pub const Node = struct {
     }
 
     fn batchModelLoadError(err: anyerror) api.GenerateBatchError {
+        if (isTransientInferenceCapacityError(err)) return .{
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .retryable = true,
+            .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
+        };
         return switch (err) {
             error.UnknownModelCompatibility => .{
                 .code = "UNKNOWN_MODEL_COMPATIBILITY",
@@ -8704,11 +9349,10 @@ pub const Node = struct {
                 .message = "model resource plan exceeds the configured inference budget",
                 .retryable = false,
             },
-            error.ResourceTemporarilyUnavailable => .{
-                .code = "MODEL_RESOURCE_BUSY",
-                .message = "insufficient inference capacity is currently available",
-                .retryable = true,
-                .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
+            error.ProcessIsolationRequired => .{
+                .code = "PROCESS_ISOLATION_REQUIRED",
+                .message = "this backend requires the supervised inference process",
+                .retryable = false,
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
@@ -8719,7 +9363,7 @@ pub const Node = struct {
     }
 
     fn batchAdmissionError(err: anyerror) api.GenerateBatchError {
-        const retryable = err == error.ResourceTemporarilyUnavailable;
+        const retryable = isTransientInferenceCapacityError(err);
         return .{
             .code = if (retryable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
             .message = if (retryable)
@@ -8868,6 +9512,8 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, true)) {
@@ -8907,6 +9553,8 @@ pub const Node = struct {
         defer ctx.allocator.free(pending);
 
         for (body.requests, 0..) |item, idx| {
+            if (idx % 16 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             results[idx] = .{
                 .custom_id = item.custom_id,
                 .index = @intCast(idx),
@@ -8928,7 +9576,13 @@ pub const Node = struct {
         var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
         for (body.requests, 0..) |item, idx| {
             if (!pending[idx]) continue;
-            owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
+            owned_messages[idx] = parseGenerateMessagesWithBudgetAndContext(
+                self,
+                ctx.allocator,
+                item.body,
+                &media_budget,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| blk: {
                 if (err == error.OutOfMemory) return err;
                 results[idx].@"error" = generateBatchMessageParseError(err).?;
                 break :blk .{ .allocator = ctx.allocator };
@@ -9001,14 +9655,14 @@ pub const Node = struct {
             var model_handle = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
+                break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
-            } else self.model_manager.acquireFromDir(model_path) catch |err| {
+            } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
@@ -9500,6 +10154,7 @@ pub const Node = struct {
                             .scheduler = model.native_generate_coordinator,
                             .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,
                             .execution_lock = batch_model_lock.pipelineExecutionLock(),
+                            .execution_control = execution_control,
                         },
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
@@ -9750,6 +10405,26 @@ pub const Node = struct {
         content: api.ChatMessageContent,
         media_budget: *RequestMediaBudget,
     ) !ParsedMultimodalRerankDocument {
+        return self.parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(allocator, content, media_budget, null);
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudgetAndContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+        request_context: InferenceDownloadRequestContext,
+    ) !ParsedMultimodalRerankDocument {
+        return self.parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(allocator, content, media_budget, request_context);
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudgetOptionalContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+        request_context: ?InferenceDownloadRequestContext,
+    ) !ParsedMultimodalRerankDocument {
         var text_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer text_buf.deinit(allocator);
         var qwen_content_buf = std.ArrayListUnmanaged(u8).empty;
@@ -9796,7 +10471,10 @@ pub const Node = struct {
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
                             try images.append(allocator, decoded.data);
                         } else {
-                            const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
+                            const downloaded = if (request_context) |context|
+                                try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url, media_budget)
+                            else
+                                try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
                             defer allocator.free(downloaded.content_type);
                             errdefer allocator.free(downloaded.data);
                             try qwen_content_buf.appendSlice(allocator, qwen3vl_reranker.image_marker);
@@ -10489,6 +11167,8 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
             return requestModelResolutionError(ctx, err);
@@ -10500,7 +11180,7 @@ pub const Node = struct {
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
         }
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -10525,6 +11205,7 @@ pub const Node = struct {
         }
 
         var pipeline = model.nerPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -10551,6 +11232,7 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var failure_stage: RebelExtractionFailureStage = .model_layout;
         const json = self.extractRebelJsonAlloc(
             ctx.allocator,
@@ -10559,6 +11241,7 @@ pub const Node = struct {
             texts,
             want_relations,
             &failure_stage,
+            execution_control,
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
             return switch (failure_stage) {
@@ -10603,7 +11286,9 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
         failure_stage: *RebelExtractionFailureStage,
+        execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
+        if (execution_control) |control| try control.check();
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 
         failure_stage.* = .model_layout;
@@ -10631,10 +11316,16 @@ pub const Node = struct {
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
         );
-        var encoder_managed = try component_loader.load(paths.encoder);
+        var encoder_managed = if (execution_control) |control|
+            try component_loader.loadWithControl(paths.encoder, control)
+        else
+            try component_loader.load(paths.encoder);
         defer encoder_managed.deinit();
         var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
-        var decoder_managed = try strict_loader.load(paths.decoder);
+        var decoder_managed = if (execution_control) |control|
+            try strict_loader.loadWithControl(paths.decoder, control)
+        else
+            try strict_loader.load(paths.decoder);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.disownSession();
         const decoder_session = decoder_managed.disownSession();
@@ -10646,6 +11337,7 @@ pub const Node = struct {
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = decoder_config,
+                .execution_control = execution_control,
             },
             .tokenizer = tokenizer.tokenizer(),
             .config = config,
@@ -10698,7 +11390,9 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var pipeline = model.glinerPipeline(ctx.allocator);
+        pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         pipeline.config.flat_ner = body.flat_ner orelse pipeline.config.flat_ner;
 
@@ -10807,6 +11501,7 @@ pub const Node = struct {
     }
 
     pub fn classifyText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.ClassifyRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -10821,7 +11516,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
             defer ctx.allocator.free(model_path);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
@@ -10843,6 +11538,7 @@ pub const Node = struct {
                 .entailment_index = entailment_idx,
             };
             var pipeline = model.classificationPipeline(ctx.allocator, config);
+            pipeline.execution_control = execution_control;
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -10863,7 +11559,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
             defer ctx.allocator.free(model_path);
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
             const model = model_handle.get();
@@ -10872,6 +11568,7 @@ pub const Node = struct {
             }
 
             var pipeline = model.glinerPipeline(ctx.allocator);
+            pipeline.execution_control = execution_control;
             const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
@@ -10897,6 +11594,8 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -10917,7 +11616,7 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_sequence_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
+            else => return modelLoadFailureResponse(ctx, err),
         };
         defer ctx.allocator.free(checkpoint_path);
 
@@ -10937,6 +11636,7 @@ pub const Node = struct {
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
             else => return inferenceFailureResponse(ctx, err),
         };
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
 
         const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
             error.LabelCountMismatch => return ctx.status(400).json(.{
@@ -10999,6 +11699,8 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11030,6 +11732,8 @@ pub const Node = struct {
         const tokens = try ctx.allocator.alloc(document_token_classification.TokenBox, body.tokens.len);
         defer ctx.allocator.free(tokens);
         for (body.tokens, 0..) |tok, idx| {
+            if (idx % 32 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             if (tok.bbox.len != 4) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "each token bbox must contain 4 integers" });
             }
@@ -11084,6 +11788,8 @@ pub const Node = struct {
         }
 
         for (predictions, 0..) |pred, pred_idx| {
+            if (pred_idx % 32 == 0) execution_control.check() catch |err|
+                return inferenceFailureResponse(ctx, err);
             const bbox_slice = try ctx.allocator.alloc(i64, pred.bbox.len);
             for (pred.bbox, 0..) |coord, ci| bbox_slice[ci] = coord;
             try bbox_bufs.append(ctx.allocator, bbox_slice);
@@ -11142,6 +11848,8 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11172,12 +11880,12 @@ pub const Node = struct {
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
         ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.load(paths.encoder) catch |err|
+        var encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer encoder_managed.deinit();
         var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+        var decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.session;
@@ -11208,6 +11916,7 @@ pub const Node = struct {
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = dec_config,
+                .execution_control = execution_control,
             },
             .tokenizer = hf_tok.tokenizer(),
             .config = .{
@@ -11253,6 +11962,7 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.ReadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11319,7 +12029,14 @@ pub const Node = struct {
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (body.images, 0..) |img_url, i| {
-            var item = downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
+            var item = downloadReadBatchContentForRequest(
+                self,
+                ctx.allocator,
+                img_url.url,
+                batch_byte_cap,
+                batch_bytes,
+                .{ .io = ctx.io, .control = execution_control },
+            ) catch |err| switch (err) {
                 error.ReadBatchTooLarge => return ctx.status(413).json(.{
                     .@"error" = "BATCH_TOO_LARGE",
                     .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
@@ -11346,11 +12063,12 @@ pub const Node = struct {
         if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
         reserved_units = required_units;
 
-        var reader = readers_mod.LoadedReader.loadFromDir(
+        var reader = readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             model_path,
             &self.session_manager,
             &self.model_manager,
+            execution_control,
         ) catch |err| switch (err) {
             error.InvalidModelForReading => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
@@ -11371,6 +12089,7 @@ pub const Node = struct {
         const results = reader.readBatch(image_datas, .{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
+            .execution_control = execution_control,
         }) catch |err| switch (err) {
             error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
             error.InvalidMaxTokens => return ctx.status(400).json(.{
@@ -11446,6 +12165,7 @@ pub const Node = struct {
     }
 
     pub fn transcribeAudio(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.TranscribeRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11530,12 +12250,12 @@ pub const Node = struct {
                 self.session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             ) catch |err| return modelLoadFailureResponse(ctx, err);
-            encoder_managed = component_loader.load(paths.encoder) catch |err|
+            encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             encoder_session = encoder_managed.?.session;
             var strict_loader = component_loader.restrictToBackend(encoder_session.backend()) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-            decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             decoder_session = decoder_managed.?.session;
             self.model_manager.validateWhisperAssetsCurrent(
@@ -11548,7 +12268,7 @@ pub const Node = struct {
             decoder_config = assets.decoder_config;
             prompt_cache = &assets.prompt_cache;
         } else |_| {
-            loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            loaded_model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             const model = loaded_model_handle.?.get();
             const whisper_config = session_factory.getWhisperConfig(model.session) orelse {
@@ -11594,6 +12314,7 @@ pub const Node = struct {
                 .language_tokens = effective_prompt_cache.language_tokens,
             },
         );
+        pipeline.execution_control = execution_control;
 
         var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
@@ -11618,6 +12339,8 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(extraction_api.ExtractionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -11653,7 +12376,7 @@ pub const Node = struct {
                 .inputs = inputs,
                 .schema_json = schema_json,
                 .options_json = options_json,
-            }, .http_route) catch |err| return extractionDirectFailureResponse(ctx, err);
+            }, .http_route, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
             _ = ctx.response.body(response.json);
@@ -11721,6 +12444,7 @@ pub const Node = struct {
         body: extraction_api.ExtractionRequest,
         texts: []const []const u8,
     ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
         if (try self.acquireSlot(ctx)) |resp| return resp;
         defer self.releaseSlot();
         self.metrics.incRequest("extract");
@@ -11730,7 +12454,7 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -11759,6 +12483,7 @@ pub const Node = struct {
 
             if (model.isGlinerModel()) {
                 var pipeline = model.glinerPipeline(ctx.allocator);
+                pipeline.execution_control = execution_control;
                 const multi_label = schema.multi_label orelse false;
                 const results = pipeline.classifyBatch(texts, schema.labels, .{
                     .threshold = options.threshold orelse 0.0,
@@ -11787,6 +12512,7 @@ pub const Node = struct {
                 .multi_label = schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
+            pipeline.execution_control = execution_control;
             var schema_prompt_tokens: usize = 0;
             const results = pipeline.classifyBatchWithPromptTokens(texts, schema.labels, &schema_prompt_tokens) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -11835,7 +12561,14 @@ pub const Node = struct {
 
         var batch_bytes: usize = 0;
         for (images, 0..) |img_url, i| {
-            const downloaded = try downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes);
+            const downloaded = try downloadReadBatchContentForRequest(
+                self,
+                ctx.allocator,
+                img_url.url,
+                batch_byte_cap,
+                batch_bytes,
+                .{ .io = ctx.io, .control = httpInferenceExecutionControl(self, ctx) },
+            );
             defer ctx.allocator.free(downloaded.content_type);
             errdefer ctx.allocator.free(downloaded.data);
 
@@ -12202,6 +12935,8 @@ pub const Node = struct {
     }
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -12216,11 +12951,12 @@ pub const Node = struct {
         const result = tabular_mod.http.predict(ctx.io, ctx.allocator, &self.tabular_registry, .{
             .model = body.model,
             .input = body.input,
-        }) catch |err| switch (err) {
+        }, execution_control) catch |err| switch (err) {
             error.ModelNotFound => return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "predictor not found" }),
             error.BatchTooLarge => return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "batch too large" }),
             error.FeatureMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature vector length mismatch" }),
             error.LoadFailed => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = "failed to load predictor" }),
+            error.Timeout, error.Cancelled => return inferenceFailureResponse(ctx, err),
             else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = internalErrorMessage("INTERNAL_ERROR", err) }),
         };
 
@@ -12343,7 +13079,7 @@ pub const Node = struct {
             );
             return err;
         };
-        self.attachIo(io);
+        try self.attachIo(io);
         self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
@@ -13058,6 +13794,7 @@ fn parseDirectExtractionInputs(
     prompt: ?[]const u8,
     max_tokens: ?usize,
     max_media_bytes: usize,
+    request_context: InferenceDownloadRequestContext,
 ) !DirectExtractionInputs {
     var media_budget = RequestMediaBudget.init(max_media_bytes);
     var out = DirectExtractionInputs{
@@ -13068,7 +13805,7 @@ fn parseDirectExtractionInputs(
     errdefer out.deinit();
 
     for (inputs) |input| {
-        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget);
+        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget, request_context);
     }
     if (out.texts.items.len > 0 and out.images.items.len > 0) return error.UnsupportedInput;
     if (out.texts.items.len == 0 and out.images.items.len == 0) return error.UnsupportedInput;
@@ -13081,6 +13818,7 @@ fn appendDirectExtractionContent(
     out: *DirectExtractionInputs,
     content_json: []const u8,
     media_budget: *RequestMediaBudget,
+    request_context: InferenceDownloadRequestContext,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
     defer parsed.deinit();
@@ -13113,13 +13851,13 @@ fn appendDirectExtractionContent(
                     else
                         null;
                     if (url) |value| {
-                        try appendDownloadedExtractionImage(node, allocator, out, value, media_budget);
+                        try appendDownloadedExtractionImage(node, allocator, out, value, media_budget, request_context);
                         saw_media = true;
                     }
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
                     if (part.object.get("url")) |url_value| {
                         if (url_value == .string) {
-                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget);
+                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget, request_context);
                             saw_media = true;
                         }
                     } else if (part.object.get("data")) |data_value| {
@@ -13159,8 +13897,15 @@ fn appendDownloadedExtractionImage(
     out: *DirectExtractionInputs,
     url: []const u8,
     media_budget: *RequestMediaBudget,
+    request_context: InferenceDownloadRequestContext,
 ) !void {
-    const downloaded = try downloadRemoteContentWithBudgetForRequest(node, allocator, url, media_budget);
+    const downloaded = try downloadRemoteContentWithBudgetForRequestWithContext(
+        node,
+        allocator,
+        request_context,
+        url,
+        media_budget,
+    );
     defer allocator.free(downloaded.content_type);
     errdefer allocator.free(downloaded.data);
     if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
@@ -14931,12 +15676,24 @@ test "generate batch capacity errors include actionable retry metadata" {
         busy_load.retry_after_ms.valueOrNull(),
     );
 
+    const saturated_load = Node.batchModelLoadError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_load.code);
+    try std.testing.expect(saturated_load.retryable);
+
     const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_admission.code);
     try std.testing.expectEqual(true, busy_admission.retryable);
     try std.testing.expectEqual(
         @as(?i64, transient_capacity_retry_after_ms),
         busy_admission.retry_after_ms.valueOrNull(),
+    );
+
+    const saturated_admission = Node.batchAdmissionError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_admission.code);
+    try std.testing.expect(saturated_admission.retryable);
+    try std.testing.expectEqual(
+        @as(?i64, transient_capacity_retry_after_ms),
+        saturated_admission.retry_after_ms.valueOrNull(),
     );
 
     const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
@@ -15869,6 +16626,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
         &out,
         "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YWJj\"}}]",
         &media_budget,
+        .{ .io = std.testing.io },
     );
     try std.testing.expectEqual(first_uri.len, media_budget.used_bytes);
     try std.testing.expectError(
@@ -15879,6 +16637,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
             &out,
             "[{\"type\":\"media\",\"data\":\"ZGVm\"}]",
             &media_budget,
+            .{ .io = std.testing.io },
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), out.images.items.len);
@@ -15894,15 +16653,16 @@ test "direct extraction content releases temporary ownership on every allocation
             var out = DirectExtractionInputs{ .allocator = allocator };
             defer out.deinit();
             var budget = RequestMediaBudget.init(32);
-            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget, .{ .io = std.testing.io });
             try appendDirectExtractionContent(
                 target,
                 allocator,
                 &out,
                 "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
                 &budget,
+                .{ .io = std.testing.io },
             );
-            try appendDirectExtractionContent(target, allocator, &out, "42", &budget);
+            try appendDirectExtractionContent(target, allocator, &out, "42", &budget, .{ .io = std.testing.io });
             try std.testing.expectEqual(@as(usize, 3), out.texts.items.len);
         }
     };
@@ -15973,6 +16733,29 @@ test "fail-fast embedding capacity response exposes retry contract" {
         @as(i64, transient_capacity_retry_after_ms),
         parsed.value.retry_after_ms,
     );
+
+    const saturated = embedDenseInputFailure(error.ConcurrencyUnavailable);
+    try std.testing.expectEqual(@as(u16, 503), saturated.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated.code);
+    const saturated_item = embedItemFailure(0, error.ConcurrencyUnavailable, "execution");
+    try std.testing.expectEqual(@as(u16, 503), saturated_item.status);
+    try std.testing.expect(saturated_item.retryable);
+    try std.testing.expectEqual(@as(?i64, transient_capacity_retry_after_ms), saturated_item.retry_after_ms);
+}
+
+test "cold model load executor saturation exposes retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.ConcurrencyUnavailable);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(transient_capacity_retry_after_seconds, response.header("Retry-After").?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_RESOURCE_BUSY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
 test "changing model publication returns an explicit retry contract" {
@@ -16012,6 +16795,30 @@ test "managed download markers return the model publication retry contract" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
+test "inference lifetime errors preserve timeout and cancellation semantics" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var timeout_response = try inferenceFailureResponse(&ctx, error.Timeout);
+    defer timeout_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), timeout_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_response.body.?, "INFERENCE_TIMEOUT") != null);
+
+    var cancelled_response = try modelLoadFailureResponse(&ctx, error.Cancelled);
+    defer cancelled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), cancelled_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, cancelled_response.body.?, "INFERENCE_CANCELLED") != null);
+
+    var saturated_response = try inferenceFailureResponse(&ctx, error.ConcurrencyUnavailable);
+    defer saturated_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), saturated_response.status.code);
+    try std.testing.expectEqualStrings(transient_capacity_retry_after_seconds, saturated_response.header("Retry-After").?);
+    try std.testing.expect(std.mem.indexOf(u8, saturated_response.body.?, "MODEL_RESOURCE_BUSY") != null);
+}
+
 test "registerRoutesOn prefixes embed aliases and metrics route" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -16035,10 +16842,72 @@ test "node attachIo wires model session manager" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
 
-    node.attachIo(std.testing.io);
+    try node.attachIo(std.testing.io);
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+}
+
+test "supervised node owns and joins the hard cancellation watchdog" {
+    var node = try Node.init(std.testing.allocator, .{
+        .process_termination_available = true,
+    });
+    defer node.deinit();
+    try std.testing.expectError(
+        error.HardCancellationWatchdogNotStarted,
+        (InferenceExecutionControl{
+            .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(),
+        }).enterUninterruptible(.process_required),
+    );
+    try node.attachIo(std.testing.io);
+
+    const control = node.bindExecutionControl(null, .{});
+    try std.testing.expect(control.io != null);
+    try std.testing.expect(control.hard_cancellation != null);
+    var guard = try control.enterUninterruptible(.process_required);
+    guard.deinit();
+}
+
+test "supervised node drains load task guards before destroying watchdog" {
+    const Probe = struct {
+        ready: std.Io.Event = .unset,
+        blocked: std.Io.Event = .unset,
+        finished: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This(), io: std.Io, control: InferenceExecutionControl) std.Io.Cancelable!void {
+            defer self.finished = true;
+            var guard = control.enterUninterruptible(.process_required) catch |err| {
+                self.err = err;
+                self.ready.set(io);
+                return;
+            };
+            defer guard.deinit();
+            self.ready.set(io);
+            // Only manager shutdown can release this task. Its watchdog guard
+            // must remain valid until cancellation has unwound the task.
+            try self.blocked.wait(io);
+        }
+    };
+    var probe = Probe{};
+    {
+        var node = try Node.init(std.testing.allocator, .{
+            .process_termination_available = true,
+        });
+        defer node.deinit();
+        const io = std.testing.io;
+        try node.attachIo(io);
+        node.model_manager.load_io = io;
+        try node.model_manager.load_group.concurrent(io, Probe.run, .{
+            &probe, io, node.bindExecutionControl(null, .{}),
+        });
+        try probe.ready.waitTimeout(io, .{ .duration = .{
+            .raw = std.Io.Duration.fromSeconds(5),
+            .clock = .awake,
+        } });
+        try std.testing.expect(probe.err == null);
+    }
+    try std.testing.expect(probe.finished);
 }
 
 test "canonical relation schemas preserve endpoint label constraints" {
@@ -17007,6 +17876,10 @@ test "generation live pressure is an actionable retryable capacity error" {
     const batch_error = batchGenerationError(error.ResourceTemporarilyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", batch_error.code);
     try std.testing.expect(batch_error.retryable);
+
+    const saturated_batch_error = batchGenerationError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_batch_error.code);
+    try std.testing.expect(saturated_batch_error.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -18387,7 +19260,7 @@ fn parseDenseEmbedInputsWithBudgetAndContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
 }
@@ -18398,7 +19271,7 @@ fn parseDenseEmbedInputsWithBudgetOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18440,7 +19313,7 @@ fn parseDirectDenseEmbedInputsWithContext(
     manifest: *const manifest_mod.ModelManifest,
     parts: []const Node.DirectDenseEmbedPart,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, request_context);
 }
@@ -18451,7 +19324,7 @@ fn parseDirectDenseEmbedInputsOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     parts: []const Node.DirectDenseEmbedPart,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18519,7 +19392,7 @@ fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
 }
@@ -18530,7 +19403,7 @@ fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -18566,7 +19439,7 @@ fn appendDenseEmbedImageUrl(
     url: []const u8,
     index: usize,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !void {
     if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
     const downloaded = if (request_context) |context|
@@ -18626,7 +19499,7 @@ fn appendDenseEmbedInput(
     item: std.json.Value,
     index: usize,
     media_budget: *RequestMediaBudget,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
 ) !void {
     if (item == .string) {
         if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
@@ -18720,6 +19593,11 @@ const EmbedDenseInputFailure = struct {
 };
 
 fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .status = 503,
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+    };
     return switch (err) {
         error.ImageDecodeFailed => .{
             .status = 400,
@@ -18731,11 +19609,6 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "MODEL_RESOURCE_LIMIT",
             .message = "request resource plan exceeds the configured inference budget",
         },
-        error.ResourceTemporarilyUnavailable => .{
-            .status = 503,
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-        },
         else => .{
             .status = 500,
             .code = "INFERENCE_FAILED",
@@ -18745,7 +19618,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
 }
 
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-    if (err == error.ResourceTemporarilyUnavailable) {
+    if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
     }
     const failure = embedDenseInputFailure(err);
@@ -18810,6 +19683,15 @@ const DenseEmbedPartialResult = struct {
 };
 
 fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .index = @intCast(index),
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+        .stage = stage,
+        .retryable = true,
+        .status = 503,
+        .retry_after_ms = transient_capacity_retry_after_ms,
+    };
     return switch (err) {
         error.ImageDecodeFailed => .{
             .index = @intCast(index),
@@ -18826,15 +19708,6 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
             .stage = stage,
             .retryable = false,
             .status = 400,
-        },
-        error.ResourceTemporarilyUnavailable => .{
-            .index = @intCast(index),
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-            .stage = stage,
-            .retryable = true,
-            .status = 503,
-            .retry_after_ms = transient_capacity_retry_after_ms,
         },
         else => .{
             .index = @intCast(index),
@@ -18928,17 +19801,19 @@ fn prepareInitialDenseEmbeddingPipeline(
     model: *model_manager_mod.LoadedModel,
     allocator: std.mem.Allocator,
     inputs: *const ParsedDenseEmbedInputs,
+    control: InferenceExecutionControl,
 ) !embedding_mod.EmbeddingPipeline {
-    model.lockEmbeddingAssets();
+    try model.lockEmbeddingAssetsWithControl(control);
     defer model.unlockEmbeddingAssets();
     if (inputs.audio.items.len > 0) {
         // Audio is deliberately the only optional phase admitted up front.
         // Text/image assets are admitted after the audio outputs are copied.
-        try model.ensureAudioEmbeddingAssetsLocked();
+        try model.ensureAudioEmbeddingAssetsLockedWithControl(control);
     } else {
-        try model.ensurePrimaryEmbeddingAssetsLocked(
+        try model.ensurePrimaryEmbeddingAssetsLockedWithControl(
             inputs.texts.items.len > 0,
             inputs.images.items.len > 0,
+            control,
         );
     }
     return model.embeddingPipelineLocked(allocator);
@@ -18950,11 +19825,13 @@ fn admitPrimaryDenseEmbeddingAssetsAfterAudio(
     inputs: *const ParsedDenseEmbedInputs,
 ) !void {
     if (inputs.texts.items.len == 0 and inputs.images.items.len == 0) return;
-    model.lockEmbeddingAssets();
+    const control = pipeline.execution_control orelse return error.MissingInferenceExecutionControl;
+    try model.lockEmbeddingAssetsWithControl(control);
     defer model.unlockEmbeddingAssets();
-    try model.ensurePrimaryEmbeddingAssetsLocked(
+    try model.ensurePrimaryEmbeddingAssetsLockedWithControl(
         inputs.texts.items.len > 0,
         inputs.images.items.len > 0,
+        control,
     );
     model.bindEmbeddingPipelineAssetsLocked(pipeline);
 }
@@ -18970,16 +19847,25 @@ fn admitPrimaryDenseEmbeddingAssetsAfterAudioPartial(
     inputs: *const ParsedDenseEmbedInputs,
 ) PartialPrimaryDenseEmbeddingAdmission {
     var admission = PartialPrimaryDenseEmbeddingAdmission{};
-    model.lockEmbeddingAssets();
+    const control = pipeline.execution_control orelse {
+        admission.text_error = error.MissingInferenceExecutionControl;
+        admission.image_error = error.MissingInferenceExecutionControl;
+        return admission;
+    };
+    model.lockEmbeddingAssetsWithControl(control) catch |err| {
+        admission.text_error = err;
+        admission.image_error = err;
+        return admission;
+    };
     defer model.unlockEmbeddingAssets();
 
     if (inputs.texts.items.len > 0) {
-        model.ensurePrimaryEmbeddingAssetsLocked(true, false) catch |err| {
+        model.ensurePrimaryEmbeddingAssetsLockedWithControl(true, false, control) catch |err| {
             admission.text_error = err;
         };
     }
     if (inputs.images.items.len > 0) {
-        model.ensurePrimaryEmbeddingAssetsLocked(false, true) catch |err| {
+        model.ensurePrimaryEmbeddingAssetsLockedWithControl(false, true, control) catch |err| {
             admission.image_error = err;
         };
     }
@@ -20713,7 +21599,7 @@ const RemoteContentRequestFailure = struct {
 
 fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
     return switch (err) {
-        error.OutOfMemory, error.Timeout, error.Canceled => err,
+        error.OutOfMemory, error.Timeout, error.Canceled, error.Cancelled => err,
         error.StreamTooLong => error.RemoteContentTooLarge,
         error.HostNotAllowed,
         error.PathNotAllowed,
@@ -20739,7 +21625,7 @@ fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
 }
 
 fn isDenseEmbedRequestAbort(err: anyerror) bool {
-    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled;
+    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled or err == error.Cancelled;
 }
 
 fn downloadRemoteContentWithBudgetForRequest(
@@ -20754,7 +21640,7 @@ fn downloadRemoteContentWithBudgetForRequest(
 fn downloadRemoteContentWithBudgetForRequestWithContext(
     self: *Node,
     alloc: std.mem.Allocator,
-    request_context: DenseEmbedRequestContext,
+    request_context: InferenceDownloadRequestContext,
     url: []const u8,
     budget: *RequestMediaBudget,
 ) !scraping.DownloadedContent {
@@ -20764,7 +21650,7 @@ fn downloadRemoteContentWithBudgetForRequestWithContext(
 fn downloadRemoteContentWithBudgetForRequestOptionalContext(
     self: *Node,
     alloc: std.mem.Allocator,
-    request_context: ?DenseEmbedRequestContext,
+    request_context: ?InferenceDownloadRequestContext,
     url: []const u8,
     budget: *RequestMediaBudget,
 ) !scraping.DownloadedContent {
@@ -20787,16 +21673,15 @@ fn downloadRemoteContentWithBudgetForRequestOptionalContext(
     else
         remaining_u64;
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
-    const download_context = if (request_context) |context|
-        try denseEmbedDownloadContext(context)
-    else
-        null;
+    if (request_context) |context| try context.control.check();
     if (comptime builtin.is_test) request_work_test_counters.media_fetch_attempts += 1;
-    var downloaded = (if (download_context) |context|
-        scraping.downloadContentAllocWithContext(alloc, context, url, &bounded_security, s3_credentials)
-    else
-        scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials)) catch |err|
-        return normalizeRemoteContentRequestError(err);
+    var downloaded = downloadContentForInferenceRequest(
+        alloc,
+        request_context,
+        url,
+        &bounded_security,
+        s3_credentials,
+    ) catch |err| return normalizeRemoteContentRequestError(err);
     errdefer downloaded.deinit(alloc);
     try budget.add(inline_budget_bytes orelse downloaded.data.len);
     return downloaded;
@@ -20879,6 +21764,12 @@ fn generationMemoryBudgetResponse(
 }
 
 fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
+    if (isTransientInferenceCapacityError(err)) return .{
+        .status = 503,
+        .code = "MODEL_RESOURCE_BUSY",
+        .message = "insufficient inference capacity is currently available",
+        .retryable = true,
+    };
     return switch (err) {
         error.PromptTooLong => .{
             .status = 400,
@@ -20891,12 +21782,6 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .code = "MEMORY_BUDGET_EXCEEDED",
             .message = memory_budget_exceeded_message,
             .retryable = false,
-        },
-        error.ResourceTemporarilyUnavailable => .{
-            .status = 503,
-            .code = "MODEL_RESOURCE_BUSY",
-            .message = "insufficient inference capacity is currently available",
-            .retryable = true,
         },
         else => null,
     };
@@ -20915,7 +21800,7 @@ fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-    if (err == error.ResourceTemporarilyUnavailable)
+    if (isTransientInferenceCapacityError(err))
         return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
         return ctx.status(failure.status).json(.{
@@ -20973,6 +21858,8 @@ fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror
 
 fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (err == error.OutOfMemory) return err;
+    if (err == error.Timeout or err == error.Canceled or err == error.Cancelled)
+        return inferenceFailureResponse(ctx, err);
     const failure = remoteContentRequestFailure(err) orelse return err;
     return ctx.status(failure.status).json(.{
         .@"error" = failure.code,
@@ -21010,6 +21897,46 @@ fn downloadReadBatchContent(
     current_bytes: usize,
     inline_content_trust: InlineContentTrust,
 ) !scraping.DownloadedContent {
+    return downloadReadBatchContentOptionalContext(
+        self,
+        alloc,
+        url,
+        max_bytes,
+        current_bytes,
+        inline_content_trust,
+        null,
+    );
+}
+
+fn downloadReadBatchContentWithContext(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+    inline_content_trust: InlineContentTrust,
+    request_context: InferenceDownloadRequestContext,
+) !scraping.DownloadedContent {
+    return downloadReadBatchContentOptionalContext(
+        self,
+        alloc,
+        url,
+        max_bytes,
+        current_bytes,
+        inline_content_trust,
+        request_context,
+    );
+}
+
+fn downloadReadBatchContentOptionalContext(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+    inline_content_trust: InlineContentTrust,
+    request_context: ?InferenceDownloadRequestContext,
+) !scraping.DownloadedContent {
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
     const remaining_u64: u64 = @intCast(remaining);
@@ -21018,7 +21945,7 @@ fn downloadReadBatchContent(
     // absent or empty override into an allow-all policy for this read path.
     var bounded_security = boundedReadContentSecurity(effectiveRequestContentSecurity(self), url, remaining_u64, inline_content_trust);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
-    return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
+    return downloadContentForInferenceRequest(alloc, request_context, url, &bounded_security, s3_credentials);
 }
 
 fn downloadReadBatchContentForRequest(
@@ -21027,8 +21954,9 @@ fn downloadReadBatchContentForRequest(
     url: []const u8,
     max_bytes: usize,
     current_bytes: usize,
+    request_context: InferenceDownloadRequestContext,
 ) !scraping.DownloadedContent {
-    return downloadReadBatchContent(self, alloc, url, max_bytes, current_bytes, .untrusted) catch |err| {
+    return downloadReadBatchContentWithContext(self, alloc, url, max_bytes, current_bytes, .untrusted, request_context) catch |err| {
         if (err == error.ReadBatchTooLarge) return err;
         return normalizeRemoteContentRequestError(err);
     };

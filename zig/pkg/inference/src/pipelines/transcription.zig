@@ -30,6 +30,7 @@ const backends = @import("../backends/backends.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const audio = @import("audio.zig");
 const whisper_prompt = @import("whisper_prompt.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const TranscribeConfig = struct {
     max_length: usize = 448,
@@ -66,6 +67,7 @@ pub const TranscriptionPipeline = struct {
     decoder: backends.Session,
     tokenizer: tokenizer_mod.Tokenizer,
     config: TranscribeConfig,
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -122,6 +124,7 @@ pub const TranscriptionPipeline = struct {
 
     /// Transcribe PCM audio samples at the given sample rate.
     pub fn transcribePcm(self: *TranscriptionPipeline, samples: []const f32, sample_rate: u32) !TranscribeResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const mel_elements = std.math.mul(
             usize,
@@ -154,7 +157,7 @@ pub const TranscriptionPipeline = struct {
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
 
-        const encoder_outputs = try encoder_permit.run(&.{mel_tensor}, allocator);
+        const encoder_outputs = try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -209,7 +212,12 @@ pub const TranscriptionPipeline = struct {
             // Rename encoder output to match decoder's expected input name
             const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
 
-            const dec_outputs = try self.decoder.run(&.{ dec_tensor, enc_hidden }, allocator);
+            if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
+            const dec_outputs = try self.decoder.runWithControl(
+                &.{ dec_tensor, enc_hidden },
+                allocator,
+                self.execution_control,
+            );
             defer {
                 for (dec_outputs) |*t| {
                     var mt = t.*;
