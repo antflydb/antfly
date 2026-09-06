@@ -31,6 +31,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -87,12 +88,23 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_json_atomic(path: Path, value: object) -> None:
+def write_json_atomic(path: Path, value: object, *, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(encoded, encoding="utf-8")
-    os.replace(temporary, path)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Publish the complete report without replacing a concurrent writer.
+            os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_json(path: Path) -> dict[str, Any]:

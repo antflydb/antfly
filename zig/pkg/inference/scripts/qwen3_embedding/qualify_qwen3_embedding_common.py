@@ -431,9 +431,8 @@ def run_qualification(
         server_full[case_id] = vector
         rows.extend(case_gates(case_id, case["embeddings"]["1024"], vector, min_cosine))
 
-        if (
-            reduced_dimension_replay_fn is not None
-            and not reduced_dimension_replay_fn(case)
+        if reduced_dimension_replay_fn is not None and not reduced_dimension_replay_fn(
+            case
         ):
             continue
         reduced_body = embedding_request_body(
@@ -451,9 +450,7 @@ def run_qualification(
         document_case_ids_fn(cases)
         if document_case_ids_fn is not None
         else [
-            case_id
-            for case_id in sorted(cases)
-            if cases[case_id]["role"] == "document"
+            case_id for case_id in sorted(cases) if cases[case_id]["role"] == "document"
         ]
     )
     batch_body = embedding_request_body(

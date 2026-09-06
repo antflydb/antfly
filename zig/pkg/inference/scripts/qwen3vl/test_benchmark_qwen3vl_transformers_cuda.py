@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -110,6 +111,48 @@ class CudaBenchmarkContractTests(unittest.TestCase):
             )
             self.assertEqual(2, result)
             self.assertEqual("original", output.read_text(encoding="utf-8"))
+
+    def test_report_created_during_run_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "report.json"
+
+            def concurrent_report(_args: object) -> None:
+                output.write_text("concurrent report", encoding="utf-8")
+                raise benchmark.QualificationError("benchmark failed")
+
+            with (
+                mock.patch.object(
+                    benchmark, "parse_args", return_value=args(output=output)
+                ),
+                mock.patch.object(
+                    benchmark, "validate_args", side_effect=concurrent_report
+                ),
+            ):
+                self.assertEqual(2, benchmark.main([]))
+            self.assertEqual("concurrent report", output.read_text(encoding="utf-8"))
+            self.assertEqual([output], list(Path(raw).iterdir()))
+
+    def test_exclusive_publication_writes_complete_report_and_cleans_temporary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "report.json"
+            report = {"pass": False, "failure": "benchmark failed"}
+            benchmark.write_json_atomic(output, report, overwrite=False)
+            self.assertEqual(report, json.loads(output.read_text(encoding="utf-8")))
+            self.assertEqual([output], list(Path(raw).iterdir()))
+
+    def test_dangling_output_symlink_is_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "missing.json"
+            output = Path(raw) / "report.json"
+            output.symlink_to(target)
+            with mock.patch.object(
+                benchmark, "parse_args", return_value=args(output=output)
+            ):
+                self.assertEqual(2, benchmark.main([]))
+            self.assertTrue(output.is_symlink())
+            self.assertFalse(target.exists())
 
     def test_reference_contract_binds_request_and_logits(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -48,7 +48,7 @@ CUDA_PARITY_LIMITS = {
 def validate_args(args: argparse.Namespace) -> None:
     if platform.system() != "Linux":
         raise QualificationError("Transformers CUDA benchmark requires Linux")
-    if args.output.exists():
+    if args.output.exists() or args.output.is_symlink():
         raise QualificationError(f"refusing to overwrite output: {args.output}")
     for label, path in (
         ("oracle script", args.oracle_script),
@@ -228,12 +228,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    if args.output.exists():
-        print(
-            f"Qwen3-VL CUDA benchmark failed: refusing to overwrite output: {args.output}",
-            file=sys.stderr,
-        )
-        return 2
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "pass": False,
@@ -344,7 +338,13 @@ def main(argv: list[str] | None = None) -> int:
             report["failure"] = "one or more CUDA benchmark gates failed"
     except (QualificationError, OSError, ValueError) as exc:
         report["failure"] = str(exc)
-    write_json_atomic(args.output.resolve(), report)
+    try:
+        write_json_atomic(args.output.absolute(), report, overwrite=False)
+    except OSError as exc:
+        print(
+            f"Qwen3-VL CUDA benchmark failed to publish report: {exc}", file=sys.stderr
+        )
+        return 2
     print(json.dumps({"pass": report["pass"], "report": str(args.output.resolve())}))
     return 0 if report["pass"] else 2
 
