@@ -3073,11 +3073,16 @@ pub const DBIndexStats = struct {
     // This is deliberately independent of serving authority and is never
     // persisted or exposed as a separate public field.
     runtime_target_observation_complete: bool = true,
-    // Cache-local replay witnesses belonging to the retained serving and
-    // coverage payloads, not the potentially newer replay progress overlay.
-    // Null on a raw owner observation; never serialized or persisted.
+    // Replay witnesses belonging to retained serving/coverage payloads, not a
+    // newer progress overlay. Live owners issue these with publication stamps;
+    // incomplete/status-only observations may leave them unknown. Neither
+    // metadata relabeling nor cloning may manufacture a witness.
     runtime_serving_applied_sequence: ?u64 = null,
     runtime_coverage_applied_sequence: ?u64 = null,
+    // Owner-issued local payload authority. Null means unknown, not revision
+    // zero. These are never synthesized by metadata overlays or serialized.
+    serving_publication: ?@import("publication.zig").Stamp = null,
+    coverage_publication: ?@import("publication.zig").Stamp = null,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -3094,8 +3099,9 @@ pub const DBIndexStats = struct {
     // Authoritative O(1) projection of the resident search-admission gate for
     // this exact dense incarnation. Zero members is still a valid snapshot.
     serving_snapshot_ready: bool = false,
-    // Process-local immutable serving revision. It is ordered only when the
-    // serving observation has the same nonzero owner identity.
+    // Dense storage's process-local immutable serving revision. Zero is
+    // unavailable, not a comparable revision for another index kind. Generic
+    // owner-observation ordering uses serving_publication instead.
     serving_snapshot_revision: u64 = 0,
     // Process-local owner of the immutable serving snapshot above. This is
     // index-scoped because targeted structural observations can retain a

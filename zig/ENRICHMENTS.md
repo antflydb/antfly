@@ -228,13 +228,14 @@ queryable; `complete` is blocked by `target_observation` in addition to any
 coverage/publication debt.
 
 Observing an accepted target is distinct from applying its deletion or source
-replacement. The status cache retains the last exact reducing commit watermark
-across subsequent additive commits. Serving and coverage payloads each carry
-their own cache-local applied-replay witness; retaining an older payload must
-also retain its witness even if the replay progress overlay advances. Counts
-may decrease when the corresponding payload applies that reducing commit, not
-merely because an observer discovers its target. Once applied, the watermark
-cannot authorize a second regression without another reducing commit.
+replacement. Target and reducing commit watermarks merge independently, including
+out-of-order notifications. Serving and coverage carry separate owner-issued
+publication stamps and applied prefixes; retaining a payload retains its stamp
+even if the replay progress overlay advances. A newer authoritative publication
+can decrease counts, including intermediate progress before the latest accepted
+delete is applied. The cache does not use cardinality maxima or callback timing
+to order stamped observations. Unknown/status-only observations cannot fabricate
+owner authority. See `STATUS.md` for successor recovery and reporter fencing.
 
 Full-text publication and cleanup share the same source-consumption predicate,
 including chunks implicitly routed through `full_text_index`. Internal control

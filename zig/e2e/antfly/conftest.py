@@ -40,6 +40,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -1141,6 +1142,27 @@ class StatefulAntflyServer:
             self.tempdir.cleanup()
 
 
+def require_standalone_storage_headroom(root: Path) -> None:
+    """Fail before launch when production disk admission cannot run fixtures.
+
+    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    safety floor, plus 256 MiB for the small local fixtures. This is a test
+    environment requirement, not an override of the server's disk guard.
+    """
+    usage = shutil.disk_usage(root)
+    safety_floor = max(1024**3, usage.total // 20)
+    required = safety_floor + 256 * 1024**2
+    if usage.free < required:
+        raise RuntimeError(
+            "Insufficient E2E storage headroom: "
+            f"path={root} available_bytes={usage.free} "
+            f"safety_floor_bytes={safety_floor} required_bytes={required}. "
+            "Repairs, schema rebuilds, and native backups would wait for disk "
+            "admission. Free space or set TMPDIR to a volume with sufficient "
+            "headroom; production disk safeguards have not been disabled."
+        )
+
+
 class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
@@ -1157,6 +1179,7 @@ class StandaloneAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            require_standalone_storage_headroom(self.root)
             self.replica_root = self.root / "replicas"
             self.log_path = self.root / "server.log"
             self.log_file = setup.enter_context(self.log_path.open("w"))

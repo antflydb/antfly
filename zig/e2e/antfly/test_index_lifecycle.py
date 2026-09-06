@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import struct
+import threading
 import time
 from urllib.parse import quote
 
@@ -911,6 +913,90 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
         assert {
             hit["_id"] for hit in after_delete["responses"][0]["hits"]["hits"]
         } == remaining
+
+
+def test_concurrent_insert_delete_publications_match_search_results(stateful_api):
+    """Status must report reductions, not the maximum count ever observed."""
+    table = f"publication_ordering_{time.time_ns()}"
+    dense = "semantic"
+    text = "full_text_index_v0"
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.create_index(
+        table, dense, {"type": "embeddings", "external": True, "dimension": 3}
+    )
+    packed = _pack_f32_le([1.0, 0.0, 0.0])
+
+    def document():
+        return {"body": "publication regression", "_embeddings": {dense: packed}}
+
+    expected = {f"initial:{i}" for i in range(12)}
+    stateful_api.batch_write(
+        table, inserts={key: document() for key in expected}, sync_level="write"
+    )
+    incarnations = {}
+
+    def exact_publication():
+        statuses = {}
+        for name in (dense, text):
+            before = time.monotonic()
+            detail = stateful_api.get_index(table, name)
+            assert time.monotonic() - before < 5.0, detail
+            status = ready_index_status(
+                detail, until="complete", require_query_fresh=True
+            )
+            if status is None:
+                return None
+            if name in incarnations:
+                assert status["incarnation"] == incarnations[name]
+            count = status.get("total_indexed", status.get("doc_count"))
+            if count != len(expected):
+                return None
+            statuses[name] = status
+        return statuses
+
+    initial = wait_until(exact_publication, timeout_s=30, interval_s=0.05)
+    assert initial is not None
+    incarnations = {name: status["incarnation"] for name, status in initial.items()}
+    for iteration in range(3):
+        deleted = sorted(expected)[:3]
+        added = f"added:{iteration}"
+        barrier = threading.Barrier(2)
+
+        def commit(payload):
+            # Independent HTTP connections: the shared fixture intentionally
+            # serializes its Session and would hide concurrent commit delivery.
+            barrier.wait(timeout=10)
+            response = requests.post(
+                f"{stateful_api.url}/tables/{table}/batch",
+                json={**payload, "sync_level": "write"},
+                timeout=30,
+            )
+            assert response.ok, response.text
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writes = [
+                pool.submit(commit, {"deletes": deleted}),
+                pool.submit(commit, {"inserts": {added: document()}}),
+            ]
+            for write in writes:
+                write.result(timeout=35)
+        expected.difference_update(deleted)
+        expected.add(added)
+        assert wait_until(exact_publication, timeout_s=30, interval_s=0.05), {
+            name: stateful_api.get_index(table, name) for name in (dense, text)
+        }
+        for payload in (
+            {"indexes": [dense], "embeddings": {dense: packed}, "limit": 100},
+            {
+                "indexes": [text],
+                "full_text_search": {"field": "body", "match": "publication"},
+                "limit": 100,
+            },
+        ):
+            assert (
+                set(_response_hit_ids(stateful_api.query_table(table, payload)))
+                == expected
+            )
 
 
 def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(

@@ -16,10 +16,45 @@
 
 import pytest
 import requests
+from types import SimpleNamespace
 
 import conftest as e2e_conftest
 import helpers
 import test_standalone as standalone
+
+
+@pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])
+def test_storage_preflight_matches_absolute_and_fractional_safety_floor(
+    monkeypatch, tmp_path, total
+):
+    floor = max(1024**3, total // 20)
+    required = floor + 256 * 1024**2
+    observation = SimpleNamespace(total=total, free=required - 1)
+    paths = []
+
+    def disk_usage(path):
+        paths.append(path)
+        return observation
+
+    monkeypatch.setattr(e2e_conftest.shutil, "disk_usage", disk_usage)
+    with pytest.raises(
+        RuntimeError, match="Insufficient E2E storage headroom"
+    ) as error:
+        e2e_conftest.require_standalone_storage_headroom(tmp_path)
+    assert f"safety_floor_bytes={floor}" in str(error.value)
+    assert "TMPDIR" in str(error.value)
+    observation.free = required
+    e2e_conftest.require_standalone_storage_headroom(tmp_path)
+    assert paths == [tmp_path, tmp_path]
+
+
+def test_storage_preflight_does_not_hide_observation_failure(monkeypatch, tmp_path):
+    def unavailable(_):
+        raise OSError("capacity observation failed")
+
+    monkeypatch.setattr(e2e_conftest.shutil, "disk_usage", unavailable)
+    with pytest.raises(OSError, match="capacity observation failed"):
+        e2e_conftest.require_standalone_storage_headroom(tmp_path)
 
 
 def test_model_preflight_recognizes_atomic_variant_publication(tmp_path):

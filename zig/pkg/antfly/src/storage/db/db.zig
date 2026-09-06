@@ -4009,6 +4009,9 @@ pub const DB = struct {
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
+    status_owner_epoch: u64 = 0,
+    status_publication_mutex: std.atomic.Mutex = .unlocked,
+    status_publication_revision: u64 = 0,
     repair_cleanup_owner_id: u64,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
@@ -4496,6 +4499,7 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
+                .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
@@ -26760,6 +26764,10 @@ pub const DB = struct {
     fn textIndexTermCount(entry: anytype) u64 {
         const snap = entry.acquireSnapshot();
         defer snap.release();
+        return textSnapshotTermCount(snap);
+    }
+
+    fn textSnapshotTermCount(snap: anytype) u64 {
         var terms: u64 = 0;
         for (snap.segments) |*seg| {
             terms +|= seg.layoutStats(false).inverted_term_count;
@@ -27194,6 +27202,14 @@ pub const DB = struct {
     }
 
     fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
+        // This compatibility overlay is not an owner capture. It must never
+        // edit facts while retaining the stamp of a different observation.
+        for (runtime_stats.indexes) |*item| {
+            item.serving_publication = null;
+            item.coverage_publication = null;
+            item.runtime_serving_applied_sequence = null;
+            item.runtime_coverage_applied_sequence = null;
+        }
         // Coverage outcomes and identity totals are one status invariant. A
         // cached status may predate the write whose generated artifact is
         // being overlaid, so refresh the maintained O(1) identity summary at
@@ -27507,6 +27523,13 @@ pub const DB = struct {
     }
 
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
+        // Serialize owner captures, not HTTP reads. A stamp orders the whole
+        // coherent capture; concurrent captures cannot assign a newer revision
+        // to an older payload. Individual index snapshots retain their own
+        // publication locks and replay prefixes are sampled before their facts.
+        lockAtomic(&self.status_publication_mutex);
+        defer self.status_publication_mutex.unlock();
+        self.status_publication_revision += 1;
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         var durable_index_repairs = try self.loadIndexRepairStateForStats(alloc);
@@ -27584,13 +27607,15 @@ pub const DB = struct {
             item.repair_scan_issue_count = index_repair_summary.repair_scan_count;
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
 
+            var serving_observed = false;
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
                         const text_snapshot = entry.acquireSnapshot();
                         defer text_snapshot.release();
                         item.doc_count = text_snapshot.liveDocCount();
-                        item.term_count = textIndexTermCount(entry);
+                        item.term_count = textSnapshotTermCount(text_snapshot);
+                        serving_observed = true;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
@@ -27606,6 +27631,7 @@ pub const DB = struct {
                         item.root_node = hbc_stats.root_node;
                         item.serving_snapshot_revision = published.generation;
                         item.serving_snapshot_owner_id = self.backend_owner_id;
+                        serving_observed = true;
                         item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
@@ -27636,6 +27662,7 @@ pub const DB = struct {
                         else
                             sparse_snapshot.doc_count;
                         item.term_count = sparse_snapshot.term_count;
+                        serving_observed = true;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
@@ -27643,16 +27670,23 @@ pub const DB = struct {
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
                         graph_stats: {
-                            const graph_snapshot = entry.index.stats(alloc) catch break :graph_stats;
+                            const graph_snapshot = entry.index.stats(alloc) catch {
+                                serving_observed = false;
+                                break :graph_stats;
+                            };
                             item.edge_count = graph_snapshot.edge_count;
                             item.node_count = graph_snapshot.node_count;
                             item.doc_count = graph_snapshot.node_count;
+                            serving_observed = true;
                             visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
                     }
                 },
-                .algebraic => try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false),
+                .algebraic => {
+                    try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false);
+                    serving_observed = self.core.index_manager.algebraicIndex(cfg.name) != null;
+                },
             }
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
@@ -27663,6 +27697,7 @@ pub const DB = struct {
                 );
             }
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
+            self.stampIndexObservation(cfg, &item, if (durable_index_repairs) |*state| state else null, serving_observed);
             index_stats[index_count] = item;
             index_count += 1;
         }
@@ -27692,6 +27727,32 @@ pub const DB = struct {
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
         };
+    }
+
+    fn stampIndexObservation(self: *DB, cfg: types.IndexConfig, item: *types.DBIndexStats, repairs: ?*const index_repair_state.State, serving_observed: bool) void {
+        // Read-only and status-only DBs are observers, not successor writers.
+        if (self.open_mode != .writer and self.open_mode != .writer_no_replay) return;
+        if (!item.coverage_identity_ready or item.load_error != null) return;
+        if (!serving_observed and !item.coverage_summary_ready) return;
+        const recovered = self.observeResidentIndexAdmission(self.alloc, item.name, repairs) == .admitted and
+            !item.repair_degraded and !item.index_repair_action_required and
+            (std.mem.eql(u8, item.projection_checkpoint_status, "clean") or item.index_repair_active_generation_serviceable) and
+            item.projection_checkpoint_config_hash == types.indexConfigHash(cfg) and
+            item.projection_checkpoint_applied_sequence <= item.replay_applied_sequence;
+        const stamp = @import("publication.zig").Stamp{
+            .owner_epoch = self.status_owner_epoch,
+            .revision = self.status_publication_revision,
+            .applied_through = item.replay_applied_sequence,
+            .recovered_through = if (recovered) item.projection_checkpoint_applied_sequence else null,
+        };
+        if (serving_observed) {
+            item.serving_publication = stamp;
+            item.runtime_serving_applied_sequence = stamp.applied_through;
+        }
+        if (item.coverage_summary_ready) {
+            item.coverage_publication = stamp;
+            item.runtime_coverage_applied_sequence = stamp.applied_through;
+        }
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
@@ -63629,15 +63690,25 @@ test "db vector status revalidates stale repair admission without a query" {
             observed_dense = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
             try std.testing.expectEqual(db.backend_owner_id, index_stats.serving_snapshot_owner_id);
+            try std.testing.expectEqual(db.status_owner_epoch, index_stats.serving_publication.?.owner_epoch);
         } else if (std.mem.eql(u8, index_stats.name, "sparse_status")) {
             observed_sparse = true;
             try std.testing.expect(index_stats.serving_snapshot_ready);
+            try std.testing.expectEqual(db.status_owner_epoch, index_stats.serving_publication.?.owner_epoch);
         }
     }
     try std.testing.expect(observed_dense);
     try std.testing.expect(observed_sparse);
     try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_status"));
     try std.testing.expect(!db.core.index_manager.repairUnavailable("sparse_status"));
+    var refreshed = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, refreshed);
+    try std.testing.expect(refreshed.indexes[0].serving_publication.?.revision > stats.indexes[0].serving_publication.?.revision);
+    try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &refreshed));
+    for (refreshed.indexes) |item| {
+        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.serving_publication);
+        try std.testing.expectEqual(@as(?@import("publication.zig").Stamp, null), item.coverage_publication);
+    }
 }
 
 test "db resolver catalog persists across reopen" {
