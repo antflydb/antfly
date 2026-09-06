@@ -80,6 +80,7 @@ pub const Context = struct {
     models_dir: []const u8,
     session_manager: *backends_mod.SessionManager,
     model_manager: *model_manager_mod.ModelManager,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
     reader_discovery_override: if (builtin.is_test) ?ReaderDiscoveryOverride else void = if (builtin.is_test) null else {},
     reader_text_override: if (builtin.is_test) ?ReaderTextOverride else void = if (builtin.is_test) null else {},
@@ -443,13 +444,17 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        var model_handle = if (ctx.execution_control) |control|
+            try ctx.model_manager.acquireFromDirWithControl(self.model_path, control)
+        else
+            try ctx.model_manager.acquireFromDir(self.model_path);
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
         var gliner = model.glinerPipeline(ctx.allocator);
+        gliner.execution_control = ctx.execution_control;
         var extraction_config = config;
         extraction_config.cleanup_model = try model.getCleanupHead();
         return extraction_mod.extractBatch(ctx.allocator, &gliner, texts, schemas, extraction_config);
@@ -487,11 +492,12 @@ const ReaderExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        var reader = try readers_mod.LoadedReader.loadFromDir(
+        var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
+            ctx.execution_control,
         );
         defer reader.deinit();
 
@@ -500,7 +506,9 @@ const ReaderExtractor = struct {
             if (input_tokens > limit) return error.InferenceInputTokensExceeded;
         }
 
-        const results = try reader.readBatch(image_datas, read_options);
+        var controlled_options = read_options;
+        controlled_options.execution_control = ctx.execution_control;
+        const results = try reader.readBatch(image_datas, controlled_options);
         defer {
             for (results) |*result| result.deinit();
             ctx.allocator.free(results);
@@ -587,11 +595,12 @@ fn readTextsWithReader(
     image_datas: []const []const u8,
     read_options: readers_mod.ReadOptions,
 ) ![][]const u8 {
-    var reader = readers_mod.LoadedReader.loadFromDir(
+    var reader = readers_mod.LoadedReader.loadFromDirWithControl(
         ctx.allocator,
         model_path,
         ctx.session_manager,
         ctx.model_manager,
+        ctx.execution_control,
     ) catch |err| return err;
     defer reader.deinit();
 
@@ -602,8 +611,10 @@ fn readTextsWithReader(
         ctx.allocator.free(texts);
     }
 
+    var controlled_options = read_options;
+    controlled_options.execution_control = ctx.execution_control;
     for (image_datas, 0..) |image_data, i| {
-        var result = try reader.read(image_data, read_options);
+        var result = try reader.read(image_data, controlled_options);
         defer result.deinit();
         texts[i] = try ctx.allocator.dupe(u8, result.text);
         initialized += 1;

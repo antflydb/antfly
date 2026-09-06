@@ -17,6 +17,7 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const RequestContext = @import("../inference/execution_context.zig").RequestContext;
 const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
@@ -57,6 +58,7 @@ pub const BackendFactory = struct {
     max_response_bytes: ?usize = null,
     source_table: []const u8 = "",
     execution: execution_context.Context = .{},
+    request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
@@ -78,6 +80,7 @@ pub const BackendFactory = struct {
         max_response_bytes: ?usize = null,
         source_table: []const u8 = "",
         execution: execution_context.Context = .{},
+        request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
     };
 
@@ -98,6 +101,7 @@ pub const BackendFactory = struct {
             .max_response_bytes = options.max_response_bytes,
             .source_table = options.source_table,
             .execution = execution,
+            .request_context = options.request_context,
             .limits = options.limits,
         };
     }
@@ -111,7 +115,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.limits);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
     }
 };
 
@@ -126,6 +130,7 @@ const BackendState = struct {
     secret_store: ?*common_secrets.FileStore = null,
     max_response_bytes: ?usize = null,
     execution: execution_context.Context = .{},
+    request_context: ?RequestContext = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -143,6 +148,7 @@ const BackendState = struct {
         inference_api_key: ?[]const u8,
         max_response_bytes: ?usize,
         execution: execution_context.Context,
+        request_context: ?RequestContext,
         limits: *provider_limits.Registry,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
@@ -163,6 +169,7 @@ const BackendState = struct {
         state.secret_store = secret_store;
         state.max_response_bytes = max_response_bytes;
         state.execution = execution;
+        state.request_context = request_context;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
@@ -186,6 +193,13 @@ const BackendState = struct {
                     .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
+                    .request_control = if (request_context) |context| .{
+                        .deadline_ns = context.deadline_ns,
+                        .cancellation = if (context.cancellation) |token|
+                            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+                        else
+                            null,
+                    } else .{},
                 }) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
@@ -260,6 +274,27 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        if (self.request_context) |context| {
+            try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
+            const timeout_ms = try context.remainingTimeoutMs();
+            const cancellation = if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null;
+            switch (self.provider) {
+                .openai => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .remote_antfly => |*provider| {
+                    provider.setRequestTimeoutMs(timeout_ms);
+                    provider.setRequestCancellation(context.cancellation);
+                },
+                .vertex => |*provider| provider.setAbsoluteRequestControl(.{
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = cancellation,
+                }),
+                .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .embedded_antfly => {},
+            }
+        }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         try validateGenerationMessagesTokenBudget(self.cfg, messages);
         if (self.provider == .embedded_antfly and policy.enabled()) return error.UnsupportedLocalRateLimit;
@@ -327,7 +362,7 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
-                const request_context = self.execution.requestContext(
+                const linked_context = self.request_context orelse self.execution.requestContext(
                     self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
                 );
                 if (local.generate_messages_with_context) |generate_messages| {
@@ -335,7 +370,7 @@ const BackendState = struct {
                         "generate_messages_with_context",
                         local.boundary_dispatch,
                         generate_messages,
-                        .{ local.ptr, alloc, model, messages, request_context },
+                        .{ local.ptr, alloc, model, messages, linked_context },
                     );
                     break :blk inference.GenerateResult{
                         .content = content,
@@ -367,7 +402,7 @@ const BackendState = struct {
                         "generate_text_with_context",
                         local.boundary_dispatch,
                         generate_text,
-                        .{ local.ptr, alloc, model, roles, contents, request_context },
+                        .{ local.ptr, alloc, model, roles, contents, linked_context },
                     )
                 else if (local.generate_text) |generate_text|
                     try managed_embedder.AntflyProviderBoundary.call(
@@ -385,6 +420,7 @@ const BackendState = struct {
             },
         };
         defer result.deinit();
+        if (self.request_context) |context| try context.check();
 
         return .{
             .content = try alloc.dupe(u8, result.content),
@@ -812,6 +848,7 @@ pub fn generateAntflyTextBatchResponse(
     options: BackendFactory.Options,
     texts: []const []const u8,
 ) !httpx.Response {
+    if (options.request_context) |context| try context.check();
     try cfg.validate();
     if (cfg.provider != .antfly or cfg.url.len == 0 or texts.len == 0)
         return error.InvalidGeneratorConfig;
@@ -832,7 +869,14 @@ pub fn generateAntflyTextBatchResponse(
     return http.post(url, .{
         .json = body,
         .headers = if (authorization != null) &headers else null,
-        .timeout_ms = 300_000,
+        .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,
+        .cancellation = if (options.request_context) |context|
+            if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null
+        else
+            null,
         .attempt_observer = state.quota.?.limiter().observer(output_tokens),
     });
 }
@@ -890,6 +934,28 @@ pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []c
             },
         };
     }
+}
+
+test "generating backend batch preserves cancellation alongside quota policy" {
+    const alloc = std.testing.allocator;
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "budget", .url = "http://127.0.0.1:1" });
+    cfg.rate_limit = .{ .requests_per_minute = 1 };
+    var context = RequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
+        .limits = &limits,
+        .request_context = context,
+    }, &.{"hello"}));
+    var cancelled = std.atomic.Value(bool).init(true);
+    context.deadline_ns = null;
+    context.cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
+        .limits = &limits,
+        .request_context = context,
+    }, &.{"hello"}));
 }
 
 test "generating backend batch reserves all output caps before dispatch" {

@@ -27,6 +27,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
 const session_mod = @import("../backends/session.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const ClassificationConfig = struct {
     max_length: usize = 512,
@@ -97,6 +98,7 @@ pub const ClassificationPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: ClassificationConfig,
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn usesDistributedGpuHosted(self: *const ClassificationPipeline) bool {
         return self.config.distributed.enabled and
@@ -140,6 +142,7 @@ pub const ClassificationPipeline = struct {
         texts: []const []const u8,
         labels: []const []const u8,
     ) ![][]ClassificationResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, @intCast(texts.len));
         var prepared = try self.prepareInputs(texts, labels);
         defer prepared.deinit();
         return self.classifyPrepared(&prepared);
@@ -423,7 +426,7 @@ pub const ClassificationPipeline = struct {
             break :blk &[_]Tensor{ input_ids_tensor, attention_mask_tensor, token_type_tensor.? };
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
-        var outputs = try run_permit.run(inputs, alloc);
+        var outputs = try run_permit.runWithControl(inputs, alloc, self.execution_control);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

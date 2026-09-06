@@ -296,9 +296,18 @@ fn forwardCTImpl(
     phase_started_at = traceMetalEncoderPhase("embeddings", phase_started_at);
     errdefer cb.free(hidden);
     for (0..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
         const next = try encoderLayer(cb, config, hidden, attention_mask, batch, seq_len, layer, resident_slots);
         cb.free(hidden);
         hidden = next;
+        if (cb.execution_control != null and frame_active and
+            (layer + 1) % 2 == 0 and layer + 1 < config.num_hidden_layers)
+        {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
+            try cb.checkExecutionControl();
+            frame_active = try cb.decoderRuntimeBeginFrame();
+        }
     }
     phase_started_at = traceMetalEncoderPhase("layers", phase_started_at);
 
@@ -320,6 +329,7 @@ fn forwardCTImpl(
         try cb.decoderRuntimeSubmitAndWaitFrame();
         frame_active = false;
     }
+    try cb.checkExecutionControl();
     _ = traceMetalEncoderPhase("submit_wait", phase_started_at);
     return hidden;
 }

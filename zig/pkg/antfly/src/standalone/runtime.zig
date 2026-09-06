@@ -2059,6 +2059,11 @@ pub fn runFromIterator(
 
     const configured_inference: antfly.common.config.Config.InferenceConfig =
         if (loaded_cfg) |cfg| cfg.inference else .{};
+    // An explicit inference endpoint is a process-isolation contract, not a
+    // fallback hint. In this mode standalone must not retain hidden in-process
+    // routes or provider callbacks that can route a wedged native/GPU kernel
+    // back into the database process.
+    const embedded_inference_enabled = configured_inference.api_url == null;
     const effective_kernel_jit_mode = try resolveKernelJitMode(
         configured_inference.kernel_jit.mode,
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
@@ -2098,8 +2103,8 @@ pub fn runFromIterator(
         .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
             process_memory_resolution.effective_source,
         ),
-        .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
-        .preload_len = active_preload.len,
+        .preload_ptr = if (!embedded_inference_enabled or active_preload.len == 0) null else active_preload.ptr,
+        .preload_len = if (embedded_inference_enabled) active_preload.len else 0,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
         .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
@@ -2378,17 +2383,17 @@ pub fn runFromIterator(
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
-            .inference_request_admission_source = .{
+            .inference_request_admission_source = if (embedded_inference_enabled) .{
                 .ptr = antfly_node,
                 .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
                 .release_fn = releaseEmbeddedInferenceRequest,
                 .stats_fn = embeddedInferenceRequestStats,
-            },
-            .local_inference_connection_target = .{
+            } else null,
+            .local_inference_connection_target = if (embedded_inference_enabled) .{
                 .capabilities = inference_connection_abi.Capability.streaming_response,
                 .context = &local_inference_connection_context,
                 .invoke = invokeLocalInferenceConnection,
-            },
+            } else null,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2531,7 +2536,10 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
-    data_server.setAntflyProvider(inferenceBoundaryProvider(&embedded_provider_lifetime));
+    data_server.setAntflyProvider(if (embedded_inference_enabled)
+        inferenceBoundaryProvider(&embedded_provider_lifetime)
+    else
+        null);
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
@@ -2621,6 +2629,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2635,6 +2644,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2773,13 +2783,14 @@ fn serveUnifiedWithInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2796,13 +2807,14 @@ fn serveUnifiedWithLinkedInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2820,6 +2832,7 @@ fn serveUnifiedInner(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
@@ -2847,17 +2860,19 @@ fn serveUnifiedInner(
         for (linked_inference_routes.items) |route| alloc.destroy(route);
         linked_inference_routes.deinit(alloc);
     }
-    if (comptime inline_inference) {
-        try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
-    } else {
-        const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
-        try registerLinkedInferenceManifest(
-            alloc,
-            &server,
-            antfly_node,
-            functions,
-            &linked_inference_routes,
-        );
+    if (register_inference_routes) {
+        if (comptime inline_inference) {
+            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+        } else {
+            const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+            try registerLinkedInferenceManifest(
+                alloc,
+                &server,
+                antfly_node,
+                functions,
+                &linked_inference_routes,
+            );
+        }
     }
 
     // Runtime roles consume the shared direct/linked kernel registrar instead
@@ -4970,6 +4985,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
         .embed_dense_texts = inferenceProviderEmbedDenseTexts,
         .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
         .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
+        .embed_sparse_texts_with_context = inferenceProviderEmbedSparseTextsWithContext,
         .embed_dense_parts = inferenceProviderEmbedDenseParts,
         .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
         .embed_dense_rasters = inferenceProviderEmbedDenseRasters,
@@ -5009,9 +5025,9 @@ fn invokeInferenceProvider(
     provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
-    deadline_ns: ?u64,
+    request_context: ?antfly.inference.RequestContext,
 ) !Result {
-    return try invokeInferenceProviderWithBinary(Result, alloc, provider_context, operation, request, deadline_ns, &.{}, &.{});
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, request_context, &.{}, &.{});
 }
 
 fn invokeInferenceProviderControlled(
@@ -5023,7 +5039,7 @@ fn invokeInferenceProviderControlled(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) !Result {
-    return try invokeInferenceProviderWithBinaryControlled(Result, alloc, provider_context, operation, request, deadline_ns, &.{}, &.{}, cancellation);
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, requestContextFromControls(deadline_ns, cancellation), &.{}, &.{});
 }
 
 fn invokeInferenceProviderWithBinary(
@@ -5036,7 +5052,7 @@ fn invokeInferenceProviderWithBinary(
     binary_payloads: []const inference_bridge.ProviderBinaryPayload,
     attachment_refs: []const inference_bridge.ProviderAttachmentRef,
 ) !Result {
-    return try invokeInferenceProviderWithBinaryControlled(Result, alloc, provider_context, operation, request, deadline_ns, binary_payloads, attachment_refs, .none);
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, requestContextFromControls(deadline_ns, .none), binary_payloads, attachment_refs);
 }
 
 fn invokeInferenceProviderWithBinaryControlled(
@@ -5050,6 +5066,29 @@ fn invokeInferenceProviderWithBinaryControlled(
     attachment_refs: []const inference_bridge.ProviderAttachmentRef,
     cancellation: CancellationToken,
 ) !Result {
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, requestContextFromControls(deadline_ns, cancellation), binary_payloads, attachment_refs);
+}
+
+fn requestContextFromControls(deadline_ns: ?u64, cancellation: CancellationToken) ?antfly.inference.RequestContext {
+    if (deadline_ns == null and cancellation.ptr == null) return null;
+    return .{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .deadline_ns = deadline_ns,
+        .cancellation = if (cancellation.ptr != null) cancellation else null,
+    };
+}
+
+fn invokeInferenceProviderWithBinaryContext(
+    comptime Result: type,
+    alloc: std.mem.Allocator,
+    provider_context: *anyopaque,
+    operation: inference_bridge.ProviderOperation,
+    request: anytype,
+    request_context: ?antfly.inference.RequestContext,
+    binary_payloads: []const inference_bridge.ProviderBinaryPayload,
+    attachment_refs: []const inference_bridge.ProviderAttachmentRef,
+) !Result {
+    if (request_context) |context| try context.check();
     const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
     var call_guard = try lifetime.acquire();
     defer call_guard.deinit();
@@ -5058,8 +5097,33 @@ fn invokeInferenceProviderWithBinaryControlled(
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
-    const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
-    const cancellation_adapter = ProviderInvocationCancellation{ .token = cancellation };
+    const effective_deadline_ns = if (request_context) |active|
+        active.deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min
+    else
+        platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
+    const RequestCancellation = struct {
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return 1));
+            const active = context.* orelse return 0;
+            return @intFromBool(if (active.cancellation) |token| token.isCancelled() else false);
+        }
+    };
+    const RequestProgress = struct {
+        fn update(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: inference_bridge.String, backend: inference_bridge.String) callconv(.c) void {
+            const context: *const ?antfly.inference.RequestContext = @ptrCast(@alignCast(raw orelse return));
+            const active = context.* orelse return;
+            const progress = active.progress orelse return;
+            const typed_phase = std.enums.fromInt(antfly.inference.request_context.Phase, phase) orelse return;
+            progress.update(.{
+                .phase = typed_phase,
+                .completed = completed,
+                .total = total,
+                .model = model.slice(),
+                .backend = backend.slice(),
+                .deadline_ns = active.deadline_ns,
+            });
+        }
+    };
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
@@ -5073,7 +5137,14 @@ fn invokeInferenceProviderWithBinaryControlled(
         .binary_payloads_len = binary_payloads.len,
         .attachment_refs = if (attachment_refs.len > 0) attachment_refs.ptr else null,
         .attachment_refs_len = attachment_refs.len,
-        .cancellation = cancellation_adapter.view(),
+        .cancellation = if (request_context != null and request_context.?.cancellation != null)
+            .{ .context = &request_context, .is_cancelled = RequestCancellation.requested }
+        else
+            .{},
+        .progress = if (request_context != null and request_context.?.progress != null)
+            .{ .context = @constCast(&request_context), .update_progress = RequestProgress.update }
+        else
+            .{},
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceInvokeProvider(&context);
@@ -5088,6 +5159,7 @@ fn invokeInferenceProviderWithBinaryControlled(
         inference_host.linkedInferenceDestroyProviderResponse(owned_response)
     else
         linkedInferenceApiInfallible().destroy_provider_response(owned_response);
+    if (request_context) |active| try active.check();
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -5371,6 +5443,20 @@ fn inferenceProviderEmbedSparseTexts(
     }, null);
 }
 
+fn inferenceProviderEmbedSparseTextsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![]antfly.db.embedder.SparseEmbedding {
+    try context.check();
+    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
+        .model = model,
+        .texts = texts,
+    }, context.request);
+}
+
 fn inferenceProviderEmbedDenseParts(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
@@ -5513,17 +5599,13 @@ fn inferenceProviderGenerateTextWithContext(
     model: []const u8,
     roles: []const []const u8,
     contents: []const []const u8,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]u8 {
-    try context.check();
-    const result = try invokeInferenceProviderControlled([]u8, alloc, handle, .generate_text, .{
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, .{
         .model = model,
         .roles = roles,
         .contents = contents,
-    }, context.deadline_ns, context.cancellation);
-    errdefer alloc.free(result);
-    try context.check();
-    return result;
+    }, context);
 }
 
 fn inferenceProviderGenerateMessages(
@@ -5543,16 +5625,12 @@ fn inferenceProviderGenerateMessagesWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]u8 {
-    try context.check();
-    const result = try invokeInferenceProviderControlled([]u8, alloc, handle, .generate_messages, .{
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, .{
         .model = model,
         .messages = messages,
-    }, context.deadline_ns, context.cancellation);
-    errdefer alloc.free(result);
-    try context.check();
-    return result;
+    }, context);
 }
 
 fn inferenceProviderGenerateMessagesWithAttachments(
@@ -5569,7 +5647,6 @@ fn inferenceProviderGenerateMessagesWithAttachments(
         messages,
         attachments,
         null,
-        .none,
     );
 }
 
@@ -5579,7 +5656,7 @@ fn inferenceProviderGenerateMessagesWithAttachmentsWithContext(
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
     attachments: []const antfly.inference.work.Attachment,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]u8 {
     try context.check();
     const result = try inferenceProviderGenerateMessagesWithAttachmentsControlled(
@@ -5588,8 +5665,7 @@ fn inferenceProviderGenerateMessagesWithAttachmentsWithContext(
         model,
         messages,
         attachments,
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     errdefer alloc.free(result);
     try context.check();
@@ -5602,8 +5678,7 @@ fn inferenceProviderGenerateMessagesWithAttachmentsControlled(
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
     attachments: []const antfly.inference.work.Attachment,
-    deadline_ns: ?u64,
-    cancellation: CancellationToken,
+    request_context: ?antfly.inference.RequestContext,
 ) anyerror![]u8 {
     const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, attachments.len);
     defer alloc.free(payloads);
@@ -5624,16 +5699,15 @@ fn inferenceProviderGenerateMessagesWithAttachmentsControlled(
             .has_page_number = @intFromBool(attachment.identity.page_number != null),
         };
     }
-    return try invokeInferenceProviderWithBinaryControlled(
+    return try invokeInferenceProviderWithBinaryContext(
         []u8,
         alloc,
         handle,
         .generate_messages_with_attachments,
         .{ .model = model, .messages = messages, .attachment_count = attachments.len },
-        deadline_ns,
+        request_context,
         payloads,
         refs,
-        cancellation,
     );
 }
 
@@ -5658,17 +5732,16 @@ fn inferenceProviderModelCapabilitiesWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     task: antfly.inference.work.Task,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror!antfly.inference.work.InferenceCapabilities {
     try context.check();
-    const result = try invokeInferenceProviderControlled(
+    const result = try invokeInferenceProvider(
         antfly.inference.work.InferenceCapabilities,
         alloc,
         handle,
         .model_capabilities,
         .{ .model = model, .task = task },
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     try context.check();
     return result;
@@ -5693,7 +5766,7 @@ fn inferenceProviderChunkInputWithContext(
     context: antfly.inference.execution_context.RequestContext,
 ) anyerror![]inference_chunker.Chunk {
     try context.check();
-    const result = try inferenceProviderChunkInputControlled(handle, alloc, model, input, config, context.deadline_ns, context.cancellation);
+    const result = try inferenceProviderChunkInputControlled(handle, alloc, model, input, config, context.deadline_ns, context.cancellation orelse .none);
     errdefer inference_chunker.types.freeChunks(alloc, result);
     try context.check();
     return result;
@@ -5786,19 +5859,12 @@ fn inferenceProviderReadImagesWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.Request,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]antfly.readers.Result {
-    try context.check();
-    const results = try invokeInferenceProviderControlled([]antfly.readers.Result, alloc, handle, .read_images, .{
+    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
         .model = model,
         .request = request,
-    }, context.deadline_ns, context.cancellation);
-    errdefer {
-        for (results) |*result| antfly.readers.deinitResult(alloc, result);
-        alloc.free(results);
-    }
-    try context.check();
-    return results;
+    }, context);
 }
 
 fn inferenceProviderReadEncodedImages(
@@ -5807,7 +5873,7 @@ fn inferenceProviderReadEncodedImages(
     model: []const u8,
     request: antfly.readers.EncodedRequest,
 ) anyerror![]antfly.readers.Result {
-    return try inferenceProviderReadEncodedImagesControlled(handle, alloc, model, request, null, .none);
+    return try inferenceProviderReadEncodedImagesControlled(handle, alloc, model, request, null);
 }
 
 fn inferenceProviderReadEncodedImagesWithContext(
@@ -5815,7 +5881,7 @@ fn inferenceProviderReadEncodedImagesWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.EncodedRequest,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror![]antfly.readers.Result {
     try context.check();
     const results = try inferenceProviderReadEncodedImagesControlled(
@@ -5823,8 +5889,7 @@ fn inferenceProviderReadEncodedImagesWithContext(
         alloc,
         model,
         request,
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     errdefer {
         for (results) |*result| antfly.readers.deinitResult(alloc, result);
@@ -5839,22 +5904,20 @@ fn inferenceProviderReadEncodedImagesControlled(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.EncodedRequest,
-    deadline_ns: ?u64,
-    cancellation: CancellationToken,
+    request_context: ?antfly.inference.RequestContext,
 ) anyerror![]antfly.readers.Result {
     if (request.images.len == 0) return error.ReadBatchTooLarge;
     var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
     defer encoded.deinit(alloc);
-    return try invokeInferenceProviderWithBinaryControlled(
+    return try invokeInferenceProviderWithBinaryContext(
         []antfly.readers.Result,
         alloc,
         handle,
         .read_encoded_images,
         encodedImageProviderMetadata(model, request),
-        deadline_ns,
+        request_context,
         encoded.payloads,
         encoded.refs,
-        cancellation,
     );
 }
 
@@ -5864,7 +5927,7 @@ fn inferenceProviderReadEncodedImagesReported(
     model: []const u8,
     request: antfly.readers.EncodedRequest,
 ) anyerror!antfly.readers.BatchResult {
-    return try inferenceProviderReadEncodedImagesReportedControlled(handle, alloc, model, request, null, .none);
+    return try inferenceProviderReadEncodedImagesReportedControlled(handle, alloc, model, request, null);
 }
 
 fn inferenceProviderReadEncodedImagesReportedWithContext(
@@ -5872,7 +5935,7 @@ fn inferenceProviderReadEncodedImagesReportedWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.EncodedRequest,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror!antfly.readers.BatchResult {
     try context.check();
     var result = try inferenceProviderReadEncodedImagesReportedControlled(
@@ -5880,8 +5943,7 @@ fn inferenceProviderReadEncodedImagesReportedWithContext(
         alloc,
         model,
         request,
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     errdefer result.deinit(alloc);
     try context.check();
@@ -5893,22 +5955,20 @@ fn inferenceProviderReadEncodedImagesReportedControlled(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.EncodedRequest,
-    deadline_ns: ?u64,
-    cancellation: CancellationToken,
+    request_context: ?antfly.inference.RequestContext,
 ) anyerror!antfly.readers.BatchResult {
     if (request.images.len == 0) return error.ReadBatchTooLarge;
     var encoded = try encodedImageProviderPayloadsAlloc(alloc, request.images);
     defer encoded.deinit(alloc);
-    return try invokeInferenceProviderWithBinaryControlled(
+    return try invokeInferenceProviderWithBinaryContext(
         antfly.readers.BatchResult,
         alloc,
         handle,
         .read_encoded_images_reported,
         encodedImageProviderMetadata(model, request),
-        deadline_ns,
+        request_context,
         encoded.payloads,
         encoded.refs,
-        cancellation,
     );
 }
 
@@ -5972,7 +6032,6 @@ fn inferenceProviderReadRasterImagesReported(
         model,
         request,
         null,
-        .none,
     );
 }
 
@@ -5981,7 +6040,7 @@ fn inferenceProviderReadRasterImagesReportedWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.RasterRequest,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror!antfly.readers.BatchResult {
     try context.check();
     var result = try inferenceProviderReadRasterImagesReportedControlled(
@@ -5989,8 +6048,7 @@ fn inferenceProviderReadRasterImagesReportedWithContext(
         alloc,
         model,
         request,
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     errdefer result.deinit(alloc);
     try context.check();
@@ -6002,13 +6060,12 @@ fn inferenceProviderReadRasterImagesReportedControlled(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.readers.RasterRequest,
-    deadline_ns: ?u64,
-    cancellation: CancellationToken,
+    request_context: ?antfly.inference.RequestContext,
 ) !antfly.readers.BatchResult {
     try antfly.readers.validateRasterRequest(request);
     var borrowed = try rasterProviderPayloadsAlloc(alloc, request.images);
     defer borrowed.deinit(alloc);
-    return invokeInferenceProviderWithBinaryControlled(
+    return invokeInferenceProviderWithBinaryContext(
         antfly.readers.BatchResult,
         alloc,
         handle,
@@ -6021,10 +6078,9 @@ fn inferenceProviderReadRasterImagesReportedControlled(
             .max_tokens = request.max_tokens,
             .source_fingerprint = request.source_fingerprint,
         },
-        deadline_ns,
+        request_context,
         borrowed.payloads,
         borrowed.refs,
-        cancellation,
     );
 }
 
@@ -6125,16 +6181,12 @@ fn inferenceProviderTranscribeAudioWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.transcribing.Request,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror!antfly.transcribing.Response {
-    try context.check();
-    var result = try invokeInferenceProviderControlled(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
+    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
         .model = model,
         .request = request,
-    }, context.deadline_ns, context.cancellation);
-    errdefer antfly.transcribing.deinitResponse(alloc, &result);
-    try context.check();
-    return result;
+    }, context);
 }
 
 fn inferenceProviderExtract(
@@ -6143,7 +6195,7 @@ fn inferenceProviderExtract(
     model: []const u8,
     request: antfly.extracting.Request,
 ) anyerror!antfly.extracting.Response {
-    return try inferenceProviderExtractControlled(handle, alloc, model, request, null, .none);
+    return try inferenceProviderExtractControlled(handle, alloc, model, request, null);
 }
 
 fn inferenceProviderExtractWithContext(
@@ -6151,7 +6203,7 @@ fn inferenceProviderExtractWithContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.extracting.Request,
-    context: antfly.inference.execution_context.RequestContext,
+    context: antfly.inference.RequestContext,
 ) anyerror!antfly.extracting.Response {
     try context.check();
     var result = try inferenceProviderExtractControlled(
@@ -6159,8 +6211,7 @@ fn inferenceProviderExtractWithContext(
         alloc,
         model,
         request,
-        context.deadline_ns,
-        context.cancellation,
+        context,
     );
     errdefer result.deinit();
     try context.check();
@@ -6172,8 +6223,7 @@ fn inferenceProviderExtractControlled(
     alloc: std.mem.Allocator,
     model: []const u8,
     request: antfly.extracting.Request,
-    deadline_ns: ?u64,
-    cancellation: CancellationToken,
+    request_context: ?antfly.inference.RequestContext,
 ) anyerror!antfly.extracting.Response {
     const payloads = try alloc.alloc(inference_bridge.ProviderBinaryPayload, request.attachments.len);
     defer alloc.free(payloads);
@@ -6193,11 +6243,11 @@ fn inferenceProviderExtractControlled(
         .schema_json = request.schema_json,
         .options_json = request.options_json,
     };
-    const json = try invokeInferenceProviderWithBinaryControlled([]u8, alloc, handle, .extract, .{
+    const json = try invokeInferenceProviderWithBinaryContext([]u8, alloc, handle, .extract, .{
         .model = model,
         .request = wire_request,
         .attachment_count = request.attachments.len,
-    }, deadline_ns, payloads, refs, cancellation);
+    }, request_context, payloads, refs);
     return .{ .allocator = alloc, .json = json };
 }
 

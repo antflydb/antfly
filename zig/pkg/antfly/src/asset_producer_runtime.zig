@@ -28,6 +28,7 @@ const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 const inference_work = @import("inference/work.zig");
 const remote_capabilities = @import("inference/remote_capabilities.zig");
 const execution_context = @import("inference/execution_context.zig");
+const RequestContext = execution_context.RequestContext;
 
 const provider_limits = @import("common/provider_limits.zig");
 const Allocator = std.mem.Allocator;
@@ -201,11 +202,14 @@ pub const Runtime = struct {
     http: *httpx.Client,
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
+    request_progress: ?execution_context.ProgressSink = null,
     owned_http: ?*httpx.Client = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
+    owns_inference_api_url: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
     provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
@@ -214,12 +218,16 @@ pub const Runtime = struct {
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
+        /// Process-isolated Antfly inference endpoint. When no local provider
+        /// is installed, Antfly asset configs without their own URL inherit
+        /// this endpoint instead of falling back to an unrelated localhost
+        /// default.
+        inference_api_url: ?[]const u8 = null,
         secret_store: ?*common_secrets.FileStore = null,
         max_provider_response_bytes: usize = default_asset_provider_response_bytes,
         provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
         result_limits: ResultLimits = .{},
         remote_capability_cache: ?*remote_capabilities.Cache = null,
-        inference_api_url: ?[]const u8 = null,
         source_table: []const u8 = "",
     };
 
@@ -241,6 +249,7 @@ pub const Runtime = struct {
             },
             .limits = options.limits,
             .antfly_provider = options.antfly_provider,
+            .inference_api_url = options.inference_api_url,
             .secret_store = options.secret_store,
             .max_provider_response_bytes = options.max_provider_response_bytes,
             .provider_response_envelope_bytes = options.provider_response_envelope_bytes,
@@ -279,7 +288,7 @@ pub const Runtime = struct {
         errdefer client.deinit();
 
         const owned_default_endpoint = if (options.inference_api_url) |endpoint|
-            try alloc.dupe(u8, endpoint)
+            try normalizeAntflyInferenceBaseUrl(alloc, endpoint)
         else
             null;
         errdefer if (owned_default_endpoint) |endpoint| alloc.free(endpoint);
@@ -295,6 +304,7 @@ pub const Runtime = struct {
         runtime.owned_source_table = owned_source_table;
         runtime.execution.default_endpoint = owned_default_endpoint;
         runtime.execution.routing.source_table = owned_source_table orelse "";
+        runtime.inference_api_url = owned_default_endpoint;
         return runtime;
     }
 
@@ -302,6 +312,11 @@ pub const Runtime = struct {
         self.capability_cache.deinit();
         if (self.owned_default_endpoint) |endpoint| self.alloc.free(endpoint);
         if (self.owned_source_table) |source_table| self.alloc.free(source_table);
+        if (self.owns_inference_api_url) {
+            if (self.inference_api_url) |owned| self.alloc.free(owned);
+            self.inference_api_url = null;
+            self.owns_inference_api_url = false;
+        }
         if (self.owned_http) |client| {
             client.deinit();
             self.alloc.destroy(client);
@@ -314,10 +329,16 @@ pub const Runtime = struct {
         return self.execution.capability_cache orelse &self.capability_cache;
     }
 
-    fn requestContext(self: *const Runtime) execution_context.RequestContext {
-        return self.execution.requestContext(
-            self.execution.io orelse self.http.io,
-        );
+    fn requestContext(self: *const Runtime) RequestContext {
+        return .{
+            .io = self.execution.io orelse self.http.io,
+            .deadline_ns = self.execution.deadline_ns,
+            .cancellation = if (self.execution.cancellation.ptr != null)
+                self.execution.cancellation
+            else
+                null,
+            .progress = self.request_progress,
+        };
     }
 
     fn linkedModelCapabilities(
@@ -767,6 +788,7 @@ pub const Runtime = struct {
             if (self.execution.max_response_bytes) |configured| @min(requested, configured) else requested
         else
             self.execution.max_response_bytes;
+        scoped.request_progress = context.progress orelse self.request_progress;
         return scoped;
     }
 
@@ -1450,6 +1472,7 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
+            try self.execution.check(platform.time.monotonicNs());
             out[i] = try self.produceOne(alloc, request);
         }
         return out;
@@ -2271,6 +2294,7 @@ pub const Runtime = struct {
             .max_response_bytes = self.responseLimitForTask(.generator, 1),
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
+            .request_context = self.requestContext(),
             .limits = self.limits,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
@@ -2901,6 +2925,38 @@ pub const Runtime = struct {
             return try extracting.firstResultJsonAlloc(alloc, response.json);
         }
         return try alloc.dupe(u8, response.json);
+    }
+
+    fn effectiveGeneratorConfig(self: *const Runtime, cfg: generating_runtime.GeneratorConfig) generating_runtime.GeneratorConfig {
+        var effective = cfg;
+        if (effective.provider == .antfly and effective.url.len == 0 and self.antfly_provider == null) {
+            if (self.inference_api_url) |url| effective.url = url;
+        }
+        return effective;
+    }
+
+    fn effectiveReaderConfig(self: *const Runtime, cfg: readers.Config) readers.Config {
+        var effective = cfg;
+        if (effective.provider == .antfly and effective.resolvedUrl() == null and self.antfly_provider == null) {
+            effective.url = self.inference_api_url;
+        }
+        return effective;
+    }
+
+    fn effectiveTranscriberConfig(self: *const Runtime, cfg: transcribing.Config) transcribing.Config {
+        var effective = cfg;
+        if (effective.provider == .antfly and effective.resolvedUrl() == null and self.antfly_provider == null) {
+            effective.url = self.inference_api_url;
+        }
+        return effective;
+    }
+
+    fn effectiveExtractorConfig(self: *const Runtime, cfg: extracting.Config) extracting.Config {
+        var effective = cfg;
+        if (effective.provider == .antfly and effective.resolvedUrl() == null and self.antfly_provider == null) {
+            if (self.inference_api_url) |url| effective.url = url;
+        }
+        return effective;
     }
 };
 
@@ -4792,6 +4848,18 @@ test "remote generator batch streams attachments into one exact JSON body" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+fn normalizeAntflyInferenceBaseUrl(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n/");
+    if (trimmed.len == 0) return error.InvalidAntflyInferenceBaseUrl;
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    if (std.mem.indexOfPos(u8, trimmed, host_start, "/") != null)
+        return error.InvalidAntflyInferenceBaseUrl;
+    return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+}
+
 const ParsedGenerateBatchResponse = struct {
     items: []asset_producer.ProducedItem,
     execution: inference_work.ExecutionReport,
@@ -5017,6 +5085,47 @@ fn freeGeneratorContentParts(alloc: Allocator, parts: []generating_runtime.Conte
         }
     }
     alloc.free(parts);
+}
+
+test "asset producer runtime external inference endpoint is canonical and authoritative" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{
+        .inference_api_url = "http://inference-worker.example/",
+    });
+    defer {
+        runtime.deinit();
+        alloc.destroy(runtime);
+    }
+
+    try std.testing.expectEqualStrings("http://inference-worker.example/ai/v1", runtime.inference_api_url.?);
+
+    const generator = runtime.effectiveGeneratorConfig(.{
+        .provider = .antfly,
+        .model = "BAAI/bge-m3",
+        .url = "",
+    });
+    try std.testing.expectEqualStrings(runtime.inference_api_url.?, generator.url);
+
+    const reader = runtime.effectiveReaderConfig(.{
+        .provider = .antfly,
+        .model = "reader-model",
+    });
+    try std.testing.expectEqualStrings(runtime.inference_api_url.?, reader.resolvedUrl().?);
+
+    const transcriber = runtime.effectiveTranscriberConfig(.{
+        .provider = .antfly,
+        .model = "transcriber-model",
+    });
+    try std.testing.expectEqualStrings(runtime.inference_api_url.?, transcriber.resolvedUrl().?);
+
+    const extractor = runtime.effectiveExtractorConfig(.{
+        .provider = .antfly,
+        .model = "extractor-model",
+    });
+    try std.testing.expectEqualStrings(runtime.inference_api_url.?, extractor.resolvedUrl().?);
 }
 
 test "asset producer runtime parses reader multimodal parts" {
@@ -5453,6 +5562,11 @@ test "owned asset producer foreground contract follows the selected route" {
         fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
             return error.TestUnexpectedResult;
         }
+
+        fn readImagesWithContext(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request, context: RequestContext) ![]readers.Result {
+            try context.check();
+            return error.TestUnexpectedResult;
+        }
     };
 
     var local = Local{};
@@ -5476,6 +5590,17 @@ test "owned asset producer foreground contract follows the selected route" {
         .producer_type = .copy,
         .config_json = "",
         .source_text = "copy",
+    }}));
+
+    var controlled_provider = local.provider();
+    controlled_provider.read_images_with_context = Local.readImagesWithContext;
+    const controlled_runtime = try Runtime.createOwned(alloc, io_impl.io(), .{ .antfly_provider = controlled_provider });
+    const controlled = controlled_runtime.ownedProducer();
+    defer controlled.deinit(alloc);
+    try std.testing.expect(try controlled.foregroundBoundedForRequests(alloc, &.{.{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
+        .source_text = "image",
     }}));
 }
 

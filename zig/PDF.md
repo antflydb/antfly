@@ -1602,12 +1602,19 @@ document. They are architectural requirements, not Florence-specific cleanup:
     Antfly reranker or query embedder cannot accidentally target coordinator
     localhost.
 166. **The shared execution context described cancellation and bounds but
-    could not carry them.** It now includes an absolute monotonic deadline, a
-    transport-neutral cancellation token, and a caller response ceiling.
-    Reranker discovery and execution intersect those controls with finite
-    family limits; generation also forwards provider cancellation through its
-    HTTP request. A canceled or expired public query therefore bounds both
-    catalog discovery and the admitted inference request.
+    could not carry them, and a later request-context layer duplicated its
+    nominal ABI type.** The unified execution-control module now distinguishes
+    two composable lifetimes: a durable `ExecutionEnvironment` owns routing,
+    capability-cache, I/O-pool, and provider defaults, while one canonical
+    `RequestContext` borrows per-invocation I/O, absolute deadline,
+    cancellation, and progress. Every task family and checked callback uses
+    that same request type; the public `request_context` namespace is an alias
+    of the canonical module and cannot define a second ABI. Reranker discovery and
+    execution intersect those controls with finite family limits; generation
+    forwards provider cancellation and the original progress sink rather than
+    deriving a reduced callback context. A canceled or expired public query
+    therefore bounds both catalog discovery and the admitted inference
+    request.
 167. **Durable semantic chunking retained only I/O and a capability-cache
     pointer.** Chunking now resolves explicit, linked, and provisioned-default
     routes through the same execution context, scopes discovery and execution

@@ -1461,6 +1461,40 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const bge_m3_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/bge_m3_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .build_options_mod = build_options_mod,
+        .json_mod = runtime_graph.json_mod,
+        .httpx_mod = httpx_mod,
+        .inference_api_mod = inference_api_mod,
+        .inference_audio_mod = inference_audio_mod,
+        .inference_chunker_mod = inference_chunker_mod,
+        .jinja_mod = jinja_mod,
+        .inference_tokenizer_mod = inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
+        .inference_linalg_mod = inference_linalg_mod,
+        .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
+        .jsonschema_mod = antfly_jsonschema_mod,
+        .scraping_mod = antfly_scraping_mod,
+        .image_mod = antfly_image_mod,
+        .ml_mod = ml_mod,
+        .ml_tabular_mod = runtime_graph.ml_tabular_mod,
+        .prometheus_mod = prometheus_mod,
+        .structlog_mod = structlog_mod,
+        .onnx_graph_mod = onnx_graph_mod,
+        .pjrt_mod = pjrt_mod,
+        .platform_mod = platform_mod,
+        .protobuf_mod = protobuf_mod,
+        .reader_config_mod = reader_config_mod,
+        .inference_client_mod = client_mod,
+    });
+    bge_m3_runtime_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extracting", extracting_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
@@ -1470,15 +1504,14 @@ pub fn build(b: *std.Build) void {
     bge_m3_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the Metal source and frameworks.
-    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    bge_m3_e2e_bench_exe.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
+    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
     if (b.args) |args| {
         run_bge_m3_e2e_bench.addArgs(args);
     }
-    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
+    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run node-request and pretokenized BGE-M3 encoder benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
     const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{

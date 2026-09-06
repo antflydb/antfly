@@ -9489,6 +9489,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
+            /** @description Maximum number of chunks to generate per document. Zero uses the chunker default. */
             max_chunks?: number;
             /** Format: float */
             threshold?: number;
@@ -10806,8 +10807,29 @@ export interface components {
             worker_failed: boolean;
             /** @description Whether the background enrichment worker is currently running. */
             worker_started: boolean;
-            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            /** @description Whether pending work has no worker or has exceeded its execution/progress deadline. */
             stalled: boolean;
+            /** @enum {string} */
+            stall_reason: "" | "worker_missing" | "model_loading" | "embedding_overdue" | "publishing_overdue";
+            /** @enum {string} */
+            active_phase: "idle" | "loading_model" | "tokenizing" | "executing" | "serializing" | "publishing";
+            active_model: string;
+            active_backend: string;
+            /**
+             * Format: uint64
+             * @description Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+             */
+            active_deadline_ms: number;
+            /** Format: uint64 */
+            last_progress_ms: number;
+            /** Format: uint64 */
+            active_progress_completed: number;
+            /** Format: uint64 */
+            active_progress_total: number;
+            /** Format: uint64 */
+            inference_timeout_count: number;
+            /** Format: uint64 */
+            inference_cancel_count: number;
             /** Format: uint64 */
             skip_by_hash_count: number;
             /** Format: uint64 */

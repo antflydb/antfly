@@ -37,6 +37,8 @@ pub const Provider = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
+    request_timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -96,6 +98,11 @@ pub const Provider = struct {
         self.presence_penalty = presence_penalty;
     }
 
+    pub fn setRequestControl(self: *Provider, timeout_ms: ?u64, cancellation: ?httpx.CancellationToken) void {
+        self.request_timeout_ms = timeout_ms;
+        self.cancellation = cancellation;
+    }
+
     pub fn embedder(self: *Provider) inference.Embedder {
         return .{
             .ptr = @ptrCast(self),
@@ -129,6 +136,8 @@ pub const Provider = struct {
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = self.cancellation,
         });
         defer resp.deinit();
         if (!resp.ok()) return mapEmbedStatus(resp.status.code);
@@ -198,6 +207,8 @@ pub const Provider = struct {
             .json = json_body,
             .headers = self.authHeaders(),
             .max_response_size = self.max_response_bytes,
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = self.cancellation,
         });
         defer resp.deinit();
         if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;

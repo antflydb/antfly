@@ -1514,6 +1514,8 @@ pub fn build(b: *std.Build) void {
         inference_enable_system_blas,
         inference_blas_root,
     );
+    const platform_tests = addDelegatedPackageStep(b, "platform", "lib/platform", "test", "lib/platform");
+    delegated_inference_steps.inference_test.dependOn(platform_tests.step);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
@@ -3538,11 +3540,25 @@ pub fn build(b: *std.Build) void {
             "antfly chunk request frames borrowed binary input",
             "capability lease HTTP fields own storage",
             "provider quotas",
+            "vertex provider",
         },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+
+    const lib_google_tests = b.addTest(.{ .root_module = google_mod });
+    const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
+    const lib_google_test_step = b.step("lib-google-test", "Run Google credential cache and transport tests");
+    lib_google_test_step.dependOn(&run_lib_google_tests.step);
+
+    const lib_managed_embedder_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"managed embedder"},
+    });
+    const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
+    const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
+    lib_managed_embedder_test_step.dependOn(&run_lib_managed_embedder_tests.step);
 
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
@@ -3753,6 +3769,10 @@ pub fn build(b: *std.Build) void {
         "managed embedder dimension probe validation modes",
         "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder rejects unsupported execution namespaces",
+        "managed embedder separates index and artifact lookup namespaces",
+        "managed embedder validates sparse config with probe during normalization",
+        "managed embedder routes antfly without api_url to local provider",
         "managed embedder artifact backed embedding translation",
         "managed embedder binds execution to catalog semantic producer identity",
         "managed embedder reuses an executable owner for producerless artifact consumers",
@@ -5042,6 +5062,15 @@ pub fn build(b: *std.Build) void {
             "document unit spool admits replay memory before opening a read transaction",
             "document publication spool reads ordered segments with one transaction",
             "document publication spool admits replay memory before opening a read transaction",
+            "context-aware embedder receives the request lifetime and fails closed when absent",
+            "inference timeout policy avoids inline retry storms",
+            "inference recovery is scoped by model and backend",
+            "asset inference recovery uses one identity from plan through provider call",
+            "post-provider deadline records timeout recovery before returning",
+            "document extraction reserves PDF decoder peak memory atomically",
+            "PDF decoder reservation composes with every live slice owner",
+            "PDF decoder credit and OCR transient allocations compose without double charging",
+            "reserved PDF working set is bounded without duplicate resource charges",
             "budgeted document download composes with materialization accounting",
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
@@ -7830,6 +7859,12 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This root intentionally links the complete standalone runtime and
+        // embedded inference ABI. The merged document executors plus execution
+        // control peak near 7.6 GiB in macOS debug codegen, so publish an
+        // honest scheduler reservation with normal variance headroom. Linux
+        // retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 9 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
@@ -7865,6 +7900,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_google_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
@@ -9826,6 +9862,7 @@ pub fn build(b: *std.Build) void {
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
+    quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
@@ -9847,6 +9884,38 @@ pub fn build(b: *std.Build) void {
     }
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
+
+    const run_bge_m3_native_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_native_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "native",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_native_managed.addArgs(args);
+    const bge_m3_native_managed_step = b.step(
+        "bench-bge-m3-native-managed-e2e",
+        "Benchmark BGE-M3 native through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_native_managed_step.dependOn(&run_bge_m3_native_managed.step);
+
+    const run_bge_m3_metal_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_metal_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "metal",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_metal_managed.addArgs(args);
+    const bge_m3_metal_managed_step = b.step(
+        "bench-bge-m3-metal-managed-e2e",
+        "Benchmark BGE-M3 Metal through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_metal_managed_step.dependOn(&run_bge_m3_metal_managed.step);
 
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("bench/compat_runner.zig"),
@@ -11169,6 +11238,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         role_mod.addImport("structlog", structlog_mod);
+        role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);

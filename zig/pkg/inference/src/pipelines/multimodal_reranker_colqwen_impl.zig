@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const backends = @import("../backends/backends.zig");
 const Tensor = backends.Tensor;
 const tokenizer_mod = @import("inference_tokenizer");
@@ -71,6 +72,7 @@ pub const Pipeline = struct {
     max_length: usize,
     add_bos_token: bool,
     config: Config = .{},
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -107,6 +109,7 @@ pub const Pipeline = struct {
     }
 
     pub fn encodeQueryText(self: *const Pipeline, query: []const u8) !EncodedSequence {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         return encodeQuery(
             self.cb,
             self.allocator,
@@ -116,6 +119,7 @@ pub const Pipeline = struct {
             query,
             self.max_length,
             self.add_bos_token,
+            self.execution_control,
         );
     }
 
@@ -185,6 +189,7 @@ pub const Pipeline = struct {
             images,
             self.max_length,
             self.add_bos_token,
+            self.execution_control,
         );
     }
 };
@@ -209,7 +214,9 @@ pub fn encodeQuery(
     query: []const u8,
     max_length: usize,
     add_bos_token: bool,
+    execution_control: ?InferenceExecutionControl,
 ) !EncodedSequence {
+    if (execution_control) |control| try control.check();
     const full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prompt_cfg.query_prefix, query });
     defer allocator.free(full);
 
@@ -221,8 +228,9 @@ pub fn encodeQuery(
     for (encoded.ids, 0..) |id, idx| ids_i64[idx] = id;
 
     const hidden = try gpt_arch.hiddenForward(cb, allocator, gpt_cfg, ids_i64, 1, encoded.ids.len, null);
+    defer allocator.free(hidden);
+    if (execution_control) |control| try control.check();
     const projected = try applyRetrievalProjection(cb, allocator, hidden, encoded.ids.len, @intCast(gpt_cfg.hidden_size));
-    allocator.free(hidden);
     return .{
         .allocator = allocator,
         .input_ids = encoded.ids,
@@ -245,7 +253,9 @@ pub fn scoreDocument(
     images: []const []const u8,
     max_length: usize,
     add_bos_token: bool,
+    execution_control: ?InferenceExecutionControl,
 ) !f32 {
+    if (execution_control) |control| try control.check();
     if (images.len == 0) return error.NoImages;
 
     var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
@@ -253,7 +263,9 @@ pub fn scoreDocument(
         for (prepared_images.items) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
-    for (images) |img| {
+    for (images, 0..) |img, index| {
+        if (execution_control) |control|
+            try control.update(.tokenizing, @intCast(index), @intCast(images.len));
         try prepared_images.append(allocator, try qwen2vl.prepareImage(allocator, img, prep_cfg));
     }
 
@@ -269,15 +281,19 @@ pub fn scoreDocument(
         native_image_embeddings.deinit(allocator);
     }
     if (vision_session == null) {
-        for (prepared_images.items) |prepared| {
+        for (prepared_images.items, 0..) |prepared, index| {
+            if (execution_control) |control|
+                try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
             try native_image_embeddings.append(allocator, .{
                 .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
     } else {
-        for (prepared_images.items) |prepared| {
-            try image_embeddings.append(allocator, try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared));
+        for (prepared_images.items, 0..) |prepared, index| {
+            if (execution_control) |control|
+                try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
+            try image_embeddings.append(allocator, try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
         }
     }
 
@@ -398,9 +414,10 @@ pub fn encodeImageTokens(
     gpt_cfg: gpt_mod.Config,
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared: qwen2vl.PreparedImage,
+    execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     if (vision_session) |vs| {
-        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size);
+        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size, execution_control);
     }
     return qwen2vl_vision.encodePreparedImageTokens(cb, allocator, gpt_cfg, prep_cfg, prepared);
 }
@@ -412,6 +429,7 @@ fn runVisionSession(
     vision_session: backends.Session,
     prepared: qwen2vl.PreparedImage,
     expected_hidden_size: u32,
+    execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     const input_info = vision_session.inputInfo();
     var needs_grid = false;
@@ -436,7 +454,7 @@ fn runVisionSession(
         break :blk &[_]Tensor{ pixel_tensor, grid_tensor.? };
     } else &[_]Tensor{pixel_tensor};
 
-    const outputs = try vision_session.run(inputs, allocator);
+    const outputs = try vision_session.runWithControl(inputs, allocator, execution_control);
     defer {
         for (outputs) |*output| output.deinit();
         allocator.free(outputs);

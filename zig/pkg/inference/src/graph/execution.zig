@@ -15,6 +15,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const gpt_arch = @import("../architectures/gpt.zig");
 const contracts = @import("backend_contracts.zig");
 const ops = @import("../ops/ops.zig");
@@ -44,15 +45,18 @@ fn compiledModelForwardRequest(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
     attention_mode: cache_mod.AttentionMode,
+    execution_control: ?InferenceExecutionControl,
 ) !model_runtime.ForwardRequest {
     return if (attention_mode == .paged_decode) blk: {
         if (input_ids.len != 1 or seq_len == 0) return error.UnsupportedShape;
         break :blk .{ .decode = .{
+            .execution_control = execution_control,
             .token_id = input_ids[0],
             .position = seq_len - 1,
             .attention_mode = attention_mode,
         } };
     } else .{ .prefill = .{
+        .execution_control = execution_control,
         .input_ids = input_ids,
         .seq_len = seq_len,
         .query_seq_len = decode_context.query_sequence_len,
@@ -78,13 +82,28 @@ test "compiled prefill request preserves KV ring policy" {
         },
     };
 
-    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 64, &decode_context, .paged_prefill);
+    const request = try compiledModelForwardRequest(&.{ 1, 2 }, 64, &decode_context, .paged_prefill, null);
     switch (request) {
         .prefill => |prefill| {
             try std.testing.expectEqual(@as(usize, 128), prefill.max_inflight_tokens);
             try std.testing.expect(prefill.allow_swa_ring);
         },
         .decode => return error.TestExpectedEqual,
+    }
+}
+
+test "compiled model request preserves execution control" {
+    const decode_context = gpt_arch.DecodeContext{
+        .attention_mode = .paged_decode,
+        .total_sequence_len = 2,
+        .query_sequence_len = 1,
+        .kv_sequence_len = 2,
+    };
+    const control = InferenceExecutionControl{ .deadline_ns = 0 };
+    const request = try compiledModelForwardRequest(&.{7}, 2, &decode_context, .paged_decode, control);
+    switch (request) {
+        .decode => |decode| try std.testing.expectError(error.Timeout, decode.check()),
+        .prefill => return error.TestExpectedEqual,
     }
 }
 
@@ -631,7 +650,7 @@ pub fn graphForwardCompiledModelLast(
     const allocator = pipeline.allocator;
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode);
+    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
     if (backend_def.execute_model_forward_direct) |execute_direct| {
         if (try execute_direct(
             allocator,
@@ -733,7 +752,10 @@ pub fn prepareCompiledModelRuntime(
         cache,
         attach_context,
         .single_device,
-        .{ .kv_tokens_hint = kv_tokens_hint },
+        .{
+            .execution_control = pipeline.execution_control,
+            .kv_tokens_hint = kv_tokens_hint,
+        },
     );
 }
 
@@ -754,7 +776,7 @@ pub fn graphForwardCompiledModelOutput(
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode);
+    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
     return try execute_direct(
         pipeline.allocator,
         cache,
@@ -782,7 +804,7 @@ pub fn graphForwardCompiledModelGreedyToken(
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
-    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode);
+    const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
     return try execute_direct(
         pipeline.allocator,
         cache,

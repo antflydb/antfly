@@ -17,6 +17,8 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const inference_request_context = @import("../../../inference/execution_context.zig");
+const RequestContext = inference_request_context.RequestContext;
 const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
@@ -33,6 +35,9 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 /// page rather than an implicit document-level pool.
 pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
 pub const DenseEmbedRasterItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const antfly_image.BorrowedRasterAttachment, dims: u32) anyerror![]const []const f32;
+pub const DenseEmbedWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32, context: RequestContext) anyerror![]f32;
+pub const DenseEmbedBatchWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, context: RequestContext) anyerror![]const []const f32;
+pub const DenseEmbedPartsWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: RequestContext) anyerror![]f32;
 pub const DenseMediaPartLimitFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?usize;
 pub const DenseCapabilitiesFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8) anyerror!inference_work.InferenceCapabilities;
 pub const DensePartInvocationMemory = inference_work.InvocationMemoryPlan;
@@ -60,8 +65,16 @@ pub const DensePartInvocationMemoryFn = *const fn (
 ) anyerror!DensePartInvocationMemory;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const EmbedSetCancellationFn = *const fn (ptr: *anyopaque, cancellation: CancellationToken) void;
+pub const EmbedSetProgressFn = *const fn (ptr: *anyopaque, progress: inference_request_context.ProgressSink) void;
+pub const RecoveryIdentity = struct {
+    model: []const u8,
+    backend: []const u8 = "",
+};
+pub const EmbedRecoveryIdentityFn = *const fn (ptr: *anyopaque, embedding_name: []const u8) ?RecoveryIdentity;
 pub const SparseEmbedFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) anyerror!SparseEmbedding;
 pub const SparseEmbedBatchFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding;
+pub const SparseEmbedWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, context: RequestContext) anyerror!SparseEmbedding;
+pub const SparseEmbedBatchWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, context: RequestContext) anyerror![]SparseEmbedding;
 pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 
 pub const SparseEmbedding = struct {
@@ -82,11 +95,16 @@ pub const DenseEmbedder = struct {
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
     dense_embed_raster_items_fn: ?DenseEmbedRasterItemsFn = null,
+    dense_embed_with_context_fn: ?DenseEmbedWithContextFn = null,
+    dense_embed_batch_with_context_fn: ?DenseEmbedBatchWithContextFn = null,
+    dense_embed_parts_with_context_fn: ?DenseEmbedPartsWithContextFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     capabilities_fn: ?DenseCapabilitiesFn = null,
     part_invocation_memory_fn: ?DensePartInvocationMemoryFn = null,
     deinit_fn: ?DenseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
+    set_progress_fn: ?EmbedSetProgressFn = null,
+    recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
     /// implementations that cannot make this guarantee; background replay
@@ -111,6 +129,51 @@ pub const DenseEmbedder = struct {
         const safe_texts = sanitized.texts();
         const dense_embed_batch_fn = self.dense_embed_batch_fn orelse return try fallbackDenseBatch(self, alloc, embedding_name, safe_texts, dims);
         return try dense_embed_batch_fn(self.ptr, alloc, embedding_name, safe_texts, dims);
+    }
+
+    pub fn embedDenseWithContext(
+        self: DenseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        try context.check();
+        const embed = self.dense_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
+        defer sanitized.deinit(alloc);
+        const vector = try embed(self.ptr, alloc, embedding_name, sanitized.text, dims, context);
+        context.check() catch |err| {
+            alloc.free(vector);
+            return err;
+        };
+        return vector;
+    }
+
+    pub fn embedDenseBatchWithContext(
+        self: DenseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        dims: u32,
+        context: RequestContext,
+    ) ![]const []const f32 {
+        try context.check();
+        var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const safe_texts = sanitized.texts();
+        const vectors = if (self.dense_embed_batch_with_context_fn) |embed_batch|
+            try embed_batch(self.ptr, alloc, embedding_name, safe_texts, dims, context)
+        else if (self.dense_embed_with_context_fn != null)
+            try fallbackDenseBatchWithContext(self, alloc, embedding_name, safe_texts, dims, context)
+        else
+            return error.UncancellableInferenceProvider;
+        context.check() catch |err| {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return err;
+        };
+        return vectors;
     }
 
     pub fn supportsParts(self: DenseEmbedder) bool {
@@ -294,6 +357,26 @@ pub const DenseEmbedder = struct {
         return vectors;
     }
 
+    pub fn embedDensePartsWithContext(
+        self: DenseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        parts: []const template_mod.ContentPart,
+        dims: u32,
+        context: RequestContext,
+    ) ![]f32 {
+        try context.check();
+        const embed = self.dense_embed_parts_with_context_fn orelse return error.UncancellableInferenceProvider;
+        var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
+        defer sanitized.deinit(alloc);
+        const vector = try embed(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims, context);
+        context.check() catch |err| {
+            alloc.free(vector);
+            return err;
+        };
+        return vector;
+    }
+
     pub fn deinit(self: DenseEmbedder, alloc: Allocator) void {
         const deinit_fn = self.deinit_fn orelse return;
         deinit_fn(self.ptr, alloc);
@@ -302,6 +385,16 @@ pub const DenseEmbedder = struct {
     pub fn setCancellation(self: DenseEmbedder, cancellation: CancellationToken) void {
         const set_cancellation_fn = self.set_cancellation_fn orelse return;
         set_cancellation_fn(self.ptr, cancellation);
+    }
+
+    pub fn setProgress(self: DenseEmbedder, progress: inference_request_context.ProgressSink) void {
+        const set_progress_fn = self.set_progress_fn orelse return;
+        set_progress_fn(self.ptr, progress);
+    }
+
+    pub fn recoveryIdentity(self: DenseEmbedder, embedding_name: []const u8) RecoveryIdentity {
+        const get_identity = self.recovery_identity_fn orelse return .{ .model = embedding_name };
+        return get_identity(self.ptr, embedding_name) orelse .{ .model = embedding_name };
     }
 };
 
@@ -402,8 +495,12 @@ pub const SparseEmbedder = struct {
     ptr: *anyopaque,
     sparse_embed_fn: SparseEmbedFn,
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
+    sparse_embed_with_context_fn: ?SparseEmbedWithContextFn = null,
+    sparse_embed_batch_with_context_fn: ?SparseEmbedBatchWithContextFn = null,
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
+    set_progress_fn: ?EmbedSetProgressFn = null,
+    recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
@@ -425,6 +522,49 @@ pub const SparseEmbedder = struct {
         return try sparse_embed_batch_fn(self.ptr, alloc, embedding_name, safe_texts);
     }
 
+    pub fn embedSparseWithContext(
+        self: SparseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        context: RequestContext,
+    ) !SparseEmbedding {
+        try context.check();
+        const embed = self.sparse_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
+        defer sanitized.deinit(alloc);
+        var result = try embed(self.ptr, alloc, embedding_name, sanitized.text, context);
+        context.check() catch |err| {
+            result.deinit(alloc);
+            return err;
+        };
+        return result;
+    }
+
+    pub fn embedSparseBatchWithContext(
+        self: SparseEmbedder,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        texts: []const []const u8,
+        context: RequestContext,
+    ) ![]SparseEmbedding {
+        try context.check();
+        var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const safe_texts = sanitized.texts();
+        const embeddings = if (self.sparse_embed_batch_with_context_fn) |embed_batch|
+            try embed_batch(self.ptr, alloc, embedding_name, safe_texts, context)
+        else if (self.sparse_embed_with_context_fn != null)
+            try fallbackSparseBatchWithContext(self, alloc, embedding_name, safe_texts, context)
+        else
+            return error.UncancellableInferenceProvider;
+        context.check() catch |err| {
+            freeSparseEmbeddingBatch(alloc, embeddings);
+            return err;
+        };
+        return embeddings;
+    }
+
     pub fn deinit(self: SparseEmbedder, alloc: Allocator) void {
         const deinit_fn = self.deinit_fn orelse return;
         deinit_fn(self.ptr, alloc);
@@ -433,6 +573,16 @@ pub const SparseEmbedder = struct {
     pub fn setCancellation(self: SparseEmbedder, cancellation: CancellationToken) void {
         const set_cancellation_fn = self.set_cancellation_fn orelse return;
         set_cancellation_fn(self.ptr, cancellation);
+    }
+
+    pub fn setProgress(self: SparseEmbedder, progress: inference_request_context.ProgressSink) void {
+        const set_progress_fn = self.set_progress_fn orelse return;
+        set_progress_fn(self.ptr, progress);
+    }
+
+    pub fn recoveryIdentity(self: SparseEmbedder, embedding_name: []const u8) RecoveryIdentity {
+        const get_identity = self.recovery_identity_fn orelse return .{ .model = embedding_name };
+        return get_identity(self.ptr, embedding_name) orelse .{ .model = embedding_name };
     }
 };
 
@@ -594,6 +744,28 @@ fn fallbackDenseBatch(
     return batch;
 }
 
+fn fallbackDenseBatchWithContext(
+    self: DenseEmbedder,
+    alloc: Allocator,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+    dims: u32,
+    context: RequestContext,
+) ![]const []const f32 {
+    const batch = try alloc.alloc([]const f32, texts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (batch[0..initialized]) |vector| alloc.free(@constCast(vector));
+        alloc.free(batch);
+    }
+    for (texts, 0..) |text, i| {
+        try context.update(.executing, i, texts.len);
+        batch[i] = try self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
+        initialized += 1;
+    }
+    return batch;
+}
+
 fn fallbackSparseBatch(
     self: SparseEmbedder,
     alloc: Allocator,
@@ -608,6 +780,27 @@ fn fallbackSparseBatch(
     }
     for (texts, 0..) |text, i| {
         batch[i] = try self.embedSparse(alloc, embedding_name, text);
+        initialized += 1;
+    }
+    return batch;
+}
+
+fn fallbackSparseBatchWithContext(
+    self: SparseEmbedder,
+    alloc: Allocator,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+    context: RequestContext,
+) ![]SparseEmbedding {
+    const batch = try alloc.alloc(SparseEmbedding, texts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (batch[0..initialized]) |*embedding| embedding.deinit(alloc);
+        alloc.free(batch);
+    }
+    for (texts, 0..) |text, i| {
+        try context.update(.executing, i, texts.len);
+        batch[i] = try self.embedSparseWithContext(alloc, embedding_name, text, context);
         initialized += 1;
     }
     return batch;
@@ -1052,4 +1245,49 @@ test "media part item embedding planning preserves heterogeneous MIME accounting
     const repaired_shape = try densePartInvocationShape(&invalid_text);
     try std.testing.expect(repaired_shape.preparation_bytes >=
         @sizeOf(template_mod.ContentPart) + @sizeOf(?[]u8) + 3);
+}
+
+test "context-aware embedder receives the request lifetime and fails closed when absent" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn legacy(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            return try alloc.alloc(f32, dims);
+        }
+
+        fn controlled(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: []const u8,
+            dims: u32,
+            context: RequestContext,
+        ) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
+            self.calls += 1;
+            return try alloc.alloc(f32, dims);
+        }
+    };
+
+    var probe = Probe{};
+    const controlled = DenseEmbedder{
+        .ptr = &probe,
+        .dense_embed_fn = Probe.legacy,
+        .dense_embed_with_context_fn = Probe.controlled,
+    };
+    const context = RequestContext{
+        .io = std.testing.io,
+        .deadline_ns = std.math.maxInt(u64),
+    };
+    const vector = try controlled.embedDenseWithContext(std.testing.allocator, "model", "text", 3, context);
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+
+    const legacy = DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.legacy };
+    try std.testing.expectError(
+        error.UncancellableInferenceProvider,
+        legacy.embedDenseWithContext(std.testing.allocator, "model", "text", 3, context),
+    );
 }

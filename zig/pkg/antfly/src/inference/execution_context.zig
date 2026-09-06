@@ -41,7 +41,78 @@ pub const RoutingContext = struct {
     }
 };
 
-pub const InferenceExecutionContext = struct {
+pub const Phase = enum(u8) {
+    queued,
+    loading_model,
+    loading_weights,
+    preparing_weights,
+    tokenizing,
+    executing,
+    serializing,
+    publishing,
+};
+
+pub const Progress = struct {
+    phase: Phase,
+    completed: u64 = 0,
+    total: u64 = 0,
+    model: []const u8 = "",
+    backend: []const u8 = "",
+    deadline_ns: ?u64 = null,
+};
+
+pub const ProgressSink = struct {
+    ptr: ?*anyopaque = null,
+    update_fn: *const fn (?*anyopaque, Progress) void,
+
+    pub fn update(self: ProgressSink, progress: Progress) void {
+        self.update_fn(self.ptr, progress);
+    }
+};
+
+/// Invocation-local control plane shared by all model families and checked
+/// callback boundaries. It borrows its cancellation and progress targets for
+/// the duration of one admitted invocation.
+pub const RequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64,
+    cancellation: ?CancellationToken = null,
+    progress: ?ProgressSink = null,
+
+    pub fn check(self: RequestContext) !void {
+        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        const deadline = self.deadline_ns orelse return;
+        if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    pub fn remainingTimeoutMs(self: RequestContext) !?u64 {
+        try self.check();
+        const deadline = self.deadline_ns orelse return null;
+        const remaining_ns = deadline -| platform_time.monotonicNs();
+        return @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
+    }
+
+    pub fn update(self: RequestContext, phase: Phase, completed: u64, total: u64) !void {
+        try self.check();
+        if (self.progress) |sink| sink.update(.{ .phase = phase, .completed = completed, .total = total, .deadline_ns = self.deadline_ns });
+    }
+
+    pub fn updateDetail(self: RequestContext, phase: Phase, completed: u64, total: u64, model: []const u8, backend: []const u8) !void {
+        try self.check();
+        if (self.progress) |sink| sink.update(.{
+            .phase = phase,
+            .completed = completed,
+            .total = total,
+            .model = model,
+            .backend = backend,
+            .deadline_ns = self.deadline_ns,
+        });
+    }
+};
+
+/// Durable, task-neutral execution environment. Provider owners may retain
+/// this value; each invocation derives a short-lived `RequestContext` from it.
+pub const ExecutionEnvironment = struct {
     /// Default distributed inference endpoint. Explicit per-model URLs retain
     /// precedence; an available linked callback retains precedence over this
     /// default for configs that did not explicitly request a remote endpoint.
@@ -65,7 +136,7 @@ pub const InferenceExecutionContext = struct {
     http_client: ?*httpx.Client = null,
 
     pub fn resolveAntflyEndpoint(
-        self: InferenceExecutionContext,
+        self: ExecutionEnvironment,
         explicit_endpoint: ?[]const u8,
         linked_callback_available: bool,
     ) ?[]const u8 {
@@ -79,14 +150,14 @@ pub const InferenceExecutionContext = struct {
         return null;
     }
 
-    pub fn waitContext(self: InferenceExecutionContext) remote_capabilities.WaitContext {
+    pub fn waitContext(self: ExecutionEnvironment) remote_capabilities.WaitContext {
         return .{
             .deadline_ns = self.deadline_ns,
             .cancellation = self.cancellation,
         };
     }
 
-    pub fn requestContext(self: InferenceExecutionContext, io: std.Io) RequestContext {
+    pub fn requestContext(self: ExecutionEnvironment, io: std.Io) RequestContext {
         return .{
             .io = io,
             .deadline_ns = self.deadline_ns,
@@ -94,12 +165,12 @@ pub const InferenceExecutionContext = struct {
         };
     }
 
-    pub fn check(self: InferenceExecutionContext, now_ns: u64) !void {
+    pub fn check(self: ExecutionEnvironment, now_ns: u64) !void {
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| if (now_ns >= deadline) return error.Timeout;
     }
 
-    pub fn boundedResponseBytes(self: InferenceExecutionContext, family_limit: usize) usize {
+    pub fn boundedResponseBytes(self: ExecutionEnvironment, family_limit: usize) usize {
         return if (self.max_response_bytes) |requested|
             @min(requested, family_limit)
         else
@@ -107,7 +178,7 @@ pub const InferenceExecutionContext = struct {
     }
 
     pub fn remainingTimeoutMs(
-        self: InferenceExecutionContext,
+        self: ExecutionEnvironment,
         now_ns: u64,
         family_limit_ms: u64,
     ) !u64 {
@@ -122,23 +193,8 @@ pub const InferenceExecutionContext = struct {
     }
 };
 
-pub const Context = InferenceExecutionContext;
-
-/// Invocation-local control plane for linked task callbacks. It deliberately
-/// excludes routing, caches, and provider configuration: callbacks receive
-/// only the executor and controls they must observe while work is in flight.
-pub const RequestContext = struct {
-    io: std.Io,
-    deadline_ns: ?u64 = null,
-    cancellation: CancellationToken = .none,
-
-    pub fn check(self: RequestContext) !void {
-        try self.cancellation.check();
-        if (self.deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.Timeout;
-        }
-    }
-};
+pub const InferenceExecutionContext = ExecutionEnvironment;
+pub const Context = ExecutionEnvironment;
 
 test "execution context gives explicit and linked routes precedence" {
     const context = Context{ .default_endpoint = "http://distributed" };
@@ -176,4 +232,21 @@ test "execution context preserves control and resource bounds" {
     try std.testing.expectEqual(@as(?u64, 200), context.waitContext().deadline_ns);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, context.check(0));
+}
+
+test "request context preserves absolute deadlines and cancellation" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const context = RequestContext{
+        .io = std.testing.io,
+        .deadline_ns = null,
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+    try context.check();
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, context.check());
+
+    var expired = context;
+    expired.cancellation = null;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, expired.remainingTimeoutMs());
 }

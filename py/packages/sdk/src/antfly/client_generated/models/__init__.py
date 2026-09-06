@@ -225,6 +225,8 @@ from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
+from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
+from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -1228,6 +1230,8 @@ __all__ = (
     "EnrichmentConfig",
     "EnrichmentKind",
     "EnrichmentRuntimeStatus",
+    "EnrichmentRuntimeStatusActivePhase",
+    "EnrichmentRuntimeStatusStallReason",
     "Error",
     "EvalConfig",
     "EvalOptions",

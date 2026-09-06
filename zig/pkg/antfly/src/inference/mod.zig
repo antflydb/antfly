@@ -25,12 +25,14 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
-pub const request_context = @import("request_context.zig");
+pub const execution_context = @import("execution_context.zig");
+/// Compatibility namespace for callers compiled against the pre-unification
+/// module spelling. It aliases the canonical execution-control module.
+pub const request_context = execution_context;
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
 pub const work = @import("work.zig");
 pub const remote_capabilities = @import("remote_capabilities.zig");
-pub const execution_context = @import("execution_context.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const google_auth = @import("antfly_google").auth;
 
@@ -44,7 +46,7 @@ pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
-pub const RequestContext = request_context.RequestContext;
+pub const RequestContext = execution_context.RequestContext;
 
 test "inference module compiles" {
     _ = types;
@@ -94,6 +96,8 @@ test "embedding provider request helpers" {
     try @import("../common/provider_limits.zig").testProviderQuotas();
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
+    try managed_embedder.testManagedEmbeddingRequestContextProgress();
     try google_auth.testCredentialSourceCacheKeys();
     try credential_source_identity.testCredentialSourceIdentities();
     try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();

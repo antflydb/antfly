@@ -19,6 +19,14 @@
 
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const UninterruptibleGuard = execution_control_mod.UninterruptibleGuard;
+
+fn enterGenerationBoundary(control: ?InferenceExecutionControl) !UninterruptibleGuard {
+    const active = control orelse return .{};
+    return active.enterUninterruptible(.process_required);
+}
 
 const c = @cImport({
     @cInclude("ort_genai_c.h");
@@ -664,6 +672,21 @@ pub const GenAiModel = struct {
     context_length: i32,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !GenAiModel {
+        return loadWithControl(allocator, model_dir, null);
+    }
+
+    pub fn loadWithControl(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !GenAiModel {
+        if (control) |active| try active.check();
+        var load_guard = if (control) |active|
+            try active.enterUninterruptible(.process_required)
+        else
+            UninterruptibleGuard{};
+        defer load_guard.deinit();
+
         const path_z = try allocator.dupeZ(u8, model_dir);
         defer allocator.free(path_z);
 
@@ -673,6 +696,8 @@ pub const GenAiModel = struct {
 
         var tokenizer: ?*c.OgaTokenizer = null;
         try check(c.OgaCreateTokenizer(model.?, &tokenizer));
+        errdefer c.OgaDestroyTokenizer(tokenizer.?);
+        if (control) |active| try active.check();
 
         return .{
             .model = model.?,
@@ -694,6 +719,35 @@ pub const GenerateOptions = struct {
     top_p: f32 = 0,
     top_k: i32 = 0,
 };
+
+fn checkGenerationControl(
+    control: ?InferenceExecutionControl,
+    completed: usize,
+    opts: GenerateOptions,
+) !void {
+    if (control) |active| try active.update(
+        .executing,
+        @intCast(completed),
+        @intCast(@max(opts.max_tokens, 1)),
+    );
+}
+
+test "generation control is polled at token boundaries" {
+    const State = struct {
+        checks: usize = 0,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 2) return error.Cancelled;
+        }
+    };
+
+    var state = State{};
+    const control = InferenceExecutionControl{ .ptr = &state, .check_fn = State.check };
+    try checkGenerationControl(control, 0, .{ .max_tokens = 8 });
+    try std.testing.expectError(error.Cancelled, checkGenerationControl(control, 1, .{ .max_tokens = 8 }));
+}
 
 /// Result of a generation call.
 pub const GenerateResult = struct {
@@ -768,7 +822,16 @@ fn multimodalPromptTokenCount(
 }
 
 /// Generate text from a prompt using ortgenai.
-pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: []const u8, opts: GenerateOptions) !GenerateResult {
+pub fn generate(
+    allocator: std.mem.Allocator,
+    model: *const GenAiModel,
+    prompt: []const u8,
+    opts: GenerateOptions,
+    execution_control: ?InferenceExecutionControl,
+) !GenerateResult {
+    if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     // Encode prompt to token sequences
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
@@ -826,6 +889,7 @@ pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: 
     var hit_max = false;
 
     while (!c.OgaGenerator_IsDone(generator.?)) {
+        try checkGenerationControl(execution_control, token_count, opts);
         try check(c.OgaGenerator_GenerateNextToken(generator.?));
 
         // Get the newly generated token via GetNextTokens
@@ -844,6 +908,7 @@ pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: 
         }
 
         token_count += 1;
+        try checkGenerationControl(execution_control, token_count, opts);
         if (opts.max_tokens > 0 and token_count >= @as(usize, @intCast(opts.max_tokens))) {
             hit_max = true;
             break;
@@ -865,7 +930,11 @@ pub fn generateFirstTokenDebug(
     model: *const GenAiModel,
     prompt: []const u8,
     opts: GenerateOptions,
+    execution_control: ?InferenceExecutionControl,
 ) !FirstTokenDebug {
+    if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
 
@@ -892,7 +961,9 @@ pub fn generateFirstTokenDebug(
     try check(c.OgaCreateTokenizerStream(model.tokenizer, &stream));
     defer c.OgaDestroyTokenizerStream(stream.?);
 
+    try checkGenerationControl(execution_control, 0, opts);
     try check(c.OgaGenerator_GenerateNextToken(generator.?));
+    try checkGenerationControl(execution_control, 1, opts);
     var next_tokens: [*c]const i32 = undefined;
     var next_count: usize = 0;
     try check(c.OgaGenerator_GetNextTokens(generator.?, &next_tokens, &next_count));
@@ -918,8 +989,12 @@ pub fn generateWithImages(
     prompt: []const u8,
     image_data: []const []const u8,
     opts: GenerateOptions,
+    execution_control: ?InferenceExecutionControl,
 ) !GenerateResult {
-    if (image_data.len == 0) return generate(allocator, model, prompt, opts);
+    if (image_data.len == 0) return generate(allocator, model, prompt, opts, execution_control);
+    if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
 
     // Load images from byte buffers
     const ptrs = try allocator.alloc(*const anyopaque, image_data.len);
@@ -1003,6 +1078,7 @@ pub fn generateWithImages(
     var hit_max = false;
 
     while (!c.OgaGenerator_IsDone(generator.?)) {
+        try checkGenerationControl(execution_control, token_count, opts);
         try check(c.OgaGenerator_GenerateNextToken(generator.?));
 
         var next_tokens: [*c]const i32 = undefined;
@@ -1019,6 +1095,7 @@ pub fn generateWithImages(
         }
 
         token_count += 1;
+        try checkGenerationControl(execution_control, token_count, opts);
         if (opts.max_tokens > 0 and token_count >= @as(usize, @intCast(opts.max_tokens))) {
             hit_max = true;
             break;
@@ -1048,7 +1125,11 @@ pub fn generateStreaming(
     opts: GenerateOptions,
     on_token_ctx: *anyopaque,
     on_token: TokenCallback,
+    execution_control: ?InferenceExecutionControl,
 ) !GenerateResult {
+    if (execution_control) |control| try control.check();
+    var hard_cancellation = try enterGenerationBoundary(execution_control);
+    defer hard_cancellation.deinit();
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
 
@@ -1097,6 +1178,7 @@ pub fn generateStreaming(
     var stopped_by_callback = false;
 
     while (!c.OgaGenerator_IsDone(generator.?)) {
+        try checkGenerationControl(execution_control, token_count, opts);
         try check(c.OgaGenerator_GenerateNextToken(generator.?));
 
         var next_tokens: [*c]const i32 = undefined;
@@ -1105,6 +1187,7 @@ pub fn generateStreaming(
         if (next_count == 0) break;
         const new_token = next_tokens[0];
         token_count += 1;
+        try checkGenerationControl(execution_control, token_count, opts);
 
         var decoded: [*c]const u8 = null;
         try check(c.OgaTokenizerStreamDecode(stream.?, new_token, &decoded));

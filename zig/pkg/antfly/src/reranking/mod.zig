@@ -17,7 +17,7 @@ const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_request_context = @import("../inference/request_context.zig");
+const inference_request_context = @import("../inference/execution_context.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const antfly_provider = @import("../inference/local.zig");
 const remote_capabilities = @import("../inference/remote_capabilities.zig");
@@ -426,11 +426,19 @@ pub fn rerankDocumentsWithOptions(
             var auth = try RequestAuthentication.init(alloc, cfg, options.secret_store);
             defer auth.deinit(alloc);
             const api_key = auth.token;
+            const auth_control = @import("antfly_google").RequestControl{
+                .deadline_ns = if (options.execution_context) |context| context.deadline_ns else null,
+                .cancellation = httpCancellation(if (options.execution_context) |context| context.cancellation else null),
+            };
             const token_source = if (api_key == null and options.runtime != null)
-                options.runtime.?.credentials.tokenSource(
+                options.runtime.?.credentials.tokenSourceWithControl(
                     if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
                     "https://www.googleapis.com/auth/cloud-platform",
-                ) catch return error.InvalidRerankerConfig
+                    auth_control,
+                ) catch |err| switch (err) {
+                    error.Cancelled, error.Timeout, error.OutOfMemory => return err,
+                    else => return error.InvalidRerankerConfig,
+                }
             else
                 null;
             var provider = try vertex_provider.Provider.init(alloc, http, .{
@@ -439,6 +447,7 @@ pub fn rerankDocumentsWithOptions(
                 .credentials_path = if (cfg.credentials_path.len > 0) cfg.credentials_path else null,
                 .bearer_token = api_key,
                 .token_source = token_source,
+                .request_control = auth_control,
             });
             defer provider.deinit();
             var quota = try acquireQuota(cfg, options, auth.identity(cfg), provider.project_id, "global", policy);

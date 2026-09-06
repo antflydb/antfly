@@ -218,6 +218,16 @@ pub const ReadRasterImagesRequest = struct {
     source_fingerprint: ?[]const u8 = null,
 };
 
+pub const ProgressView = extern struct {
+    context: ?*anyopaque = null,
+    update_progress: ?*const fn (?*anyopaque, phase: u8, completed: u64, total: u64, model: String, backend: String) callconv(.c) void = null,
+
+    pub fn update(self: ProgressView, phase: u8, completed: u64, total: u64, model: []const u8, backend: []const u8) void {
+        const callback = self.update_progress orelse return;
+        callback(self.context, phase, completed, total, String.init(model), String.init(backend));
+    }
+};
+
 pub const ProviderInvokeContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -236,6 +246,8 @@ pub const ProviderInvokeContext = extern struct {
     /// attachment fields. ABI v24's strict size/version gate rejects older
     /// layouts rather than silently losing media or cooperative cancellation.
     cancellation: http_abi.CancellationView = .{},
+    /// Appended in ABI v19 and extended in v20 with model/backend detail.
+    progress: ProgressView = .{},
 };
 
 pub const RouteManifestEntry = extern struct {

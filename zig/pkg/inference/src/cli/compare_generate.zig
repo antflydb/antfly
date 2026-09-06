@@ -753,7 +753,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
         var onnx_gen = try ortgenai.GenAiModel.load(allocator, onnx_model_dir);
         defer onnx_gen.deinit();
-        var onnx_first = try ortgenai.generateFirstTokenDebug(allocator, &onnx_gen, onnx_prompt, .{});
+        var onnx_first = try ortgenai.generateFirstTokenDebug(allocator, &onnx_gen, onnx_prompt, .{}, null);
         defer onnx_first.deinit();
         print("onnx_first_token: id={d} text={s}\n", .{ onnx_first.token_id, onnx_first.text });
         return;

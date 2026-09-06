@@ -16,6 +16,8 @@ const std = @import("std");
 const antfly_image = @import("antfly_image");
 const inference_work = @import("../../../inference/work.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const request_context = @import("../../../inference/execution_context.zig");
+const RequestContext = request_context.RequestContext;
 
 const Allocator = std.mem.Allocator;
 
@@ -28,6 +30,23 @@ pub const InvocationContext = struct {
     deadline_ns: ?u64 = null,
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
+    progress: ?request_context.ProgressSink = null,
+
+    pub fn check(self: InvocationContext) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+        }
+    }
+
+    pub fn fromRequestContext(context: RequestContext) InvocationContext {
+        return .{
+            .io = context.io,
+            .deadline_ns = context.deadline_ns,
+            .cancellation = context.cancellation orelse .none,
+            .progress = context.progress,
+        };
+    }
 };
 
 pub const ProducerType = enum {
@@ -275,6 +294,12 @@ pub const Producer = struct {
     }
 
     pub fn foregroundBoundedForRequests(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        // A finite implementation-specific timeout is not sufficient for a
+        // foreground request: the provider must accept the caller's actual
+        // deadline and cancellation token. Legacy callbacks remain available
+        // to durable background replay, but can never advertise foreground
+        // cancellability.
+        if (self.vtable.produce_with_context == null) return false;
         if (self.vtable.foreground_bounded_for_requests) |foreground_bounded|
             return try foreground_bounded(self.ptr, alloc, requests);
         return self.vtable.foreground_bounded;
@@ -306,6 +331,16 @@ pub const Producer = struct {
         if (self.vtable.produce_with_context) |produce_fn|
             return try produce_fn(self.ptr, alloc, request, self.invocation_context);
         return try self.vtable.produce(self.ptr, alloc, request);
+    }
+
+    pub fn produceWithContext(self: Producer, alloc: Allocator, request: Request, context: RequestContext) ![]u8 {
+        try context.check();
+        const output = try self.withInvocationContext(.fromRequestContext(context)).produce(alloc, request);
+        context.check() catch |err| {
+            alloc.free(output);
+            return err;
+        };
+        return output;
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
@@ -521,6 +556,17 @@ pub const Producer = struct {
         if (self.vtable.can_produce_batch) |can_produce_batch|
             return if (try can_produce_batch(self.ptr, alloc, requests)) .native else .none;
         return .serial_compatibility;
+    }
+
+    pub fn produceBatchWithContext(self: Producer, alloc: Allocator, requests: []const Request, context: RequestContext) ![][]u8 {
+        try context.check();
+        const out = try self.withInvocationContext(.fromRequestContext(context)).produceBatch(alloc, requests);
+        context.check() catch |err| {
+            for (out) |item| if (item.len > 0) alloc.free(item);
+            alloc.free(out);
+            return err;
+        };
+        return out;
     }
 
     /// Compatibility wrapper for callers that only need to choose between the
@@ -1219,4 +1265,35 @@ test "asset producer enforces invocation contracts with immutable planning and e
     try std.testing.expectEqual(@as(usize, 1), state.execution_calls);
     try std.testing.expectEqual(@as(?u64, null), producer.invocation_context.deadline_ns);
     try std.testing.expectEqual(@as(?usize, null), producer.invocation_context.max_response_bytes);
+}
+
+test "asset producer forwards request context to cancellable implementations" {
+    const Probe = struct {
+        context_calls: usize = 0,
+
+        fn legacy(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
+            return error.LegacyCallbackInvoked;
+        }
+
+        fn controlled(raw: *anyopaque, alloc: Allocator, _: Request, context: InvocationContext) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            self.context_calls += 1;
+            return try alloc.dupe(u8, "controlled");
+        }
+    };
+
+    var probe = Probe{};
+    const producer = Producer{
+        .ptr = &probe,
+        .vtable = &.{ .produce = Probe.legacy, .produce_with_context = Probe.controlled },
+    };
+    const output = try producer.produceWithContext(std.testing.allocator, .{
+        .producer_type = .copy,
+        .config_json = "",
+        .source_text = "input",
+    }, .{ .io = std.testing.io, .deadline_ns = null });
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("controlled", output);
+    try std.testing.expectEqual(@as(usize, 1), probe.context_calls);
 }

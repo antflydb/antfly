@@ -18,6 +18,8 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -2500,13 +2502,15 @@ pub const LoadedModel = struct {
         );
     }
 
-    fn ensureOptionalSession(
+    fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
+        control: ?InferenceExecutionControl,
     ) !bool {
+        if (control) |active| try active.check();
         if (slot.* != null) return false;
         const session_path = path orelse return false;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
@@ -2529,12 +2533,24 @@ pub const LoadedModel = struct {
             strict_backend[0..],
             shared_ctx,
             &session_manager,
+            control,
         );
-        slot.* = loaded.session;
-        lease_slot.* = loaded.resource_lease;
-        loaded.owns_session = false;
-        loaded.resource_lease = null;
+        defer loaded.deinit();
+        if (control) |active| try active.check();
+        const owned = loaded.take();
+        slot.* = owned.session;
+        lease_slot.* = owned.resource_lease;
         return true;
+    }
+
+    fn ensureOptionalSession(
+        self: *LoadedModel,
+        kind: DeclaredOptionalSessionKind,
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+        path: ?[]const u8,
+    ) !bool {
+        return self.ensureOptionalSessionWithControl(kind, slot, lease_slot, path, null);
     }
 
     fn releaseOptionalSession(
@@ -2552,6 +2568,10 @@ pub const LoadedModel = struct {
     /// retain shared concurrency.
     pub fn lockEmbeddingAssets(self: *LoadedModel) void {
         spinLock(&self.embedding_session_lock);
+    }
+
+    pub fn lockEmbeddingAssetsWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try control.lock(&self.embedding_session_lock);
     }
 
     pub fn unlockEmbeddingAssets(self: *LoadedModel) void {
@@ -2614,6 +2634,18 @@ pub const LoadedModel = struct {
         );
     }
 
+    pub fn ensureVisionSessionWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try self.lockEmbeddingAssetsWithControl(control);
+        defer self.unlockEmbeddingAssets();
+        _ = try self.ensureOptionalSessionWithControl(
+            .vision,
+            &self.vision_session,
+            &self.vision_resource_lease,
+            self.manifest.visual_model_path,
+            control,
+        );
+    }
+
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         self.lockEmbeddingAssets();
         defer self.unlockEmbeddingAssets();
@@ -2623,6 +2655,17 @@ pub const LoadedModel = struct {
     pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         try self.ensurePrimaryEmbeddingAssetsLocked(include_text, include_image);
         if (include_audio) try self.ensureAudioEmbeddingAssetsLocked();
+    }
+
+    pub fn ensureEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        include_audio: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        try self.ensurePrimaryEmbeddingAssetsLockedWithControl(include_text, include_image, control);
+        if (include_audio) try self.ensureAudioEmbeddingAssetsLockedWithControl(control);
     }
 
     const PrimaryEmbeddingAssetAcquisitions = struct {
@@ -2678,6 +2721,42 @@ pub const LoadedModel = struct {
         }
     }
 
+    pub fn ensurePrimaryEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        var acquired = PrimaryEmbeddingAssetAcquisitions{};
+        errdefer self.rollbackPrimaryEmbeddingAssetsLocked(acquired);
+
+        if (include_text) {
+            acquired.text_projection = try self.ensureOptionalSessionWithControl(
+                .text_projection,
+                &self.text_projection,
+                &self.text_projection_resource_lease,
+                self.manifest.text_projection_path,
+                control,
+            );
+        }
+        if (include_image) {
+            acquired.vision = try self.ensureOptionalSessionWithControl(
+                .vision,
+                &self.vision_session,
+                &self.vision_resource_lease,
+                self.manifest.visual_model_path,
+                control,
+            );
+            acquired.visual_projection = try self.ensureOptionalSessionWithControl(
+                .visual_projection,
+                &self.visual_projection,
+                &self.visual_projection_resource_lease,
+                self.manifest.visual_projection_path,
+                control,
+            );
+        }
+    }
+
     /// Admit the ephemeral audio sidecars as one phase. Any partial admission
     /// is rolled back immediately so a failed request cannot strand a lease
     /// and prevent subsequent text/image work from making progress.
@@ -2694,6 +2773,24 @@ pub const LoadedModel = struct {
             &self.audio_projection,
             &self.audio_projection_resource_lease,
             self.manifest.audio_projection_path,
+        );
+    }
+
+    pub fn ensureAudioEmbeddingAssetsLockedWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        errdefer self.releaseAudioEmbeddingAssetsLocked();
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio,
+            &self.audio_session,
+            &self.audio_resource_lease,
+            self.manifest.audio_model_path,
+            control,
+        );
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio_projection,
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+            self.manifest.audio_projection_path,
+            control,
         );
     }
 
@@ -3087,6 +3184,10 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -3106,6 +3207,7 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3145,6 +3247,10 @@ test "audio asset rollback closes every ephemeral session" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -3164,6 +3270,7 @@ test "audio asset rollback closes every ephemeral session" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3208,33 +3315,110 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 const LoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
+    hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
-    /// Protected by ModelManager.load_lock. The owner starts with one reference;
-    /// every waiter takes one before dropping the manager lock.
-    refs: usize = 1,
-    /// The owner already receives a model handle directly from the uncached
-    /// load. Keep its flight reference distinguishable so retirement reserves
-    /// handles only for waiters that have not adopted theirs yet.
-    owner_ref_pending: bool = true,
+    /// Protected by ModelManager.load_lock. The manager-owned task holds one
+    /// reference and every request waiter holds another.
+    refs: usize = 2,
+    /// Active request waiters. The terminal `abandoned` state prevents a new
+    /// request from joining initialization after the final waiter has left.
+    waiters: std.atomic.Value(usize) = .init(1),
+    /// Distinguishes the manager task reference so retirement reserves handles
+    /// only for request waiters that have not adopted theirs yet.
+    task_ref_pending: bool = true,
     /// A retired model detaches its completed flight so a replacement can use
     /// the same key. Detached flights live until existing waiters consume them.
     registered: bool = true,
     /// Retirement reserves one active model handle for every remaining flight
     /// waiter. Waiters adopt those reservations instead of incrementing the
-    /// handle count a second time; the owner already has its handle.
+    /// handle count a second time.
     handles_reserved: bool = false,
 
+    const abandoned = std.math.maxInt(usize);
+
+    fn tryAddWaiter(self: *LoadFlight) bool {
+        var current = self.waiters.load(.acquire);
+        while (current != abandoned) {
+            std.debug.assert(current < abandoned - 1);
+            if (self.waiters.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn releaseWaiter(self: *LoadFlight, abandon_if_last: bool) void {
+        var current = self.waiters.load(.acquire);
+        while (true) {
+            std.debug.assert(current != abandoned and current > 0);
+            const next = if (abandon_if_last and current == 1) abandoned else current - 1;
+            if (self.waiters.cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return;
+        }
+    }
+
     fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
-        std.debug.assert(self.refs >= @intFromBool(self.owner_ref_pending));
-        return self.refs - @intFromBool(self.owner_ref_pending);
+        std.debug.assert(self.refs >= @intFromBool(self.task_ref_pending));
+        return self.refs - @intFromBool(self.task_ref_pending);
     }
 };
 
-test "load flight retirement reservations exclude the owner handle" {
+const LoadFlightControl = struct {
+    flight: *LoadFlight,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.flight.waiters.load(.acquire) == LoadFlight.abandoned)
+            return error.Cancelled;
+    }
+
+    fn control(self: *@This()) InferenceExecutionControl {
+        return .{
+            .io = self.flight.io,
+            .ptr = self,
+            .check_fn = check,
+            .hard_cancellation = self.flight.hard_cancellation,
+        };
+    }
+};
+
+const LoadTask = struct {
+    manager: *ModelManager,
+    flight: *LoadFlight,
+    flight_key: []u8,
+    model_dir: []u8,
+    preferred_backends: []backends.BackendType,
+    session_manager: backends.SessionManager,
+    cache_default_alias: bool,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+
+    fn deinit(self: *@This()) void {
+        const allocator = self.manager.allocator;
+        allocator.free(self.flight_key);
+        allocator.free(self.model_dir);
+        allocator.free(self.preferred_backends);
+        allocator.destroy(self);
+    }
+};
+
+test "manager load flight remains active until its final waiter leaves" {
+    var flight = LoadFlight{ .io = std.testing.io };
+    var load_control = LoadFlightControl{ .flight = &flight };
+    try load_control.control().check();
+    try std.testing.expect(flight.tryAddWaiter());
+    flight.releaseWaiter(true);
+    try load_control.control().check();
+    flight.releaseWaiter(true);
+    try std.testing.expectError(error.Cancelled, load_control.control().check());
+    try std.testing.expect(!flight.tryAddWaiter());
+}
+
+test "load flight retirement reservations exclude the manager task" {
     var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
     try std.testing.expectEqual(@as(usize, 2), flight.unadoptedWaiterRefs());
-    flight.owner_ref_pending = false;
+    flight.task_ref_pending = false;
     try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
 }
 
@@ -3346,6 +3530,16 @@ pub const ModelHandle = struct {
     /// restart; concurrent users retain the retired object until they unwind.
     pub fn retire(self: *ModelHandle) void {
         const model = self.model orelse return;
+        self.manager.retireLoadedModel(model);
+        self.release();
+    }
+
+    /// Quarantine the exact model/backend pair before retiring its in-process
+    /// runtime. A later durable retry can select the next healthy backend
+    /// without penalizing unrelated models that use the same backend.
+    pub fn quarantine(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        markModelBackendUnhealthy(self.manager, model.model_dir, model.session.backend());
         self.manager.retireLoadedModel(model);
         self.release();
     }
@@ -3643,6 +3837,14 @@ pub const ModelManager = struct {
     eviction_group: std.Io.Group = .init,
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
+    /// Cold initialization is owned by the manager rather than whichever
+    /// request happened to miss the cache first. Request waiters may therefore
+    /// cancel independently without invalidating shared work.
+    load_group: std.Io.Group = .init,
+    load_io: ?std.Io = null,
+    /// Lazily allocated at a stable address for offline/direct callers. Never
+    /// borrow a request's Io: shared loads and resident sessions outlive it.
+    owned_load_runtime: ?*std.Io.Threaded = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
     in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
@@ -3651,6 +3853,8 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
@@ -4781,6 +4985,21 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 null,
+                null,
+            );
+        }
+
+        pub fn loadWithControl(
+            self: *const ComponentLoader,
+            model_path: []const u8,
+            control: InferenceExecutionControl,
+        ) !ManagedSession {
+            try self.ensureComponentPath(model_path);
+            return self.manager.loadManagedSessionWithAdmission(
+                model_path,
+                self.preferredBackends(),
+                null,
+                control,
             );
         }
 
@@ -4794,6 +5013,7 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 shared_backend_ctx,
+                null,
             );
         }
 
@@ -5102,12 +5322,14 @@ pub const ModelManager = struct {
         model_path: []const u8,
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
         return self.loadManagedSessionWithAdmissionUsingManager(
             model_path,
             preferred_backends,
             shared_backend_ctx,
             &self.session_manager,
+            control,
         );
     }
 
@@ -5117,7 +5339,9 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try source_session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -5131,6 +5355,7 @@ pub const ModelManager = struct {
         defer artifact_estimate.deinit();
 
         for (effective_backends) |backend| {
+            if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
@@ -5149,6 +5374,7 @@ pub const ModelManager = struct {
             session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (resource_lease) |*lease| lease.release();
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
@@ -5192,43 +5418,43 @@ pub const ModelManager = struct {
                 };
             }
 
+            var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
+                if (err == error.ProcessIsolationRequired) {
+                    // An in-process caller can still use a later cooperative
+                    // backend. A required backend has a single candidate and
+                    // therefore remains fail-closed.
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                }
+                return err;
+            };
+            defer construction.deinit();
             if (session_manager.loadModelWithImportedOnnxContext(
                 model_path,
                 shared_backend_ctx,
             )) |loaded_session| {
-                var session = loaded_session;
-                if (resource_lease) |*lease| {
-                    lease.retain(resident_amounts) catch |err| {
-                        session.close();
-                        lease.release();
-                        return err;
-                    };
-                }
+                var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+                resource_lease = null;
+                defer loaded.deinit();
+                if (control) |active| try active.check();
+                if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
                 if (self.admission_enabled) {
                     const session_admission_limits = self.admissionLimitsForSession(
                         backend_runtime,
-                        session,
+                        loaded.session,
                     );
-                    attachSessionRunAdmission(
+                    try attachSessionRunAdmission(
                         self.allocator,
-                        &session,
+                        &loaded.session,
                         self.admissionController(),
                         backend_runtime,
                         session_admission_limits,
                         resident_amounts,
                         null,
-                    ) catch |err| {
-                        session.close();
-                        if (resource_lease) |*lease| lease.release();
-                        return err;
-                    };
+                    );
                 }
-                return .{
-                    .session = session,
-                    .resource_lease = resource_lease,
-                };
+                return loaded.take();
             } else |err| {
-                if (resource_lease) |*lease| lease.release();
                 rememberPreferredLoadError(&first_err, err);
             }
         }
@@ -5378,6 +5604,13 @@ pub const ModelManager = struct {
     }
 
     pub fn deinit(self: *ModelManager) void {
+        // Sessions can retain the load runtime. Join work and destroy all
+        // resident resources before tearing down the manager-owned fallback.
+        defer if (self.owned_load_runtime) |owned| {
+            owned.deinit();
+            self.allocator.destroy(owned);
+        };
+        if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
         std.debug.assert(self.in_flight_whisper_assets.count() == 0);
@@ -5386,6 +5619,7 @@ pub const ModelManager = struct {
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
+        self.unhealthy_model_backends.deinit(self.allocator);
         var whisper_assets_it = self.whisper_assets.iterator();
         while (whisper_assets_it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -5841,6 +6075,21 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            control,
         );
     }
 
@@ -5855,6 +6104,23 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            control,
         );
     }
 
@@ -5874,6 +6140,22 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
         );
     }
 
@@ -5889,6 +6171,24 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
         );
     }
 
@@ -5929,6 +6229,7 @@ pub const ModelManager = struct {
     ) !?*LoadedModel {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
+            if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
             const variant_key = try backendVariantCacheKey(
                 self.allocator,
                 model_dir,
@@ -5941,11 +6242,13 @@ pub const ModelManager = struct {
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
         }
         return null;
     }
@@ -6005,6 +6308,36 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
+    fn runLoadTask(task: *LoadTask) std.Io.Cancelable!void {
+        defer task.deinit();
+        const manager = task.manager;
+        defer manager.releaseLoadFlight(task.flight_key, task.flight);
+
+        var load_control = LoadFlightControl{ .flight = task.flight };
+        var handle = manager.loadFromDirUncached(
+            task.model_dir,
+            &task.session_manager,
+            task.cache_default_alias,
+            task.a4b_request,
+            load_control.control(),
+        ) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        load_control.control().check() catch |err| {
+            // loadFromDirUncached publishes before returning. If every waiter
+            // left during its final non-suspending section, retire that orphan
+            // instead of leaving an unused runtime resident.
+            handle.retire();
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.finishLoadFlight(task.flight, handle.get(), null);
+        // The task owns only the construction handle. Request waiters adopt
+        // their own handles from the completed flight.
+        handle.release();
+    }
+
     fn releaseLoadFlight(
         self: *ModelManager,
         flight_key: []const u8,
@@ -6012,8 +6345,8 @@ pub const ModelManager = struct {
     ) void {
         var removed_key: ?[]const u8 = null;
         self.lockLoadedModels();
-        std.debug.assert(flight.owner_ref_pending);
-        flight.owner_ref_pending = false;
+        std.debug.assert(flight.task_ref_pending);
+        flight.task_ref_pending = false;
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         if (flight.refs != 0) {
@@ -6036,18 +6369,59 @@ pub const ModelManager = struct {
         self: *ModelManager,
         flight_key: []const u8,
         flight: *LoadFlight,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
-        flight.completed.waitUncancelable(flight.io);
+        var waiter_consumed = false;
+        defer if (!waiter_consumed) {
+            var result = self.consumeLoadFlightWaiter(flight_key, flight, .abandon);
+            result.handle.release();
+        };
+        while (!flight.completed.isSet()) {
+            if (control) |active| try active.update(.loading_model, 0, 1);
+            flight.completed.waitTimeout(flight.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
+        waiter_consumed = true;
+        errdefer result.handle.release();
+        if (control) |active| try active.check();
+        if (result.err) |err| return err;
+        if (result.handle.model == null) return error.NoBackendAvailable;
+        return result.handle;
+    }
+
+    /// Consume exactly one waiter reference and transfer its model ownership,
+    /// if any, to the caller. Retirement reserves handles for outstanding
+    /// waiters; even an abandoning waiter must release that reservation. Keep
+    /// this accounting under the same lock as retirement, and release returned
+    /// handles outside the lock because the last release can destroy a model.
+    fn consumeLoadFlightWaiter(
+        self: *ModelManager,
+        flight_key: []const u8,
+        flight: *LoadFlight,
+        disposition: enum { adopt, abandon },
+    ) struct { handle: ModelHandle, err: ?anyerror } {
         var removed_key: ?[]const u8 = null;
         var destroy_flight = false;
         self.lockLoadedModels();
-        const model = flight.model;
+        var handle = ModelHandle{ .manager = self, .model = null };
         const maybe_err = flight.err;
-        if (model) |loaded| {
-            if (!flight.handles_reserved) loaded.active_handles += 1;
+        if (flight.model) |loaded| {
+            if (flight.handles_reserved or disposition == .adopt) {
+                if (!flight.handles_reserved) loaded.active_handles += 1;
+                handle.model = loaded;
+            }
         }
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
+        flight.releaseWaiter(disposition == .abandon);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -6058,14 +6432,23 @@ pub const ModelManager = struct {
             destroy_flight = true;
         }
         self.unlockLoadedModels();
-
         if (removed_key) |key| self.allocator.free(key);
         if (destroy_flight) self.allocator.destroy(flight);
-        if (maybe_err) |err| return err;
-        return .{
-            .manager = self,
-            .model = model orelse return error.NoBackendAvailable,
+        return .{ .handle = handle, .err = maybe_err };
+    }
+
+    /// Called under load_lock. Once selected, the group's runtime never changes,
+    /// including when attachIo is called after an offline load has started.
+    fn loadCoordinationIoLocked(self: *ModelManager) !std.Io {
+        if (self.load_io) |io| return io;
+        const io = self.session_manager.io orelse blk: {
+            const owned = try self.allocator.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(self.allocator, .{});
+            self.owned_load_runtime = owned;
+            break :blk owned.io();
         };
+        self.load_io = io;
+        return io;
     }
 
     fn loadFromDirCoordinated(
@@ -6074,7 +6457,9 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -6105,30 +6490,57 @@ pub const ModelManager = struct {
         }
         if (self.in_flight_loads.get(flight_key)) |flight| {
             flight.refs += 1;
+            if (!flight.tryAddWaiter()) {
+                flight.refs -= 1;
+                self.unlockLoadedModels();
+                return error.ResourceTemporarilyUnavailable;
+            }
             self.unlockLoadedModels();
-            return self.waitForLoadFlight(flight_key, flight);
+            return self.waitForLoadFlight(flight_key, flight, control);
         }
 
+        const coordination_io = self.loadCoordinationIoLocked() catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
         const flight = self.allocator.create(LoadFlight) catch |err| {
             self.unlockLoadedModels();
             return err;
         };
-        // Antfly injects BackendRuntime.io through Node.attachIo. Keep the
-        // inference package coupled only to the std.Io capability so standalone
-        // and embedded owners can provide different runtime implementations.
-        // The process-local fallback is only for offline callers that do not
-        // attach a runtime.
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
         flight.* = .{
             .io = coordination_io,
+            .hard_cancellation = if (control) |active| active.hard_cancellation else null,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
             return err;
         };
-        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+        const task = self.allocator.create(LoadTask) catch |err| {
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_model_dir = self.allocator.dupe(u8, model_dir) catch |err| {
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_backends = self.allocator.dupe(backends.BackendType, effective_backends) catch |err| {
+            self.allocator.free(task_model_dir);
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
             self.allocator.free(owned_flight_key);
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
@@ -6139,25 +6551,48 @@ pub const ModelManager = struct {
         // runtime for its complete construction.
         var session_manager = sessionManagerForPreferredBackends(
             self.allocator,
-            effective_backends,
+            task_backends,
             &self.session_manager,
         );
+        session_manager.io = coordination_io;
         session_manager.a4b_inference_request = policy.a4b_request;
-        self.unlockLoadedModels();
-
-        var handle = self.loadFromDirUncached(
-            model_dir,
-            &session_manager,
-            cache_default_alias,
-            policy.a4b_request,
-        ) catch |err| {
-            self.finishLoadFlight(flight, null, err);
-            self.releaseLoadFlight(flight_key, flight);
+        task.* = .{
+            .manager = self,
+            .flight = flight,
+            .flight_key = task_flight_key,
+            .model_dir = task_model_dir,
+            .preferred_backends = task_backends,
+            .session_manager = session_manager,
+            .cache_default_alias = cache_default_alias,
+            .a4b_request = policy.a4b_request,
+        };
+        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+            task.deinit();
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
             return err;
         };
-        self.finishLoadFlight(flight, handle.get(), null);
-        self.releaseLoadFlight(flight_key, flight);
-        return handle;
+        self.unlockLoadedModels();
+        if (control != null) {
+            self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
+                // `Group.async` is allowed to execute eagerly when its async pool is
+                // saturated. A request-scoped cold load must never run on the request
+                // lane: the waiter is what translates request cancellation into an
+                // abandoned flight. Fail closed when guaranteed concurrency is not
+                // available and retire the task reference exactly as runLoadTask
+                // would have done.
+                self.finishLoadFlight(flight, null, err);
+                task.deinit();
+                self.releaseLoadFlight(flight_key, flight);
+            };
+        } else {
+            // Startup preloads and direct/offline callers have no request lifetime
+            // to protect. Retain the permissive path for executors such as
+            // std.testing.io that intentionally do not offer concurrency.
+            self.load_group.async(coordination_io, runLoadTask, .{task});
+        }
+        return self.waitForLoadFlight(flight_key, flight, control);
     }
 
     fn loadFromDirUncached(
@@ -6166,12 +6601,15 @@ pub const ModelManager = struct {
         sm: *backends.SessionManager,
         cache_default_alias: bool,
         a4b_request: ?backend_contracts.A4bInferenceRequest,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 4);
 
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
+        if (control) |active| try active.update(.loading_model, 1, 4);
         var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {
             sm.preferred_backends = try policyAllowedBackends(
@@ -6239,6 +6677,7 @@ pub const ModelManager = struct {
             self.allocator.destroy(sp);
         };
 
+        if (control) |active| try active.check();
         switch (tokenizer_type) {
             .huggingface => {
                 hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
@@ -6260,16 +6699,24 @@ pub const ModelManager = struct {
                 sp_tok = sp;
             },
         }
+        if (control) |active| try active.update(.loading_model, 2, 4);
         if (tokenizer_resource_lease) |*lease| {
             try lease.retain(tokenizer_admission_plan.?.resident);
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
-        var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
-        errdefer if (loaded_session.resource_lease) |*lease| lease.release();
+        if (control) |active| try active.update(.loading_weights, 0, 1);
+        var loaded_session = try loadSessionForPreferredBackends(
+            self,
+            sm.preferred_backends,
+            model_dir,
+            man,
+            sm,
+            control,
+        );
+        defer loaded_session.deinit();
+        if (control) |active| try active.update(.loading_model, 3, 4);
         const session = loaded_session.session;
-        var session_owned = true;
-        errdefer if (session_owned) session.close();
 
         var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
             try whisper_prompt.PromptCache.init(
@@ -6396,6 +6843,11 @@ pub const ModelManager = struct {
             .resource_lease = loaded_session.resource_lease,
         };
 
+        // Keep publication behind the same cooperative boundary as expensive
+        // construction. An abandoned manager task should release its fully
+        // built model through the armed errdefers, not briefly expose it.
+        if (control) |active| try active.update(.loading_model, 4, 4);
+
         // The fully initialized model is now the sole owner. Disarm every
         // construction errdefer before publishLoadedModel takes responsibility
         // for cleanup on either publication failure or duplicate convergence.
@@ -6403,7 +6855,6 @@ pub const ModelManager = struct {
         hf_tok = null;
         sp_tok = null;
         tokenizer_resource_lease = null;
-        session_owned = false;
         chat_tmpl = null;
         whisper_prompt_cache = null;
         shared_moe_cache = null;
@@ -6411,7 +6862,16 @@ pub const ModelManager = struct {
         native_generate_coordinator = null;
         owned_model_dir_owned = false;
         model_storage_owned = false;
-        loaded_session.resource_lease = null;
+        _ = loaded_session.take();
+        model.kernel_jit_profile_bundle = qualified_profile_bundle;
+        qualified_profile_bundle = null;
+        // Preparation is still fallible after construction ownership moves to
+        // the model. Keep a single rollback owner until publication takes it.
+        var unpublished_model_owned = true;
+        errdefer if (unpublished_model_owned) {
+            model.deinit();
+            self.allocator.destroy(model);
+        };
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the
@@ -6424,16 +6884,26 @@ pub const ModelManager = struct {
         {
             if (session_factory.getGptConfig(session)) |gpt_config| {
                 if (graph_mod.metal_executor.supportsSession(session)) {
-                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(self.allocator, session, gpt_config) catch |err| {
+                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntimeWithControl(self.allocator, session, gpt_config, control) catch |err| {
+                        if (control) |active| try active.check();
+                        switch (err) {
+                            error.Canceled,
+                            error.Cancelled,
+                            error.Timeout,
+                            error.ProcessIsolationRequired,
+                            error.HardCancellationWatchdogNotStarted,
+                            error.InferenceWorkerShuttingDown,
+                            => return err,
+                            else => {},
+                        }
                         std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_dir, @errorName(err) });
                     };
                 }
             }
         }
 
-        model.kernel_jit_profile_bundle = qualified_profile_bundle;
-        qualified_profile_bundle = null;
-
+        if (control) |active| try active.check();
+        unpublished_model_owned = false;
         return self.publishLoadedModel(model, cache_default_alias, a4b_request);
     }
 
@@ -6584,6 +7054,56 @@ fn loadedModelUsesPreferredBackend(
     return false;
 }
 
+const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
+const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(model_dir);
+    hasher.update(&[_]u8{@intFromEnum(backend)});
+    var digest: ModelBackendHealthKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn markModelBackendUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) void {
+    const retry_after_ns = platform.time.monotonicNs() +| model_backend_quarantine_ns;
+    spinLock(&self.unhealthy_backend_lock);
+    self.unhealthy_model_backends.put(
+        self.allocator,
+        modelBackendHealthKey(model_dir, backend),
+        retry_after_ns,
+    ) catch {
+        self.unhealthy_backend_lock.unlock();
+        return;
+    };
+    self.unhealthy_backend_lock.unlock();
+    std.log.warn("quarantined inference model path={s} backend={s} for {d}ms", .{
+        model_dir,
+        @tagName(backend),
+        model_backend_quarantine_ns / std.time.ns_per_ms,
+    });
+}
+
+fn modelBackendIsUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) bool {
+    const key = modelBackendHealthKey(model_dir, backend);
+    const now_ns = platform.time.monotonicNs();
+    spinLock(&self.unhealthy_backend_lock);
+    defer self.unhealthy_backend_lock.unlock();
+    const retry_after_ns = self.unhealthy_model_backends.get(key) orelse return false;
+    if (now_ns < retry_after_ns) return true;
+    _ = self.unhealthy_model_backends.remove(key);
+    return false;
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -6654,6 +7174,10 @@ test "explicit backend lookup reuses only a matching default alias" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6671,6 +7195,7 @@ test "explicit backend lookup reuses only a matching default alias" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -6879,6 +7404,10 @@ test "failed loaded model retires from lookup while active handles unwind" {
         fn run(_: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
             return alloc.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6893,6 +7422,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         var state: u8 = 0;
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -6916,7 +7446,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         .io = std.testing.io,
         .model = &model,
         .refs = 2,
-        .owner_ref_pending = false,
+        .task_ref_pending = false,
     };
     try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
 
@@ -7076,7 +7606,19 @@ fn sessionManagerForPreferredBackends(
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
+        .process_isolation_available = source.process_isolation_available,
     };
+}
+
+test "session manager load clones preserve process isolation policy" {
+    var source = backends.SessionManager.init(std.testing.allocator);
+    source.process_isolation_available = false;
+    const clone = sessionManagerForPreferredBackends(
+        std.testing.allocator,
+        &.{.native},
+        &source,
+    );
+    try std.testing.expect(!clone.process_isolation_available);
 }
 
 pub const ManagedSession = struct {
@@ -7089,6 +7631,15 @@ pub const ManagedSession = struct {
         if (self.resource_lease) |*lease| lease.release();
         self.resource_lease = null;
         self.owns_session = false;
+    }
+
+    /// Move the session and its admission together. A deferred deinit remains
+    /// safe on the emptied source, including across fallible publication work.
+    pub fn take(self: *ManagedSession) ManagedSession {
+        const owned = self.*;
+        self.resource_lease = null;
+        self.owns_session = false;
+        return owned;
     }
 
     /// Transfer session ownership while leaving admission accounting with the
@@ -7646,13 +8197,26 @@ fn nativeModelLoadAdmission(
     };
 }
 
+/// All managed constructors share this boundary. Keep the returned guard in
+/// the attempt's scope until post-construction checks and rollback finish.
+fn enterSessionConstruction(
+    control: ?InferenceExecutionControl,
+    backend_runtime: backends.BackendRuntime,
+) !execution_control_mod.UninterruptibleGuard {
+    const active = control orelse return .{};
+    try active.check();
+    return active.enterUninterruptible(backend_runtime.loadInterruption());
+}
+
 fn loadSessionForPreferredBackends(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
     model_dir: []const u8,
     man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
+    if (control) |active| try active.check();
     var required_backend_scratch: [1]backends.BackendType = undefined;
     const policy_backends = try source_session_manager.requiredBackendCandidates(
         preferred_backends,
@@ -7673,6 +8237,11 @@ fn loadSessionForPreferredBackends(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
+        if (control) |active| try active.check();
+        if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
+            rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
+            continue;
+        }
         if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
             std.log.err(
                 "loadModel({s}) qualified CUDA A4B artifact rejected CPU fallback after GPU admission failure",
@@ -7690,6 +8259,13 @@ fn loadSessionForPreferredBackends(
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (control) |active| try active.updateDetail(
+            .preparing_weights,
+            0,
+            1,
+            model_dir,
+            @tagName(backend),
+        );
         if (source_session_manager.kernel_jit.mode.failClosed() and
             std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
@@ -7700,6 +8276,9 @@ fn loadSessionForPreferredBackends(
         };
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+        // This attempt owns admission until the successful result explicitly
+        // takes it. Includes cancellation, guard-arm failure, and fallback.
+        defer if (resource_lease) |*lease| lease.release();
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
@@ -7729,6 +8308,7 @@ fn loadSessionForPreferredBackends(
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
             }
+            if (control) |active| try active.check();
             resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
                 admission_limits,
@@ -7751,42 +8331,45 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
-            var session = loaded_session;
-            if (resource_lease) |*lease| {
-                lease.retain(resident_amounts) catch |err| {
-                    session.close();
-                    lease.release();
-                    return err;
-                };
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
             }
+            return err;
+        };
+        defer hard_cancellation.deinit();
+        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+            var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+            resource_lease = null;
+            defer loaded.deinit();
+            if (control) |active| try active.check();
+            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
                 const session_admission_limits = manager.admissionLimitsForSession(
                     backend_runtime,
-                    session,
+                    loaded.session,
                 );
-                attachSessionRunAdmission(
+                try attachSessionRunAdmission(
                     manager.allocator,
-                    &session,
+                    &loaded.session,
                     manager.admissionController(),
                     backend_runtime,
                     session_admission_limits,
                     resident_amounts,
                     &man,
-                ) catch |err| {
-                    session.close();
-                    if (resource_lease) |*lease| lease.release();
-                    return err;
-                };
+                );
             }
-            return .{ .session = session, .resource_lease = resource_lease };
+            return loaded.take();
         } else |err| {
-            if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
             rememberPreferredLoadError(&first_err, err);
         }
     }
 
+    // A missing process boundary is an expected fail-closed policy decision,
+    // not an artifact/import failure.
+    if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
     std.log.err("manifest paths onnx={?s} visual={?s} audio={?s} text_projection={?s} visual_projection={?s} audio_projection={?s}", .{
         man.onnx_path,
@@ -7799,6 +8382,407 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+fn writeCancellationTestModel(dir: std.Io.Dir, allocator: std.mem.Allocator) !void {
+    try writeTinyDebertaEncoderGgufForModelManagerTest(dir, allocator, "model.gguf");
+    try dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"deberta","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        ,
+    });
+    try dir.writeFile(std.testing.io, .{
+        .sub_path = "tokenizer.json",
+        .data =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}
+        ,
+    });
+}
+
+/// Record checkpoints on a successful cold load, then inject cancellation at
+/// those exact checkpoints without depending on hard-coded check counts.
+const LoadCancellationTrace = struct {
+    checks: usize = 0,
+    fail_at: ?usize = null,
+    after_manifest: usize = 0,
+    after_session: usize = 0,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.checks += 1;
+        if (self.fail_at == self.checks) return error.Cancelled;
+    }
+
+    fn progress(raw: ?*anyopaque, update: execution_control_mod.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (update.phase != .loading_model or update.total != 4) return;
+        if (update.completed == 1) self.after_manifest = self.checks;
+        if (update.completed == 3) self.after_session = self.checks;
+    }
+
+    fn control(self: *@This()) InferenceExecutionControl {
+        return .{ .ptr = self, .check_fn = check, .progress = .{ .ptr = self, .update_fn = progress } };
+    }
+};
+
+test "cold direct loads own a concurrent runtime beyond the request lifetime" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    {
+        var request_io = std.Io.Threaded.init(allocator, .{});
+        defer request_io.deinit();
+        var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{ .io = request_io.io() });
+        defer handle.release();
+        try std.testing.expect(manager.owned_load_runtime != null);
+        try std.testing.expect(manager.load_io.?.userdata != request_io.io().userdata);
+    }
+    // The request runtime has been destroyed. Both cached access and another
+    // cold load must still work; retiring the first handle forces the latter.
+    {
+        var cached = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+        cached.retire();
+    }
+    var reloaded = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer reloaded.release();
+    // A late attachment must not move an existing Group to a different Io.
+    const owned_io = manager.load_io.?;
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+}
+
+test "cold load coordination reuses an attached runtime without a fallback" {
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+    try std.testing.expect(manager.owned_load_runtime == null);
+}
+
+test "ColQwen query forward observes managed backend cancellation after tokenization" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer handle.release();
+    var trace = LoadCancellationTrace{};
+    var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+    defer compute.deinit();
+    trace.fail_at = trace.checks + 1;
+    // No pipeline-level control: only the managed backend can stop this
+    // forward after tokenization, at its first weight operation.
+    try std.testing.expectError(error.Cancelled, @import("../pipelines/multimodal_reranker_colqwen_impl.zig").encodeQuery(
+        &compute.backend,
+        allocator,
+        handle.get().getTokenizer(),
+        .{},
+        .{ .hidden_size = 4, .vocab_size = 16, .num_hidden_layers = 1, .num_attention_heads = 2 },
+        "a",
+        16,
+        false,
+        null,
+    ));
+    try std.testing.expectEqual(trace.fail_at.?, trace.checks);
+}
+
+test "cold load rollback owns manifest and constructed session before cancellation checkpoints" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var checkpoints: [3]usize = undefined;
+    for (0..4) |iteration| {
+        var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+        defer manager.deinit();
+        manager.configureServingPolicy(.{ .allow_unknown = true });
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+        try manager.ensureResourceOwnerReady();
+        var trace = LoadCancellationTrace{ .fail_at = if (iteration == 0) null else checkpoints[iteration - 1] };
+        const result = manager.loadFromDirUncached(root, &manager.session_manager, true, null, trace.control());
+        if (iteration == 0) {
+            var handle = try result;
+            defer handle.release();
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+            // The final checkpoint is after ownership has moved into the
+            // unpublished model, including any speculative preparation.
+            checkpoints = .{ trace.after_manifest, trace.after_session, trace.checks };
+            try std.testing.expect(checkpoints[0] > 0 and checkpoints[1] > checkpoints[0]);
+            try std.testing.expect(checkpoints[2] > checkpoints[1]);
+            var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+            defer compute.deinit();
+            trace.fail_at = trace.checks + 1;
+            try std.testing.expectError(error.Cancelled, compute.backend.checkExecutionControl());
+        } else {
+            try std.testing.expectError(error.Cancelled, result);
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "load flight waiter exits release retirement reservations and admission" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+
+    const Exit = enum { cancel_during_wait, cancel_after_completion, adopt };
+    const Cancellation = struct {
+        manager: *ModelManager,
+        flight: *LoadFlight,
+        model: *LoadedModel,
+        publish_before_cancel: bool,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.publish_before_cancel) {
+                // Deterministically interleave completion and retirement after
+                // the waiter observed an incomplete flight, before it exits.
+                self.manager.finishLoadFlight(self.flight, self.model, null);
+                self.manager.retireLoadedModel(self.model);
+            }
+            return error.Cancelled;
+        }
+    };
+
+    for ([_]bool{ false, true }) |task_ref_pending| {
+        for ([_]Exit{ .cancel_during_wait, .cancel_after_completion, .adopt }) |exit| {
+            var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+            defer manager.deinit();
+            manager.configureServingPolicy(.{ .allow_unknown = true });
+            manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+            try manager.ensureResourceOwnerReady();
+            var keeper = try manager.loadFromDirUncached(root, &manager.session_manager, true, null, null);
+            defer keeper.release();
+            const model = keeper.get();
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+
+            const flight = try allocator.create(LoadFlight);
+            flight.* = .{
+                .io = std.testing.io,
+                .refs = 1 + @as(usize, @intFromBool(task_ref_pending)),
+                .task_ref_pending = task_ref_pending,
+            };
+            try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
+            // The task can drop its reference either before or after the
+            // waiter. Only waiter references own retirement reservations.
+            defer if (task_ref_pending) manager.releaseLoadFlight("flight", flight);
+            var cancellation = Cancellation{
+                .manager = &manager,
+                .flight = flight,
+                .model = model,
+                .publish_before_cancel = exit == .cancel_during_wait,
+            };
+            if (exit != .cancel_during_wait) {
+                manager.finishLoadFlight(flight, model, null);
+                manager.retireLoadedModel(model);
+            }
+            const result = manager.waitForLoadFlight("flight", flight, if (exit == .adopt) null else .{
+                .ptr = &cancellation,
+                .check_fn = Cancellation.check,
+            });
+            if (exit == .adopt) {
+                var adopted = try result;
+                try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+                adopted.release();
+            } else {
+                try std.testing.expectError(error.Cancelled, result);
+            }
+            try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+            keeper.release();
+            // This proves that cancellation releases the native model and its
+            // lease, not merely that it removes the flight from the registry.
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "optional session adoption owns rollback and transfers admission exactly once" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var final_check: usize = 0;
+    for (0..2) |iteration| {
+        var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+        defer manager.deinit();
+        manager.configureServingPolicy(.{ .allow_unknown = true });
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+        try manager.ensureResourceOwnerReady();
+        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+        defer primary.deinit();
+        const baseline = manager.admissionController().snapshot();
+        var model: LoadedModel = undefined;
+        model.allocator = allocator;
+        model.session = primary.session;
+        model.session_manager = &manager.session_manager;
+        model.model_manager = &manager;
+        model.kernel_jit_profile_bundle = null;
+        var slot: ?backends.Session = null;
+        var lease_slot: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (lease_slot) |*lease| lease.release();
+        defer if (slot) |session| session.close();
+        var trace = LoadCancellationTrace{ .fail_at = if (iteration == 0) null else final_check };
+        const result = model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease_slot, root, trace.control());
+        if (iteration == 0) {
+            try std.testing.expect(try result);
+            final_check = trace.checks;
+            try std.testing.expect(slot != null and lease_slot != null);
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > baseline.host_weight_bytes);
+            // Already-adopted components must not load or reserve again.
+            try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease_slot, root, .{}));
+        } else {
+            try std.testing.expectError(error.Cancelled, result);
+            try std.testing.expect(slot == null and lease_slot == null);
+            try std.testing.expectEqual(baseline, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "component construction arms cancellation before backend entry and releases admission on failure" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    const Boundary = struct {
+        manager: *ModelManager,
+        arms: usize = 0,
+        fn arm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.manager.admissionController().snapshot().host_weight_bytes > 0);
+            self.arms += 1;
+            return error.OutOfMemory;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed constructor guard cannot be disarmed");
+        }
+    };
+    var boundary = Boundary{ .manager = &manager };
+    for (0..3) |_| {
+        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        try std.testing.expectError(error.OutOfMemory, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{
+            .hard_cancellation = .{ .ptr = &boundary, .arm_fn = Boundary.arm, .disarm_fn = Boundary.disarm },
+        }));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    }
+    try std.testing.expectEqual(@as(usize, 3), boundary.arms);
+}
+
+test "managed constructors retain cooperative fallback without a process boundary" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{ .metal, .native },
+        .process_isolation_available = false,
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    var man = try manifest_mod.loadFromDir(allocator, root);
+    defer man.deinit();
+    for ([_]bool{ false, true }) |component| {
+        var loaded = if (component)
+            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{})
+        else
+            try loadSessionForPreferredBackends(&manager, &.{ .metal, .native }, root, man, &manager.session_manager, .{});
+        try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
+        loaded.deinit();
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    }
+}
+
+test "preferred load attempt releases admission on cancellation and guard failure" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // Admission only needs artifact bytes. These cases must fail before any
+    // backend constructor sees the deliberately invalid artifact.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "weights.bin", .data = "weights" });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "weights.bin" });
+    defer allocator.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator, .onnx_path = path };
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.required_backend = null;
+    sessions.required_backend_invalid = false;
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024, .backend_limit_bytes = 1024 });
+    try manager.ensureResourceOwnerReady();
+
+    const Hooks = struct {
+        fn cancelAfterAdmission(raw: ?*anyopaque) !void {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw.?));
+            if (owner.admissionController().snapshot().host_weight_bytes > 0) return error.Timeout;
+        }
+        fn failArm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw));
+            try std.testing.expect(owner.admissionController().snapshot().host_weight_bytes > 0);
+            return error.OutOfMemory;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed arm must not be disarmed");
+        }
+    };
+    const controls = [_]InferenceExecutionControl{
+        .{},
+        .{ .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
+        .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
+    };
+    const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
+    // Metal and CPU ONNX have the same process-required construction contract;
+    // use Metal's runtime descriptor so this test needs no optional ORT install.
+    for (0..3) |_| for (controls, errors) |control, expected| {
+        try std.testing.expectError(expected, loadSessionForPreferredBackends(
+            &manager,
+            &.{.metal},
+            root,
+            man,
+            &sessions,
+            control,
+        ));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    };
 }
 
 fn loadErrorPriority(err: anyerror) u2 {

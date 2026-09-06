@@ -26916,9 +26916,9 @@ fn createManagedDbEnrichments(
         const io = managed_io orelse return error.MissingBackendRuntimeIo;
         break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
             .antfly_provider = local_provider,
+            .inference_api_url = inference_api_url,
             .secret_store = store,
             .remote_capability_cache = remote_capability_cache,
-            .inference_api_url = inference_api_url,
             .source_table = source_table,
         });
     } else null;
@@ -27423,6 +27423,12 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
+        // `enrichments` is a move-only owner. The initial open consumes and
+        // clears it when producers are enabled, but a provider-only set keeps
+        // its chunk provider until this scope releases it. Do that before
+        // replacing the aggregate; assignment would otherwise discard its
+        // owned routing strings and HTTP client.
+        enrichments.deinit(alloc);
         enrichments = try createManagedDbEnrichments(
             alloc,
             indexes_json,

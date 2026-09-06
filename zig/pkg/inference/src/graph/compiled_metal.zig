@@ -201,7 +201,11 @@ fn ensureModelExecutor(
 fn resetRuntimeAtPrefillStart(runtime: *model_runtime.ModelRuntime, request: model_runtime.PrefillRequest) !void {
     // A fresh prompt starts at position zero. Later chunks must retain the
     // runtime-owned KV written by earlier chunks.
-    if (request.seq_len == request.query_seq_len) try runtime.reset();
+    if (request.seq_len == request.query_seq_len) {
+        try request.check();
+        try runtime.reset();
+        try request.check();
+    }
 }
 
 fn executeModelForward(
