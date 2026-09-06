@@ -12,14 +12,15 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Job-local immutable topology and shuffle records. These bounded blocks use
+//! Job-local immutable adjacency, bounded fold state, and fixture value records.
+//! These bounded blocks use
 //! numeric ordinals throughout iteration; document IDs are resolved only when
 //! compiling topology or crossing the public score boundary.
 const std = @import("std");
 pub const max_edges = 4096;
 pub const fold_entries = 256;
 
-/// One bounded shuffle fold. Cursor and compensated accumulators commit
+/// One bounded adjacency fold. Cursor and compensated accumulators commit
 /// together; attempt identity prevents a replacement from mixing executions.
 pub const Fold = struct {
     attempt: u64 = 0,

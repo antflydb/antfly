@@ -590,13 +590,13 @@ seed budget caps input at 64 MiB and decode/mapping work at 67,108,864 units
 (one prior byte plus one current node per unit). Every actual read is charged,
 including repeated identities; no seed cache is implied. Zero allowance disables
 warm starts. Exhausting this optional budget cold-starts without consuming later
-metrics' cold execution allowance. Materializer epoch 9 fingerprints this policy
-and the independently authenticated routing-root format.
+metrics' cold execution allowance. Materializer epoch 10 fingerprints this policy
+and the independently authenticated paged routing format.
 An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 7 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 8 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
 The same job/configuration/epoch fence applies to workers, coordinator phase
@@ -615,47 +615,52 @@ and preserves caller order. Attempt-fenced checkpoint writes update each block
 once and retire obsolete iterations by block. Small graphs use the same bounded
 pipeline, with one summary leaf, one scalar root, and one data partition.
 
-Iterative native jobs compile bounded, immutable ordinal topology checkpoints once
-per job and contribution lane. Subsequent iterations consume numeric edge and
-vector blocks without parsing document IDs or repeating source dictionary lookups.
-Contribution output is packed by target ordinal block and checkpoint, with the
-producer attempt in its identity. Each producer checkpoint writes at most 4,096
-ordinal values directly to their destination block namespaces; retries do not
-rescan or delete staged output. Reducers select only the completed producer's
-attempt, so a replacement attempt with different checkpoint boundaries cannot
-double-count abandoned output. Document IDs remain at the input/output boundary;
-node-oriented reducer reads still resolve their ordinals through sorted multi-get.
+Iterative native jobs compile immutable row-oriented adjacency during the first
+contribution phase of each lane. HITS stores both orientations, so hub reduction
+does not repeatedly scatter across target-sorted physical edges. Each compile
+checkpoint scans at most 4,096 edges and emits tiles of at most 256 neighbor/output
+ordinal pairs, grouped by output vector block. Later contribution phases are
+metadata-only barriers. Reducers gather the current input vector directly; no
+numeric contribution shuffle is written on any iteration. Adjacency identities
+include the first-iteration producer attempt and checkpoint. Reducers select only
+that producer's completed attempt, so replacement attempts with different tile
+boundaries cannot double-count abandoned output. Document IDs remain at the
+input/output boundary; node-oriented reducers resolve ordinals by sorted multi-get.
 
-All native reducers retain immutable inputs throughout the consumer phase.
+All native reducers retain immutable adjacency until job cleanup.
 Checkpointed output may be replayed safely after lease takeover. Once every
-consumer finishes, the phase barrier deletes at most 512 input records per
+consumer finishes, the phase barrier deletes at most 512 temporary vector records per
 transaction, persisting a last-deleted-key cursor atomically with each batch.
 Restart seeks beyond that cursor instead of rescanning LSM tombstones. Completed
 namespaces retain a durable sentinel until job cleanup. Retirement counts flow
 through DB maintenance sweeps, idle detection and runtime status
 (`total_retired_input_records` / `last_retired_input_records`). The barrier advances
-only after cleanup finishes. Both HITS lanes retire each iteration this way,
-rather than accumulating hub shards until publication. Retained contribution
-state is bounded by one iteration (including bounded abandoned attempts), not
-the number of power iterations.
+only after cleanup finishes. Both HITS lanes retire raw vectors each iteration.
+Retained topology is proportional to edges and bounded producer attempts, not
+the number of power iterations; temporary vectors remain iteration-bounded.
 
 Large reduction passes reuse the immutable node quantiles: independently leased
-producers fold at most 512 physical contribution shards for a group of up to
+producers fold at most 16 physical adjacency tiles (at most 4,096 edges) for a group of up to
 256 nodes per checkpoint. Their attempt-fenced cursor and compensated sums
 survive restart; a replacement attempt recomputes without mixing old state.
 Completed folds atomically publish raw vector blocks and partial spectral norms
 or PageRank dangling mass. The root deterministically combines at most 256
 completed scalar records. Data reducers stay behind that barrier and read only
-raw vector blocks, eliminating the second shuffle fold for normalization.
-Raw vectors retire with the consumed inputs, bounding retained state by an
+raw vector blocks, avoiding a second adjacency traversal for normalization.
+Raw vectors retire at the consumer barrier, bounding temporary state by an
 iteration. Filtered-out ranges contribute empty leaves.
 
-Serverless metric wire version 8 separates the ranked routing root from the
-primary point index. Manifest version 18 carries both digests, so point reads
-still authenticate the complete footer in one range request. Top-K reads fetch
-only the root (at most 1,832 bytes) and the requested ranked blocks, never the
-primary point index. The root also binds primary vector extents and the point
-index digest; decoders validate the cross-tier relationship. Unreleased older
+Serverless metric wire version 9 separates the ranked routing root, a sparse
+directory, and 64-entry primary routing pages. Manifest version 18 authenticates
+the root, which authenticates the directory; each directory entry authenticates
+one routing page, whose entries authenticate score blocks. Point reads load
+only selected pages, with global block ordinals preserving score-cache identity.
+Indexes fitting in one routing page retain a single footer fetch and decoded
+cache lease, avoiding extra network round trips for small metrics.
+Top-K reads fetch only the root (at most 1,872 bytes) and requested ranked blocks,
+never the point directory or pages. The root also binds primary vector extents
+and the complete point-index digest for full-artifact/warm-start validation.
+Decoders validate the cross-tier relationship. Unreleased older
 graph-metric wire versions are rejected rather than migrated at query time.
 
 Eigenvector and HITS always use canonical cold seeds in both runtimes. An old
@@ -663,7 +668,7 @@ spectral vector may have zero support on a newly dominant disconnected component
 normalization alone cannot make that a safe warm start. A future spectral restart
 policy needs component/support guarantees and oracle tests for topology changes.
 
-Serverless query caches retain authenticated decoded metric routing indexes under
+Serverless query caches retain authenticated decoded metric roots and directories under
 an independent 16 MiB process-memory budget (configurable with
 `max_graph_metric_routing_bytes`). Identity includes the immutable artifact,
 checksums, footer extent, and wire version. Leases keep borrowed IDs alive;
@@ -678,6 +683,10 @@ its lease before waiters wake without losing the result. Cancellation releases
 the waiter's registration; the last reference releases a bypassed result. This
 does not create another unbounded cache: fill registrations have fixed capacity,
 and every consuming query applies its retained-memory admission to the lease.
+Routing pages use the authenticated block cache and are decoded only for selected
+pages, so a large primary index cannot repeatedly bypass the decoded-index cache.
+Fetched payloads are freed by their query-session allocator, independently of the
+allocator owning returned scores or per-request routing arrays.
 No storage or decode operation runs under the cache lock. Warm point
 and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
 misses, and retained bytes are exposed in query-cache statistics.

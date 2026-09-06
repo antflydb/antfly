@@ -18,7 +18,7 @@ const bounded_decode = @import("../bounded_decode.zig");
 // Epoch 9 shares optional warm starts across lake and document publication.
 // Rebuild older sidecars so admission decisions and output remain tied to one
 // explicit materializer contract.
-pub const materializer_epoch: u32 = 9;
+pub const materializer_epoch: u32 = 10;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

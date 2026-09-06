@@ -25,6 +25,11 @@ pub const wire_version: u16 = artifact_ref.graph_metric_segment_wire_version;
 const fixed_header_len = wire_magic.len + @sizeOf(u16) + 4 * @sizeOf(u8) + @sizeOf(u32) +
     3 * @sizeOf(u64) + 3 * @sizeOf(u32);
 const routing_magic = "AFGR";
+// Footer: AFGR/count, flat entries grouped into authenticated 64-entry pages,
+// AFGD directory, AFTK root, root-length/footer-length trailer. The root binds
+// both the directory digest (sparse reads) and full point digest (verification).
+const directory_magic = "AFGD";
+pub const routing_page_entries: usize = 64;
 const top_tier_magic = "AFTK";
 pub const routing_trailer_len: usize = 8;
 pub const score_block_entries: usize = 1024;
@@ -36,7 +41,7 @@ pub const max_ranked_score_block_bytes: usize = @sizeOf(u16) + max_score_node_id
 const routing_header_len = routing_magic.len + @sizeOf(u32);
 const routing_entry_fixed_len = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32) + std.crypto.hash.sha2.Sha256.digest_length;
 const top_tier_header_len = top_tier_magic.len + @sizeOf(u32) + @sizeOf(u32);
-const routing_root_metadata_len = 2 * @sizeOf(u64) + 32;
+const routing_root_metadata_len = 3 * @sizeOf(u64) + 64;
 const routing_root_trailer_len = @sizeOf(u32) + routing_trailer_len;
 const ranked_score_fixed_len = @sizeOf(u16) + @sizeOf(u64);
 const ranked_routing_entry_len = @sizeOf(u64) + @sizeOf(u32) + std.crypto.hash.sha2.Sha256.digest_length;
@@ -64,6 +69,8 @@ pub const Control = struct {
 };
 
 pub const RoutingEntry = struct {
+    /// Global score-block ordinal, including when only selected pages are loaded.
+    block_index: usize = 0,
     first_node_id: []const u8,
     offset: u64,
     len: usize,
@@ -97,6 +104,8 @@ pub const RoutingIndex = struct {
     primary_data_offset: u64 = 0,
     primary_data_end: u64 = 0,
     point_index_checksum: [32]u8 = @splat(0),
+    directory_len: usize = 0,
+    directory_checksum: [32]u8 = @splat(0),
 
     pub fn deinit(self: *RoutingIndex, alloc: Allocator) void {
         alloc.free(self.entries);
@@ -313,18 +322,19 @@ pub fn decodeRoutingIndexForVersionWithCancellationAlloc(
         if (entry_index > 0 and std.mem.order(u8, entries[entry_index - 1].first_node_id, first_node_id) != .lt) {
             return error.InvalidGraphMetricSegment;
         }
-        entry.* = .{ .first_node_id = first_node_id, .offset = offset, .len = len_u32, .checksum = checksum };
+        entry.* = .{ .block_index = entry_index, .first_node_id = first_node_id, .offset = offset, .len = len_u32, .checksum = checksum };
         previous_end = end;
     }
-    if (pos != point_index.len or (previous_end orelse root.primary_data_offset) != root.primary_data_end or
+    if (pos + root.directory_len != point_index.len or (previous_end orelse root.primary_data_offset) != root.primary_data_end or
         (entries.len != 0 and entries[0].offset != root.primary_data_offset)) return error.InvalidGraphMetricSegment;
+    try validateDirectory(point_index, pos, footer_offset, entry_count, root.directory_checksum, cancellation);
     try cancellation.check();
     alloc.free(root.entries);
     root.entries = entries;
     return root;
 }
 
-/// The root is at most 1,832 bytes, independent of primary vector cardinality.
+/// The root is bounded independently of primary vector cardinality.
 /// Its trailer length is included in the manifest-authenticated digest.
 pub fn routingRootLen(score_count: usize) usize {
     return top_tier_header_len + routing_root_metadata_len + routing_root_trailer_len +
@@ -355,6 +365,10 @@ pub fn decodeRoutingRootAlloc(alloc: Allocator, root: []const u8, artifact_byte_
     if (primary_start > primary_end or primary_end > footer_offset) return error.InvalidGraphMetricSegment;
     var point_checksum: [32]u8 = undefined;
     @memcpy(&point_checksum, try take(root, &pos, 32));
+    const directory_len = std.math.cast(usize, try readInt(u64, root, &pos)) orelse return error.InvalidGraphMetricSegment;
+    if (directory_len < routing_header_len or directory_len > footer_len - root.len - routing_header_len) return error.InvalidGraphMetricSegment;
+    var directory_checksum: [32]u8 = undefined;
+    @memcpy(&directory_checksum, try take(root, &pos, 32));
     const entries = try alloc.alloc(RankedRoutingEntry, blocks);
     errdefer alloc.free(entries);
     var next_offset = primary_end;
@@ -367,7 +381,90 @@ pub fn decodeRoutingRootAlloc(alloc: Allocator, root: []const u8, artifact_byte_
         next_offset += len;
     }
     if (next_offset != footer_offset or pos + routing_root_trailer_len != root.len) return error.InvalidGraphMetricSegment;
-    return .{ .entries = try alloc.alloc(RoutingEntry, 0), .ranked_entries = entries, .top_score_count = count, .footer_offset = footer_offset, .primary_data_offset = primary_start, .primary_data_end = primary_end, .point_index_checksum = point_checksum };
+    return .{ .entries = try alloc.alloc(RoutingEntry, 0), .ranked_entries = entries, .top_score_count = count, .footer_offset = footer_offset, .primary_data_offset = primary_start, .primary_data_end = primary_end, .point_index_checksum = point_checksum, .directory_len = directory_len, .directory_checksum = directory_checksum };
+}
+
+fn readRoutingEntry(bytes: []const u8, pos: *usize) !RoutingEntry {
+    const id_len = try readInt(u32, bytes, pos);
+    if (id_len == 0 or id_len > max_score_node_id_bytes) return error.InvalidGraphMetricSegment;
+    const offset = try readInt(u64, bytes, pos);
+    const len = try readInt(u32, bytes, pos);
+    if (len == 0) return error.InvalidGraphMetricSegment;
+    var checksum: [32]u8 = undefined;
+    @memcpy(&checksum, try take(bytes, pos, 32));
+    return .{ .first_node_id = try take(bytes, pos, id_len), .offset = offset, .len = len, .checksum = checksum };
+}
+
+/// Directory entries describe authenticated routing pages, not score blocks.
+/// Their identifiers borrow bytes; the caller retains the directory payload.
+pub fn decodePointDirectoryAlloc(alloc: Allocator, bytes: []const u8, directory_offset: u64, footer_offset: u64, block_count: usize, cancellation: CancellationToken) ![]RoutingEntry {
+    try cancellation.check();
+    var pos: usize = 0;
+    if (!std.mem.eql(u8, try take(bytes, &pos, directory_magic.len), directory_magic)) return error.InvalidGraphMetricSegment;
+    const count = try readInt(u32, bytes, &pos);
+    if (count != scoreBlockCountForSize(block_count, routing_page_entries) or count > bytes.len / routing_entry_fixed_len) return error.InvalidGraphMetricSegment;
+    const entries = try alloc.alloc(RoutingEntry, count);
+    errdefer alloc.free(entries);
+    var next = std.math.add(u64, footer_offset, routing_header_len) catch return error.InvalidGraphMetricSegment;
+    for (entries, 0..) |*entry, i| {
+        try cancellation.check();
+        entry.* = try readRoutingEntry(bytes, &pos);
+        entry.block_index = i * routing_page_entries;
+        if (entry.offset != next or next > directory_offset or entry.len > directory_offset - next or
+            entry.len > routing_page_entries * (routing_entry_fixed_len + max_score_node_id_bytes) or
+            (i > 0 and std.mem.order(u8, entries[i - 1].first_node_id, entry.first_node_id) != .lt)) return error.InvalidGraphMetricSegment;
+        next += entry.len;
+    }
+    if (pos != bytes.len or next != directory_offset) return error.InvalidGraphMetricSegment;
+    return entries;
+}
+
+pub fn decodePointPageAlloc(alloc: Allocator, bytes: []const u8, page: RoutingEntry, block_count: usize, primary_start: u64, primary_end: u64, cancellation: CancellationToken) ![]RoutingEntry {
+    try cancellation.check();
+    if (page.block_index >= block_count or bytes.len != page.len) return error.InvalidGraphMetricSegment;
+    const count = @min(routing_page_entries, block_count - page.block_index);
+    const entries = try alloc.alloc(RoutingEntry, count);
+    errdefer alloc.free(entries);
+    var pos: usize = 0;
+    var next: ?u64 = null;
+    for (entries, 0..) |*entry, i| {
+        try cancellation.check();
+        entry.* = try readRoutingEntry(bytes, &pos);
+        entry.block_index = page.block_index + i;
+        if (entry.offset < primary_start or entry.offset > primary_end or entry.len > primary_end - entry.offset or
+            (next != null and entry.offset != next.?) or
+            (i > 0 and std.mem.order(u8, entries[i - 1].first_node_id, entry.first_node_id) != .lt)) return error.InvalidGraphMetricSegment;
+        next = entry.offset + entry.len;
+    }
+    if (pos != bytes.len or !std.mem.eql(u8, entries[0].first_node_id, page.first_node_id) or
+        (page.block_index == 0 and entries[0].offset != primary_start) or
+        (page.block_index + count == block_count and next.? != primary_end)) return error.InvalidGraphMetricSegment;
+    return entries;
+}
+
+/// Validate the complete directory against the canonical flat page records.
+/// Full artifact validation and warm-start reads use this allocation-free path.
+fn validateDirectory(point: []const u8, directory_start: usize, footer_offset: u64, block_count: usize, checksum: [32]u8, cancellation: CancellationToken) !void {
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(point[directory_start..], &actual, .{});
+    if (!std.mem.eql(u8, &actual, &checksum)) return error.InvalidGraphMetricSegment;
+    var pos = directory_start;
+    if (!std.mem.eql(u8, try take(point, &pos, directory_magic.len), directory_magic)) return error.InvalidGraphMetricSegment;
+    const page_count = scoreBlockCountForSize(block_count, routing_page_entries);
+    if (try readInt(u32, point, &pos) != page_count) return error.InvalidGraphMetricSegment;
+    var record_pos: usize = routing_header_len;
+    for (0..page_count) |page_index| {
+        try cancellation.check();
+        const page = try readRoutingEntry(point, &pos);
+        const start = record_pos;
+        const first = try readRoutingEntry(point[0..directory_start], &record_pos);
+        const count = @min(routing_page_entries, block_count - page_index * routing_page_entries);
+        for (1..count) |_| _ = try readRoutingEntry(point[0..directory_start], &record_pos);
+        std.crypto.hash.sha2.Sha256.hash(point[start..record_pos], &actual, .{});
+        if (page.offset != footer_offset + start or page.len != record_pos - start or
+            !std.mem.eql(u8, page.first_node_id, first.first_node_id) or !std.mem.eql(u8, &page.checksum, &actual)) return error.InvalidGraphMetricSegment;
+    }
+    if (pos != point.len or record_pos != directory_start) return error.InvalidGraphMetricSegment;
 }
 
 pub fn artifactIntegrity(segment: types.Segment, payload: []const u8) !ArtifactIntegrity {
@@ -655,6 +752,31 @@ pub fn encodeAllocWithCancellationAndLimit(
         block_offset += block_len;
     }
     std.debug.assert(block_offset == score_data_end);
+    const directory_offset = pos;
+    putBytes(data, &pos, directory_magic);
+    putInt(u32, data, &pos, @intCast(scoreBlockCountForSize(block_count, routing_page_entries)));
+    var page_start = footer_offset + routing_header_len;
+    var first_block: usize = 0;
+    while (first_block < block_count) : (first_block += routing_page_entries) {
+        try cancellation.check();
+        var page_end = page_start;
+        for (first_block..@min(block_count, first_block + routing_page_entries)) |_| {
+            _ = try readRoutingEntry(data[0..directory_offset], &page_end);
+        }
+        const first_id = segment.scores[first_block * score_block_entries].node_id;
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data[page_start..page_end], &checksum, .{});
+        putInt(u32, data, &pos, @intCast(first_id.len));
+        putInt(u64, data, &pos, @intCast(page_start));
+        putInt(u32, data, &pos, @intCast(page_end - page_start));
+        putBytes(data, &pos, &checksum);
+        putBytes(data, &pos, first_id);
+        page_start = page_end;
+    }
+    std.debug.assert(page_start == directory_offset);
+    const directory_len = pos - directory_offset;
+    var directory_checksum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data[directory_offset..pos], &directory_checksum, .{});
     var point_checksum: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data[footer_offset..pos], &point_checksum, .{});
     const root_offset = pos;
@@ -664,6 +786,8 @@ pub fn encodeAllocWithCancellationAndLimit(
     putInt(u64, data, &pos, @intCast(score_data_offset));
     putInt(u64, data, &pos, @intCast(score_data_end));
     putBytes(data, &pos, &point_checksum);
+    putInt(u64, data, &pos, @intCast(directory_len));
+    putBytes(data, &pos, &directory_checksum);
     for (ranked_entries[0..prepared.blockCount()]) |entry| {
         putInt(u64, data, &pos, entry.offset);
         putInt(u32, data, &pos, @intCast(entry.len));
@@ -1032,11 +1156,14 @@ fn prepareTopTier(scores: []const types.Score, cancellation: CancellationToken) 
 }
 
 fn routingEncodedSize(scores: []const types.Score, prepared: *const PreparedTopTier) !usize {
-    var size: usize = routing_header_len + top_tier_header_len + routing_root_metadata_len + routing_root_trailer_len;
+    var size: usize = 2 * routing_header_len + top_tier_header_len + routing_root_metadata_len + routing_root_trailer_len;
     var score_index: usize = 0;
     while (score_index < scores.len) : (score_index += score_block_entries) {
         size = std.math.add(usize, size, routing_entry_fixed_len) catch return error.GraphMetricSegmentTooLarge;
         size = std.math.add(usize, size, scores[score_index].node_id.len) catch return error.GraphMetricSegmentTooLarge;
+        if (score_index / score_block_entries % routing_page_entries == 0) {
+            size = std.math.add(usize, size, routing_entry_fixed_len + scores[score_index].node_id.len) catch return error.GraphMetricSegmentTooLarge;
+        }
     }
     size = std.math.add(usize, size, std.math.mul(usize, prepared.blockCount(), ranked_routing_entry_len) catch return error.GraphMetricSegmentTooLarge) catch return error.GraphMetricSegmentTooLarge;
     if (size > max_routing_bytes) return error.GraphMetricSegmentTooLarge;
@@ -1086,6 +1213,15 @@ fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []cons
         expected_offset += block_len;
     }
     if (expected_offset != score_data_end) return error.InvalidGraphMetricSegment;
+    const directory_start = pos;
+    if (!std.mem.eql(u8, try take(footer, &pos, directory_magic.len), directory_magic)) return error.InvalidGraphMetricSegment;
+    const page_count = scoreBlockCountForSize(scoreBlockCount(scores.len), routing_page_entries);
+    if (try readInt(u32, footer, &pos) != page_count) return error.InvalidGraphMetricSegment;
+    for (0..page_count) |_| _ = try readRoutingEntry(footer, &pos);
+    const directory_len = pos - directory_start;
+    var directory_checksum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(footer[directory_start..pos], &directory_checksum, .{});
+    try validateDirectory(footer[0..pos], directory_start, footer_offset, scoreBlockCount(scores.len), directory_checksum, cancellation);
     {
         var point_checksum: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(footer[0..pos], &point_checksum, .{});
@@ -1097,6 +1233,8 @@ fn validateRoutingFooter(data: []const u8, score_data_end: usize, scores: []cons
         if (block_count != scoreBlockCountForSize(expected_top.len, ranked_score_block_entries)) return error.InvalidGraphMetricSegment;
         if (try readInt(u64, footer, &pos) != primary_start or try readInt(u64, footer, &pos) != score_data_end or
             !std.mem.eql(u8, try take(footer, &pos, 32), &point_checksum)) return error.InvalidGraphMetricSegment;
+        if (try readInt(u64, footer, &pos) != directory_len or
+            !std.mem.eql(u8, try take(footer, &pos, 32), &directory_checksum)) return error.InvalidGraphMetricSegment;
         var ranked_offset = score_data_end;
         for (0..block_count) |block_index| {
             try cancellation.check();
@@ -1232,7 +1370,7 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     defer root.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), root.entries.len);
     try std.testing.expectEqual(@as(usize, 1), root.ranked_entries.len);
-    try std.testing.expectEqual(@as(usize, 1832), routingRootLen(1_000_000));
+    try std.testing.expectEqual(@as(usize, 1872), routingRootLen(1_000_000));
     try std.testing.expectEqual(routingRootLen(max_persisted_top_entries), routingRootLen(std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidGraphMetricSegment, decodeRoutingRootAlloc(alloc, encoded[encoded.len - root_len + 1 ..], encoded.len, wire_version, .none));
     const integrity = try artifactIntegrity(segment, encoded);

@@ -20,7 +20,7 @@
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
 pub const graph_metric_manifest_wire_version: u16 = 18;
-pub const graph_metric_segment_wire_version: u16 = 8;
+pub const graph_metric_segment_wire_version: u16 = 9;
 
 pub const GraphMetricMaterializationState = enum(u8) {
     ready = 0,
