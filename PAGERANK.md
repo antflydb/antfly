@@ -582,7 +582,7 @@ An optional seed never turns an admissible cold build into a budget rejection.
 Native PageRank pins its seed generation and configuration for the job and computes
 the surviving seed mass through the bounded, checkpointed initialization summary.
 Every worker uses that same scalar before writing ranks and source factors. Zero
-surviving mass falls back to the uniform vector. Execution epoch 4 rejects older
+surviving mass falls back to the uniform vector. Execution epoch 5 rejects older
 in-flight jobs: rebuild them with upgraded workers. Their previously published
 score generation remains readable; partially computed old seeds are not resumed.
 The same job/configuration/epoch fence applies to workers, coordinator phase
@@ -600,6 +600,24 @@ distinct. Sorted multi-get resolves dictionary slots, deduplicates block reads,
 and preserves caller order. Attempt-fenced checkpoint writes update each block
 once and retire obsolete iterations by block. Small jobs keep the inline scalar
 layout to avoid sparse block and dictionary overhead.
+
+Large native jobs compile bounded, immutable ordinal topology checkpoints once
+per job and contribution lane. Subsequent iterations consume numeric edge and
+vector blocks without parsing document IDs or repeating source dictionary lookups.
+Contribution output is packed by target ordinal block and checkpoint, with the
+producer attempt in its identity. Reducers select only the completed producer's
+attempt, so a replacement attempt with different checkpoint boundaries cannot
+double-count abandoned output. Document IDs remain at the input/output boundary;
+node-oriented reducer reads still resolve their ordinals through sorted multi-get.
+
+All native reducers retain immutable inputs throughout the consumer phase.
+Checkpointed output may be replayed safely after lease takeover. Once every
+consumer finishes, the phase barrier deletes at most 512 input records per
+transaction, resuming from the remaining namespace after restart. It advances
+only after cleanup finishes. Both HITS lanes retire each iteration this way,
+rather than accumulating hub shards until publication. Retained contribution
+state is bounded by one iteration (including bounded abandoned attempts), not
+the number of power iterations.
 
 Large normalization passes reuse the immutable node quantiles: independently
 leased producers scan up to 4,096 nodes per checkpoint, and the root deterministically
@@ -621,6 +639,12 @@ Misses reserve bounded per-identity fill ownership before fetching or decoding.
 Waiters yield through caller-owned `std.Io`, check cancellation independently,
 and can take over when a failed/canceled producer releases ownership. At most
 64 distinct fills are admitted concurrently; cache saturation applies backpressure.
+Registered waiters pin a shared result independently of LRU admission, including
+when retention is disabled or existing entries are pinned. The producer may drop
+its lease before waiters wake without losing the result. Cancellation releases
+the waiter's registration; the last reference releases a bypassed result. This
+does not create another unbounded cache: fill registrations have fixed capacity,
+and every consuming query applies its retained-memory admission to the lease.
 No storage or decode operation runs under the cache lock. Warm point
 and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
 misses, and retained bytes are exposed in query-cache statistics.

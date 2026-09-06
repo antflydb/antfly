@@ -822,7 +822,18 @@ fn acquireRouting(
                     fill = index;
                     break;
                 },
-                .wait => |epoch| {
+                .wait => |registered| {
+                    var waiter = registered;
+                    defer waiter.deinit();
+                    if (try waiter.awaitResult(session.io, session.cancellation)) |shared| {
+                        var lease = shared;
+                        errdefer lease.deinit();
+                        try session.chargeGraphMetricRetained(lease.entry.bytes());
+                        try session.chargeGraphMetricDecode(0, 1);
+                        return lease;
+                    }
+                },
+                .saturated => |epoch| {
                     try cache.graph_metric_routing.awaitFill(session.io, session.cancellation, epoch);
                 },
             }
@@ -852,7 +863,7 @@ fn acquireRouting(
     errdefer owner.destroy(entry);
     entry.* = .{ .key = key, .alloc = owner, .footer = owned, .routing = routing };
     try session.cancellation.check();
-    if (session.cache) |cache| return cache.graph_metric_routing.adopt(entry, cache.cfg.max_graph_metric_routing_bytes);
+    if (session.cache) |cache| return cache.graph_metric_routing.publish(fill.?, entry, cache.cfg.max_graph_metric_routing_bytes);
     return .{ .entry = entry };
 }
 
