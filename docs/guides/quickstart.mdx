@@ -1230,8 +1230,8 @@ let resp = client
 </Tabs>
 
 The CLI and cURL commands stream Server-Sent Events as each step completes. A
-terminal `event: error` makes the CLI exit nonzero; `event: done` marks a
-successful stream. The SDK examples request structured JSON instead. Each
+terminal `event: done` marks success; an error or incomplete stream makes the
+CLI exit nonzero. The SDK examples request structured JSON instead. Each
 example searches for semantically similar articles, reranks and prunes results
 with Qwen3, and uses Gemma to generate a capped answer from the retrieved context.
 The example keeps the original retrieval query and requests only an answer.

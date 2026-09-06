@@ -96,36 +96,3 @@ If padded-token work explains the gap, investigate bounded length-aware
 batching while preserving source/vector association. If lock/acquisition time
 dominates, investigate contention or reloads. Do not increase concurrency
 before identifying which stage limits throughput.
-
-## First matched-input observation (2026-09-05)
-
-ReleaseFast + Metal on the M4 Max/36 GiB machine, with an 8192 MiB inference
-host budget. A prewarmed Qwen Q8 model indexed the first 64 articles of the
-original quickstart fixture. The bounded index completed with 64 covered
-sources, 174 searchable vectors, and no failures. After indexing completed,
-16 captured eight-item batches (128 inputs) were replayed over HTTP with
-one warmup and two timed repetitions per batch.
-
-- Managed inference-boundary throughput: **11.90 embeddings/s** (10.758 s).
-- HTTP replay throughput: **11.84 embeddings/s** (21.615 s for two passes).
-- Maximum absolute vector difference: **0**, across all timed replays.
-- Managed execution/pooling/normalization: 10.253 s, about 95% of total.
-- Model resolution/manifest reading: 0.498 s, about 4.6% of total.
-- Tokenization: 6.578 ms; model acquisition: 31 microseconds; execution-lock
-  wait: 2 microseconds across the 16 captured managed requests.
-- 44,184 active tokens versus 68,496 padded positions. About 35.5% of padded
-  positions were padding. Maximum sequence lengths ranged from 114 to 1,159
-  despite the chunker's configured 200-token target.
-
-Per-batch HTTP throughput ranged from about 5.25 to 41.33 embeddings/s, and
-matched each original managed batch closely. This run does not reproduce a
-managed/API throughput penalty. It shows that comparing uniformly short
-passages against variable-length managed chunks can be misleading. It does
-not establish the cause of the separate 2.9x operational gap on James's
-machine; run this capture/replay there to distinguish inputs from contention
-or other runtime effects. No scheduler/concurrency change was made on the
-basis of unmatched timings.
-
-Local evidence: `/private/tmp/antfly-exact-replay.Jc19VP`, including captures,
-`replay-results.json`, `index-observations.json`, and timing-only `server.log`.
-These local artifacts are not checked into the repository.
