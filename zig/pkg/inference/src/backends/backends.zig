@@ -91,11 +91,22 @@ pub const BackendType = enum {
     /// Strongest cancellation mechanism available once execution has crossed
     /// into the backend. GPU driver and PJRT calls have no portable per-call
     /// abort primitive, so they may execute only in a supervised worker.
-    pub fn interruption(self: BackendType) Interruption {
+    pub fn executionInterruption(self: BackendType) Interruption {
         return switch (self) {
             .native, .wasm => .cooperative,
             .onnx => .native_terminable,
             .metal, .cuda, .pjrt => .process_required,
+        };
+    }
+
+    /// Model/session construction does not have the per-call termination
+    /// handle that ONNX execution exposes. Any constructor which enters a
+    /// native runtime or device driver therefore belongs to the replaceable
+    /// worker, even when later execution can be terminated in-process.
+    pub fn loadInterruption(self: BackendType) Interruption {
+        return switch (self) {
+            .native, .wasm => .cooperative,
+            .onnx, .metal, .cuda, .pjrt => .process_required,
         };
     }
 
@@ -123,10 +134,14 @@ pub const BackendRuntime = struct {
         };
     }
 
-    pub fn interruption(self: BackendRuntime) Interruption {
+    pub fn executionInterruption(self: BackendRuntime) Interruption {
         if (self.backend == .onnx and self.onnx_execution_provider == .cuda)
             return .process_required;
-        return self.backend.interruption();
+        return self.backend.executionInterruption();
+    }
+
+    pub fn loadInterruption(self: BackendRuntime) Interruption {
+        return self.backend.loadInterruption();
     }
 };
 
@@ -137,11 +152,11 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
     }).usesGpuHostedSession());
     try std.testing.expectEqual(
         Interruption.native_terminable,
-        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).interruption(),
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).executionInterruption(),
     );
     try std.testing.expectEqual(
         Interruption.process_required,
-        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cuda }).interruption(),
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cuda }).executionInterruption(),
     );
     try std.testing.expect((BackendRuntime{
         .backend = .onnx,
@@ -150,11 +165,22 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
 }
 
 test "backend interruption policy isolates unabortable driver calls" {
-    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.interruption());
-    try std.testing.expectEqual(Interruption.native_terminable, BackendType.onnx.interruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.interruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.interruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.interruption());
+    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.executionInterruption());
+    try std.testing.expectEqual(Interruption.native_terminable, BackendType.onnx.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.executionInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.executionInterruption());
+}
+
+test "backend load policy isolates native runtime construction" {
+    try std.testing.expectEqual(Interruption.cooperative, BackendType.native.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.onnx.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.loadInterruption());
+    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.loadInterruption());
+    try std.testing.expectEqual(
+        Interruption.process_required,
+        (BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).loadInterruption(),
+    );
 }
 
 test "embedded session policy fails before selecting an uninterruptible backend" {
@@ -247,7 +273,7 @@ pub const SessionManager = struct {
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
         const backend_runtime = try self.resolveBackendRuntime(backend);
-        if (!self.process_isolation_available and backend_runtime.interruption() == .process_required)
+        if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required)
             return error.ProcessIsolationRequired;
     }
 
@@ -336,7 +362,7 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
-            if (!self.process_isolation_available and backend_runtime.interruption() == .process_required) {
+            if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required) {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }

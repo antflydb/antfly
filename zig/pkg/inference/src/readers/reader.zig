@@ -29,6 +29,7 @@ const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
@@ -55,10 +56,26 @@ const VisionLoadedReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !VisionLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !VisionLoadedReader {
         return .{
             .allocator = allocator,
             .parser_kind = try detectParserKind(allocator, model_path),
-            .core = try vision_reader_mod.LoadedVisionReader.loadFromDir(allocator, model_path, session_manager, model_manager),
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromDirWithControl(
+                allocator,
+                model_path,
+                session_manager,
+                model_manager,
+                control,
+            ),
         };
     }
 
@@ -119,13 +136,21 @@ const VlmLoadedReader = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !VlmLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !VlmLoadedReader {
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind != .moondream) return error.InvalidModelForReading;
 
         return .{
             .allocator = allocator,
             .parser_kind = parser_kind,
-            .pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, model_path),
+            .pipeline = try onnx_decoder_only_vlm.Pipeline.loadWithControl(allocator, model_path, control),
         };
     }
 
@@ -144,7 +169,7 @@ const VlmLoadedReader = struct {
         var raw = try self.pipeline.generatePrompt(prompt, images[0..], .{
             .max_tokens = @intCast(options.max_tokens orelse 256),
             .cache_dtype = options.cache_dtype,
-        });
+        }, options.execution_control);
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
@@ -165,6 +190,14 @@ const GenAiLoadedReader = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !GenAiLoadedReader {
+        return loadFromDirWithControl(allocator, model_path, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !GenAiLoadedReader {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
 
         const parser_kind = try detectParserKind(allocator, model_path);
@@ -174,7 +207,7 @@ const GenAiLoadedReader = struct {
             return error.InvalidModelForReading;
         errdefer allocator.free(prepared_model_dir);
 
-        const model = try ortgenai.GenAiModel.load(allocator, prepared_model_dir);
+        const model = try ortgenai.GenAiModel.loadWithControl(allocator, prepared_model_dir, control);
         errdefer {
             var model_mut = model;
             model_mut.deinit();
@@ -234,12 +267,23 @@ pub const LoadedReader = union(enum) {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,
                 model_path,
                 session_manager,
                 model_manager,
+                control,
             ) };
         }
 
@@ -247,12 +291,17 @@ pub const LoadedReader = union(enum) {
         if (parser_kind == .moondream) {
             if (try session_manager.allowsDirectBackend(.onnx)) {
                 if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
-                    return .{ .vlm = try VlmLoadedReader.loadFromDir(allocator, model_path) };
+                    return .{ .vlm = try VlmLoadedReader.loadFromDirWithControl(allocator, model_path, control) };
                 }
                 if (build_options.enable_onnx) {
-                    if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |reader| {
+                    if (GenAiLoadedReader.loadFromDirWithControl(allocator, model_path, control)) |reader| {
                         return .{ .genai = reader };
                     } else |err| {
+                        switch (err) {
+                            error.Canceled, error.Cancelled, error.Timeout => return err,
+                            else => {},
+                        }
+                        if (control) |active| try active.check();
                         std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
                     }
                 }
@@ -262,7 +311,13 @@ pub const LoadedReader = union(enum) {
             return error.NativePix2StructNotYetSupported;
         }
 
-        return .{ .vision = try VisionLoadedReader.loadFromDir(allocator, model_path, session_manager, model_manager) };
+        return .{ .vision = try VisionLoadedReader.loadFromDirWithControl(
+            allocator,
+            model_path,
+            session_manager,
+            model_manager,
+            control,
+        ) };
     }
 
     pub fn deinit(self: *LoadedReader) void {

@@ -18,7 +18,7 @@ const std = @import("std");
 const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
-const inference_process_supervisor = @import("inference_process_supervisor.zig");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;

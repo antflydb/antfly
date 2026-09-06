@@ -8269,7 +8269,7 @@ fn loadSessionForPreferredBackends(
         }
         if (control) |active| try active.check();
         var hard_cancellation = if (control) |active|
-            try active.enterUninterruptible(backend_runtime.interruption())
+            try active.enterUninterruptible(backend_runtime.loadInterruption())
         else
             execution_control_mod.UninterruptibleGuard{};
         defer hard_cancellation.deinit();

@@ -267,6 +267,7 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
 }
 
 pub fn main(init: std.process.Init) !void {
+    if (try platform.inference_process_supervisor.runIfNeeded(init, 1)) return;
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -591,10 +592,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
-        // This binary is itself a dedicated inference process. A cancelled
-        // uninterruptible request may terminate it for its service manager to
-        // restart; it never takes a database runtime down with it.
-        .process_termination_available = true,
+        // Only the replaceable worker advertises process termination. The
+        // stable parent owns restart after a hard cancellation boundary fires.
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;

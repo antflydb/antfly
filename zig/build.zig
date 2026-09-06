@@ -11075,6 +11075,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         role_mod.addImport("structlog", structlog_mod);
+        role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);

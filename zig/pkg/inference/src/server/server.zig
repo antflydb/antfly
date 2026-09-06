@@ -1190,7 +1190,7 @@ const HardCancellationWatchdog = struct {
                     "uninterruptible inference request expired; terminating supervised worker err={s}",
                     .{@errorName(err)},
                 );
-                std.process.abort();
+                platform.inference_process_supervisor.restartWorker();
             }
             try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
         }
@@ -5465,7 +5465,13 @@ pub const Node = struct {
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
 
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
+            allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+            control,
+        );
         defer reader.deinit();
         try control.update(.loading_model, 1, 1);
 
@@ -7845,7 +7851,7 @@ pub const Node = struct {
                 }
             }
 
-            var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
+            var pipeline = onnx_decoder_only_vlm.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
@@ -7988,10 +7994,7 @@ pub const Node = struct {
                     );
                 }
 
-                var ort_hard_cancellation = execution_control.enterUninterruptible(.process_required) catch |err|
-                    return inferenceFailureResponse(ctx, err);
-                defer ort_hard_cancellation.deinit();
-                var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
+                var gen_model = ortgenai.GenAiModel.loadWithControl(ctx.allocator, prepared_model_dir, execution_control) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
                 execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
@@ -11605,7 +11608,7 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_sequence_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
+            else => return modelLoadFailureResponse(ctx, err),
         };
         defer ctx.allocator.free(checkpoint_path);
 
@@ -12052,11 +12055,12 @@ pub const Node = struct {
         if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
         reserved_units = required_units;
 
-        var reader = readers_mod.LoadedReader.loadFromDir(
+        var reader = readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             model_path,
             &self.session_manager,
             &self.model_manager,
+            execution_control,
         ) catch |err| switch (err) {
             error.InvalidModelForReading => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",

@@ -17,7 +17,7 @@ const structlog = @import("structlog");
 const build_options = @import("build_options");
 const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
-const inference_process_supervisor = @import("inference_process_supervisor.zig");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 const antfly_cloud_binary = "antfly-cloud";
 

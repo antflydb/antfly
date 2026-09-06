@@ -469,7 +469,7 @@ pub const Session = struct {
 
     pub fn interruption(self: Session) Interruption {
         if (self.vtable.interruption) |classify| return classify(self.ptr);
-        return self.backend().interruption();
+        return self.backend().executionInterruption();
     }
 
     pub fn close(self: Session) void {

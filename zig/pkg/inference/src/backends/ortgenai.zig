@@ -19,8 +19,9 @@
 
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
-const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
-const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const UninterruptibleGuard = execution_control_mod.UninterruptibleGuard;
 
 fn enterGenerationBoundary(control: ?InferenceExecutionControl) !UninterruptibleGuard {
     const active = control orelse return .{};
@@ -671,6 +672,21 @@ pub const GenAiModel = struct {
     context_length: i32,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !GenAiModel {
+        return loadWithControl(allocator, model_dir, null);
+    }
+
+    pub fn loadWithControl(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !GenAiModel {
+        if (control) |active| try active.check();
+        var load_guard = if (control) |active|
+            try active.enterUninterruptible(.process_required)
+        else
+            UninterruptibleGuard{};
+        defer load_guard.deinit();
+
         const path_z = try allocator.dupeZ(u8, model_dir);
         defer allocator.free(path_z);
 
@@ -680,6 +696,8 @@ pub const GenAiModel = struct {
 
         var tokenizer: ?*c.OgaTokenizer = null;
         try check(c.OgaCreateTokenizer(model.?, &tokenizer));
+        errdefer c.OgaDestroyTokenizer(tokenizer.?);
+        if (control) |active| try active.check();
 
         return .{
             .model = model.?,

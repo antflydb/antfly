@@ -21,6 +21,7 @@ const multistage_ocr = @import("../pipelines/multistage_ocr.zig");
 const ctc_decode = @import("../pipelines/ctc_decode.zig");
 const image = @import("../pipelines/image.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const AssetResolver = struct {
     allocator: std.mem.Allocator,
@@ -102,6 +103,17 @@ pub const LoadedMultiStageReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedMultiStageReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedMultiStageReader {
+        if (control) |active| try active.check();
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
@@ -136,6 +148,7 @@ pub const LoadedMultiStageReader = struct {
             &component_loader,
         );
         defer preflight.deinit();
+        if (control) |active| try active.check();
         var first_err: ?anyerror = null;
         for (component_loader.preferredBackends()) |backend| {
             var backend_loader = try component_loader.restrictToBackend(backend);
@@ -146,7 +159,13 @@ pub const LoadedMultiStageReader = struct {
                 &metadata,
                 &backend_loader,
                 &preflight,
+                control,
             ) catch |err| {
+                switch (err) {
+                    error.Canceled, error.Cancelled, error.Timeout => return err,
+                    else => {},
+                }
+                if (control) |active| try active.check();
                 if (first_err == null) first_err = err;
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
                 continue;
@@ -202,6 +221,7 @@ pub const LoadedMultiStageReader = struct {
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         preflight: *PreflightAssets,
+        control: ?InferenceExecutionControl,
     ) !LoadedMultiStageReader {
         var managed_sessions = std.ArrayListUnmanaged(model_manager_mod.ManagedSession).empty;
         errdefer {
@@ -213,7 +233,7 @@ pub const LoadedMultiStageReader = struct {
         const detection_path = try asset_resolver.resolve(detection_file);
         defer allocator.free(detection_path);
 
-        var detector_managed = try component_loader.load(detection_path);
+        var detector_managed = try loadComponent(component_loader, detection_path, control);
         errdefer detector_managed.deinit();
         const detector = detector_managed.disownSession();
         var detector_owned = true;
@@ -247,7 +267,7 @@ pub const LoadedMultiStageReader = struct {
             const layout_path = try asset_resolver.resolve(model_file);
             defer allocator.free(layout_path);
 
-            var layout_managed = try component_loader.load(layout_path);
+            var layout_managed = try loadComponent(component_loader, layout_path, control);
             errdefer layout_managed.deinit();
             pipeline.layout = layout_managed.disownSession();
             try managed_sessions.append(allocator, layout_managed);
@@ -259,7 +279,7 @@ pub const LoadedMultiStageReader = struct {
             const order_path = try asset_resolver.resolve(model_file);
             defer allocator.free(order_path);
 
-            var order_managed = try component_loader.load(order_path);
+            var order_managed = try loadComponent(component_loader, order_path, control);
             errdefer order_managed.deinit();
             pipeline.order = order_managed.disownSession();
             try managed_sessions.append(allocator, order_managed);
@@ -272,7 +292,7 @@ pub const LoadedMultiStageReader = struct {
                 const rec_path = try asset_resolver.resolve(recognition_stage.model_file.?);
                 defer allocator.free(rec_path);
 
-                var rec_managed = try component_loader.load(rec_path);
+                var rec_managed = try loadComponent(component_loader, rec_path, control);
                 errdefer rec_managed.deinit();
                 const rec_session = rec_managed.disownSession();
                 var rec_session_owned = true;
@@ -307,13 +327,14 @@ pub const LoadedMultiStageReader = struct {
                 else
                     return error.InvalidMetadata;
                 pipeline.recognizer = .{
-                    .vision2seq = try multistage_ocr.Vision2SeqRecognizer.loadFromStagePathsWithTokenizer(
+                    .vision2seq = try multistage_ocr.Vision2SeqRecognizer.loadFromStagePathsWithTokenizerAndControl(
                         allocator,
                         model_path,
                         encoder_path,
                         decoder_path,
                         component_loader,
                         managed_tokenizer,
+                        control,
                     ),
                 };
             }
@@ -324,6 +345,15 @@ pub const LoadedMultiStageReader = struct {
             .pipeline = pipeline,
             .managed_sessions = managed_sessions,
         };
+    }
+
+    fn loadComponent(
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !model_manager_mod.ManagedSession {
+        if (control) |active| return component_loader.loadWithControl(model_path, active);
+        return component_loader.load(model_path);
     }
 
     pub fn deinit(self: *LoadedMultiStageReader) void {

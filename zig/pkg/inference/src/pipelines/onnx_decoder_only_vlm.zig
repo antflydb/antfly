@@ -13,7 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
@@ -262,7 +263,16 @@ pub const Pipeline = struct {
     execution_control: ?InferenceExecutionControl = null,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !Pipeline {
+        return loadWithControl(allocator, model_dir, null);
+    }
+
+    pub fn loadWithControl(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !Pipeline {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
+        if (control) |active| try active.check();
 
         var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
         errdefer manifest.deinit();
@@ -286,6 +296,12 @@ pub const Pipeline = struct {
         const vision_path = try findOnnxFile(allocator, model_dir, &vision_candidates);
         defer if (vision_path) |path| allocator.free(path);
 
+        var load_guard = if (control) |active|
+            try active.enterUninterruptible(.process_required)
+        else
+            execution_control_mod.UninterruptibleGuard{};
+        defer load_guard.deinit();
+
         const decoder = try backends.onnx.createSession(allocator, decoder_path);
         errdefer decoder.close();
         const embed_tokens = try backends.onnx.createSession(allocator, embed_path);
@@ -295,6 +311,7 @@ pub const Pipeline = struct {
         else
             null;
         errdefer if (vision_encoder) |session| session.close();
+        if (control) |active| try active.check();
 
         if (platform.env.getenv("TERMITE_DEBUG_ONNX_INPUTS") != null) {
             std.debug.print("onnx-decoder-inputs:\n", .{});
@@ -385,7 +402,7 @@ pub const Pipeline = struct {
             &[_][]const u8{};
         defer if (has_images) self.allocator.free(image_bytes);
 
-        return self.generatePrompt(prompt, image_bytes, config);
+        return self.generatePrompt(prompt, image_bytes, config, self.execution_control);
     }
 
     pub fn generatePrompt(
@@ -393,7 +410,9 @@ pub const Pipeline = struct {
         prompt: []const u8,
         images: []const []const u8,
         config: generation.GenerationConfig,
+        control: ?InferenceExecutionControl,
     ) !generation.GenerationResult {
+        if (control) |active| try active.check();
         const tok = self.hf_tok.tokenizer();
 
         const token_ids = blk: {
@@ -433,12 +452,12 @@ pub const Pipeline = struct {
 
         const max_tokens: usize = @intCast(@max(config.max_tokens, 1));
         for (0..max_tokens) |step| {
-            if (self.execution_control) |control|
-                try control.update(.executing, @intCast(step), @intCast(max_tokens));
+            if (control) |active|
+                try active.update(.executing, @intCast(step), @intCast(max_tokens));
             const logits = if (first_step)
-                try self.firstStep(working_token_ids, images, &kv_cache)
+                try self.firstStep(working_token_ids, images, &kv_cache, control)
             else
-                try self.subsequentStep(working_token_ids, &kv_cache);
+                try self.subsequentStep(working_token_ids, &kv_cache, control);
             defer self.allocator.free(logits);
 
             first_step = false;
@@ -504,7 +523,7 @@ pub const Pipeline = struct {
 
         var kv_cache = KvCache.init(self.allocator);
         defer kv_cache.deinit();
-        const logits = try self.firstStep(ids, &.{}, &kv_cache);
+        const logits = try self.firstStep(ids, &.{}, &kv_cache, self.execution_control);
         defer self.allocator.free(logits);
         const token_id: i32 = @intCast(activations.argmax(logits));
         const token_text = try tok.decode(self.allocator, &.{token_id});
@@ -590,7 +609,13 @@ pub const Pipeline = struct {
         };
     }
 
-    fn firstStep(self: *Pipeline, input_ids: []const i64, images: []const []const u8, kv_cache: *KvCache) ![]f32 {
+    fn firstStep(
+        self: *Pipeline,
+        input_ids: []const i64,
+        images: []const []const u8,
+        kv_cache: *KvCache,
+        control: ?InferenceExecutionControl,
+    ) ![]f32 {
         var decoder_inputs = std.ArrayListUnmanaged(Tensor).empty;
         defer {
             for (decoder_inputs.items) |*tensor| tensor.deinit();
@@ -602,7 +627,7 @@ pub const Pipeline = struct {
         var input_tensor = try Tensor.initInt64(self.allocator, "input_ids", &input_shape, input_ids);
         defer input_tensor.deinit();
 
-        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, self.execution_control);
+        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, embed_outputs);
         if (embed_outputs.len == 0) return error.NoEmbedOutput;
 
@@ -613,7 +638,7 @@ pub const Pipeline = struct {
 
         if (images.len > 0) {
             const vision = self.vision_encoder orelse return error.MissingVisionEncoder;
-            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images, self.execution_control);
+            const image_features = try encodeImages(self.allocator, self.model_dir, vision, self.gpt_config, images, control);
             defer self.allocator.free(image_features.data);
             const combined = try concatImageAndTextEmbeddings(self.allocator, image_features.data, embeds, hidden_size);
             self.allocator.free(embeds);
@@ -645,11 +670,16 @@ pub const Pipeline = struct {
 
         try appendZeroPastKvInputs(self.allocator, self.decoder, &decoder_inputs, self.gpt_config);
 
-        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, self.execution_control);
+        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, control);
         return extractLogitsAndMoveKv(self.allocator, outputs, kv_cache);
     }
 
-    fn subsequentStep(self: *Pipeline, input_ids: []const i64, kv_cache: *KvCache) ![]f32 {
+    fn subsequentStep(
+        self: *Pipeline,
+        input_ids: []const i64,
+        kv_cache: *KvCache,
+        control: ?InferenceExecutionControl,
+    ) ![]f32 {
         var decoder_inputs = std.ArrayListUnmanaged(Tensor).empty;
         defer {
             for (decoder_inputs.items) |*tensor| tensor.deinit();
@@ -661,7 +691,7 @@ pub const Pipeline = struct {
         var input_tensor = try Tensor.initInt64(self.allocator, "input_ids", &input_shape, input_ids);
         defer input_tensor.deinit();
 
-        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, self.execution_control);
+        var embed_outputs = try self.embed_tokens.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, embed_outputs);
         if (embed_outputs.len == 0) return error.NoEmbedOutput;
 
@@ -695,10 +725,18 @@ pub const Pipeline = struct {
 
         try onnx_kv_cache.appendPastInputs(self.allocator, self.decoder.inputInfo(), kv_cache, &decoder_inputs);
 
-        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, self.execution_control);
+        const outputs = try self.decoder.runWithControl(decoder_inputs.items, self.allocator, control);
         return extractLogitsAndMoveKv(self.allocator, outputs, kv_cache);
     }
 };
+
+test "prompt generation observes explicit request control before pipeline state" {
+    var pipeline: Pipeline = undefined;
+    try std.testing.expectError(
+        error.Timeout,
+        pipeline.generatePrompt("", &.{}, .{}, .{ .deadline_ns = 0 }),
+    );
+}
 
 const ImageFeatures = struct {
     data: []f32,

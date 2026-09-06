@@ -482,11 +482,12 @@ const ReaderExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        var reader = try readers_mod.LoadedReader.loadFromDir(
+        var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
+            ctx.execution_control,
         );
         defer reader.deinit();
 
@@ -579,11 +580,12 @@ fn readTextsWithReader(
     image_datas: []const []const u8,
     read_options: readers_mod.ReadOptions,
 ) ![][]const u8 {
-    var reader = readers_mod.LoadedReader.loadFromDir(
+    var reader = readers_mod.LoadedReader.loadFromDirWithControl(
         ctx.allocator,
         model_path,
         ctx.session_manager,
         ctx.model_manager,
+        ctx.execution_control,
     ) catch |err| return err;
     defer reader.deinit();
 

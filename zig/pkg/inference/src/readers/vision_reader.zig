@@ -24,6 +24,7 @@ const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
 const c_file = @import("../util/c_file.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const PreprocessorConfig = struct {
     image_size: usize = 384,
@@ -57,6 +58,17 @@ pub const LoadedVisionReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedVisionReader {
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedVisionReader {
+        if (control) |active| try active.check();
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
@@ -68,10 +80,13 @@ pub const LoadedVisionReader = struct {
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null, control);
         } else |_| {}
 
-        var model_handle = model_manager.acquireFromDir(model_path) catch |err| {
+        var model_handle = (if (control) |active|
+            model_manager.acquireFromDirWithControl(model_path, active)
+        else
+            model_manager.acquireFromDir(model_path)) catch |err| {
             std.log.err("reader native model load failed model={s} err={t}", .{ model_path, err });
             return err;
         };
@@ -110,10 +125,28 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
+        return loadFromStagePathsWithControl(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            component_loader,
+            null,
+        );
+    }
+
+    pub fn loadFromStagePathsWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        control: ?InferenceExecutionControl,
+    ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
 
-        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null);
+        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null, control);
     }
 
     pub fn loadFromStagePathsWithTokenizer(
@@ -123,6 +156,26 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !LoadedVisionReader {
+        return loadFromStagePathsWithTokenizerAndControl(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            component_loader,
+            managed_tokenizer,
+            null,
+        );
+    }
+
+    pub fn loadFromStagePathsWithTokenizerAndControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+        control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
@@ -135,6 +188,7 @@ pub const LoadedVisionReader = struct {
             preproc,
             component_loader,
             managed_tokenizer,
+            control,
         );
     }
 
@@ -147,13 +201,14 @@ pub const LoadedVisionReader = struct {
         preproc: PreprocessorConfig,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         preloaded_tokenizer: ?*model_manager_mod.ManagedHfTokenizer,
+        control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
-        var encoder_managed = try component_loader.load(encoder_path);
+        var encoder_managed = try loadComponent(component_loader, encoder_path, control);
         errdefer encoder_managed.deinit();
         const encoder_session = encoder_managed.session;
 
         var strict_loader = try component_loader.restrictToBackend(encoder_session.backend());
-        var decoder_managed = try strict_loader.load(decoder_path);
+        var decoder_managed = try loadComponent(&strict_loader, decoder_path, control);
         errdefer decoder_managed.deinit();
         const decoder_session = decoder_managed.session;
 
@@ -164,6 +219,7 @@ pub const LoadedVisionReader = struct {
         else
             try component_loader.loadHfTokenizerFile(tok_path);
         errdefer loaded_tokenizer.deinit();
+        if (control) |active| try active.check();
 
         return .{
             .allocator = allocator,
@@ -176,6 +232,15 @@ pub const LoadedVisionReader = struct {
             .encoder_managed = encoder_managed,
             .decoder_managed = decoder_managed,
         };
+    }
+
+    fn loadComponent(
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !model_manager_mod.ManagedSession {
+        if (control) |active| return component_loader.loadWithControl(model_path, active);
+        return component_loader.load(model_path);
     }
 
     pub fn deinit(self: *LoadedVisionReader) void {
