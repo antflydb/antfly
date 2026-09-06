@@ -120,6 +120,7 @@ pub const Pipeline = struct {
         projector_path: []const u8,
         config: Config,
     ) !Pipeline {
+        try cb.checkExecutionControl();
         if (gpt_config.family != .qwen3_vl or gpt_config.image_token_index < 0 or
             projector_path.len == 0 or config.max_images == 0 or config.max_images > 8 or
             config.max_length < qwen3vl_reranker.protected_assistant_suffix_tokens or
@@ -146,6 +147,9 @@ pub const Pipeline = struct {
         document_content: []const u8,
         images: []const []const u8,
     ) !ScoreResult {
+        // The borrowed backend is the single execution-control source. Its
+        // owner must retain the hard-cancellation guard through our cleanup.
+        try self.cb.checkExecutionControl();
         if (images.len == 0 or images.len > self.config.max_images) {
             return error.ImageLimitExceeded;
         }
@@ -162,6 +166,7 @@ pub const Pipeline = struct {
 
         const raw_ids = try self.tokenizer.encode(self.allocator, prompt);
         defer self.allocator.free(raw_ids);
+        try self.cb.checkExecutionControl();
         if (raw_ids.len == 0) return error.InvalidRerankerSequence;
         try validateTokenIdsAndPlaceholders(
             raw_ids,
@@ -192,6 +197,7 @@ pub const Pipeline = struct {
             },
         );
         defer projected.deinit();
+        try self.cb.checkExecutionControl();
 
         const visual_tokens = try sumVisualTokens(projected.tokens_per_image);
         const unexpanded_budget = try placeholderSequenceBudget(
@@ -233,6 +239,7 @@ pub const Pipeline = struct {
             self.config.max_length,
         );
         defer prepared.deinit(self.cb);
+        try self.cb.checkExecutionControl();
         const prompt_tokens = prepared.token_ids.len;
         if (prompt_tokens == 0 or prepared.plan.tokenCount() != prompt_tokens) {
             return error.InvalidPreparedPrompt;
@@ -252,9 +259,11 @@ pub const Pipeline = struct {
             prepared.deepstack_layer_count,
         );
         const score = try qwen3vl_reranker.stableSigmoid(raw_logit);
+        try self.cb.checkExecutionControl();
         if (self.qualification_trace) |trace| {
             try trace.capture(prompt, placeholder_ids, &prepared, raw_logit, score);
         }
+        try self.cb.checkExecutionControl();
         return .{
             .score = score,
             .raw_logit = raw_logit,
@@ -318,6 +327,15 @@ fn placeholderSequenceBudget(
         return error.InputTokenLimitExceeded;
     }
     return budget;
+}
+
+test "Qwen3-VL multimodal reranker honors backend cancellation before preparing documents" {
+    var cb: ops.ComputeBackend = undefined;
+    cb.execution_control = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, Pipeline.init(std.testing.allocator, &cb, undefined, undefined, "", .{}));
+    var pipeline: Pipeline = undefined;
+    pipeline.cb = &cb;
+    try std.testing.expectError(error.Timeout, pipeline.scoreDocument("query", "document", &.{}));
 }
 
 test "Qwen3-VL multimodal reranker reserves exact expanded token budget" {

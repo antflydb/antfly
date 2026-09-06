@@ -397,7 +397,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     };
     errdefer state.route_validator.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
-    state.node.attachIo(state.io);
+    try state.node.attachIo(state.io);
     return state;
 }
 
@@ -438,23 +438,65 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     const request_json = context.request_json.slice();
     const deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
     const alloc = state.alloc;
+    const CancellationAdapter = struct {
+        view: http_abi.CancellationView,
+
+        fn requested(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.view.requested();
+        }
+    };
+    var cancellation_adapter = CancellationAdapter{ .view = context.cancellation };
+    const ProgressAdapter = struct {
+        view: inference_bridge.ProgressView,
+
+        fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.view.update(
+                @intFromEnum(progress.phase),
+                progress.completed,
+                progress.total,
+                progress.model,
+                progress.backend,
+            );
+        }
+    };
+    var progress_adapter = ProgressAdapter{ .view = context.progress };
+    const execution_control = inference.InferenceExecutionControl{
+        .deadline_ns = deadline_ns,
+        .cancellation = if (context.cancellation.is_cancelled != null)
+            .{ .ptr = &cancellation_adapter, .is_cancelled_fn = CancellationAdapter.requested }
+        else
+            null,
+        .progress = if (context.progress.update_progress != null)
+            .{ .ptr = &progress_adapter, .update_fn = ProgressAdapter.update }
+        else
+            null,
+    };
+    try execution_control.check();
 
     const response_json = switch (operation) {
         .embed_dense_texts, .embed_dense_texts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithContextAndTask(
+                try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
                     state.alloc,
                     state.io,
-                    deadline_ns,
+                    execution_control,
                     parsed.value.model,
                     parsed.value.texts,
                     parsed.value.task_type,
                     parsed.value.instruction,
                 )
             else
-                try state.node.embedDenseTextsDirect(state.alloc, parsed.value.model, parsed.value.texts);
+                try state.node.embedDenseTextsDirectWithExecutionControl(
+                    state.alloc,
+                    state.io,
+                    execution_control,
+                    parsed.value.model,
+                    parsed.value.texts,
+                );
             defer {
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
@@ -464,7 +506,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .embed_sparse_texts => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try localAntflyEmbedSparseTexts(&state.node, alloc, parsed.value.model, parsed.value.texts);
+            const result = try state.node.embedSparseTextsDirectWithControl(alloc, parsed.value.model, parsed.value.texts, execution_control);
             defer {
                 for (result) |*item| item.deinit(alloc);
                 alloc.free(result);
@@ -480,7 +522,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parsed.value.parts,
                 state.io,
-                if (operation == .embed_dense_parts_with_context) deadline_ns else null,
+                execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
@@ -493,17 +535,6 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const CancellationControl = struct {
-                fn check(raw: ?*anyopaque) !void {
-                    const cancellation: *const http_abi.CancellationView = @ptrCast(@alignCast(raw.?));
-                    if (cancellation.requested()) return error.Cancelled;
-                }
-            };
-            var cancellation = context.cancellation;
-            const execution_control: ?inference.pipelines.RerankingExecutionControl = if (cancellation.is_cancelled != null)
-                .{ .ptr = &cancellation, .check_fn = CancellationControl.check }
-            else
-                null;
             const result = try state.node.rerankTextsDirectWithContext(
                 alloc,
                 state.io,
@@ -525,6 +556,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.roles,
                 parsed.value.contents,
                 parsed.value.options.max_tokens,
+                execution_control,
             );
             const result = try providerGenerationContent(outcome);
             defer alloc.free(result);
@@ -539,6 +571,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.model,
                 parsed.value.messages,
                 parsed.value.options,
+                execution_control,
             );
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -546,7 +579,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .read_images => blk: {
             var parsed = try std.json.parseFromSlice(ReadImagesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.readImagesDirect(alloc, parsed.value.model, parsed.value.request);
+            const result = try state.node.readImagesDirectWithControl(alloc, parsed.value.model, parsed.value.request, execution_control);
             defer {
                 for (result) |*item| antfly.readers.deinitResult(alloc, item);
                 alloc.free(result);
@@ -556,14 +589,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            var result = try state.node.transcribeAudioDirect(alloc, parsed.value.model, parsed.value.request);
+            var result = try state.node.transcribeAudioDirectWithControl(alloc, parsed.value.model, parsed.value.request, execution_control);
             defer antfly.transcribing.deinitResponse(alloc, &result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .extract => blk: {
             var parsed = try std.json.parseFromSlice(ExtractRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            var result = try state.node.extractDirect(alloc, parsed.value.model, parsed.value.request);
+            var result = try state.node.extractDirectWithControl(alloc, parsed.value.model, parsed.value.request, execution_control);
             defer result.deinit();
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
         },
@@ -574,6 +607,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         },
     };
     errdefer alloc.free(response_json);
+    try execution_control.update(.serializing, 1, 1);
     const response = try alloc.create(ProviderResponseState);
     response.* = .{ .alloc = alloc, .json = response_json };
     context.out_response_handle.* = response;
@@ -1053,6 +1087,44 @@ fn localAntflyEmbedDenseTexts(
     return try node.embedDenseTextsDirect(alloc, model, texts);
 }
 
+const LocalInferenceControlAdapter = struct {
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.context.check();
+    }
+
+    fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const sink = self.context.request.progress orelse return;
+        const phase = std.enums.fromInt(
+            antfly.inference.request_context.Phase,
+            @intFromEnum(progress.phase),
+        ) orelse return;
+        sink.update(.{
+            .phase = phase,
+            .completed = progress.completed,
+            .total = progress.total,
+            .model = progress.model,
+            .backend = progress.backend,
+            .deadline_ns = self.context.request.deadline_ns,
+        });
+    }
+
+    fn control(self: *@This()) inference.InferenceExecutionControl {
+        return .{
+            .deadline_ns = self.context.request.deadline_ns,
+            .ptr = self,
+            .check_fn = check,
+            .progress = if (self.context.request.progress != null)
+                .{ .ptr = self, .update_fn = update }
+            else
+                null,
+        };
+    }
+};
+
 fn localAntflyEmbedDenseTextsWithContext(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -1061,10 +1133,11 @@ fn localAntflyEmbedDenseTextsWithContext(
     context: antfly.inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.embedDenseTextsDirectWithContextAndTask(
+    var adapter = LocalInferenceControlAdapter{ .context = context };
+    return try node.embedDenseTextsDirectWithExecutionControlAndTask(
         alloc,
         context.request.io,
-        context.request.deadline_ns,
+        adapter.control(),
         model,
         texts,
         context.task_type.canonical(),
@@ -1078,17 +1151,17 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     model: []const u8,
     parts: []const antfly.template.ContentPart,
     io: std.Io,
-    deadline_ns: ?u64,
+    control: inference.InferenceExecutionControl,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
     defer alloc.free(direct_parts);
-    return try node.embedDensePartsDirectWithContextAndTask(
+    return try node.embedDensePartsDirectWithExecutionControlAndTask(
         alloc,
         io,
-        deadline_ns,
+        control,
         model,
         direct_parts,
         task_type,
@@ -1110,6 +1183,26 @@ pub fn localAntflyDirectDenseParts(
         } },
     };
     return out;
+}
+
+fn localAntflyEmbedDensePartsWithContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    var adapter = LocalInferenceControlAdapter{ .context = context };
+    return try localAntflyEmbedDensePartsWithExecutionContext(
+        ptr,
+        alloc,
+        model,
+        parts,
+        context.request.io,
+        adapter.control(),
+        context.task_type.canonical(),
+        context.instruction,
+    );
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -1164,11 +1257,13 @@ fn localAntflyGenerateMessages(
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
     options: antfly.inference.GenerationOptions,
+    control: inference.InferenceExecutionControl,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
     const preflight = try preflightLocalGenerateMessages(messages);
     var admission = try node.beginDirectGenerateAdmission(preflight, options.max_tokens);
+    admission.execution_control = control;
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);

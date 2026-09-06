@@ -17,6 +17,7 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const RequestContext = @import("../inference/request_context.zig").RequestContext;
 const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
@@ -50,6 +51,7 @@ pub const BackendFactory = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
+    request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
@@ -68,6 +70,7 @@ pub const BackendFactory = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
+        request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
     };
 
@@ -82,6 +85,7 @@ pub const BackendFactory = struct {
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
+            .request_context = options.request_context,
             .limits = options.limits,
         };
     }
@@ -95,7 +99,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.limits);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.request_context, self.limits);
     }
 };
 
@@ -107,6 +111,7 @@ const BackendState = struct {
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
+    request_context: ?RequestContext = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -122,6 +127,7 @@ const BackendState = struct {
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
+        request_context: ?RequestContext,
         limits: *provider_limits.Registry,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
@@ -139,6 +145,7 @@ const BackendState = struct {
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
+        state.request_context = request_context;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
@@ -162,6 +169,13 @@ const BackendState = struct {
                     .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
+                    .request_control = if (request_context) |context| .{
+                        .deadline_ns = context.deadline_ns,
+                        .cancellation = if (context.cancellation) |token|
+                            httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+                        else
+                            null,
+                    } else .{},
                 }) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
@@ -230,6 +244,27 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
+        if (self.request_context) |context| {
+            try context.updateDetail(.executing, 0, 1, model, @tagName(std.meta.activeTag(self.provider)));
+            const timeout_ms = try context.remainingTimeoutMs();
+            const cancellation = if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null;
+            switch (self.provider) {
+                .openai => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .remote_antfly => |*provider| {
+                    provider.setRequestTimeoutMs(timeout_ms);
+                    provider.setRequestCancellation(context.cancellation);
+                },
+                .vertex => |*provider| provider.setAbsoluteRequestControl(.{
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = cancellation,
+                }),
+                .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .embedded_antfly => {},
+            }
+        }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         if (policy.tokens_per_minute != 0) {
             if (self.cfg.max_tokens <= 0) return error.InvalidRateLimitPolicy;
@@ -295,14 +330,22 @@ const BackendState = struct {
             },
             .embedded_antfly => |local| blk: {
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
-                if (local.generate_messages) |generate_messages| {
+                if (self.request_context) |context| {
+                    try context.check();
+                    if (local.generate_messages_with_context) |generate_messages| {
+                        const content = try generate_messages(local.ptr, alloc, model, messages, options, context);
+                        break :blk inference.GenerateResult{
+                            .content = content,
+                            .allocator = alloc,
+                        };
+                    }
+                } else if (local.generate_messages) |generate_messages| {
                     const content = try generate_messages(local.ptr, alloc, model, messages, options);
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
                     };
                 }
-                const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
                 const contents = try alloc.alloc([]const u8, messages.len);
@@ -311,7 +354,13 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = try generate_text(local.ptr, alloc, model, roles, contents, options);
+                const content = if (self.request_context) |context| blk_content: {
+                    const generate_text = local.generate_text_with_context orelse return error.UncancellableInferenceProvider;
+                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents, options, context);
+                } else blk_content: {
+                    const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
+                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents, options);
+                };
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,
@@ -319,6 +368,7 @@ const BackendState = struct {
             },
         };
         defer result.deinit();
+        if (self.request_context) |context| try context.check();
 
         return .{
             .content = try alloc.dupe(u8, result.content),
@@ -580,6 +630,19 @@ test "generating backend routes antfly and url-less antfly to local provider" {
             try std.testing.expectEqual(@as(i32, 128), options.max_tokens);
             return try a.dupe(u8, "local ok");
         }
+
+        fn generateTextWithContext(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            roles: []const []const u8,
+            contents: []const []const u8,
+            options: inference.GenerationOptions,
+            context: RequestContext,
+        ) anyerror![]u8 {
+            try context.check();
+            return generateText(ptr, a, model, roles, contents, options);
+        }
     };
 
     var fake = FakeLocal{};
@@ -588,6 +651,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
         .embed_dense_texts = FakeLocal.embedDenseTexts,
         .embed_sparse_texts = FakeLocal.embedSparseTexts,
         .generate_text = FakeLocal.generateText,
+        .generate_text_with_context = FakeLocal.generateTextWithContext,
     };
 
     const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
@@ -604,6 +668,14 @@ test "generating backend routes antfly and url-less antfly to local provider" {
     try std.testing.expectEqualStrings("local ok", antfly_result.content);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    var controlled_result = try executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = null },
+    }, &messages);
+    defer controlled_result.deinit();
+    try std.testing.expectEqualStrings("local ok", controlled_result.content);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "generating backend passes multimodal messages to local provider callback" {
@@ -654,6 +726,18 @@ test "generating backend passes multimodal messages to local provider callback" 
             }
             return try a.dupe(u8, "local multimodal ok");
         }
+
+        fn generateMessagesWithContext(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            messages: []const ChatMessage,
+            options: inference.GenerationOptions,
+            context: RequestContext,
+        ) anyerror![]u8 {
+            try context.check();
+            return generateMessages(ptr, a, model, messages, options);
+        }
     };
 
     var fake = FakeLocal{};
@@ -662,6 +746,7 @@ test "generating backend passes multimodal messages to local provider callback" 
         .embed_dense_texts = FakeLocal.embedDenseTexts,
         .embed_sparse_texts = FakeLocal.embedSparseTexts,
         .generate_messages = FakeLocal.generateMessages,
+        .generate_messages_with_context = FakeLocal.generateMessagesWithContext,
     };
 
     const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .parts = &.{
@@ -680,6 +765,14 @@ test "generating backend passes multimodal messages to local provider callback" 
     defer result.deinit();
     try std.testing.expectEqualStrings("local multimodal ok", result.content);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    var controlled_result = try executeChainWithOptions(alloc, &client, &chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = null },
+    }, &messages);
+    defer controlled_result.deinit();
+    try std.testing.expectEqualStrings("local multimodal ok", controlled_result.content);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "generating antfly backend treats missing default api key env as optional" {
@@ -752,6 +845,7 @@ pub fn generateAntflyTextBatchResponse(
     options: BackendFactory.Options,
     texts: []const []const u8,
 ) !httpx.Response {
+    if (options.request_context) |context| try context.check();
     try cfg.validate();
     if (cfg.provider != .antfly or cfg.url.len == 0 or texts.len == 0)
         return error.InvalidGeneratorConfig;
@@ -772,9 +866,38 @@ pub fn generateAntflyTextBatchResponse(
     return http.post(url, .{
         .json = body,
         .headers = if (authorization != null) &headers else null,
-        .timeout_ms = 300_000,
+        .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,
+        .cancellation = if (options.request_context) |context|
+            if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null
+        else
+            null,
         .attempt_observer = state.quota.?.limiter().observer(output_tokens),
     });
+}
+
+test "generating backend batch preserves cancellation alongside quota policy" {
+    const alloc = std.testing.allocator;
+    var limits = provider_limits.Registry.init(alloc);
+    defer limits.deinit();
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "budget", .url = "http://127.0.0.1:1" });
+    cfg.rate_limit = .{ .requests_per_minute = 1 };
+    var context = RequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
+        .limits = &limits,
+        .request_context = context,
+    }, &.{"hello"}));
+    var cancelled = std.atomic.Value(bool).init(true);
+    context.deadline_ns = null;
+    context.cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
+        .limits = &limits,
+        .request_context = context,
+    }, &.{"hello"}));
 }
 
 test "generating backend batch reserves all output caps before dispatch" {

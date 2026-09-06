@@ -16,6 +16,7 @@ const std = @import("std");
 
 const backends = @import("../backends/backends.zig");
 const compiled_artifact = @import("../compiled_artifact.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const cache_mod = @import("cache.zig");
 const model_runtime = @import("model_runtime.zig");
 const onnx_kv_cache = @import("onnx_kv_cache.zig");
@@ -241,6 +242,7 @@ const Runtime = struct {
                 request.input_ids,
                 self.fallback_vocab_size,
                 request.query_seq_len,
+                request.execution_control,
             ),
             .runtime_owned_host_cache => try runDecoderArtifactWithSession(
                 allocator,
@@ -251,6 +253,7 @@ const Runtime = struct {
                 request.input_ids.len,
                 false,
                 self.fallback_vocab_size,
+                request.execution_control,
             ),
             .backend_owned_kv => try runBackendOwnedDecoderArtifactWithSession(
                 allocator,
@@ -262,6 +265,7 @@ const Runtime = struct {
                 false,
                 self.decode_session != null,
                 self.fallback_vocab_size,
+                request.execution_control,
             ),
         };
         return .{ .logits = last_logits };
@@ -293,6 +297,7 @@ const Runtime = struct {
                     request.position + 1,
                     true,
                     self.fallback_vocab_size,
+                    request.execution_control,
                 );
             },
             .backend_owned_kv => blk: {
@@ -307,6 +312,7 @@ const Runtime = struct {
                     true,
                     true,
                     self.fallback_vocab_size,
+                    request.execution_control,
                 );
             },
             .host_assisted_explicit_kv => unreachable,
@@ -369,6 +375,7 @@ fn runFullArtifactLastLogitsWithSession(
     input_ids: []const i64,
     fallback_vocab_size: usize,
     query_seq_len: usize,
+    execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     const input_info = session.inputInfo();
     if (input_info.len == 0) return error.UnsupportedArtifactInputs;
@@ -377,7 +384,7 @@ fn runFullArtifactLastLogitsWithSession(
     var full_inputs_owned = true;
     errdefer if (full_inputs_owned) deinitTensorSlice(allocator, full_inputs);
 
-    const outputs = try session.run(full_inputs, allocator);
+    const outputs = try session.runWithControl(full_inputs, allocator, execution_control);
     var outputs_owned = true;
     errdefer if (outputs_owned) deinitTensorSlice(allocator, outputs);
     deinitTensorSlice(allocator, full_inputs);
@@ -426,6 +433,7 @@ fn runDecoderArtifactWithSession(
     total_sequence_len: usize,
     use_cached_past: bool,
     fallback_vocab_size: usize,
+    execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     const input_info = session.inputInfo();
     const output_info = session.outputInfo();
@@ -447,7 +455,7 @@ fn runDecoderArtifactWithSession(
         try appendDecoderEmptyPastInputs(allocator, input_info, &inputs);
     }
 
-    const outputs = try session.run(inputs.items, allocator);
+    const outputs = try session.runWithControl(inputs.items, allocator, execution_control);
     var outputs_owned = true;
     errdefer if (outputs_owned) deinitTensorSlice(allocator, outputs);
 
@@ -477,6 +485,7 @@ fn runBackendOwnedDecoderArtifactWithSession(
     use_cached_past: bool,
     retain_cache_outputs: bool,
     fallback_vocab_size: usize,
+    execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     const input_info = session.inputInfo();
     const output_info = session.outputInfo();
@@ -507,12 +516,13 @@ fn runBackendOwnedDecoderArtifactWithSession(
         try appendPresentOutputNames(allocator, output_info, &retain_output_names);
     }
 
-    var run_result = try backends.onnx.runWithBoundValues(
+    var run_result = try backends.onnx.runWithBoundValuesControl(
         session,
         tensor_inputs.items,
         retained_inputs.items,
         retain_output_names.items,
         allocator,
+        execution_control,
     );
     defer run_result.deinit();
 

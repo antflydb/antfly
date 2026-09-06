@@ -204,14 +204,17 @@ const TestStepProgressEvent = struct {
     collected: ?i64 = null,
     complete: ?bool = null,
     questions: ?[]AgentQuestion = null,
-    selection_source: ?[]const u8 = null,
-    next_selection_source: ?[]const u8 = null,
-    probe_relevance: ?f64 = null,
-    probe_hits: ?i64 = null,
     sub_question: ?[]const u8 = null,
-    planner_decision: ?[]const u8 = null,
-    fallback_consensus_ambiguous: ?bool = null,
-    generation: ?[]const u8 = null,
+    details: ?struct {
+        selection_source: ?[]const u8 = null,
+        next_selection_source: ?[]const u8 = null,
+        candidate_scores: []const struct {
+            probe_relevance: ?f64 = null,
+            probe_hits: ?i64 = null,
+        } = &.{},
+        planner_decision: ?[]const u8 = null,
+        fallback_consensus_ambiguous: ?bool = null,
+    } = null,
 };
 
 pub const QueryRunner = struct {
@@ -346,6 +349,8 @@ const LiveEmitter = struct {
     sink: ?EventSink = null,
     alloc: std.mem.Allocator,
     next_step_index: usize = 0,
+    // Buffered transcripts replay the same event schema with final results.
+    replay_result: ?RetrievalAgentResult = null,
 
     fn emitValue(self: *LiveEmitter, event_name: []const u8, value: anytype) !void {
         if (self.sink) |sink| try sink.emitValue(self.alloc, event_name, value);
@@ -385,7 +390,7 @@ const LiveEmitter = struct {
 
     fn emitStep(self: *LiveEmitter, step: AgentStep) !void {
         if (self.sink == null) return;
-        const step_id = try std.fmt.allocPrint(self.alloc, "live_step_{d}", .{self.next_step_index});
+        const step_id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{self.next_step_index});
         defer self.alloc.free(step_id);
         self.next_step_index += 1;
 
@@ -396,7 +401,23 @@ const LiveEmitter = struct {
             .action = step.action,
         });
 
-        if (std.mem.eql(u8, step.name, "select_strategy")) {
+        if (std.mem.eql(u8, step.name, "pipeline")) {
+            if (self.replay_result) |result| try self.emitHits(result.hits, result.strategy_used == .tree or hasTreeHits(result.hits));
+        } else if (std.mem.eql(u8, step.name, "select_strategy")) {
+            if (step.details) |details| {
+                if (details.map.get("selection_source")) |source| {
+                    if (source == .string and std.mem.eql(u8, source.string, "probe")) {
+                        try self.emitValue("step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "probe",
+                            .action = step.action,
+                            .details = step.details,
+                        });
+                    }
+                }
+            }
             try self.emitTextChunks("reasoning", step.action);
             try self.emitValue("step_progress", .{
                 .id = step_id,
@@ -426,6 +447,27 @@ const LiveEmitter = struct {
                 .action = step.action,
                 .details = step.details,
             });
+            const ambiguity_events = .{
+                .{ "current_vs_fallback_ambiguous", "current_vs_fallback_ambiguity", "evaluation found the current result and the best fallback to be effectively tied" },
+                .{ "fallback_consensus_ambiguous", "fallback_consensus_ambiguity", "evaluation found multiple stronger fallback strategies that remain effectively tied" },
+            };
+            if (step.details) |details| {
+                inline for (ambiguity_events) |event| {
+                    if (details.map.get(event[0])) |ambiguous| {
+                        if (ambiguous == .bool and ambiguous.bool) {
+                            try self.emitTextChunks("reasoning", event[2]);
+                            try self.emitValue("step_progress", .{
+                                .id = step_id,
+                                .kind = step.kind,
+                                .name = step.name,
+                                .phase = event[1],
+                                .action = step.action,
+                                .details = step.details,
+                            });
+                        }
+                    }
+                }
+            }
         } else if (std.mem.eql(u8, step.name, "agentic")) {
             if (toolCountFromStepDetails(step.details)) |tools_count| {
                 try self.emitValue("tool_mode", .{ .mode = "structured_output", .tools_count = tools_count });
@@ -434,6 +476,15 @@ const LiveEmitter = struct {
             }
             try self.emitTextChunks("reasoning", step.action);
         } else if (step.kind == .tool_call) {
+            if (self.replay_result) |result| {
+                if (step.details) |details| {
+                    if (details.map.get("strategy")) |strategy| {
+                        if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
+                            try self.emitTreeProgress(result.hits);
+                        }
+                    }
+                }
+            }
             try self.emitValue("step_progress", .{
                 .id = step_id,
                 .kind = step.kind,
@@ -451,7 +502,12 @@ const LiveEmitter = struct {
                 .phase = "clarification",
                 .action = step.action,
                 .details = step.details,
+                .questions = if (self.replay_result) |result| result.questions else null,
             });
+        } else if (std.mem.eql(u8, step.name, "generation")) {
+            if (self.replay_result) |result| {
+                if (result.generation) |content| try self.emitTextChunks("generation", content);
+            }
         }
 
         try self.emitValue("step_completed", .{
@@ -466,18 +522,20 @@ const LiveEmitter = struct {
 
     fn emitHits(self: *LiveEmitter, hits: []const QueryHit, tree_search: bool) !void {
         if (self.sink == null) return;
-        if (tree_search) {
-            try self.emitValue("step_progress", .{
-                .name = "pipeline",
-                .phase = "tree_search",
-                .depth = maxTreeHitDepth(hits),
-                .num_nodes = hits.len,
-                .collected = hits.len,
-                .complete = true,
-                .sufficient = hits.len > 0,
-            });
-        }
+        if (tree_search) try self.emitTreeProgress(hits);
         for (hits) |hit| try self.emitValue("hit", hit);
+    }
+
+    fn emitTreeProgress(self: *LiveEmitter, hits: []const QueryHit) !void {
+        try self.emitValue("step_progress", .{
+            .name = "pipeline",
+            .phase = "tree_search",
+            .depth = maxTreeHitDepth(hits),
+            .num_nodes = hits.len,
+            .collected = hits.len,
+            .complete = true,
+            .sufficient = hits.len > 0,
+        });
     }
 
     fn emitDone(self: *LiveEmitter, result: RetrievalAgentResult) !void {
@@ -4154,7 +4212,7 @@ fn planNextAgenticFallback(
     );
     const next_index = selectNextAgenticFallbackIndex(refined_scores, attempted_query_indices) orelse return null;
     return .{
-        .indices = try alloc.dupe(usize, &[_]usize{next_index}),
+        .indices = try arena.dupe(usize, &[_]usize{next_index}),
         .source = .evaluation,
         .candidate_scores = refined_scores,
     };
@@ -5087,227 +5145,38 @@ fn isQuestionLike(query: []const u8) bool {
     return false;
 }
 
+const SseTranscript = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn emit(raw: *anyopaque, allocator: std.mem.Allocator, name: []const u8, json: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.bytes.appendSlice(allocator, "event: ");
+        try self.bytes.appendSlice(allocator, name);
+        try self.bytes.appendSlice(allocator, "\ndata: ");
+        try self.bytes.appendSlice(allocator, json);
+        try self.bytes.appendSlice(allocator, "\n\n");
+    }
+};
+
 fn encodeSse(
     alloc: std.mem.Allocator,
     result: RetrievalAgentResult,
 ) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-
-    const steps = result.steps orelse &.{};
-    if (result.classification) |classification| {
-        try appendSseEventValue(alloc, &out, "classification", classification);
-        if (classification.reasoning) |reasoning| {
-            try appendSseTextChunks(alloc, &out, "reasoning", reasoning, null, "classification");
-        }
-        if (classification.sub_questions) |sub_questions| {
-            for (sub_questions, 0..) |sub_question, i| {
-                try appendSseEventValue(alloc, &out, "step_progress", .{
-                    .name = "classification",
-                    .phase = "decompose",
-                    .index = i,
-                    .sub_question = sub_question,
-                });
-            }
-        }
-    }
-    for (steps, 0..) |step, i| {
-        const step_id = try std.fmt.allocPrint(alloc, "step_{d}", .{i});
-        defer alloc.free(step_id);
-
-        try appendSseEventValue(alloc, &out, "step_started", .{
-            .id = step_id,
-            .kind = step.kind,
-            .name = step.name,
-            .action = step.action,
-        });
-
-        if (std.mem.eql(u8, step.name, "pipeline")) {
-            if (result.strategy_used == .tree or hasTreeHits(result.hits)) {
-                const tree_depth = maxTreeHitDepth(result.hits);
-                try appendSseEventValue(alloc, &out, "step_progress", .{
-                    .id = step_id,
-                    .kind = step.kind,
-                    .name = step.name,
-                    .phase = "tree_search",
-                    .depth = tree_depth,
-                    .num_nodes = result.hits.len,
-                    .collected = result.hits.len,
-                    .complete = true,
-                    .sufficient = result.hits.len > 0,
-                    .action = step.action,
-                    .details = step.details,
-                });
-            }
-            for (result.hits) |hit| {
-                try appendSseEventValue(alloc, &out, "hit", hit);
-            }
-        } else if (std.mem.eql(u8, step.name, "select_strategy")) {
-            if (step.details) |details| {
-                if (details.map.get("selection_source")) |selection_source| {
-                    if (selection_source == .string and std.mem.eql(u8, selection_source.string, "probe")) {
-                        try appendSseEventValue(alloc, &out, "step_progress", .{
-                            .id = step_id,
-                            .kind = step.kind,
-                            .name = step.name,
-                            .phase = "probe",
-                            .action = step.action,
-                            .details = step.details,
-                        });
-                    }
-                }
-            }
-            try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
-            try appendSseEventValue(alloc, &out, "step_progress", .{
-                .id = step_id,
-                .kind = step.kind,
-                .name = step.name,
-                .phase = "select_strategy",
-                .action = step.action,
-                .details = step.details,
-            });
-        } else if (std.mem.eql(u8, step.name, "refine_query")) {
-            try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
-            try appendSseEventValue(alloc, &out, "step_progress", .{
-                .id = step_id,
-                .kind = step.kind,
-                .name = step.name,
-                .phase = stepProgressPhase(step.details, "refine_query"),
-                .action = step.action,
-                .details = step.details,
-            });
-        } else if (std.mem.eql(u8, step.name, "evaluate")) {
-            try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
-            try appendSseEventValue(alloc, &out, "step_progress", .{
-                .id = step_id,
-                .kind = step.kind,
-                .name = step.name,
-                .phase = "evaluate",
-                .action = step.action,
-                .details = step.details,
-            });
-            if (step.details) |details| {
-                if (details.map.get("current_vs_fallback_ambiguous")) |ambiguous| {
-                    if (ambiguous == .bool and ambiguous.bool) {
-                        try appendSseTextChunks(
-                            alloc,
-                            &out,
-                            "reasoning",
-                            "evaluation found the current result and the best fallback to be effectively tied",
-                            step_id,
-                            step.name,
-                        );
-                        try appendSseEventValue(alloc, &out, "step_progress", .{
-                            .id = step_id,
-                            .kind = step.kind,
-                            .name = step.name,
-                            .phase = "current_vs_fallback_ambiguity",
-                            .action = step.action,
-                            .details = step.details,
-                        });
-                    }
-                }
-                if (details.map.get("fallback_consensus_ambiguous")) |ambiguous| {
-                    if (ambiguous == .bool and ambiguous.bool) {
-                        try appendSseTextChunks(
-                            alloc,
-                            &out,
-                            "reasoning",
-                            "evaluation found multiple stronger fallback strategies that remain effectively tied",
-                            step_id,
-                            step.name,
-                        );
-                        try appendSseEventValue(alloc, &out, "step_progress", .{
-                            .id = step_id,
-                            .kind = step.kind,
-                            .name = step.name,
-                            .phase = "fallback_consensus_ambiguity",
-                            .action = step.action,
-                            .details = step.details,
-                        });
-                    }
-                }
-            }
-        } else if (std.mem.eql(u8, step.name, "agentic")) {
-            if (toolCountFromStepDetails(step.details)) |tools_count| {
-                try appendSseEventValue(alloc, &out, "tool_mode", .{
-                    .mode = "structured_output",
-                    .tools_count = tools_count,
-                });
-            } else {
-                try appendSseEventValue(alloc, &out, "tool_mode", .{
-                    .mode = "structured_output",
-                });
-            }
-            try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
-        } else if (step.kind == .tool_call) {
-            if (step.details) |details| {
-                if (details.map.get("strategy")) |strategy| {
-                    if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
-                        const tree_depth = maxTreeHitDepth(result.hits);
-                        try appendSseEventValue(alloc, &out, "step_progress", .{
-                            .id = step_id,
-                            .kind = step.kind,
-                            .name = step.name,
-                            .phase = "tree_search",
-                            .depth = tree_depth,
-                            .num_nodes = result.hits.len,
-                            .collected = result.hits.len,
-                            .complete = true,
-                            .sufficient = result.hits.len > 0,
-                            .action = step.action,
-                            .details = step.details,
-                        });
-                    }
-                }
-            }
-            try appendSseEventValue(alloc, &out, "step_progress", .{
-                .id = step_id,
-                .kind = step.kind,
-                .name = step.name,
-                .phase = "tool_call",
-                .action = step.action,
-                .details = step.details,
-            });
-        } else if (std.mem.eql(u8, step.name, "clarification")) {
-            try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
-            try appendSseEventValue(alloc, &out, "step_progress", .{
-                .id = step_id,
-                .kind = step.kind,
-                .name = step.name,
-                .phase = "clarification",
-                .action = step.action,
-                .details = step.details,
-                .questions = result.questions,
-            });
-        } else if (std.mem.eql(u8, step.name, "generation")) {
-            if (result.generation) |generation| {
-                try appendSseTextChunks(alloc, &out, "generation", generation, step_id, step.name);
-            }
-        }
-
-        try appendSseEventValue(alloc, &out, "step_completed", .{
-            .id = step_id,
-            .kind = step.kind,
-            .name = step.name,
-            .action = step.action,
-            .status = step.status,
-            .details = step.details,
-        });
-    }
-
+    var transcript = SseTranscript{};
+    defer transcript.bytes.deinit(alloc);
+    var emitter = LiveEmitter{
+        .alloc = alloc,
+        .sink = .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit },
+        .replay_result = result,
+    };
+    if (result.classification) |classification| try emitter.emitClassification(classification);
+    for (result.steps orelse &.{}) |step| try emitter.emitStep(step);
     if (result.followup_questions) |followups| {
-        for (followups) |followup| {
-            try appendSseEventValue(alloc, &out, "followup", followup);
-        }
+        for (followups) |followup| try emitter.emitValue("followup", followup);
     }
-
-    if (result.eval_result) |eval_result| {
-        try appendSseEventValue(alloc, &out, "eval", eval_result);
-    }
-
-    try appendSseEventValue(alloc, &out, "done", result);
-    return try out.toOwnedSlice(alloc);
+    if (result.eval_result) |eval_result| try emitter.emitValue("eval", eval_result);
+    try emitter.emitDone(result);
+    return try transcript.bytes.toOwnedSlice(alloc);
 }
 
 fn maxTreeHitDepth(hits: []const QueryHit) i64 {
@@ -5337,28 +5206,6 @@ fn stepProgressPhase(
         if (phase == .string) return phase.string;
     }
     return default_phase;
-}
-
-fn appendSseTextChunks(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    event_name: []const u8,
-    text: []const u8,
-    _: ?[]const u8,
-    _: ?[]const u8,
-) !void {
-    if (text.len == 0) {
-        try appendSseEventValue(alloc, out, event_name, text);
-        return;
-    }
-
-    const chunk_len: usize = 80;
-    var start: usize = 0;
-    while (start < text.len) {
-        const end = @min(start + chunk_len, text.len);
-        try appendSseEventValue(alloc, out, event_name, text[start..end]);
-        start = end;
-    }
 }
 
 fn encodeSseError(
@@ -9293,7 +9140,10 @@ test "retrieval agent sse emits followup events" {
     defer std.testing.allocator.free(events);
     var parsed_followup = try parseJsonBody([]const u8, std.testing.allocator, firstSseEventData(events, "followup").?);
     defer parsed_followup.deinit();
-    try std.testing.expectEqualStrings("What else should I know about: How does retrieval work?", parsed_followup.value);
+    var done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
+    defer done.deinit();
+    try std.testing.expectEqual(@as(usize, 2), countSseEvents(events, "followup"));
+    try std.testing.expectEqualStrings(done.value.followup_questions.?[0], parsed_followup.value);
 }
 
 test "retrieval agent sse emits eval events" {
@@ -9331,9 +9181,9 @@ test "retrieval agent sse emits eval events" {
     defer std.testing.allocator.free(encoded.body);
     const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
     defer std.testing.allocator.free(events);
-    var parsed_eval = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, firstSseEventData(events, "eval").?);
+    var parsed_eval = try parseJsonBody(eval_openapi.EvalResult, std.testing.allocator, firstSseEventData(events, "eval").?);
     defer parsed_eval.deinit();
-    try std.testing.expect(parsed_eval.value.generation != null);
+    try std.testing.expect(parsed_eval.value.scores.?.generation != null);
 }
 
 test "retrieval agent sse encodes clarification through step events" {
@@ -9366,16 +9216,12 @@ test "retrieval agent sse encodes clarification through step events" {
     try std.testing.expect(countSseEvents(events, "done") >= 1);
     var saw_clarification = false;
     for (events) |event| {
-        if (!(std.mem.eql(u8, event.event, "step_started") or std.mem.eql(u8, event.event, "step_progress") or std.mem.eql(u8, event.event, "step_completed"))) continue;
+        if (!std.mem.eql(u8, event.event, "step_progress")) continue;
         var parsed_progress = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, event.data);
         defer parsed_progress.deinit();
         if (!std.mem.eql(u8, parsed_progress.value.phase, "clarification")) continue;
         saw_clarification = true;
-        if (parsed_progress.value.questions) |questions| {
-            try std.testing.expectEqualStrings("select_query", questions[0].id);
-        } else if (parsed_progress.value.id) |id| {
-            try std.testing.expectEqualStrings("select_query", id);
-        }
+        try std.testing.expectEqualStrings("select_query", parsed_progress.value.questions.?[0].id);
     }
     try std.testing.expect(saw_clarification);
 }
@@ -9465,28 +9311,43 @@ test "retrieval agent sse emits probe progress for ambiguous agentic selection" 
         }
     };
 
-    var runner = FakeRunner{};
     const body =
         \\{"query":"architecture overview","stream":true,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","semantic_search":"architecture overview","indexes":["semantic_idx"],"limit":5},{"table":"docs","full_text_search":{"query":"body:architecture"},"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
     ;
-    const encoded = try execute(std.testing.allocator, runner.iface(), null, body);
-    defer std.testing.allocator.free(encoded.body);
-    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
-    defer std.testing.allocator.free(events);
-    try std.testing.expect(countSseEvents(events, "reasoning") >= 1);
-    var saw_probe = false;
-    for (events) |event| {
-        if (!std.mem.eql(u8, event.event, "step_progress")) continue;
-        var parsed_progress = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, event.data);
-        defer parsed_progress.deinit();
-        if (!std.mem.eql(u8, parsed_progress.value.phase, "probe")) continue;
-        saw_probe = true;
-        try std.testing.expectEqualStrings("probe", parsed_progress.value.selection_source.?);
-        try std.testing.expect(parsed_progress.value.probe_relevance != null);
-        try std.testing.expect(parsed_progress.value.id != null);
-        try std.testing.expectEqualStrings("planning", parsed_progress.value.kind.?);
+    for ([_]bool{ false, true }) |streaming| {
+        var runner = FakeRunner{};
+        var transcript = SseTranscript{};
+        defer transcript.bytes.deinit(std.testing.allocator);
+        const encoded = if (streaming)
+            try executeWithEventSink(std.testing.allocator, runner.iface(), null, body, .{
+                .ptr = &transcript,
+                .emit_json_fn = SseTranscript.emit,
+                .sse_only = true,
+            })
+        else
+            try execute(std.testing.allocator, runner.iface(), null, body);
+        defer std.testing.allocator.free(encoded.body);
+        const events = try parseSseEventsAlloc(std.testing.allocator, if (streaming) transcript.bytes.items else encoded.body);
+        defer std.testing.allocator.free(events);
+        try std.testing.expect(countSseEvents(events, "reasoning") >= 1);
+        var saw_probe = false;
+        for (events) |event| {
+            if (!std.mem.eql(u8, event.event, "step_progress")) continue;
+            var parsed_progress = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, event.data);
+            defer parsed_progress.deinit();
+            if (!std.mem.eql(u8, parsed_progress.value.phase, "probe")) continue;
+            saw_probe = true;
+            try std.testing.expectEqualStrings("probe", parsed_progress.value.details.?.selection_source.?);
+            const candidates = parsed_progress.value.details.?.candidate_scores;
+            try std.testing.expectEqual(@as(usize, 2), candidates.len);
+            var probed = false;
+            for (candidates) |candidate| probed = probed or candidate.probe_relevance != null;
+            try std.testing.expect(probed);
+            try std.testing.expect(parsed_progress.value.id != null);
+            try std.testing.expectEqualStrings("planning", parsed_progress.value.kind.?);
+        }
+        try std.testing.expect(saw_probe);
     }
-    try std.testing.expect(saw_probe);
 }
 
 test "retrieval agent sse emits evaluation progress for fallback planning" {
@@ -9536,144 +9397,104 @@ test "retrieval agent sse emits evaluation progress for fallback planning" {
         defer parsed_progress.deinit();
         if (!std.mem.eql(u8, parsed_progress.value.phase, "evaluate")) continue;
         saw_evaluate = true;
-        try std.testing.expectEqualStrings("evaluation", parsed_progress.value.selection_source.?);
-        try std.testing.expectEqualStrings("evaluation", parsed_progress.value.next_selection_source.?);
-        try std.testing.expect(parsed_progress.value.probe_hits != null);
+        try std.testing.expectEqualStrings("evaluation", parsed_progress.value.details.?.next_selection_source.?);
+        var probed = false;
+        for (parsed_progress.value.details.?.candidate_scores) |candidate| {
+            probed = probed or candidate.probe_hits != null;
+        }
+        try std.testing.expect(probed);
     }
     try std.testing.expect(saw_evaluate);
 }
 
 test "retrieval agent sse emits evaluation refinement progress" {
-    const FakeRunner = struct {
-        call_count: usize = 0,
-
-        fn iface(self: *@This()) QueryRunner {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .run_query = runQuery },
-            };
-        }
-
-        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.call_count += 1;
-            var parsed_query = try parseQueryRequestBody(alloc, query_json);
-            defer parsed_query.deinit();
-            if (parsed_query.value.semantic_search != null) {
-                if (self.call_count == 1) {
-                    return .{
-                        .json = try alloc.dupe(u8,
-                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
-                        ),
-                    };
-                }
-                return .{
-                    .json = try alloc.dupe(u8,
-                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic","_score":1.0,"_source":{"body":"Explain the architecture of Antfly in detail with cluster topology, storage roles, and retrieval planning."}}]}}]}
-                    ),
-                };
-            }
-            if (parsed_query.value.filter_query != null) return error.TestUnexpectedResult;
-            return error.TestUnexpectedResult;
-        }
+    const alloc = std.testing.allocator;
+    // Planner decisions have their own tests. Exercise the event contract
+    // directly so relevance scoring cannot bypass this serialization branch.
+    var details = try parseJsonBody(JsonObject, alloc, "{\"phase\":\"evaluation_refine\",\"planner_decision\":\"refine_query\"}");
+    defer details.deinit();
+    const step = AgentStep{
+        .kind = .planning,
+        .name = "refine_query",
+        .action = "explain the planner decision",
+        .status = .success,
+        .details = details.value,
     };
-
-    var runner = FakeRunner{};
-    const body =
-        \\{"query":"Explain the architecture of Antfly in detail","stream":true,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","semantic_search":"architecture overview","indexes":["semantic_idx"],"limit":5},{"table":"docs","filter_query":{"query":"status:active"},"limit":5}]}
-    ;
-    const encoded = try execute(std.testing.allocator, runner.iface(), null, body);
-    defer std.testing.allocator.free(encoded.body);
-    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
-    defer std.testing.allocator.free(events);
-    try std.testing.expect(countSseEvents(events, "reasoning") >= 2);
-    try std.testing.expect(countSseEvents(events, "step_completed") >= 1);
-    var saw_refine = false;
+    const result = RetrievalAgentResult{
+        .created_at = 0,
+        .status = .completed,
+        .hits = &.{},
+        .steps = &.{step},
+    };
+    const buffered = try encodeSse(alloc, result);
+    defer alloc.free(buffered);
+    var transcript = SseTranscript{};
+    defer transcript.bytes.deinit(alloc);
+    var live = LiveEmitter{
+        .alloc = alloc,
+        .sink = .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit },
+    };
+    try live.emitStep(step);
+    try live.emitDone(result);
+    try std.testing.expectEqualStrings(buffered, transcript.bytes.items);
+    const events = try parseSseEventsAlloc(alloc, transcript.bytes.items);
+    defer alloc.free(events);
+    var saw_progress = false;
     for (events) |event| {
         if (!std.mem.eql(u8, event.event, "step_progress")) continue;
-        var parsed_progress = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, event.data);
-        defer parsed_progress.deinit();
-        if (!std.mem.eql(u8, parsed_progress.value.phase, "evaluation_refine")) continue;
-        saw_refine = true;
-        try std.testing.expectEqualStrings("refine_query", parsed_progress.value.planner_decision.?);
+        var parsed = try parseJsonBody(TestStepProgressEvent, alloc, event.data);
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.phase, "evaluation_refine")) continue;
+        saw_progress = true;
+        try std.testing.expectEqualStrings("refine_query", parsed.value.details.?.planner_decision.?);
+        try std.testing.expect(parsed.value.id != null);
     }
-    try std.testing.expect(saw_refine);
+    try std.testing.expect(saw_progress);
 }
 
 test "retrieval agent sse emits fallback consensus ambiguity progress" {
-    const FakeRunner = struct {
-        call_count: usize = 0,
-
-        fn iface(self: *@This()) QueryRunner {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .run_query = runQuery },
-            };
-        }
-
-        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.call_count += 1;
-            var parsed_query = try parseQueryRequestBody(alloc, query_json);
-            defer parsed_query.deinit();
-            if (parsed_query.value.semantic_search != null) {
-                if (self.call_count == 1) {
-                    return .{
-                        .json = try alloc.dupe(u8,
-                            \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.7,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.6,"_source":{"body":"overview"}}]}}]}
-                        ),
-                    };
-                }
-                return .{
-                    .json = try alloc.dupe(u8,
-                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:thin","_score":0.71,"_source":{"body":"architecture"}},{"_id":"doc:other","_score":0.61,"_source":{"body":"overview"}}]}}]}
-                    ),
-                };
-            }
-            if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings != null) {
-                return .{
-                    .json = try alloc.dupe(u8,
-                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:hybrid","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
-                    ),
-                };
-            }
-            if (parsed_query.value.embeddings != null) {
-                return .{
-                    .json = try alloc.dupe(u8,
-                        \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:semantic_fallback","_score":0.8,"_source":{"body":"architecture overview"}}]}}]}
-                    ),
-                };
-            }
-            return error.TestUnexpectedResult;
-        }
+    const alloc = std.testing.allocator;
+    // Planner decisions have their own tests. Exercise the event contract
+    // directly so relevance scoring cannot bypass this serialization branch.
+    var details = try parseJsonBody(JsonObject, alloc, "{\"fallback_consensus_ambiguous\":true,\"planner_decision\":\"clarify\"}");
+    defer details.deinit();
+    const step = AgentStep{
+        .kind = .planning,
+        .name = "evaluate",
+        .action = "explain the planner decision",
+        .status = .success,
+        .details = details.value,
     };
-
-    var runner = FakeRunner{};
-    const body =
-        \\{"query":"Explain the architecture of Antfly in detail","stream":true,"max_internal_iterations":4,"max_user_clarifications":1,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","semantic_search":"architecture overview","indexes":["semantic_idx"],"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5},{"table":"docs","full_text_search":{"query":"body:architecture"},"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
-    ;
-    const encoded = try execute(std.testing.allocator, runner.iface(), null, body);
-    defer std.testing.allocator.free(encoded.body);
-    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
-    defer std.testing.allocator.free(events);
-    var saw_ambiguity = false;
+    const result = RetrievalAgentResult{
+        .created_at = 0,
+        .status = .completed,
+        .hits = &.{},
+        .steps = &.{step},
+    };
+    const buffered = try encodeSse(alloc, result);
+    defer alloc.free(buffered);
+    var transcript = SseTranscript{};
+    defer transcript.bytes.deinit(alloc);
+    var live = LiveEmitter{
+        .alloc = alloc,
+        .sink = .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit },
+    };
+    try live.emitStep(step);
+    try live.emitDone(result);
+    try std.testing.expectEqualStrings(buffered, transcript.bytes.items);
+    const events = try parseSseEventsAlloc(alloc, transcript.bytes.items);
+    defer alloc.free(events);
+    var saw_progress = false;
     for (events) |event| {
-        if (std.mem.eql(u8, event.event, "step_progress")) {
-            var parsed_progress = try parseJsonBody(TestStepProgressEvent, std.testing.allocator, event.data);
-            defer parsed_progress.deinit();
-            if (!std.mem.eql(u8, parsed_progress.value.phase, "fallback_consensus_ambiguity")) continue;
-            saw_ambiguity = true;
-            try std.testing.expectEqualStrings("clarify", parsed_progress.value.planner_decision.?);
-            try std.testing.expectEqual(true, parsed_progress.value.fallback_consensus_ambiguous.?);
-        } else if (std.mem.eql(u8, event.event, "reasoning")) {
-            var parsed_reasoning = try parseJsonBody([]const u8, std.testing.allocator, event.data);
-            defer parsed_reasoning.deinit();
-            if (std.mem.indexOf(u8, parsed_reasoning.value, "multiple stronger fallback strategies remain effectively tied") != null) {
-                saw_ambiguity = true;
-            }
-        }
+        if (!std.mem.eql(u8, event.event, "step_progress")) continue;
+        var parsed = try parseJsonBody(TestStepProgressEvent, alloc, event.data);
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.phase, "fallback_consensus_ambiguity")) continue;
+        saw_progress = true;
+        try std.testing.expectEqualStrings("clarify", parsed.value.details.?.planner_decision.?);
+        try std.testing.expectEqual(true, parsed.value.details.?.fallback_consensus_ambiguous.?);
     }
-    try std.testing.expect(saw_ambiguity);
+    try std.testing.expect(saw_progress);
 }
 
 test "retrieval agent sse emits error events on query failure" {
@@ -9699,9 +9520,9 @@ test "retrieval agent sse emits error events on query failure" {
     defer std.testing.allocator.free(events);
 
     try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
-    var parsed_error = try parseJsonBody([]const u8, std.testing.allocator, firstSseEventData(events, "error").?);
+    var parsed_error = try parseJsonBody(struct { @"error": []const u8 }, std.testing.allocator, firstSseEventData(events, "error").?);
     defer parsed_error.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, parsed_error.value, "TestSyntheticFailure") != null);
+    try std.testing.expectEqualStrings("TestSyntheticFailure", parsed_error.value.@"error");
 }
 
 test "retrieval agent generation uses the canonical generator and chain contract" {

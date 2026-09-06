@@ -156,6 +156,7 @@ pub const Provider = struct {
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -323,6 +324,7 @@ pub const Provider = struct {
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -407,7 +409,11 @@ pub const Provider = struct {
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
-            .timeout_ms = 300_000,
+            .timeout_ms = self.request_timeout_ms orelse 300_000,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         });
         defer resp.deinit();
         if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;

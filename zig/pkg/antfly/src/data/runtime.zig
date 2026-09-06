@@ -19600,7 +19600,7 @@ fn runtimeStatusReportFromLocalStatus(
     const freshness = try alloc.dupe(u8, @tagName(status.metadata.freshness));
     errdefer alloc.free(freshness);
     const enrichment = try runtimeEnrichmentStatusReportFromStats(alloc, status.stats.enrichment);
-    errdefer alloc.free(enrichment.projection_checkpoint_status);
+    errdefer antfly.metadata.table_manager.freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     return .{
         .table_id = table.table_id,
         .table_name = table_name,
@@ -19640,10 +19640,28 @@ fn runtimeEnrichmentStatusReportFromStats(
     alloc: std.mem.Allocator,
     stats: antfly.db.types.EnrichmentStats,
 ) !antfly.metadata.table_manager.RuntimeEnrichmentStatusReport {
+    const projection_checkpoint_status = try alloc.dupe(u8, stats.projection_checkpoint_status);
+    errdefer alloc.free(projection_checkpoint_status);
+    const stall_reason = try alloc.dupe(u8, stats.stall_reason);
+    errdefer alloc.free(stall_reason);
+    const active_phase = try alloc.dupe(u8, stats.active_phase);
+    errdefer alloc.free(active_phase);
+    const active_model = try alloc.dupe(u8, stats.active_model.slice());
+    errdefer alloc.free(active_model);
+    const active_backend = try alloc.dupe(u8, stats.active_backend.slice());
+    errdefer alloc.free(active_backend);
     var report: antfly.metadata.table_manager.RuntimeEnrichmentStatusReport = .{};
     inline for (std.meta.fields(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
-            @field(report, field.name) = try alloc.dupe(u8, @field(stats, field.name));
+        if (comptime std.mem.eql(u8, field.name, "active_model")) {
+            @field(report, field.name) = active_model;
+        } else if (comptime std.mem.eql(u8, field.name, "active_backend")) {
+            @field(report, field.name) = active_backend;
+        } else if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
+            @field(report, field.name) = projection_checkpoint_status;
+        } else if (comptime std.mem.eql(u8, field.name, "stall_reason")) {
+            @field(report, field.name) = stall_reason;
+        } else if (comptime std.mem.eql(u8, field.name, "active_phase")) {
+            @field(report, field.name) = active_phase;
         } else {
             @field(report, field.name) = @field(stats, field.name);
         }
