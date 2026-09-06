@@ -12,6 +12,16 @@ hubs can reuse the same storage, job, and query surfaces later.
 
 ## User Model
 
+Service-targeted maintenance roles (including `supervise` and `launch`) require
+`ANTFLY_INTERNAL_SERVICE_SECRET` (at least 32 bytes) and
+`ANTFLY_INTERNAL_SERVICE_ISSUER`, matching the owning service's
+`antfly.internal_service.secret` and `antfly.internal_service.issuer` credentials.
+Supply these through the deployment's secret environment, never process arguments.
+Roles validate credentials before requesting work; supervisors and launchers
+validate them before spawning children. Children inherit the environment, and
+the shared HTTP client signs only internal API requests with short-lived tokens.
+The process harness exercises enforced authentication without an unsigned bypass.
+
 Users opt in through graph index configuration. A graph metric is owned by the
 graph index because it is derived index state: the graph index tracks dirtiness,
 runs maintenance, stores scores, and exposes query access. Table schema may

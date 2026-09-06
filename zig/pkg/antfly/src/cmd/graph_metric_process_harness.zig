@@ -18,6 +18,11 @@ const httpx = @import("httpx");
 const platform = @import("antfly_platform");
 const graph_query_mod = antfly.graph_query;
 
+const harness_internal_service_secret = "graph-metric-process-harness-internal-service-secret";
+const harness_internal_service_issuer = "graph-metric-process-harness";
+// Scoped to main's lifetime; every child gets an owned environment snapshot.
+var child_environ: ?*const std.process.Environ.Map = null;
+
 const HarnessProfile = enum {
     smoke,
     promotion,
@@ -171,6 +176,12 @@ fn recordServiceMultipagePhaseProofs(
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
+    var environ = try init.environ_map.clone(alloc);
+    defer environ.deinit();
+    try environ.put("ANTFLY_INTERNAL_SERVICE_SECRET", harness_internal_service_secret);
+    try environ.put("ANTFLY_INTERNAL_SERVICE_ISSUER", harness_internal_service_issuer);
+    child_environ = &environ;
+    defer child_environ = null;
 
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -4710,6 +4721,7 @@ fn runSupervisorProcess(
         "2",
     };
     const result = try std.process.run(alloc, io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .reserve_amount = 512,
     });
@@ -4804,6 +4816,7 @@ fn runLaunchProcess(
         summary_dir,
     };
     const result = try std.process.run(alloc, io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .reserve_amount = 512,
     });
@@ -8201,7 +8214,10 @@ const ProcessHarnessApiRuntime = struct {
         runtime.status_source = .{};
         runtime.api_server = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(
             alloc,
-            .{},
+            .{
+                .internal_service_secret = harness_internal_service_secret,
+                .internal_service_issuer = harness_internal_service_issuer,
+            },
             runtime.status_source.iface(),
             null,
             runtime.write_source.source(),
@@ -8280,6 +8296,7 @@ fn runAndKillCoordinatorAfterReady(
     };
     try verifyRoleProcessArgvScoped(argv[0..]);
     var child = try std.process.spawn(io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .stdin = .ignore,
         .stdout = .ignore,
@@ -8434,6 +8451,7 @@ fn runAndKillRoleProcessAfterReady(
 ) !void {
     try verifyRoleProcessArgvScoped(argv);
     var child = try std.process.spawn(io, .{
+        .environ_map = child_environ,
         .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -8477,6 +8495,7 @@ fn runAndKillDegreePageOwnerAfterReady(
         "10000",
     };
     var child = try std.process.spawn(io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .stdin = .ignore,
         .stdout = .ignore,
@@ -8544,6 +8563,7 @@ fn runAndKillWorkerRoleAfterReady(
     };
     try verifyRoleProcessArgvScoped(argv[0..]);
     var child = try std.process.spawn(io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .stdin = .ignore,
         .stdout = .ignore,
@@ -8591,6 +8611,7 @@ fn runAndKillMetricPageOwnerAfterReady(
         "10000",
     };
     var child = try std.process.spawn(io, .{
+        .environ_map = child_environ,
         .argv = argv[0..],
         .stdin = .ignore,
         .stdout = .ignore,
@@ -9226,6 +9247,7 @@ fn runRoleProcess(
 ) !RoleRunSummary {
     try verifyRoleProcessArgvScoped(argv);
     const result = try std.process.run(alloc, io, .{
+        .environ_map = child_environ,
         .argv = argv,
         .reserve_amount = 512,
     });

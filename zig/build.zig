@@ -8411,6 +8411,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
+        "api http client authenticates only the internal API namespace",
         "multi-shard reads fail closed for shard-local graph metric scores",
         "graph metric shard request carries internal status without mutating public request",
         "encode query request includes graph metric read rerank and traversal status",

@@ -19,6 +19,7 @@ const platform_clock = antfly.platform_clock;
 const graph_metric_runtime_mod = antfly.db.graph_metric_runtime;
 const graph_query_mod = antfly.graph_query;
 const writer_lock_mod = antfly.lmdb_engine.writer_lock;
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 
 const RuntimeRole = graph_metric_runtime_mod.Role;
 const SweepResult = antfly.db.IndexManager.GraphMetricPlannedSchedulerSweepResult;
@@ -453,6 +454,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
                 return;
             }
             const target = (try supervisor.target()) orelse return error.InvalidArguments;
+            if (target == .service) _ = try serviceCredentials(init.environ_map);
             const summary = try runSupervisorConfigured(init.io, alloc, argv0, target, supervisor);
             try writeJson(init.io, alloc, summary);
             return;
@@ -465,6 +467,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
                 return;
             }
             const target = (try launcher.target()) orelse return error.InvalidArguments;
+            if (target == .service) _ = try serviceCredentials(init.environ_map);
             const summary = try runLaunchedConfigured(init.io, alloc, argv0, target, launcher);
             try writeJson(init.io, alloc, summary);
             return;
@@ -482,7 +485,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     cli.owner_id = owner_incarnation;
     const summary = if (try cli.serviceTarget()) |target| blk: {
         if (cli.db_path != null) return error.InvalidArguments;
-        break :blk try runServiceConfigured(alloc, target, cli);
+        break :blk try runServiceConfigured(init, target, cli);
     } else blk: {
         const db_path = cli.db_path orelse return error.InvalidArguments;
         break :blk try runConfigured(alloc, db_path, cli);
@@ -576,10 +579,25 @@ const RealServiceMaintenanceClient = struct {
     }
 };
 
-fn runServiceConfigured(alloc: std.mem.Allocator, target: ServiceTarget, cli: CliConfig) !RunSummary {
+fn serviceCredentials(environ: *const std.process.Environ.Map) !internal_service_auth.Config {
+    const secret = environ.get("ANTFLY_INTERNAL_SERVICE_SECRET");
+    const issuer = environ.get("ANTFLY_INTERNAL_SERVICE_ISSUER");
+    try internal_service_auth.validateRuntimeConfig(secret, null, issuer);
+    return .{ .secret = secret.?, .issuer = issuer.? };
+}
+
+fn runServiceConfigured(init: std.process.Init, target: ServiceTarget, cli: CliConfig) !RunSummary {
+    const alloc = init.gpa;
+    // Use the same secret-key environment mapping as data/metadata runtimes.
+    // Children inherit credentials without exposing secrets in process argv.
+    const credentials = serviceCredentials(init.environ_map) catch |err| {
+        std.log.err("graph metric service roles require ANTFLY_INTERNAL_SERVICE_SECRET (at least 32 bytes) and ANTFLY_INTERNAL_SERVICE_ISSUER; err={s}", .{@errorName(err)});
+        return err;
+    };
     var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
     defer executor.deinit();
     var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+    _ = client.withInternalServiceAuth(credentials.secret, credentials.issuer);
     var context = RealServiceMaintenanceClient{ .client = &client };
     return try runServiceConfiguredWithRequester(
         RealServiceMaintenanceClient,
@@ -2036,6 +2054,20 @@ fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) 
 fn expectParseSupervisorInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
     var args = std.process.Args.Iterator.init(.{ .vector = argv });
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
+}
+
+test "graph metric maintenance service credentials fail closed before requesting work" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try std.testing.expectError(error.InternalServiceSecretMissing, serviceCredentials(&environ));
+    try environ.put("ANTFLY_INTERNAL_SERVICE_SECRET", "short");
+    try std.testing.expectError(error.InternalServiceSecretTooShort, serviceCredentials(&environ));
+    try environ.put("ANTFLY_INTERNAL_SERVICE_SECRET", "0123456789abcdef0123456789abcdef");
+    try std.testing.expectError(error.InternalServiceIssuerMissing, serviceCredentials(&environ));
+    try environ.put("ANTFLY_INTERNAL_SERVICE_ISSUER", "cluster-a");
+    const credentials = try serviceCredentials(&environ);
+    try std.testing.expectEqualStrings("cluster-a", credentials.issuer);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", credentials.secret);
 }
 
 test "graph metric maintenance command parses worker pool config" {
