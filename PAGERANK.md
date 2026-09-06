@@ -511,19 +511,21 @@ operations, transferred bytes, decoded blocks/work, and retained result-column
 and status memory across every named operation and metric dependency. This closes the
 per-metric-limit loophole where a valid request could multiply the allowed I/O
 by its dependency count. Exhaustion fails before the next backend range read
-and is returned as an actionable, non-retryable HTTP 422. Current v5/v6
-artifacts continue to use authenticated routed blocks and the persisted bounded
-top tier. Independent immutable score ranges use bounded eight-way `std.Io`
+and is returned as an actionable, non-retryable HTTP 422. The unreleased
+serverless format has one accepted wire version: discarded pre-release layouts
+are rejected rather than carried as a permanent compatibility surface.
+Independent immutable score ranges use bounded eight-way `std.Io`
 fanout, while every child view shares the same synchronized request ledger and
 pinned manifest. Range payloads are decoded and released one fanout batch at a
 time, so peak temporary memory is bounded by concurrency rather than the total
 number of planned ranges. Parallel metric workers write into disjoint
 request-owned result columns, avoiding a second full-column clone from the
-thread-safe transient allocator. Public graph shaping carries stable source-row
+thread-safe transient allocator. Point-score planning uses a sparse sorted
+worklist, so the common path allocates in proportion to requested nodes and
+touched blocks instead of the complete routing table. Public graph shaping
+carries stable source-row
 ordinals through filter and order stages, fetches later dependencies only for
 surviving rows, and moves nodes once when the final projection is materialized.
-v1-v3 compatibility reads are charged for their full artifact before
-materialization.
 
 Planned native maintenance pins the index catalog with a shared lifetime guard
 for each bounded scheduler unit. It does not hold the database-wide apply fence:
@@ -563,14 +565,30 @@ an asynchronous child.
 
 External serverless reconciliation accepts the same caller-owned compute
 runtime as ordinary lake builds, keeping CPU fanout under one operator-visible
-limit. A future physical-format migration may share an ordinal dictionary only
-within an exact `(source graph artifact, edge-filter projection)` identity;
-graph-wide ordinals are not interchangeable because filters change the active
-node set. Likewise, native attempt pages may move to blob records only with a
-durable target aggregation/index layer that preserves bounded adoption and
-reclaimed-attempt delta replacement. These are versioned storage migrations,
-not query-path shortcuts: existing artifacts and in-flight attempts must remain
-readable throughout rolling upgrades.
+limit. Iterative kernels also accept authenticated, ordinal-aligned seeds from
+the last compatible publication. Reconciliation linearly maps the prior
+node-sorted vector onto the new projection, assigns zero to new nodes, skips
+deleted nodes, and lets the kernel validate and normalize the result. A
+disjoint, rejected, over-budget, or incompatible prior artifact cold-starts;
+corrupt object identity still fails closed. Native iterative metrics use the
+same policy against their prior published generations. This preserves exact convergence
+semantics while avoiding a cold restart after small topology changes.
+
+Ordinal dictionaries are scoped to an exact edge-filter projection; graph-wide
+ordinals are not interchangeable because filters change the active node set.
+The compute lifecycle treats that projection as the family boundary and shares
+its topology across every compatible column. Durable score artifacts remain
+independently addressable by column: point reads are the primary serving shape,
+so they must not fetch unrelated columns or couple cache eviction and rebuild
+failure domains. Paired HITS shares one kernel execution while publishing its
+two columns independently. A packed multi-column wire is therefore gated on a
+scale benchmark that proves its storage savings exceed its extra random-read
+and lifecycle costs; it is not assumed to be an unconditional optimization.
+PageRank contributions remain target/page qualified so retry adoption and
+reclaimed-attempt replacement stay deterministic. Serverless is unreleased and
+accepts no compatibility readers for discarded graph-metric prototypes;
+native in-flight attempt changes still require an explicit rolling-upgrade
+bridge.
 
 ## Query Integration
 

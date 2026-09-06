@@ -174,6 +174,14 @@ pub const Options = struct {
     cancellation: CancellationToken = .none,
     io: ?std.Io = null,
     max_parallelism: usize = 1,
+    /// Optional ordinal-aligned seed vectors from the last compatible
+    /// publication. Materializers must only provide these after mapping the
+    /// prior node dictionary onto the current immutable topology. Kernels
+    /// validate and normalize the vectors, so corrupt or empty seeds fail
+    /// closed instead of perturbing convergence.
+    initial_scores: ?[]const f64 = null,
+    initial_authorities: ?[]const f64 = null,
+    initial_hubs: ?[]const f64 = null,
 };
 
 const parallel_edge_threshold: usize = 128 * 1024;
@@ -500,7 +508,11 @@ pub fn pageRankTopologyAlloc(alloc: Allocator, topology: Topology, options: Opti
         scale.* = if (out_degree == 0) 0 else options.damping / @as(f64, @floatFromInt(out_degree));
     }
     const count: f64 = @floatFromInt(node_count);
-    @memset(scores, 1.0 / count);
+    if (options.initial_scores) |initial| {
+        try initializeProbabilityVector(scores, initial, options.cancellation);
+    } else {
+        @memset(scores, 1.0 / count);
+    }
 
     var iteration: u32 = 0;
     var delta: f64 = 0;
@@ -536,7 +548,11 @@ pub fn eigenvectorTopologyAlloc(alloc: Allocator, topology: Topology, options: O
     if (node_count == 0) return .{ .scores = scores, .iterations_completed = 0, .converged = true, .delta = 0 };
     var next = try alloc.alloc(f64, node_count);
     defer alloc.free(next);
-    @memset(scores, 1.0 / @sqrt(@as(f64, @floatFromInt(node_count))));
+    if (options.initial_scores) |initial| {
+        try initializeUnitVector(scores, initial, options.cancellation);
+    } else {
+        @memset(scores, 1.0 / @sqrt(@as(f64, @floatFromInt(node_count))));
+    }
     var iteration: u32 = 0;
     var delta: f64 = 0;
     while (iteration < options.max_iterations) {
@@ -572,8 +588,16 @@ pub fn hitsTopologyAlloc(alloc: Allocator, topology: Topology, options: Options)
     const next_hubs = try alloc.alloc(f64, node_count);
     defer alloc.free(next_hubs);
     const initial = 1.0 / @sqrt(@as(f64, @floatFromInt(node_count)));
-    @memset(authorities, initial);
-    @memset(hubs, initial);
+    if (options.initial_authorities) |seed| {
+        try initializeUnitVector(authorities, seed, options.cancellation);
+    } else {
+        @memset(authorities, initial);
+    }
+    if (options.initial_hubs) |seed| {
+        try initializeUnitVector(hubs, seed, options.cancellation);
+    } else {
+        @memset(hubs, initial);
+    }
     var iteration: u32 = 0;
     var delta: f64 = 0;
     while (iteration < options.max_iterations) {
@@ -588,6 +612,48 @@ pub fn hitsTopologyAlloc(alloc: Allocator, topology: Topology, options: Options)
         if (delta <= options.tolerance) return .{ .authorities = authorities, .hubs = hubs, .iterations_completed = iteration, .converged = true, .delta = delta };
     }
     return .{ .authorities = authorities, .hubs = hubs, .iterations_completed = iteration, .converged = false, .delta = delta };
+}
+
+fn initializeProbabilityVector(destination: []f64, seed: []const f64, cancellation: CancellationToken) !void {
+    if (seed.len != destination.len or seed.len == 0) return error.InvalidGraphMetricWarmStart;
+    var sum: f64 = 0;
+    var correction: f64 = 0;
+    for (seed, 0..) |value, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricWarmStart;
+        const next = sum + value;
+        correction += if (@abs(sum) >= @abs(value)) (sum - next) + value else (value - next) + sum;
+        sum = next;
+    }
+    const total = sum + correction;
+    if (!std.math.isFinite(total) or total <= 0) return error.InvalidGraphMetricWarmStart;
+    const scale = 1.0 / total;
+    for (seed, destination, 0..) |value, *out, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        out.* = value * scale;
+    }
+}
+
+fn initializeUnitVector(destination: []f64, seed: []const f64, cancellation: CancellationToken) !void {
+    if (seed.len != destination.len or seed.len == 0) return error.InvalidGraphMetricWarmStart;
+    var squared_norm: f64 = 0;
+    var correction: f64 = 0;
+    for (seed, 0..) |value, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricWarmStart;
+        const square = value * value;
+        if (!std.math.isFinite(square)) return error.InvalidGraphMetricWarmStart;
+        const next = squared_norm + square;
+        correction += if (@abs(squared_norm) >= @abs(square)) (squared_norm - next) + square else (square - next) + squared_norm;
+        squared_norm = next;
+    }
+    const norm = @sqrt(squared_norm + correction);
+    if (!std.math.isFinite(norm) or norm <= 0) return error.InvalidGraphMetricWarmStart;
+    const scale = 1.0 / norm;
+    for (seed, destination, 0..) |value, *out, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        out.* = value * scale;
+    }
 }
 
 fn pageRankSinkMass(scores: []const f64, source_scale: []const f64, options: Options) !f64 {
@@ -939,6 +1005,43 @@ test "serverless bounded graph metric kernels compute all supported metrics" {
 test "serverless graph metric kernels reject unbounded work before allocating" {
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, pageRankAlloc(std.testing.allocator, 2, &.{}, .{ .max_nodes = 1 }));
     try std.testing.expectError(error.InvalidGraphMetricEdge, degreeAlloc(std.testing.allocator, 1, &.{.{ .source = 0, .target = 1 }}, .{}));
+}
+
+test "serverless graph metric kernels normalize compatible warm starts and reject malformed seeds" {
+    const alloc = std.testing.allocator;
+    const edges = [_]Edge{
+        .{ .source = 0, .target = 1 },
+        .{ .source = 1, .target = 2 },
+        .{ .source = 2, .target = 0 },
+        .{ .source = 2, .target = 1 },
+    };
+    var topology = try Topology.initAlloc(alloc, 3, &edges, .none);
+    defer topology.deinit(alloc);
+
+    const cold_options = Options{ .tolerance = 1e-12, .max_iterations = 100 };
+    var cold = try pageRankTopologyAlloc(alloc, topology, cold_options);
+    defer cold.deinit(alloc);
+    var warm_options = cold_options;
+    warm_options.initial_scores = cold.scores;
+    var warm = try pageRankTopologyAlloc(alloc, topology, warm_options);
+    defer warm.deinit(alloc);
+    try std.testing.expect(warm.iterations_completed <= cold.iterations_completed);
+    try std.testing.expect(warm.delta <= cold_options.tolerance);
+
+    const scaled_seed = [_]f64{ 2, 4, 4 };
+    var seeded_eigenvector = try eigenvectorTopologyAlloc(alloc, topology, .{
+        .max_iterations = 1,
+        .initial_scores = &scaled_seed,
+    });
+    defer seeded_eigenvector.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), seeded_eigenvector.iterations_completed);
+
+    try std.testing.expectError(error.InvalidGraphMetricWarmStart, pageRankTopologyAlloc(alloc, topology, .{
+        .initial_scores = &.{ 1, 2 },
+    }));
+    try std.testing.expectError(error.InvalidGraphMetricWarmStart, hitsTopologyAlloc(alloc, topology, .{
+        .initial_authorities = &.{ 0, 0, 0 },
+    }));
 }
 
 test "graph metric topology materializes only requested adjacency lanes" {

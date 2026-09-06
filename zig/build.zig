@@ -8263,6 +8263,7 @@ pub fn build(b: *std.Build) void {
         "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
         "graph metric status exposes queued and active local build lease",
         "graph metric coordinator reports expired exhausted page lease",
+        "graph planned metric build retires a superseded generation without poisoning newer work",
         "graph pagerank planned build publishes scores matching local runner",
         "graph pagerank reclaimed contribution and reduce pages overwrite partial output",
         "graph pagerank scan adoption maintains one idempotent out-degree total",

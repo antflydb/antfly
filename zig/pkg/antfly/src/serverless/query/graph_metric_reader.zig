@@ -482,34 +482,48 @@ fn scoresInto(
     }
 
     @memset(values, null);
-    const block_counts = try alloc.alloc(usize, routing.entries.len);
-    defer alloc.free(block_counts);
-    @memset(block_counts, 0);
-    const no_block = std.math.maxInt(usize);
-    const node_block_indexes = try alloc.alloc(usize, node_ids.len);
-    defer alloc.free(node_block_indexes);
-    var grouped_count: usize = 0;
-    for (node_ids, node_block_indexes) |node_id, *node_block_index| {
-        node_block_index.* = routing.findIndex(node_id) orelse no_block;
-        if (node_block_index.* == no_block) continue;
-        block_counts[node_block_index.*] += 1;
-        grouped_count += 1;
+    // Candidate sets are normally much smaller than the persisted vector.
+    // Keep request planning proportional to requested nodes/touched blocks,
+    // rather than allocating and clearing three arrays sized to every block in
+    // the artifact for a one-node lookup.
+    const PendingNode = struct {
+        block_index: usize,
+        node_index: usize,
+
+        fn lessThan(_: void, left: @This(), right: @This()) bool {
+            return left.block_index < right.block_index or
+                (left.block_index == right.block_index and left.node_index < right.node_index);
+        }
+    };
+    const TouchedBlock = struct {
+        block_index: usize,
+        first_pending: usize,
+        pending_count: usize,
+    };
+    var pending_nodes = std.ArrayListUnmanaged(PendingNode).empty;
+    defer pending_nodes.deinit(alloc);
+    try pending_nodes.ensureTotalCapacity(alloc, node_ids.len);
+    for (node_ids, 0..) |node_id, node_index| {
+        const block_index = routing.findIndex(node_id) orelse continue;
+        pending_nodes.appendAssumeCapacity(.{ .block_index = block_index, .node_index = node_index });
     }
-    const block_offsets = try alloc.alloc(usize, routing.entries.len + 1);
-    defer alloc.free(block_offsets);
-    block_offsets[0] = 0;
-    for (block_counts, 0..) |count, block_index| block_offsets[block_index + 1] = block_offsets[block_index] + count;
-    const grouped_node_indexes = try alloc.alloc(usize, grouped_count);
-    defer alloc.free(grouped_node_indexes);
-    const cursors = try alloc.dupe(usize, block_offsets[0..routing.entries.len]);
-    defer alloc.free(cursors);
-    for (node_block_indexes, 0..) |block_index, node_index| {
-        if (block_index == no_block) continue;
-        grouped_node_indexes[cursors[block_index]] = node_index;
-        cursors[block_index] += 1;
+    std.mem.sort(PendingNode, pending_nodes.items, {}, PendingNode.lessThan);
+    var touched_blocks = std.ArrayListUnmanaged(TouchedBlock).empty;
+    defer touched_blocks.deinit(alloc);
+    var pending_start: usize = 0;
+    while (pending_start < pending_nodes.items.len) {
+        const block_index = pending_nodes.items[pending_start].block_index;
+        var pending_end = pending_start + 1;
+        while (pending_end < pending_nodes.items.len and pending_nodes.items[pending_end].block_index == block_index) : (pending_end += 1) {}
+        try touched_blocks.append(alloc, .{
+            .block_index = block_index,
+            .first_pending = pending_start,
+            .pending_count = pending_end - pending_start,
+        });
+        pending_start = pending_end;
     }
 
-    const fetch_ranges = try planScoreFetchRangesAlloc(alloc, routing.entries, block_counts, control.score_data_offset);
+    const fetch_ranges = try planSparseScoreFetchRangesAlloc(alloc, routing.entries, touched_blocks.items, control.score_data_offset);
     defer alloc.free(fetch_ranges);
     var fetch_start: usize = 0;
     while (fetch_start < fetch_ranges.len) {
@@ -527,8 +541,14 @@ fn scoresInto(
 
         for (range_batch, fetched_ranges.payloads) |range, payload| {
             try session.checkCancellation();
-            for (range.first_block..range.last_block + 1) |block_index| {
-                if (block_counts[block_index] == 0) continue;
+            var touched_index = std.sort.lowerBound(TouchedBlock, touched_blocks.items, range.first_block, struct {
+                fn order(block_index: usize, touched: TouchedBlock) std.math.Order {
+                    return std.math.order(block_index, touched.block_index);
+                }
+            }.order);
+            while (touched_index < touched_blocks.items.len and touched_blocks.items[touched_index].block_index <= range.last_block) : (touched_index += 1) {
+                const touched = touched_blocks.items[touched_index];
+                const block_index = touched.block_index;
                 const entry = routing.entries[block_index];
                 if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;
                 const relative_offset = std.math.cast(usize, entry.offset - range.offset) orelse return error.InvalidGraphMetricSegment;
@@ -545,7 +565,8 @@ fn scoresInto(
                 {
                     return error.InvalidGraphMetricSegment;
                 }
-                for (grouped_node_indexes[block_offsets[block_index]..block_offsets[block_index + 1]]) |node_index| {
+                for (pending_nodes.items[touched.first_pending..][0..touched.pending_count]) |pending| {
+                    const node_index = pending.node_index;
                     values[node_index] = decoded_block.score(node_ids[node_index]);
                 }
             }
@@ -562,6 +583,41 @@ fn scoresInto(
         .edge_generation = if (metric_artifact.edge_generation != 0) metric_artifact.edge_generation else session.manifest.version,
         .computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms),
     };
+}
+
+fn planSparseScoreFetchRangesAlloc(
+    alloc: Allocator,
+    entries: []const metric_segment.codec.RoutingEntry,
+    touched_blocks: anytype,
+    score_data_offset: u64,
+) ![]ScoreFetchRange {
+    if (touched_blocks.len <= max_score_range_requests) {
+        const ranges = try alloc.alloc(ScoreFetchRange, touched_blocks.len);
+        errdefer alloc.free(ranges);
+        for (touched_blocks, ranges) |touched, *range| {
+            if (touched.block_index >= entries.len) return error.InvalidGraphMetricSegment;
+            const entry = entries[touched.block_index];
+            range.* = .{
+                .first_block = touched.block_index,
+                .last_block = touched.block_index,
+                .offset = entry.offset,
+                .len = entry.len,
+            };
+        }
+        return ranges;
+    }
+
+    // Dense/coalesced requests are already bounded by max_point_scores. Only
+    // this less common path pays O(total blocks), where evaluating fixed
+    // windows is necessary to enforce the request-count budget.
+    const block_counts = try alloc.alloc(usize, entries.len);
+    defer alloc.free(block_counts);
+    @memset(block_counts, 0);
+    for (touched_blocks) |touched| {
+        if (touched.block_index >= entries.len) return error.InvalidGraphMetricSegment;
+        block_counts[touched.block_index] = touched.pending_count;
+    }
+    return try planScoreFetchRangesAlloc(alloc, entries, block_counts, score_data_offset);
 }
 
 fn planScoreFetchRangesAlloc(
@@ -1213,6 +1269,24 @@ test "serverless graph metric range planning caps broad point batches" {
         error.GraphMetricQueryBudgetExceeded,
         fetchScoreRangeBatchAlloc(alloc, &unused_session, 0, 0, &.{}, &oversized_batch),
     );
+}
+
+test "serverless graph metric sparse planning stays proportional to touched blocks" {
+    const alloc = std.testing.allocator;
+    var entries: [4096]metric_segment.codec.RoutingEntry = undefined;
+    for (&entries, 0..) |*entry, index| entry.* = .{
+        .first_node_id = "node",
+        .offset = index * 64,
+        .len = 64,
+    };
+    const touched = [_]struct { block_index: usize, first_pending: usize, pending_count: usize }{
+        .{ .block_index = 3072, .first_pending = 0, .pending_count = 1 },
+    };
+    const ranges = try planSparseScoreFetchRangesAlloc(alloc, &entries, &touched, 0);
+    defer alloc.free(ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(usize, 3072), ranges[0].first_block);
+    try std.testing.expectEqual(@as(usize, 64), ranges[0].len);
 }
 
 test "serverless graph metric broad point ranges have candidate-independent cache identity" {

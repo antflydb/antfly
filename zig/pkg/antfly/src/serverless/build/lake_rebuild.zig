@@ -702,6 +702,23 @@ fn appendExternalGraphMetricDeclarationsAlloc(
             continue;
         }
 
+        // Keep prior immutable vectors as optional warm-start inputs even when
+        // the graph payload changed. The materializer authenticates and maps
+        // each node-sorted vector onto the new projection; incompatible,
+        // rejected, or disjoint artifacts simply cold-start.
+        const prior_metric_artifacts = try alloc.alloc(?manifest_artifact.ArtifactRef, dirty_configs.items.len);
+        defer alloc.free(prior_metric_artifacts);
+        @memset(prior_metric_artifacts, null);
+        for (dirty_configs.items, 0..) |config, dirty_index| {
+            const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+            defer alloc.free(metric_name);
+            if (findDeclaration(published_declarations, metric_name)) |existing| {
+                if (existing.binding.sidecar_kind == .graph_metric and existing.artifact.kind == .graph_metric_segment) {
+                    prior_metric_artifacts[dirty_index] = existing.artifact;
+                }
+            }
+        }
+
         const built = build: {
             graph_metric_budget.chargeGraphPayload(
                 graph_declaration.artifact.artifact_id,
@@ -742,12 +759,13 @@ fn appendExternalGraphMetricDeclarationsAlloc(
                     else => return err,
                 };
             }
-            break :build lake_graph_metric.publishManyFromPreparedGraphWithBudgetAlloc(
+            break :build lake_graph_metric.publishManyFromPreparedGraphWithWarmStartsAlloc(
                 alloc,
                 artifacts,
                 spec.index_name,
                 graph_declaration.artifact,
                 dirty_configs.items,
+                prior_metric_artifacts,
                 cancellation,
                 graph_metric_limits,
                 &graph_metric_budget,
