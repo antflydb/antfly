@@ -16,9 +16,10 @@ const std = @import("std");
 const bridge = @import("inference_bridge.zig");
 const http = @import("../runtime_http_abi.zig");
 
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
+pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
 pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };

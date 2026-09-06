@@ -25,9 +25,17 @@ const max_retained_bytes = 256 * 1024 * 1024;
 const control_budget_bytes = 4 * 1024 * 1024;
 const max_requests = 128;
 const header_len = 17;
-const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity };
+const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply };
 const MessageKind = enum(u8) { request = 1, response, event };
 const Failure = enum { failure, capacity };
+
+// Resource mutations use dedicated frames and slots, never payload offers.
+// The caller registers fixed reply storage before the peer may mutate a budget.
+pub const max_resource_bytes = 1024;
+const max_resource_requests = 128;
+pub const ResourceReply = struct { code: i32 = 0, detail: i32 = 0, value: u64 = 0 };
+const ResourcePending = struct { id: u64, ready: std.Io.Event = .unset, reply: ?ResourceReply = null };
+const ResourceTask = struct { id: u64, len: usize, bytes: [max_resource_bytes]u8 };
 
 pub const Payload = struct {
     metadata: []const u8 = "",
@@ -115,8 +123,14 @@ pub const Endpoint = struct {
     context: *anyopaque,
     handler: *const fn (*anyopaque, *Request) anyerror!OwnedPayload,
     on_closed: *const fn (*anyopaque) void,
+    resource_handler: ?*const fn (*anyopaque, []const u8) anyerror!ResourceReply = null,
     next_id: u64,
     next_transfer: u64 = 1,
+    next_resource_id: u64 = 1,
+    resource_pending: [max_resource_requests]?*ResourcePending = @splat(null),
+    resource_active: [max_resource_requests]?u64 = @splat(null),
+    failed: std.Io.Event = .unset,
+    lifecycle_group: std.Io.Group = .init,
     closed: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     writer_mutex: std.Io.Mutex = .init,
@@ -134,13 +148,28 @@ pub const Endpoint = struct {
 
     pub fn start(self: *Endpoint) !void {
         try self.reader_group.concurrent(self.io, readLoop, .{self});
+        errdefer self.reader_group.cancel(self.io);
+        try self.lifecycle_group.concurrent(self.io, lifecycle, .{self});
+    }
+    // Safe from a handler or under the resource mutex: the lifecycle task owns
+    // reader cancellation and on_closed (including process reaping).
+    pub fn fail(self: *Endpoint) void {
+        self.closed.store(true, .release);
+        self.failed.set(self.io);
+    }
+    fn lifecycle(self: *Endpoint) std.Io.Cancelable!void {
+        self.failed.wait(self.io) catch {};
+        self.reader_group.cancel(self.io);
     }
     pub fn deinit(self: *Endpoint) void {
-        self.reader_group.cancel(self.io);
+        self.failed.set(self.io);
+        self.lifecycle_group.await(self.io) catch self.lifecycle_group.cancel(self.io);
         self.control_writes.cancel(self.io);
         self.handlers.cancel(self.io);
         std.debug.assert(self.pending.count() == 0 and self.active.count() == 0 and self.offers.count() == 0);
         std.debug.assert(self.retained_bytes == 0 and self.control_bytes == 0);
+        for (self.resource_pending) |entry| std.debug.assert(entry == null);
+        for (self.resource_active) |entry| std.debug.assert(entry == null);
         self.pending.deinit(self.alloc);
         self.active.deinit(self.alloc);
         self.offers.deinit(self.alloc);
@@ -148,8 +177,8 @@ pub const Endpoint = struct {
     }
 
     fn reserveBytesLocked(self: *Endpoint, size: usize) !void {
-        // Small resource callbacks have their own allowance, even when bulk
-        // requests and their responses occupy the entire data budget.
+        // Keep small ordinary messages separate from bulk payloads. Resource
+        // callbacks use neither allowance.
         const counter = if (size <= max_frame_bytes) &self.control_bytes else &self.retained_bytes;
         const limit = if (size <= max_frame_bytes) control_budget_bytes else self.retained_limit;
         if (size > limit - counter.*) return error.ResourceTemporarilyUnavailable;
@@ -228,6 +257,56 @@ pub const Endpoint = struct {
         }
     }
 
+    pub fn callResource(self: *Endpoint, payload: []const u8) !ResourceReply {
+        // Every failure here is a transport failure, not a budget denial.
+        errdefer self.fail();
+        if (payload.len == 0 or payload.len > max_resource_bytes) return error.InvalidResourceFrame;
+        var pending: ResourcePending = undefined;
+        const slot = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
+            for (&self.resource_pending, 0..) |*entry, i| {
+                if (entry.* != null) continue;
+                const id = self.next_resource_id;
+                self.next_resource_id = try std.math.add(u64, id, 1);
+                pending = .{ .id = id };
+                entry.* = &pending;
+                break :blk i;
+            }
+            return error.ResourceCallbackCapacity;
+        };
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            self.resource_pending[slot] = null;
+            self.mutex.unlock(self.io);
+        }
+        try self.sendFrame(.resource_request, pending.id, payload);
+        try pending.ready.wait(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return pending.reply orelse error.InferenceWorkerUnavailable;
+    }
+
+    fn handleResource(self: *Endpoint, task: *ResourceTask, slot: usize) std.Io.Cancelable!void {
+        defer {
+            self.mutex.lockUncancelable(self.io);
+            self.resource_active[slot] = null;
+            self.mutex.unlock(self.io);
+            self.alloc.destroy(task);
+        }
+        // Reply storage is fixed and already available before the mutation.
+        var bytes: [16]u8 = undefined;
+        const reply = self.resource_handler.?(self.context, task.bytes[0..task.len]) catch {
+            self.fail();
+            return;
+        };
+        std.mem.writeInt(i32, bytes[0..4], reply.code, .little);
+        std.mem.writeInt(i32, bytes[4..8], reply.detail, .little);
+        std.mem.writeInt(u64, bytes[8..16], reply.value, .little);
+        self.sendFrame(.resource_reply, task.id, &bytes) catch self.fail();
+    }
+
     fn waitTick(self: *Endpoint, ready: *std.Io.Event) !void {
         ready.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => {},
@@ -294,7 +373,7 @@ pub const Endpoint = struct {
         defer self.writer_mutex.unlock(self.io);
         if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
         var header: [header_len]u8 = undefined;
-        @memcpy(header[0..4], "AFW2");
+        @memcpy(header[0..4], "AFW3");
         header[4] = @intFromEnum(kind);
         std.mem.writeInt(u64, header[5..13], id, .little);
         std.mem.writeInt(u32, header[13..17], @intCast(payload.len), .little);
@@ -329,6 +408,7 @@ pub const Endpoint = struct {
         while (pending.next()) |entry| entry.*.ready.set(self.io);
         var offers = self.offers.valueIterator();
         while (offers.next()) |entry| entry.*.ready.set(self.io);
+        for (self.resource_pending) |entry| if (entry) |resource| resource.ready.set(self.io);
         var active = self.active.valueIterator();
         while (active.next()) |entry| entry.*.cancelled.store(true, .release);
         var incoming = self.incoming.valueIterator();
@@ -342,7 +422,7 @@ pub const Endpoint = struct {
         while (true) {
             var header: [header_len]u8 = undefined;
             try self.readExact(&header);
-            if (!std.mem.eql(u8, header[0..4], "AFW2")) return error.InvalidWorkerFrame;
+            if (!std.mem.eql(u8, header[0..4], "AFW3")) return error.InvalidWorkerFrame;
             const kind = std.enums.fromInt(Kind, header[4]) orelse return error.InvalidWorkerFrame;
             const id = std.mem.readInt(u64, header[5..13], .little);
             const length = std.mem.readInt(u32, header[13..17], .little);
@@ -352,6 +432,34 @@ pub const Endpoint = struct {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             switch (kind) {
+                .resource_request => {
+                    if (self.resource_handler == null or length == 0 or length > max_resource_bytes)
+                        return error.InvalidResourceFrame;
+                    for (self.resource_active) |entry| if (entry == id) return error.InvalidResourceFrame;
+                    const slot = for (self.resource_active, 0..) |entry, i| {
+                        if (entry == null) break i;
+                    } else return error.ResourceCallbackCapacity;
+                    const task = try self.alloc.create(ResourceTask);
+                    errdefer self.alloc.destroy(task);
+                    task.* = .{ .id = id, .len = length, .bytes = undefined };
+                    @memcpy(task.bytes[0..length], bytes);
+                    self.resource_active[slot] = id;
+                    errdefer self.resource_active[slot] = null;
+                    try self.handlers.concurrent(self.io, handleResource, .{ self, task, slot });
+                },
+                .resource_reply => {
+                    if (length != 16) return error.InvalidResourceFrame;
+                    const pending = for (self.resource_pending) |entry| {
+                        if (entry) |resource| if (resource.id == id) break resource;
+                    } else return error.InvalidResourceFrame;
+                    if (pending.reply != null) return error.InvalidResourceFrame;
+                    pending.reply = .{
+                        .code = std.mem.readInt(i32, bytes[0..4], .little),
+                        .detail = std.mem.readInt(i32, bytes[4..8], .little),
+                        .value = std.mem.readInt(u64, bytes[8..16], .little),
+                    };
+                    pending.ready.set(self.io);
+                },
                 .offer => {
                     if (length != 21 or self.incoming.contains(id)) return error.InvalidWorkerFrame;
                     const message_kind = std.enums.fromInt(MessageKind, bytes[0]) orelse return error.InvalidWorkerFrame;
@@ -733,4 +841,213 @@ test "inference worker response ownership survives endpoint replacement" {
     };
     defer response.deinit();
     try std.testing.expectEqualStrings("response", response.view().body);
+}
+
+test "inference worker resource callbacks bypass saturated ordinary budgets and slots" {
+    const Probe = struct {
+        fn resource(_: *anyopaque, bytes: []const u8) !ResourceReply {
+            try std.testing.expectEqualStrings("reserve", bytes);
+            return .{ .value = 7 };
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.resource_handler = Probe.resource;
+    pair.child.control_bytes = control_budget_bytes;
+    pair.child.retained_bytes = max_retained_bytes;
+    pair.child.mutex.unlock(pair.child.io);
+    // Fill even the ordinary offer, pending, and handler slots. Resource calls
+    // must neither inspect these entries nor require an ordinary reply offer.
+    var pending = Pending{};
+    var offer = Offer{};
+    var dummy_request: Request = undefined;
+    pair.parent.mutex.lockUncancelable(pair.parent.io);
+    for (0..max_requests) |i| {
+        try pair.parent.pending.put(pair.parent.alloc, @intCast(i + 1000), &pending);
+        try pair.parent.offers.put(pair.parent.alloc, @intCast(i + 1000), &offer);
+    }
+    pair.parent.control_bytes = control_budget_bytes;
+    pair.parent.retained_bytes = max_retained_bytes;
+    pair.parent.mutex.unlock(pair.parent.io);
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    for (0..max_requests) |i| try pair.child.active.put(pair.child.alloc, @intCast(i + 1000), &dummy_request);
+    pair.child.mutex.unlock(pair.child.io);
+    defer {
+        pair.parent.mutex.lockUncancelable(pair.parent.io);
+        pair.parent.pending.clearRetainingCapacity();
+        pair.parent.offers.clearRetainingCapacity();
+        pair.parent.control_bytes = 0;
+        pair.parent.retained_bytes = 0;
+        pair.parent.mutex.unlock(pair.parent.io);
+        pair.child.mutex.lockUncancelable(pair.child.io);
+        pair.child.active.clearRetainingCapacity();
+        pair.child.control_bytes = 0;
+        pair.child.retained_bytes = 0;
+        pair.child.mutex.unlock(pair.child.io);
+    }
+    const result = try pair.parent.callResource("reserve");
+    try std.testing.expectEqual(@as(u64, 7), result.value);
+    try std.testing.expect(!pair.parent.closed.load(.acquire));
+    try std.testing.expect(!pair.child.closed.load(.acquire));
+}
+
+test "inference worker uncertain resource replies fence cleanup and wake callers" {
+    const Probe = struct {
+        pair: *TestPair,
+        leased: std.atomic.Value(bool) = .init(false),
+        reaping: std.Io.Event = .unset,
+        reaped: std.Io.Event = .unset,
+        cleaned: std.Io.Event = .unset,
+        cleanups: usize = 0,
+        fn resource(raw: *anyopaque, _: []const u8) !ResourceReply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.leased.store(true, .release);
+            // The mutation succeeds, but the reply cannot be delivered.
+            // Called inside a handler: teardown must never try to join itself.
+            self.pair.child.fail();
+            return .{ .value = 7 };
+        }
+        fn closed(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reaping.set(std.testing.io);
+            self.reaped.wait(std.testing.io) catch unreachable;
+            self.leased.store(false, .release);
+            self.cleanups += 1;
+            self.pair.parent.fail(); // Models the worker's pipe EOF.
+            self.cleaned.set(std.testing.io);
+        }
+        fn call(self: *@This()) !void {
+            try std.testing.expectError(error.InferenceWorkerUnavailable, self.pair.parent.callResource("reserve"));
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var probe: Probe = .{ .pair = &pair };
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.context = &probe;
+    pair.child.resource_handler = Probe.resource;
+    pair.child.on_closed = Probe.closed;
+    pair.child.mutex.unlock(pair.child.io);
+    var call = try std.testing.io.concurrent(Probe.call, .{&probe});
+    defer _ = call.cancel(std.testing.io) catch {};
+    // Always unblock lifecycle cleanup even if an assertion fails.
+    defer probe.reaped.set(std.testing.io);
+    try probe.reaping.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(probe.leased.load(.acquire));
+    pair.child.fail(); // Repeated faults must not run cleanup twice.
+    probe.reaped.set(std.testing.io);
+    try probe.cleaned.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try call.await(std.testing.io);
+    try std.testing.expect(!probe.leased.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), probe.cleanups);
+}
+
+test "inference worker resource dispatch failure closes the endpoint before mutation" {
+    const Probe = struct {
+        pair: *TestPair,
+        fn resource(_: *anyopaque, _: []const u8) !ResourceReply {
+            return error.OutOfMemory;
+        }
+        fn closed(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pair.parent.fail();
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var probe: Probe = .{ .pair = &pair };
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.context = &probe;
+    pair.child.resource_handler = Probe.resource;
+    pair.child.on_closed = Probe.closed;
+    pair.child.mutex.unlock(pair.child.io);
+    try std.testing.expectError(error.InferenceWorkerUnavailable, pair.parent.callResource("release"));
+    try std.testing.expect(pair.child.closed.load(.acquire));
+}
+
+test "inference worker malformed resource replies close the endpoint" {
+    const Probe = struct {
+        pair: *TestPair,
+        fn resource(raw: *anyopaque, _: []const u8) !ResourceReply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.pair.child.sendFrame(.resource_reply, 1, "truncated");
+            return .{ .value = 7 };
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var probe: Probe = .{ .pair = &pair };
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.context = &probe;
+    pair.child.resource_handler = Probe.resource;
+    pair.child.mutex.unlock(pair.child.io);
+    try std.testing.expectError(error.InferenceWorkerUnavailable, pair.parent.callResource("reserve"));
+    try std.testing.expect(pair.parent.closed.load(.acquire));
+}
+
+test "inference worker exhausted resource dispatch slots fail the owner instead of dropping release" {
+    const Probe = struct {
+        pair: *TestPair,
+        fn resource(_: *anyopaque, _: []const u8) !ResourceReply {
+            return error.UnexpectedDispatch;
+        }
+        fn closed(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pair.parent.fail();
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var probe: Probe = .{ .pair = &pair };
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.context = &probe;
+    pair.child.resource_handler = Probe.resource;
+    pair.child.on_closed = Probe.closed;
+    for (&pair.child.resource_active, 0..) |*entry, i| entry.* = @intCast(i + 1000);
+    pair.child.mutex.unlock(pair.child.io);
+    defer {
+        pair.child.mutex.lockUncancelable(pair.child.io);
+        pair.child.resource_active = @splat(null);
+        pair.child.mutex.unlock(pair.child.io);
+    }
+    try std.testing.expectError(error.InferenceWorkerUnavailable, pair.parent.callResource("release"));
+    try std.testing.expect(pair.child.closed.load(.acquire));
+}
+
+test "inference worker concurrent resource callbacks route replies by ID" {
+    const Probe = struct {
+        pair: *TestPair,
+        both: std.Io.Event = .unset,
+        entered: std.atomic.Value(usize) = .init(0),
+        fn resource(raw: *anyopaque, bytes: []const u8) !ResourceReply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both.set(std.testing.io);
+            try self.both.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            return .{ .value = bytes[0] };
+        }
+        fn call(self: *@This(), bytes: []const u8) !void {
+            const result = try self.pair.parent.callResource(bytes);
+            try std.testing.expectEqual(@as(u64, bytes[0]), result.value);
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var probe: Probe = .{ .pair = &pair };
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    pair.child.context = &probe;
+    pair.child.resource_handler = Probe.resource;
+    pair.child.mutex.unlock(pair.child.io);
+    var first = try std.testing.io.concurrent(Probe.call, .{ &probe, "first" });
+    defer _ = first.cancel(std.testing.io) catch {};
+    var second = try std.testing.io.concurrent(Probe.call, .{ &probe, "second" });
+    defer _ = second.cancel(std.testing.io) catch {};
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
 }
