@@ -1024,7 +1024,7 @@ antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
 `--projector auto` includes image and audio support. Try a local file with
 `antfly inference generate <model-dir> "Describe this input" --image ./photo.jpg`
 or `--audio ./clip.wav`. Use `--projector none` for a smaller, text-only download.
-The RAG example below uses text and limits output to 128 tokens.
+The RAG example below uses text and limits output to 512 tokens per model turn.
 For other providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 

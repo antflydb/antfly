@@ -182,13 +182,18 @@ const FunctionGemmaParser = struct {
         try buf.appendSlice(allocator, "Available tools:\n");
         for (tools) |tool| {
             try buf.appendSlice(allocator, self.tokens.start_function_decl);
+            try buf.appendSlice(allocator, "declaration:");
             try buf.appendSlice(allocator, tool.function.name);
             try buf.appendSlice(allocator, "{description:");
             try buf.appendSlice(allocator, self.tokens.escape);
             try buf.appendSlice(allocator, tool.function.description);
             try buf.appendSlice(allocator, self.tokens.escape);
             try buf.appendSlice(allocator, ",parameters:");
-            try self.formatParams(&buf, allocator, tool.function.parameters);
+            // Use Gemma's declaration notation while retaining all schema
+            // keywords, including nested constraints and union/reference types.
+            if (tool.function.parameters) |parameters| {
+                try self.formatGemma4Schema(&buf, allocator, .{ .object = parameters.map }, .schema);
+            } else try buf.appendSlice(allocator, "{}");
             try buf.append(allocator, '}');
             try buf.appendSlice(allocator, self.tokens.end_function_decl);
             try buf.append(allocator, '\n');
@@ -205,6 +210,57 @@ const FunctionGemmaParser = struct {
         try buf.append(allocator, '\n');
 
         return try buf.toOwnedSlice(allocator);
+    }
+
+    const SchemaContext = enum { schema, schema_map, value, type_name };
+
+    fn formatGemma4Schema(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: std.json.Value, context: SchemaContext) std.mem.Allocator.Error!void {
+        switch (value) {
+            .object => |object| {
+                try buf.append(alloc, '{');
+                var it = object.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try buf.append(alloc, ',');
+                    first = false;
+                    const key = entry.key_ptr.*;
+                    try buf.appendSlice(alloc, key);
+                    try buf.append(alloc, ':');
+                    const child: SchemaContext = if (context == .schema_map) .schema else if (context != .schema) .value else blk: {
+                        if (std.mem.eql(u8, key, "type")) break :blk .type_name;
+                        inline for (.{ "properties", "patternProperties", "$defs", "definitions", "dependentSchemas" }) |keyword| {
+                            if (std.mem.eql(u8, key, keyword)) break :blk .schema_map;
+                        }
+                        inline for (.{ "items", "prefixItems", "additionalItems", "additionalProperties", "unevaluatedProperties", "unevaluatedItems", "contains", "propertyNames", "allOf", "anyOf", "oneOf", "not", "if", "then", "else" }) |keyword| {
+                            if (std.mem.eql(u8, key, keyword)) break :blk .schema;
+                        }
+                        break :blk .value;
+                    };
+                    try self.formatGemma4Schema(buf, alloc, entry.value_ptr.*, child);
+                }
+                try buf.append(alloc, '}');
+            },
+            .array => |array| {
+                try buf.append(alloc, '[');
+                for (array.items, 0..) |item, i| {
+                    if (i != 0) try buf.append(alloc, ',');
+                    try self.formatGemma4Schema(buf, alloc, item, context);
+                }
+                try buf.append(alloc, ']');
+            },
+            .string => |string| {
+                try buf.appendSlice(alloc, self.tokens.escape);
+                if (context == .type_name) {
+                    for (string) |char| try buf.append(alloc, std.ascii.toUpper(char));
+                } else try buf.appendSlice(alloc, string);
+                try buf.appendSlice(alloc, self.tokens.escape);
+            },
+            else => {
+                const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                defer alloc.free(encoded);
+                try buf.appendSlice(alloc, encoded);
+            },
+        }
     }
 
     fn formatParams(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, parameters: ?std.json.ArrayHashMap(std.json.Value)) !void {
@@ -1678,7 +1734,7 @@ test "gemma4 tool tokens format prompt and parse tool call" {
     };
     const prompt = try parser.formatToolsPrompt(allocator, &tools);
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>declaration:lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool_call>call:function_name") != null);
 
     const update = try parser.feed("<|tool_call>call:lookup{id:42}<tool_call|>");
@@ -1713,6 +1769,30 @@ test "gemma4 tool tokens format prompt and parse tool call" {
     try std.testing.expectEqualStrings("", parallel_update.ready_text);
     try std.testing.expectEqual(@as(usize, 2), parallel_update.new_calls.len);
     try std.testing.expectEqualStrings("{\"id\":43}", parallel_update.new_calls[1].function.arguments);
+}
+
+test "gemma4 tool declarations preserve complete nested parameter schemas" {
+    const alloc = std.testing.allocator;
+    var parser = FunctionGemmaParser{ .allocator = alloc, .tokens = .{
+        .format = .gemma4,
+        .start_function_decl = "<|tool>",
+        .end_function_decl = "<tool|>",
+        .start_function_call = "<|tool_call>",
+        .end_function_call = "<tool_call|>",
+        .escape = "<|\"|>",
+    } };
+    defer parser.deinit();
+    const schema =
+        \\{"type":"object","properties":{"query_index":{"type":"integer","enum":[0,2]},"query_request":{"type":"object","properties":{"full_text_search":{"anyOf":[{"type":"object"},{"type":"string"}]},"indexes":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"required":["query_index","query_request"],"additionalProperties":false,"$defs":{"leaf":{"type":"string"}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), alloc, schema, .{});
+    defer parsed.deinit();
+    const prompt = try parser.formatToolsPrompt(alloc, &.{.{ .function = .{ .name = "submit_query", .description = "Validate a query", .parameters = parsed.value } }});
+    defer alloc.free(prompt);
+    const expected =
+        \\parameters:{type:<|"|>OBJECT<|"|>,properties:{query_index:{type:<|"|>INTEGER<|"|>,enum:[0,2]},query_request:{type:<|"|>OBJECT<|"|>,properties:{full_text_search:{anyOf:[{type:<|"|>OBJECT<|"|>},{type:<|"|>STRING<|"|>}]},indexes:{type:<|"|>ARRAY<|"|>,items:{type:<|"|>STRING<|"|>}}},additionalProperties:false}},required:[<|"|>query_index<|"|>,<|"|>query_request<|"|>],additionalProperties:false,$defs:{leaf:{type:<|"|>STRING<|"|>}}}
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, expected) != null);
 }
 
 test "loadParser detects tool token convention from GGUF tokenizer metadata" {
