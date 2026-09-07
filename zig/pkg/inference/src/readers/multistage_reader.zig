@@ -308,6 +308,20 @@ pub const LoadedMultiStageReader = struct {
                     rec_session,
                     .recognition,
                 );
+                if (metadata.model_type) |model_type| {
+                    if (std.mem.eql(u8, model_type, "paddleocr")) {
+                        const outputs = rec_session.outputInfo();
+                        if (outputs.len == 0 or outputs[0].shape.len != 3)
+                            return error.UnexpectedOutputShape;
+                        const vocab_size = std.math.cast(usize, outputs[0].shape[2]) orelse
+                            return error.UnexpectedOutputShape;
+                        preflight.char_dict = try completePaddleCharDict(
+                            allocator,
+                            preflight.char_dict orelse return error.InvalidMetadata,
+                            vocab_size,
+                        );
+                    }
+                }
                 const char_dict = preflight.takeCharDict() orelse
                     return error.InvalidMetadata;
                 pipeline.recognizer = .{ .ctc = .{
@@ -391,6 +405,33 @@ pub const LoadedMultiStageReader = struct {
         };
     }
 };
+
+/// Paddle's optional space class follows the file dictionary. Class zero is
+/// the CTC blank and is deliberately not stored in the dictionary.
+fn completePaddleCharDict(allocator: std.mem.Allocator, dict: [][]u8, vocab_size: usize) ![][]u8 {
+    if (vocab_size == dict.len + 1) return dict;
+    if (vocab_size != dict.len + 2) return error.DictionaryClassCountMismatch;
+    const space = try allocator.dupe(u8, " ");
+    errdefer allocator.free(space);
+    const expanded = try allocator.realloc(dict, dict.len + 1);
+    expanded[dict.len] = space;
+    return expanded;
+}
+
+test "Paddle CTC preserves the model's trailing space class" {
+    const allocator = std.testing.allocator;
+    var dict = try ctc_decode.loadCharDictBytes(allocator, "A\nB\n");
+    defer ctc_decode.freeCharDict(allocator, dict);
+    dict = try completePaddleCharDict(allocator, dict, 4);
+    const result = try ctc_decode.decode(allocator, &.{
+        0, 1, 0, 0,
+        0, 0, 0, 1,
+        0, 0, 1, 0,
+    }, 3, 4, dict);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("A B", result.text);
+    try std.testing.expectError(error.DictionaryClassCountMismatch, completePaddleCharDict(allocator, dict, 6));
+}
 
 /// Backend-independent assets are validated and loaded exactly once before
 /// fallback begins. Backend attempts therefore contain only graph/session work,
@@ -547,7 +588,27 @@ fn loadStagePreprocessConfig(
     }
 
     if (!loaded_stage_preprocessor) {
-        if (metadata.model_type) |model_type| applyModelTypeNormalization(model_type, stage_kind, &config);
+        if (metadata.model_type) |model_type| {
+            applyModelTypeNormalization(model_type, stage_kind, &config);
+            if (std.mem.eql(u8, model_type, "paddleocr")) {
+                switch (stage_kind) {
+                    .detection => {
+                        const input_info = session.inputInfo();
+                        if (input_info.len > 0 and input_info[0].shape.len == 4 and
+                            input_info[0].shape[2] <= 0 and input_info[0].shape[3] <= 0)
+                        {
+                            config.keep_aspect_ratio = true;
+                            config.size_multiple = 32;
+                        }
+                    },
+                    .recognition => {
+                        // The 320px training canvas is not a dynamic-width
+                        // model limit. Bound memory without crushing long lines.
+                        if (config.dynamic_width) config.width = 3200;
+                    },
+                }
+            }
+        }
     }
     if (metadata.model_type) |model_type| applyModelTypeStageDefaults(model_type, stage_kind, &config);
     return config;
@@ -609,10 +670,12 @@ fn defaultPreprocessConfig(stage_kind: StageKind) multistage_ocr.PreprocessConfi
     };
 }
 
-fn applyModelTypeNormalization(model_type: []const u8, _: StageKind, config: *multistage_ocr.PreprocessConfig) void {
+fn applyModelTypeNormalization(model_type: []const u8, stage_kind: StageKind, config: *multistage_ocr.PreprocessConfig) void {
     if (std.mem.eql(u8, model_type, "paddleocr")) {
-        config.mean = .{ 0.485, 0.456, 0.406 };
-        config.std = .{ 0.229, 0.224, 0.225 };
+        // Detection uses ImageNet normalization; CTC recognition was trained
+        // on pixel / 255, then subtract 0.5 and divide by 0.5.
+        config.mean = if (stage_kind == .detection) .{ 0.485, 0.456, 0.406 } else .{ 0.5, 0.5, 0.5 };
+        config.std = if (stage_kind == .detection) .{ 0.229, 0.224, 0.225 } else .{ 0.5, 0.5, 0.5 };
         config.rescale_factor = 1.0 / 255.0;
     }
 }
@@ -807,19 +870,26 @@ test "parsePreprocessorConfig reads array size shortest-edge fallback and rescal
     try std.testing.expectEqual(@as(u32, 512), config.height);
 }
 
-test "applyModelTypeNormalization only provides fallback defaults" {
-    var config = multistage_ocr.PreprocessConfig{
-        .width = 320,
-        .height = 48,
-        .mean = .{ 0.1, 0.2, 0.3 },
-        .std = .{ 0.9, 0.8, 0.7 },
-        .rescale_factor = 1.0,
-    };
-
+test "Paddle recognition maps black and white pixels to training range" {
+    const allocator = std.testing.allocator;
+    var config = defaultPreprocessConfig(.recognition);
     applyModelTypeNormalization("paddleocr", .recognition, &config);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.485), config.mean[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.229), config.std[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 255.0), config.rescale_factor, 1e-6);
+    var pixels = [_]u8{ 0, 0, 0, 255, 255, 255 };
+    const normalized = try image.preprocessDecodedRectScaledWithResample(
+        allocator,
+        .{ .data = &pixels, .width = 2, .height = 1, .channels = 3 },
+        2,
+        1,
+        config.mean,
+        config.std,
+        config.rescale_factor,
+        .nearest,
+    );
+    defer allocator.free(normalized);
+    for (0..3) |channel| {
+        try std.testing.expectApproxEqAbs(@as(f32, -1), normalized[channel * 2], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), normalized[channel * 2 + 1], 1e-6);
+    }
 }
 
 test "detection stage keeps loaded preprocessor size while recognition still follows model shape" {

@@ -64,8 +64,45 @@ pub const PreprocessConfig = struct {
     resample: image.Resample = .bilinear,
     keep_aspect_ratio: bool = false,
     dynamic_width: bool = false,
+    size_multiple: u32 = 1,
     pad_value_rgb: [3]u8 = .{ 255, 255, 255 },
 };
+
+fn detectionInputSize(config: PreprocessConfig, width: u32, height: u32) struct { width: u32, height: u32 } {
+    if (!config.keep_aspect_ratio or width == 0 or height == 0) {
+        return .{ .width = config.width, .height = config.height };
+    }
+    const scale = @min(@as(f64, 1), @min(
+        @as(f64, @floatFromInt(config.width)) / @as(f64, @floatFromInt(width)),
+        @as(f64, @floatFromInt(config.height)) / @as(f64, @floatFromInt(height)),
+    ));
+    const multiple = @max(@as(u32, 1), config.size_multiple);
+    var dimensions: [2]u32 = undefined;
+    for ([_]u32{ width, height }, [_]u32{ config.width, config.height }, &dimensions) |source, limit, *dimension| {
+        const scaled: u32 = @intFromFloat(@as(f64, @floatFromInt(source)) * scale);
+        const units = scaled / multiple;
+        const twice_remainder = @as(u64, scaled % multiple) * 2;
+        // Match nearest-even rounding used by Paddle's DetResizeForTest.
+        const round_up = twice_remainder > multiple or (twice_remainder == multiple and units % 2 != 0);
+        const rounded = (@as(u64, units) + @intFromBool(round_up)) * multiple;
+        const max_aligned = @max(multiple, limit / multiple * multiple);
+        dimension.* = @intCast(std.math.clamp(rounded, @as(u64, multiple), @as(u64, max_aligned)));
+    }
+    return .{ .width = dimensions[0], .height = dimensions[1] };
+}
+
+test "detector resize preserves aspect ratio and aligns network dimensions" {
+    const config = PreprocessConfig{ .width = 960, .height = 960, .keep_aspect_ratio = true, .size_multiple = 32 };
+    const small = detectionInputSize(config, 639, 159);
+    try std.testing.expectEqual(@as(u32, 640), small.width);
+    try std.testing.expectEqual(@as(u32, 160), small.height);
+    const large = detectionInputSize(config, 1920, 1280);
+    try std.testing.expectEqual(@as(u32, 960), large.width);
+    try std.testing.expectEqual(@as(u32, 640), large.height);
+    const halfway = detectionInputSize(config, 80, 48);
+    try std.testing.expectEqual(@as(u32, 64), halfway.width);
+    try std.testing.expectEqual(@as(u32, 64), halfway.height);
+}
 
 pub const RecognitionResult = struct {
     text: []u8,
@@ -442,10 +479,7 @@ pub const MultiStageOCRPipeline = struct {
                 const cropped = try crop.cropBBox(self.allocator, img, region.bbox);
                 defer cropped.deinit(self.allocator);
 
-                const rec = recognizer.recognize(cropped, control) catch |err| switch (err) {
-                    error.Cancelled, error.Timeout => return err,
-                    else => continue,
-                };
+                const rec = try recognizer.recognize(cropped, control);
                 if (rec.text.len == 0) {
                     self.allocator.free(rec.text);
                     continue;
@@ -491,11 +525,12 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
+        const input_size = detectionInputSize(self.detection_preprocess, img.width, img.height);
         const pixel_values = try image.preprocessDecodedRectScaledWithResample(
             self.allocator,
             img,
-            self.detection_preprocess.width,
-            self.detection_preprocess.height,
+            input_size.width,
+            input_size.height,
             self.detection_preprocess.mean,
             self.detection_preprocess.std,
             self.detection_preprocess.rescale_factor,
@@ -507,8 +542,8 @@ pub const MultiStageOCRPipeline = struct {
         const shape = [_]i64{
             1,
             3,
-            @intCast(self.detection_preprocess.height),
-            @intCast(self.detection_preprocess.width),
+            @intCast(input_size.height),
+            @intCast(input_size.width),
         };
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
@@ -517,7 +552,7 @@ pub const MultiStageOCRPipeline = struct {
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
 
-        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], self.detection_preprocess.width, self.detection_preprocess.height);
+        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], input_size.width, input_size.height);
         defer self.allocator.free(heatmap.values);
         traceDetectionHeatmap(&outputs[0], heatmap.values, heatmap.width, heatmap.height, self.post_processor);
         return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);

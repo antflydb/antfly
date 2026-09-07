@@ -1396,6 +1396,22 @@ pub fn build(b: *std.Build) void {
     const gliner2_e2e_bench_step = b.step("bench-gliner2-e2e", "Run real-bundle GLiNER2 recognition E2E benchmarks");
     gliner2_e2e_bench_step.dependOn(&run_gliner2_e2e_bench.step);
 
+    const reader_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-reader-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/reader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    reader_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    reader_bench_exe.root_module.link_libc = true;
+    const install_reader_bench = b.addInstallArtifact(reader_bench_exe, .{});
+    b.step("reader-bench-install", "Build the isolated production OCR reader probe").dependOn(&install_reader_bench.step);
+    const run_reader_bench = b.addRunArtifact(reader_bench_exe);
+    if (b.args) |args| run_reader_bench.addArgs(args);
+    b.step("bench-reader", "Read local images with native OCR and emit JSONL timings").dependOn(&run_reader_bench.step);
+
     const clipclap_native_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-native-bench",
         .root_module = b.createModule(.{

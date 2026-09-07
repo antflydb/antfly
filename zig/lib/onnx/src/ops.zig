@@ -1047,12 +1047,14 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
     const rank: u8 = @intCast(@min(data.len, 8));
     var materialized_negative_count: usize = 0;
     var copied_zero_axes: [8]bool = .{false} ** 8;
+    var copies_dynamic_dimension = false;
     for (0..rank) |i| {
         const d: i64 = @intFromFloat(data[i]);
         if (d == 0 and !allow_zero) {
             // ONNX opset <14 default: 0 means copy from input shape
             dims[i] = if (i < input_shape.rank()) input_shape.dim(@intCast(i)) else 1;
             copied_zero_axes[i] = true;
+            if (dims[i] < 0) copies_dynamic_dimension = true;
         } else if (d == -1) {
             dims[i] = -1;
             materialized_negative_count += 1;
@@ -1325,7 +1327,7 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
 
     const result = try builder.reshape(inputs[0], new_shape);
     const target_node = builder.graph.node(inputs[1]);
-    const runtime_shape = std.meta.activeTag(target_node.op) != .constant;
+    const runtime_shape = std.meta.activeTag(target_node.op) != .constant or copies_dynamic_dimension;
     if (runtime_shape or allow_zero) {
         const reshape_node = builder.graph.nodeMut(result);
         reshape_node.op.reshape.runtime_shape = runtime_shape;
@@ -2994,6 +2996,9 @@ fn tryConvFused(
     for (0..out_shape.rank()) |i| {
         if (out_shape.dim(@intCast(i)) <= 0) return null;
     }
+    // Representative dimensions inferred through runtime reshapes are not a
+    // static convolution geometry, even when every inferred dimension is > 0.
+    if (nodeHasRuntimeDependentShape(builder, x, 0) or nodeHasRuntimeDependentShape(builder, w, 0)) return null;
 
     // Synthesize a zero bias if the ONNX op has none — fused conv always takes 3 inputs.
     const bias = if (inputs.len >= 3 and inputs[2] != null_node)
@@ -3657,54 +3662,58 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
 // ── Phase 3: Pooling Ops ────────────────────────────────────────────
 
 fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    // AveragePool: reduce_mean over spatial window
-    // For global average pool variant or simple cases
+    if (inputs.len == 0) return error.MissingInput;
     const in_shape = builder.graph.node(inputs[0]).output_shape;
+    if (in_shape.rank() < 3 or in_shape.rank() > 6) return error.UnsupportedOp;
+    const num_spatial = in_shape.rank() - 2;
     const kernel = getInts(node.attributes, "kernel_shape");
     const strides = getInts(node.attributes, "strides");
+    const pads = getInts(node.attributes, "pads");
+    const dilations = getInts(node.attributes, "dilations");
+    if (kernel.len != num_spatial or
+        (strides.len != 0 and strides.len != num_spatial) or
+        (pads.len != 0 and pads.len != 2 * @as(usize, num_spatial)) or
+        (dilations.len != 0 and dilations.len != num_spatial)) return error.InvalidAttribute;
 
-    if (kernel.len == 0) return error.InvalidAttribute;
+    // Unpadded, floor-mode pooling is an exact depthwise window sum divided
+    // by its area. Never substitute a global reduction for a sliding window.
+    if (getInt(node.attributes, "ceil_mode", 0) != 0) return error.UnsupportedOp;
+    const auto_pad = getString(node.attributes, "auto_pad", "NOTSET");
+    if (!std.mem.eql(u8, auto_pad, "NOTSET") and !std.mem.eql(u8, auto_pad, "VALID")) return error.UnsupportedOp;
+    for (pads) |pad| if (pad != 0) return error.UnsupportedOp;
+    for (dilations) |dilation| if (dilation != 1) return error.UnsupportedOp;
+    for (strides) |stride| {
+        if (stride <= 0 or stride > std.math.maxInt(u32)) return error.InvalidAttribute;
+    }
 
-    // Simple case: kernel covers entire spatial dim and stride=1
-    // → reduce_mean over spatial axes
-    const num_spatial = in_shape.rank() - 2;
     var is_global = true;
-    for (0..num_spatial) |i| {
-        if (i < kernel.len and kernel[i] != in_shape.dim(@intCast(i + 2))) {
-            is_global = false;
-            break;
-        }
+    var kernel_elems: usize = 1;
+    for (kernel, 0..) |size, i| {
+        if (size <= 0) return error.InvalidAttribute;
+        kernel_elems = std.math.mul(usize, kernel_elems, std.math.cast(usize, size) orelse return error.InvalidAttribute) catch return error.InvalidAttribute;
+        if (size != in_shape.dim(@intCast(i + 2))) is_global = false;
     }
+    if (is_global) return convertGlobalAveragePool(builder, inputs);
 
-    if (is_global) {
-        return convertGlobalAveragePool(builder, inputs);
-    }
-
-    // Non-global: compute output shape and use reduce_mean windowed
-    // This is an approximation — proper sliding window needs conv_general
-    var out_dims: [8]i64 = .{0} ** 8;
-    out_dims[0] = in_shape.dim(0); // batch
-    out_dims[1] = in_shape.dim(1); // channels
-    for (0..num_spatial) |i| {
-        const in_d = in_shape.dim(@intCast(i + 2));
-        const k: i64 = if (i < kernel.len) kernel[i] else 1;
-        const s: i64 = if (i < strides.len) strides[i] else 1;
-        out_dims[i + 2] = @divTrunc(in_d - k, s) + 1;
-    }
-    const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ };
-
-    // Use conv_general with uniform weights as average pooling
-    // For simplicity, use reduce_mean on spatial axes as approximation
-    var spatial_axes: [8]u8 = undefined;
-    for (0..num_spatial) |i| spatial_axes[i] = @intCast(i + 2);
-    const reduced = try builder.reduceMean(inputs[0], spatial_axes[0..num_spatial]);
-
-    // If output shape differs from reduced, reshape
-    const red_shape = builder.graph.node(reduced).output_shape;
-    if (red_shape.rank_ != out_shape.rank_) {
-        return builder.reshape(reduced, out_shape);
-    }
-    return reduced;
+    const channels = std.math.cast(u32, in_shape.dim(1)) orelse return error.UnsupportedOp;
+    if (channels == 0) return error.UnsupportedOp;
+    var weight_dims = [_]i64{0} ** 8;
+    weight_dims[0] = channels;
+    weight_dims[1] = 1;
+    @memcpy(weight_dims[2..][0..num_spatial], kernel);
+    const weight_shape = Shape{ .dtype = in_shape.dtype, .dims = weight_dims, .rank_ = in_shape.rank_ };
+    const weight_elems = std.math.mul(usize, channels, kernel_elems) catch return error.InvalidAttribute;
+    const ones = try builder.graph.allocator.alloc(f32, weight_elems);
+    defer builder.graph.allocator.free(ones);
+    @memset(ones, 1);
+    const weight = try builder.tensorConst(ones, weight_shape);
+    var conv_attributes = [_]AttributeProto{
+        .{ .name = "group", .i = channels },
+        .{ .name = "strides", .ints = @constCast(strides) },
+    };
+    const conv_node = NodeProto{ .op_type = "Conv", .attributes = &conv_attributes };
+    const summed = try convertConv(builder, &conv_node, &.{ inputs[0], weight });
+    return builder.div(summed, try builder.scalarConst(in_shape.dtype, @floatFromInt(kernel_elems)));
 }
 
 fn convertMaxPool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -4109,6 +4118,43 @@ fn convertEinsum(builder: *Builder, node: *const NodeProto, inputs: []const Node
 
 // ── Phase 4: ConvTranspose, Resize ─────────────────────────────────
 
+/// Validated per-axis ConvTranspose geometry.
+const ConvTransposeGeometry = struct {
+    stride: [4]i64 = .{1} ** 4,
+    dilation: [4]i64 = .{1} ** 4,
+    pad_begin: [4]i64 = .{0} ** 4,
+    pad_end: [4]i64 = .{0} ** 4,
+    output_pad: [4]i64 = .{0} ** 4,
+    kernel: [4]i64 = .{0} ** 4,
+
+    /// Dilated kernel extent: dilation*(kernel-1)+1.
+    fn effectiveKernel(geo: *const ConvTransposeGeometry, axis: usize) i64 {
+        return geo.dilation[axis] * (geo.kernel[axis] - 1) + 1;
+    }
+};
+
+/// ConvTranspose lowering to the graph's forward-convolution primitive.
+///
+/// ConvTranspose(X, W, stride s, dilation d, pads p, output_padding op,
+/// groups g) — with ONNX weight layout [C_in, C_out/g, k...] — is exactly a
+/// stride-1 cross-correlation of
+///   • X zero-stuffed by s along each spatial axis (s-1 zeros between
+///     consecutive elements), and
+///   • W rewritten into the forward-conv layout [C_out, C_in/g, k'...] with
+///     the channel axes swapped per group, the kernel spatially flipped, and
+///     taps spaced d-1 apart (k' = d*(k-1)+1),
+/// with per-axis padding d*(k-1) - p_begin / d*(k-1) - p_end + op. Each
+/// output axis then measures (in-1)*s - p_b - p_e + d*(k-1) + 1 + op, the
+/// ONNX formula.
+///
+/// Both transforms are emitted as ordinary graph ops (reshape / transpose /
+/// gather / mul / broadcast_in_dim / slice), so runtime-bound parameter
+/// weights (large ONNX initializers) work alongside constants, and constant
+/// subtrees are folded away by the const-fold pass. The zero-stuffing
+/// produces stride-1 trailing zeros past the ideal (in-1)*s+1 extent, so each
+/// spatial axis is additionally cropped with shape_of-derived runtime slice
+/// limits; that keeps the conv padding symmetric (and thus natively
+/// executable) whenever pads/output_padding are.
 fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     if (inputs.len < 2) return error.MissingInput;
     const x = inputs[0];
@@ -4117,89 +4163,391 @@ fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []con
 
     const x_shape = builder.graph.node(x).output_shape;
     const w_shape = builder.graph.node(w).output_shape;
-    if (x_shape.rank() < 3) return error.UnsupportedOp;
-    const num_spatial: u8 = x_shape.rank() - 2;
+    if (w_shape.rank() < 3 or w_shape.rank() > 6) return error.UnsupportedOp;
+    if (x_shape.rank() != w_shape.rank()) return error.ShapeMismatch;
+    const num_spatial: u8 = w_shape.rank() - 2;
+    if (!std.mem.eql(u8, getString(node.attributes, "auto_pad", "NOTSET"), "NOTSET"))
+        return error.UnsupportedOp;
+    if (getInts(node.attributes, "output_shape").len != 0) return error.UnsupportedOp;
 
+    const group_i64 = getInt(node.attributes, "group", 1);
+    if (group_i64 <= 0) return error.InvalidAttribute;
+    const group: u32 = std.math.cast(u32, group_i64) orelse return error.InvalidAttribute;
+
+    // Kernel geometry comes from the weight tensor and must be static.
+    const c_in = w_shape.dim(0);
+    const c_out_local = w_shape.dim(1);
+    if (c_in <= 0 or c_out_local <= 0) {
+        log.warn("ConvTranspose: weight channel dims must be static, got weight shape {any}", .{w_shape});
+        return error.UnsupportedOp;
+    }
+    if (@rem(c_in, group_i64) != 0) return error.ShapeMismatch;
+    if (x_shape.dim(1) > 0 and x_shape.dim(1) != c_in) return error.ShapeMismatch;
+    const c_out = std.math.mul(i64, c_out_local, group_i64) catch return error.InvalidAttribute;
+
+    var geo = ConvTransposeGeometry{};
     const strides_attr = getInts(node.attributes, "strides");
     const pads_attr = getInts(node.attributes, "pads");
     const dilations_attr = getInts(node.attributes, "dilations");
     const output_padding_attr = getInts(node.attributes, "output_padding");
-    const group: u32 = @intCast(getInt(node.attributes, "group", 1));
-
+    const kernel_attr = getInts(node.attributes, "kernel_shape");
+    for ([_][]const i64{ strides_attr, dilations_attr, output_padding_attr, kernel_attr }) |values| {
+        if (values.len != 0 and values.len != num_spatial) return error.InvalidAttribute;
+    }
+    if (pads_attr.len != 0 and pads_attr.len != 2 * @as(usize, num_spatial)) return error.InvalidAttribute;
     for (0..num_spatial) |i| {
-        const stride: i64 = if (i < strides_attr.len) strides_attr[i] else 1;
-        if (stride != 1) return error.UnsupportedOp;
+        geo.stride[i] = if (i < strides_attr.len) strides_attr[i] else 1;
+        geo.dilation[i] = if (i < dilations_attr.len) dilations_attr[i] else 1;
+        geo.pad_begin[i] = if (i < pads_attr.len) pads_attr[i] else 0;
+        geo.pad_end[i] = if (i + num_spatial < pads_attr.len) pads_attr[i + num_spatial] else 0;
+        geo.output_pad[i] = if (i < output_padding_attr.len) output_padding_attr[i] else 0;
+        geo.kernel[i] = w_shape.dim(@intCast(i + 2));
+        if (geo.stride[i] <= 0 or geo.dilation[i] <= 0) return error.InvalidAttribute;
+        if (geo.pad_begin[i] < 0 or geo.pad_end[i] < 0 or geo.output_pad[i] < 0) return error.InvalidAttribute;
+        if (geo.kernel[i] <= 0) {
+            log.warn("ConvTranspose: kernel dims must be static, got weight shape {any}", .{w_shape});
+            return error.UnsupportedOp;
+        }
+        if (kernel_attr.len != 0 and kernel_attr[i] != geo.kernel[i]) return error.ShapeMismatch;
+        if (geo.output_pad[i] >= @max(geo.stride[i], geo.dilation[i])) return error.InvalidAttribute;
+        const dilated = std.math.mul(i64, geo.dilation[i], geo.kernel[i] - 1) catch return error.InvalidAttribute;
+        _ = std.math.add(i64, dilated, 1) catch return error.InvalidAttribute;
     }
 
-    // ConvTranspose: decompose as conv_general with adjusted padding.
-    // For stride=1, ConvTranspose is conv with kernel spatially flipped and
-    // padding = kernel_size - 1 - original_padding (full convolution).
-    // For stride>1, we insert zeros between input elements (fractional striding),
-    // which we approximate by using conv_general with stride=1 and expanded padding.
+    // Forward-conv window per axis. Negative padding (pads wider than the
+    // dilated kernel) is realized by cropping the stuffed input instead, so
+    // both conv paddings stay non-negative.
+    var conv_pad: [4][2]i64 = .{.{0} ** 2} ** 4;
+    var crop_begin: [4]i64 = .{0} ** 4;
+    var crop_end: [4]i64 = .{0} ** 4;
+    var asymmetric = false;
+    for (0..num_spatial) |i| {
+        const pad_b = geo.effectiveKernel(i) - 1 - geo.pad_begin[i];
+        const pad_e = std.math.add(i64, geo.effectiveKernel(i) - 1 - geo.pad_end[i], geo.output_pad[i]) catch return error.InvalidAttribute;
+        crop_begin[i] = if (pad_b < 0) -pad_b else 0;
+        const trailing: i64 = if (geo.stride[i] > 1) geo.stride[i] - 1 else 0;
+        const excess_end: i64 = if (pad_e < 0) -pad_e else 0;
+        crop_end[i] = std.math.add(i64, trailing, excess_end) catch return error.InvalidAttribute;
+        conv_pad[i][0] = pad_b + crop_begin[i];
+        conv_pad[i][1] = pad_e + excess_end;
+        if (conv_pad[i][0] != conv_pad[i][1]) asymmetric = true;
+    }
+    if (asymmetric) {
+        log.warn("ConvTranspose '{s}': asymmetric output window (pads/output_padding differ per side); the lowered graph is exact but native conv execution supports symmetric padding only", .{node.name});
+    }
 
+    // Output spatial dims: (in-1)*s - p_b - p_e + d*(k-1) + 1 + op.
+    var out_dims: [8]i64 = .{0} ** 8;
+    out_dims[0] = x_shape.dim(0);
+    out_dims[1] = c_out;
+    for (0..num_spatial) |i| {
+        const in_d = x_shape.dim(@intCast(i + 2));
+        if (in_d <= 0) {
+            out_dims[i + 2] = -1;
+        } else {
+            const expanded = std.math.mul(i64, in_d - 1, geo.stride[i]) catch return error.InvalidAttribute;
+            const extent = std.math.add(i64, expanded, geo.effectiveKernel(i)) catch return error.InvalidAttribute;
+            const padded = std.math.add(i64, extent, geo.output_pad[i]) catch return error.InvalidAttribute;
+            const cropped = std.math.sub(i64, padded, geo.pad_begin[i]) catch return error.InvalidAttribute;
+            out_dims[i + 2] = std.math.sub(i64, cropped, geo.pad_end[i]) catch return error.InvalidAttribute;
+            if (out_dims[i + 2] <= 0) return error.InvalidAttribute;
+        }
+    }
+    const out_shape = Shape{ .dtype = x_shape.dtype, .dims = out_dims, .rank_ = x_shape.rank_ };
+
+    // 1. Weight → forward-conv layout [C_out, C_in/group, k'...].
+    const conv_w = try convTransposeWeight(builder, w, w_shape, num_spatial, &geo, group_i64);
+
+    // 2. Zero-stuff strided axes and crop every axis to its exact extent.
+    const conv_x = try dilateConvTransposeInput(builder, x, x_shape, num_spatial, &geo, &crop_begin, &crop_end);
+
+    // 3. Stride-1 convolution over the derived window.
     var conv_attrs = ml.graph.node.ConvAttrs{};
     conv_attrs.num_spatial = num_spatial;
     conv_attrs.groups = group;
-
-    // ConvTranspose always runs the inner conv with stride=1.
-    // The "stride" in ConvTranspose means input dilation (fractional striding).
     for (0..num_spatial) |i| {
-        conv_attrs.strides[i] = 1;
+        conv_attrs.padding[i][0] = std.math.cast(i32, conv_pad[i][0]) orelse return error.InvalidAttribute;
+        conv_attrs.padding[i][1] = std.math.cast(i32, conv_pad[i][1]) orelse return error.InvalidAttribute;
     }
-
-    // Compute output spatial dims and effective padding.
-    // out = (in - 1) * stride - 2*pad + dilation*(kernel-1) + output_padding + 1
-    var out_dims: [8]i64 = .{0} ** 8;
-    out_dims[0] = x_shape.dim(0); // batch
-    // For ConvTranspose, weight layout is [C_in, C_out/groups, kH, kW]
-    out_dims[1] = w_shape.dim(1) * @as(i64, group); // output channels
-
-    for (0..num_spatial) |i| {
-        const in_d = x_shape.dim(@intCast(i + 2));
-        const k_d = w_shape.dim(@intCast(i + 2));
-        const stride: i64 = if (i < strides_attr.len) strides_attr[i] else 1;
-        const dilation: i64 = if (i < dilations_attr.len) dilations_attr[i] else 1;
-        const pad_begin: i64 = if (i < pads_attr.len) pads_attr[i] else 0;
-        const pad_end: i64 = if (i + num_spatial < pads_attr.len) pads_attr[i + num_spatial] else 0;
-        const out_pad: i64 = if (i < output_padding_attr.len) output_padding_attr[i] else 0;
-        const effective_k = dilation * (k_d - 1) + 1;
-
-        out_dims[i + 2] = if (in_d <= 0 or k_d <= 0)
-            -1
-        else
-            (in_d - 1) * stride - pad_begin - pad_end + effective_k + out_pad;
-
-        // Effective padding for the transpose conv (full convolution padding)
-        conv_attrs.padding[i][0] = @intCast(effective_k - 1 - pad_begin);
-        conv_attrs.padding[i][1] = @intCast(effective_k - 1 - pad_end + out_pad);
-    }
-
-    const out_shape = Shape{ .dtype = x_shape.dtype, .dims = out_dims, .rank_ = x_shape.rank_ };
-
     var result = try builder.graph.addNode(.{
         .op = .{ .conv_general = conv_attrs },
         .output_shape = out_shape,
-        .inputs = .{ x, w, null_node, null_node },
+        .inputs = .{ conv_x, conv_w, null_node, null_node },
         .num_inputs = 2,
     });
 
     if (has_bias) {
-        const bias = inputs[2];
-        const bias_shape = builder.graph.node(bias).output_shape;
-        if (bias_shape.rank() == 1 and out_shape.rank() >= 3) {
-            var bias_dims: [8]i64 = .{0} ** 8;
-            bias_dims[0] = 1;
-            bias_dims[1] = bias_shape.dim(0);
-            for (2..out_shape.rank()) |i| bias_dims[i] = 1;
-            const reshaped_bias_shape = Shape{ .dtype = bias_shape.dtype, .dims = bias_dims, .rank_ = out_shape.rank_ };
-            const reshaped_bias = try builder.reshape(bias, reshaped_bias_shape);
-            result = try builder.add(result, reshaped_bias);
-        } else {
-            result = try builder.add(result, bias);
-        }
+        result = try addConvBias(builder, result, inputs[2], out_shape);
     }
 
     return result;
+}
+
+/// Rewrite a ConvTranspose weight [C_in, C_out/group, k...] into the forward
+/// conv layout [C_out, C_in/group, k'...] with k' = dilation*(k-1)+1:
+/// the channel axes are swapped per group (reshape → transpose → reshape),
+/// the kernel is spatially flipped, and dilation holes are zeroed
+/// (gather + 0/1 mask). Emitted as graph ops so parameter weights work;
+/// constant weights fold to a single constant in the const-fold pass.
+fn convTransposeWeight(
+    builder: *Builder,
+    w: NodeId,
+    w_shape: Shape,
+    num_spatial: u8,
+    geo: *const ConvTransposeGeometry,
+    group: i64,
+) ConvertError!NodeId {
+    const c_in_per_g = @divTrunc(w_shape.dim(0), group);
+    const c_out_local = w_shape.dim(1);
+    const w_rank = w_shape.rank();
+
+    // [C_in, M, k...] → [g, C_in/g, M, k...] (split the input-channel axis).
+    var split_dims: [8]i64 = .{1} ** 8;
+    split_dims[0] = group;
+    split_dims[1] = c_in_per_g;
+    split_dims[2] = c_out_local;
+    for (0..num_spatial) |i| split_dims[3 + i] = geo.kernel[i];
+    var current = try builder.reshape(w, Shape{ .dtype = w_shape.dtype, .dims = split_dims, .rank_ = 3 + num_spatial });
+
+    // Swap the channel axes: [g, M, C_in/g, k...].
+    var perm: [8]u8 = .{0} ** 8;
+    perm[1] = 2;
+    perm[2] = 1;
+    for (3..3 + num_spatial) |i| perm[i] = @intCast(i);
+    current = try builder.transpose(current, perm[0 .. 3 + num_spatial]);
+
+    // Merge the output-channel axes: [g*M, C_in/g, k...].
+    var merged_dims: [8]i64 = .{1} ** 8;
+    merged_dims[0] = c_out_local * group;
+    merged_dims[1] = c_in_per_g;
+    for (0..num_spatial) |i| merged_dims[2 + i] = geo.kernel[i];
+    current = try builder.reshape(current, Shape{ .dtype = w_shape.dtype, .dims = merged_dims, .rank_ = w_rank });
+
+    // Spatial flip + dilation embedding per axis.
+    for (0..num_spatial) |i| {
+        const k = geo.kernel[i];
+        const d = geo.dilation[i];
+        if (k == 1) continue; // single tap: nothing to flip or dilate
+        const k_eff = geo.effectiveKernel(i);
+
+        // Gather the flipped source tap for every dilated slot; hole slots
+        // repeat a neighbour and are zeroed by the mask below.
+        const idx_shape = Shape.init(.i32, &.{k_eff});
+        const idx = try builder.graph.allocator.alloc(i32, @intCast(k_eff));
+        defer builder.graph.allocator.free(idx);
+        for (idx, 0..) |*slot, j| {
+            slot.* = std.math.cast(i32, k - 1 - @divTrunc(@as(i64, @intCast(j)), d)) orelse return error.InvalidAttribute;
+        }
+        const indices = try builder.tensorConstBytes(std.mem.sliceAsBytes(idx), idx_shape);
+
+        var gathered_dims: [8]i64 = builder.graph.node(current).output_shape.dims;
+        gathered_dims[2 + i] = k_eff;
+        const gathered_shape = Shape{ .dtype = w_shape.dtype, .dims = gathered_dims, .rank_ = w_rank };
+        current = try builder.graph.addNode(.{
+            .op = .{ .gather = .{ .axis = @intCast(2 + i) } },
+            .output_shape = gathered_shape,
+            .inputs = .{ current, indices, null_node, null_node },
+            .num_inputs = 2,
+        });
+
+        if (d > 1) {
+            // Zero the dilation holes.
+            const mask_data = try builder.graph.allocator.alloc(f32, @intCast(k_eff));
+            defer builder.graph.allocator.free(mask_data);
+            for (mask_data, 0..) |*mask, j| {
+                mask.* = if (@rem(@as(i64, @intCast(j)), d) == 0) 1.0 else 0.0;
+            }
+            var mask_dims: [8]i64 = .{1} ** 8;
+            mask_dims[2 + i] = k_eff;
+            const mask = try builder.tensorConst(mask_data, Shape{ .dtype = w_shape.dtype, .dims = mask_dims, .rank_ = w_rank });
+            current = try builder.mul(current, mask);
+        }
+    }
+
+    return current;
+}
+
+/// Zero-stuff (dilate) the input's strided spatial axes, then crop every
+/// spatial axis to its exact ConvTranspose extent.
+///
+/// Stuffing: interleave a length-1 slot axis after each strided spatial
+/// axis, broadcast it to `stride` copies of every element, and multiply by a
+/// 0/1 mask that keeps only slot 0 — giving [..., in*stride, ...] with zeros
+/// between elements. reshape / broadcast_in_dim / mul all resolve dynamic
+/// dims at runtime.
+///
+/// Cropping: the stuffed axis is (stride-1) zeros longer than the ideal
+/// (in-1)*stride+1 window (and over-padded configs crop further so both conv
+/// paddings stay non-negative), so every spatial axis is sliced to length.
+/// End limits come from a shape_of-derived node so dynamic dims work; fully
+/// static inputs use static slice limits.
+fn dilateConvTransposeInput(
+    builder: *Builder,
+    x: NodeId,
+    x_shape: Shape,
+    num_spatial: u8,
+    geo: *const ConvTransposeGeometry,
+    crop_begin: *const [4]i64,
+    crop_end: *const [4]i64,
+) ConvertError!NodeId {
+    const rank = x_shape.rank();
+    var current = x;
+
+    var any_strided = false;
+    for (0..num_spatial) |i| {
+        if (geo.stride[i] > 1) any_strided = true;
+    }
+
+    if (any_strided) {
+        // [N, C, d0, (s0), d1, (s1), ...] — slot axes in parens.
+        var inter_dims: [8]i64 = .{1} ** 8;
+        var slot_stride: [8]i64 = .{1} ** 8;
+        var is_slot: [8]bool = .{false} ** 8;
+        var ir: u8 = 0;
+        var expanded_rank: usize = rank;
+        for (0..num_spatial) |i| {
+            if (geo.stride[i] > 1) expanded_rank += 1;
+        }
+        if (expanded_rank > inter_dims.len) return error.TooManyDimensions;
+        for (0..rank) |d| {
+            inter_dims[ir] = x_shape.dim(@intCast(d));
+            ir += 1;
+            if (d >= 2 and geo.stride[d - 2] > 1) {
+                inter_dims[ir] = 1;
+                slot_stride[ir] = geo.stride[d - 2];
+                is_slot[ir] = true;
+                ir += 1;
+            }
+        }
+        const inter_rank: u8 = ir;
+        const reshaped = try builder.reshape(current, Shape{ .dtype = x_shape.dtype, .dims = inter_dims, .rank_ = inter_rank });
+
+        var bcast_dims = inter_dims;
+        var mask_dims: [8]i64 = .{1} ** 8;
+        var mask_count: usize = 1;
+        for (0..inter_rank) |i| {
+            if (!is_slot[i]) continue;
+            bcast_dims[i] = slot_stride[i];
+            mask_dims[i] = slot_stride[i];
+            mask_count = std.math.mul(usize, mask_count, @intCast(slot_stride[i])) catch return error.InvalidAttribute;
+        }
+        const bcast_shape = Shape{ .dtype = x_shape.dtype, .dims = bcast_dims, .rank_ = inter_rank };
+        var bcast_axes: [8]u8 = .{0} ** 8;
+        for (0..inter_rank) |i| bcast_axes[i] = @intCast(i);
+        const broadcasted = try builder.graph.addNode(.{
+            .op = .{ .broadcast_in_dim = .{
+                .target_shape = bcast_shape,
+                .broadcast_axes = bcast_axes,
+                .num_axes = inter_rank,
+            } },
+            .output_shape = bcast_shape,
+            .inputs = .{ reshaped, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
+
+        // Keep only slot 0 of each interleaved axis (mask has 1s elsewhere).
+        const mask_data = try builder.graph.allocator.alloc(f32, mask_count);
+        defer builder.graph.allocator.free(mask_data);
+        for (mask_data, 0..) |*out, linear| {
+            var v: i64 = @intCast(linear);
+            var keep = true;
+            for (0..inter_rank) |i| {
+                if (!is_slot[i]) continue;
+                if (@rem(v, slot_stride[i]) != 0) keep = false;
+                v = @divTrunc(v, slot_stride[i]);
+            }
+            out.* = if (keep) 1.0 else 0.0;
+        }
+        const mask = try builder.tensorConst(mask_data, Shape{ .dtype = x_shape.dtype, .dims = mask_dims, .rank_ = inter_rank });
+        const masked = try addElementwiseWithShape(builder, .mul, broadcasted, mask, bcast_shape);
+
+        // Merge (dim, stride) pairs back into dim*stride.
+        var merge_dims: [8]i64 = .{1} ** 8;
+        var scale_dims: [8]i64 = .{1} ** 8;
+        var dynamic = false;
+        for (0..rank) |d| {
+            const dim = x_shape.dim(@intCast(d));
+            const s: i64 = if (d >= 2) geo.stride[d - 2] else 1;
+            scale_dims[d] = s;
+            dynamic = dynamic or dim <= 0;
+            merge_dims[d] = if (dim <= 0) -1 else std.math.mul(i64, dim, s) catch return error.InvalidAttribute;
+        }
+        const merged_shape = Shape{ .dtype = x_shape.dtype, .dims = merge_dims, .rank_ = rank };
+        if (dynamic) {
+            // Multiple symbolic axes cannot be inferred from element count.
+            // Carry the exact request shape through the reshape operand.
+            const source_dims = try builder.graph.addNode(.{
+                .op = .{ .shape_of = .{ .start = 0, .end = rank } },
+                .output_shape = Shape.init(.i64, &.{rank}),
+                .inputs = .{ x, null_node, null_node, null_node },
+                .num_inputs = 1,
+            });
+            const scales = try builder.tensorConstBytes(std.mem.sliceAsBytes(scale_dims[0..rank]), Shape.init(.i64, &.{rank}));
+            const target_dims = try builder.mul(source_dims, scales);
+            current = try builder.graph.addNode(.{
+                .op = .{ .reshape = .{ .new_shape = merged_shape, .runtime_shape = true } },
+                .output_shape = merged_shape,
+                .inputs = .{ masked, target_dims, null_node, null_node },
+                .num_inputs = 2,
+            });
+        } else {
+            current = try builder.reshape(masked, merged_shape);
+        }
+    }
+
+    var any_crop = false;
+    for (0..num_spatial) |i| {
+        if (crop_begin[i] > 0 or crop_end[i] > 0) any_crop = true;
+    }
+    if (any_crop) {
+        const stuffed_dims = builder.graph.node(current).output_shape;
+
+        // Runtime end limit per spatial axis: dim - crop_end.
+        const dims_node = try builder.graph.addNode(.{
+            .op = .{ .shape_of = .{ .start = 2, .end = rank } },
+            .output_shape = Shape.init(.i64, &.{num_spatial}),
+            .inputs = .{ current, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
+        const crop_const = try builder.tensorConstBytes(std.mem.sliceAsBytes(crop_end[0..num_spatial]), Shape.init(.i64, &.{num_spatial}));
+        const limits_node = try builder.sub(dims_node, crop_const);
+
+        var slice_attrs = ml.graph.node.SliceAttrs{};
+        slice_attrs.num_axes = rank;
+        slice_attrs.num_bound_axes = num_spatial;
+        slice_attrs.runtime_limits = nodeDependsOnRuntimeValue(builder, limits_node, 0);
+        var cropped_dims: [8]i64 = .{0} ** 8;
+        for (0..rank) |d| {
+            slice_attrs.starts[d] = if (d >= 2) crop_begin[d - 2] else 0;
+            slice_attrs.strides[d] = 1;
+            const dim = stuffed_dims.dim(@intCast(d));
+            if (d >= 2) {
+                slice_attrs.bound_axes[d - 2] = @intCast(d);
+                if (dim > 0) {
+                    cropped_dims[d] = dim - crop_begin[d - 2] - crop_end[d - 2];
+                    slice_attrs.limits[d] = dim - crop_end[d - 2];
+                } else {
+                    cropped_dims[d] = -1;
+                    slice_attrs.limits[d] = -1;
+                }
+            } else {
+                slice_attrs.limits[d] = dim;
+                cropped_dims[d] = dim;
+            }
+        }
+        const runtime_bounds = slice_attrs.runtime_limits;
+        current = try builder.graph.addNode(.{
+            .op = .{ .slice = slice_attrs },
+            .output_shape = Shape{ .dtype = x_shape.dtype, .dims = cropped_dims, .rank_ = rank },
+            .inputs = if (runtime_bounds)
+                .{ current, limits_node, limits_node, null_node }
+            else
+                .{ current, null_node, null_node, null_node },
+            .num_inputs = if (runtime_bounds) 3 else 1,
+        });
+    }
+
+    return current;
 }
 
 fn convertResize(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -7169,8 +7517,6 @@ test "convertNode Cast" {
     try std.testing.expectEqual(DType.f16, g.node(result).output_shape.dtype);
 }
 
-// ── Coverage Tests: Broadcasting ────────────────────────────────────
-
 test "convertNode broadcast Mul different ranks" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -7183,6 +7529,64 @@ test "convertNode broadcast Mul different ranks" {
     const result = try convertNode(allocator, &b, &node, &.{ x, y }, null);
     try std.testing.expect(result != null_node);
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .mul);
+}
+
+test "convertNode ConvTranspose rejects dynamic weight geometry and invalid attributes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 8 }));
+
+    // Dynamic weight channels cannot be transposed at lowering time.
+    const w_dyn = try b.parameter("w", Shape.init(.f32, &.{ -1, 2, 3 }));
+    const node = NodeProto{ .op_type = "ConvTranspose" };
+    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &b, &node, &.{ x, w_dyn }, null));
+
+    // group must divide C_in.
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 2, 3 }));
+    var group = [_]AttributeProto{
+        .{ .name = "group", .i = 3 },
+    };
+    const grouped = NodeProto{ .op_type = "ConvTranspose", .attributes = &group };
+    try std.testing.expectError(error.ShapeMismatch, convertNode(allocator, &b, &grouped, &.{ x, w }, null));
+
+    var bad_strides = [_]i64{0};
+    var zero_stride = [_]AttributeProto{
+        .{ .name = "strides", .ints = &bad_strides },
+    };
+    const strided = NodeProto{ .op_type = "ConvTranspose", .attributes = &zero_stride };
+    try std.testing.expectError(error.InvalidAttribute, convertNode(allocator, &b, &strided, &.{ x, w }, null));
+}
+
+test "ConvTranspose rejects unsupported windows and overflowing geometry" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 1, 8 }));
+    const w = try builder.parameter("w", Shape.init(.f32, &.{ 1, 1, 3 }));
+    var auto_pad = [_]AttributeProto{.{ .name = "auto_pad", .s = "SAME_UPPER" }};
+    const automatic = NodeProto{ .op_type = "ConvTranspose", .attributes = &auto_pad };
+    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &builder, &automatic, &.{ x, w }, null));
+
+    var requested_size = [_]i64{16};
+    var output_shape = [_]AttributeProto{.{ .name = "output_shape", .ints = &requested_size }};
+    const requested = NodeProto{ .op_type = "ConvTranspose", .attributes = &output_shape };
+    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &builder, &requested, &.{ x, w }, null));
+
+    var dilation = [_]i64{std.math.maxInt(i64)};
+    var overflow_attrs = [_]AttributeProto{.{ .name = "dilations", .ints = &dilation }};
+    const overflow = NodeProto{ .op_type = "ConvTranspose", .attributes = &overflow_attrs };
+    try std.testing.expectError(error.InvalidAttribute, convertNode(allocator, &builder, &overflow, &.{ x, w }, null));
+
+    const x4 = try builder.parameter("x4", Shape.init(.f32, &.{ 1, 1, 2, 2, 2, 2 }));
+    const w4 = try builder.parameter("w4", Shape.init(.f32, &.{ 1, 1, 1, 1, 1, 1 }));
+    var strides4 = [_]i64{ 2, 2, 2, 2 };
+    var rank_attrs = [_]AttributeProto{.{ .name = "strides", .ints = &strides4 }};
+    const excess_rank = NodeProto{ .op_type = "ConvTranspose", .attributes = &rank_attrs };
+    try std.testing.expectError(error.TooManyDimensions, convertNode(allocator, &builder, &excess_rank, &.{ x4, w4 }, null));
 }
 
 test "convertNode broadcast Sub scalar" {
@@ -7405,38 +7809,6 @@ test "convertNode ConvTranspose 1D" {
     try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
     try std.testing.expectEqual(@as(i64, 2), out_shape.dim(1));
     try std.testing.expectEqual(@as(i64, 10), out_shape.dim(2));
-}
-
-test "convertNode ConvTranspose 2D with stride is unsupported until native upsampling is exact" {
-    const allocator = std.testing.allocator;
-    var g = Graph.init(allocator);
-    defer g.deinit();
-    var b = Builder.init(&g);
-
-    // Input: [1, 3, 4, 4], Weight: [3, 2, 3, 3], stride=2
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 3, 4, 4 }));
-    const w = try b.parameter("w", Shape.init(.f32, &.{ 3, 2, 3, 3 }));
-    var strides = [_]i64{ 2, 2 };
-    var attrs = [_]AttributeProto{
-        .{ .name = "strides", .ints = &strides },
-    };
-    const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
-    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &b, &node, &.{ x, w }, null));
-}
-
-test "convertNode ConvTranspose with bias" {
-    const allocator = std.testing.allocator;
-    var g = Graph.init(allocator);
-    defer g.deinit();
-    var b = Builder.init(&g);
-
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 8 }));
-    const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 2, 3 }));
-    const bias = try b.parameter("bias", Shape.init(.f32, &.{2}));
-    const node = NodeProto{ .op_type = "ConvTranspose" };
-    const result = try convertNode(allocator, &b, &node, &.{ x, w, bias }, null);
-    // Result should be add (conv + bias)
-    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .add);
 }
 
 test "convertNode IsNaN produces mul (AND of two masks)" {

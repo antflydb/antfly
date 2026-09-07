@@ -16978,16 +16978,13 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
                 const font_scale = @abs(prior.font_size) * axis;
                 const gap = textRunForwardGap(prior, run.*);
                 const word_gap = @max(0.5, font_scale * 0.12);
-                const operator_overlap_tolerance = font_scale * 0.15;
-                const operator_boundary = prior.paint_order != run.paint_order;
                 const caption_boundary =
                     prior.paint_order != run.paint_order and
                     endsWithColon(prior.text) and
                     startsWithAsciiUpper(run.text);
-                if (gap > word_gap or
-                    caption_boundary or
-                    (operator_boundary and gap > -operator_overlap_tolerance))
-                {
+                // A text-showing operator boundary can split a single word.
+                // Infer separators from geometry, not content-stream chunking.
+                if (gap > word_gap or caption_boundary) {
                     try out.append(alloc, ' ');
                 }
             }
@@ -20596,7 +20593,7 @@ test "reader reconstructs spaces and lines from positioned text runs" {
     var runs = [_]TextRun{
         .{ .text = "Max", .x = 0, .y = 100, .font_size = 10, .advance_width = 15, .paint_order = 0 },
         .{ .text = "Length", .x = 17, .y = 100, .font_size = 10, .advance_width = 30, .paint_order = 0 },
-        .{ .text = "Avg", .x = 46.5, .y = 100, .font_size = 10, .advance_width = 14, .paint_order = 1 },
+        .{ .text = "Avg", .x = 49, .y = 100, .font_size = 10, .advance_width = 14, .paint_order = 1 },
         .{ .text = "Multi-v", .x = 0, .y = 80, .font_size = 10, .advance_width = 30, .paint_order = 2 },
         .{ .text = "ec", .x = 30.5, .y = 80, .font_size = 10, .advance_width = 8, .paint_order = 2 },
     };
@@ -20605,6 +20602,18 @@ test "reader reconstructs spaces and lines from positioned text runs" {
     try std.testing.expectEqualStrings("Max Length Avg\nMulti-vec\n", text);
     try std.testing.expect(sameNonWhitespaceBytes("MaxLengthAvg Multi-vec", text));
     try std.testing.expect(!sameNonWhitespaceBytes("MaxLengthAvg Multi-vector", text));
+}
+
+test "reader preserves words split across text-showing operators" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = "Hel", .x = 0, .y = 100, .font_size = 10, .advance_width = 15, .paint_order = 0 },
+        .{ .text = "lo", .x = 15, .y = 100, .font_size = 10, .advance_width = 8, .paint_order = 1 },
+        .{ .text = "world", .x = 26, .y = 100, .font_size = 10, .advance_width = 25, .paint_order = 2 },
+    };
+    const text = try reconstructTextFromRunsAlloc(alloc, &runs);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Hello world\n", text);
 }
 
 test "reader clamps reconstructed spans after trimming line whitespace" {
@@ -20692,7 +20701,7 @@ test "reader extracts positioned text runs from text matrix operators" {
 test "reader preserves text state across page content streams" {
     const alloc = std.testing.allocator;
     const first_content = "q 2 0 0 2 0 0 cm BT /F1 12 Tf 1 0 0 1 72 360 Tm (Hello) Tj\n";
-    const second_content = "(World) Tj ET Q\n";
+    const second_content = "( World) Tj ET Q\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",

@@ -2143,6 +2143,211 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     try std.testing.expectEqualSlices(f32, &.{ -425.0, 0.0, 255.0, 340.0 }, outputs[3].asFloat32());
 }
 
+test "imported onnx ConvTranspose preserves channels bias and changing spatial dimensions" {
+    const allocator = std.testing.allocator;
+    const proto = onnx_graph.proto;
+    var input_dims = [_]proto.TensorShapeProto.Dimension{
+        .{ .dim_value = 1 },        .{ .dim_value = 1 },
+        .{ .dim_param = "height" }, .{ .dim_param = "width" },
+    };
+    var output_dims = [_]proto.TensorShapeProto.Dimension{
+        .{ .dim_value = 1 },            .{ .dim_value = 2 },
+        .{ .dim_param = "out_height" }, .{ .dim_param = "out_width" },
+    };
+    var inputs = [_]proto.ValueInfoProto{.{
+        .name = "x",
+        .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &input_dims } } },
+    }};
+    var outputs = [_]proto.ValueInfoProto{.{
+        .name = "y",
+        .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &output_dims } } },
+    }};
+    const weights = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const bias = [_]f32{ 10, 20 };
+    var weight_dims = [_]i64{ 1, 2, 2, 2 };
+    var bias_dims = [_]i64{2};
+    var initializers = [_]proto.TensorProto{
+        .{ .name = "w", .dims = &weight_dims, .data_type = .float32, .raw_data = std.mem.sliceAsBytes(&weights) },
+        .{ .name = "b", .dims = &bias_dims, .data_type = .float32, .raw_data = std.mem.sliceAsBytes(&bias) },
+    };
+    var node_inputs = [_][]const u8{ "x", "w", "b" };
+    var node_outputs = [_][]const u8{"y"};
+    var strides = [_]i64{ 2, 2 };
+    var attrs = [_]proto.AttributeProto{.{ .name = "strides", .ints = &strides, .attr_type = .ints }};
+    var nodes = [_]proto.NodeProto{.{
+        .op_type = "ConvTranspose",
+        .inputs = &node_inputs,
+        .outputs = &node_outputs,
+        .attributes = &attrs,
+    }};
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 11 }};
+    const model = proto.ModelProto{
+        .ir_version = 7,
+        .opset_import = &opsets,
+        .graph = .{ .name = "transpose_conv", .nodes = &nodes, .initializers = &initializers, .inputs = &inputs, .outputs = &outputs },
+    };
+    const bytes = try onnx_graph.serializeModel(allocator, &model);
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer allocator.free(path);
+
+    const cases = [_]struct { shape: [4]i64, values: []const f32, out_shape: [4]i64, expected: []const f32 }{
+        .{
+            .shape = .{ 1, 1, 2, 2 },
+            .values = &.{ 1, 2, 3, 4 },
+            .out_shape = .{ 1, 2, 4, 4 },
+            .expected = &.{
+                11, 12, 12, 14, 13, 14, 16, 18, 13, 16, 14, 18, 19, 22, 22, 26,
+                25, 26, 30, 32, 27, 28, 34, 36, 35, 38, 40, 44, 41, 44, 48, 52,
+            },
+        },
+        .{
+            .shape = .{ 1, 1, 1, 3 },
+            .values = &.{ 2, 0, 1 },
+            .out_shape = .{ 1, 2, 2, 6 },
+            .expected = &.{
+                12, 14, 10, 10, 11, 12, 16, 18, 10, 10, 13, 14,
+                30, 32, 20, 20, 25, 26, 34, 36, 20, 20, 27, 28,
+            },
+        },
+    };
+    for ([_]graph_runtime_mod.Strategy{ .interpreter, .partitioned }) |strategy| {
+        var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = strategy });
+        defer session.close();
+        for (cases) |case| {
+            var input = try Tensor.initFloat32(allocator, "x", &case.shape, case.values);
+            defer input.deinit();
+            const result = try session.run(&.{input}, allocator);
+            defer {
+                for (result) |*tensor| tensor.deinit();
+                allocator.free(result);
+            }
+            try std.testing.expectEqual(@as(usize, 1), result.len);
+            try std.testing.expectEqualSlices(i64, &case.out_shape, result[0].shape);
+            try std.testing.expectEqualSlices(f32, case.expected, result[0].asFloat32());
+        }
+    }
+}
+
+test "imported onnx AveragePool preserves windows across changing image widths" {
+    const allocator = std.testing.allocator;
+    const proto = onnx_graph.proto;
+    var input_dims = [_]proto.TensorShapeProto.Dimension{
+        .{ .dim_value = 1 }, .{ .dim_value = 2 },
+        .{ .dim_value = 3 }, .{ .dim_param = "width" },
+    };
+    var output_dims = [_]proto.TensorShapeProto.Dimension{
+        .{ .dim_value = 1 }, .{ .dim_value = 2 },
+        .{ .dim_value = 1 }, .{ .dim_param = "out_width" },
+    };
+    var inputs = [_]proto.ValueInfoProto{.{
+        .name = "x",
+        .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &input_dims } } },
+    }};
+    var outputs = [_]proto.ValueInfoProto{.{
+        .name = "y",
+        .type_proto = .{ .tensor_type = .{ .elem_type = .float32, .shape = .{ .dims = &output_dims } } },
+    }};
+    var window = [_]i64{ 3, 2 };
+    var attrs = [_]proto.AttributeProto{
+        .{ .name = "kernel_shape", .ints = &window, .attr_type = .ints },
+        .{ .name = "strides", .ints = &window, .attr_type = .ints },
+    };
+    var node_inputs = [_][]const u8{"x"};
+    var node_outputs = [_][]const u8{"y"};
+    var nodes = [_]proto.NodeProto{.{
+        .op_type = "AveragePool",
+        .inputs = &node_inputs,
+        .outputs = &node_outputs,
+        .attributes = &attrs,
+    }};
+    var opsets = [_]proto.OpsetImport{.{ .domain = "", .version = 11 }};
+    const model = proto.ModelProto{
+        .ir_version = 7,
+        .opset_import = &opsets,
+        .graph = .{ .name = "window_pool", .nodes = &nodes, .inputs = &inputs, .outputs = &outputs },
+    };
+    const bytes = try onnx_graph.serializeModel(allocator, &model);
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer allocator.free(path);
+    var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = .interpreter });
+    defer session.close();
+    var values: [36]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    const cases = [_]struct { width: usize, expected: []const f32 }{
+        .{ .width = 6, .expected = &.{ 7.5, 9.5, 11.5, 25.5, 27.5, 29.5 } },
+        .{ .width = 4, .expected = &.{ 5.5, 7.5, 17.5, 19.5 } },
+    };
+    for (cases) |case| {
+        var input = try Tensor.initFloat32(allocator, "x", &.{ 1, 2, 3, @intCast(case.width) }, values[0 .. 6 * case.width]);
+        defer input.deinit();
+        const result = try session.run(&.{input}, allocator);
+        defer {
+            for (result) |*tensor| tensor.deinit();
+            allocator.free(result);
+        }
+        try std.testing.expectEqualSlices(i64, &.{ 1, 2, 1, @intCast(case.width / 2) }, result[0].shape);
+        try std.testing.expectEqualSlices(f32, case.expected, result[0].asFloat32());
+    }
+}
+
+test "imported onnx reshape copies runtime batch before splitting attention heads" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 12 }));
+    const split = try builder.reshape(x, Shape.init(.f32, &.{ 0, -1, 3, 2, 2 }));
+    const transposed = try builder.transpose(split, &.{ 2, 0, 3, 1, 4 });
+    try graph.markOutput(transposed);
+    const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer allocator.free(path);
+    var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = .interpreter });
+    defer session.close();
+    var values: [72]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i);
+    const cases = [_]struct { batch: usize, steps: usize }{
+        .{ .batch = 2, .steps = 3 },
+        .{ .batch = 1, .steps = 4 },
+    };
+    for (cases) |case| {
+        var input = try Tensor.initFloat32(allocator, "x", &.{ @intCast(case.batch), @intCast(case.steps), 12 }, values[0 .. case.batch * case.steps * 12]);
+        defer input.deinit();
+        const result = try session.run(&.{input}, allocator);
+        defer {
+            for (result) |*tensor| tensor.deinit();
+            allocator.free(result);
+        }
+        try std.testing.expectEqualSlices(i64, &.{ 3, @intCast(case.batch), 2, @intCast(case.steps), 2 }, result[0].shape);
+        const actual = result[0].asFloat32();
+        var offset: usize = 0;
+        for (0..3) |projection| {
+            for (0..case.batch) |batch| {
+                for (0..2) |head| {
+                    for (0..case.steps) |step| {
+                        for (0..2) |lane| {
+                            try std.testing.expectEqual(values[(batch * case.steps + step) * 12 + projection * 4 + head * 2 + lane], actual[offset]);
+                            offset += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "ONNX artifact inspection includes and validates external tensor files" {
     const allocator = std.testing.allocator;
 

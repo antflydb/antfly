@@ -161,6 +161,7 @@ test {
     _ = native_read;
     _ = @import("metal_generated_quant_stats.zig");
     _ = @import("readers/reader.zig");
+    _ = @import("readers/multistage_reader.zig");
     _ = native_extract;
     _ = compare_generate;
     _ = run_options;

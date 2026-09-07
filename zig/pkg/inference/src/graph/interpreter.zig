@@ -1598,7 +1598,7 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
         if (dims[d] <= 0) return null;
     }
     if (cb.tensorShapeMatches(val, dims[0..rank]) catch null) |matches| {
-        return if (matches) null else cb.primReshape(val, dims[0..rank]) catch null;
+        if (matches) return null;
     }
     const actual = cb.tensorShape(val, std.heap.page_allocator) catch {
         return cb.primReshape(val, dims[0..rank]) catch null;
@@ -2495,7 +2495,7 @@ pub fn executeNode(
 
         .fused_masked_bce_with_logits_backward => |attrs| {
             var logits_shape_buf: [8]i64 = undefined;
-            const logits_shape = fillShapeDims(graph, ins[0], &logits_shape_buf);
+            const logits_shape = runtimeOrDeclaredShape(state, graph, ins[0], &logits_shape_buf);
             return cb.maskedBceWithLogitsBackward(&.{
                 .logits = V.get(ins[0]),
                 .labels = V.get(ins[1]),
@@ -3326,22 +3326,22 @@ pub fn executeNode(
 
         .reduce_sum => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceSum(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_max => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceMax(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_mean => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primReduceMean(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .argmax => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             return cb.primArgMax(V.get(ins[0]), attrs.axis, attrs.keepdims, in_shape);
         },
         .reshape => |attrs| {
@@ -3399,7 +3399,7 @@ pub fn executeNode(
         },
         .transpose => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             const r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (r) |v| cb.free(v);
             var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
@@ -3442,7 +3442,7 @@ pub fn executeNode(
         },
         .broadcast_in_dim => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
             var rank = @as(usize, attrs.target_shape.rank());
             var target_dims: [8]i64 = undefined;
             for (0..rank) |d| target_dims[d] = attrs.target_shape.dim(@intCast(d));
@@ -3496,8 +3496,8 @@ pub fn executeNode(
         .dot_general => |attrs| {
             var lbuf: [8]i64 = undefined;
             var rbuf: [8]i64 = undefined;
-            const lhs_shape = fillShapeDims(graph, ins[0], &lbuf);
-            const rhs_shape = fillShapeDims(graph, ins[1], &rbuf);
+            const lhs_shape = runtimeOrDeclaredShape(state, graph, ins[0], &lbuf);
+            const rhs_shape = runtimeOrDeclaredShape(state, graph, ins[1], &rbuf);
             // Reshape inputs to declared shapes for shape-tracking backends.
             const lhs_r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (lhs_r) |r| cb.free(r);
@@ -3729,6 +3729,8 @@ pub fn executeNode(
         },
         .slice => |attrs| {
             var sbuf: [8]i64 = undefined;
+            // Slice uses declared symbolic axes to interpret full-axis negative
+            // limits; its backend separately resolves concrete tensor dimensions.
             const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             const rank = @as(usize, attrs.num_axes);
             var starts: [8]i64 = undefined;
@@ -3802,8 +3804,8 @@ pub fn executeNode(
         .concat_prim => |attrs| {
             var abuf: [8]i64 = undefined;
             var bbuf: [8]i64 = undefined;
-            const a_shape = fillShapeDims(graph, ins[0], &abuf);
-            const b_shape = fillShapeDims(graph, ins[1], &bbuf);
+            const a_shape = runtimeOrDeclaredShape(state, graph, ins[0], &abuf);
+            const b_shape = runtimeOrDeclaredShape(state, graph, ins[1], &bbuf);
             return cb.primConcatPrim(V.get(ins[0]), V.get(ins[1]), attrs.axis, a_shape, b_shape) catch |err| {
                 const a_inputs = graph.node(ins[0]).getInputs();
                 const b_inputs = graph.node(ins[1]).getInputs();
@@ -5992,6 +5994,54 @@ test "reshape preserves runtime batch for exported singleton target" {
     const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
     defer allocator.free(actual_shape);
     try std.testing.expectEqualSlices(i64, &.{ 2, 6, 2, 2 }, actual_shape);
+}
+
+test "transpose broadcast concat and reduction preserve concrete dimensions after a runtime reshape" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 3, 2 }));
+    const target = try builder.tensorConst(&.{ 1, 1, 3, 2 }, Shape.init(.i64, &.{4}));
+    const representative = Shape.init(.f32, &.{ 1, 1, 1, 2 });
+    const reshaped = try graph.addNode(.{
+        .op = .{ .reshape = .{ .new_shape = representative, .runtime_shape = true } },
+        .output_shape = representative,
+        .inputs = .{ x, target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const transposed = try builder.transpose(reshaped, &.{ 0, 3, 1, 2 });
+    const bias = try builder.tensorConst(&.{ 1, -2 }, Shape.init(.f32, &.{ 1, 2, 1, 1 }));
+    const shifted = try builder.sub(transposed, bias);
+    const concatenated = try builder.concat(shifted, shifted, 1);
+    const means = try builder.reduceMean(concatenated, &.{3});
+    try graph.markOutput(transposed);
+    try graph.markOutput(concatenated);
+    try graph.markOutput(means);
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    var cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 1, 3, 2 });
+    defer cb.free(input);
+    var result = try execute(allocator, &graph, &cb, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = input }},
+    });
+    defer result.deinit(&cb);
+    const shape = try cb.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 1, 3 }, shape);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 3, 5, 2, 4, 6 }, actual);
+    const concat_shape = try cb.tensorShape(result.outputs[1], allocator);
+    defer allocator.free(concat_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4, 1, 3 }, concat_shape);
+    const concat_values = try cb.toFloat32(result.outputs[1], allocator);
+    defer allocator.free(concat_values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 2, 4, 4, 6, 8, 0, 2, 4, 4, 6, 8 }, concat_values);
+    const mean_values = try cb.toFloat32(result.outputs[2], allocator);
+    defer allocator.free(mean_values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 6, 2, 6 }, mean_values);
 }
 
 test "runtime shape drives symbolic reduce" {
