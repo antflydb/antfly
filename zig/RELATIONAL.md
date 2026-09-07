@@ -353,13 +353,25 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. ACB5 separates row metadata from independently addressed,
+this build path. ACB6 separates row metadata from independently addressed,
 checksummed per-column metadata. The root contains a sorted sparse directory
 of 64-ordinal presence pages (12 bytes per populated page); binary search
 locates only the columns a predicate/projection requests, without allocating or
 decoding every column's bounds and bitmaps. Missing declared metadata is
 corruption, not a missing field. Existence predicates and null projections need neither payload I/O
 nor value-stream decoding, even for large vector/JSON columns.
+
+Payloads have independently checksummed row-group pages. The builder chooses
+a power-of-two row-group size targeting about 16 KiB of uncompressed values:
+compact scalar columns stay in one page, while wide columns get finer-grained
+pages. A single large value may exceed that target. Column metadata declares
+the group size and exact encoded bytes for every page, including zero-byte
+absent/null-only groups. Predicates load pages intersecting their surviving
+candidate mask; projections load only the pages containing delivered rows.
+Repeated predicates share decoded pages. The cost model charges only still-
+unread pages containing surviving values, and `payload_pages_read` exposes the
+actual I/O alongside bytes read. Publication retires every declared page
+atomically; generation reclamation also covers canceled or obsolete pages.
 
 Column segments carry schema epochs, null state, and numeric min/max summaries.
 A manifest records the schema-bound generation and directory state.
@@ -459,6 +471,15 @@ a bounded 256-slot atomic hint table: collisions may compact a range early, neve
 change visibility. Deferred ranges have checksummed state and a durable,
 generation-bound due-time index. Discovery examines up to 128 candidates or
 50 ms per batch and commits all new deferrals and cursor progress together.
+Deferral state caches immutable block row counts and source bytes. Subsequent
+wakes inspect bounded dirty-marker prefixes and use their maximum committed
+mutation token as a range-local revision: a write elsewhere does not reread
+the block root or rewrite unchanged deferrals. This avoids a new range-index
+lookup/update in foreground transactions and preserves bulk append ingestion.
+It still performs small dirty-marker probes on table-wide wakes; statistics
+separate `admission_root_reads` and `admission_dirty_probes`. Restart reuses the
+durable admission facts. Empty completed coverage re-enters bootstrap when a
+new row arrives, rather than attempting admission against a missing directory.
 Due timers are considered first; ready work discovered behind deferred ranges
 can run in the same worker turn. A merge turn cannot lose a selected ready range,
 and merge/cleanup work prevents entering a deferred-only wait. Publication retires

@@ -62818,6 +62818,137 @@ fn drainTestRelationalMaintenance(db: *DB) !void {
     }
 }
 
+test "relational columnar adaptive maintenance resumes after empty coverage" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    for (0..3) |cycle| {
+        for (0..64) |_| {
+            _ = try db.runRelationalColumnMaintenancePass();
+            if (!db.relational_column_maintenance.pending.load(.acquire)) break;
+        }
+        try std.testing.expect(!db.relational_column_maintenance.pending.load(.acquire));
+        if (cycle == 1) {
+            try db.batch(.{ .deletes = &.{"row"} });
+        } else try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"n\":1}" }} });
+    }
+    for (0..64) |_| {
+        _ = try db.runRelationalColumnMaintenancePass();
+        if (!db.relational_column_maintenance.pending.load(.acquire)) break;
+    }
+    try std.testing.expect(!db.relational_column_maintenance.pending.load(.acquire));
+    var scan_stats: types.ColumnarScanStats = .{};
+    var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .columnar_stats = &scan_stats });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.documents.len);
+    try std.testing.expectEqual(@as(u64, 0), scan_stats.primary_rows_read);
+}
+
+test "relational columnar range admission ignores unrelated mutation epochs" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(types.BatchWrite, 1024);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"n\":1}" };
+    try db.batch(.{ .writes = writes });
+    try drainTestRelationalMaintenance(&db);
+    for (0..4) |i| try db.batch(.{ .writes = &.{.{ .key = writes[i * 256].key, .value = "{\"n\":2}" }} });
+    relational_columns.test_now_ns = 100 * std.time.ns_per_s;
+    defer relational_columns.test_now_ns = null;
+    for (0..8) |_| _ = try db.runRelationalColumnMaintenancePass();
+    const roots = db.relational_column_maintenance.admission_root_reads.load(.monotonic);
+    const deferred = db.relational_column_maintenance.ranges_deferred.load(.monotonic);
+    try std.testing.expect(roots >= 4);
+    for (0..8) |i| {
+        try db.batch(.{ .writes = &.{.{ .key = writes[0].key, .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d}}}", .{i + 3}) }} });
+        _ = try db.runRelationalColumnMaintenancePass();
+    }
+    try std.testing.expectEqual(roots, db.relational_column_maintenance.admission_root_reads.load(.monotonic));
+    try std.testing.expectEqual(deferred + 8, db.relational_column_maintenance.ranges_deferred.load(.monotonic));
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    for (0..8) |_| _ = try db.runRelationalColumnMaintenancePass();
+    try std.testing.expectEqual(@as(u64, 0), db.relational_column_maintenance.admission_root_reads.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), db.relational_column_maintenance.ranges_deferred.load(.monotonic));
+}
+
+test "relational columnar selected payload pages bound wide projection reads" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "n", .path = "n", .column_type = .integer },
+            .{ .name = "payload", .path = "payload", .column_type = .string },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var random = std.Random.DefaultPrng.init(42);
+        const writes = try scratch.alloc(types.BatchWrite, 64);
+        const payloads = try scratch.alloc([]const u8, writes.len);
+        for (writes, 0..) |*write, i| {
+            const payload = try scratch.alloc(u8, 4096);
+            for (payload) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+            payloads[i] = payload;
+            write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"payload\":\"{s}\"}}", .{ i, payload }) };
+        }
+        try db.batch(.{ .writes = writes });
+        try drainTestRelationalMaintenance(&db);
+        var all_stats: types.ColumnarScanStats = .{};
+        var all = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .columnar_stats = &all_stats });
+        defer all.deinit(alloc);
+        var one_stats: types.ColumnarScanStats = .{};
+        var one = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .limit = 1, .columnar_stats = &one_stats });
+        defer one.deinit(alloc);
+        try std.testing.expectEqualDeep(all.documents[0], one.documents[0]);
+        try std.testing.expectEqual(@as(u64, 1), one_stats.payload_pages_read);
+        try std.testing.expect(one_stats.payload_bytes_read * 8 < all_stats.payload_bytes_read);
+        // The scalar predicate narrows the payload selection before wide pages
+        // are decoded; OR leaves can request different pages of one column.
+        const filter = try std.fmt.allocPrint(scratch, "{{\"disjuncts\":[{{\"conjuncts\":[{{\"term\":{{\"n\":0}}}},{{\"term\":{{\"payload\":\"{s}\"}}}}]}},{{\"conjuncts\":[{{\"term\":{{\"n\":63}}}},{{\"term\":{{\"payload\":\"{s}\"}}}}]}}]}}", .{ payloads[0], payloads[63] });
+        var filtered_stats: types.ColumnarScanStats = .{};
+        var filtered = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .filter_query_json = filter, .columnar_stats = &filtered_stats });
+        defer filtered.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), filtered.documents.len);
+        try std.testing.expectEqualDeep(all.documents[0], filtered.documents[0]);
+        try std.testing.expectEqualDeep(all.documents[63], filtered.documents[1]);
+        try std.testing.expect(filtered_stats.payload_bytes_read * 4 < all_stats.payload_bytes_read);
+        try std.testing.expectEqual(@as(u64, 2), filtered_stats.values_materialized);
+        // Coverage publication retires every payload page, including pages
+        // never read by the point projection above.
+        try db.batch(.{ .deletes = &.{ writes[0].key, writes[63].key } });
+        try drainTestRelationalMaintenance(&db);
+        var after = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"} });
+        defer after.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 62), after.documents.len);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        var reopened_stats: types.ColumnarScanStats = .{};
+        var reopened = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .columnar_stats = &reopened_stats });
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqualDeep(after.documents, reopened.documents);
+        try std.testing.expectEqual(@as(u64, 0), reopened_stats.primary_rows_read);
+    }
+}
+
 test "relational columnar row cursor skips artifact fanout and preserves binary owners" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {

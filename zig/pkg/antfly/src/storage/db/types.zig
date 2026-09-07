@@ -1120,6 +1120,7 @@ pub const LookupResult = struct {
 };
 
 pub const ColumnarScanStats = struct {
+    payload_pages_read: u64 = 0,
     primary_owners_examined: u64 = 0,
     used: bool = false,
     blocks_read: u64 = 0,
@@ -2568,6 +2569,8 @@ pub const VisibilityStats = struct {
 };
 
 pub const ColumnarMaintenanceStats = struct {
+    admission_root_reads: u64 = 0,
+    admission_dirty_probes: u64 = 0,
     owners_examined: u64 = 0,
     scheduler_candidates: u64 = 0,
     scheduler_commits: u64 = 0,

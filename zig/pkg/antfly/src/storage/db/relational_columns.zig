@@ -72,6 +72,8 @@ pub const Maintenance = struct {
     owners_examined: std.atomic.Value(u64) = .init(0),
     scheduler_candidates: std.atomic.Value(u64) = .init(0),
     scheduler_commits: std.atomic.Value(u64) = .init(0),
+    admission_root_reads: std.atomic.Value(u64) = .init(0),
+    admission_dirty_probes: std.atomic.Value(u64) = .init(0),
     waiting_until_ns: std.atomic.Value(u64) = .init(0),
     read_revision: std.atomic.Value(u64) = .init(0),
     // Worker-owned hints. Durable timers/cursor remain authoritative on restart.
@@ -126,6 +128,8 @@ pub const Maintenance = struct {
             .owners_examined = self.owners_examined.load(.monotonic),
             .scheduler_candidates = self.scheduler_candidates.load(.monotonic),
             .scheduler_commits = self.scheduler_commits.load(.monotonic),
+            .admission_root_reads = self.admission_root_reads.load(.monotonic),
+            .admission_dirty_probes = self.admission_dirty_probes.load(.monotonic),
             .waiting_until_ns = self.waiting_until_ns.load(.monotonic),
         };
     }
@@ -182,6 +186,11 @@ fn columnMetaKey(alloc: alloc_type, generation: u64, block: u64, ordinal: u32) !
     return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:p{x:0>8}", .{ prefix, generation, block, ordinal });
 }
 
+fn columnPageKey(alloc: alloc_type, generation: u64, block: u64, ordinal: u32, page: usize) ![]u8 {
+    if (page == 0) return blockKey(alloc, generation, block, ordinal);
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:c{x:0>8}:{x:0>2}", .{ prefix, generation, block, ordinal, page });
+}
+
 fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: type, value: T) !void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);
@@ -191,6 +200,38 @@ fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: t
 const Row = struct { key: []const u8, hash: [32]u8, timestamp: u64, physical_bytes: u64 = 0 };
 const Bounds = struct { present: bool = false, minimum: f64 = 0, maximum: f64 = 0 };
 const Column = struct { writer: dv.TypedDocValuesWriter, presence: [null_bytes]u8 = @splat(0), nulls: [null_bytes]u8 = @splat(0), bounds: Bounds = .{} };
+
+const ColumnPages = struct {
+    shift: u4,
+    sizes: []const u8,
+
+    fn init(meta: []const u8, rows: usize) !@This() {
+        const offset = 25 + 2 * null_bytes;
+        if (meta.len < offset + 1 or meta[offset] > 8 or rows > max_rows) return error.InvalidColumnSegment;
+        const shift: u4 = @intCast(meta[offset]);
+        const page_rows = @as(usize, 1) << shift;
+        const count = std.math.divCeil(usize, rows, page_rows) catch unreachable;
+        if (meta.len != offset + 1 + count * 8) return error.InvalidColumnSegment;
+        const result = @This(){ .shift = shift, .sizes = meta[offset + 1 ..] };
+        var total: u64 = 0;
+        for (0..count) |page| {
+            const bytes = result.size(page);
+            total = std.math.add(u64, total, bytes) catch return error.InvalidColumnSegment;
+            var present = false;
+            for (page * page_rows..@min(rows, (page + 1) * page_rows)) |row| {
+                const bit = @as(u8, 1) << @intCast(row % 8);
+                present = present or (meta[25 + row / 8] & ~meta[25 + null_bytes + row / 8] & bit != 0);
+            }
+            if ((bytes != 0) != present) return error.InvalidColumnSegment;
+        }
+        if (total != std.mem.readInt(u64, meta[17..25], .little)) return error.InvalidColumnSegment;
+        return result;
+    }
+
+    fn size(self: @This(), page: usize) u64 {
+        return std.mem.readInt(u64, self.sizes[page * 8 ..][0..8], .little);
+    }
+};
 
 fn ColumnBuilder(comptime DBType: type) type {
     return struct {
@@ -219,7 +260,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             if (self.rows.items.len == 0) return;
             const scratch = self.arena.allocator();
             var meta = std.ArrayListUnmanaged(u8).empty;
-            try meta.appendSlice(scratch, "ACB5");
+            try meta.appendSlice(scratch, "ACB6");
             try appendInt(&meta, scratch, u32, self.view.?.version());
             try appendInt(&meta, scratch, u32, @intCast(self.rows.items.len));
             const ordinals = try scratch.alloc(u32, self.columns.count());
@@ -249,12 +290,39 @@ fn ColumnBuilder(comptime DBType: type) type {
                 try column_meta.append(scratch, @intFromBool(bounds.present));
                 try appendInt(&column_meta, scratch, u64, @bitCast(bounds.minimum));
                 try appendInt(&column_meta, scratch, u64, @bitCast(bounds.maximum));
-                const values = try entry.value_ptr.writer.build();
-                try appendInt(&column_meta, scratch, u64, values.len + 4);
+                // Keep compact scalar columns together, but independently
+                // address wide payloads in ~16 KiB row groups. Page writers
+                // borrow the prepared entries rather than duplicating values.
+                const entries = entry.value_ptr.writer.entries.items;
+                var raw_bytes: usize = 0;
+                for (entries) |cell| raw_bytes +|= 12 + if (cell.owned_bytes) |bytes| bytes.len else 8;
+                const average = @max(1, raw_bytes / @max(1, self.rows.items.len));
+                const shift: u4 = @intCast(std.math.log2_int(usize, @min(max_rows, @max(1, 16 * 1024 / average))));
+                const page_rows = @as(usize, 1) << shift;
+                const page_count = std.math.divCeil(usize, self.rows.items.len, page_rows) catch unreachable;
+                const sizes = try scratch.alloc(u64, page_count);
+                @memset(sizes, 0);
+                var first: usize = 0;
+                var payload_bytes: u64 = 0;
+                for (sizes, 0..) |*size, page| {
+                    var last = first;
+                    while (last < entries.len and entries[last].doc_id < (page + 1) * page_rows) : (last += 1) {}
+                    if (last != first) {
+                        var writer = entry.value_ptr.writer;
+                        writer.entries = .{ .items = entries[first..last], .capacity = last - first };
+                        const values = try writer.build();
+                        size.* = values.len + 4;
+                        payload_bytes += size.*;
+                        try writes.append(scratch, .{ .key = try columnPageKey(scratch, self.generation, self.blocks, ordinal, page), .value = try checked(scratch, values) });
+                    }
+                    first = last;
+                }
+                try appendInt(&column_meta, scratch, u64, payload_bytes);
                 try column_meta.appendSlice(scratch, &entry.value_ptr.presence);
                 try column_meta.appendSlice(scratch, &entry.value_ptr.nulls);
+                try column_meta.append(scratch, shift);
+                for (sizes) |size| try appendInt(&column_meta, scratch, u64, size);
                 try writes.append(scratch, .{ .key = try columnMetaKey(scratch, self.generation, self.blocks, ordinal), .value = try checked(scratch, column_meta.items) });
-                try writes.append(scratch, .{ .key = try blockKey(scratch, self.generation, self.blocks, ordinal), .value = try checked(scratch, values) });
             }
             for (self.rows.items) |row| {
                 try appendInt(&meta, scratch, u32, std.math.cast(u32, row.key.len) orelse return error.InvalidColumnSegment);
@@ -342,7 +410,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             var scope = try read.openReadScope(scratch);
             defer scope.close();
             var decoder = Decoder{ .bytes = try verified(try scope.get(try blockKey(scratch, self.generation, range.block, null))) };
-            if (!std.mem.eql(u8, try decoder.take(4), "ACB5")) return error.InvalidColumnSegment;
+            if (!std.mem.eql(u8, try decoder.take(4), "ACB6")) return error.InvalidColumnSegment;
             _ = try decoder.int(u32);
             const count = try decoder.int(u32);
             if (count > max_rows) return error.InvalidColumnSegment;
@@ -531,7 +599,7 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
     var view = db.core.acquireSchemaView() orelse return error.UnknownSchemaVersion;
     defer view.release();
     var meta: [24]u8 = @splat(0);
-    @memcpy(meta[0..4], "ACB5");
+    @memcpy(meta[0..4], "ACB6");
     std.mem.writeInt(u32, meta[4..8], view.version(), .little);
     const root_key = try blockKey(alloc, generation, 0, null);
     defer alloc.free(root_key);
@@ -731,14 +799,15 @@ fn mergeCandidate(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: 
 
 fn blockVersion(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !u32 {
     const meta = try verified(try read.get(try blockKey(alloc, generation, block, null)));
-    if (meta.len < 24 or !std.mem.eql(u8, meta[0..4], "ACB5")) return error.InvalidColumnSegment;
+    if (meta.len < 24 or !std.mem.eql(u8, meta[0..4], "ACB6")) return error.InvalidColumnSegment;
     return std.mem.readInt(u32, meta[4..8], .little);
 }
 
 fn retireBlock(txn: *store_mod.DocStore.Txn, read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !void {
     const key = try blockKey(alloc, generation, block, null);
     var decoder = Decoder{ .bytes = try verified(try read.get(key)) };
-    _ = try decoder.take(12);
+    _ = try decoder.take(8);
+    const rows = try decoder.int(u32);
     const count = try decoder.int(u32);
     _ = try decoder.int(u64);
     for (0..count) |_| {
@@ -748,8 +817,12 @@ fn retireBlock(txn: *store_mod.DocStore.Txn, read: *store_mod.DocStore.Txn, allo
         while (mask != 0) {
             const ordinal = page * 64 + @as(u32, @intCast(@ctz(mask)));
             mask &= mask - 1;
-            try txn.delete(try blockKey(alloc, generation, block, ordinal));
-            try txn.delete(try columnMetaKey(alloc, generation, block, ordinal));
+            const metadata_key = try columnMetaKey(alloc, generation, block, ordinal);
+            const pages = try ColumnPages.init(try verified(try read.get(metadata_key)), rows);
+            for (0..pages.sizes.len / 8) |payload_page| if (pages.size(payload_page) != 0) {
+                try txn.delete(try columnPageKey(alloc, generation, block, ordinal, payload_page));
+            };
+            try txn.delete(metadata_key);
         }
     }
     try txn.delete(key);
@@ -772,19 +845,24 @@ fn maintenanceNow() u64 {
 
 const Deferred = struct {
     first_ns: u64,
+    /// Highest mutation token in this range, not the table-wide wake revision.
     version: u64,
     source_bytes: u64,
+    rows: u32,
 
     fn decode(encoded: []const u8) !@This() {
         const body = try verified(encoded);
-        if (body.len != 24) return error.InvalidColumnSegment;
-        return .{ .first_ns = std.mem.readInt(u64, body[0..8], .little), .version = std.mem.readInt(u64, body[8..16], .little), .source_bytes = std.mem.readInt(u64, body[16..24], .little) };
+        if (body.len != 28) return error.InvalidColumnSegment;
+        const rows = std.mem.readInt(u32, body[24..28], .little);
+        if (rows > max_rows) return error.InvalidColumnSegment;
+        return .{ .first_ns = std.mem.readInt(u64, body[0..8], .little), .version = std.mem.readInt(u64, body[8..16], .little), .source_bytes = std.mem.readInt(u64, body[16..24], .little), .rows = rows };
     }
     fn encode(self: @This(), alloc: alloc_type) ![]u8 {
-        var body: [24]u8 = undefined;
+        var body: [28]u8 = undefined;
         std.mem.writeInt(u64, body[0..8], self.first_ns, .little);
         std.mem.writeInt(u64, body[8..16], self.version, .little);
         std.mem.writeInt(u64, body[16..24], self.source_bytes, .little);
+        std.mem.writeInt(u32, body[24..28], self.rows, .little);
         return checked(alloc, &body);
     }
     fn due(self: @This()) u64 {
@@ -896,21 +974,30 @@ fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, ma
         };
         const previous = if (encoded) |bytes| try Deferred.decode(bytes) else null;
         const debt = maintenance.debtSlot(manifest.generation, range.block).load(.monotonic);
-        const waiting = if (previous) |state| now >= state.first_ns and now < state.due() and state.version == version and debt < @max(state.source_bytes, 64 * 1024) else false;
-        if (waiting) {
-            earliest = @min(earliest, previous.?.due());
-        } else {
-            const meta = try verified(try read.get(try blockKey(alloc, manifest.generation, range.block, null)));
-            if (meta.len < 24) return error.InvalidColumnSegment;
-            const rows = std.mem.readInt(u32, meta[8..12], .little);
-            const source = std.mem.readInt(u64, meta[16..24], .little);
+        {
+            // Roots are immutable for a block ID. Cache their admission facts
+            // durably and probe only the small dirty records on later wakes.
+            // This adds no range-summary lookup/write to foreground ingestion.
+            const facts: struct { rows: u32, source: u64 } = if (previous) |state| .{ .rows = state.rows, .source = state.source_bytes } else blk: {
+                const meta = try verified(try read.get(try blockKey(alloc, manifest.generation, range.block, null)));
+                if (meta.len < 24 or !std.mem.eql(u8, meta[0..4], "ACB6")) return error.InvalidColumnSegment;
+                _ = maintenance.admission_root_reads.fetchAdd(1, .monotonic);
+                const rows = std.mem.readInt(u32, meta[8..12], .little);
+                if (rows > max_rows) return error.InvalidColumnSegment;
+                break :blk .{ .rows = rows, .source = std.mem.readInt(u64, meta[16..24], .little) };
+            };
+            const rows = facts.rows;
+            const source = facts.source;
             var count: usize = 0;
             var delta: u64 = 0;
+            var range_version: u64 = 0;
             // Use the same cursor to count the range and jump to the next one.
             while (entry) |marker| {
                 if (!std.mem.startsWith(u8, marker.key, dirty_prefix) or (range.end.len != 0 and std.mem.order(u8, marker.key[dirty_prefix.len..], range.end) != .lt)) break;
                 if (marker.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
                 count += 1;
+                _ = maintenance.admission_dirty_probes.fetchAdd(1, .monotonic);
+                range_version = @max(range_version, std.mem.readInt(u64, marker.value[0..8], .little));
                 delta +|= std.mem.readInt(u64, marker.value[8..16], .little);
                 if (count >= 1024 or count >= (rows + 3) / 4 or delta >= source / 8) break;
                 entry = try dirty.next();
@@ -921,11 +1008,13 @@ fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, ma
                 next_id = range.start;
                 break;
             }
-            const state = Deferred{ .first_ns = if (previous) |old| old.first_ns else now, .version = version, .source_bytes = source };
-            try writes.append(alloc, .{ .key = defer_key, .value = try state.encode(alloc) });
+            const state = Deferred{ .first_ns = if (previous) |old| old.first_ns else now, .version = range_version, .source_bytes = source, .rows = rows };
+            if (previous == null or previous.?.version != range_version) {
+                try writes.append(alloc, .{ .key = defer_key, .value = try state.encode(alloc) });
+                _ = maintenance.ranges_deferred.fetchAdd(1, .monotonic);
+            }
             if (previous == null) try writes.append(alloc, .{ .key = try timerKey(alloc, manifest.generation, state.due(), range.block), .value = try directoryValue(alloc, range.block, range.start) });
             earliest = @min(earliest, state.due());
-            _ = maintenance.ranges_deferred.fetchAdd(1, .monotonic);
         }
         if (range.end.len == 0) {
             exhausted = true;
@@ -1186,7 +1275,19 @@ fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Ran
             const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
             if ((try seen.getOrPut(alloc, ordinal)).found_existing) continue;
             const column = try block.column(ordinal);
-            if (column.cells == null) projected_bytes +|= column.payload_bytes;
+            if (column.pages) |pages| {
+                const page_rows = @as(usize, 1) << pages.shift;
+                for (0..pages.sizes.len / 8) |page| {
+                    if (column.loaded_pages[page]) continue;
+                    for (page * page_rows..@min(block.rows.len, (page + 1) * page_rows)) |row| {
+                        const bit = @as(u8, 1) << @intCast(row % 8);
+                        if (surviving[row] and column.present(row) and column.bitmaps[null_bytes + row / 8] & bit == 0) {
+                            projected_bytes +|= pages.size(page);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     const overlay = delta_bytes +| @as(u64, count) *| 4096 +| projected_bytes;
@@ -1220,6 +1321,18 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const manifest = try Manifest.decode(manifest_bytes);
     if (!manifest.ready) return false;
     const bootstrap = try bootstrapBoundary(&read, manifest);
+    // An empty completed generation has no directory entry to resolve a new
+    // dirty row against. Re-bootstrap it before adaptive admission; explicit
+    // drains already handled this via the later missing-range fallback.
+    if (manifest.ranges == 0 and bootstrap == null) {
+        var probe = try read.openCursor();
+        defer probe.close();
+        const entry = try probe.seekAtOrAfter(dirty_prefix);
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, dirty_prefix)) return false;
+        db.core.unlockApplyShared();
+        locked = false;
+        return rebuild(db, alloc, true, adaptive);
+    }
     const selection = if (adaptive and bootstrap == null) try selectReady(db, &read, scratch, manifest, manifest_bytes, store_revision) else Selection{};
     var dirty = try read.openCursor();
     defer dirty.close();
@@ -1446,7 +1559,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
         // A bounded all-deleted prefix still needs its own empty block. Using
         // the old suffix's block here would resurrect its retired prefix rows.
         var meta: [24]u8 = @splat(0);
-        @memcpy(meta[0..4], "ACB5");
+        @memcpy(meta[0..4], "ACB6");
         std.mem.writeInt(u32, meta[4..8], version, .little);
         try publish.put(try blockKey(scratch, manifest.generation, builder.blocks, null), try checked(scratch, &meta));
         try publish.put(range.key, try directoryValue(scratch, builder.blocks, builder.continuation.?));
@@ -1626,6 +1739,9 @@ const Block = struct {
         bounds: Bounds = .{},
         bitmaps: []const u8 = &.{},
         cells: ?[]?codec.Cell = null,
+        pages: ?ColumnPages = null,
+        loaded_pages: [max_rows]bool = @splat(false),
+        read_payload: bool = false,
         logical: [max_rows]?std.json.Value = @splat(null),
         fn present(self: @This(), row: usize) bool {
             return self.bitmaps.len != 0 and self.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0;
@@ -1650,11 +1766,12 @@ const Block = struct {
                 std.mem.readInt(u64, page[4..12], .little) & (@as(u64, 1) << @intCast(ordinal % 64)) != 0)
             {
                 const meta = try verified(try self.scope.get(try columnMetaKey(self.alloc, self.generation, self.index, ordinal)));
-                if (meta.len != 25 + 2 * null_bytes or meta[0] > 1) return error.InvalidColumnSegment;
+                value.pages = try ColumnPages.init(meta, self.rows.len);
+                if (meta[0] > 1) return error.InvalidColumnSegment;
                 value.bounds = .{ .present = meta[0] == 1, .minimum = @bitCast(std.mem.readInt(u64, meta[1..9], .little)), .maximum = @bitCast(std.mem.readInt(u64, meta[9..17], .little)) };
                 if (!std.math.isFinite(value.bounds.minimum) or !std.math.isFinite(value.bounds.maximum) or value.bounds.minimum > value.bounds.maximum) return error.InvalidColumnSegment;
                 value.payload_bytes = std.mem.readInt(u64, meta[17..25], .little);
-                value.bitmaps = meta[25..];
+                value.bitmaps = meta[25 .. 25 + 2 * null_bytes];
                 for (value.bitmaps[0..null_bytes], value.bitmaps[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
                 for (self.rows.len..max_rows) |row| if (value.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
                 if (self.stats) |stats| {
@@ -1668,11 +1785,14 @@ const Block = struct {
         return value;
     }
 
-    fn cells(self: *@This(), ordinal: u32) ![]?codec.Cell {
+    fn cells(self: *@This(), ordinal: u32, candidates: []const bool) ![]?codec.Cell {
         const column_view = try self.column(ordinal);
-        if (column_view.cells) |values| return values;
-        const values = try self.alloc.alloc(?codec.Cell, self.rows.len);
-        @memset(values, null);
+        if (column_view.cells == null) {
+            const values = try self.alloc.alloc(?codec.Cell, self.rows.len);
+            @memset(values, null);
+            column_view.cells = values;
+        }
+        const values = column_view.cells.?;
         const col = self.table.relational_columns[ordinal];
         if (column_view.bitmaps.len != 0) {
             const bits = column_view.bitmaps;
@@ -1684,19 +1804,28 @@ const Block = struct {
                 .geopoint => .geo_point,
                 .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
             };
-            var has_values = false;
-            for (bits[0..null_bytes], bits[null_bytes..]) |presence, nulls| has_values = has_values or (presence & ~nulls != 0);
             for (values, 0..) |*value, i| if (bits[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) {
                 value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = expected, .is_null = true, .value = undefined };
             };
-            if (has_values) {
-                const key = try blockKey(self.alloc, self.generation, self.index, ordinal);
+            const pages = column_view.pages.?;
+            const page_rows = @as(usize, 1) << pages.shift;
+            for (0..pages.sizes.len / 8) |page| {
+                if (column_view.loaded_pages[page] or pages.size(page) == 0) continue;
+                const first = page * page_rows;
+                const end = @min(values.len, first + page_rows);
+                var needed = false;
+                for (first..end) |i| needed = needed or (candidates[i] and column_view.present(i) and bits[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) == 0);
+                if (!needed) continue;
+                const key = try columnPageKey(self.alloc, self.generation, self.index, ordinal, page);
                 const bytes = try verified(try self.scope.get(key));
+                if (bytes.len + 4 != pages.size(page)) return error.InvalidColumnSegment;
                 if (self.stats) |stats| {
-                    stats.columns_read += 1;
+                    if (!column_view.read_payload) stats.columns_read += 1;
+                    stats.payload_pages_read += 1;
                     stats.encoded_bytes_read += bytes.len + 4;
                     stats.payload_bytes_read += bytes.len + 4;
                 }
+                column_view.read_payload = true;
                 var reader = try dv.TypedDocValuesReader.init(self.alloc, bytes);
                 if (reader.value_type != expected) return error.InvalidColumnSegment;
                 for (0..reader.num_chunks) |chunk_index| {
@@ -1704,12 +1833,13 @@ const Block = struct {
                     // Block arena owns decoded payloads, including borrowed strings.
                     var it = chunk.iterator();
                     while (try it.next()) |entry| {
-                        if (entry.doc_id >= values.len or values[entry.doc_id] != null or !column_view.present(entry.doc_id)) return error.InvalidColumnSegment;
+                        if (entry.doc_id < first or entry.doc_id >= end or values[entry.doc_id] != null or !column_view.present(entry.doc_id)) return error.InvalidColumnSegment;
                         values[entry.doc_id] = .{ .ordinal = ordinal, .path = col.path, .value_type = reader.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .value = entry.value };
                     }
                 }
+                for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
+                column_view.loaded_pages[page] = true;
             }
-            for (values, 0..) |value, i| if ((value != null) != column_view.present(i)) return error.InvalidColumnSegment;
         }
         column_view.cells = values;
         return values;
@@ -1723,7 +1853,9 @@ const Block = struct {
             value.logical[row] = .null;
             return .null;
         }
-        const cell = (try self.cells(ordinal))[row].?;
+        var selected: [max_rows]bool = @splat(false);
+        selected[row] = true;
+        const cell = (try self.cells(ordinal, selected[0..self.rows.len]))[row].?;
         const logical = try codec.ownedJsonValueFromCellAlloc(self.alloc, self.table.relational_columns[ordinal], cell);
         value.logical[row] = logical;
         if (self.stats) |stats| stats.values_materialized += 1;
@@ -1754,7 +1886,7 @@ const Block = struct {
                 const column_view = try self.column(ordinal);
                 const bounds = column_view.bounds;
                 if (bounds.present and !try matcher.predicate.mayMatchNumericBounds(bounds.minimum, bounds.maximum)) return;
-                const values = if (matcher.predicate == .exists) null else try self.cells(ordinal);
+                const values = if (matcher.predicate == .exists) null else try self.cells(ordinal, candidates);
                 for (out, 0..) |*matched, i| {
                     if (!candidates[i]) continue;
                     matched.* = if (values) |typed| blk: {
@@ -1880,7 +2012,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             stats.metadata_bytes_read += meta.len + 4;
         }
         var decoder = Decoder{ .bytes = meta };
-        if (!std.mem.eql(u8, try decoder.take(4), "ACB5")) return error.InvalidColumnSegment;
+        if (!std.mem.eql(u8, try decoder.take(4), "ACB6")) return error.InvalidColumnSegment;
         const version = try decoder.int(u32);
         const rows_len = try decoder.int(u32);
         if (rows_len > max_rows) return error.InvalidColumnSegment;
