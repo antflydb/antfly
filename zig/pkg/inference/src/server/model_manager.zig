@@ -10619,7 +10619,34 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try std.testing.expectError(error.MissingSpecialTokenIds, pipeline.recognizeBatch(&.{"hello"}, &.{"person"}));
 }
 
-test "ModelManager serving policy fails closed before loading generator weights" {
+test "ModelManager strict serving policy rejects unknown generator architectures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"brand_new_decoder\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = false });
+
+    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
+}
+
+test "ModelManager default serving policy still rejects a generator without a loadable artifact" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10643,37 +10670,10 @@ test "ModelManager serving policy fails closed before loading generator weights"
     defer manager.deinit();
     manager.configureServingPolicy(.{});
 
-    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
-}
-
-test "unknown opt in still rejects a generator without a loadable artifact" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"generator\"}",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "config.json",
-        .data = "{\"model_type\":\"brand_new_decoder\"}",
-    });
-
-    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(dir_path);
-
-    var manager = ModelManager.init(allocator, .{
-        .allocator = allocator,
-        .preferred_backends = &.{.native},
-    });
-    defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
-
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
 
-test "unknown opt in does not enable a known incompatible generator" {
+test "ModelManager default serving policy does not enable a known incompatible generator" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10695,7 +10695,7 @@ test "unknown opt in does not enable a known incompatible generator" {
         .preferred_backends = &.{.native},
     });
     defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureServingPolicy(.{});
 
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
