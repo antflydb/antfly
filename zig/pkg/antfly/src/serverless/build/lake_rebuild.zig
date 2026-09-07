@@ -642,95 +642,47 @@ fn appendExternalGraphMetricDeclarationsAlloc(
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
     var requests = std.ArrayListUnmanaged(lake_graph_metric.PublicationRequest).empty;
     defer requests.deinit(alloc);
-    const Destination = struct { ordinal: usize, graph: sidecar_manifest.DeclaredArtifact };
-    var destinations = std.ArrayListUnmanaged(Destination).empty;
-    defer destinations.deinit(alloc);
-    var metric_declarations = std.ArrayListUnmanaged(?sidecar_manifest.DeclaredArtifact).empty;
-    defer {
-        for (metric_declarations.items) |maybe| if (maybe) |declaration| freeOwnedDeclaration(alloc, declaration);
-        metric_declarations.deinit(alloc);
+    var previous_metrics = std.ArrayListUnmanaged(manifest_artifact.ArtifactRef).empty;
+    defer previous_metrics.deinit(alloc);
+    for (published_declarations) |declaration| {
+        if (declaration.binding.sidecar_kind == .graph_metric and declaration.artifact.kind == .graph_metric_segment)
+            try previous_metrics.append(alloc, declaration.artifact);
     }
+    var source_declarations = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    defer source_declarations.deinit(alloc);
     for (specs) |spec| {
         try cancellation.check();
         const graph_declaration = findDeclaration(declarations.items, spec.index_name) orelse continue;
         if (graph_declaration.binding.sidecar_kind != .graph or graph_declaration.artifact.kind != .graph_segment) return error.SidecarArtifactKindMismatch;
-        const topology_unchanged = if (findDeclaration(published_declarations, spec.index_name)) |previous_graph|
-            previous_graph.binding.sidecar_kind == .graph and
-                artifactRefsIdentifySamePayload(previous_graph.artifact, graph_declaration.artifact)
-        else
-            false;
         var effective_provenance = provenance;
         effective_provenance.edge_generation = graph_declaration.artifact.edge_generation;
 
-        const resolved = try alloc.alloc(?sidecar_manifest.DeclaredArtifact, spec.configs.len);
-        defer alloc.free(resolved);
-        @memset(resolved, null);
-        errdefer for (resolved) |maybe_declaration| if (maybe_declaration) |declaration| freeOwnedDeclaration(alloc, declaration);
-
-        for (spec.configs, 0..) |config, config_index| {
+        for (spec.configs) |config| {
             const metric_name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
             defer alloc.free(metric_name);
-            const expected_hash = try graphMetricBindingHashAlloc(alloc, config, graph_declaration.artifact.artifact_id);
-            defer alloc.free(expected_hash);
-            var reused = false;
-            if (topology_unchanged) {
-                if (findDeclaration(published_declarations, metric_name)) |existing| {
-                    if (existing.binding.sidecar_kind == .graph_metric and
-                        source_binding.sameSourceSnapshot(existing.binding, graph_declaration.binding) and
-                        std.mem.eql(u8, existing.binding.index_config_hash, expected_hash) and
-                        try graphMetricArtifactReusable(alloc, artifacts, existing.artifact, config, graph_declaration.artifact, cancellation))
-                    {
-                        var cloned = try cloneDeclarationAlloc(alloc, existing);
-                        if (cloned.artifact.published_generation == 0) cloned.artifact.published_generation = effective_provenance.published_generation;
-                        if (cloned.artifact.edge_generation == 0) cloned.artifact.edge_generation = effective_provenance.edge_generation;
-                        if (cloned.artifact.computed_at_ms == 0) cloned.artifact.computed_at_ms = effective_provenance.computed_at_ms;
-                        if (cloned.artifact.materializer_fingerprint == 0) cloned.artifact.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
-                        resolved[config_index] = cloned;
-                        reused = true;
-                    }
+            var request = lake_graph_metric.PublicationRequest{
+                .graph_index_name = spec.index_name,
+                .source_graph = graph_declaration.artifact,
+                .config = config,
+                .provenance = effective_provenance,
+            };
+            if (findDeclaration(published_declarations, metric_name)) |existing| {
+                if (existing.binding.sidecar_kind == .graph_metric and existing.artifact.kind == .graph_metric_segment) {
+                    request.prior_artifact = existing.artifact;
                 }
             }
-            if (!reused) {
-                var request = lake_graph_metric.PublicationRequest{
-                    .graph_index_name = spec.index_name,
-                    .source_graph = graph_declaration.artifact,
-                    .config = config,
-                    .provenance = effective_provenance,
-                };
-                if (findDeclaration(published_declarations, metric_name)) |existing| {
-                    if (existing.binding.sidecar_kind == .graph_metric and existing.artifact.kind == .graph_metric_segment) {
-                        request.prior_artifact = existing.artifact;
-                        if (topology_unchanged and source_binding.sameSourceSnapshot(existing.binding, graph_declaration.binding)) {
-                            if (existing.artifact.edge_generation != 0) request.provenance.edge_generation = existing.artifact.edge_generation;
-                            if (std.mem.eql(u8, existing.binding.index_config_hash, expected_hash)) {
-                                if (existing.artifact.published_generation != 0) request.provenance.published_generation = existing.artifact.published_generation;
-                                if (existing.artifact.computed_at_ms != 0) request.provenance.computed_at_ms = existing.artifact.computed_at_ms;
-                            }
-                        }
-                    }
-                }
-                try requests.append(alloc, request);
-                try destinations.append(alloc, .{ .ordinal = metric_declarations.items.len + config_index, .graph = graph_declaration });
-            }
-        }
-        try metric_declarations.ensureUnusedCapacity(alloc, resolved.len);
-        for (resolved) |*maybe_declaration| {
-            metric_declarations.appendAssumeCapacity(maybe_declaration.*);
-            maybe_declaration.* = null;
+            try requests.append(alloc, request);
+            try source_declarations.append(alloc, graph_declaration);
         }
     }
-    const built = try lake_graph_metric.publishRequestsAlloc(alloc, artifacts, requests.items, cancellation, graph_metric_limits, &graph_metric_budget, runtime);
+    const built = try lake_graph_metric.publishRequestsWithPriorAlloc(alloc, artifacts, requests.items, previous_metrics.items, cancellation, graph_metric_limits, &graph_metric_budget, runtime);
     defer {
         for (built) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
         alloc.free(built);
     }
-    for (requests.items, built, destinations.items) |request, artifact, destination| {
-        metric_declarations.items[destination.ordinal] = try graphMetricDeclarationAlloc(alloc, destination.graph, request.config, artifact);
-    }
-    try declarations.ensureUnusedCapacity(alloc, metric_declarations.items.len);
-    for (metric_declarations.items) |*maybe| {
-        declarations.appendAssumeCapacity(maybe.*.?);
-        maybe.* = null;
+    try declarations.ensureUnusedCapacity(alloc, built.len);
+    for (requests.items, built, source_declarations.items) |request, artifact, graph_declaration| {
+        declarations.appendAssumeCapacity(try graphMetricDeclarationAlloc(alloc, graph_declaration, request.config, artifact));
     }
 
     const owned = try declarations.toOwnedSlice(alloc);
@@ -1511,45 +1463,6 @@ fn artifactRefsIdentifySamePayload(lhs: manifest_artifact.ArtifactRef, rhs: mani
     return lhs.byte_len == rhs.byte_len and
         std.mem.eql(u8, lhs.artifact_id, rhs.artifact_id) and
         std.mem.eql(u8, lhs.checksum, rhs.checksum);
-}
-
-fn graphMetricArtifactReusable(
-    alloc: Allocator,
-    artifacts: *artifact_store.ArtifactStore,
-    ref: manifest_artifact.ArtifactRef,
-    config: @import("../../graph/graph.zig").GraphMetricConfig,
-    graph_ref: manifest_artifact.ArtifactRef,
-    cancellation: CancellationToken,
-) !bool {
-    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, cancellation) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
-        else => return err,
-    };
-    const prefix_len = try graph_metric_segment.headerProbeLen(
-        ref.byte_len,
-        graph_ref.artifact_id,
-        graph_ref.checksum,
-    );
-    const prefix = artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
-        alloc,
-        ref.artifact_id,
-        ref.byte_len,
-        ref.checksum,
-        0,
-        prefix_len,
-        cancellation,
-    ) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
-        error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return false,
-        else => return err,
-    };
-    defer alloc.free(prefix);
-    const header = graph_metric_segment.decodeHeader(prefix) catch return false;
-    return header.kind == config.kind and
-        header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
-        header.materializer_fingerprint == lake_graph_metric.materializerFingerprint(.{}) and
-        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
-        std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
 fn indexConfigHashAlloc(
@@ -3062,14 +2975,14 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
         inventory,
         .{
             .table_name = "docs",
-            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40},\"centrality\":{\"kind\":\"eigenvector\"}}}}",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40},\"centrality\":{\"kind\":\"eigenvector\"},\"degree_alias\":{\"kind\":\"degree\"}}},\"graph_alias\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"}}}}",
         },
         reconciled.artifacts,
         .{ .published_generation = 2, .edge_generation = 2, .computed_at_ms = 2 },
     );
     defer updated.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 5), updated.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 8), updated.artifacts.len);
     const updated_graph = updated.find("graph_idx").?;
     const updated_metric = updated.find(metric_artifact_name).?;
     const updated_degree = updated.find(degree_artifact_name).?;
@@ -3087,6 +3000,24 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     try std.testing.expectEqual(degree_declaration.artifact.computed_at_ms, updated_degree.artifact.computed_at_ms);
     try std.testing.expectEqual(@as(u64, 2), updated_centrality.artifact.published_generation);
     try std.testing.expectEqual(graph_declaration.artifact.edge_generation, updated_centrality.artifact.edge_generation);
+
+    const alias_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "degree_alias");
+    defer alloc.free(alias_name);
+    const alias = updated.find(alias_name).?;
+    try std.testing.expectEqualStrings(degree_declaration.artifact.artifact_id, alias.artifact.artifact_id);
+    try std.testing.expectEqual(degree_declaration.artifact.computed_at_ms, alias.artifact.computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 2), alias.artifact.published_generation);
+    try std.testing.expectEqual(updated_graph.artifact.edge_generation, alias.artifact.edge_generation);
+    try std.testing.expect(source_binding.sameSourceSnapshot(updated_graph.binding, alias.binding));
+    try std.testing.expectEqualStrings(degree_declaration.binding.index_config_hash, alias.binding.index_config_hash);
+    const index_alias_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_alias", "degree");
+    defer alloc.free(index_alias_name);
+    const index_alias = updated.find(index_alias_name).?;
+    try std.testing.expectEqualStrings(updated_graph.artifact.artifact_id, updated.find("graph_alias").?.artifact.artifact_id);
+    try std.testing.expectEqualStrings(degree_declaration.artifact.artifact_id, index_alias.artifact.artifact_id);
+    try std.testing.expectEqual(degree_declaration.artifact.computed_at_ms, index_alias.artifact.computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 2), index_alias.artifact.published_generation);
+    try std.testing.expectEqual(updated.find("graph_alias").?.artifact.edge_generation, index_alias.artifact.edge_generation);
 
     // Simulate a legacy graph declaration whose topology generation and metric
     // source digests were not persisted, then replace every existing metric

@@ -755,6 +755,23 @@ use the first available prior artifact in request order as their optional seed;
 authentication or compatibility failure still cold-starts the shared computation.
 Aggregate budgets count actual unique work, source reads, and output uploads.
 
+Both publication paths resolve the complete requested plan against a shared
+inventory of prior computations. Equivalent new or renamed aliases reuse a ready
+payload without source reads, kernel work, encoding, or uploads. Each immutable
+prior payload is authenticated and its header read at most once per publication,
+including failed verification. New aliases retain the original computation time
+while carrying their own current publication and topology provenance.
+Lake and sidecar manifest validation permits shared IDs for distinct graph/metric
+names only when every immutable metadata field agrees; conflicting duplicate
+declarations remain invalid.
+
+The preceding manifest's ordered metric references are the admission-plan
+witness. Rejected computations remain reusable only while the complete plan,
+source identities, and materializer policy are unchanged. Removing or changing a
+budget-consuming sibling therefore retries previously rejected work; an unchanged
+plan does not cause a retry loop. Missing or invalid prior payloads are rebuilt
+with fresh publication/computation provenance.
+
 The storage-independent PageRank, eigenvector, and HITS kernels partition the
 CSR vertex/edge work stream into fixed logical tiles, including boundaries inside
 high-degree vertices. Complete rows remain target-owned. Only tile-boundary rows
@@ -774,5 +791,6 @@ and bypasses are exposed in `QueryCacheStats`; maintenance can explicitly drain
 retention, but queries never wait for it. Local-cache read errors fall back to
 authenticated origin reads; origin integrity failures remain fatal.
 
-Materializer epoch 11 invalidates earlier admission and reduction policies.
+Materializer epoch 12 invalidates earlier admission and reduction policies,
+including rejections retained without a complete admission-plan witness.
 Serverless is unreleased and supports only the current artifact contract.

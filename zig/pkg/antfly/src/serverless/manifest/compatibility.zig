@@ -77,7 +77,9 @@ fn validateArtifacts(artifacts: []const artifact_ref.ArtifactRef) !void {
         if (artifact.artifact_id.len == 0) return error.IncompatibleLakeManifest;
         if (artifact.checksum.len == 0) return error.IncompatibleLakeManifest;
         for (artifacts[0..idx]) |previous| {
-            if (std.mem.eql(u8, previous.artifact_id, artifact.artifact_id)) {
+            if (std.mem.eql(u8, previous.artifact_id, artifact.artifact_id) and
+                !artifact_ref.areGraphArtifactAliases(previous, artifact))
+            {
                 return error.DuplicateLakeManifestArtifact;
             }
         }
@@ -136,6 +138,16 @@ fn hasArtifact(
         if (artifact.kind == kind and std.mem.eql(u8, artifact.artifact_id, artifact_id)) return true;
     }
     return false;
+}
+
+test "serverless lake manifest compatibility permits consistent graph metric aliases" {
+    const original = artifact_ref.ArtifactRef{ .kind = .graph_metric_segment, .name = "1:a1:x", .artifact_id = "metric", .checksum = "checksum", .byte_len = 128, .metadata_version = artifact_ref.graph_metric_segment_wire_version };
+    var alias = original;
+    alias.name = "1:b1:y";
+    try validateArtifacts(&.{ original, alias });
+    alias.graph_metric_control_len += 1;
+    try std.testing.expectError(error.DuplicateLakeManifestArtifact, validateArtifacts(&.{ original, alias }));
+    try std.testing.expectError(error.DuplicateLakeManifestArtifact, validateArtifacts(&.{ original, original }));
 }
 
 test "lake manifest compatibility accepts row fragments with stats" {

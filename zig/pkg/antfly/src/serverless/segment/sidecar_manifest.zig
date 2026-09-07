@@ -49,7 +49,9 @@ pub const Manifest = struct {
                 if (std.mem.eql(u8, previous.name, artifact.name)) {
                     return error.DuplicateSidecarArtifactDeclaration;
                 }
-                if (std.mem.eql(u8, previous.artifact.artifact_id, artifact.artifact.artifact_id)) {
+                if (std.mem.eql(u8, previous.artifact.artifact_id, artifact.artifact.artifact_id) and
+                    !artifact_ref.areGraphArtifactAliases(previous.artifact, artifact.artifact))
+                {
                     return error.DuplicateSidecarArtifactDeclaration;
                 }
             }
@@ -262,6 +264,21 @@ test "sidecar manifest rejects mismatched artifact kinds and duplicate ids" {
         error.DuplicateSidecarArtifactDeclaration,
         (Manifest{ .artifacts = &duplicate }).validate(),
     );
+}
+
+test "serverless sidecar manifest permits only consistent graph metric aliases" {
+    const original = DeclaredArtifact{
+        .name = "1:a1:x",
+        .binding = .{ .sidecar_kind = .graph_metric, .source_kind = .serverless_fragment, .row_ref_kind = .serverless, .snapshot_id = "manifest-1", .schema_fingerprint = "schema-v1", .column_bindings = &.{"edges"}, .index_config_hash = "metric-config" },
+        .artifact = .{ .kind = .graph_metric_segment, .name = "1:a1:x", .artifact_id = "metric", .checksum = "checksum", .byte_len = 128, .metadata_version = artifact_ref.graph_metric_segment_wire_version },
+    };
+    var alias = original;
+    alias.name = "1:b1:y";
+    alias.artifact.name = alias.name;
+    try (Manifest{ .artifacts = &.{ original, alias } }).validate();
+    alias.artifact.graph_metric_source_checksum[0] = 1;
+    try std.testing.expectError(error.DuplicateSidecarArtifactDeclaration, (Manifest{ .artifacts = &.{ original, alias } }).validate());
+    try std.testing.expectError(error.DuplicateSidecarArtifactDeclaration, (Manifest{ .artifacts = &.{ original, original } }).validate());
 }
 
 test "sidecar manifest validates declared artifacts against RowSource batches" {
