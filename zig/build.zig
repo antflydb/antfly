@@ -4310,6 +4310,10 @@ pub fn build(b: *std.Build) void {
         "api http unsupported unsorted query response is machine readable",
         "api http unsupported hierarchy grouping response uses the public contract",
         "api http point lookup retries bounded local readiness races",
+        "api http retry clock translates native query deadlines",
+        "api http retry sleep is bounded by request deadline",
+        "api http transient read retry honors expired request deadline before source query",
+        "api http transient read retry stops before source query when client cancellation is signaled",
         "api http hierarchy traversal preserves policy and cursor across remote hydration seam",
         "api http public sort gate accepts synthetic hierarchy child positions",
         "api http public sort capability gate validates mapped sortable fields",
@@ -6699,6 +6703,7 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "table reads translate request deadlines into the routing clock",
             "distributed reranking widens retrieval and stays coordinator owned",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",

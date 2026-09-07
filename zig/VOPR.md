@@ -3252,6 +3252,36 @@ build exit. This closes the named packet-replay and teardown failures; it does
 not certify the separate v53 managed-publication completion work or every
 transitive production callback's determinism.
 
+### Native Query Deadline Follow-up (2026-09-07)
+
+The non-VOPR review caught incomplete clock boundaries in routing and HTTP
+readiness retries: public queries still create native `CLOCK_MONOTONIC`
+deadlines, whereas catalogs and retries use their borrowed executor's `.awake`
+clock. On Darwin these are different clocks. The pre-fix binary returned
+immediate 504s for otherwise successful one- and two-shard queries with 1 s or 5 s budgets;
+the observed clock offset was approximately 11 s.
+
+Request-to-routing and HTTP retry boundaries now translate the remaining budget
+into the destination clock without changing the query engine's native execution
+deadline.
+Lookup translation preserves its explicitly borrowed request clock, and join
+routing creates relative deadlines directly in the catalog clock. Same-clock
+deadlines remain unchanged, absent deadlines remain absent, and an expired
+request cannot acquire a fresh budget. A shifted-clock unit regression covers
+the cross-domain, same-domain, and expired cases on every platform. Public E2E
+regressions exercise both one and two shards, short and long valid deadlines,
+and immediate expiry. This is boundary translation, not a claim that every
+query execution callback is now driven by VoprIo.
+
+Validation: the table-read gate passes **77/77** and the focused HTTP retry,
+deadline, and cancellation tests pass **5/5**, in both Debug and ReleaseSafe.
+The rebuilt server passes **20/20** deadline, query-string, exact-sort, join,
+and graph E2Es. The original separate metadata/data-server reproduction now
+returns 200 for 1 s, 5 s, and 30 s budgets (5–6 ms observed). Formatting checks
+pass. An intermediate broader run observed a post-restart exact-sort status
+assertion failure; its isolated rerun and the final broader run passed. This
+deadline fix does not claim to resolve that intermittent status observation.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

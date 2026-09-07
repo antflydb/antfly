@@ -50,6 +50,22 @@ pub const RoutingBudget = struct {
         return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
     }
 
+    /// Translate a deadline into this budget's clock without extending it.
+    /// Threaded .awake and native MONOTONIC have different epochs on Darwin.
+    pub fn deadlineFrom(self: RoutingBudget, source: RoutingBudget) ?u64 {
+        const deadline = source.deadline_ns orelse return null;
+        if (self.io) |target| {
+            if (source.io) |origin| {
+                if (target.userdata == origin.userdata and target.vtable == origin.vtable and target.dispatch == origin.dispatch)
+                    return deadline;
+            }
+        } else if (source.io == null) return deadline;
+        // Sample the destination first so time spent translating cannot
+        // extend the caller's budget. Expired budgets remain expired.
+        const target_now = self.nowNs();
+        return target_now +| (deadline -| source.nowNs());
+    }
+
     pub fn sleepNs(self: RoutingBudget, duration_ns: u64) !void {
         if (self.io) |borrow| {
             var receiver = try borrow.receive();
@@ -95,6 +111,13 @@ pub const CatalogSource = struct {
 
     pub fn budget(self: CatalogSource, deadline_ns: ?u64) RoutingBudget {
         return .{ .deadline_ns = deadline_ns, .io = self.io };
+    }
+
+    /// Routing deadlines belong to this catalog, not necessarily to the
+    /// request executor. Preserve remaining time when crossing clock domains.
+    /// In particular, Threaded .awake and native MONOTONIC differ on Darwin.
+    pub fn deadlineFrom(self: CatalogSource, source: RoutingBudget) ?u64 {
+        return self.budget(null).deadlineFrom(source);
     }
 
     pub const VTable = struct {

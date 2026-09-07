@@ -2859,12 +2859,61 @@ const ProvisionedConsistencyRequest = union(enum) {
     },
 };
 
-fn provisionedConsistencyDeadline(request: ProvisionedConsistencyRequest) ?u64 {
+fn queryRoutingDeadline(catalog: table_catalog.CatalogSource, req: db_mod.types.SearchRequest) ?u64 {
+    return catalog.deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
+}
+
+fn lookupRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.types.LookupOptions) ?u64 {
+    return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io });
+}
+
+fn provisionedConsistencyDeadline(catalog: table_catalog.CatalogSource, request: ProvisionedConsistencyRequest) ?u64 {
     return switch (request) {
-        .search => |req| req.execution_deadline_ns,
-        .lookup => |lookup| lookup.opts.execution_deadline_ns,
+        .search => |req| queryRoutingDeadline(catalog, req),
+        .lookup => |lookup| lookupRoutingDeadline(catalog, lookup.opts),
         .scan => null,
     };
+}
+
+test "table reads translate request deadlines into the routing clock" {
+    const vopr = @import("vopr");
+    const ns = std.time.ns_per_s;
+    // Deliberately unlike native MONOTONIC on every platform, including
+    // machines where Threaded .awake happens to have the same epoch.
+    var routing_io = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * ns) });
+    defer routing_io.deinit();
+    const catalog = table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&routing_io.io()),
+    };
+    const native_deadline = platform_time.monotonicNs() + 5 * ns;
+    const req = db_mod.types.SearchRequest{ .execution_deadline_ns = native_deadline };
+    const deadline = queryRoutingDeadline(catalog, req).?;
+    const routing_now = catalog.budget(null).nowNs();
+    try std.testing.expect(deadline > routing_now);
+    try std.testing.expect(deadline <= routing_now + 5 * ns);
+    try std.testing.expectEqual(native_deadline, req.execution_deadline_ns.?);
+    try catalog.budget(deadline).checkpoint();
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(queryRoutingDeadline(catalog, .{ .execution_deadline_ns = 0 })).checkpoint());
+    try std.testing.expect(queryRoutingDeadline(catalog, .{}) == null);
+    try std.testing.expectEqual(routing_now + ns, routeDeadlineFromTimeoutMs(catalog, 1000).?);
+
+    var request_io = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * ns });
+    defer request_io.deinit();
+    const opts = db_mod.types.LookupOptions{
+        .execution_deadline_ns = 8 * ns,
+        .execution_io = @import("../runtime_io_abi.zig").Borrow.init(&request_io.io()),
+    };
+    try std.testing.expectEqual(routing_now + ns, lookupRoutingDeadline(catalog, opts).?);
+    request_io.monotonic_ns += ns / 4;
+    try std.testing.expectEqual(routing_now + 3 * ns / 4, provisionedConsistencyDeadline(catalog, .{ .lookup = .{ .key = "doc:a", .opts = opts } }).?);
+    request_io.monotonic_ns = 8 * ns;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(lookupRoutingDeadline(catalog, opts)).checkpoint());
+    // Same-domain conversion is identity, including already-expired values.
+    try std.testing.expectEqual(@as(?u64, 123), lookupRoutingDeadline(catalog, .{ .execution_deadline_ns = 123, .execution_io = catalog.io }));
+    const native_catalog = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_catalog, req).?);
 }
 
 fn prepareProvisionedGroupConsistency(
@@ -3336,7 +3385,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedKeyRead {
-        const deadline_ns = provisionedConsistencyDeadline(request);
+        const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
         var attempt: usize = 0;
         while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
@@ -3383,7 +3432,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedSpanRead {
-        const deadline_ns = provisionedConsistencyDeadline(request);
+        const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
@@ -3503,7 +3552,7 @@ pub const ProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
         cancellation: db_mod.types.CancellationToken,
     ) !?ReadPreparation.Activity {
-        const request_deadline_ns = if (request) |value| provisionedConsistencyDeadline(value) else null;
+        const request_deadline_ns = if (request) |value| provisionedConsistencyDeadline(self.catalog, value) else null;
         const deadline_ns = earliestDeadline(
             request_deadline_ns,
             if (self.expected_route_fence) |fence| fence.admission_deadline_ns else null,
@@ -3784,9 +3833,9 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
-            try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns)
+            try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
-            try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+            try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, queryRoutingDeadline(self.catalog, req));
         defer routing_session.deinit();
         var routed_source = self.*;
         routed_source.catalog = routing_session.catalog();
@@ -3953,9 +4002,9 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var routing_session = if (requiresAuthoritativeRoutingSession(req))
-                try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns)
+                try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
             else
-                try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+                try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, queryRoutingDeadline(self.catalog, req));
             defer routing_session.deinit();
             var routed_source = self.*;
             routed_source.catalog = routing_session.catalog();
@@ -5341,7 +5390,7 @@ pub const HostedProvisionedTableReadSource = struct {
             hosted.catalog,
             table_name,
             key,
-            opts.execution_deadline_ns,
+            lookupRoutingDeadline(hosted.catalog, opts),
         );
         const fence = routed.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5610,9 +5659,9 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
-            try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns)
+            try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
-            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, queryRoutingDeadline(hosted.catalog, req));
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
@@ -5623,7 +5672,7 @@ pub const HostedProvisionedTableReadSource = struct {
             table_name,
             "",
             "",
-            req.execution_deadline_ns,
+            queryRoutingDeadline(self.catalog, req),
         );
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
@@ -5731,14 +5780,14 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?db_mod.RuntimePreflightSummary {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
-            try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns)
+            try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
-            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, queryRoutingDeadline(hosted.catalog, req));
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, "", "", req.execution_deadline_ns);
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, "", "", queryRoutingDeadline(self.catalog, req));
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
@@ -5953,7 +6002,7 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
@@ -5983,7 +6032,7 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
@@ -6013,7 +6062,7 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
@@ -6043,7 +6092,7 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(self.catalog, timeout_ms));
         const fence = route_snapshot.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
@@ -6213,9 +6262,9 @@ fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_router
     };
 }
 
-fn routeDeadlineFromTimeoutMs(timeout_ms: ?u32) ?u64 {
+fn routeDeadlineFromTimeoutMs(catalog: table_catalog.CatalogSource, timeout_ms: ?u32) ?u64 {
     const duration_ms = timeout_ms orelse return null;
-    return platform_time.monotonicNs() +| @as(u64, duration_ms) * std.time.ns_per_ms;
+    return catalog.budget(null).nowNs() +| @as(u64, duration_ms) * std.time.ns_per_ms;
 }
 
 const ManagedReadRuntimeConfig = struct {
@@ -9633,7 +9682,7 @@ fn queryHostedAcrossGroupsAtGenerations(
     consistency: raft_mod.ReadConsistency,
     required_identity_generations: ?[]const ?u64,
 ) !db_mod.types.SearchResult {
-    var route_snapshot = try table_catalog.routedGroupsSnapshotUntil(alloc, self.catalog, table_name, group_ids, req.execution_deadline_ns);
+    var route_snapshot = try table_catalog.routedGroupsSnapshotUntil(alloc, self.catalog, table_name, group_ids, queryRoutingDeadline(self.catalog, req));
     defer route_snapshot.deinit(alloc);
     var pinned = RoutePinnedCatalog{
         .base = self.catalog,

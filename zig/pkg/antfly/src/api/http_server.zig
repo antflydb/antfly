@@ -11092,9 +11092,10 @@ pub const ApiHttpServer = struct {
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
         const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
+        const retry_deadline_ns = retryDeadlineFromNative(retry_io, request_deadline_ns);
         while (true) {
             try ensureRequestActive(cancellation);
-            if (retryDeadlineExpired(request_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
+            if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
                 source,
@@ -11111,9 +11112,9 @@ pub const ApiHttpServer = struct {
                 error.TopologyChanged,
                 => {
                     const now_ns = retryMonotonicNs(retry_io);
-                    if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
-                    const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, cancellation);
                     continue;
@@ -11147,6 +11148,10 @@ pub const ApiHttpServer = struct {
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
+        const retry_deadline_ns = table_catalog.RoutingBudget.initIo(null, retry_io).deadlineFrom(.{
+            .deadline_ns = request.deadline_ns,
+            .io = request.deadline_io,
+        });
         while (true) {
             try ensureTableOperationActive(request);
             return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
@@ -11154,7 +11159,7 @@ pub const ApiHttpServer = struct {
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(
-                        request.deadline_ns,
+                        retry_deadline_ns,
                         now_ns,
                         start_ns,
                         retry_timeout_ns,
@@ -11849,7 +11854,7 @@ pub const ApiHttpServer = struct {
         defer query_req.deinit(alloc);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
-            if (retryDeadlineExpired(deadline, retryMonotonicNs(self.sharedApiIo()))) return error.Timeout;
+            try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
@@ -12093,10 +12098,11 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = retryMonotonicNs(retry_io);
+        const retry_deadline_ns = retryDeadlineFromNative(retry_io, req.execution_deadline_ns);
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
-            if (retryDeadlineExpired(req.execution_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
+            if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
@@ -12112,8 +12118,8 @@ pub const ApiHttpServer = struct {
                     if (err == error.IdentityReadGenerationChanged and req.identity_read_generation != null) return err;
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = retryMonotonicNs(retry_io);
-                    if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
@@ -17776,6 +17782,10 @@ fn retryMonotonicNs(io: ?std.Io) u64 {
     return platform_time.monotonicNs();
 }
 
+fn retryDeadlineFromNative(io: ?std.Io, deadline_ns: ?u64) ?u64 {
+    return table_catalog.RoutingBudget.initIo(null, io).deadlineFrom(.init(deadline_ns));
+}
+
 const native_backup_quiescence_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
 const native_backup_quiescence_retry_max_ns: u64 = 100 * std.time.ns_per_ms;
 
@@ -23145,6 +23155,22 @@ test "api http retry sleep is bounded by request deadline" {
     );
 }
 
+test "api http retry clock translates native query deadlines" {
+    var io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer io.deinit();
+    const native_deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    const deadline = retryDeadlineFromNative(io.io(), native_deadline).?;
+    const now_ns = retryMonotonicNs(io.io());
+    try std.testing.expect(deadline > now_ns);
+    try std.testing.expect(deadline <= now_ns + std.time.ns_per_s);
+    try std.testing.expect(!retryDeadlineExpired(deadline, now_ns));
+    try std.testing.expect(retryDeadlineExpired(retryDeadlineFromNative(io.io(), 0), now_ns));
+    try std.testing.expectEqual(native_deadline, retryDeadlineFromNative(null, native_deadline).?);
+    try std.testing.expect(retryDeadlineFromNative(io.io(), null) == null);
+}
+
 test "api http point lookup retries bounded local readiness races" {
     const FakeStatus = struct {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -23318,7 +23344,7 @@ test "api http transient read retry stops before source query when client cancel
         null,
         reads.source(),
         "docs",
-        .{ .cancellation = &cancelled },
+        .{ .cancellation = CancellationToken.fromAtomic(&cancelled) },
         .read_index,
         .none,
     ));
