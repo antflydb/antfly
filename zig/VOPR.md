@@ -3081,12 +3081,13 @@ Validation: read-gate, manifest/retention, user-manager, and independent auth
 archive gates pass in Debug and ReleaseSafe. The DataServer restart regressions,
 auth-lifecycle and serverless-workflow VOPR campaigns, production runtime build,
 seven HTTP auth E2E tests, and repository formatting checks also pass.
-The broader `production-cluster-join-split-vopr-test` is **not green**:
-it reproduces a 175-byte packet payload replay divergence followed by
+At that checkpoint, `production-cluster-join-split-vopr-test` was **not green**:
+it reproduced a 175-byte packet payload replay divergence followed by
 `VoprIoTeardownStalled`. A separate clean worktree at the pre-fix checkpoint
 `91dab5df73` reproduces the same failure class (choice 11221 versus 11227
 with these fixes). Packet-level determinism and abort-path teardown therefore
-remain open work; this checkpoint does not claim to fix them.
+were not fixed by that checkpoint. See the readiness and replay follow-up below
+for the subsequent root-cause investigation.
 
 The latest pre-fix Linux CI E2E run reported a same-name serverless dense-index
 update status error and a CLI semantic-query timeout (321 passed, two failed).
@@ -3157,11 +3158,99 @@ checks also pass. Against the rebuilt binary, all 21 transaction E2E tests,
 the concurrent insert/delete publication regression, and the same-name
 serverless dense-index update regression pass (23 E2E tests total).
 
-The broader DB/index VOPR gate passes 11 of 12 tests: its managed-readiness
-scenario fails with `IndexRebuilding`. The same failure reproduces in a clean
-worktree at the pre-fix commit `20f359ab7f`, so it remains a separate existing
-limitation. These focused fixes also do not resolve the broader packet-replay
-limitation recorded above.
+The initial DB/index VOPR rerun passed 11 of 12 tests, with
+`IndexRebuilding` in managed readiness. Reproducing it at `20f359ab7f`
+established its history, not an acceptable exemption from the gate. The
+follow-up below fixes it and investigates the distributed replay failure.
+
+### Readiness and Replay Root-Cause Follow-up (2026-09-06–07)
+
+**Managed readiness is green: 12/12 DB/index VOPR tests pass in Debug and
+ReleaseSafe.** The fixture admitted a repair intent but never ran the repair
+owner's deferred source discovery, and it disabled the canonical index worker.
+It now enables that worker on the manual backend, advances the actual repair
+intent, drains replay, and verifies a durable one-document checkpoint before
+testing progressive visibility. A serviceable partial generation must not be
+reported as degraded; atomic and initial-publication reads still fail closed.
+Scenario version 2 requires fresh histories, with no legacy migration.
+
+The distributed investigation found several distinct faults rather than an
+opaque packet-replay limitation:
+
+- A manually constructed backend omitted its filesystem I/O capability.
+  The fixture now supplies VoprIo for both general and filesystem operations;
+  durable identity publication must not fall back to host storage.
+- Routing clients and cache/session/write-admission paths used host-clock
+  elapsed time in `X-Antfly-Routing-Remaining-Ms`. Identical controlled choices
+  could therefore produce different packet bytes. The routing capability now
+  carries its borrowed clock through capture, cache TTLs, deadlines, retries,
+  and pinned projections. Clock borrows use the independent-library I/O bridge.
+  Packet identity and payload-digest checks are unchanged.
+- Internal routed lookup ingress also established host-clock deadlines.
+  Ingress now pairs those deadlines with its executor, and operation and lookup
+  checks retain that authority. Native transaction-only ingress keeps its
+  existing explicit clock contract; this is not a repo-wide clock migration.
+- Six Raft snapshot-sender tasks could remain in uncancelable condition waits
+  during abort teardown. Non-joining transport shutdown now closes sender
+  admission, cancels active requests, and wakes idle workers before scheduler
+  draining. The owner retains responsibility for joining and freeing them.
+  Metadata fixture teardown signals its transports too. Snapshot retry deadlines
+  use the owning executor's clock.
+- The broadcast-join oracle incorrectly required a shuffle worker-attempt
+  ledger. Broadcast still must prove distributed execution, both groups, and
+  the expected rows; durable shuffle retains its worker/finalizer requirements.
+- Shard I/O could re-enter metadata apply and replace the transition array
+  while its executor retained a record pointer. Debug replay exposed a
+  use-after-free during split-request serialization. Observation and action
+  passes now own deep record snapshots, fence reentrant passes, and revalidate
+  the live record after each external call before publishing results. Tests
+  cover split and merge removal/replacement during successful and failing
+  callbacks, array reallocation, nested passes, and allocation-failure cleanup.
+- The fixture suppressed all data-node Raft tickers during a yielding control
+  round, and otherwise advanced election ticks at its 1 ms control quantum
+  instead of production's 100 ms Raft cadence. Tickers now remain independent,
+  defer only a busy node through a non-blocking production progress seam, and
+  use the production Raft and control intervals independently. Live inspection
+  found stable term-1 source/destination leaders, but the old control hot loop
+  had spent over 156,000 transitions advancing only eight virtual seconds;
+  repeated cached observations consumed the history budget before normal
+  heartbeat/cache intervals elapsed. The real DataServer regression verifies
+  busy-node deferral and subsequent progress, work-cost callbacks outside the
+  Raft mutex, and cancellation without retaining the lock.
+- Deliberate aborts exposed an unclassified `ClientShuttingDown` at the public
+  batch boundary. It produced an internal error and failed the test runner's
+  error-log check even after all 16 scenario tests passed. Shutdown now returns
+  the existing conservative `WriteOutcomeUnknown` result: it neither claims
+  that nothing committed nor invites a blind retry. The HTTP regression checks
+  the 409 response and one commit-hook invocation for shutdown and ambiguous
+  Raft outcomes. Unexpected-error logging and the runner's error-log check
+  remain enabled.
+
+Focused validation includes all 41 Raft transport tests in Debug and
+ReleaseSafe, all 14 transition-service tests in both modes, four metadata
+routing protocol tests, 20 remote-routing/source
+tests, and a virtual ingress deadline regression. The sender regression covers
+both not-yet-entered and idle workers, repeated shutdown, rejected admission,
+scheduler quiescence, and owner cleanup. Four independent-library I/O ABI tests
+pass in ReleaseSafe. The native ABI is version 6, and the composed full-cluster
+scenario is version 54. The full join/split gate additionally checks bounded
+early termination and exact replay, not just successful-history teardown.
+
+The production binary and repository formatting checks pass. The previous
+pushed checkpoint's Linux AutoGraph multi-node write test timed out; it passes
+locally against the rebuilt binary. That rerun does not establish the CI root
+cause or certify Linux timing. All 34 local transaction, resolution, and
+automatic shard-split E2E tests pass against the final rebuilt binary,
+including the shutdown classification fix.
+
+Complete join/split histories and their fresh-world exact replays pass in both
+Debug and ReleaseSafe within the unchanged 420,000-transition budget.
+Both full gates exit successfully with all 16 tests passing, including bounded
+early-abort exact replay. The final Debug rerun also verifies that expected
+shutdown no longer emits the six error-level logs that failed its earlier
+build exit. This closes the named packet-replay and teardown failures; it does
+not certify the separate v53 managed-publication completion work or every
+transitive production callback's determinism.
 
 ### Current Answer: Coverage, Parity, and Completeness
 
@@ -3176,7 +3265,7 @@ fault domains in the same replayable history.
 | Question | Current answer | Highest-value next work |
 | --- | --- | --- |
 | Where should Antfly add VOPR testing? | At production orchestration boundaries that combine durable state, ownership, public visibility, and recovery | Deepen the v11-v53 production-owner cluster with managed-index inner-publication/disk-pressure faults and graph/query cancellation under disk pressure; cache topology/link/storage/resource overlap; serverless multi-worker placement and object-store/process/resource overlap; additional replication topology, cancellation, and source/target-crash timings; metadata leadership loss during cutover; row-level tenant scoping and identity mutation races; and cross-domain fault overlap. Add cancellation under storage faults, simultaneous process loss before cancellation drain, richer fault combinations, and broader socket/topology/short-write targets. Broaden the repository-wide strong-read and managed-index contracts; extend durable joins across authorization/generation and broader forms; extend global query across topology, storage, resource, coordinator/metadata and multi-process loss; then compose metadata administration, MCP/A2A, cloud authentication, extension invocation, and live credential/provider replacement |
-| Which Antithesis ideas remain worth porting locally? | The large engine features, saved cross-run event-set programs, non-blocking bounded live streams, and reversible logical service rates with per-node/per-operation evidence are implemented at the registered in-process boundary; query-cache, DataServer, graph, replication, and serverless work are production-charged seams, and v42-v52 add the cited production recovery/fencing/capacity compositions. V53 adds bounded managed-index lifecycle evidence, not completed publication/reconstruction | Transitive determinism auditing; v53 completion and packet-level replay stabilization; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable; broader service-rate fault combinations and production/search adoption |
+| Which Antithesis ideas remain worth porting locally? | The large engine features, saved cross-run event-set programs, non-blocking bounded live streams, and reversible logical service rates with per-node/per-operation evidence are implemented at the registered in-process boundary; query-cache, DataServer, graph, replication, and serverless work are production-charged seams, and v42-v52 add the cited production recovery/fencing/capacity compositions. V53 adds bounded managed-index lifecycle evidence, not completed publication/reconstruction; v54 closes the named join/split packet-replay and teardown failures | Transitive determinism auditing and broader packet-level replay coverage; v53 managed-publication completion; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable; broader service-rate fault combinations and production/search adoption |
 | Is distributed VOPR missing? | **Partly.** In-process application-level distributed VOPR exists: logical nodes, directional links, process/storage/resource domains, independent and overlapping link-plus-resource faults, selected-listener socket admission, one selected-node disk-capacity denial/recovery path, quiet suffixes, and exact replay are integrated | Antithesis-style separate-address-space orchestration is not implemented, and whole-deployment breadth is incomplete. Co-resident HA/data-plane/serverless ownership, managed-index and cross-domain disk-pressure combinations, broader socket/storage/process/restart overlap, federated process agents, and live mixed binaries remain future or conditional work |
 | Are the features called finished actually finished? | Only within each narrowly stated **integrated** seam and its named green replay gate | Do not infer current aggregate health, transitive call-graph determinism, every cross-domain combination, arbitrary native/container determinism, or Antithesis product parity. Partial, ongoing, conditional, and explicitly excluded work remains unfinished |
 

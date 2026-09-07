@@ -103,6 +103,7 @@ pub const HttpTransportStack = struct {
     }
 
     pub fn beginShutdown(self: *HttpTransportStack) void {
+        self.snapshot_transport.beginShutdown();
         self.driver.beginShutdown();
     }
 

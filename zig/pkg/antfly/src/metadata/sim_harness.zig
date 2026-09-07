@@ -8512,6 +8512,8 @@ pub const VoprPublicClusterFixture = struct {
         for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
             runtime.requestStop();
         if (self.cluster_started) {
+            for (self.cluster.cluster.nodes) |*node|
+                node.runtime.svc.beginTransportShutdown();
             self.cluster.stopAll();
             self.cluster_started = false;
         }

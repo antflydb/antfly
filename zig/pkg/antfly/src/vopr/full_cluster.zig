@@ -21,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 53;
+    pub const version: u32 = 54;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -3456,7 +3456,7 @@ fn runExactMode(
             else if (production_durable_join_takeover_mode)
                 "full-cluster-vopr-v20-durable-join-takeover"
             else if (production_join_split_mode)
-                "full-cluster-vopr-v19-join-split"
+                "full-cluster-vopr-v54-join-split-borrowed-routing-clock"
             else if (production_graph_split_resource_pressure_mode)
                 "full-cluster-vopr-v18-graph-split-resource-pressure"
             else if (production_graph_split_partial_write_mode)
@@ -3663,6 +3663,15 @@ test "full cluster production data plane distributed join active split exact rep
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_join_split_ordinal;
+    // Abort while routing and ingress requests still own resources. A clean
+    // successful history alone does not certify replay-error teardown.
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        11_000,
+        .bounded_lifecycle,
+    );
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],

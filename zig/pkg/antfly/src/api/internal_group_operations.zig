@@ -755,6 +755,7 @@ pub const Operations = struct {
         const reads = try self.routedReads(alloc, request, input.group_id);
         var options = input.options;
         options.execution_deadline_ns = request.deadline_ns;
+        options.execution_io = request.deadline_io;
         options.cancellation = request.cancellation;
         const result = reads.lookupGroupLocal(
             alloc,

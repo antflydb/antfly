@@ -215,13 +215,13 @@ fn checkLookupOptionsActive(opts: db_mod.types.LookupOptions) !void {
         if (value.isCancelled()) return error.Cancelled;
     }
     const deadline_ns = opts.execution_deadline_ns orelse return;
-    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    if (opts.executionNowNs() >= deadline_ns) return error.Timeout;
 }
 
 fn lookupRemainingTimeoutMs(opts: db_mod.types.LookupOptions) !?u32 {
     try checkLookupOptionsActive(opts);
     const deadline_ns = opts.execution_deadline_ns orelse return null;
-    const now_ns = platform_time.monotonicNs();
+    const now_ns = opts.executionNowNs();
     if (now_ns >= deadline_ns) return error.Timeout;
     const remaining_ns = deadline_ns - now_ns;
     const rounded_ms = @max(
@@ -1469,7 +1469,7 @@ const RoutePinnedCatalog = struct {
     topology_epoch: u64,
 
     fn source(self: *@This()) table_catalog.CatalogSource {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .io = self.base.io };
     }
 
     const vtable: table_catalog.CatalogSource.VTable = .{

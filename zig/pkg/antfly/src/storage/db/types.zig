@@ -1170,9 +1170,16 @@ pub const LookupOptions = struct {
     /// Internal, absolute monotonic deadline used by routed lookups. It is not
     /// part of the public lookup projection contract and is never serialized.
     execution_deadline_ns: ?u64 = null,
+    execution_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
     /// Borrowed request cancellation source. Callers must keep it alive for
     /// the synchronous lookup call.
     cancellation: ?CancellationToken = null,
+
+    pub fn executionNowNs(self: LookupOptions) u64 {
+        const borrow = self.execution_io orelse return @import("antfly_platform").time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible lookup clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
 };
 
 pub const LookupResult = struct {

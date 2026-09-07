@@ -40952,7 +40952,7 @@ fn checkLookupOptionsActive(opts: types.LookupOptions) !void {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
     if (opts.execution_deadline_ns) |deadline_ns| {
-        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        if (opts.executionNowNs() >= deadline_ns) return error.Timeout;
     }
 }
 

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const runtime_io_abi = @import("../runtime_io_abi.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -7669,6 +7670,19 @@ pub const DataServer = struct {
         self.runRaftRoundOnly() catch |err| return handleRaftProgressError(err);
     }
 
+    /// Cooperative tickers must not block their scheduler thread on a native
+    /// mutex owned by a suspended control operation. Defer only this node's
+    /// turn when busy; other nodes must remain free to advance consensus.
+    pub fn tryRunRaftProgressRoundOnly(self: *DataServer) !bool {
+        const raft = self.data_raft orelse return false;
+        // Preserve the blocking ticker's ordering: charging may suspend.
+        if (self.work_cost_port) |port| try port.charge(.raft_round, 1);
+        if (!self.data_raft_mutex.tryLock()) return false;
+        defer self.data_raft_mutex.unlock();
+        raft.runRound() catch |err| try handleRaftProgressError(err);
+        return true;
+    }
+
     /// Publishes one full production store-status observation without running
     /// unrelated maintenance lanes. Managed runtimes normally reach this work
     /// through `runControlRoundOnly`; deterministic runtimes use this seam to
@@ -9731,13 +9745,11 @@ pub const DataServer = struct {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (route.write_route_fence) |fence| {
-                    // Catalog admission APIs use the process monotonic clock,
-                    // while the Raft loop's deadline belongs to its borrowed
-                    // std.Io clock. Preserve the remaining duration when the
-                    // two authorities differ (notably under VoprIo).
+                    // Preserve the remaining duration in the catalog's own
+                    // clock domain; both sides may borrow simulated I/O.
                     const admission_now_ns = self.dataRaftMonotonicNs();
                     if (admission_now_ns >= deadline_ns) return error.LeaderUnavailable;
-                    const admission_deadline_ns = platform_time.monotonicNs() +|
+                    const admission_deadline_ns = admission_source.catalog.budget(null).nowNs() +|
                         (deadline_ns - admission_now_ns);
                     routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
                         alloc,
@@ -18486,18 +18498,6 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-fn lockAtomicBefore(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
-    if (deadline_ns == null) {
-        lockAtomic(mutex);
-        return true;
-    }
-    while (platform_time.monotonicNs() < deadline_ns.?) {
-        if (mutex.tryLock()) return true;
-        platform_clock.Clock.real().sleepMs(1);
-    }
-    return false;
-}
-
 fn catalogRoutingProbeDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
     return @min(
         deadline_ns,
@@ -18525,10 +18525,6 @@ fn isCatalogRoutingTimeout(err: anyerror) bool {
 
 fn normalizeCatalogRoutingSnapshotError(err: anyerror) anyerror {
     return if (isCatalogRoutingTimeout(err)) error.CatalogRoutingSnapshotTimeout else err;
-}
-
-fn ensureCatalogRoutingDeadline(deadline_ns: u64) !void {
-    if (platform_time.monotonicNs() >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
 }
 
 fn legacyCatalogRoutingOptimisticDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
@@ -18568,13 +18564,21 @@ fn cloneRoutePlanFromWireUntil(
     plan: antfly.metadata_api.CatalogRoutePlan,
     deadline_ns: u64,
 ) !antfly.public_api.table_catalog.CatalogRoutePlan {
-    try ensureCatalogRoutingDeadline(deadline_ns);
+    return cloneRoutePlanFromWireWithBudget(alloc, plan, .{ .deadline_ns = deadline_ns });
+}
+
+fn cloneRoutePlanFromWireWithBudget(
+    alloc: std.mem.Allocator,
+    plan: antfly.metadata_api.CatalogRoutePlan,
+    budget: antfly.public_api.table_catalog.RoutingBudget,
+) !antfly.public_api.table_catalog.CatalogRoutePlan {
+    try budget.checkpoint();
     const groups = try alloc.alloc(antfly.public_api.table_catalog.CatalogGroupRoute, plan.groups.len);
     errdefer alloc.free(groups);
     for (plan.groups, groups, 0..) |source_group, *target_group, index| {
         // This is a primitive copy, so checking once per bounded batch
         // preserves prompt cancellation without a clock read per route.
-        if (index % 64 == 0) try ensureCatalogRoutingDeadline(deadline_ns);
+        try budget.checkpointIndex(index);
         target_group.* = .{
             .group_id = source_group.group_id,
             .range_id = source_group.range_id,
@@ -18585,7 +18589,7 @@ fn cloneRoutePlanFromWireUntil(
             },
         };
     }
-    try ensureCatalogRoutingDeadline(deadline_ns);
+    try budget.checkpoint();
     return .{
         .metadata_group_id = plan.metadata_group_id,
         .metadata_incarnation = plan.metadata_incarnation,
@@ -18840,17 +18844,18 @@ const RemoteMetadataSource = struct {
             alloc: std.mem.Allocator,
             source: antfly.metadata_api.CatalogRoutingSnapshot,
         ) !*@This() {
-            return try createUntil(alloc, source, null);
+            return try createUntil(alloc, source, null, null);
         }
 
         fn createUntil(
             alloc: std.mem.Allocator,
             source: antfly.metadata_api.CatalogRoutingSnapshot,
             deadline_ns: ?u64,
+            io: ?std.Io,
         ) !*@This() {
             const entry = try alloc.create(@This());
             errdefer alloc.destroy(entry);
-            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns) };
+            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns, io) };
             return entry;
         }
 
@@ -19037,6 +19042,14 @@ const RemoteMetadataSource = struct {
         return @intCast(@max(0, std.Io.Clock.now(.awake, self.io).nanoseconds));
     }
 
+    fn lockBefore(self: *RemoteMetadataSource, mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+        while (true) {
+            if (deadline_ns) |deadline| if (self.awakeNs() >= deadline) return false;
+            if (mutex.tryLock()) return true;
+            self.io.sleep(.fromMilliseconds(1), .awake) catch return false;
+        }
+    }
+
     fn awakeMs(self: *const RemoteMetadataSource) u64 {
         const now_ns = @max(0, std.Io.Clock.now(.awake, self.io).nanoseconds);
         return @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
@@ -19088,7 +19101,7 @@ const RemoteMetadataSource = struct {
     ) !RoutingProtocol {
         var probe_generation: u64 = undefined;
         while (true) {
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = self.awakeNs();
             try ensureBudgetActive(budget);
             lockAtomic(&self.cache_mutex);
             const state = self.routing_protocol_states[index];
@@ -19108,7 +19121,7 @@ const RemoteMetadataSource = struct {
                 break;
             }
             self.cache_mutex.unlock();
-            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), remote_metadata_routing_probe_wait_ns / std.time.ns_per_ms));
+            try self.io.sleep(.fromNanoseconds(remote_metadata_routing_probe_wait_ns), .awake);
         }
 
         const capabilities = client.fetchCapabilities(self.base_uris[index], budget) catch |err| switch (err) {
@@ -19137,7 +19150,7 @@ const RemoteMetadataSource = struct {
         const state = &self.routing_protocol_states[index];
         if (state.generation == probe_generation) {
             state.protocol = protocol;
-            state.checked_at_ns = platform_time.monotonicNs();
+            state.checked_at_ns = self.awakeNs();
             state.probe_in_flight = false;
         }
         const selected = state.protocol;
@@ -19150,7 +19163,7 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         const state = &self.routing_protocol_states[index];
         state.protocol = .legacy_v1;
-        state.checked_at_ns = platform_time.monotonicNs();
+        state.checked_at_ns = self.awakeNs();
         state.generation +%= 1;
         state.probe_in_flight = false;
         self.cache_mutex.unlock();
@@ -19343,7 +19356,8 @@ const RemoteMetadataSource = struct {
 
     fn fetchSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
         return try self.fetchSnapshotWithBudget(.{
-            .deadline_ns = platform_time.monotonicNs() +| remote_metadata_snapshot_timeout_ns,
+            .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns,
+            .io = self.io,
         });
     }
 
@@ -19457,6 +19471,7 @@ const RemoteMetadataSource = struct {
     fn catalogSource(self: *RemoteMetadataSource) antfly.public_api.table_catalog.CatalogSource {
         return .{
             .ptr = self,
+            .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
@@ -19554,16 +19569,16 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        const deadline_ns = platform_time.monotonicNs() +|
+        const deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
-        const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
+        const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns, .io = self.io };
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
         const fallback_indices = try std.heap.page_allocator.alloc(usize, self.base_uris.len);
         defer std.heap.page_allocator.free(fallback_indices);
         var endpoint_discovery = MetadataMutationEndpointDiscovery.init(fallback_indices);
         for (0..self.base_uris.len) |attempt| {
-            if (platform_time.monotonicNs() >= deadline_ns)
+            if (self.awakeNs() >= deadline_ns)
                 return error.NotLeader;
             const index = self.metadataApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -19571,7 +19586,7 @@ const RemoteMetadataSource = struct {
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
             const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
-                if (platform_time.monotonicNs() >= deadline_ns)
+                if (self.awakeNs() >= deadline_ns)
                     return error.NotLeader;
                 last_pre_admission_err = err;
                 continue;
@@ -19609,7 +19624,7 @@ const RemoteMetadataSource = struct {
             return result;
         }
         for (endpoint_discovery.fallbacks()) |index| {
-            if (platform_time.monotonicNs() >= deadline_ns)
+            if (self.awakeNs() >= deadline_ns)
                 return error.NotLeader;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -19682,7 +19697,7 @@ const RemoteMetadataSource = struct {
         if (mutation_driver.forwards_remaining == 0)
             return error.NotLeader;
         const forwarding = mutation_driver.nextContext(
-            platform_time.monotonicNs(),
+            self.awakeNs(),
             50 * std.time.ns_per_ms,
         ) orelse return error.NotLeader;
         const result = callFn(
@@ -19949,19 +19964,19 @@ const RemoteMetadataSource = struct {
         var routing_invalidation_generation: u64 = 0;
         if (!linearizable) {
             if (try self.cachedRoutingSnapshotFresh(deadline_ns)) |snapshot| return snapshot;
-            if (!lockAtomicBefore(&self.routing_refresh_mutex, deadline_ns))
+            if (!self.lockBefore(&self.routing_refresh_mutex, deadline_ns))
                 return error.CatalogRoutingSnapshotTimeout;
             refresh_locked = true;
             // Singleflight followers recheck after the active refresh. This
             // keeps a burst of routed reads to one metadata request.
             if (try self.cachedRoutingSnapshotFresh(deadline_ns)) |snapshot| return snapshot;
-            if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+            if (!self.lockBefore(&self.cache_mutex, deadline_ns))
                 return error.CatalogRoutingSnapshotTimeout;
             routing_invalidation_generation = self.snapshot_invalidation_generation;
             self.cache_mutex.unlock();
         }
         const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
-            .{ .deadline_ns = deadline }
+            .{ .deadline_ns = deadline, .io = self.io }
         else
             null;
         var last_err: anyerror = error.MissingMetadataApi;
@@ -19969,8 +19984,8 @@ const RemoteMetadataSource = struct {
             ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
             const index = self.metadataReadApiIndexForAttempt(attempt);
             const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
-                const now_ns = platform_time.monotonicNs();
-                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt) };
+                const now_ns = self.awakeNs();
+                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt), .io = self.io };
             } else null;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -20057,7 +20072,7 @@ const RemoteMetadataSource = struct {
                 return err;
             };
             if (deadline_ns) |deadline| {
-                if (platform_time.monotonicNs() >= deadline) {
+                if (self.awakeNs() >= deadline) {
                     var owned = snapshot;
                     freeRoutingSnapshotOwned(self.alloc, &owned);
                     return error.CatalogRoutingSnapshotTimeout;
@@ -20066,7 +20081,7 @@ const RemoteMetadataSource = struct {
             return snapshot;
         }
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return last_err;
     }
@@ -20075,8 +20090,8 @@ const RemoteMetadataSource = struct {
         self: *RemoteMetadataSource,
         deadline_ns: ?u64,
     ) !?antfly.metadata_api.CatalogRoutingSnapshot {
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+        const now_ms: u64 = @intCast(@divTrunc(self.awakeNs(), std.time.ns_per_ms));
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns))
             return error.CatalogRoutingSnapshotTimeout;
         const entry = self.cached_routing_snapshot orelse {
             self.cache_mutex.unlock();
@@ -20089,7 +20104,7 @@ const RemoteMetadataSource = struct {
         entry.retain();
         self.cache_mutex.unlock();
         defer entry.release(self.alloc);
-        return try cloneRoutingSnapshotOwnedUntil(self.alloc, entry.snapshot, deadline_ns);
+        return try cloneRoutingSnapshotOwnedUntil(self.alloc, entry.snapshot, deadline_ns, self.io);
     }
 
     fn publishRoutingSnapshot(
@@ -20098,14 +20113,14 @@ const RemoteMetadataSource = struct {
         invalidation_generation: u64,
         deadline_ns: ?u64,
     ) !void {
-        const entry = try RoutingSnapshotCacheEntry.createUntil(self.alloc, snapshot, deadline_ns);
+        const entry = try RoutingSnapshotCacheEntry.createUntil(self.alloc, snapshot, deadline_ns, self.io);
         var published = false;
         defer if (!published) entry.release(self.alloc);
         var retired: ?*RoutingSnapshotCacheEntry = null;
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        const now_ms: u64 = @intCast(@divTrunc(self.awakeNs(), std.time.ns_per_ms));
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) {
+            if (self.awakeNs() >= deadline) {
                 self.cache_mutex.unlock();
                 return error.CatalogRoutingSnapshotTimeout;
             }
@@ -20115,7 +20130,7 @@ const RemoteMetadataSource = struct {
             return error.MetadataSnapshotHeadMismatch;
         }
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) {
+            if (self.awakeNs() >= deadline) {
                 self.cache_mutex.unlock();
                 return error.CatalogRoutingSnapshotTimeout;
             }
@@ -20160,15 +20175,15 @@ const RemoteMetadataSource = struct {
         deadline_ns: ?u64,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
-        const tables = try cloneRoutingTablesOwnedUntil(self.alloc, source_tables, deadline_ns);
+        const tables = try cloneRoutingTablesOwnedUntil(self.alloc, source_tables, deadline_ns, self.io);
         errdefer freeTablesOwned(self.alloc, tables);
-        const ranges = try cloneRoutingRangesOwnedUntil(self.alloc, source_ranges, deadline_ns);
+        const ranges = try cloneRoutingRangesOwnedUntil(self.alloc, source_ranges, deadline_ns, self.io);
         errdefer freeRangesOwned(self.alloc, ranges);
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return .{
             .metadata_group_id = metadata_group_id,
@@ -20191,11 +20206,11 @@ const RemoteMetadataSource = struct {
 
     fn remoteWaitForRoutingChange(ptr: *anyopaque, observed_token: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.awakeNs();
         if (now_ns >= deadline_ns) return .retry;
         const probe_deadline_ns = catalogRoutingProbeDeadline(now_ns, deadline_ns, probe_interval_ns);
         const final_probe = probe_deadline_ns == deadline_ns;
-        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = probe_deadline_ns };
+        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = probe_deadline_ns, .io = self.io };
         const index = self.metadataReadApiIndexForAttempt(0);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -20207,10 +20222,10 @@ const RemoteMetadataSource = struct {
             budget,
         ) catch |err| {
             if (err == error.UnsupportedOperation) {
-                const fallback_now_ns = platform_time.monotonicNs();
+                const fallback_now_ns = self.awakeNs();
                 if (fallback_now_ns < probe_deadline_ns) {
                     const wait_ns = probe_deadline_ns - fallback_now_ns;
-                    platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                    try self.io.sleep(.fromNanoseconds(wait_ns), .awake);
                 }
             }
             self.noteMetadataReadProbeMiss(index);
@@ -20249,11 +20264,12 @@ const RemoteMetadataSource = struct {
         var legacy_count: usize = 0;
         var incompatible_count: usize = 0;
         for (0..self.base_uris.len) |attempt| {
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = self.awakeNs();
             if (now_ns >= deadline_ns) return .timed_out;
             const index = self.metadataReadApiIndexForAttempt(attempt);
             const budget = antfly.metadata_http_client.RequestBudget{
                 .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt),
+                .io = self.io,
             };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -20280,13 +20296,13 @@ const RemoteMetadataSource = struct {
                 .found => {
                     const plan = parsed.value.plan orelse return error.InvalidCatalogRouteResponse;
                     try self.acceptMetadataIdentity(plan.metadata_group_id, plan.metadata_incarnation);
-                    var owned_plan = cloneRoutePlanFromWireUntil(alloc, plan, deadline_ns) catch |err| switch (err) {
+                    var owned_plan = cloneRoutePlanFromWireWithBudget(alloc, plan, antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, self.io)) catch |err| switch (err) {
                         error.CatalogRoutingSnapshotTimeout => return .timed_out,
                         else => return err,
                     };
                     errdefer owned_plan.deinit(alloc);
                     self.noteMetadataReadSuccess(index);
-                    if (platform_time.monotonicNs() >= deadline_ns) {
+                    if (self.awakeNs() >= deadline_ns) {
                         owned_plan.deinit(alloc);
                         return .timed_out;
                     }
@@ -20298,7 +20314,7 @@ const RemoteMetadataSource = struct {
                         parsed.value.token.metadata_incarnation,
                     );
                     self.noteMetadataReadSuccess(index);
-                    if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+                    if (self.awakeNs() >= deadline_ns) return .timed_out;
                     return .publication_not_observed;
                 },
                 .timed_out, .authority_changed => {
@@ -20324,22 +20340,22 @@ const RemoteMetadataSource = struct {
         probe_interval_ns: u64,
     ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const optimistic_deadline_ns = legacyCatalogRoutingOptimisticDeadline(
-            platform_time.monotonicNs(),
+            self.awakeNs(),
             deadline_ns,
             probe_interval_ns,
         );
-        optimistic_loop: while (platform_time.monotonicNs() < optimistic_deadline_ns) {
+        optimistic_loop: while (self.awakeNs() < optimistic_deadline_ns) {
             var snapshot = self.remoteRoutingSnapshotWithMode(optimistic_deadline_ns, false) catch |err| switch (err) {
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => break,
                 else => return err,
             };
             defer remoteFreeRoutingSnapshot(self, &snapshot);
-            const optimistic_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+            const optimistic_plan = antfly.public_api.table_catalog.routePlanFromSnapshotWithBudget(
                 alloc,
                 snapshot,
                 table_name,
                 query,
-                optimistic_deadline_ns,
+                antfly.public_api.table_catalog.RoutingBudget.initIo(optimistic_deadline_ns, self.io),
             ) catch |err| switch (err) {
                 error.CatalogRoutingSnapshotTimeout => break :optimistic_loop,
                 else => return err,
@@ -20347,23 +20363,23 @@ const RemoteMetadataSource = struct {
             if (optimistic_plan) |plan| {
                 return .{ .found = plan };
             }
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = self.awakeNs();
             if (now_ns >= optimistic_deadline_ns or optimistic_deadline_ns - now_ns <= probe_interval_ns) break;
             const wait_ns = @min(optimistic_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
-            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+            try self.io.sleep(.fromNanoseconds(wait_ns), .awake);
         }
-        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+        if (self.awakeNs() >= deadline_ns) return .timed_out;
         var authoritative = self.remoteRoutingSnapshotWithMode(deadline_ns, true) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return .timed_out,
             else => return err,
         };
         defer remoteFreeRoutingSnapshot(self, &authoritative);
-        const authoritative_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+        const authoritative_plan = antfly.public_api.table_catalog.routePlanFromSnapshotWithBudget(
             alloc,
             authoritative,
             table_name,
             query,
-            deadline_ns,
+            antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, self.io),
         ) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return .timed_out,
             else => return err,
@@ -23121,9 +23137,10 @@ fn cloneRoutingTablesOwnedUntil(
     alloc: std.mem.Allocator,
     records: []const antfly.metadata.table_manager.TableRecord,
     deadline_ns: ?u64,
+    io: ?std.Io,
 ) ![]antfly.metadata.table_manager.TableRecord {
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
     const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
     var initialized: usize = 0;
@@ -23133,7 +23150,7 @@ fn cloneRoutingTablesOwnedUntil(
     }
     for (records, 0..) |record, i| {
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         out[i] = try antfly.metadata.table_manager.cloneRoutingTable(alloc, record);
         initialized += 1;
@@ -23159,9 +23176,10 @@ fn cloneRoutingRangesOwnedUntil(
     alloc: std.mem.Allocator,
     records: []const antfly.metadata.table_manager.RangeRecord,
     deadline_ns: ?u64,
+    io: ?std.Io,
 ) ![]antfly.metadata.table_manager.RangeRecord {
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
     var initialized: usize = 0;
@@ -23171,7 +23189,7 @@ fn cloneRoutingRangesOwnedUntil(
     }
     for (records, 0..) |record, i| {
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         out[i] = try antfly.metadata.table_manager.cloneRoutingRange(alloc, record);
         initialized += 1;
@@ -23183,16 +23201,17 @@ fn cloneRoutingSnapshotOwnedUntil(
     alloc: std.mem.Allocator,
     snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
     deadline_ns: ?u64,
+    io: ?std.Io,
 ) !antfly.metadata_api.CatalogRoutingSnapshot {
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
-    const tables = try cloneRoutingTablesOwnedUntil(alloc, snapshot.tables, deadline_ns);
+    const tables = try cloneRoutingTablesOwnedUntil(alloc, snapshot.tables, deadline_ns, io);
     errdefer freeTablesOwned(alloc, tables);
-    const ranges = try cloneRoutingRangesOwnedUntil(alloc, snapshot.ranges, deadline_ns);
+    const ranges = try cloneRoutingRangesOwnedUntil(alloc, snapshot.ranges, deadline_ns, io);
     errdefer freeRangesOwned(alloc, ranges);
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        if (antfly.public_api.table_catalog.RoutingBudget.initIo(null, io).nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
     return .{
         .metadata_group_id = snapshot.metadata_group_id,
@@ -25735,6 +25754,40 @@ test "data raft ticker advances consensus independently of control rounds" {
     try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), server.last_data_raft_local_intents.len);
     const cached_intents_ptr = server.last_data_raft_local_intents.ptr;
+
+    {
+        lockAtomic(&server.data_raft_mutex);
+        defer server.data_raft_mutex.unlock();
+        try std.testing.expect(!try server.tryRunRaftProgressRoundOnly());
+    }
+    try std.testing.expect(try server.tryRunRaftProgressRoundOnly());
+
+    {
+        const ChargeProbe = struct {
+            mutex: *std.atomic.Mutex,
+            calls: usize = 0,
+            cancel: bool = false,
+            fn charge(ptr: *anyopaque, kind: DataServerWorkKind, units: u64) !void {
+                const probe: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expectEqual(DataServerWorkKind.raft_round, kind);
+                try std.testing.expectEqual(@as(u64, 1), units);
+                try std.testing.expect(probe.mutex.tryLock());
+                probe.mutex.unlock();
+                probe.calls += 1;
+                if (probe.cancel) return error.Canceled;
+            }
+        };
+        var probe = ChargeProbe{ .mutex = &server.data_raft_mutex };
+        server.work_cost_port = .{ .ptr = &probe, .charge_fn = ChargeProbe.charge };
+        defer server.work_cost_port = null;
+        try std.testing.expect(try server.tryRunRaftProgressRoundOnly());
+        try server.runRaftProgressRoundOnly();
+        probe.cancel = true;
+        try std.testing.expectError(error.Canceled, server.tryRunRaftProgressRoundOnly());
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expect(server.data_raft_mutex.tryLock());
+        server.data_raft_mutex.unlock();
+    }
 
     // Simulate leadership loss after durable topology convergence. An
     // unchanged metadata epoch must still run the lightweight campaign phase.
@@ -39552,6 +39605,54 @@ test "remote metadata source shares backend runtime io across a bounded executor
     try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
 }
 
+test "remote routing capture cache and session share a virtual deadline clock" {
+    const alloc = std.testing.allocator;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    const Stub = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const body = if (std.mem.endsWith(u8, request.uri, "/capabilities"))
+                try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataCapabilities{}, .{})
+            else blk: {
+                try std.testing.expectEqualStrings("1000", request.header("X-Antfly-Routing-Remaining-Ms").?);
+                break :blk try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.CatalogRoutingSnapshot{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = .{'1'} ** 32,
+                    .catalog_revision = 9,
+                    .tables = &.{},
+                    .ranges = &.{},
+                }, .{});
+            };
+            return .{ .status = 200, .body = body };
+        }
+    };
+    var stub = Stub{};
+    var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, sim.io());
+    defer source.deinit();
+    const deadline = std.time.ns_per_s;
+    var captured = try source.remoteRoutingSnapshotWithMode(deadline, false);
+    defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &captured);
+    try std.testing.expectEqual(@as(u64, 9), captured.catalog_revision);
+    const calls_after_capture = stub.calls;
+    var cached = try source.remoteRoutingSnapshotWithMode(deadline, false);
+    defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &cached);
+    try std.testing.expectEqual(calls_after_capture, stub.calls);
+    var session = try antfly.public_api.table_catalog.RoutingSession.init(alloc, source.catalogSource(), deadline);
+    defer session.deinit();
+    try std.testing.expectEqual(@as(u64, 0), session.catalog().budget(deadline).nowNs());
+    try session.catalog().budget(deadline).checkpoint();
+    sim.monotonic_ns = deadline;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.catalog().budget(deadline).checkpoint());
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithMode(deadline, false));
+    sim.monotonic_ns += metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms;
+    var refreshed = try source.remoteRoutingSnapshotWithMode(@intCast(sim.monotonic_ns + std.time.ns_per_s), false);
+    defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &refreshed);
+    try std.testing.expect(stub.calls > calls_after_capture + 1);
+}
+
 test "remote metadata source accepts transport-neutral request executors" {
     const Stub = struct {
         calls: usize = 0,
@@ -39835,6 +39936,7 @@ test "remote routing cache entries retain immutable snapshots outside the cache 
         std.testing.allocator,
         entry.snapshot,
         platform_time.monotonicNs() + std.time.ns_per_s,
+        null,
     );
     defer freeRoutingSnapshotOwned(std.testing.allocator, &cloned);
     try std.testing.expectEqual(@as(u64, 9), cloned.catalog_revision);
@@ -39845,6 +39947,7 @@ test "remote routing cache entries retain immutable snapshots outside the cache 
             std.testing.allocator,
             entry.snapshot,
             platform_time.monotonicNs(),
+            null,
         ),
     );
 }
@@ -39873,7 +39976,7 @@ test "remote routing never publishes a cache entry after its deadline" {
     try source.publishRoutingSnapshot(
         first,
         source.snapshot_invalidation_generation,
-        platform_time.monotonicNs() + std.time.ns_per_s,
+        source.awakeNs() + std.time.ns_per_s,
     );
 
     lockAtomic(&source.cache_mutex);
@@ -39887,7 +39990,7 @@ test "remote routing never publishes a cache entry after its deadline" {
         source.publishRoutingSnapshot(
             replacement,
             source.snapshot_invalidation_generation,
-            platform_time.monotonicNs(),
+            source.awakeNs(),
         ),
     );
 

@@ -355,6 +355,7 @@ pub const HttpSnapshotTransport = struct {
     send_mutex: std.Io.Mutex = .init,
     send_ready: std.Io.Condition = .init,
     send_state: SenderState = .stopped,
+    send_shutdown_requested: bool = false,
     send_queue: std.ArrayListUnmanaged(QueuedSnapshot) = .empty,
     send_active_jobs: []?*QueuedSnapshot = &.{},
     send_active_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -495,6 +496,10 @@ pub const HttpSnapshotTransport = struct {
         self.send_mutex.lockUncancelable(self.artifact_io);
         while (self.send_state == .starting)
             self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
+        if (self.send_shutdown_requested) {
+            self.send_mutex.unlock(self.artifact_io);
+            return error.AsyncSnapshotSenderClosing;
+        }
         if (self.send_state == .running) {
             self.send_mutex.unlock(self.artifact_io);
             return;
@@ -552,6 +557,20 @@ pub const HttpSnapshotTransport = struct {
         self.send_state = .running;
         self.send_ready.broadcast(self.artifact_io);
         self.send_mutex.unlock(self.artifact_io);
+    }
+
+    /// Close admission and wake idle senders without joining their futures.
+    /// The owner may drive a shared scheduler to quiescence before deinit.
+    /// Keep join ownership in stopAsyncSender, including a concurrent start.
+    pub fn beginShutdown(self: *HttpSnapshotTransport) void {
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        defer self.send_mutex.unlock(self.artifact_io);
+        self.send_shutdown_requested = true;
+        // The starting owner has not published its worker/job arrays yet.
+        if (self.send_state == .running) {
+            for (self.send_active_jobs) |job| if (job) |value| value.cancellation.cancel();
+        }
+        self.send_ready.broadcast(self.artifact_io);
     }
 
     fn stopAsyncSender(self: *HttpSnapshotTransport) void {
@@ -641,11 +660,11 @@ pub const HttpSnapshotTransport = struct {
         // bytes. Queue saturation is normal backpressure and takes no
         // ownership from the caller.
         self.send_mutex.lockUncancelable(self.artifact_io);
-        if (self.send_state != .running) {
+        if (self.send_state != .running or self.send_shutdown_requested) {
             const lifecycle_err: anyerror = switch (self.send_state) {
                 .stopped, .starting => error.AsyncSnapshotSenderNotStarted,
                 .closing => error.AsyncSnapshotSenderClosed,
-                .running => unreachable,
+                .running => error.AsyncSnapshotSenderClosed,
             };
             self.send_mutex.unlock(self.artifact_io);
             return lifecycle_err;
@@ -699,7 +718,7 @@ pub const HttpSnapshotTransport = struct {
         defer self.send_mutex.unlock(self.artifact_io);
         self.releaseSubmissionReservationLocked(req.to, req.snapshot.data.len);
         reservation_live = false;
-        if (self.send_state != .running) return error.AsyncSnapshotSenderClosed;
+        if (self.send_state != .running or self.send_shutdown_requested) return error.AsyncSnapshotSenderClosed;
         // A concurrent submitter may have published the same identity while
         // this caller prepared its job. Treat that as successful idempotence.
         if (self.findDuplicateLocked(req)) {
@@ -782,11 +801,11 @@ pub const HttpSnapshotTransport = struct {
             self.send_mutex.lockUncancelable(self.artifact_io);
             while (self.send_state == .starting)
                 self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
-            if (self.send_state != .running) {
+            if (self.send_state != .running or self.send_shutdown_requested) {
                 self.send_mutex.unlock(self.artifact_io);
                 return false;
             }
-            const now_ms = snapshotNowMs();
+            const now_ms = self.snapshotNowMs();
             for (self.send_queue.items, 0..) |job, index| {
                 if (job.not_before_ms > now_ms or self.send_active_peers.contains(job.to)) continue;
                 out.* = job;
@@ -800,7 +819,7 @@ pub const HttpSnapshotTransport = struct {
             self.send_mutex.unlock(self.artifact_io);
             if (pending == 0) {
                 self.send_mutex.lockUncancelable(self.artifact_io);
-                if (self.send_state == .running and self.send_queue.items.len == 0)
+                if (self.send_state == .running and !self.send_shutdown_requested and self.send_queue.items.len == 0)
                     self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
                 self.send_mutex.unlock(self.artifact_io);
             } else {
@@ -820,7 +839,7 @@ pub const HttpSnapshotTransport = struct {
         std.debug.assert(self.send_retained_jobs > 0 and self.send_retained_bytes >= job.snapshot.data.len);
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
-        if (self.send_state == .running and !job.runtime_cancelled) {
+        if (self.send_state == .running and !self.send_shutdown_requested and !job.runtime_cancelled) {
             self.queueCompletionLocked(job, .delivered);
             _ = self.send_metrics.completions_delivered.fetchAdd(1, .monotonic);
         }
@@ -849,8 +868,8 @@ pub const HttpSnapshotTransport = struct {
         self.send_mutex.lockUncancelable(self.artifact_io);
         self.send_active_jobs[worker_index] = null;
         std.debug.assert(self.send_active_peers.remove(job.to));
-        if (self.send_state == .running and !job.runtime_cancelled and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
-            job.not_before_ms = snapshotNowMs() +| self.snapshotRetryDelayMs(job.*);
+        if (self.send_state == .running and !self.send_shutdown_requested and !job.runtime_cancelled and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
+            job.not_before_ms = self.snapshotNowMs() +| self.snapshotRetryDelayMs(job.*);
             job.cancellation = .{};
             self.send_queue.appendAssumeCapacity(job.*);
             job.* = undefined;
@@ -863,7 +882,7 @@ pub const HttpSnapshotTransport = struct {
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
         _ = self.send_metrics.dropped.fetchAdd(1, .monotonic);
-        const publish_failure = self.send_state == .running and !job.runtime_cancelled;
+        const publish_failure = self.send_state == .running and !self.send_shutdown_requested and !job.runtime_cancelled;
         if (publish_failure) {
             self.queueCompletionLocked(job, .failed);
             _ = self.send_metrics.completions_failed.fetchAdd(1, .monotonic);
@@ -898,13 +917,17 @@ pub const HttpSnapshotTransport = struct {
     fn nextSnapshotSendSleepMs(self: *HttpSnapshotTransport) u64 {
         self.send_mutex.lockUncancelable(self.artifact_io);
         defer self.send_mutex.unlock(self.artifact_io);
-        const now_ms = snapshotNowMs();
+        const now_ms = self.snapshotNowMs();
         var delay: u64 = 25;
         for (self.send_queue.items) |job| {
             if (job.not_before_ms <= now_ms) return 1;
             delay = @min(delay, job.not_before_ms - now_ms);
         }
         return @max(@as(u64, 1), delay);
+    }
+
+    fn snapshotNowMs(self: *const HttpSnapshotTransport) u64 {
+        return @intCast(@divTrunc(@max(0, std.Io.Clock.now(.awake, self.artifact_io).nanoseconds), std.time.ns_per_ms));
     }
 
     fn snapshotRetryDelayMs(self: *const HttpSnapshotTransport, job: QueuedSnapshot) u64 {
@@ -2158,8 +2181,50 @@ pub const HttpSnapshotTransport = struct {
     }
 };
 
-fn snapshotNowMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+test "http snapshot begin shutdown drains queued and idle VoprIo senders" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    const Stub = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedSnapshotRequest;
+        }
+    };
+    for ([_]bool{ false, true }) |enter_worker| {
+        var sim = try vopr.vopr_io.VoprIo.init(.{ .required = .of(&.{ .files, .task_scheduling, .synchronization }) });
+        defer sim.deinit();
+        var token: u8 = 0;
+        var transport = try HttpSnapshotTransport.initShared(alloc, .{ .root_dir = "/snapshots" }, .{
+            .ptr = &token,
+            .vtable = &.{ .execute = Stub.execute },
+        }, null, sim.io());
+        defer transport.deinit();
+        try transport.startAsyncSender();
+        if (enter_worker) {
+            var enabled: vopr.transition.List = .{};
+            defer enabled.deinit(alloc);
+            var events: vopr.event.Sink = .{};
+            defer events.deinit(alloc);
+            try sim.scheduler().enumerateReady(&enabled, alloc);
+            try std.testing.expectEqual(@as(usize, 1), enabled.items.items.len);
+            try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+            enabled.items.clearRetainingCapacity();
+            try sim.scheduler().enumerateReady(&enabled, alloc);
+            try std.testing.expectEqual(@as(usize, 0), enabled.items.items.len);
+        }
+        try std.testing.expect(!sim.tasks.isQuiescent());
+        transport.beginShutdown();
+        transport.beginShutdown();
+        try std.testing.expectError(error.AsyncSnapshotSenderClosing, transport.startAsyncSender());
+        try std.testing.expectError(error.AsyncSnapshotSenderClosed, transport.submitSnapshot(.{
+            .group_id = 7,
+            .to = 2,
+            .snapshot = .{ .metadata = .{ .index = 11, .term = 3 }, .data = @constCast("payload") },
+        }));
+        _ = try sim.cancelAndDrainTasksForTeardown(alloc, 32);
+        try std.testing.expect(sim.tasks.isQuiescent());
+        transport.stopAsyncSender();
+        try sim.ensureNoCapabilityViolation();
+    }
 }
 
 test "http snapshot transport module compiles" {

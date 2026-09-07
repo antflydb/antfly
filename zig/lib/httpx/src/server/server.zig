@@ -367,6 +367,9 @@ pub const Context = struct {
     /// Optional application-owned absolute monotonic deadline established by
     /// ingress middleware. The HTTP library carries but does not interpret it.
     application_deadline_ns: ?u64 = null,
+    /// Clock authority paired with the application deadline. Null leaves
+    /// interpretation to an application's native-clock contract.
+    application_deadline_io: ?Io = null,
     /// Records malformed application deadline metadata so authentication can
     /// run before an application-specific validation response is disclosed.
     application_deadline_invalid: bool = false,

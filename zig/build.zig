@@ -4536,8 +4536,7 @@ pub fn build(b: *std.Build) void {
         "shard operation adapter metadata runtime dispatches actions",
         "transition destination requires a stable healthy voter set",
         "transition retry jitter is bounded and desynchronizes services",
-        "transition service preserves nested guarded adapter identity",
-        "transition service retries split bootstrap after leader recovery",
+        "transition service",
         "raft scheduler ready priority cannot starve consensus ticks",
     };
     const raft_runtime_tests = b.addTest(.{
@@ -8545,7 +8544,10 @@ pub fn build(b: *std.Build) void {
     const run_production_cluster_graph_split_resource_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_resource_pressure_vopr_tests);
     const production_cluster_join_split_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"full cluster production data plane distributed join active split exact replay"},
+        .filters = &.{
+            "full cluster production data plane distributed join active split exact replay",
+            "production distributed join oracle accepts broadcast without a shuffle ledger",
+        },
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_join_split_vopr_tests = b.addRunArtifact(production_cluster_join_split_vopr_tests);

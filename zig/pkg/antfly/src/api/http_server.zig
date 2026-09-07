@@ -10945,7 +10945,13 @@ pub const ApiHttpServer = struct {
             error.HASyncCommitWaitMissingContext,
             error.HASyncCommitWaitStandbyNotInPolicy,
             => return error.HAWriteDurabilityPending,
-            error.RaftBatchWriteOutcomeUnknown => return error.WriteOutcomeUnknown,
+            error.RaftBatchWriteOutcomeUnknown,
+            // Transport shutdown is an expected lifecycle outcome, but by
+            // itself does not prove that this batch's commit never began.
+            // Preserve the conservative do-not-retry signal, not an internal
+            // server error or an assertion that nothing was written.
+            error.ClientShuttingDown,
+            => return error.WriteOutcomeUnknown,
             // The public batch path is atomic: multi-group writes use 2PC and
             // the single-group fast path is one Raft command. Preserve the
             // conservative do-not-retry signal if a legacy adapter reports a
@@ -31701,6 +31707,21 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
 
+    for ([_]anyerror{ error.ClientShuttingDown, error.RaftBatchWriteOutcomeUnknown, error.RaftBatchWritePartialOutcome }) |unknown_err| {
+        writes.commit_error = unknown_err;
+        const calls_before = writes.batch_commit_calls;
+        var unknown_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer unknown_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, unknown_resp.body, "write outcome unknown") != null);
+        try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
+    }
+
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
         writes.commit_error = wait_err;
         var pending_resp = try executeHttpxTestRequest(&server, .{
@@ -31745,7 +31766,7 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 7), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 10), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {

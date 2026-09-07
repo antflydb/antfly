@@ -690,7 +690,8 @@ pub const AntflyApiHandler = struct {
         else
             metadata_api.catalog_route_default_deadline_ms;
         const bounded_ms = @max(@as(u32, 1), @min(budget_ms, metadata_api.catalog_route_max_deadline_ms));
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
             @as(u64, bounded_ms) *| std.time.ns_per_ms;
     }
 
@@ -1505,6 +1506,7 @@ pub const AntflyApiHandler = struct {
                 }.call,
             } else .none,
             .deadline_ns = ctx.application_deadline_ns,
+            .deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,
@@ -7301,6 +7303,27 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
+    // Routed reads use the transport's clock even when the host epoch is
+    // unrelated. Transaction-only ingress retains its native contract.
+    {
+        var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+        defer sim.deinit();
+        var routed_request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/internal/v1/groups/7/tables/docs/lookup/doc");
+        defer routed_request.deinit();
+        try routed_request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+        try routed_request.setHeader(metadata_api.catalog_route_deadline_ms_header, "250");
+        var routed_ctx = httpx.Context.init(std.testing.allocator, sim.io(), &routed_request);
+        defer routed_ctx.deinit();
+        AntflyApiHandler.establishCatalogRouteFenceDeadline(&routed_ctx);
+        const operation = AntflyApiHandler.operationContext(&routed_ctx, null);
+        try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), operation.deadline_ns.?);
+        try operation.ensureActive();
+        const options = db_mod.types.LookupOptions{ .execution_deadline_ns = operation.deadline_ns, .execution_io = operation.deadline_io };
+        try std.testing.expectEqual(@as(u64, 0), options.executionNowNs());
+        sim.monotonic_ns = 250 * std.time.ns_per_ms;
+        try std.testing.expectError(error.DeadlineExceeded, operation.ensureActive());
+        try std.testing.expect(options.executionNowNs() >= options.execution_deadline_ns.?);
+    }
     const budget_ms: u32 = 250;
     var request = try httpx.Request.init(
         std.testing.allocator,

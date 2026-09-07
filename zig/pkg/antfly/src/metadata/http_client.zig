@@ -301,7 +301,7 @@ pub const MetadataHttpClient = struct {
             request.content_type = "application/json";
         }
         if (budget) |value| {
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = value.nowNs();
             if (now_ns >= value.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
             const remaining_ns = value.deadline_ns - now_ns;
             const remaining_ms = @max(
@@ -337,7 +337,7 @@ pub const MetadataHttpClient = struct {
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_authority);
         defer self.alloc.free(uri);
 
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = budget.nowNs();
         if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         const remaining_ns = budget.deadline_ns - now_ns;
         const remaining_ms = @max(
@@ -383,7 +383,7 @@ pub const MetadataHttpClient = struct {
     ) !std.json.Parsed(metadata_api.CatalogRouteResolveResult) {
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_await_route);
         defer self.alloc.free(uri);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = budget.nowNs();
         if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         const remaining_ms = @max(
             @as(u64, 1),
@@ -1611,6 +1611,40 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
         parsed.value.store_id,
         routes.Routes.internal_node_status_suffix,
     });
+}
+
+test "metadata routing clients preserve the borrowed clock in every relative deadline" {
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+    defer sim.deinit();
+    const Executor = struct {
+        calls: usize = 0,
+        expected_ms: []const u8 = "1501",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(self.expected_ms, req.header(routes.routing_remaining_ms_header).?);
+            self.calls += 1;
+            return .{
+                .status = 504,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "deadline exceeded"),
+            };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const budget = RequestBudget{ .io = sim.io(), .deadline_ns = 18 * std.time.ns_per_s + 501 * std.time.ns_per_ms };
+    const uri = "http://metadata.test";
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchLinearizableRoutingSnapshot(uri, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.waitForRoutingChange(uri, .{}, false, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.awaitCatalogRoute(uri, .{ .query = .{ .table_name = "docs", .selector = .table } }, budget));
+    sim.monotonic_ns += 500 * std.time.ns_per_ms;
+    executor.expected_ms = "1001";
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    sim.monotonic_ns = budget.deadline_ns;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
 }
 
 test "metadata routing client forwards relative deadline and preserves timeout" {

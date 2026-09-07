@@ -52,6 +52,27 @@ const internal_service_secret = "metadata-simulation-internal-service-secret";
 const internal_service_issuer = "metadata-sim";
 const modeled_healthy_capacity_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+test "production distributed join oracle accepts broadcast without a shuffle ledger" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .alloc = alloc, .sim = undefined };
+    const body =
+        \\{"responses":[{"hits":{"hits":[{"_source":{"title":"production-tenant","docs.title":"production-left"}},{"_source":{"title":"production-tenant","docs.title":"production-right"}}]},"profile":{"join":{"distributed_execution":true,"groups_queried":2,"rows_matched":2}}}]}
+    ;
+    try std.testing.expect(try fixture.joinResponseComplete(body));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const join = parsed.value.object.getPtr("responses").?.array.items[0].object.getPtr("profile").?.object.getPtr("join").?;
+    join.object.getPtr("groups_queried").?.* = .{ .integer = 1 };
+    const single_owner = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(single_owner);
+    try std.testing.expect(!try fixture.joinResponseComplete(single_owner));
+    join.object.getPtr("groups_queried").?.* = .{ .integer = 2 };
+    join.object.getPtr("rows_matched").?.* = .{ .integer = 1 };
+    const incomplete = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(incomplete);
+    try std.testing.expect(!try fixture.joinResponseComplete(incomplete));
+}
+
 const ModeledCapacitySource = struct {
     sim: *vopr.vopr_io.VoprIo,
     root: []const u8,
@@ -1602,6 +1623,7 @@ pub const Fixture = struct {
             self.backend_runtimes[index] = try background_runtime.BackendRuntimeHandle.init(alloc, .{
                 .backend = .manual,
                 .borrowed_io = .{ .general = self.sim.io() },
+                .filesystem_io = self.sim.io(),
             });
             self.backend_runtime_count += 1;
             self.durable_job_lanes[index] = vopr_durable_job_lane.Lane.init(
@@ -2534,12 +2556,10 @@ pub const Fixture = struct {
         self.control_requests.post(self.sim.io());
         try self.control_completions.wait(self.sim.io());
         if (self.driver_failure) |err| return err;
-        // Give independently owned Raft and HTTP tasks a deterministic
-        // scheduling boundary before the next status observation. Promoted
-        // histories retain their accelerated cadence; the resource campaign
-        // uses the managed production cadence because capacity can keep a
-        // committed apply pending for the full request deadline.
-        try self.sim.io().sleep(.fromMilliseconds(self.driverCadenceMs()), .awake);
+        // Respect production control pacing while independent Raft and HTTP
+        // tasks advance. A 1 ms hot loop burns the history budget on repeated
+        // cached observations before a normal heartbeat/cache interval elapses.
+        try self.sim.io().sleep(.fromMilliseconds(raft_runtime_loop.RuntimeCadence.default_control_tick_ms), .awake);
     }
 
     fn driverCadenceMs(self: *const Fixture) i64 {
@@ -2551,28 +2571,12 @@ pub const Fixture = struct {
 
     fn driveRaft(self: *Fixture, index: usize) void {
         defer self.raft_driver_done[index] = true;
-        // Existing promoted histories intentionally use an accelerated 1 ms
-        // scheduling quantum. Resource admission can keep a committed apply
-        // pending for the full public request deadline; run that campaign at
-        // the managed production driver's real default cadence so it tests
-        // bounded retries rather than manufacturing thousands of hot-loop
-        // attempts that production would never schedule.
-        const cadence_ms = self.driverCadenceMs();
+        // A Raft round advances election/heartbeat ticks, not just queued I/O.
+        // Keep its interval independent of workload/control pacing: the old
+        // 1 ms control quantum accelerated election timeouts 100x relative to
+        // the simulated network and production request deadlines.
+        const cadence_ms = raft_runtime_loop.RuntimeCadence.default_raft_tick_ms;
         while (!self.driver_stop) {
-            if (self.control_round_active) {
-                // Let an explicitly scheduled production control operation
-                // reach its next external boundary before making another Raft
-                // ticker runnable. This is a valid deterministic schedule and
-                // prevents continuously due tickers from starving the control
-                // task that production's runtime scheduler would service.
-                self.sim.io().sleep(.fromMilliseconds(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms), .awake) catch |err| {
-                    if (err == error.Canceled and self.driver_stop) return;
-                    self.driver_failure = err;
-                    self.driver_stop = true;
-                    return;
-                };
-                continue;
-            }
             if (self.data_server_paused[index] or !self.data_server_live[index]) {
                 self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
                     if (err == error.Canceled and self.driver_stop) return;
@@ -2583,14 +2587,14 @@ pub const Fixture = struct {
                 continue;
             }
             self.raft_driver_active[index] = true;
-            self.data_servers[index].runRaftProgressRoundOnly() catch |err| {
+            const advanced = self.data_servers[index].tryRunRaftProgressRoundOnly() catch |err| {
                 self.raft_driver_active[index] = false;
                 self.driver_failure = err;
                 self.driver_stop = true;
                 return;
             };
             self.raft_driver_active[index] = false;
-            self.raft_driver_rounds[index] +|= 1;
+            if (advanced) self.raft_driver_rounds[index] +|= 1;
             self.sim.io().sleep(.fromMilliseconds(cadence_ms), .awake) catch |err| {
                 if (err == error.Canceled and self.driver_stop) return;
                 self.driver_failure = err;
@@ -3981,7 +3985,7 @@ pub const Fixture = struct {
         const distributed = join_value.object.get("distributed_execution") orelse return false;
         const groups = join_value.object.get("groups_queried") orelse return false;
         const rows = join_value.object.get("rows_matched") orelse return false;
-        const worker_attempts = join_value.object.get("worker_attempts") orelse return false;
+        const worker_attempts = join_value.object.get("worker_attempts") orelse .null;
         // Broadcast reports each right owner in groups_queried. A shuffle
         // finalizer delegates partitions instead, so its production witness
         // is the exact-group worker-attempt ledger plus the finalizer ledger

@@ -691,7 +691,7 @@ const ManagedReadinessFixture = struct {
             .physical_root_mode = .external_backend,
             .external_root_incarnation = 1,
             .index_repair_checkpoint_storage = self.repair_storage.storage(),
-            .start_index_workers = false,
+            .start_index_workers = true,
             .start_optional_runtime_workers = false,
             .ttl_cleanup = .{ .enabled = false },
             .enrichment = .{
@@ -783,7 +783,7 @@ const managed_readiness_atomic_config =
 
 pub const ManagedReadinessScenario = struct {
     pub const name: []const u8 = "managed-index-readiness";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const fail_closed_id = vopr.id.stable(name, "atomic-and-initial-publication-fail-closed");
     const progressive_id = vopr.id.stable(name, "progressive-checkpoint-is-queryable");
@@ -931,7 +931,24 @@ pub const ManagedReadinessScenario = struct {
         }
 
         fn firstCheckpoint(self: *@This()) !void {
+            if (self.fixture.db.executor.appliedSequence(managed_readiness_index_name) == null)
+                return error.ManagedIndexCanonicalWorkerMissing;
+            // Admission records bounded repair debt; the repair owner, not
+            // the ordinary replay drain, discovers the existing corpus.
+            const result = try self.fixture.db.advanceIndexRepairIntent(
+                self.allocator,
+                self.repair_id.?,
+                .{},
+            );
+            if (!result.attempted or !result.deferred or result.repaired or result.terminal)
+                return error.ManagedIndexSourceReplayDidNotAdvance;
             try self.fixture.db.runUntilIdle();
+            const checkpoint = try self.fixture.db.core.loadProjectionCheckpoint(
+                self.allocator,
+                managed_readiness_index_name,
+            );
+            if (checkpoint.published_count != 1)
+                return error.ManagedIndexPartialCheckpointMissing;
             self.stage = .grow;
         }
 
@@ -952,7 +969,7 @@ pub const ManagedReadinessScenario = struct {
                 self.progressive_partial_hits = try self.searchHits();
                 self.progressive_partial_queryable =
                     stats.index_repair_active_generation_serviceable and
-                    stats.repair_degraded and
+                    !stats.repair_degraded and
                     stats.doc_count == 1 and
                     self.progressive_partial_hits == 1 and
                     try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
@@ -1236,7 +1253,7 @@ fn runManagedReadinessMode(allocator: std.mem.Allocator, mode_id: u64) !void {
     var artifact = try vopr.runner.run(ManagedReadinessScenario, allocator, scripted.source(), .{
         .system = "antfly",
         .transition_budget = 12,
-        .source_revision = "managed-index-readiness-vopr-v1",
+        .source_revision = "managed-index-readiness-vopr-v2",
         .target = "native",
         .optimize = @tagName(builtin.mode),
     });

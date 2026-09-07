@@ -73,8 +73,8 @@ fn resolveCatalogGroupsEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) ![]u64 {
-    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
-    const budget = table_catalog.RoutingBudget.init(deadline_ns);
+    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
+    const budget = catalog.budget(deadline_ns);
     return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,
@@ -11838,8 +11838,8 @@ pub const ProvisionedTableWriteSource = struct {
         while (!self.tryBeginTableRequest(table_name)) {
             try cancellation.check();
             try fence.admission_cancellation.check();
-            if (platform_time.monotonicNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
-            platform.clock.Clock.real().sleepMs(1);
+            if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            try self.catalog.budget(null).sleepNs(std.time.ns_per_ms);
         }
         errdefer self.endTableRequest(table_name);
         try cancellation.check();
@@ -19707,8 +19707,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
-        const routing_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
-        const routing_budget = table_catalog.RoutingBudget.init(routing_deadline_ns);
+        const routing_deadline_ns = self.catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        const routing_budget = self.catalog.budget(routing_deadline_ns);
         var route = (try resolveCatalogRouteEventuallyUntil(
             alloc,
             self.catalog,
@@ -20813,7 +20813,7 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
         try cancellation.check();
@@ -21567,7 +21567,7 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_req.table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
 
@@ -24374,7 +24374,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             alloc,
             self.catalog,
             table_name,
-            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+            self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
 
@@ -32257,7 +32257,7 @@ fn loadTableIdentityNamespaceForGroup(
     // safe for tentative reads because a removed/reassigned group may still
     // be present in a follower or TTL cache.
     var snapshot = try (try catalog.routingSource()).linearizableSnapshot(
-        platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
     );
     defer snapshot.deinit();
     var table_id: ?u64 = null;
