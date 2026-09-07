@@ -12428,30 +12428,41 @@ pub const DB = struct {
         alloc: Allocator,
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
+        const target = (try self.managedAdmissionProofTarget(alloc, intent)) orelse return false;
+        return try self.managedGenerationIsServiceableAtLeast(alloc, intent.index_name, intent.config_hash, target);
+    }
+
+    fn managedAdmissionProofTarget(
+        self: *DB,
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+    ) !?u64 {
         if ((intent.kind != .dense_vector and intent.kind != .sparse_vector) or
             intent.work_class != .initial_build or
             intent.candidate_relative_path != null or
-            intent.phase != .detected)
+            intent.phase != .detected or
+            intent.root_generation != self.core.root_generation)
         {
-            return false;
+            return null;
         }
 
         const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
         defer alloc.free(admission_key);
         const admission_raw = self.core.store.get(alloc, admission_key) catch |err| switch (err) {
-            error.NotFound => return false,
+            // Idle coverage recovery can follow a completed admission whose
+            // marker is already retired. It still owns the canonical detected
+            // generation; its exact config/target and live checkpoint prove
+            // publication without borrowing authority from a shadow or repair.
+            error.NotFound => return if (intent.trigger == .replay_artifact_unavailable)
+                intent.target_sequence
+            else
+                null,
             else => return err,
         };
         defer alloc.free(admission_raw);
         const marker = try decodeManagedIndexAdmissionMarker(admission_raw);
-        if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
-
-        return try self.managedGenerationIsServiceableAtLeast(
-            alloc,
-            intent.index_name,
-            intent.config_hash,
-            @max(marker.replay_target_sequence, intent.target_sequence),
-        );
+        if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return null;
+        return @max(marker.replay_target_sequence, intent.target_sequence);
     }
 
     /// Atomic managed admission normally defers the canonical derived worker
@@ -12500,29 +12511,12 @@ pub const DB = struct {
         alloc: Allocator,
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
-        if ((intent.kind != .dense_vector and intent.kind != .sparse_vector) or
-            intent.work_class != .initial_build or
-            intent.candidate_relative_path != null or
-            intent.phase != .detected)
-        {
-            return false;
-        }
-
-        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
-        defer alloc.free(admission_key);
-        const admission_raw = self.core.store.get(alloc, admission_key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        defer alloc.free(admission_raw);
-        const marker = try decodeManagedIndexAdmissionMarker(admission_raw);
-        if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
-
+        const target = (try self.managedAdmissionProofTarget(alloc, intent)) orelse return false;
         return try self.progressiveManagedGenerationIsQueryableAtLeast(
             alloc,
             intent.index_name,
             intent.config_hash,
-            @max(marker.replay_target_sequence, intent.target_sequence),
+            target,
         );
     }
 
@@ -26342,6 +26336,17 @@ pub const DB = struct {
         repair_state_corrupt: bool,
         item: *types.DBIndexStats,
     ) !void {
+        // Compatibility overlays can carry a retired intent. Replace the
+        // complete durable lifecycle bundle, including the no-intent case.
+        if (item.index_repair_last_error) |value| alloc.free(value);
+        const defaults = types.DBIndexStats{ .name = item.name, .kind = item.kind };
+        inline for (@typeInfo(types.DBIndexStats).@"struct".fields) |field| {
+            if (comptime std.mem.startsWith(u8, field.name, "index_repair_") or
+                std.mem.eql(u8, field.name, "index_lifecycle_work_class"))
+            {
+                @field(item, field.name) = @field(defaults, field.name);
+            }
+        }
         if (repair_state_corrupt) {
             item.index_lifecycle_work_class = .repair;
             item.index_repair_trigger = "corrupt_local_repair_state";
@@ -27338,8 +27343,6 @@ pub const DB = struct {
                 // Live cardinality and cached readiness are not one observation.
                 // A shadow may now be installed but still gated by validation.
                 // Refresh durable lifecycle and the query gate with the counts.
-                if (item.index_repair_last_error) |value| stats_alloc.free(value);
-                item.index_repair_last_error = null;
                 try self.applyDurableIndexRepairStats(
                     stats_alloc,
                     if (repairs) |*state| state else null,
@@ -87972,7 +87975,11 @@ test "db repair preflight retains a canonical generation completed after schedul
     try testManagedGenerationRepairAdmission(.late_completion);
 }
 
-fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion }) !void {
+test "db coverage recovery admits a published generation after its admission marker retires" {
+    try testManagedGenerationRepairAdmission(.coverage_recovery);
+}
+
+fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery }) !void {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -88002,10 +88009,29 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
     try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
 
-    if (mode == .late_completion) {
+    if (mode == .coverage_recovery) {
+        try db.removeIndexRepairIntentAndPin(alloc, admission_id);
+        const recovery_id = try db.createGenerationRepairIntentAtTarget(
+            alloc,
+            cfg,
+            .replay_artifact_unavailable,
+            0,
+            0,
+            "generated_source_coverage_incomplete_after_replay",
+            null,
+            .pending,
+            .initial_build,
+        );
+        var recovery = try db.loadIndexRepairEntryById(alloc, recovery_id);
+        defer recovery.deinit(alloc);
+        try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, recovery.intent));
+        try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, recovery.intent));
+    }
+
+    if (mode == .late_completion or mode == .coverage_recovery) {
         // Enter the selected owner's reconstruction path after the canonical
         // worker has finished, bypassing only the earlier scheduler probe.
-        const ready_stats = try db.stats(alloc);
+        var ready_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, ready_stats);
         try db.failIfIndexQuarantined(cfg.name);
         try std.testing.expect(try db.beginIndexRepairLease(cfg.name));
@@ -88019,6 +88045,13 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         try std.testing.expectEqual(@as(u64, 1), repair.repaired);
         try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
         try db.failIfIndexQuarantined(cfg.name);
+        try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &ready_stats));
+        for (ready_stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, cfg.name)) continue;
+            try std.testing.expectEqual(@as(?u128, null), item.index_repair_id);
+            try std.testing.expectEqual(types.IndexLifecycleWorkClass.none, item.index_lifecycle_work_class);
+            try std.testing.expect(item.serving_snapshot_ready);
+        }
         return;
     }
 
