@@ -761,7 +761,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         table_name,
         index_name,
         timeout_s=30.0,
-        interval_s=0.25,
+        interval_s=0.01,
         until="complete",
     )
     index = backup_api.get_index(table_name, index_name)
