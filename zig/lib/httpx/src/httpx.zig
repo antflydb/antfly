@@ -104,6 +104,7 @@ pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const common = @import("util/common.zig");
 pub const attachment_envelope = @import("util/attachment_envelope.zig");
+pub const numeric_response = @import("util/numeric_response.zig");
 
 pub const testing_mod = @import("testing.zig");
 
@@ -352,6 +353,10 @@ test "core types" {
 
 test "headers" {
     _ = headers;
+}
+
+test "numeric response" {
+    _ = numeric_response;
 }
 
 test "uri" {

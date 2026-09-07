@@ -4648,6 +4648,7 @@ fn validateSparseEmbeddingForEntry(
         error.InvalidEmbeddingResponse,
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
+        error.QueueFull,
         error.EmbedRequestFailed,
         => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
@@ -4724,6 +4725,7 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         // contract so clients do not turn transient saturation into a
         // permanent configuration failure.
         error.ConcurrencyUnavailable,
+        error.QueueFull,
         => true,
         else => false,
     };
@@ -5106,7 +5108,6 @@ fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected
 
 fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
     return switch (err) {
-        error.QueueFull,
         error.ResourceTemporarilyUnavailable,
         => error.EmbedTransientFailure,
         else => err,
@@ -8752,9 +8753,9 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     const sparse_entry = managed.findEntry("sparse_idx").?;
     const multimodal_entry = managed.findEntry("multimodal_idx").?;
 
-    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
-    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+    try std.testing.expectError(error.QueueFull, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.QueueFull, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.QueueFull, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.ResourceTemporarilyUnavailable;
     try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));

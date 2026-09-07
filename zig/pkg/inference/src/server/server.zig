@@ -9166,6 +9166,15 @@ pub const Node = struct {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 }
+                if (httpx.numeric_response.requested(ctx.header("Accept"))) {
+                    const frame = buildDenseNumericFrame(ctx.allocator, embeddings, requested_dimensions, admission_manifest.normalize) catch |err| switch (err) {
+                        error.InvalidEmbeddingDimensions => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "dimensions exceeds the model embedding size" }),
+                        error.NumericResponseTooLarge => return ctx.status(413).json(.{ .@"error" = "RESPONSE_TOO_LARGE", .message = "numeric response exceeds the 4 MiB frame limit" }),
+                        else => return err,
+                    };
+                    errdefer ctx.allocator.free(frame);
+                    return publishNumericFrame(ctx, frame);
+                }
                 const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, admission_manifest.normalize, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
@@ -13420,6 +13429,15 @@ pub const Node = struct {
         scores: []const f32,
         prompt_tokens: usize,
     ) !httpx.Response {
+        if (httpx.numeric_response.requested(ctx.header("Accept"))) {
+            const frame = httpx.numeric_response.allocFrame(ctx.allocator, .scores, scores.len, 1) catch |err| switch (err) {
+                error.NumericResponseTooLarge => return ctx.status(413).json(.{ .@"error" = "RESPONSE_TOO_LARGE", .message = "numeric response exceeds the 4 MiB frame limit" }),
+                else => return err,
+            };
+            errdefer ctx.allocator.free(frame);
+            for (scores, 0..) |score, i| try httpx.numeric_response.setValue(frame, i, score);
+            return publishNumericFrame(ctx, frame);
+        }
         const data = try ctx.allocator.alloc(api.RerankObject, scores.len);
         defer ctx.allocator.free(data);
         for (scores, 0..) |score, i| {
@@ -26355,6 +26373,72 @@ fn truncatedEmbeddingScale(emb: []const f32, dimensions: usize, renormalize: boo
     for (emb[0..dimensions]) |val| norm_sq += @as(f64, val) * @as(f64, val);
     if (norm_sq <= 0) return 1.0;
     return 1.0 / @sqrt(norm_sq);
+}
+
+/// Transfers the frame only after headers have been built successfully.
+fn publishNumericFrame(ctx: *httpx.Context, frame: []u8) !httpx.Response {
+    try ctx.setHeader("Content-Type", httpx.numeric_response.content_type);
+    // Multiple Vary fields compose; do not erase Origin or another middleware's
+    // cache key when adding representation negotiation.
+    try ctx.response.headers.append("Vary", "Accept");
+    var response = try ctx.response.build();
+    errdefer response.deinit();
+    try response.headers.setContentLength(frame.len);
+    response.body = frame;
+    response.body_owned = true;
+    return response;
+}
+
+fn buildDenseNumericFrame(alloc: std.mem.Allocator, embeddings: []const []const f32, requested_dimensions: ?usize, renormalize: bool) ![]u8 {
+    if (embeddings.len == 0) return error.InvalidEmbeddingResponse;
+    const dimensions = requested_dimensions orelse embeddings[0].len;
+    for (embeddings) |row| if (dimensions > row.len or row.len != embeddings[0].len) return error.InvalidEmbeddingDimensions;
+    const frame = try httpx.numeric_response.allocFrame(alloc, .dense, embeddings.len, dimensions);
+    errdefer alloc.free(frame);
+    for (embeddings, 0..) |row, i| {
+        const scale = truncatedEmbeddingScale(row, dimensions, renormalize);
+        for (row[0..dimensions], 0..) |value, j|
+            try httpx.numeric_response.setValue(frame, i * dimensions + j, @floatCast(@as(f64, value) * scale));
+    }
+    return frame;
+}
+
+test "Antfly inference numeric dense response preserves truncation and normalization" {
+    const alloc = std.testing.allocator;
+    const rows = [_][]const f32{ &.{ 0.48, 0.64, 0.6 }, &.{ 0, 0, 1 } };
+    const frame = try buildDenseNumericFrame(alloc, &rows, 2, true);
+    defer alloc.free(frame);
+    const view = try httpx.numeric_response.parse(frame, .dense, 2, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), view.value(0), 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), view.value(1), 0.00001);
+    try std.testing.expectEqual(@as(f32, 0), view.value(2));
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, buildDenseNumericFrame(alloc, &rows, 4, true));
+}
+
+test "Antfly inference numeric HTTP response ownership is allocation failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var request = try httpx.Request.init(alloc, .POST, "/ai/v1/rerank");
+            defer request.deinit();
+            try request.headers.set("Accept", httpx.numeric_response.accept);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            try ctx.setHeader("Vary", "Origin");
+            var response = try Node.writeRerankScoresResponse(&ctx, "reranker", &.{ 0.25, 0.75 }, 2);
+            defer response.deinit();
+            try std.testing.expectEqualStrings(httpx.numeric_response.content_type, response.contentType().?);
+            try std.testing.expectEqualStrings("Origin", response.headers.get("Vary").?);
+            var varies_on_accept = false;
+            for (response.headers.entries.items) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "Vary") and std.mem.eql(u8, header.value, "Accept")) varies_on_accept = true;
+            }
+            try std.testing.expect(varies_on_accept);
+            try std.testing.expectEqualStrings("32", response.headers.get("Content-Length").?);
+            const view = try httpx.numeric_response.parse(response.body.?, .scores, 2, 1);
+            try std.testing.expectEqual(@as(f32, 0.75), view.value(1));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn buildEmbedDenseResponse(

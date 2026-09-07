@@ -3360,7 +3360,7 @@ The hardening above follows these long-term rules:
     capability owners are borrowed, while mutable invocation credentials,
     progress, cancellation, allocations and outputs are not shared. Publication
     remains coordinator-owned. Regressions cover lane use, credit release,
-    independent typed output, and embedding/OCR overlap; hardware throughput
+    independent typed output, and bounded peer execution; hardware throughput
     qualification remains separate.
 152. **Implemented after invocation-plan review:** media memory planning is
     pure arithmetic over a coordinator-resolved capability snapshot. The same
@@ -3387,14 +3387,55 @@ The hardening above follows these long-term rules:
     per invocation. JSON providers and distributed responses retain their
     conservative bounded response/parser contract; shrinking those limits also
     requires bounding discovery and response parsing, not just vector bytes.
-155. **Implemented after owner-overlap review:** shared-window work has an
-    explicit begin/join lifetime spanning the owner's inference. The common
-    OCR-owner plus one embedding-consumer case can overlap without a third
-    producer. Speculative rendering may run alongside this group only under
-    the existing joint memory admission. Tests cover two-consumer progress,
-    borrowed-pointer identity, cancellation/join, and resource-credit release.
+155. **Corrected after owner-overlap/admission review:** shared-window work has
+    an explicit begin/join lifetime, but executor slots do not represent model
+    permits. Embedding peers drain before synchronous text consumers and before
+    `begin` returns to the owner. A peer rejected explicitly by inference
+    admission gets one serial retry after the entire cohort has joined; the
+    rest of that window stays serial. Local `QueueFull` and the distributed
+    503 `reason=inference_admission, retryable=true` retain this distinction.
+    Arbitrary transport failures, rate limits, and model errors do not authorize
+    that retry. Successful peers stage normally; owner progress on a one-slot
+    node does not depend on an external replay or another render traversal.
+    Owner/peer inference overlap is intentionally disabled until a provider can
+    atomically grant the group's weighted permits, including expanded media
+    admission. CPU render prefetch still uses its separate joint memory grant.
+156. **Implemented after memory-lifetime review:** asynchronous invocations and
+    shared PNG representations own independent, non-reclaiming grants. They
+    cannot freeze or borrow the owner's retained-page/invocation allocator.
+    Synchronous, joined scopes may still reuse idle owner credit. Optional
+    sharing that cannot obtain its additional grant declines without taking
+    the owner's reserved capacity. Alternate PNG storage is released as soon
+    as its peers finish, before owner inference or prefetch. Tests allocate from
+    the real owner grant while a full independent peer grant remains live and
+    verify ledger release.
+157. **Implemented after completion-order review:** the bounded inference job
+    set uses a completion event and per-slot completion state. A completed slot
+    is joined, fenced, published and released before refilling it, even if an
+    earlier sibling remains slow. This removes the full-wave barrier from queue
+    refill without adding threads or moving durable publication to workers.
+158. **Implemented after page-ownership review:** rendered pages remain owned
+    by their window until fallible quality-warning updates succeed. Per-item
+    cleanup is registered before ownership transfer; failure joins borrowers
+    before releasing media. Allocation-failure sweeps cover warning creation.
+159. **Implemented after distributed numeric-response review:** dense embedding
+    and reranker clients negotiate `application/vnd.antfly.numeric.v1` with
+    JSON fallback. The node writes bounded f32 frames directly, preserving
+    dense truncation/renormalization and reranker order. V1 carries `AFN1`, a
+    little-endian u32 kind (1=dense, 2=scores), u64 row/column counts, then
+    row-major little-endian f32 values. Scores have one column. Frames are capped
+    at 4 MiB; readers validate version, kind, expected cardinality, shape, exact
+    byte length, overflow and finiteness before allocating results. Default,
+    sparse, and per-item-error responses remain JSON. Legacy octet-stream
+    decoders also reject malformed lengths and clean up partial allocations.
+    Response-construction allocation sweeps also cover the shared HTTP header
+    helper; failed list growth releases both copied header fields.
+    This removes JSON float serialization/parsing on negotiated calls, not the
+    conservative remote admission allowance: discovery/route validation and
+    old-node JSON fallback still share that allowance. Shrinking it requires
+    separately bounded discovery and a capability-bound response contract.
     Hardware throughput and peak-RSS qualification remain separate from these
-    deterministic scheduling regressions.
+    deterministic scheduling and wire regressions.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

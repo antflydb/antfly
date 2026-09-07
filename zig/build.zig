@@ -3561,7 +3561,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"managed embedder"},
+        .filters = &.{ "managed embedder", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");

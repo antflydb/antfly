@@ -298,7 +298,7 @@ pub const Provider = struct {
     source_table: ?[]u8 = null,
     capability_token: ?[]u8 = null,
     capability_revision: ?[]u8 = null,
-    request_header_storage: [5][2][]const u8 = undefined,
+    request_header_storage: [6][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -453,6 +453,14 @@ pub const Provider = struct {
         };
     }
 
+    fn numericRequestOptions(self: *Provider, options: httpx.RequestOptions) httpx.RequestOptions {
+        var result = options;
+        const count = if (options.headers) |headers| headers.len else 0;
+        self.request_header_storage[count] = .{ "Accept", httpx.numeric_response.accept };
+        result.headers = self.request_header_storage[0 .. count + 1];
+        return result;
+    }
+
     pub fn setSamplingOptions(
         self: *Provider,
         temperature: ?f32,
@@ -605,11 +613,12 @@ pub const Provider = struct {
                     httpx.attachment_envelope.content_type,
                     null,
                 ),
+                parts.len,
             );
         }
         const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);
         defer alloc.free(json_body);
-        return try self.embedJsonBody(alloc, json_body);
+        return try self.embedJsonBody(alloc, json_body, parts.len);
     }
 
     pub fn embedWithTask(
@@ -653,32 +662,40 @@ pub const Provider = struct {
             .instruction = instruction,
         });
         defer alloc.free(json_body);
-        return try self.embedJsonBody(alloc, json_body);
+        return try self.embedJsonBody(alloc, json_body, if (input == .array) input.array.items.len else 1);
     }
 
-    fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8) !inference.EmbedResult {
-        return self.embedBody(alloc, self.controlledJsonRequest(json_body, null));
+    fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8, expected_count: usize) !inference.EmbedResult {
+        return self.embedBody(alloc, self.controlledJsonRequest(json_body, null), expected_count);
     }
 
     fn embedBody(
         self: *Provider,
         alloc: std.mem.Allocator,
         options: httpx.RequestOptions,
+        expected_count: usize,
     ) !inference.EmbedResult {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
-        var resp = try self.http.post(url, options);
+        var resp = try self.http.post(url, self.numericRequestOptions(options));
         defer resp.deinit();
 
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
+            if (isInferenceAdmissionDenied(resp)) return error.QueueFull;
             return mapEmbedStatus(resp.status.code);
         }
 
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| {
+            if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+                const view = try httpx.numeric_response.parse(body, .dense, expected_count, null);
+                return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
+            }
             if (std.mem.startsWith(u8, ct, "application/octet-stream")) {
+                if (body.len < 16 or std.mem.readInt(u64, body[0..8], .little) != expected_count)
+                    return error.InvalidEmbeddingResponse;
                 var result = try binary.deserializeDense(alloc, body);
                 const vectors = result.vectors;
                 const dim = result.dimension;
@@ -691,7 +708,10 @@ pub const Provider = struct {
             }
         }
 
-        return try parseDenseJsonResponseAlloc(alloc, body);
+        var result = try parseDenseJsonResponseAlloc(alloc, body);
+        errdefer result.deinit();
+        if (result.vectors.len != expected_count) return error.InvalidEmbeddingResponse;
+        return result;
     }
 
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
@@ -793,13 +813,17 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
+        var resp = try self.http.post(url, self.numericRequestOptions(self.controlledJsonRequest(json_body, null)));
         defer resp.deinit();
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale
         else
             error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
+        if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+            const view = try httpx.numeric_response.parse(body, .scores, documents.len, 1);
+            return .{ .scores = try view.scoresAlloc(alloc), .allocator = alloc };
+        };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const scores = if (parsed.value.scores) |scores_src| blk: {
@@ -809,6 +833,9 @@ pub const Provider = struct {
             for (scores_src, 0..) |item, i| out[i] = item.score;
             break :blk out;
         } else return error.InvalidRerankerResponse;
+        errdefer alloc.free(scores);
+        if (scores.len != documents.len) return error.InvalidRerankerResponse;
+        for (scores) |score| if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
         return .{
             .scores = scores,
             .allocator = alloc,
@@ -838,6 +865,31 @@ fn isCapabilityStaleResponse(response: httpx.Response) bool {
     if (response.status.code != 409) return false;
     const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn isInferenceAdmissionDenied(response: httpx.Response) bool {
+    if (response.status.code != 503) return false;
+    const body = response.body orelse return false;
+    if (body.len > 4096) return false;
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const Failure = struct { reason: ?[]const u8 = null, retryable: bool = false };
+    var parsed = std.json.parseFromSlice(Failure, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.retryable and std.mem.eql(u8, parsed.value.reason orelse "", "inference_admission");
+}
+
+test "antfly provider preserves explicit distributed admission denial" {
+    var response = httpx.Response.init(std.testing.allocator, 503);
+    defer response.deinit();
+    response.body = "{\"reason\":\"inference_admission\",\"retryable\":true}";
+    try std.testing.expect(isInferenceAdmissionDenied(response));
+    response.body = "{\"reason\":\"model_loading\",\"retryable\":true}";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
+    response.body = "{\"reason\":\"inference_admission\",\"retryable\":false}";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
+    response.body = "not JSON";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
 }
 
 fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]const u8) void {
@@ -975,10 +1027,17 @@ test "antfly embed request carries retrieval task and instruction" {
 }
 
 test "antfly embed parts lends raw binary through its request envelope" {
-    return testEmbedPartsRequestRoundTrip();
+    return testEmbedPartsRequestRoundTrip(false);
 }
 
-fn testEmbedPartsRequestRoundTrip() !void {
+test "antfly numeric responses negotiate dense and score frames with JSON fallback" {
+    try testEmbedPartsRequestRoundTrip(false);
+    try testEmbedPartsRequestRoundTrip(true);
+    try testRerankScoresResponse(false);
+    try testRerankScoresResponse(true);
+}
+
+fn testEmbedPartsRequestRoundTrip(binary_response: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -988,6 +1047,7 @@ fn testEmbedPartsRequestRoundTrip() !void {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqual(httpx.Method.POST, req.method);
             try std.testing.expectEqualStrings("/embed", req.path);
+            try std.testing.expectEqualStrings(httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
             try std.testing.expectEqualStrings(
                 httpx.attachment_envelope.content_type,
                 req.header("Content-Type") orelse return error.TestExpectedContentType,
@@ -1002,10 +1062,13 @@ fn testEmbedPartsRequestRoundTrip() !void {
         }
     };
 
+    const frame = try httpx.numeric_response.allocFrame(alloc, .dense, 1, 3);
+    defer alloc.free(frame);
+    for ([_]f32{ 0.25, 0.5, 0.75 }, 0..) |value, i| try httpx.numeric_response.setValue(frame, i, value);
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
-            .body = "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
-            .content_type = "application/json",
+            .body = if (binary_response) frame else "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
+            .content_type = if (binary_response) httpx.numeric_response.content_type else "application/json",
         } },
     });
     defer ts.deinit();
@@ -1221,16 +1284,23 @@ test "antfly rerank round trip" {
 }
 
 test "antfly rerank accepts scores array response" {
+    try testRerankScoresResponse(false);
+}
+
+fn testRerankScoresResponse(binary_response: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const frame = try httpx.numeric_response.allocFrame(alloc, .scores, 2, 1);
+    defer alloc.free(frame);
+    try httpx.numeric_response.setValue(frame, 0, 0.8);
+    try httpx.numeric_response.setValue(frame, 1, 0.2);
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/rerank", .respond = .{
-            .body =
-            \\{"scores":[0.8,0.2]}
-            ,
+            .body = if (binary_response) frame else "{\"scores\":[0.8,0.2]}",
+            .content_type = if (binary_response) httpx.numeric_response.content_type else "application/json",
         } },
     });
     defer ts.deinit();
