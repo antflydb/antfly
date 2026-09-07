@@ -425,31 +425,49 @@ The repository includes runnable Lite templates:
   dense vector index with caller-supplied embeddings, full-text search, dense
   search, hybrid search, status, and portable backup.
 
-Both examples are gated by `zig build lite-core` against the built
+Both examples are gated by `zig build lite-test` against the built
 `libantfly` C ABI.
 
-## Build Profiles
+## Build And Test
 
-The repository exposes focused Lite build profiles:
+Build the Lite CLI and `libantfly` from the `zig` directory:
 
 ```bash
-zig build lite-core
-zig build lite-full -Dlite-local-inference-runtime=true
-zig build lite-wasm
-zig build capi-package-test
-zig build lite-dev
+zig build lite
 ```
 
-`lite-core` builds the embedded database and maintenance CLI,
-and `libantfly` without a heavyweight local inference runtime. `lite-full`
-builds the full Antfly CLI with Lite support and requires the local inference
-runtime capability flag so Lite status, C ABI, and bindings advertise
-`local_embedded` correctly. `lite-wasm` builds the
-hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
-pulling in the broader server or inference WASM bundle. `capi-package-test`
-checks that release packaging preserves the `libantfly` header and library
-artifacts. `lite-dev` runs the broader development and compatibility checks,
-including the Lite WASM profile and packaging regression.
+`lite` installs the Lite-only CLI as `zig-out/bin/antfly`, along with the
+`libantfly` library and C header. It reuses the standalone runtime archives,
+including the API and inference runtimes needed by `lite serve`. It does not
+run tests.
+
+Run the Lite backend, CLI, C ABI, Go bindings, embedded examples, and packaging
+checks separately:
+
+```bash
+zig build lite-test
+```
+
+The tests exercise both the Lite-only CLI and the full Antfly CLI. Focused
+checks remain available, including `lite-native-test`, `lite-cmd-test`,
+`lite-go-test`, and `capi-package-test`. Both CLI smoke tests run as part of
+`lite-test` without a separate build target.
+
+For the full Antfly CLI with Lite commands and the C library, use the existing
+build targets:
+
+```bash
+zig build antfly capi
+```
+
+When embedding a local inference runtime, pass
+`-Dlite-local-inference-runtime=true` to advertise its availability in Lite
+status and bindings. The flag declares the capability; it does not package a
+separate inference runtime.
+
+Build and install the embedded database and inference WASM bundle with
+`zig build wasm`. Run `zig build wasm-test` to build the bundle and execute
+its Node smoke test.
 
 ## Integrity And Maintenance
 
