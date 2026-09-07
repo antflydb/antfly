@@ -400,6 +400,12 @@ views use a compact loaded-page bitmap and allocate no JSON slots. Logical
 slots are allocated only on first materialization, sized to the actual block
 row count; scalar and existence predicates never allocate them.
 `column_view_bytes` and `logical_slots_initialized` expose these costs.
+Logical column values borrow strings and exact JSON number tokens from their
+pinned decoded payloads. Only containers and escaped tokens need new storage;
+an iterative standard-tokenizer adapter validates JSON without recursive parser
+frames. Durable prepared rows and values retained across primary-cursor advances
+continue to use owned materialization. Borrowed trees never enter the payload
+cache or escape block lifetime.
 
 Each scan also owns a lazy, byte-budgeted cache of verified typed payloads,
 shared across its block read scopes. Payloads own decompressed byte buffers;
@@ -443,6 +449,25 @@ trades bounded block workspace for less row decoding: selective nested scans
 allocate 138/310 kB (LMDB/LSM), versus 27 kB for the streaming primary baseline;
 dense full output allocates about 6.9/7.0 MB versus 35.8 MB. These are fixture
 measurements, not universal latency guarantees or timing-based test gates.
+
+The dense nested-predicate benchmark exercises 512 rows whose JSON column has
+a matching scalar and an unselected 2,049-element array (~4 KiB per row).
+Five measured rounds follow a warmup. On the same local ReleaseFast arm64 macOS
+setup, compared with `b021b89de` before selection reuse/borrowed materialization:
+
+| Backend | Median milliseconds, before → after | Cumulative allocated bytes, before → after |
+| --- | ---: | ---: |
+| LMDB | 81.230 → 29.733 | 263,149,212 → 82,092,620 |
+| LSM | 78.278 → 31.151 | 275,850,442 → 102,463,108 |
+
+All 512 primary owners are still read and checked; the already-evaluated
+predicate is reused, not run twice. Allocation totals are allocator traffic,
+not peak RSS. Reproduce with `--test-filter 'relational columnar dense nested
+predicate benchmark'`. The deterministic historical-plan churn benchmark
+(`--test-filter 'column scan cursor historical churn'`) warms 32 resident epochs
+then visits 32 consecutive rows from a rejected epoch: execution ownership cuts
+plan builds from 32 to 1 and allocated bytes from 58,464 to 1,827 in its small
+two-column fixture. Regression gates assert work/ownership bounds, not timings.
 
 Reproducible focused benchmarks (Zig 0.16, ReleaseFast, arm64 macOS):
 
@@ -724,17 +749,28 @@ exclusion, and special-field output uses late AROW materialization after selecti
 with special-field loaders sharing the same read transaction. A block with at
 least a block's worth of remaining output budget costs actual surviving row bytes
 and random-read overhead against sequential primary access; dense output takes
-the latter. Small limits retain page-window evaluation.
+the latter. Evaluated selection masks survive that switch: an ordered cursor
+reuses positive and negative decisions only for unchanged owners with matching
+key, schema version, semantic hash, and timestamp. Dirty/unknown owners still
+evaluate their authoritative rows. Small limits retain page-window evaluation.
 
 `column_scan_plan.zig` binds filter roots, nested traversal, and projection
 ordinals once per resident schema epoch. Clean blocks, dirty overlays, and
 primary ranges share the request-local plan cache. Up to 32 resident plans use
 frequency-based admission; active blocks pin their immutable views and cannot
-be evicted by a different dirty-row epoch. Capacity pressure uses transient
-owned plans, with no global locks or cross-request cache. Compiled predicates
+be evicted by a different dirty-row epoch. Each of the column, dirty-overlay,
+and sequential-primary streams independently pins its active plan, including
+plans rejected by cache admission. A covered primary range also borrows its
+block's plan across interleaved dirty epochs. Thus cache pressure cannot turn
+a consecutive historical run into per-row schema compilation. Residency stays
+bounded at 32 cache entries plus at most three active execution pins; acquiring
+a successor may temporarily retain one extra plan. No global locks or
+cross-request cache are introduced. Compiled predicates
 are borrowed from the request instead of copied into every epoch plan.
 `scan_plans_built`, `scan_plan_hits`, and `late_materialized_{rows,bytes}` expose
-binding reuse and deferred primary I/O.
+binding reuse and deferred primary I/O. `selection_reused_rows` and
+`primary_predicate_rows` distinguish reused decisions from authoritative
+predicate evaluations, including overlay work.
 
 Checked directory boundary links detect missing range entries; block
 and manifest checksums protect derived bytes. Corruption resumes

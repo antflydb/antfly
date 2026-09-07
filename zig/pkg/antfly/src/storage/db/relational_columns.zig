@@ -1541,9 +1541,14 @@ const Directory = struct {
 
 const DirtyRanges = struct {
     read_cost: u64 = 0,
+    plans: scan_plan.Cursor = .{},
     cursor: store_mod.DocStore.Txn.CursorAdapter,
     pending: ?[]const u8,
     pending_bytes: ?u64 = 0,
+    fn deinit(self: *@This()) void {
+        self.plans.deinit();
+        self.cursor.close();
+    }
     fn setPending(self: *@This(), entry: anytype) void {
         self.pending = if (entry) |kv| kv.key else null;
         self.pending_bytes = 0;
@@ -1621,12 +1626,14 @@ const DirtyRanges = struct {
             if (opts.columnar_stats) |stats| stats.primary_rows_read += 1;
             self.read_cost +|= bytes.len;
             const version = try codec.rowSchemaVersion(bytes);
-            const plan = try plans.get(db, version);
-            defer plan.release();
+            const plan = try self.plans.get(plans, db, version);
             const view = plan.view;
             const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
             const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
             if (!eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns)) continue;
+            if (plan.filter != null) {
+                if (opts.columnar_stats) |stats| stats.primary_predicate_rows += 1;
+            }
             if (!try plan.matches(scratch, id, typed)) continue;
             const projected = if (opts.include_documents) try projectPrimary(plan, materializer, scratch, id, typed) else null;
             try deliver(alloc, row, projected, opts, visitor, progress);
@@ -1637,7 +1644,7 @@ const DirtyRanges = struct {
 
 fn rangeClean(read: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range) !bool {
     var dirty = try DirtyRanges.init(read, alloc, range.start);
-    defer dirty.cursor.close();
+    defer dirty.deinit();
     return !try dirty.overlaps(alloc, range.start, range.end);
 }
 
@@ -2387,7 +2394,9 @@ const Block = struct {
             if (self.stats) |stats| stats.cell_cache_hits += 1;
         } else try self.loadPage(ordinal, value.pages.?.containing(row));
         const cell = cells_view[row] orelse return error.InvalidColumnSegment;
-        const logical = try codec.ownedJsonValueFromCellAlloc(self.alloc, self.table.relational_columns[ordinal], cell);
+        // Decoded payloads stay pinned until block teardown; only containers
+        // and escaped JSON tokens need new storage, never stable cell bytes.
+        const logical = try codec.borrowedJsonValueFromCellAlloc(self.alloc, self.table.relational_columns[ordinal], cell);
         logical_slots[row] = logical;
         if (self.stats) |stats| stats.values_materialized += 1;
         return logical;
@@ -2652,13 +2661,17 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
     if (!manifest.ready) return false;
     var plans = scan_plan.Cache{ .alloc = alloc, .source = filter, .opts = opts };
     defer plans.deinit();
+    var column_plans: scan_plan.Cursor = .{};
+    defer column_plans.deinit();
+    var primary_plans: scan_plan.Cursor = .{};
+    defer primary_plans.deinit();
     const bootstrap = try bootstrapBoundary(txn, manifest);
     if (opts.columnar_stats) |stats| stats.used = true;
     const lower_key = if (std.mem.order(u8, from, byte_range.start) == .gt) from else byte_range.start;
     var directory = try Directory.init(alloc, txn, manifest.generation, lower_key);
     defer directory.deinit();
     var dirty_ranges = try DirtyRanges.init(txn, alloc, lower_key);
-    defer dirty_ranges.cursor.close();
+    defer dirty_ranges.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var payload_cache = read_cache.Cache.init(alloc, opts.columnar_decoded_cache_bytes);
@@ -2684,7 +2697,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (byte_range.end.len != 0 and std.mem.order(u8, range.start, byte_range.end) != .lt) return true;
         if (bootstrap) |boundary| if (std.mem.order(u8, range.start, boundary) != .lt) {
             if (opts.columnar_stats) |stats| stats.uncovered_ranges_read += 1;
-            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, null, materializer);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             continue;
         };
@@ -2721,14 +2734,14 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             row.physical_bytes = try decoder.int(u64);
         }
         if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
-        const schema_plan = try plans.get(db, version);
-        defer schema_plan.release();
+        const schema_plan = try column_plans.get(&plans, db, version);
         const view = schema_plan.view;
         try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
         var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts, .payload_cache = &payload_cache, .plan = schema_plan };
         defer block.deinit();
         var matched: [max_rows]bool = @splat(true);
         var candidates: [max_rows]bool = @splat(false);
+        var known: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
         // Full/special output pays primary I/O only for survivors. For an
         // scan with at least a block of remaining output budget, measure the
@@ -2737,6 +2750,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         const selected_for_cost = (opts.limit == 0 or opts.limit -| progress.delivered >= rows.len) and opts.include_documents and schema_plan.projected == null;
         if (selected_for_cost) {
             if (dirty_range) try excludeReplaced(txn, scratch, rows, candidates[0..rows.len]);
+            @memcpy(known[0..rows.len], candidates[0..rows.len]);
             if (schema_plan.filter) |value| {
                 try block.evaluate(value, candidates[0..rows.len], matched[0..rows.len]);
                 @memcpy(candidates[0..rows.len], matched[0..rows.len]);
@@ -2746,7 +2760,11 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (plan.primary) {
             if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
             db.relational_column_maintenance.noteRead(manifest.generation, index, source_bytes);
-            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+            var selection = RowSelection{ .plan = schema_plan, .rows = rows, .known = known[0..rows.len], .matched = candidates[0..rows.len], .evaluated = selected_for_cost and schema_plan.filter != null };
+            // Even an unadmitted historical plan is owned by the active block.
+            // Share it with sequential execution instead of recompiling it.
+            primary_plans.use(schema_plan);
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, &selection, materializer);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             continue;
         }
@@ -2823,7 +2841,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
     }
     if (!had_range) {
         if (manifest.ranges != 0) return error.InvalidColumnSegment;
-        try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+        try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, null, materializer);
     }
     return true;
 }
@@ -2869,7 +2887,58 @@ fn deliver(alloc: alloc_type, row: Row, projected: ?[]const u8, opts: types.Scan
     if (opts.columnar_stats) |stats| stats.rows_selected += 1;
 }
 
-fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, range_start: []const u8, range_end: []const u8, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, materializer: Materializer) !void {
+/// Snapshot-bound predicate decisions, consumed by an ordered primary cursor.
+/// Unknown (including every dirty owner) is distinct from a negative result.
+/// The identity witness prevents derived metadata from overriding a changed
+/// authoritative row, even if its key and schema version were reused.
+const RowSelection = struct {
+    plan: *scan_plan.Plan,
+    rows: []const Row,
+    known: []const bool,
+    matched: []const bool,
+    evaluated: bool = true,
+    next: usize = 0,
+
+    fn decision(self: *RowSelection, row: Row, version: u32) ?bool {
+        if (!self.evaluated) return null;
+        while (self.next < self.rows.len and std.mem.order(u8, self.rows[self.next].key, row.key) == .lt) self.next += 1;
+        if (self.next == self.rows.len or !self.known[self.next] or version != self.plan.view.version()) return null;
+        const base = self.rows[self.next];
+        if (!std.mem.eql(u8, base.key, row.key) or base.timestamp != row.timestamp or !std.mem.eql(u8, &base.hash, &row.hash)) return null;
+        return self.matched[self.next];
+    }
+};
+
+test "relational columnar selection distinguishes unknown owners from rejected rows" {
+    const alloc = std.testing.allocator;
+    const epoch = try registry.Epoch.createCloned(alloc, .{ .version = 7 });
+    defer epoch.release();
+    var plan = scan_plan.Plan{ .alloc = alloc, .view = .{ .epoch = epoch }, .arena = std.heap.ArenaAllocator.init(alloc), .primary_filter = null, .filter = null, .projected = null };
+    defer plan.arena.deinit();
+    const rows = [_]Row{
+        .{ .key = "a", .hash = @splat(1), .timestamp = 10 },
+        .{ .key = "b", .hash = @splat(2), .timestamp = 20 },
+        .{ .key = "c", .hash = @splat(3), .timestamp = 30 },
+    };
+    var selected = RowSelection{ .plan = &plan, .rows = &rows, .known = &.{ true, false, true }, .matched = &.{ false, false, true } };
+    try std.testing.expectEqual(@as(?bool, false), selected.decision(rows[0], 7));
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(rows[0], 8));
+    var changed = rows[0];
+    changed.timestamp += 1;
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    changed = rows[0];
+    changed.hash[0] += 1;
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    changed = rows[0];
+    changed.key = "aa";
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(rows[1], 7));
+    try std.testing.expectEqual(@as(?bool, true), selected.decision(rows[2], 7));
+    changed.key = "d";
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+}
+
+fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, range_start: []const u8, range_end: []const u8, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, plan_cursor: *scan_plan.Cursor, selection: ?*RowSelection, materializer: Materializer) !void {
     const Context = struct {
         db: @TypeOf(db),
         alloc: alloc_type,
@@ -2883,6 +2952,8 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
         now_ns: u64,
         progress: *Progress,
         plans: *scan_plan.Cache,
+        plan_cursor: *scan_plan.Cursor,
+        selection: ?*RowSelection,
         materializer: Materializer,
         fn checkpoint(ptr: ?*anyopaque, _: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
@@ -2906,8 +2977,8 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
             if (self.to.len != 0 and (if (self.opts.exclusive_to) std.mem.order(u8, id, self.to) != .lt else std.mem.order(u8, id, self.to) == .gt)) return .stop;
             if (self.opts.columnar_stats) |stats| stats.primary_rows_read += 1;
             const version = try codec.rowSchemaVersion(value);
-            const plan = try self.plans.get(self.db, version);
-            defer plan.release();
+            if (self.selection) |selected| if (version == selected.plan.view.version()) self.plan_cursor.use(selected.plan);
+            const plan = try self.plan_cursor.get(self.plans, self.db, version);
             const view = plan.view;
             const typed = if (self.db.core.store.valuesAreAuthenticated())
                 try codec.ordinalRowViewTrusted(value, view.tableSchema().*, view.physicalLayout())
@@ -2915,13 +2986,23 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
                 try codec.ordinalRowView(value, view.tableSchema().*, view.physicalLayout());
             const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
             if (!eligibleRow(row, self.from, self.to, self.byte_range, self.opts, self.ttl_ns, self.now_ns)) return .@"continue";
-            if (!try plan.matches(scratch, row.key, typed)) return .@"continue";
+            const decision = if (self.selection) |selected| selected.decision(row, version) else null;
+            const matched = if (decision) |selected| blk: {
+                if (self.opts.columnar_stats) |stats| stats.selection_reused_rows += 1;
+                break :blk selected;
+            } else blk: {
+                if (plan.filter != null) {
+                    if (self.opts.columnar_stats) |stats| stats.primary_predicate_rows += 1;
+                }
+                break :blk try plan.matches(scratch, row.key, typed);
+            };
+            if (!matched) return .@"continue";
             const projected = if (self.opts.include_documents) try projectPrimary(plan, self.materializer, scratch, row.key, typed) else null;
             try deliver(self.alloc, row, projected, self.opts, self.visitor, self.progress);
             return if (self.opts.limit > 0 and self.progress.delivered >= self.opts.limit) .stop else .@"continue";
         }
     };
-    var context = Context{ .db = db, .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .from = from, .to = to, .byte_range = byte_range, .opts = opts, .visitor = visitor, .ttl_ns = ttl_ns, .now_ns = now_ns, .progress = progress, .plans = plans, .materializer = materializer };
+    var context = Context{ .db = db, .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .from = from, .to = to, .byte_range = byte_range, .opts = opts, .visitor = visitor, .ttl_ns = ttl_ns, .now_ns = now_ns, .progress = progress, .plans = plans, .plan_cursor = plan_cursor, .selection = selection, .materializer = materializer };
     defer context.arena.deinit();
     var lower_raw = if (std.mem.order(u8, range_start, from) == .lt) from else range_start;
     if (std.mem.order(u8, lower_raw, byte_range.start) == .lt) lower_raw = byte_range.start;

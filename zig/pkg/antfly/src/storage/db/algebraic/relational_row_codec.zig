@@ -765,6 +765,29 @@ pub fn ownedJsonValueFromCellAlloc(
     column: runtime_schema.RelationalColumn,
     cell: Cell,
 ) !std.json.Value {
+    return jsonValueFromCellAlloc(alloc, column, cell, .alloc_always);
+}
+
+/// Materialize containers/escaped tokens, borrowing stable cell payload bytes
+/// wherever possible. The caller must pin the cell and its schema until every
+/// consumer of the returned value has finished. Unlike the owned variant,
+/// this is unsuitable for retaining values across a primary cursor advance.
+/// Allocate into an arena; recursive owned-value cleanup must not free the
+/// borrowed strings. As with the owned helper, partial allocation is leaky.
+pub fn borrowedJsonValueFromCellAlloc(
+    alloc: Allocator,
+    column: runtime_schema.RelationalColumn,
+    cell: Cell,
+) !std.json.Value {
+    return jsonValueFromCellAlloc(alloc, column, cell, .alloc_if_needed);
+}
+
+fn jsonValueFromCellAlloc(
+    alloc: Allocator,
+    column: runtime_schema.RelationalColumn,
+    cell: Cell,
+    allocation: std.json.AllocWhen,
+) !std.json.Value {
     if (cell.is_null) return .null;
     return switch (column.column_type) {
         .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
@@ -774,12 +797,11 @@ pub fn ownedJsonValueFromCellAlloc(
         .integer => .{ .integer = cell.value.i64_val },
         .number => .{ .float = cell.value.f64_val },
         .boolean => .{ .bool = cell.value.bool_val },
-        // Row payloads may be backed by a scan cursor and must be retained.
-        .string, .blob, .geoshape => .{ .string = try alloc.dupe(u8, cell.value.bytes_val) },
-        .json => try std.json.parseFromSliceLeaky(std.json.Value, alloc, cell.value.bytes_val, .{
-            .allocate = .alloc_always,
-            .parse_numbers = false,
-        }),
+        .string, .blob, .geoshape => .{ .string = if (allocation == .alloc_always) try alloc.dupe(u8, cell.value.bytes_val) else cell.value.bytes_val },
+        .json => if (allocation == .alloc_if_needed)
+            try borrowedJsonValueLeaky(alloc, cell.value.bytes_val)
+        else
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, cell.value.bytes_val, .{ .allocate = .alloc_always, .parse_numbers = false }),
         .geopoint => blk: {
             var object = std.json.ObjectMap.empty;
             try object.put(alloc, "lat", .{ .float = cell.value.geo_point.lat });
@@ -799,6 +821,66 @@ pub fn ownedJsonValueFromCellAlloc(
             break :blk .{ .array = array };
         },
     };
+}
+
+/// std.json.Value's custom parser unconditionally allocates strings, even when
+/// ParseOptions.allocate is alloc_if_needed. Use the standard validating token
+/// scanner with an iterative container stack to preserve the borrowed contract
+/// (including exact number lexemes). The caller owns the arena and input pin.
+fn borrowedJsonValueLeaky(alloc: Allocator, bytes: []const u8) !std.json.Value {
+    const Frame = struct { value: std.json.Value, key: ?[]const u8 = null };
+    var frames = std.ArrayListUnmanaged(Frame).empty;
+    defer frames.deinit(alloc);
+    var scanner = std.json.Scanner.initCompleteInput(alloc, bytes);
+    defer scanner.deinit();
+    var root: ?std.json.Value = null;
+    while (true) {
+        const token = try scanner.nextAllocMax(alloc, .alloc_if_needed, bytes.len);
+        const value: std.json.Value = switch (token) {
+            .end_of_document => return if (frames.items.len == 0) root orelse error.SyntaxError else error.SyntaxError,
+            .object_begin, .array_begin => {
+                try frames.append(alloc, .{ .value = if (token == .object_begin) .{ .object = .empty } else .{ .array = std.json.Array.init(alloc) } });
+                continue;
+            },
+            .object_end, .array_end => blk: {
+                const frame = frames.pop() orelse return error.SyntaxError;
+                if (frame.key != null or (token == .object_end) != (frame.value == .object)) return error.SyntaxError;
+                break :blk frame.value;
+            },
+            .string, .allocated_string => |string| blk: {
+                if (frames.items.len != 0) {
+                    const frame = &frames.items[frames.items.len - 1];
+                    if (frame.value == .object and frame.key == null) {
+                        frame.key = string;
+                        continue;
+                    }
+                }
+                break :blk .{ .string = string };
+            },
+            .number, .allocated_number => |number| .{ .number_string = number },
+            .true => .{ .bool = true },
+            .false => .{ .bool = false },
+            .null => .null,
+            else => return error.SyntaxError,
+        };
+        if (frames.items.len == 0) {
+            if (root != null) return error.SyntaxError;
+            root = value;
+        } else {
+            const frame = &frames.items[frames.items.len - 1];
+            switch (frame.value) {
+                .array => |*array| try array.append(value),
+                .object => |*object| {
+                    const key = frame.key orelse return error.SyntaxError;
+                    const entry = try object.getOrPut(alloc, key);
+                    if (entry.found_existing) return error.DuplicateField;
+                    entry.value_ptr.* = value;
+                    frame.key = null;
+                },
+                else => unreachable,
+            }
+        }
+    }
 }
 
 pub fn validateOrdinal(value: []const u8, table_schema: runtime_schema.TableSchema) !void {
@@ -2177,6 +2259,64 @@ test "ordinal root materialization preserves exact nested JSON numbers" {
         "9007199254740993",
         payload.object.get("exact").?.number_string,
     );
+}
+
+fn testBorrowedCellMaterialization(alloc: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const bytes = "{\"n\":9007199254740993,\"plain\":\"stable\",\"escaped\":\"line\\nbreak\"}";
+    const column = runtime_schema.RelationalColumn{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any };
+    const cell = Cell{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = bytes } };
+    const borrowed = try borrowedJsonValueFromCellAlloc(scratch, column, cell);
+    const owned = try ownedJsonValueFromCellAlloc(scratch, column, cell);
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(scratch, owned, .{}), try std.json.Stringify.valueAlloc(scratch, borrowed, .{}));
+    const stable = borrowed.object.get("plain").?.string;
+    try std.testing.expect(@intFromPtr(stable.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(stable.ptr) + stable.len <= @intFromPtr(bytes.ptr) + bytes.len);
+    try std.testing.expect(owned.object.get("plain").?.string.ptr != stable.ptr);
+    try std.testing.expectEqualStrings("9007199254740993", borrowed.object.get("n").?.number_string);
+    try std.testing.expectEqualStrings("line\nbreak", borrowed.object.get("escaped").?.string);
+}
+
+test "ordinal borrowed cell materialization pins payloads and preserves exact JSON" {
+    try testBorrowedCellMaterialization(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testBorrowedCellMaterialization, .{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const column = runtime_schema.RelationalColumn{ .name = "text", .path = "text", .column_type = .string };
+    const cell = Cell{ .ordinal = 0, .path = "text", .value_type = .bytes_val, .value = .{ .bytes_val = "stable" } };
+    try std.testing.expectEqualStrings("stable", (try borrowedJsonValueFromCellAlloc(failing.allocator(), column, cell)).string);
+    try std.testing.expectError(error.OutOfMemory, ownedJsonValueFromCellAlloc(failing.allocator(), column, cell));
+}
+
+test "ordinal borrowed JSON matches validating parser for nested and malformed values" {
+    const values = [_][]const u8{
+        "null",                                                                                        "true",                                                                    "false", "-0", "1e300", "\"text\"", "[]", "{}",
+        "[null,true,false,0,-0,18446744073709551616,1e-99,\"plain\",\"\\u00e9\\ud83d\\ude00\",{},[]]", "{\"\\u006b\":{\"a\":[{\"b\":[1,2,3]},[\"x\"]]},\"n\":-9007199254740993}",
+    };
+    for (values) |bytes| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const expected = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{ .parse_numbers = false });
+        const actual = try borrowedJsonValueLeaky(alloc, bytes);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(alloc, expected, .{}), try std.json.Stringify.valueAlloc(alloc, actual, .{}));
+    }
+    const invalid = [_][]const u8{ "", "[", "{", "[1,]", "{\"a\":}", "{\"a\" 1}", "true false", "01", "[1}", "{\"a\":1,\"\\u0061\":2}", "\"\\ud800\"" };
+    for (invalid) |bytes| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const expected = std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{ .parse_numbers = false });
+        if (expected) |_| return error.TestUnexpectedResult else |err| try std.testing.expectError(err, borrowedJsonValueLeaky(alloc, bytes));
+    }
+    // Heap-backed scanner/container stacks, not recursive parser frames.
+    var nested: [2049]u8 = undefined;
+    @memset(nested[0..1024], '[');
+    nested[1024] = '0';
+    @memset(nested[1025..], ']');
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = try borrowedJsonValueLeaky(arena.allocator(), &nested);
 }
 
 test "ordinal rows store dense vectors as canonical binary values" {

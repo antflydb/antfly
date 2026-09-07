@@ -174,6 +174,37 @@ pub const Cache = struct {
     }
 };
 
+/// Execution ownership is independent of cache admission. A stream retains
+/// its current epoch even if a scan-resistant cache rejects that epoch. The
+/// returned plan is borrowed until the next get/use/deinit on this cursor.
+pub const Cursor = struct {
+    active: ?*Plan = null,
+
+    pub fn deinit(self: *Cursor) void {
+        if (self.active) |plan| plan.release();
+        self.* = .{};
+    }
+
+    pub fn use(self: *Cursor, plan: *Plan) void {
+        if (self.active == plan) return;
+        plan.references += 1;
+        if (self.active) |old| old.release();
+        self.active = plan;
+    }
+
+    pub fn get(self: *Cursor, cache: *Cache, db: anytype, version: u32) !*Plan {
+        if (self.active) |plan| if (plan.view.version() == version) {
+            if (cache.opts.columnar_stats) |stats| stats.scan_plan_hits += 1;
+            return plan;
+        };
+        // Acquire before releasing so failure leaves the cursor usable.
+        const next = try cache.get(db, version);
+        if (self.active) |old| old.release();
+        self.active = next;
+        return next;
+    }
+};
+
 const TestCore = struct {
     alloc: Allocator,
     pub fn acquireSchemaVersionView(self: *TestCore, version: u32) !?registry.SchemaView {
@@ -229,4 +260,88 @@ test "column scan plans bound residency without evicting pinned blocks" {
     try std.testing.expectEqual(@as(u64, 99), stats.scan_plans_built);
     try std.testing.expectEqual(@as(u64, 1), stats.scan_plan_hits);
     for (cache.entries, 0..) |entry, i| try std.testing.expect(entry.? == pins[31 - i]);
+}
+
+test "column scan cursor retains rejected epochs and shares pinned execution plans" {
+    const alloc = std.testing.allocator;
+    var db = struct { core: TestCore }{ .core = .{ .alloc = alloc } };
+    var stats: types.ColumnarScanStats = .{};
+    var cache = Cache{ .alloc = alloc, .source = null, .opts = .{ .columnar_stats = &stats } };
+    defer cache.deinit();
+    // All residents are much hotter than the trailing historical epoch.
+    for (0..40) |_| for (1..33) |version| {
+        const plan = try cache.get(&db, @intCast(version));
+        plan.release();
+    };
+    stats = .{};
+    var column: Cursor = .{};
+    defer column.deinit();
+    const transient = try column.get(&cache, &db, 33);
+    for (cache.entries) |entry| try std.testing.expect(entry.? != transient);
+    var primary: Cursor = .{};
+    defer primary.deinit();
+    for (0..256) |_| {
+        primary.use(transient);
+        try std.testing.expectEqual(transient, try primary.get(&cache, &db, 33));
+        // Interleaved dirty rows use another epoch without losing the base
+        // execution plan, even though it never entered the resident cache.
+        _ = try primary.get(&cache, &db, 1);
+    }
+    try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
+    try std.testing.expectEqual(transient, try column.get(&cache, &db, 33));
+}
+
+fn testCursorAllocation(alloc: Allocator) !void {
+    var db = struct { core: TestCore }{ .core = .{ .alloc = alloc } };
+    var cache = Cache{ .alloc = alloc, .source = null, .opts = .{} };
+    defer cache.deinit();
+    var cursor: Cursor = .{};
+    defer cursor.deinit();
+    const first = try cursor.get(&cache, &db, 1);
+    try std.testing.expectEqual(first, try cursor.get(&cache, &db, 1));
+    const second = cursor.get(&cache, &db, 2) catch |err| {
+        try std.testing.expectEqual(first, cursor.active.?);
+        return err;
+    };
+    cursor.use(first);
+    try std.testing.expectEqual(first, cursor.active.?);
+    cursor.use(second);
+}
+
+test "column scan cursor releases plans on every allocation failure" {
+    try testCursorAllocation(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCursorAllocation, .{});
+}
+
+test "column scan cursor historical churn allocation benchmark" {
+    var bytes: [2]usize = undefined;
+    for (0..2) |mode| {
+        var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const alloc = measured.allocator();
+        {
+            var db = struct { core: TestCore }{ .core = .{ .alloc = alloc } };
+            var stats: types.ColumnarScanStats = .{};
+            var cache = Cache{ .alloc = alloc, .source = null, .opts = .{ .columnar_stats = &stats } };
+            defer cache.deinit();
+            for (0..40) |_| for (1..33) |version| {
+                const plan = try cache.get(&db, @intCast(version));
+                plan.release();
+            };
+            stats = .{};
+            const before = measured.allocated_bytes;
+            var cursor: Cursor = .{};
+            defer cursor.deinit();
+            for (0..32) |_| {
+                if (mode == 0) {
+                    const plan = try cache.get(&db, 33);
+                    plan.release();
+                } else _ = try cursor.get(&cache, &db, 33);
+            }
+            bytes[mode] = measured.allocated_bytes - before;
+            try std.testing.expectEqual(@as(u64, if (mode == 0) 32 else 1), stats.scan_plans_built);
+        }
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+    }
+    try std.testing.expectEqual(bytes[0], bytes[1] * 32);
+    std.debug.print("\nhistorical plan churn: per-row/cursor builds=32/1, allocated bytes={d}/{d}\n", .{ bytes[0], bytes[1] });
 }
