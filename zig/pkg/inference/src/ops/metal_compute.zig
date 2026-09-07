@@ -2742,7 +2742,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn bufElemCount(buf: *const Buf) usize {
-        if (hasHostView(buf)) {
+        if (hasHostView(buf) or (buf.native_dense_bytes != null and buf.native_dense_dtype != null)) {
             if (buf.logical_shape) |shape| {
                 if (safeShapeNumel(shape)) |numel| return numel;
             }
@@ -4506,7 +4506,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.UnsupportedTensorType;
         }
         if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
-            return error.UnsupportedTensorType;
+            // Dense f16/bf16 weights also reach elementwise consumers (for
+            // example Florence's [1, vocab] final logits bias). Keep their
+            // original storage intact while materializing an owned f32 peer.
+            const shape = buf.logical_shape orelse return error.InvalidTensorShape;
+            var dims: [metal_tensor_mod.max_dims]i32 = undefined;
+            if (shape.len > dims.len) return error.UnsupportedShape;
+            for (shape, 0..) |dim, i| dims[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+            const values = try convertNativeDenseBytesToOwnedF32(
+                std.heap.c_allocator,
+                buf.native_dense_bytes.?,
+                buf.native_dense_dtype.?,
+                try shapeNumel(shape),
+            );
+            errdefer std.heap.c_allocator.free(values);
+            return MetalTensor.owned(values, dims[0..shape.len]);
         }
         if (buf.lazy_multiply) |*lazy| {
             var lhs = try lazy.lhs.retainedCopy();
@@ -20988,6 +21002,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             return addOp(ctx, materialized_a orelse a, materialized_b orelse b);
         }
+        if ((a_buf.native_dense_bytes != null and a_buf.data.len == 0) or
+            (b_buf.native_dense_bytes != null and b_buf.data.len == 0))
+        {
+            return self.hostFallbackBinary(a, b, null, null, .add);
+        }
         const a_data = try hostSliceForBuf(a_buf);
         const b_data = try hostSliceForBuf(b_buf);
         if (!canFlatElementwise(a_buf.logical_shape, b_buf.logical_shape, a_data.len, b_data.len)) {
@@ -31237,6 +31256,49 @@ test "metal_compute: add uploads equal-size host peer instead of downloading dev
     const out_data = try metal_cb.toFloat32(out, allocator);
     defer allocator.free(out_data);
     try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: add native dense logits bias keeps single and batched rows resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const expected = [_]f32{ 11, 22, 33, 14, 25, 36 };
+    inline for (.{ tensor_mod.DType.f16, tensor_mod.DType.bf16 }) |dtype| {
+        const encoded = if (dtype == .f16)
+            [_]u16{ 0x4900, 0x4d00, 0x4f80 }
+        else
+            [_]u16{ 0x4120, 0x41a0, 0x41f0 };
+        var shape = [_]i64{ 1, 3 };
+        var bias_buf = MetalCompute.Buf{
+            .data = &.{},
+            .allocator = allocator,
+            .owned = false,
+            .logical_shape = &shape,
+            .native_dense_bytes = std.mem.asBytes(&encoded),
+            .native_dense_dtype = dtype,
+        };
+        const bias: CT = @ptrCast(&bias_buf);
+        for ([_]usize{ 1, 2 }) |rows| {
+            const input = try cb.fromFloat32Shape((&[_]f32{ 1, 2, 3, 4, 5, 6 })[0 .. rows * 3], &.{ @intCast(rows), 3 });
+            defer cb.free(input);
+            const device = try compute.ctFromOwnedMetalTensor(try compute.ownedDeviceMetalTensorFromCt(input));
+            defer cb.free(device);
+            const output = try cb.add(device, bias);
+            defer cb.free(output);
+            try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, output));
+            const values = try cb.toFloat32(output, allocator);
+            defer allocator.free(values);
+            try std.testing.expectEqualSlices(f32, expected[0 .. rows * 3], values);
+            // Reading the bias must not replace its native representation.
+            try std.testing.expectEqual(@as(usize, 0), bias_buf.data.len);
+            try std.testing.expectEqual(dtype, bias_buf.native_dense_dtype.?);
+        }
+    }
 }
 
 test "metal_compute: add keeps row-wise rhs broadcast resident" {
