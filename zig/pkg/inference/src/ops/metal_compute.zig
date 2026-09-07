@@ -732,6 +732,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         native_dense_dtype: ?tensor_mod.DType = null,
         native_dense_bytes_owned: bool = false,
         native_dense_mmap_source_bytes: ?[]const u8 = null,
+        /// Owned f32 peer for consumers that cannot use native dense bytes.
+        /// Host aliases retain its data independently of the original bytes
+        /// and lazy-weight pin. Never copied into aliases; freed by freeOp.
+        native_dense_host_cache: ?CT = null,
     };
 
     const LazyMultiply = struct {
@@ -2207,11 +2211,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             refcount.* = 1;
             break :blk refcount;
         } else null;
+        errdefer if (shared_data_refcount) |refcount| allocator.destroy(refcount);
         const logical_shape = try allocator.alloc(i64, shape.len);
-        errdefer {
-            allocator.free(logical_shape);
-            if (shared_data_refcount) |refcount| allocator.destroy(refcount);
-        }
+        errdefer allocator.free(logical_shape);
         for (shape, 0..) |dim, i| logical_shape[i] = dim;
         buf.* = .{
             .data = data,
@@ -2293,6 +2295,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return scratch[0..resolved_shape.len];
     }
 
+    /// Materialize native dense storage once, without changing its dtype or
+    /// bytes. All host views share the peer's refcounted f32 backing, so they
+    /// remain valid after the native tensor (including owned concat bytes or
+    /// a pinned mmap weight) is released.
+    fn hostAliasSource(buf: *Buf) !*Buf {
+        if (buf.native_dense_bytes == null or buf.native_dense_dtype == null or buf.data.len != 0) return buf;
+        if (buf.native_dense_host_cache) |cache| return toBuf(cache);
+        const shape = buf.logical_shape orelse return error.InvalidTensorShape;
+        const shape_i32 = try buf.allocator.alloc(i32, shape.len);
+        defer buf.allocator.free(shape_i32);
+        for (shape, 0..) |dim, i| shape_i32[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+        const values = try convertNativeDenseBytesToOwnedF32(
+            buf.allocator,
+            buf.native_dense_bytes.?,
+            buf.native_dense_dtype.?,
+            try shapeNumel(shape),
+        );
+        errdefer buf.allocator.free(values);
+        const cache = try denseBuf(buf.allocator, values, true, shape_i32);
+        buf.native_dense_host_cache = cache;
+        return toBuf(cache);
+    }
+
     fn makeViewAlias(
         self: *MetalCompute,
         input: CT,
@@ -2300,7 +2325,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         strides: []const usize,
         base_offset: usize,
     ) !CT {
-        const source = toBuf(input);
+        const source = try hostAliasSource(toBuf(input));
         // A pending lazy_multiply has no concrete `data` to alias — copying the
         // empty slice and dropping the deferred product orphans the buffer
         // (data.len=0, lazy_multiply lost). Reject so the caller materializes
@@ -2341,7 +2366,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         input: CT,
         shape: []const i64,
     ) !CT {
-        const source = toBuf(input);
+        const source = try hostAliasSource(toBuf(input));
         if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
             return error.UnsupportedTensorType;
         }
@@ -2379,7 +2404,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         shape: []const i64,
         index_map: []const usize,
     ) !CT {
-        const source = toBuf(input);
+        const source = try hostAliasSource(toBuf(input));
         if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
             return error.UnsupportedTensorType;
         }
@@ -2417,7 +2442,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         shape: []const i64,
         owned_index_map: []usize,
     ) !CT {
-        const source = toBuf(input);
+        const source = try hostAliasSource(toBuf(input));
         if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
             return error.UnsupportedTensorType;
         }
@@ -2455,7 +2480,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         input: CT,
         shape: []const i64,
     ) !CT {
-        const source = toBuf(input);
+        const source = try hostAliasSource(toBuf(input));
         const source_index_map = source.view_index_map orelse return error.InvalidTensorShape;
         if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
             return error.UnsupportedTensorType;
@@ -2670,7 +2695,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // materialization is forbidden here.
         if (hasHostView(buf)) return materializedViewSlice(buf);
         if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
-            return error.UnsupportedTensorType;
+            return (try hostAliasSource(buf)).data;
         }
         return buf.data;
     }
@@ -4513,14 +4538,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var dims: [metal_tensor_mod.max_dims]i32 = undefined;
             if (shape.len > dims.len) return error.UnsupportedShape;
             for (shape, 0..) |dim, i| dims[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
-            const values = try convertNativeDenseBytesToOwnedF32(
-                std.heap.c_allocator,
-                buf.native_dense_bytes.?,
-                buf.native_dense_dtype.?,
-                try shapeNumel(shape),
-            );
-            errdefer std.heap.c_allocator.free(values);
-            return MetalTensor.owned(values, dims[0..shape.len]);
+            return MetalTensor.ownedCloneFrom(try hostSliceForBuf(buf), dims[0..shape.len]);
         }
         if (buf.lazy_multiply) |*lazy| {
             var lhs = try lazy.lhs.retainedCopy();
@@ -6320,12 +6338,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn freeOp(ctx: *anyopaque, tensor: CT) void {
-        _ = ctx;
         const buf = toBuf(tensor);
         if (buf.lazy_entry) |entry| {
             if (entry.pin_count > 0) entry.pin_count -= 1;
         }
         releaseOwnedHostData(buf);
+        if (buf.native_dense_host_cache) |cache| freeOp(ctx, cache);
         if (buf.logical_shape) |shape| buf.allocator.free(shape);
         if (buf.view_strides) |strides| buf.allocator.free(strides);
         if (buf.logical_view_strides) |strides| buf.allocator.free(strides);
@@ -6403,13 +6421,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
-            const expected_count = if (buf.logical_shape) |shape| try shapeNumel(shape) else 0;
-            return convertNativeDenseBytesToOwnedF32(
-                allocator,
-                buf.native_dense_bytes.?,
-                buf.native_dense_dtype.?,
-                expected_count,
-            );
+            return allocator.dupe(f32, try hostSliceForBuf(buf));
         }
         // A pending lazy multiply has no concrete storage (`data` is the
         // empty placeholder); reading it through the generic host path
@@ -7107,17 +7119,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (buf.owned_quantized_storage) |storage| {
             const host = try self.dequantizeStorageToFloat32(ct, storage, self.allocator);
-            defer self.allocator.free(host);
-            return native_ctx.cb.fromFloat32Shape(host, shape_i32);
-        }
-        if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
-            const expected_count = try shapeNumel(shape_i64);
-            const host = try convertNativeDenseBytesToOwnedF32(
-                self.allocator,
-                buf.native_dense_bytes.?,
-                buf.native_dense_dtype.?,
-                expected_count,
-            );
             defer self.allocator.free(host);
             return native_ctx.cb.fromFloat32Shape(host, shape_i32);
         }
@@ -31258,6 +31259,135 @@ test "metal_compute: add uploads equal-size host peer instead of downloading dev
     try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
 }
 
+fn testNativeDenseTensor(allocator: std.mem.Allocator, bytes: []const u8, dtype: tensor_mod.DType, shape: []const i32, owned: bool) !CT {
+    const backing = if (owned) try allocator.dupe(u8, bytes) else bytes;
+    errdefer if (owned) allocator.free(backing);
+    const tensor = try MetalCompute.denseBuf(allocator, &.{}, false, shape);
+    const buf = MetalCompute.toBuf(tensor);
+    buf.native_dense_bytes = backing;
+    buf.native_dense_dtype = dtype;
+    buf.native_dense_bytes_owned = owned;
+    return tensor;
+}
+
+test "metal_compute: native dense reshape preserves values after source release" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    inline for (.{ tensor_mod.DType.f16, tensor_mod.DType.bf16 }) |dtype| {
+        const encoded = if (dtype == .f16)
+            [_]u16{ 0x4900, 0x4d00, 0x4f80 }
+        else
+            [_]u16{ 0x4120, 0x41a0, 0x41f0 };
+        for ([_]bool{ false, true }) |owned| {
+            var source: ?CT = try testNativeDenseTensor(allocator, std.mem.asBytes(&encoded), dtype, &.{ 1, 3 }, owned);
+            defer if (source) |tensor| cb.free(tensor);
+            const flat = try cb.primReshape(source.?, &.{3});
+            defer cb.free(flat);
+            const sibling = try cb.primReshape(source.?, &.{ 3, 1 });
+            defer cb.free(sibling);
+            const source_buf = MetalCompute.toBuf(source.?);
+            try std.testing.expectEqual(@as(usize, 0), source_buf.data.len);
+            try std.testing.expectEqual(dtype, source_buf.native_dense_dtype.?);
+            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&encoded), source_buf.native_dense_bytes.?);
+            try std.testing.expectEqual(MetalCompute.toBuf(flat).data.ptr, MetalCompute.toBuf(sibling).data.ptr);
+            cb.free(source.?);
+            source = null;
+            const values = try cb.toFloat32(flat, allocator);
+            defer allocator.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30 }, values);
+            const sibling_values = try cb.toFloat32(sibling, allocator);
+            defer allocator.free(sibling_values);
+            try std.testing.expectEqualSlices(f32, values, sibling_values);
+        }
+    }
+}
+
+test "metal_compute: native dense views compose across host and device consumers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    inline for (.{ tensor_mod.DType.f16, tensor_mod.DType.bf16 }) |dtype| {
+        const encoded = if (dtype == .f16)
+            [_]u16{ 0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600 }
+        else
+            [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+        for ([_]bool{ false, true }) |owned| {
+            // Start with native bytes, then exercise a strided alias, an
+            // index-map reshape, slicing and broadcast before device upload.
+            const reshaped = blk: {
+                const source = try testNativeDenseTensor(allocator, std.mem.asBytes(&encoded), dtype, &.{ 2, 3 }, owned);
+                defer cb.free(source);
+                const transposed = try cb.primTranspose(source, &.{ 1, 0 }, &.{ 2, 3 });
+                defer cb.free(transposed);
+                break :blk try cb.primReshape(transposed, &.{ 2, 3 });
+            };
+            defer cb.free(reshaped);
+            const expected = [_]f32{ 1, 4, 2, 5, 3, 6 };
+            const values = try cb.toFloat32(reshaped, allocator);
+            defer allocator.free(values);
+            try std.testing.expectEqualSlices(f32, &expected, values);
+            const sliced = try cb.sliceLastDim(reshaped, 1, 3);
+            defer cb.free(sliced);
+            const broadcast = try cb.primBroadcastInDim(sliced, &.{ 2, 2, 2 }, &.{ 1, 2 }, &.{ 2, 2 });
+            defer cb.free(broadcast);
+            const device = try compute.ctFromOwnedMetalTensor(try compute.ownedDeviceMetalTensorFromCt(broadcast));
+            defer cb.free(device);
+            const output = try cb.add(device, device);
+            defer cb.free(output);
+            try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, output));
+            const doubled = try cb.toFloat32(output, allocator);
+            defer allocator.free(doubled);
+            try std.testing.expectEqualSlices(f32, &.{ 8, 4, 6, 12, 8, 4, 6, 12 }, doubled);
+            const mixed = try cb.add(device, broadcast);
+            defer cb.free(mixed);
+            const mixed_values = try cb.toFloat32(mixed, allocator);
+            defer allocator.free(mixed_values);
+            try std.testing.expectEqualSlices(f32, doubled, mixed_values);
+            // Host reads and device uploads must not change a shared view.
+            const again = try cb.toFloat32(reshaped, allocator);
+            defer allocator.free(again);
+            try std.testing.expectEqualSlices(f32, &expected, again);
+        }
+        const source = try testNativeDenseTensor(allocator, std.mem.asBytes(&encoded), dtype, &.{ 2, 3 }, false);
+        defer cb.free(source);
+        const direct_slice = try cb.sliceLastDim(source, 1, 3);
+        defer cb.free(direct_slice);
+        const slice_values = try cb.toFloat32(direct_slice, allocator);
+        defer allocator.free(slice_values);
+        try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 6 }, slice_values);
+        const direct_broadcast = try cb.primBroadcastInDim(source, &.{ 2, 2, 3 }, &.{ 1, 2 }, &.{ 2, 3 });
+        defer cb.free(direct_broadcast);
+        const broadcast_values = try cb.toFloat32(direct_broadcast, allocator);
+        defer allocator.free(broadcast_values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6 }, broadcast_values);
+    }
+}
+
+fn testNativeDenseMaterializationAllocationFailures(allocator: std.mem.Allocator) !void {
+    const bytes = [_]u8{ 0x80, 0x3f, 0x00, 0x40 };
+    const source = try testNativeDenseTensor(allocator, &bytes, .bf16, &.{2}, false);
+    var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
+    defer MetalCompute.freeOp(&fake_ctx, source);
+    const values = try MetalCompute.hostSliceForBuf(MetalCompute.toBuf(source));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, values);
+}
+
+test "metal_compute: native dense materialization cleans up allocation failures" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testNativeDenseMaterializationAllocationFailures, .{});
+}
+
 test "metal_compute: add native dense logits bias keeps single and batched rows resident" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -31283,6 +31413,7 @@ test "metal_compute: add native dense logits bias keeps single and batched rows 
             .native_dense_dtype = dtype,
         };
         const bias: CT = @ptrCast(&bias_buf);
+        defer if (bias_buf.native_dense_host_cache) |cache| cb.free(cache);
         for ([_]usize{ 1, 2 }) |rows| {
             const input = try cb.fromFloat32Shape((&[_]f32{ 1, 2, 3, 4, 5, 6 })[0 .. rows * 3], &.{ @intCast(rows), 3 });
             defer cb.free(input);
@@ -34919,6 +35050,7 @@ test "metal_compute: toFloat32 materializes zero-copy bf16 weights" {
         .native_dense_dtype = .bf16,
     };
     var fake_ctx: u8 align(@alignOf(MetalCompute)) = 0;
+    defer if (buf.native_dense_host_cache) |cache| MetalCompute.freeOp(&fake_ctx, cache);
 
     const values = try MetalCompute.toFloat32Op(&fake_ctx, @ptrCast(&buf), std.testing.allocator);
     defer std.testing.allocator.free(values);
