@@ -1772,8 +1772,8 @@ pub fn downloadPinnedQwen3VlRerankerBundle(
 /// the official GGUF weight artifact with tokenizer sidecars from the
 /// original safetensors repository (the GGUF repo ships weights only) and
 /// write a generated model_manifest.json declaring the last-token embedder
-/// contract. The safetensors bundle carries its own sentence-transformers
-/// detection sidecars and needs no synthetic manifest.
+/// contract. Safetensors bundles retain their sentence-transformers sidecars
+/// and receive the same pinned executable query/document profile.
 pub fn downloadPinnedQwen3EmbeddingBundle(
     allocator: std.mem.Allocator,
     io: std.Io,
