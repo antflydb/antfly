@@ -210,8 +210,25 @@ pub fn chatTemplateContext(
             }
             try m.put(arena, "content", .{ .list = part_values });
         } else {
-            try m.put(arena, "content", Value.str(msg.content));
+            try m.put(arena, "content", if (msg.content_is_null) .none else Value.str(msg.content));
         }
+        if (msg.tool_calls) |calls| {
+            const values = try arena.alloc(Value, calls.len);
+            for (calls, 0..) |call, idx| {
+                const arguments = try std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{});
+                if (arguments != .object) return error.InvalidToolArguments;
+                var function = ValueMap{};
+                try function.put(arena, "name", Value.str(call.name));
+                try function.put(arena, "arguments", try jsonToTemplateValue(arena, arguments));
+                var tool = ValueMap{};
+                try tool.put(arena, "id", Value.str(call.id));
+                try tool.put(arena, "type", Value.str(call.type));
+                try tool.put(arena, "function", .{ .map = function });
+                values[idx] = .{ .map = tool };
+            }
+            try m.put(arena, "tool_calls", .{ .list = values });
+        }
+        if (msg.tool_call_id) |id| try m.put(arena, "tool_call_id", Value.str(id));
         msg_values[i] = .{ .map = m };
     }
 
@@ -233,7 +250,41 @@ pub const ChatMessage = struct {
     role: []const u8,
     content: []const u8,
     parts: ?[]const ChatContentPart = null,
+    content_is_null: bool = false,
+    tool_calls: ?[]const ChatToolCall = null,
+    tool_call_id: ?[]const u8 = null,
 };
+
+/// Borrowed OpenAI function-call history. Arguments are JSON on the wire and
+/// become an object in the Hugging Face template context (not a quoted string).
+pub const ChatToolCall = struct {
+    id: []const u8,
+    type: []const u8 = "function",
+    name: []const u8,
+    arguments: []const u8,
+};
+
+fn jsonToTemplateValue(arena: std.mem.Allocator, value: std.json.Value) !Value {
+    return switch (value) {
+        .null => .none,
+        .bool => |v| Value.bln(v),
+        .integer => |v| Value.int(v),
+        .float => |v| .{ .float = v },
+        .number_string => |v| .{ .float = try std.fmt.parseFloat(f64, v) },
+        .string => |v| Value.str(v),
+        .array => |items| blk: {
+            const values = try arena.alloc(Value, items.items.len);
+            for (items.items, values) |item, *out| out.* = try jsonToTemplateValue(arena, item);
+            break :blk .{ .list = values };
+        },
+        .object => |object| blk: {
+            var map = ValueMap{};
+            var iter = object.iterator();
+            while (iter.next()) |entry| try map.put(arena, entry.key_ptr.*, try jsonToTemplateValue(arena, entry.value_ptr.*));
+            break :blk .{ .map = map };
+        },
+    };
+}
 
 pub const ChatContentPart = union(enum) {
     text: []const u8,
@@ -253,6 +304,27 @@ pub const ChatTemplateOptions = struct {
 };
 
 // --- Tests ---
+
+test "tool history validates arguments and preserves JSON value types" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages = [_]ChatMessage{.{ .role = "assistant", .content = "", .tool_calls = &.{.{
+        .id = "c1",
+        .name = "search",
+        .arguments = "{\"nested\":[true,null,2,1.5,{\"text\":\"a\\\"b\"}]}",
+    }} }};
+    const context = try chatTemplateContext(arena, &messages, .{});
+    const args = context.get("messages").?.list[0].map.get("tool_calls").?.list[0].map.get("function").?.map.get("arguments").?.map;
+    const nested = args.get("nested").?.list;
+    try std.testing.expect(nested[0].boolean);
+    try std.testing.expect(nested[1] == .none);
+    try std.testing.expectEqual(@as(i64, 2), nested[2].integer);
+    try std.testing.expectEqual(@as(f64, 1.5), nested[3].float);
+    try std.testing.expectEqualStrings("a\"b", nested[4].map.get("text").?.string);
+    messages[0].tool_calls = &.{.{ .id = "bad", .name = "search", .arguments = "[]" }};
+    try std.testing.expectError(error.InvalidToolArguments, chatTemplateContext(arena, &messages, .{}));
+}
 
 test "render simple" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -792,6 +864,70 @@ test "gemma4 GGUF template with system message" {
             "<|turn>model\n",
         result,
     );
+}
+
+test "capture blocks preserve scope and whitespace without leaking captured output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = ValueMap{};
+    const result = try render(
+        arena,
+        "{%- set ns = namespace(seen=false) -%}" ++
+            "before  {%- set captured -%}  A{% set nested %}B{% endset %}{{ nested }}" ++
+            "{% set ns.seen = true %}  {%- endset -%}  after|{{ captured }}|{{ ns.seen }}",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("beforeafter|AB|True", result);
+}
+
+test "canonical Gemma4 template preserves thinking modes and tool history" {
+    var template = try Template.initHuggingFace(std.testing.allocator, @embedFile("testdata/gemma4_canonical_template.txt"));
+    defer template.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const messages = [_]ChatMessage{
+        .{ .role = "user", .content = "Find the code." },
+        .{ .role = "assistant", .content = "", .content_is_null = true, .tool_calls = &.{.{
+            .id = "call_1",
+            .name = "lookup",
+            .arguments = "{\"query\":\"code\",\"limit\":2}",
+        }} },
+        .{ .role = "tool", .content = "AZURE-731", .tool_call_id = "call_1" },
+    };
+    for ([_]bool{ false, true }) |thinking| {
+        var ctx = try chatTemplateContext(arena, messages[0..1], .{ .bos_token = "<bos>", .enable_thinking = thinking });
+        const prompt = try template.render(arena, &ctx);
+        try std.testing.expect(std.mem.endsWith(u8, prompt, "<|turn>model\n"));
+        try std.testing.expectEqual(thinking, std.mem.indexOf(u8, prompt, "<|think|>") != null);
+        ctx = try chatTemplateContext(arena, &messages, .{ .bos_token = "<bos>", .enable_thinking = thinking });
+        const history = try template.render(arena, &ctx);
+        try std.testing.expect(std.mem.indexOf(u8, history, "<|tool_call>call:lookup{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, history, "limit:2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, history, "query:<|\"|>code<|\"|>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, history, "<|tool_response>response:lookup{value:<|\"|>AZURE-731<|\"|>}<tool_response|>") != null);
+        try std.testing.expect(std.mem.endsWith(u8, history, if (thinking) "<|channel>thought\n" else "<tool_response|>"));
+    }
+}
+
+test "range and mapping get honor defaults and reject invalid bounds" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = ValueMap{};
+    const result = try render(
+        arena,
+        "{% set obj = namespace(present=none, value=7) %}" ++
+            "{{ obj.get('value', 9) }}|{{ obj.get('absent', 9) }}|{{ obj.get('present', 9) is none }}|" ++
+            "{% for i in range(4, -1, -2) %}{{ i }}{% endfor %}|{% for i in range(2) %}{{ i }}{% endfor %}|" ++
+            "{{ 'one\\n' 'two' }}",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("7|9|True|420|01|one\ntwo", result);
+    try std.testing.expectError(error.InvalidArguments, render(arena, "{{ range(0, 3, 0) }}", &ctx));
+    try std.testing.expectError(error.RangeTooLarge, render(arena, "{{ range(100001) }}", &ctx));
+    try std.testing.expectError(error.TemplateException, render(arena, "{{ raise_exception('bad ' 'input') }}", &ctx));
 }
 
 test {

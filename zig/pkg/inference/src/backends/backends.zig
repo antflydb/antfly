@@ -126,6 +126,19 @@ pub const BackendRuntime = struct {
     backend: BackendType,
     onnx_execution_provider: OnnxExecutionProvider = .cpu,
 
+    pub fn requiresProcessIsolation(self: BackendRuntime) bool {
+        return self.loadInterruption() == .process_required or
+            self.executionInterruption() == .process_required;
+    }
+
+    /// Placement must cover backends selected lazily after server startup.
+    pub fn availableRequiresProcessIsolation() bool {
+        inline for (std.meta.tags(BackendType)) |backend| {
+            if (backend.available() and (BackendRuntime{ .backend = backend }).requiresProcessIsolation()) return true;
+        }
+        return false;
+    }
+
     pub fn usesGpuHostedSession(self: BackendRuntime) bool {
         return switch (self.backend) {
             .metal, .cuda => true,
@@ -162,6 +175,15 @@ test "backend runtime classifies external ONNX CUDA as GPU hosted" {
         .backend = .onnx,
         .onnx_execution_provider = .cuda,
     }).usesGpuHostedSession());
+}
+
+test "backend runtime process placement covers loading and execution" {
+    try std.testing.expect(!(BackendRuntime{ .backend = .native }).requiresProcessIsolation());
+    try std.testing.expect(!(BackendRuntime{ .backend = .wasm }).requiresProcessIsolation());
+    // CPU ONNX execution is terminable, but runtime construction is not.
+    try std.testing.expect((BackendRuntime{ .backend = .onnx, .onnx_execution_provider = .cpu }).requiresProcessIsolation());
+    inline for (.{ BackendType.metal, BackendType.cuda, BackendType.pjrt }) |backend|
+        try std.testing.expect((BackendRuntime{ .backend = backend }).requiresProcessIsolation());
 }
 
 test "backend interruption policy isolates unabortable driver calls" {

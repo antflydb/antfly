@@ -456,6 +456,7 @@ def embedded_standalone_runtime():
             "process_memory_budget_mb": process_memory_budget_mb,
             "warmup_performed": warmup_performed,
             "logs": server.debug_logs,
+            "process": server.proc,
         }
     except BaseException as exc:
         # A skipped test has no primary failure to preserve; a teardown defect
@@ -624,6 +625,157 @@ def _parse_cli_json(stdout: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _inference_worker_pid(parent_pid: int) -> int | None:
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    workers = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if (
+            len(parts) == 3
+            and int(parts[1]) == parent_pid
+            and parts[2].endswith("inference _worker")
+        ):
+            workers.append(int(parts[0]))
+    assert len(workers) <= 1, workers
+    return workers[0] if workers else None
+
+
+@pytest.mark.parametrize("failure", ["kill", "disconnect"])
+def test_standalone_inference_worker_isolation(embedded_standalone_runtime, failure):
+    if os.name != "posix":
+        pytest.skip("Process fault injection requires POSIX signals")
+    runtime = embedded_standalone_runtime
+    process = runtime["process"]
+    worker = _inference_worker_pid(process.pid)
+    if worker is None:
+        pytest.skip("This build has only cooperatively interruptible backends")
+    base = runtime["base_url"]
+    table = f"worker_isolation_{failure}"
+    response = requests.post(f"{base}/tables/{table}", json={}, timeout=10)
+    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{base}/tables/{table}/batch",
+            json={
+                "inserts": {"canary": {"body": "AZURE-731"}},
+                "sync_level": "full_text",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        def check_database():
+            assert process.poll() is None, runtime["logs"]()
+            response = requests.post(
+                f"{base}/tables/{table}/query",
+                json={"full_text_search": {"match_all": {}}, "limit": 1},
+                timeout=5,
+            )
+            response.raise_for_status()
+            assert (
+                response.json()["responses"][0]["hits"]["hits"][0]["_id"] == "canary"
+            ), response.text
+
+        check_database()
+        baseline = requests.post(
+            f"{runtime['inference_api_url']}/generate",
+            json={
+                "model": runtime["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "What is the capital of France? Answer with the city name.",
+                    }
+                ],
+                "max_tokens": 128,
+                "temperature": 0,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=60,
+        )
+        baseline.raise_for_status()
+        assert "paris" in baseline.json()["choices"][0]["message"]["content"].lower(), (
+            baseline.text
+        )
+        response = requests.post(
+            f"{runtime['inference_api_url']}/generate",
+            json={
+                "model": runtime["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Count from 1 to 10000, one number at a time, without skipping any numbers.",
+                    }
+                ],
+                "max_tokens": 8192,
+                "temperature": 0,
+                "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            stream=True,
+            timeout=60,
+        )
+        try:
+            response.raise_for_status()
+            lines = response.iter_lines(chunk_size=1, decode_unicode=True)
+            first = next(line for line in lines if line.startswith("data: "))
+            assert first != "data: [DONE]", first
+            check_database()
+            if failure == "kill":
+                os.kill(worker, signal.SIGKILL)
+                completed = False
+                try:
+                    completed = any(line == "data: [DONE]" for line in lines)
+                except requests.RequestException:
+                    pass  # A broken stream is an explicit failure, not success.
+                assert not completed, (
+                    "Worker death must not fabricate a completed response"
+                )
+        finally:
+            response.close()
+        check_database()
+
+        # The next request may race with the old generation draining, but must
+        # recover without restarting the database or replaying the old request.
+        deadline = time.monotonic() + 90
+        while True:
+            response = requests.post(
+                f"{runtime['inference_api_url']}/generate",
+                json={
+                    "model": runtime["model"],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the capital of France? Answer with the city name.",
+                        }
+                    ],
+                    "max_tokens": 128,
+                    "temperature": 0,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=60,
+            )
+            if response.ok:
+                assert (
+                    "paris"
+                    in response.json()["choices"][0]["message"]["content"].lower()
+                ), response.text + "\n" + runtime["logs"]()
+                break
+            assert time.monotonic() < deadline, response.text
+            time.sleep(0.1)
+        if failure == "kill":
+            assert _inference_worker_pid(process.pid) != worker
+        check_database()
+    finally:
+        requests.delete(f"{base}/tables/{table}", timeout=10).raise_for_status()
+
+
 def test_standalone_inference_process_envelope_composition(embedded_standalone_runtime):
     budget_mb = embedded_standalone_runtime["process_memory_budget_mb"]
     if budget_mb <= 0:
@@ -677,15 +829,16 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
     assert metrics.status_code == 200
     assert metrics.headers["Content-Type"].startswith("text/plain")
     body = metrics.text
-    # Core raft host metrics written by StandaloneHealthSource.
-    assert "antfly_raft_hosted_groups" in body
-    assert "antfly_raft_reconcile_rounds_total" in body
-    # Managed service metrics.
-    assert "antfly_service_queued_updates" in body
-    assert "antfly_service_applied_updates_total" in body
+    # Standalone composes data-runtime, supervisor, and public admission
+    # metrics. Metadata-node raft-host/service metrics live on that node.
+    assert "antfly_data_server_up 1\n" in body
+    assert "antfly_runtime_supervisor_state 1\n" in body
+    assert "antfly_runtime_supervisor_cancelled 0\n" in body
+    assert "antfly_admission_query_capacity_requests" in body
+    assert "antfly_admission_inference_capacity_requests" in body
     # Prometheus exposition format sanity.
-    assert "# HELP antfly_raft_hosted_groups" in body
-    assert "# TYPE antfly_raft_hosted_groups gauge" in body
+    assert "# HELP antfly_data_server_up" in body
+    assert "# TYPE antfly_data_server_up gauge" in body
 
     unknown = requests.get(f"{health_url}/does-not-exist", timeout=5)
     assert unknown.status_code == 404
@@ -825,6 +978,119 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                 embedded_standalone_api.delete_table(table_name)
             except (requests.RequestException, ValueError):
                 pass
+
+
+def test_standalone_gemma_agent_tools_via_cli(
+    embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime
+):
+    """Qualify real model tools, not a planner's synthetic tool-call counter."""
+    if "gemma-4" not in embedded_standalone_runtime["model"].lower():
+        pytest.skip("requires a Gemma 4 tool-capable generator")
+    table = f"gemma_agent_tools_{time.time_ns()}"
+    # This value is never supplied in a user prompt or a canned tool response.
+    canary = f"AZURE-{time.time_ns()}"
+    embedded_standalone_api.create_table(table, num_shards=1)
+    try:
+        embedded_standalone_api.batch_write(
+            table,
+            inserts={
+                "anatomy": {
+                    "title": "anatomy",
+                    "body": f"The anatomy verification code is {canary}.",
+                },
+                "noise": {
+                    "title": "physics",
+                    "body": "There is no verification code here.",
+                },
+            },
+            sync_level="full_index",
+        )
+        generator = json.dumps(
+            {
+                "provider": "antfly",
+                "model": embedded_standalone_runtime["model"],
+                "max_tokens": 512,
+                "temperature": 0,
+            }
+        )
+        common = (
+            "agents",
+            "query-builder",
+            "--table",
+            table,
+            "--fields",
+            "title,body",
+            "--mode",
+            "full_text",
+            "--intent",
+            "Find the anatomy document and report its verification code.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+        )
+        response = embedded_standalone_api.s.post(
+            f"{embedded_standalone_api.url}/agents/query-builder",
+            json={
+                "table": table,
+                "schema_fields": ["title", "body"],
+                "mode": "full_text",
+                "intent": "Find the anatomy document and report its verification code.",
+                "generator": json.loads(generator),
+                "max_internal_iterations": 4,
+            },
+            timeout=240,
+        )
+        assert response.status_code == 200, response.text
+        api_plan = response.json()
+        assert api_plan["status"] == "completed", response.text
+        assert all(value is not None for value in api_plan["query_request"].values())
+        built = embedded_standalone_cli(*common, timeout_s=240)
+        plan = json.loads(built.stdout)
+        assert plan["status"] == "completed"
+        assert plan["query_request"]["table"] == table
+        assert any(
+            step["name"] == "submit_query" and step["kind"] == "tool_call"
+            for step in plan["steps"]
+        )
+        assert "generation" not in plan
+
+        executed = embedded_standalone_cli(
+            *common, "--execute", "--no-streaming", timeout_s=300
+        )
+        result = json.loads(executed.stdout)
+        assert result["status"] == "completed"
+        assert canary in result["generation"], json.dumps(result)
+        assert "anatomy" in _hit_ids(result)
+        assert any(
+            (step.get("details") or {}).get("selection_source") == "model_tool_call"
+            and (step.get("details") or {}).get("tool_call_id")
+            for step in result["steps"]
+        )
+
+        streamed = embedded_standalone_cli(
+            "agents",
+            "retrieval",
+            "--table",
+            table,
+            "--intent",
+            "Report the anatomy verification code from the database.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+            "--generate",
+            "--streaming",
+            timeout_s=240,
+        )
+        assert "event: error" not in streamed.stdout
+        assert "event: done" in streamed.stdout
+        assert "build_query" in streamed.stdout
+        assert "submit_query" in streamed.stdout
+        assert "model_tool_call" in streamed.stdout
+        assert canary in streamed.stdout
+    finally:
+        embedded_standalone_api.delete_table(table)
 
 
 def test_standalone_retrieval_generation_with_live_inference(

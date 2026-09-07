@@ -119,6 +119,9 @@ def main() -> int:
         "standalone inference paths",
         "--inference-host-budget-mb 8192",
         "--no-streaming",
+        "antfly agents query-builder --table wikipedia",
+        "--max-internal-iterations 8",
+        "Add `--execute`",
     )
     for token in required:
         if token not in source:

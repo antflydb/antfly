@@ -43,6 +43,35 @@ pub const ChainLink = lib.ChainLink;
 pub const GeneratorFactory = lib.GeneratorFactory;
 pub const default_max_tokens = lib.default_max_tokens;
 pub const parseConfigFromSlice = lib.parseConfigFromSlice;
+
+test "embedded canonical generation preserves tool definitions returned calls and cancellation" {
+    const Fake = struct {
+        fn generate(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+            try std.testing.expect(context != null);
+            try context.?.check();
+            try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0") != null);
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"query_index\":0}"}}]}}]}
+            );
+        }
+    };
+    var client = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(std.testing.allocator, &client, .{
+        .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
+        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+    });
+    var cfg = GeneratorConfig.fromAntfly(.{ .model = "gemma", .url = "" });
+    cfg.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]";
+    cfg.temperature = 0;
+    var generator = try factory.factory().create(std.testing.allocator, cfg);
+    defer generator.deinit();
+    var result = try generator.generate(std.testing.allocator, "gemma", &.{.{ .role = .user, .content = .{ .text = "search" } }});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+}
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
 pub const BackendFactory = struct {
@@ -329,6 +358,26 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
+                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null)) {
+                    const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
+                        .tools_json = self.cfg.tools_json,
+                        .tool_choice_json = self.cfg.tool_choice_json,
+                        .max_tokens = self.cfg.max_tokens,
+                        .temperature = self.cfg.temperature,
+                        .top_p = self.cfg.top_p,
+                        .top_k = self.cfg.top_k,
+                        .frequency_penalty = self.cfg.frequency_penalty,
+                        .presence_penalty = self.cfg.presence_penalty,
+                        // Agent tool turns spend the bounded output budget on
+                        // calls and answers, not optional private reasoning.
+                        .enable_thinking = if (self.cfg.tools_json != null) false else null,
+                    });
+                    defer alloc.free(body);
+                    const response = try local.generateJson(alloc, body, self.request_context);
+                    defer alloc.free(response);
+                    break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
+                }
+                if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null) return error.UnsupportedGeneratorProvider;
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
                 if (self.request_context) |context| {
                     try context.check();
@@ -351,6 +400,9 @@ const BackendState = struct {
                 const contents = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(contents);
                 for (messages, 0..) |message, i| {
+                    // A legacy text-only callback cannot preserve tool identity.
+                    if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool)
+                        return error.UnsupportedGeneratorProvider;
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
@@ -675,6 +727,17 @@ test "generating backend routes antfly and url-less antfly to local provider" {
     }, &messages);
     defer controlled_result.deinit();
     try std.testing.expectEqualStrings("local ok", controlled_result.content);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    const tool_messages = [_]ChatMessage{.{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &.{.{
+        .id = "c1",
+        .name = "search",
+        .arguments = "{}",
+    }} }};
+    try std.testing.expectError(error.UnsupportedGeneratorProvider, executeChainWithAntflyProvider(alloc, &client, &antfly_chain, local_provider, &tool_messages));
+    try std.testing.expectError(error.UnsupportedGeneratorProvider, executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = null },
+    }, &tool_messages));
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 

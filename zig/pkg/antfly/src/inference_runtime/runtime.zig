@@ -207,6 +207,10 @@ pub fn runFromIterator(
 
     const command = args.next() orelse "run";
 
+    if (std.mem.eql(u8, command, "_worker")) {
+        return @import("../standalone/inference_worker.zig").runChild(alloc, io);
+    }
+
     if (std.mem.eql(u8, command, "run")) {
         if (runHelpRequested(args)) {
             printUsage();
