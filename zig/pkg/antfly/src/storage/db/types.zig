@@ -1125,9 +1125,12 @@ pub const ColumnarScanStats = struct {
     blocks_pruned: u64 = 0,
     columns_read: u64 = 0,
     encoded_bytes_read: u64 = 0,
+    metadata_bytes_read: u64 = 0,
+    payload_bytes_read: u64 = 0,
     rows_selected: u64 = 0,
     values_materialized: u64 = 0,
     dirty_ranges_read: u64 = 0,
+    primary_rows_read: u64 = 0,
 };
 
 pub const ScanOptions = struct {
@@ -2556,7 +2559,20 @@ pub const VisibilityStats = struct {
     overflow_total: u64 = 0,
 };
 
+pub const ColumnarMaintenanceStats = struct {
+    pending: bool = false,
+    backing_off: bool = false,
+    /// Age since this process observed pending work, not the row's write time.
+    pending_age_ns: u64 = 0,
+    passes: u64 = 0,
+    ranges_compacted: u64 = 0,
+    blocks_written: u64 = 0,
+    failures: u64 = 0,
+    last_pass_ns: u64 = 0,
+};
+
 pub const DBStats = struct {
+    columnar_maintenance: ColumnarMaintenanceStats = .{},
     /// Process-local identity of the resident DB owner that sampled this
     /// status. Cache merge logic uses it only with an exact table root and
     /// index incarnation; it is not part of the public status contract.

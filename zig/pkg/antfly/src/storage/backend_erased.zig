@@ -207,6 +207,68 @@ pub const Cursor = struct {
     }
 };
 
+/// Values remain valid until close, independently of other scopes on the
+/// same immutable snapshot. A streaming consumer closes one scope per block.
+pub const ReadScope = struct {
+    allocator: Allocator,
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    const VTable = struct {
+        get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        close: *const fn (Allocator, *anyopaque) void,
+    };
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        return self.vtable.get(self.ptr, key);
+    }
+    pub fn close(self: *@This()) void {
+        self.vtable.close(self.allocator, self.ptr);
+        self.* = undefined;
+    }
+};
+
+pub fn readScopeFrom(alloc: Allocator, handle: anytype) !ReadScope {
+    return readScopeFromWithParent(alloc, handle, null);
+}
+
+fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRelease) !ReadScope {
+    const State = struct {
+        handle: @TypeOf(handle),
+        parent: ?ParentRelease,
+        fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.get(key);
+        }
+        fn close(a: Allocator, ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.handle.close();
+            if (self.parent) |owner| owner.release(owner.ptr);
+            a.destroy(self);
+        }
+    };
+    const state = try alloc.create(State);
+    state.* = .{ .handle = handle, .parent = parent };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .close = State.close } };
+}
+
+/// Portable fallback: cursor-owned storage pins are bounded; returned copies
+/// belong to this scope, never to the long-lived transaction.
+pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
+    const Scope = struct {
+        cursor: Cursor,
+        arena: std.heap.ArenaAllocator,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            const entry = (try self.cursor.seekAtOrAfter(key)) orelse return error.NotFound;
+            if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
+            return self.arena.allocator().dupe(u8, entry.value);
+        }
+        pub fn close(self: *@This()) void {
+            self.cursor.close();
+            self.arena.deinit();
+        }
+    };
+    return readScopeFrom(alloc, Scope{ .cursor = cursor, .arena = std.heap.ArenaAllocator.init(alloc) });
+}
+
 pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -217,6 +279,7 @@ pub const ReadTxn = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
     };
 
     pub fn abort(self: *ReadTxn) void {
@@ -244,6 +307,13 @@ pub const ReadTxn = struct {
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
         return try self.vtable.open_cursor(self.allocator, self.ptr);
+    }
+
+    pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
+        if (self.vtable.open_read_scope) |open| return open(alloc, self.ptr);
+        var cursor = try self.openCursor();
+        errdefer cursor.close();
+        return cursorReadScope(alloc, cursor);
     }
 };
 
@@ -1015,6 +1085,15 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        fn openReadScope(alloc: Allocator, ptr: *anyopaque) anyerror!ReadScope {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var scope = try parent.handle.openReadScope(alloc);
+            errdefer scope.close();
+            return readScopeFromWithParent(alloc, scope, parentReleaseFor(parent));
+        }
     };
 
     return .{
@@ -1025,6 +1104,7 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .open_cursor = vt.openCursor,
+            .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
         },
     };
 }
@@ -2216,8 +2296,8 @@ test "erased cursor retains read transaction until cursor close" {
         pub fn prev(_: *@This()) !?Entry {
             return null;
         }
-        pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
-            return null;
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+            return if (std.mem.eql(u8, key, "key")) self.first() else null;
         }
         pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
             return null;
@@ -2245,6 +2325,20 @@ test "erased cursor retains read transaction until cursor close" {
     try std.testing.expect(!shared.aborted);
     try std.testing.expectEqualStrings("key", (try cursor.first()).?.key);
     cursor.close();
+    try std.testing.expect(shared.cursor_closed);
+    try std.testing.expect(shared.aborted);
+
+    // Backends without a native scope use bounded cursor-owned copies while
+    // retaining the same parent snapshot, including after owner abort.
+    shared = .{};
+    var scoped_txn = try readTxnFrom(std.testing.allocator, MockRead{ .shared = &shared });
+    var scope = try scoped_txn.openReadScope(std.testing.allocator);
+    scoped_txn.abort();
+    try std.testing.expect(!shared.aborted);
+    const value = try scope.get("key");
+    try std.testing.expectError(error.NotFound, scope.get("missing"));
+    try std.testing.expectEqualStrings("value", value);
+    scope.close();
     try std.testing.expect(shared.cursor_closed);
     try std.testing.expect(shared.aborted);
 }

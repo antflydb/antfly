@@ -497,6 +497,24 @@ pub const DocStore = struct {
             return try self.read.?.get(key);
         }
 
+        /// Block-scoped values from this exact snapshot. Close scopes before
+        /// aborting the transaction (which also owns the portable-import fence).
+        pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
+            if (supports_lmdb) if (self.raw) |*raw| {
+                const Scope = struct {
+                    raw: *LmdbTransaction,
+                    dbi: LmdbDbi,
+                    pub fn get(scope: *@This(), key: []const u8) ![]const u8 {
+                        return scope.raw.get(scope.dbi, key);
+                    }
+                    pub fn close(_: *@This()) void {}
+                };
+                return backend_erased.readScopeFrom(alloc, Scope{ .raw = raw, .dbi = self.dbi });
+            };
+            if (self.read) |*read| return read.openReadScope(alloc);
+            return error.ReadOnly;
+        }
+
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);

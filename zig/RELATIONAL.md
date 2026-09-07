@@ -353,8 +353,9 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. Presence distinguishes absent values from explicit nulls and
-lets existence predicates avoid decoding the value stream entirely.
+this build path. ACL3/ACB3 keeps these bitmaps in separately checksummed block
+metadata. Existence predicates and null projections need neither payload I/O
+nor value-stream decoding, even for large vector/JSON columns.
 
 Column segments carry schema epochs, null state, and numeric min/max summaries.
 A manifest records the schema-bound generation and its initial replay coverage.
@@ -378,6 +379,14 @@ MVCC readers. Only initial creation, schema replacement, or corrupt-derived-data
 repair requires a full generation build. This keeps one row authority,
 makes schema changes and crash recovery explicit, and prevents a user-visible
 index configuration from controlling SQL/relational scan performance.
+
+A generation-bound durable round-robin cursor advances before staging, so hot
+keys, failed builds and process restarts cannot starve later dirty ranges. The
+owner worker drains up to eight ranges or 50 ms per turn (checked between
+bounded range builds), using a 100 ms active cadence while work remains and a
+five-second idle/resource-pressure backoff. DB statistics expose pending work,
+its observed age, backoff state, pass duration, failures, compacted ranges and
+written blocks without a catalog scan.
 
 ### Query path
 
@@ -424,6 +433,14 @@ materialized. Typed scalar kernels and direct vector membership do not build
 JSON trees. Candidate masks short-circuit resolved blocks/rows, inexpensive
 predicates precede composite payloads, and projected values are materialized
 only for surviving rows. JSON composite values are cached per block/row.
+
+The scan retains one immutable storage snapshot but opens a read scope per
+columnar block. LSM scopes own and release their own cached-block pins/copied
+values; they never accumulate in the parent transaction. LMDB borrows from its
+snapshot, and other backends use bounded cursor-owned copies. Dirty-range
+fallback intersects directory, query and shard bounds before opening its
+cursor, and checks keys before schema lookup or row decoding. Scan counters
+separate metadata bytes, payload bytes and primary rows decoded.
 
 Durable intent application keeps AROW as the logical authority. The immutable
 write plan requests only the graph/sparse/TTL/text fields actually consumed;
