@@ -373,6 +373,20 @@ unread pages containing surviving values, and `payload_pages_read` exposes the
 actual I/O alongside bytes read. Publication retires every declared page
 atomically; generation reclamation also covers canceled or obsolete pages.
 
+Scan planning is metadata-first. Access-path admission happens before predicate
+payload decoding, and dirty markers remove replaced/deleted base candidates
+before evaluation. Bounded marker probes feed admission; execution completes
+visibility with ordered seeks only for its current row window, skipping large
+insertion gaps without walking every marker. A limited filtered scan evaluates
+one physical predicate-page window before delivering results and stops once its
+limit is met. Unlimited scans retain block-vectorized evaluation. Cancellation
+and deadline checks run between windows, predicate nodes, and payload pages.
+Boolean leaves are ordered once per expression/block using numeric pruning,
+unread candidate-page bytes, and logical evaluation weights. Wide strings/blobs
+are not classified as cheap scalars. Boolean thresholds and negation preserve
+their semantics under ordering; repeated predicates share cached pages. These
+weights guide predicate ordering only, not the primary-versus-column byte model.
+
 Column segments carry schema epochs, null state, and numeric min/max summaries.
 A manifest records the schema-bound generation and directory state.
 Each primary put/delete atomically records an eight-byte mutation version and
@@ -390,13 +404,14 @@ the new row fails the predicate or expires. Delta evaluation is independent of
 base zone-map pruning. One changed row no longer forces primary reads for the
 whole range, and arbitrarily large deltas retain only one row read scope/arena.
 A bounded cost probe compares unchanged primary bytes plus live delta bytes
-against selected-column payload bytes plus delta point-read costs. Root metadata
+against predicate/projection payload bytes plus delta point-read costs. Shared
+predicate/projection columns are charged once. Root metadata
 records packed bytes per row; selected column metadata records payload sizes.
 Replaced base rows are subtracted, while expired primary rows still count toward
 I/O. The estimate charges 4 KiB per random read and 64 bytes per sequential row,
 requiring a 25% margin and at least 16 deltas before switching to primary scans.
 It inspects at most 1,024 dirty records or 256 KiB without fetching primary values;
-incomplete estimates omit projection costs and use the observed point-read cost
+incomplete estimates omit column payload costs and use the observed point-read cost
 as an overlay lower bound, so very large insertion bursts can still choose a
 sequential scan without walking every marker first. Small LIMIT queries (up to 16) skip the
 probe and preserve early exit. These conservative cost weights are tuning
@@ -414,8 +429,17 @@ row-keyspace change. An artifact-only owner may require reading its first record
 but child fanout does not multiply cursor steps. Owner checkpoints enforce query
 cancellation/deadlines and let builds yield after 1,024 owners or their time
 budget even without a live row. Owner-visit counters expose that work separately
-from rows read or written. Clean-range coalescing fetches known rows directly
-from the same snapshot's immutable block directory, without rescanning gaps.
+from rows read or written. Clean-range coalescing reads typed column pages from
+the same snapshot's immutable block directory, without fetching primary AROW,
+reconstructing JSON, or rescanning gaps. A bounded remapping window preserves
+semantic hashes, timestamps, physical-size accounting, absent/null cells, and
+schema identity while transposing one source column at a time into the builder.
+Decoded source pages outlive destination flushes; the writer owns copied cells
+before the source scope closes. Publication, dirty-token compare-clear, retained
+suffixes, cancellation, and restart use the same existing commit fences.
+Maintenance exposes `covered_rows_read` and `primary_rows_read` separately so
+the reduction in primary I/O is measurable. Column pages are still re-encoded
+when row ordinals change; this is not compressed-page concatenation.
 Thus neither an empty prefix nor an orphan-heavy gap after a live row can
 repeatedly consume the budget before the worker reaches its successor. Dirty
 and uncovered ranges continue to use the bounded owner cursor.

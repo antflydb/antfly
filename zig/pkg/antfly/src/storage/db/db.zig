@@ -62932,6 +62932,34 @@ test "relational columnar selected payload pages bound wide projection reads" {
         try std.testing.expectEqualDeep(all.documents[63], filtered.documents[1]);
         try std.testing.expect(filtered_stats.payload_bytes_read * 4 < all_stats.payload_bytes_read);
         try std.testing.expectEqual(@as(u64, 2), filtered_stats.values_materialized);
+        // Equivalent predicate order must not force wide payload reads.
+        const reversed_filter = try std.fmt.allocPrint(scratch, "{{\"conjuncts\":[{{\"term\":{{\"payload\":\"{s}\"}}}},{{\"term\":{{\"n\":0}}}}]}}", .{payloads[0]});
+        var reversed_stats: types.ColumnarScanStats = .{};
+        var reversed = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .filter_query_json = reversed_filter, .columnar_stats = &reversed_stats });
+        defer reversed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), reversed.documents.len);
+        try std.testing.expectEqualDeep(all.documents[0], reversed.documents[0]);
+        try std.testing.expect(reversed_stats.payload_bytes_read * 8 < all_stats.payload_bytes_read);
+        const payload_filter = try std.fmt.allocPrint(scratch, "{{\"term\":{{\"payload\":\"{s}\"}}}}", .{payloads[0]});
+        var limited_stats: types.ColumnarScanStats = .{};
+        var limited = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .filter_query_json = payload_filter, .limit = 1, .columnar_stats = &limited_stats });
+        defer limited.deinit(alloc);
+        try std.testing.expectEqualDeep(one.documents, limited.documents);
+        try std.testing.expectEqual(@as(u64, 1), limited_stats.payload_pages_read);
+        try std.testing.expect(limited_stats.payload_bytes_read * 8 < all_stats.payload_bytes_read);
+        // Both bounded overlays and dense-plan admission must ignore obsolete
+        // base predicates, including when no current row matches the filter.
+        const replacements = try scratch.alloc(types.BatchWrite, writes.len);
+        for (writes, replacements) |write, *replacement| replacement.* = .{ .key = write.key, .value = "{\"n\":100}" };
+        try db.batch(.{ .writes = replacements });
+        for ([_]u32{ 0, 1 }) |limit| {
+            var replaced_stats: types.ColumnarScanStats = .{};
+            var replaced = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .filter_query_json = payload_filter, .limit = limit, .columnar_stats = &replaced_stats });
+            defer replaced.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), replaced.documents.len);
+            try std.testing.expectEqual(@as(u64, 0), replaced_stats.payload_bytes_read);
+        }
+        try db.batch(.{ .writes = writes });
         // Coverage publication retires every payload page, including pages
         // never read by the point projection above.
         try db.batch(.{ .deletes = &.{ writes[0].key, writes[63].key } });
@@ -63568,6 +63596,72 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
     try std.testing.expectEqual(@as(u64, 1), stats.blocks_read);
     try std.testing.expectEqual(@as(u64, 0), stats.dirty_ranges_read);
     try std.testing.expect(db.relational_column_maintenance.ranges_merged.load(.monotonic) >= 3);
+    try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > 0);
+}
+
+test "relational columnar clean coalescing preserves typed cells without primary reads" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "n", .path = "n", .column_type = .integer },
+            .{ .name = "payload", .path = "payload", .column_type = .string, .allows_null = true },
+            .{ .name = "metadata", .path = "metadata", .column_type = .json, .is_json = true, .json_kind = .any, .allows_null = true },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const writes = try scratch.alloc(types.BatchWrite, 512);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        for (writes, 0..) |*write, i| {
+            const json = switch (i % 4) {
+                0 => "{\"n\":0,\"payload\":\"abc\",\"metadata\":{\"a\":[1,true,\"x\"]}}",
+                1 => "{\"n\":1,\"payload\":null,\"metadata\":null}",
+                2 => "{\"n\":2}",
+                else => "{\"n\":3,\"payload\":\"xyz\",\"metadata\":[null,2]}",
+            };
+            write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = json };
+            if (i % 256 >= 4) try deletes.append(scratch, write.key);
+        }
+        try db.batch(.{ .writes = writes });
+        try drainTestRelationalMaintenance(&db);
+        try db.batch(.{ .deletes = deletes.items });
+        const fields: []const []const u8 = &.{ "n", "payload", "metadata" };
+        var baseline = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = fields, .include_content_hashes = true });
+        defer baseline.deinit(alloc);
+        // Stop once dirty publication is complete, leaving the clean merge
+        // queue to run separately so its primary I/O can be measured exactly.
+        var passes: usize = 0;
+        while (true) {
+            var stats: types.ColumnarScanStats = .{};
+            var current = try db.scan(alloc, "", "", .{ .columnar_stats = &stats });
+            current.deinit(alloc);
+            if (stats.dirty_ranges_read == 0) break;
+            try std.testing.expect(try db.rebuildRelationalColumns());
+            passes += 1;
+            try std.testing.expect(passes < 200);
+        }
+        const primary_before = db.relational_column_maintenance.primary_rows_read.load(.monotonic);
+        try drainTestRelationalMaintenance(&db);
+        try std.testing.expectEqual(primary_before, db.relational_column_maintenance.primary_rows_read.load(.monotonic));
+        try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > 0);
+        var after = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = fields, .include_content_hashes = true });
+        defer after.deinit(alloc);
+        try std.testing.expectEqualDeep(baseline.documents, after.documents);
+        try std.testing.expectEqualDeep(baseline.hashes, after.hashes);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        var reopened_stats: types.ColumnarScanStats = .{};
+        var reopened = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = fields, .include_content_hashes = true, .columnar_stats = &reopened_stats });
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqualDeep(after.documents, reopened.documents);
+        try std.testing.expectEqual(@as(u64, 0), reopened_stats.primary_rows_read);
+    }
 }
 
 test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
@@ -63990,6 +64084,11 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
         if (i == 0 or i == 4) {
             try std.testing.expectEqual(@as(u64, 0), stats.columns_read);
             try std.testing.expectEqual(@as(u64, 0), stats.payload_bytes_read);
+        }
+        for ([_]u32{ 1, 2 }) |limit| {
+            var limited = try db.scan(alloc, "", "", .{ .filter_query_json = filter, .limit = limit });
+            defer limited.deinit(alloc);
+            try std.testing.expectEqualDeep(baseline[i].hashes[0..@min(limit, baseline[i].hashes.len)], limited.hashes);
         }
     }
 }

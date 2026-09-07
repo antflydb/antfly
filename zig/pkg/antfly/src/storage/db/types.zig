@@ -2569,6 +2569,10 @@ pub const VisibilityStats = struct {
 };
 
 pub const ColumnarMaintenanceStats = struct {
+    /// Typed source rows reused by clean coverage coalescing (no AROW reads).
+    covered_rows_read: u64 = 0,
+    /// Authoritative rows decoded during bootstrap/dirty range preparation.
+    primary_rows_read: u64 = 0,
     admission_root_reads: u64 = 0,
     admission_dirty_probes: u64 = 0,
     owners_examined: u64 = 0,

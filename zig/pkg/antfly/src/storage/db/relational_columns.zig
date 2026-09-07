@@ -70,6 +70,8 @@ pub const Maintenance = struct {
     bootstrap_quanta: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
     owners_examined: std.atomic.Value(u64) = .init(0),
+    covered_rows_read: std.atomic.Value(u64) = .init(0),
+    primary_rows_read: std.atomic.Value(u64) = .init(0),
     scheduler_candidates: std.atomic.Value(u64) = .init(0),
     scheduler_commits: std.atomic.Value(u64) = .init(0),
     admission_root_reads: std.atomic.Value(u64) = .init(0),
@@ -126,6 +128,8 @@ pub const Maintenance = struct {
             .bootstrap_quanta = self.bootstrap_quanta.load(.monotonic),
             .bytes_written = self.bytes_written.load(.monotonic),
             .owners_examined = self.owners_examined.load(.monotonic),
+            .covered_rows_read = self.covered_rows_read.load(.monotonic),
+            .primary_rows_read = self.primary_rows_read.load(.monotonic),
             .scheduler_candidates = self.scheduler_candidates.load(.monotonic),
             .scheduler_commits = self.scheduler_commits.load(.monotonic),
             .admission_root_reads = self.admission_root_reads.load(.monotonic),
@@ -400,9 +404,9 @@ fn ColumnBuilder(comptime DBType: type) type {
             return .@"continue";
         }
 
-        /// A clean, covered range's immutable root is an exact row directory
-        /// for this snapshot. Fetch only those rows: rescanning orphan gaps
-        /// during coalescing could otherwise yield at the same boundary forever.
+        /// Clean coverage is a complete typed source in this snapshot. Remap
+        /// row ordinals directly from column pages; never fetch AROW or rebuild
+        /// logical JSON just to coalesce immutable, same-schema blocks.
         fn visitCovered(self: *@This(), read: *store_mod.DocStore.Txn, range: Range, end: []const u8) !void {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -411,74 +415,126 @@ fn ColumnBuilder(comptime DBType: type) type {
             defer scope.close();
             var decoder = Decoder{ .bytes = try verified(try scope.get(try blockKey(scratch, self.generation, range.block, null))) };
             if (!std.mem.eql(u8, try decoder.take(4), "ACB6")) return error.InvalidColumnSegment;
-            _ = try decoder.int(u32);
+            const version = try decoder.int(u32);
             const count = try decoder.int(u32);
             if (count > max_rows) return error.InvalidColumnSegment;
             const pages = try decoder.int(u32);
             _ = try decoder.int(u64);
             if (pages > decoder.bytes.len / 12) return error.InvalidColumnSegment;
-            _ = try decoder.take(@as(usize, pages) * 12);
+            const ordinal_pages = try decoder.take(@as(usize, pages) * 12);
+            const rows = try scratch.alloc(Row, count);
             var previous: ?[]const u8 = null;
-            for (0..count) |_| {
-                const id = try decoder.take(try decoder.int(u32));
-                _ = try decoder.take(48); // semantic hash, timestamp, physical size
-                if (previous) |last| if (std.mem.order(u8, last, id) != .lt) return error.InvalidColumnSegment;
-                previous = id;
-                if (std.mem.order(u8, id, range.start) == .lt) continue;
-                if (end.len != 0 and std.mem.order(u8, id, end) != .lt) continue;
-                const key = try keys.relationalRowKeyAlloc(scratch, id);
-                if (try checkpoint(self, key) == .stop) return;
-                const value = scope.get(key) catch |err| switch (err) {
-                    error.NotFound => return error.InvalidColumnSegment,
-                    else => return err,
-                };
-                if (try visit(self, key, value) == .stop) return;
+            for (rows) |*row| {
+                row.key = try decoder.take(try decoder.int(u32));
+                @memcpy(&row.hash, try decoder.take(32));
+                row.timestamp = try decoder.int(u64);
+                row.physical_bytes = try decoder.int(u64);
+                if (previous) |last| if (std.mem.order(u8, last, row.key) != .lt) return error.InvalidColumnSegment;
+                previous = row.key;
             }
             if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
+            var view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            defer view.release();
+            try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
+            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.artifact_repair_metadata_stop };
+            var source_id: usize = 0;
+            while (source_id < rows.len) {
+                var selected: [max_rows]bool = @splat(false);
+                var remap: [max_rows]u32 = undefined;
+                while (source_id < rows.len) : (source_id += 1) {
+                    const row = rows[source_id];
+                    if (std.mem.order(u8, row.key, range.start) == .lt) continue;
+                    if (end.len != 0 and std.mem.order(u8, row.key, end) != .lt) continue;
+                    const key = try keys.relationalRowKeyAlloc(scratch, row.key);
+                    if (try checkpoint(self, key) == .stop) break;
+                    if (!try self.prepareVersion(version, key)) break;
+                    const dest = self.arena.allocator();
+                    remap[source_id] = @intCast(self.rows.items.len);
+                    selected[source_id] = true;
+                    var owned = row;
+                    owned.key = try dest.dupe(u8, row.key);
+                    try self.rows.append(dest, owned);
+                    self.bytes +|= @intCast(row.physical_bytes);
+                    self.prepared_bytes +|= @intCast(row.physical_bytes);
+                    _ = self.db.relational_column_maintenance.covered_rows_read.fetchAdd(1, .monotonic);
+                    if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) {
+                        source_id += 1;
+                        break;
+                    }
+                }
+                // Transpose a bounded row window one column at a time. Decoded
+                // source pages outlive destination flushes; writer.add owns any
+                // borrowed variable-width cells before the source scope closes.
+                for (0..ordinal_pages.len / 12) |page| {
+                    const encoded = ordinal_pages[page * 12 ..][0..12];
+                    const base = std.mem.readInt(u32, encoded[0..4], .little) * 64;
+                    var mask = std.mem.readInt(u64, encoded[4..12], .little);
+                    while (mask != 0) {
+                        const ordinal = base + @as(u32, @intCast(@ctz(mask)));
+                        mask &= mask - 1;
+                        const cells = try block.cells(ordinal, selected[0..rows.len]);
+                        for (cells, selected[0..rows.len], 0..) |maybe_cell, keep, i| {
+                            if (keep) if (maybe_cell) |cell| {
+                                try self.addCell(remap[i], cell);
+                            };
+                        }
+                    }
+                }
+                if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) try self.flush();
+                if (self.continuation != null) return;
+            }
         }
 
-        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
-            const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            const version = try codec.rowSchemaVersion(value);
+        fn prepareVersion(self: *@This(), version: u32, key: []const u8) !bool {
             if (self.view == null or self.view.?.version() != version) {
                 try self.flush();
                 // Epoch changes can flush a partial block and exhaust the
                 // quantum before the incoming row is added.
-                if (try self.yieldBeforeRow(key)) return .stop;
+                if (try self.yieldBeforeRow(key)) return false;
                 if (self.view) |*view| view.release();
                 self.view = null;
                 self.view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             }
+            return true;
+        }
+
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!try self.prepareVersion(try codec.rowSchemaVersion(value), key)) return .stop;
             const view = self.view.?;
             const row = try codec.ordinalRowView(value, view.tableSchema().*, view.physicalLayout());
             const scratch = self.arena.allocator();
             const id: u32 = @intCast(self.rows.items.len);
             try self.rows.append(scratch, .{ .key = (try keys.decodeStoredDocumentRowKeyAlloc(scratch, key)) orelse return error.InvalidColumnSegment, .hash = row.semanticHash(), .timestamp = row.writeTimestampNs(), .physical_bytes = value.len });
             var cells = codec.OrdinalCellIterator{ .parsed = row.parsed, .table_schema = row.table_schema };
-            while (try cells.next()) |cell| {
-                const entry = try self.columns.getOrPut(scratch, cell.ordinal);
-                if (!entry.found_existing) entry.value_ptr.* = .{ .writer = dv.TypedDocValuesWriter.init(scratch, cell.value_type, max_rows) };
-                entry.value_ptr.presence[id / 8] |= @as(u8, 1) << @intCast(id % 8);
-                if (cell.is_null) entry.value_ptr.nulls[id / 8] |= @as(u8, 1) << @intCast(id % 8) else try entry.value_ptr.writer.add(id, cell.value);
-                if (!cell.is_null) {
-                    const number: ?f64 = switch (cell.value) {
-                        .u64_val => |n| @floatFromInt(n),
-                        .i64_val => |n| @floatFromInt(n),
-                        .f64_val => |n| n,
-                        else => null,
-                    };
-                    if (number) |n| {
-                        const bounds = &entry.value_ptr.bounds;
-                        bounds.minimum = if (bounds.present) @min(bounds.minimum, n) else n;
-                        bounds.maximum = if (bounds.present) @max(bounds.maximum, n) else n;
-                        bounds.present = true;
-                    }
-                }
-            }
+            while (try cells.next()) |cell| try self.addCell(id, cell);
             self.bytes +|= value.len;
             self.prepared_bytes +|= value.len;
+            _ = self.db.relational_column_maintenance.primary_rows_read.fetchAdd(1, .monotonic);
             if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) try self.flush();
             return .@"continue";
+        }
+
+        fn addCell(self: *@This(), id: u32, cell: codec.Cell) !void {
+            const scratch = self.arena.allocator();
+            const entry = try self.columns.getOrPut(scratch, cell.ordinal);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .writer = dv.TypedDocValuesWriter.init(scratch, cell.value_type, max_rows) };
+            entry.value_ptr.presence[id / 8] |= @as(u8, 1) << @intCast(id % 8);
+            if (cell.is_null) entry.value_ptr.nulls[id / 8] |= @as(u8, 1) << @intCast(id % 8) else try entry.value_ptr.writer.add(id, cell.value);
+            if (!cell.is_null) {
+                const number: ?f64 = switch (cell.value) {
+                    .u64_val => |n| @floatFromInt(n),
+                    .i64_val => |n| @floatFromInt(n),
+                    .f64_val => |n| n,
+                    else => null,
+                };
+                if (number) |n| {
+                    const bounds = &entry.value_ptr.bounds;
+                    bounds.minimum = if (bounds.present) @min(bounds.minimum, n) else n;
+                    bounds.maximum = if (bounds.present) @max(bounds.maximum, n) else n;
+                    bounds.present = true;
+                }
+            }
         }
 
         fn deinit(self: *@This()) void {
@@ -1203,8 +1259,13 @@ fn scheduleMaintenance(txn: *store_mod.DocStore.Txn, alloc: alloc_type, turn: u6
 /// streaming early exit. An incomplete probe uses an overlay lower bound:
 /// unseen deltas add common row bytes, favor sequential access, and can only
 /// remove more unchanged base bytes from the primary estimate.
-fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, block: *Block, matched: []const bool) !bool {
-    if (opts.limit > 0 and opts.limit <= 16) return false;
+const RangeScanPlan = struct {
+    primary: bool = false,
+    visibility_complete: bool = false,
+};
+
+fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, block: *Block, candidates: []bool, filter: ?*const graph.PreparedPatternFilter) !RangeScanPlan {
+    if (opts.limit > 0 and opts.limit <= 16) return .{};
     var lower = range.start;
     if (std.mem.order(u8, lower, from) == .lt) lower = from;
     if (std.mem.order(u8, lower, byte_range.start) == .lt) lower = byte_range.start;
@@ -1230,7 +1291,7 @@ fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Ran
     var delta_bytes: u64 = 0;
     var delta_live: u64 = 0;
     var surviving: [max_rows]bool = @splat(false);
-    @memcpy(surviving[0..block.rows.len], matched);
+    @memcpy(surviving[0..block.rows.len], candidates);
     var row_index: usize = 0;
     var probe_bytes: usize = 0;
     var complete = true;
@@ -1257,6 +1318,7 @@ fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Ran
         while (row_index < block.rows.len and std.mem.order(u8, block.rows[row_index].key, id) == .lt) : (row_index += 1) {}
         if (row_index < block.rows.len and std.mem.eql(u8, block.rows[row_index].key, id)) {
             surviving[row_index] = false;
+            candidates[row_index] = false;
             if (cost_eligible[row_index]) {
                 base_bytes -|= block.rows[row_index].physical_bytes;
                 base_count -|= 1;
@@ -1268,28 +1330,19 @@ fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Ran
         entry = try cursor.next();
     }
     var projected_bytes: u64 = 0;
-    if (complete and opts.include_documents and std.mem.indexOfScalar(bool, surviving[0..block.rows.len], true) != null) {
+    if (complete and std.mem.indexOfScalar(bool, surviving[0..block.rows.len], true) != null) {
         var seen = std.AutoHashMapUnmanaged(u32, void).empty;
         defer seen.deinit(alloc);
-        for (opts.fields) |field| {
+        if (opts.include_documents) for (opts.fields) |field| {
             const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
-            if ((try seen.getOrPut(alloc, ordinal)).found_existing) continue;
-            const column = try block.column(ordinal);
-            if (column.pages) |pages| {
-                const page_rows = @as(usize, 1) << pages.shift;
-                for (0..pages.sizes.len / 8) |page| {
-                    if (column.loaded_pages[page]) continue;
-                    for (page * page_rows..@min(block.rows.len, (page + 1) * page_rows)) |row| {
-                        const bit = @as(u8, 1) << @intCast(row % 8);
-                        if (surviving[row] and column.present(row) and column.bitmaps[null_bytes + row / 8] & bit == 0) {
-                            projected_bytes +|= pages.size(page);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+            try seen.put(alloc, ordinal, {});
+        };
+        if (filter) |value| try block.predicateColumns(value.compiled, &seen);
+        var ordinals = seen.keyIterator();
+        while (ordinals.next()) |ordinal| projected_bytes +|= try block.payloadCost(ordinal.*, surviving[0..block.rows.len]);
     }
+    // Predicate/projection pages are charged once, before any payload is read.
+    // CPU ranking weights belong to leaf ordering, not this byte estimate.
     const overlay = delta_bytes +| @as(u64, count) *| 4096 +| projected_bytes;
     const primary = delta_bytes +| base_bytes +| (base_count +| delta_live) *| 64;
     if (opts.columnar_stats) |stats| {
@@ -1297,7 +1350,7 @@ fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Ran
         stats.estimated_primary_bytes +|= primary;
     }
     // Require a margin before discarding the column plan for a row scan.
-    return count >= 16 and primary +| primary / 4 < overlay;
+    return .{ .primary = count >= 16 and primary +| primary / 4 < overlay, .visibility_complete = complete };
 }
 
 /// Compact one dirty key range per maintenance pass. Large insertion bursts
@@ -1722,6 +1775,17 @@ fn supports(filter: graph.CompiledPatternFilter) bool {
     };
 }
 
+fn validateOrdinalPages(pages: []const u8, rows: usize, columns: usize) !void {
+    if (pages.len % 12 != 0 or (rows == 0 and pages.len != 0)) return error.InvalidColumnSegment;
+    for (0..pages.len / 12) |i| {
+        const page = pages[i * 12 ..][0..12];
+        const id = std.mem.readInt(u32, page[0..4], .little);
+        const mask = std.mem.readInt(u64, page[4..12], .little);
+        if (mask == 0 or @as(u64, id) * 64 + 63 - @clz(mask) >= columns) return error.InvalidColumnSegment;
+        if (i > 0 and id <= std.mem.readInt(u32, pages[(i - 1) * 12 ..][0..4], .little)) return error.InvalidColumnSegment;
+    }
+}
+
 const Block = struct {
     alloc: alloc_type,
     scope: *backend_erased.ReadScope,
@@ -1732,7 +1796,18 @@ const Block = struct {
     rows: []Row,
     ordinal_pages: []const u8,
     values: std.AutoHashMapUnmanaged(u32, *ColumnView) = .empty,
+    orders: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
     stats: ?*types.ColumnarScanStats = null,
+    scan_options: ?types.ScanOptions = null,
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn checkWork(self: *@This()) !void {
+        if (self.stop) |stop| if (stop.load(.acquire)) return error.Canceled;
+        if (self.scan_options) |opts| {
+            if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+    }
 
     const ColumnView = struct {
         payload_bytes: u64 = 0,
@@ -1810,6 +1885,7 @@ const Block = struct {
             const pages = column_view.pages.?;
             const page_rows = @as(usize, 1) << pages.shift;
             for (0..pages.sizes.len / 8) |page| {
+                try self.checkWork();
                 if (column_view.loaded_pages[page] or pages.size(page) == 0) continue;
                 const first = page * page_rows;
                 const end = @min(values.len, first + page_rows);
@@ -1863,6 +1939,7 @@ const Block = struct {
     }
 
     fn evaluate(self: *@This(), filter: graph.CompiledPatternFilter, candidates: []const bool, out: []bool) !void {
+        try self.checkWork();
         @memset(out, false);
         if (std.mem.indexOfScalar(bool, candidates, true) == null) return;
         switch (filter) {
@@ -1903,55 +1980,166 @@ const Block = struct {
                 if (conjunction) @memcpy(out, candidates);
                 var buffer: [max_rows]bool = undefined;
                 var eligible: [max_rows]bool = undefined;
-                // Cheap metadata/scalar leaves precede composite payloads.
-                for (0..2) |pass| for (items) |item| {
-                    if (self.expensive(item) != (pass == 1)) continue;
+                for (try self.orderedFilters(items, candidates)) |item_index| {
+                    const item = items[item_index];
                     for (out, candidates, eligible[0..out.len]) |matched, candidate, *value| value.* = candidate and (if (conjunction) matched else !matched);
                     if (std.mem.indexOfScalar(bool, eligible[0..out.len], true) == null) return;
                     try self.evaluate(item, eligible[0..out.len], buffer[0..out.len]);
                     for (out, buffer[0..out.len]) |*value, matched| value.* = if (conjunction) matched else value.* or matched;
-                };
+                }
             },
             .bool_query => |query| {
                 @memcpy(out, candidates);
                 var buffer: [max_rows]bool = undefined;
-                for (0..2) |pass| for (query.must) |item| {
-                    if (self.expensive(item) != (pass == 1)) continue;
+                for (try self.orderedFilters(query.must, candidates)) |item_index| {
+                    const item = query.must[item_index];
                     try self.evaluate(item, out, buffer[0..out.len]);
                     @memcpy(out, buffer[0..out.len]);
                     if (std.mem.indexOfScalar(bool, out, true) == null) return;
-                };
+                }
                 if (query.min_should > 0) {
                     var counts: [max_rows]usize = @splat(0);
                     var unresolved: [max_rows]bool = undefined;
-                    for (query.should, 0..) |item, item_index| {
-                        for (out, unresolved[0..out.len], 0..) |candidate, *eligible, i| eligible.* = candidate and counts[i] < query.min_should and counts[i] + query.should.len - item_index >= query.min_should;
-                        try self.evaluate(item, unresolved[0..out.len], buffer[0..out.len]);
+                    for (try self.orderedFilters(query.should, candidates), 0..) |item_index, position| {
+                        for (out, unresolved[0..out.len], 0..) |candidate, *eligible, i| eligible.* = candidate and counts[i] < query.min_should and counts[i] + query.should.len - position >= query.min_should;
+                        try self.evaluate(query.should[item_index], unresolved[0..out.len], buffer[0..out.len]);
                         for (buffer[0..out.len], 0..) |matched, i| counts[i] += @intFromBool(matched);
                     }
                     for (out, 0..) |*value, i| value.* = value.* and counts[i] >= query.min_should;
                 }
-                for (query.must_not) |item| {
-                    try self.evaluate(item, out, buffer[0..out.len]);
+                for (try self.orderedFilters(query.must_not, candidates)) |item_index| {
+                    try self.evaluate(query.must_not[item_index], out, buffer[0..out.len]);
                     for (out, buffer[0..out.len]) |*value, matched| value.* = value.* and !matched;
                 }
             },
         }
     }
 
-    fn expensive(self: *@This(), filter: graph.CompiledPatternFilter) bool {
-        return switch (filter) {
-            .match_all, .match_none, .doc_id => false,
-            .field_matcher => |matcher| blk: {
-                if (matcher.predicate == .exists or matcher.predicate == .numeric_range) break :blk false;
-                const ordinal = self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse break :blk false;
-                break :blk switch (self.table.relational_columns[ordinal].column_type) {
-                    .json, .dense_vector, .geoshape => true,
-                    else => false,
-                };
-            },
-            else => true,
+    /// Metadata-only estimates. Cache one ordering per immutable expression and
+    /// block, not per row window; payload decoding never happens in planning.
+    fn orderedFilters(self: *@This(), items: []const graph.CompiledPatternFilter, candidates: []const bool) ![]const usize {
+        if (items.len == 0) return &.{};
+        const key = @intFromPtr(items.ptr);
+        if (self.orders.get(key)) |order| return order;
+        const Ranked = struct {
+            index: usize,
+            cost: u64,
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.cost < b.cost or (a.cost == b.cost and a.index < b.index);
+            }
         };
+        const ranked = try self.alloc.alloc(Ranked, items.len);
+        defer self.alloc.free(ranked);
+        for (items, ranked, 0..) |item, *rank, i| rank.* = .{ .index = i, .cost = try self.predicateCost(item, candidates) };
+        std.mem.sort(Ranked, ranked, {}, Ranked.less);
+        const order = try self.alloc.alloc(usize, items.len);
+        for (ranked, order) |rank, *i| i.* = rank.index;
+        try self.orders.put(self.alloc, key, order);
+        return order;
+    }
+
+    fn payloadCost(self: *@This(), ordinal: u32, candidates: []const bool) !u64 {
+        const column_view = try self.column(ordinal);
+        var cost: u64 = 0;
+        if (column_view.pages) |pages| {
+            const page_rows = @as(usize, 1) << pages.shift;
+            for (0..pages.sizes.len / 8) |page| {
+                if (column_view.loaded_pages[page]) continue;
+                for (page * page_rows..@min(self.rows.len, (page + 1) * page_rows)) |row| {
+                    if (candidates[row] and column_view.present(row) and column_view.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) == 0) {
+                        cost +|= pages.size(page);
+                        break;
+                    }
+                }
+            }
+        }
+        return cost;
+    }
+
+    fn predicateColumns(self: *@This(), filter: graph.CompiledPatternFilter, out: *std.AutoHashMapUnmanaged(u32, void)) anyerror!void {
+        try self.checkWork();
+        switch (filter) {
+            .field_matcher => |matcher| {
+                if (matcher.predicate == .exists) return;
+                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse return);
+                const column_view = try self.column(ordinal);
+                if (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)) return;
+                try out.put(self.alloc, ordinal, {});
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| {
+                try self.predicateColumns(item, out);
+            },
+            .bool_query => |query| {
+                for (query.must) |item| try self.predicateColumns(item, out);
+                if (query.min_should > 0) for (query.should) |item| {
+                    try self.predicateColumns(item, out);
+                };
+                for (query.must_not) |item| try self.predicateColumns(item, out);
+            },
+            else => {},
+        }
+    }
+
+    fn predicateCost(self: *@This(), filter: graph.CompiledPatternFilter, candidates: []const bool) anyerror!u64 {
+        try self.checkWork();
+        return switch (filter) {
+            .match_all, .match_none, .doc_id => 0,
+            .field_matcher => |matcher| blk: {
+                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse break :blk 0);
+                const column_view = try self.column(ordinal);
+                if (matcher.predicate == .exists or (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum))) break :blk 0;
+                const cost = try self.payloadCost(ordinal, candidates);
+                const weight: u64 = switch (self.table.relational_columns[ordinal].column_type) {
+                    .json, .dense_vector, .geoshape => 64,
+                    .string, .blob => 8,
+                    else => 1,
+                };
+                break :blk cost *| weight +| @as(u64, @intCast(std.mem.count(bool, candidates, &.{true}))) *| weight;
+            },
+            .conjuncts, .disjuncts => |items| blk: {
+                var cost: u64 = 0;
+                for (items) |item| cost +|= try self.predicateCost(item, candidates);
+                break :blk cost;
+            },
+            .bool_query => |query| blk: {
+                var cost: u64 = 0;
+                for (query.must) |item| cost +|= try self.predicateCost(item, candidates);
+                if (query.min_should > 0) for (query.should) |item| {
+                    cost +|= try self.predicateCost(item, candidates);
+                };
+                for (query.must_not) |item| cost +|= try self.predicateCost(item, candidates);
+                break :blk cost;
+            },
+        };
+    }
+
+    /// A limited scan evaluates at most one physical page of each predicate
+    /// column before delivering rows. Scalar-only scans keep vectorized blocks.
+    fn windowEnd(self: *@This(), filter: graph.CompiledPatternFilter, first: usize) anyerror!usize {
+        try self.checkWork();
+        var end = self.rows.len;
+        switch (filter) {
+            .field_matcher => |matcher| {
+                if (matcher.predicate == .exists) return end;
+                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse return end);
+                if ((try self.column(ordinal)).pages) |pages| {
+                    const page_rows = @as(usize, 1) << pages.shift;
+                    end = @min(end, (first / page_rows + 1) * page_rows);
+                }
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| {
+                end = @min(end, try self.windowEnd(item, first));
+            },
+            .bool_query => |query| {
+                for (query.must) |item| end = @min(end, try self.windowEnd(item, first));
+                if (query.min_should > 0) for (query.should) |item| {
+                    end = @min(end, try self.windowEnd(item, first));
+                };
+                for (query.must_not) |item| end = @min(end, try self.windowEnd(item, first));
+            },
+            else => {},
+        }
+        return end;
     }
 };
 
@@ -2030,54 +2218,64 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
         var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
         defer view.release();
-        for (0..pages_len) |i| {
-            const page = ordinal_pages[i * 12 ..][0..12];
-            const id = std.mem.readInt(u32, page[0..4], .little);
-            const mask = std.mem.readInt(u64, page[4..12], .little);
-            if (mask == 0 or @as(u64, id) * 64 + 63 - @clz(mask) >= view.tableSchema().relational_columns.len) return error.InvalidColumnSegment;
-            if (i > 0 and id <= std.mem.readInt(u32, ordinal_pages[(i - 1) * 12 ..][0..4], .little)) return error.InvalidColumnSegment;
-        }
-        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats };
+        try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
+        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts };
         var matched: [max_rows]bool = @splat(true);
         var candidates: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
-        @memcpy(matched[0..rows.len], candidates[0..rows.len]);
-        if (filter) |value| try block.evaluate(value.compiled, candidates[0..rows.len], matched[0..rows.len]);
-        if (dirty_range and try preferPrimaryScan(txn, scratch, range, from, to, byte_range, opts, &block, matched[0..rows.len])) {
+        const plan = if (dirty_range) try planRange(txn, scratch, range, from, to, byte_range, opts, &block, candidates[0..rows.len], filter) else RangeScanPlan{ .visibility_complete = true };
+        if (plan.primary) {
             if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
             db.relational_column_maintenance.noteRead(manifest.generation, index, source_bytes);
             try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             continue;
         }
-        if (opts.columnar_stats) |stats| if (std.mem.indexOfScalar(bool, matched[0..rows.len], true) == null) {
-            stats.blocks_pruned += 1;
-        };
-        for (rows, 0..) |row, i| {
+        var window_first: usize = 0;
+        var any_matched = false;
+        while (window_first < rows.len) {
             if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
             if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-            // A retained suffix block may contain retired prefix rows. Never
-            // merge across the current directory range's boundary.
-            if (std.mem.order(u8, row.key, range.start) == .lt or (range.end.len != 0 and std.mem.order(u8, row.key, range.end) != .lt)) continue;
-            const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
-            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
-            if (replaced) continue;
-            if (!matched[i] or !byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or
-                (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, row.key, from))) continue;
-            if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
-            if (ttl_ns != 0 and row.timestamp != 0 and @import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns)) continue;
-            var projected: ?[]u8 = null;
-            if (opts.include_documents) {
-                var object = std.json.ObjectMap.empty;
-                for (opts.fields) |field| {
-                    const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
-                    if (try block.logicalValue(ordinal, i)) |value| try object.put(scratch, field, value);
+            const window_end = if (opts.limit > 0 and filter != null) try block.windowEnd(filter.?.compiled, window_first) else rows.len;
+            var window_candidates: [max_rows]bool = @splat(false);
+            @memcpy(window_candidates[window_first..window_end], candidates[window_first..window_end]);
+            // Cost probes can stop early and small LIMITs skip them altogether.
+            // Complete visibility only for this execution window, using bounded
+            // seeks rather than walking arbitrarily large insertion gaps.
+            if (!plan.visibility_complete) try excludeReplaced(txn, scratch, rows[window_first..window_end], window_candidates[window_first..window_end]);
+            @memcpy(matched[0..rows.len], window_candidates[0..rows.len]);
+            if (filter) |value| try block.evaluate(value.compiled, window_candidates[0..rows.len], matched[0..rows.len]);
+            any_matched = any_matched or std.mem.indexOfScalar(bool, matched[window_first..window_end], true) != null;
+            for (rows[window_first..window_end], window_first..) |row, i| {
+                if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+                if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                // A retained suffix block may contain retired prefix rows. Never
+                // merge across the current directory range's boundary.
+                if (std.mem.order(u8, row.key, range.start) == .lt or (range.end.len != 0 and std.mem.order(u8, row.key, range.end) != .lt)) continue;
+                const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+                if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+                if (replaced) continue;
+                if (!matched[i] or !byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or
+                    (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, row.key, from))) continue;
+                if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
+                if (ttl_ns != 0 and row.timestamp != 0 and @import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns)) continue;
+                var projected: ?[]u8 = null;
+                if (opts.include_documents) {
+                    var object = std.json.ObjectMap.empty;
+                    for (opts.fields) |field| {
+                        const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
+                        if (try block.logicalValue(ordinal, i)) |value| try object.put(scratch, field, value);
+                    }
+                    projected = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
                 }
-                projected = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
+                try deliver(alloc, row, projected, opts, visitor, progress);
+                if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             }
-            try deliver(alloc, row, projected, opts, visitor, progress);
-            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            window_first = window_end;
         }
+        if (!any_matched) if (opts.columnar_stats) |stats| {
+            stats.blocks_pruned += 1;
+        };
         _ = try dirty_ranges.emitThrough(db, alloc, txn, range.end, false, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
         if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
     }
@@ -2086,6 +2284,29 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
     }
     return true;
+}
+
+fn excludeReplaced(txn: *store_mod.DocStore.Txn, alloc: alloc_type, rows: []const Row, candidates: []bool) !void {
+    if (rows.len == 0 or std.mem.indexOfScalar(bool, candidates, true) == null) return;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+    try key.appendSlice(alloc, dirty_prefix);
+    try key.appendSlice(alloc, rows[0].key);
+    var current = try cursor.seekAtOrAfter(key.items);
+    for (rows, candidates) |row, *candidate| {
+        if (!candidate.*) continue;
+        key.clearRetainingCapacity();
+        try key.appendSlice(alloc, dirty_prefix);
+        try key.appendSlice(alloc, row.key);
+        if (current == null) return;
+        if (std.mem.order(u8, current.?.key, key.items) == .lt) current = try cursor.seekAtOrAfter(key.items);
+        if (current) |entry| if (std.mem.eql(u8, entry.key, key.items)) {
+            if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+            candidate.* = false;
+        };
+    }
 }
 
 fn eligibleRow(row: Row, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, ttl_ns: u64, now_ns: u64) bool {
