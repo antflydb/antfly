@@ -37,6 +37,40 @@ func TestByteAdmissionBoundsAggregateRetainedBodies(t *testing.T) {
 	admission.Release(10)
 }
 
+func TestByteAdmissionLeaseOwnsOnlySuccessfulGrants(t *testing.T) {
+	a := newByteAdmission(10)
+	var owner byteAdmissionLease
+	defer owner.Release()
+	if err := owner.Acquire(context.Background(), a, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Acquire(context.Background(), a, 1); err == nil {
+		t.Fatal("accepted double acquisition")
+	}
+	for _, size := range []int64{4, 11} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var denied byteAdmissionLease
+		if err := denied.Acquire(ctx, a, size); err == nil {
+			t.Fatal("accepted canceled acquisition")
+		}
+		denied.Release()
+		if got := a.Used(); got != 7 {
+			t.Fatalf("failed grant changed another lease: %d", got)
+		}
+	}
+	owner.Release()
+	owner.Release()
+	var tooLarge byteAdmissionLease
+	if err := tooLarge.Acquire(context.Background(), a, 11); !errors.Is(err, errByteAdmissionRequestTooLarge) {
+		t.Fatalf("oversized acquisition: %v", err)
+	}
+	tooLarge.Release()
+	if got := a.Used(); got != 0 {
+		t.Fatalf("retained %d bytes", got)
+	}
+}
+
 func TestByteAdmissionWakesBlockedWaiterAfterRelease(t *testing.T) {
 	admission := newByteAdmission(10)
 	if err := admission.Acquire(context.Background(), 10); err != nil {

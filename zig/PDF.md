@@ -2741,6 +2741,15 @@ The hardening above follows these long-term rules:
     merge. Native encoded-image reads are the first adapter; generation,
     embedding, reranking, chunking, extraction, rewriting, and transcription
     use the same broker contract as their fused executors become available.
+    Existing arrays publish a bounded wave of tickets before executing any
+    leader; enrollment does not launch one async task per item. Native batches
+    therefore survive executor saturation and a zero coalescing delay. Byte,
+    pixel, token, and item limits still partition groups, and compatible
+    cross-request tails may join them. Every caller executes its owned groups
+    before joining foreign leaders, avoiding cyclic follower waits. Ticket
+    scratch is bounded by the model's maximum group size; final ordered output
+    remains request-sized. Allocation failures are isolated per item, and all
+    published tickets are joined before borrowed payloads are released.
 92. **Implemented after local image-transport review:** the generic borrowed
     attachment ABI now also describes validated RGBA8 rasters with width,
     height, stride, item identity, source fingerprint, and page number. Native
@@ -3095,7 +3104,12 @@ The hardening above follows these long-term rules:
     reads the fixed header first, derives and admits the exact v1
     descriptor/metadata prefix, and reads only that prefix for model
     resolution. It no longer reserves the protocol-wide maximum prefix for
-    every request. A one-attempt route streams the untouched attachment tail
+    every request. An invocation-owned admission lease records bytes only
+    after successful acquisition and releases them idempotently on every exit,
+    including malformed metadata, routing failure, cancellation, and retries.
+    Deferring the lease before header inspection does not capture a stale
+    zero-byte reservation or release a failed grant's requested bytes.
+    A one-attempt route streams the untouched attachment tail
     directly to the inference node. A retry-enabled route sends its first
     attempt through a tee while writing the same bytes to a process-admitted
     replay file; it does not delay the first upstream byte until the entire
@@ -4056,7 +4070,7 @@ The post-implementation performance review resulted in these concrete changes:
   while waiting. The group leader derives decoded-pixel residency for the
   complete fused batch and acquires one authoritative lease immediately before
   execution.
-- Existing reader request batches are flattened into concurrent broker tickets,
+- Existing reader request batches are enrolled as bounded waves of broker tickets,
   allowing a short PDF window and compatible pages from another request to
   fill one native model batch. The broker still groups on immutable generation,
   prompt, schema, transform, options, and resource class, and the leader admits

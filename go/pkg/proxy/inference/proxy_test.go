@@ -4144,6 +4144,50 @@ func TestProxyRoutesFramedReadFromBorrowedMetadataAndForwardsBodyUnchanged(t *te
 	if !forwarded {
 		t.Fatal("framed read was not forwarded")
 	}
+	if got := p.bodyAdmission.Used(); got != 0 {
+		t.Fatalf("framed success retained %d admission bytes", got)
+	}
+}
+
+func TestProxyFramedAdmissionReleasesOnEveryFailure(t *testing.T) {
+	for _, scenario := range []string{"routing", "truncated", "descriptor", "canceled", "oversized"} {
+		t.Run(scenario, func(t *testing.T) {
+			p := NewProxy(Config{Logger: zap.NewNop()})
+			body := testProxyAttachmentEnvelope([]byte(`{"model":"missing","images":[{"url":"attachment:0"}]}`), testProxyAttachment{mime: "image/png", data: []byte{1}})
+			length := int64(len(body))
+			if scenario == "truncated" {
+				body = body[:proxyAttachmentEnvelopeHeaderBytes]
+			}
+			if scenario == "descriptor" {
+				body[proxyAttachmentEnvelopeHeaderBytes+4] = 1
+			}
+			p.bodyAdmission = newByteAdmission(1024)
+			if err := p.bodyAdmission.Acquire(context.Background(), 17); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "oversized" {
+				p.bodyAdmission.limit = 20
+			}
+			for attempt := 0; attempt < 5; attempt++ {
+				req := httptest.NewRequest(http.MethodPost, "/ai/v1/read", bytes.NewReader(body))
+				req.ContentLength = length
+				if scenario == "canceled" {
+					ctx, cancel := context.WithCancel(req.Context())
+					cancel()
+					req = req.WithContext(ctx)
+				}
+				recorder := httptest.NewRecorder()
+				p.proxyFramedRequest(recorder, req, "read", time.Now(), RoutingContext{})
+				if recorder.Code < 400 {
+					t.Fatalf("unexpected success: %d", recorder.Code)
+				}
+				if used := p.bodyAdmission.Used(); used != 17 {
+					t.Fatalf("%s left %d bytes; other request owns 17", scenario, used)
+				}
+			}
+			p.bodyAdmission.Release(17)
+		})
+	}
 }
 
 func TestProxyRetriesFramedReadFromBoundedReplayFile(t *testing.T) {
@@ -4197,6 +4241,9 @@ func TestProxyRetriesFramedReadFromBoundedReplayFile(t *testing.T) {
 	p.handleRead(recorder, request)
 	if recorder.Code != http.StatusOK || attempts != 2 {
 		t.Fatalf("status=%d attempts=%d body=%q", recorder.Code, attempts, recorder.Body.String())
+	}
+	if got := p.bodyAdmission.Used(); got != 0 {
+		t.Fatalf("framed retries retained %d admission bytes", got)
 	}
 	entries, err := os.ReadDir(spoolDir)
 	if err != nil {

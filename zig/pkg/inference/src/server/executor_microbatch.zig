@@ -406,9 +406,29 @@ pub const Broker = struct {
         }
 
         const shard = self.shardFor(key);
+        shard.mutex.lockUncancelable(io);
+        const queued = self.enqueueLocked(io, shard, key, limits, shape, &ticket, execute_ctx, execute_fn) catch |err| {
+            shard.mutex.unlock(io);
+            return err;
+        };
+        shard.mutex.unlock(io);
+        if (queued.leader) {
+            self.waitForGroupWindow(io, shard, queued.group, &ticket);
+            self.executeGroup(io, shard, queued.group);
+        } else waitForTicket(io, &ticket);
+
+        // Typed execution owns result disposal; never discard an owned Output
+        // merely because cancellation raced completion.
+        return takeResult(Output, identity, &output, slot);
+    }
+
+    const Enqueued = struct { group: *Group, leader: bool };
+
+    /// Publish only; never wait or execute while the caller is still enrolling
+    /// the rest of an existing batch. The shard lock protects group lifetime.
+    fn enqueueLocked(self: *Broker, io: std.Io, shard: *BrokerShard, key: Key, limits: Limits, shape: Shape, ticket: *Ticket, execute_ctx: *anyopaque, execute_fn: ExecuteFn) !Enqueued {
         var group: *Group = undefined;
         var leader = false;
-        shard.mutex.lockUncancelable(io);
         for (shard.groups.items) |candidate| {
             if (candidate.key.eql(key) and candidate.limits.eql(limits) and
                 candidate.execute_ctx == execute_ctx and candidate.execute_fn == execute_fn and
@@ -418,10 +438,7 @@ pub const Broker = struct {
                 break;
             }
         } else {
-            group = self.allocator.create(Group) catch |err| {
-                shard.mutex.unlock(io);
-                return err;
-            };
+            group = try self.allocator.create(Group);
             group.* = .{
                 .key = key,
                 .limits = limits,
@@ -431,17 +448,15 @@ pub const Broker = struct {
             };
             shard.groups.append(self.allocator, group) catch |err| {
                 self.allocator.destroy(group);
-                shard.mutex.unlock(io);
                 return err;
             };
             leader = true;
         }
-        const deadline_shortened = group.append(self.allocator, &ticket, shape) catch |err| {
+        const deadline_shortened = group.append(self.allocator, ticket, shape) catch |err| {
             if (leader) {
                 _ = shard.groups.pop();
                 self.allocator.destroy(group);
             }
-            shard.mutex.unlock(io);
             return err;
         };
         if (group.tickets.items.len >= group.limits.preferred_items or
@@ -455,35 +470,24 @@ pub const Broker = struct {
             // batch when there is still time to admit compatible work.
             group.wake.set(io);
         }
-        shard.mutex.unlock(io);
+        return .{ .group = group, .leader = leader };
+    }
 
-        if (leader) {
-            self.waitForGroupWindow(io, shard, group, &ticket);
-            self.executeGroup(io, shard, group);
-        } else {
-            ticket.done.wait(io) catch |err| switch (err) {
-                error.Canceled => {
-                    ticket.cancel_requested.store(true, .release);
-                    // The queued ticket borrows this stack frame. It cannot be
-                    // returned until the leader has observed cancellation.
-                    ticket.done.waitUncancelable(io);
-                },
-            };
-        }
-
-        // Cancellation can only remove queued work. Once the leader has moved
-        // this ticket to executing, the typed completed value/error wins: the
-        // broker has no generic destructor with which to discard an owned T.
-        // The canceling caller already waited above for the borrowed stack
-        // ticket to complete, so returning that result is lifetime-safe.
-        return takeResult(Output, identity, &output, slot);
+    fn waitForTicket(io: std.Io, ticket: *Ticket) void {
+        ticket.done.wait(io) catch |err| switch (err) {
+            error.Canceled => {
+                ticket.cancel_requested.store(true, .release);
+                // Ticket and payload stay borrowed until the executor joins.
+                ticket.done.waitUncancelable(io);
+            },
+        };
     }
 
     /// Submit an existing request batch as independently attributable work.
-    /// Lightweight fibers enqueue the items concurrently, allowing them to
-    /// fill the same native group and to coalesce with compatible items from
-    /// other requests. Per-item payloads, shapes, identities, and cancellation
-    /// contexts remain borrowed until this synchronous method returns.
+    /// Enqueue a bounded wave before executing any leader. This preserves
+    /// native batches even with zero spare workers or a zero coalescing delay,
+    /// while allowing compatible cross-request tickets into the same groups.
+    /// Payloads and controls remain borrowed until synchronous completion.
     pub fn submitBatchControlled(
         self: *Broker,
         comptime Payload: type,
@@ -511,7 +515,7 @@ pub const Broker = struct {
 
         // Compatibility executors are explicitly singleton and may own
         // thread-confined state. Preserve that contract for array callers;
-        // only genuine native batching is fanned into concurrent tickets.
+        // only genuine native batching enrolls multiple tickets together.
         if (limits.mode != .native or limits.max_items == 1) {
             for (payloads, shapes, identities, results) |*payload, shape, identity, *result| {
                 result.* = self.submitControlled(
@@ -533,63 +537,66 @@ pub const Broker = struct {
             return results;
         }
 
-        const BatchSubmit = struct {
-            broker: *Broker,
-            io: std.Io,
-            result_allocator: std.mem.Allocator,
-            key: Key,
-            limits: Limits,
-            shape: Shape,
-            identity: Identity,
-            deadline: ?std.Io.Clock.Timestamp,
-            cancellation: Cancellation,
-            payload: *const Payload,
-            execute_ctx: *anyopaque,
-            execute_fn: ExecuteFn,
-            result: *ItemResult(Output),
-
-            fn run(task: *@This()) std.Io.Cancelable!void {
-                task.result.* = task.broker.submitControlled(
-                    Payload,
-                    Output,
-                    task.io,
-                    task.result_allocator,
-                    task.key,
-                    task.limits,
-                    task.shape,
-                    task.identity,
-                    task.deadline,
-                    task.cancellation,
-                    task.payload,
-                    task.execute_ctx,
-                    task.execute_fn,
-                ) catch |err| resultError(Output, task.identity, err);
+        const capacity = @min(payloads.len, limits.max_items);
+        const tickets = try result_allocator.alloc(Ticket, capacity);
+        defer result_allocator.free(tickets);
+        const slots = try result_allocator.alloc(ResultSlot, capacity);
+        defer result_allocator.free(slots);
+        const outputs = try result_allocator.alloc(Output, capacity);
+        defer result_allocator.free(outputs);
+        const enqueued = try result_allocator.alloc(?Enqueued, capacity);
+        defer result_allocator.free(enqueued);
+        const shard = self.shardFor(key);
+        var start: usize = 0;
+        while (start < payloads.len) {
+            const count = @min(capacity, payloads.len - start);
+            // Initialize stable ticket storage before any leader can see it.
+            for (0..count) |offset| {
+                const index = start + offset;
+                slots[offset] = .{ .output = &outputs[offset] };
+                tickets[offset] = .{
+                    .item = .{ .allocator = result_allocator, .identity = identities[index], .payload = &payloads[index], .slot = &slots[offset] },
+                    .deadline = deadline,
+                    .cancellation = cancellation,
+                };
+                tickets[offset].item.control = .{ .io = io, .deadline = deadline, .cancellation = cancellation, .cancel_requested = &tickets[offset].cancel_requested };
+                enqueued[offset] = null;
+                const shape = shapes[index];
+                const slot = &slots[offset];
+                if (shape.bytes > limits.max_bytes or shape.pixels > limits.max_pixels or shape.tokens > limits.max_tokens) {
+                    slot.fail(error.MicrobatchResourceLimitExceeded);
+                    continue;
+                }
+                tickets[offset].item.control.check() catch |err| {
+                    slot.fail(err);
+                    continue;
+                };
             }
-        };
-        const tasks = try result_allocator.alloc(BatchSubmit, payloads.len);
-        defer result_allocator.free(tasks);
-        var group: std.Io.Group = .init;
-        for (tasks, payloads, shapes, identities, results) |*task, *payload, shape, identity, *result| {
-            task.* = .{
-                .broker = self,
-                .io = io,
-                .result_allocator = result_allocator,
-                .key = key,
-                .limits = limits,
-                .shape = shape,
-                .identity = identity,
-                .deadline = deadline,
-                .cancellation = cancellation,
-                .payload = payload,
-                .execute_ctx = execute_ctx,
-                .execute_fn = execute_fn,
-                .result = result,
+            shard.mutex.lockUncancelable(io);
+            for (0..count) |offset| {
+                const slot = &slots[offset];
+                if (slot.completed) continue;
+                const shape = shapes[start + offset];
+                enqueued[offset] = self.enqueueLocked(io, shard, key, limits, shape, &tickets[offset], execute_ctx, execute_fn) catch |err| {
+                    slot.fail(err);
+                    continue;
+                };
+            }
+            shard.mutex.unlock(io);
+            // Execute every group we own before waiting on foreign leaders.
+            // Otherwise two array callers can form a cyclic follower wait.
+            for (enqueued[0..count], tickets[0..count]) |entry, *ticket| if (entry) |queued| {
+                if (queued.leader) {
+                    self.waitForGroupWindow(io, shard, queued.group, ticket);
+                    self.executeGroup(io, shard, queued.group);
+                }
             };
-            group.async(io, BatchSubmit.run, .{task});
+            for (0..count) |offset| {
+                if (enqueued[offset]) |queued| if (!queued.leader) waitForTicket(io, &tickets[offset]);
+                results[start + offset] = takeResult(Output, identities[start + offset], &outputs[offset], slots[offset]);
+            }
+            start += count;
         }
-        // Each child converts broker/control failures into its typed item
-        // envelope. Await still joins every borrowed ticket before returning.
-        group.await(io) catch {};
         return results;
     }
 
@@ -897,6 +904,137 @@ test "microbatch broker groups native work and preserves provenance" {
     const stats = broker.snapshot(std.testing.io);
     try std.testing.expectEqual(@as(u64, 1), stats.native_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.native_items);
+}
+
+test "microbatch broker preserves bounded native waves without spare workers" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    for ([_]u64{ 0, 200 }) |wait_us| {
+        var broker = Broker.init(allocator);
+        defer broker.deinit();
+        var executor = TestExecutor{};
+        const inputs = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        const shapes = [_]Shape{.{ .bytes = 1, .pixels = 1, .tokens = 1 }} ** inputs.len;
+        const identities = [_]Identity{.{}} ** inputs.len;
+        const results = try broker.submitBatchControlled(usize, usize, io_impl.io(), allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 4, .max_pixels = 4, .max_tokens = 4, .max_wait_us = wait_us }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
+        defer allocator.free(results);
+        try std.testing.expectEqual(@as(usize, 3), executor.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 4), executor.largest_batch.load(.monotonic));
+        for (results, inputs, 0..) |result, input, index| {
+            try std.testing.expectEqual(input * 2, result.result.value);
+            try std.testing.expectEqual(results[index / 4 * 4].execution_id, result.execution_id);
+        }
+    }
+}
+
+test "microbatch native wave splits resource limits and isolates oversized items" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    for (0..3) |dimension| {
+        var broker = Broker.init(allocator);
+        defer broker.deinit();
+        var executor = TestExecutor{};
+        const inputs = [_]usize{ 1, 2, 3, 4, 5 };
+        var shapes = [_]Shape{.{ .bytes = 1, .pixels = 1, .tokens = 1 }} ** inputs.len;
+        shapes[2] = .{ .bytes = 99, .pixels = 99, .tokens = 99 };
+        const identities = [_]Identity{.{}} ** inputs.len;
+        const results = try broker.submitBatchControlled(usize, usize, io_impl.io(), allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 5, .max_items = 5, .max_bytes = if (dimension == 0) 2 else 1000, .max_pixels = if (dimension == 1) 2 else 1000, .max_tokens = if (dimension == 2) 2 else 1000 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
+        defer allocator.free(results);
+        try std.testing.expectEqual(@as(usize, 2), executor.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 2), executor.largest_batch.load(.monotonic));
+        for (results, inputs, 0..) |result, input, index| {
+            if (index == 2) try std.testing.expectEqual(error.MicrobatchResourceLimitExceeded, result.result.item_error.cause) else try std.testing.expectEqual(input * 2, result.result.value);
+        }
+    }
+}
+
+test "microbatch array enrollment drains groups on allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var broker = Broker.init(allocator);
+            defer broker.deinit();
+            var executor = TestExecutor{};
+            const inputs = [_]usize{ 1, 2, 3, 4, 5 };
+            const shapes = [_]Shape{.{ .bytes = 1 }} ** inputs.len;
+            const identities = [_]Identity{.{}} ** inputs.len;
+            const results = try broker.submitBatchControlled(usize, usize, std.testing.io, allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 2 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
+            defer allocator.free(results);
+            for (results) |result| switch (result.result) {
+                .item_error => |failure| return failure.cause,
+                .value => {},
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "microbatch concurrent array tails coalesce without item workers" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    var executor = TestExecutor{};
+    const Submit = struct {
+        broker: *Broker,
+        executor: *TestExecutor,
+        input: [2]usize,
+        source: []const u8,
+        output: ?[]ItemResult(usize) = null,
+        err: ?anyerror = null,
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            const shapes = [_]Shape{.{ .bytes = 1 }} ** 2;
+            const identities = [_]Identity{.{ .source_fingerprint = self.source }} ** 2;
+            self.output = self.broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_wait_us = 500_000 }, &shapes, &identities, null, .{}, &self.input, self.executor, TestExecutor.run) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var first = Submit{ .broker = &broker, .executor = &executor, .input = .{ 1, 2 }, .source = "a" };
+    var second = Submit{ .broker = &broker, .executor = &executor, .input = .{ 3, 4 }, .source = "b" };
+    defer if (first.output) |result| std.testing.allocator.free(result);
+    defer if (second.output) |result| std.testing.allocator.free(result);
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Submit.run, .{&first});
+    try group.concurrent(std.testing.io, Submit.run, .{&second});
+    try group.await(std.testing.io);
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 4), executor.largest_batch.load(.monotonic));
+    for ([_]*Submit{ &first, &second }) |submission| {
+        for (submission.output.?, submission.input) |result, input| {
+            try std.testing.expectEqual(input * 2, result.result.value);
+            try std.testing.expectEqualStrings(submission.source, result.identity.source_fingerprint.?);
+            try std.testing.expectEqual(first.output.?[0].execution_id, result.execution_id);
+        }
+    }
+}
+
+test "microbatch array rechecks cancellation between bounded waves" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const Executor = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        fn run(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .native_batch);
+            self.canceled.store(true, .release);
+        }
+    };
+    var executor = Executor{};
+    const inputs = [_]usize{ 1, 2, 3, 4 };
+    const shapes = [_]Shape{.{}} ** 4;
+    const identities = [_]Identity{.{}} ** 4;
+    const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), results[0].result.value);
+    try std.testing.expectEqual(@as(usize, 2), results[1].result.value);
+    for (results[2..]) |result| try std.testing.expectEqual(error.Canceled, result.result.item_error.cause);
 }
 
 test "microbatch broker flattens an existing request batch" {

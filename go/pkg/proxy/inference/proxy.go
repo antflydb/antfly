@@ -4496,15 +4496,14 @@ func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, opera
 	// The bounded metadata prefix is the only request-sized allocation retained
 	// by the routing proxy. Media stays on the socket for a single attempt; a
 	// retry-enabled route uses a bounded temporary replay file.
-	routingReservation := int64(0)
-	defer p.bodyAdmission.Release(routingReservation)
+	var routingReservation byteAdmissionLease
+	defer routingReservation.Release()
 	prefix, routingPayload, err := readProxyAttachmentRoutingPrefixAdmitted(
 		r.Body,
 		r.ContentLength,
 		p.maxRequestBodyBytes,
 		func(prefixBytes int64) error {
-			routingReservation = proxyMaterializedBodyAdmissionBytes(prefixBytes, prefixBytes)
-			return p.bodyAdmission.Acquire(r.Context(), routingReservation)
+			return routingReservation.Acquire(r.Context(), p.bodyAdmission, proxyMaterializedBodyAdmissionBytes(prefixBytes, prefixBytes))
 		},
 	)
 	if err != nil {

@@ -45,6 +45,35 @@ func newByteAdmission(limit int64) *byteAdmission {
 	return &byteAdmission{limit: limit}
 }
 
+// byteAdmissionLease is invocation-owned and must not be copied after use.
+// A zero lease is safe to defer before the retained body size is discovered.
+// Only successful admission creates ownership; failed acquisition never
+// releases another request's credit. Release is idempotent.
+type byteAdmissionLease struct {
+	admission *byteAdmission
+	bytes     int64
+}
+
+func (l *byteAdmissionLease) Acquire(ctx context.Context, admission *byteAdmission, bytes int64) error {
+	if l.admission != nil {
+		return errors.New("byte admission lease already acquired")
+	}
+	if err := admission.Acquire(ctx, bytes); err != nil {
+		return err
+	}
+	l.admission, l.bytes = admission, bytes
+	return nil
+}
+
+func (l *byteAdmissionLease) Release() {
+	if l.admission == nil {
+		return
+	}
+	admission, bytes := l.admission, l.bytes
+	l.admission, l.bytes = nil, 0
+	admission.Release(bytes)
+}
+
 func (a *byteAdmission) Acquire(ctx context.Context, bytes int64) error {
 	if bytes <= 0 {
 		return nil
