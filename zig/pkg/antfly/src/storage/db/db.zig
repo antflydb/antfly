@@ -16771,9 +16771,26 @@ pub const DB = struct {
                 durable_entry.intent.phase = .detected;
             }
             if (!resumable and durable_entry.intent.phase != .preflight) {
+                // The scheduler's earlier admission probe precedes capacity
+                // checks and source validation. Canonical publication can
+                // complete in that interval. Serialize the final decision
+                // with status: either retire the now-complete admission or
+                // commit preflight before any observer can publish its old
+                // canonical-generation proof as ready.
+                lockApply(self);
+                defer self.core.unlockApply();
+                var current = try self.loadIndexRepairEntryById(alloc, repair_id);
+                defer current.deinit(alloc);
+                if (try self.managedAdmissionGenerationIsServiceable(alloc, current.intent)) {
+                    try self.ensureManagedAdmissionCanonicalWorker(alloc, current.intent);
+                    try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+                    result.repaired += 1;
+                    result.indexes_degraded_after = 0;
+                    return result;
+                }
                 try self.updateIndexRepairIntent(alloc, repair_id, .{
                     .phase = .preflight,
-                    .attempt_count = @max(@as(u32, 1), durable_entry.intent.attempt_count),
+                    .attempt_count = @max(@as(u32, 1), current.intent.attempt_count),
                     .failure_streak = 0,
                     .next_retry_at_ms = 0,
                     .replace_last_error = true,
@@ -26377,14 +26394,13 @@ pub const DB = struct {
         // their physical artifact count can still be advancing.
         const active_generation_complete =
             self.managedAdmissionGenerationIsServiceable(alloc, intent) catch false;
-        // Queryability belongs to the last exact published snapshot, not the
-        // repair target. A progressive generation can safely serve while the
-        // intent's replay fence and the live artifact target continue to
-        // advance. This proof reads the durable projection certificate and
-        // exact loaded cardinality; mere physical installation is never
-        // sufficient.
+        // Use the same intent-scoped exception as query admission. An older
+        // publication certificate can still match after damage discovery or
+        // after admission hands off to a shadow build. It cannot override that
+        // repair's closed gate: only an initial canonical build may establish
+        // progressive serviceability without replacement validation.
         const active_generation_queryable =
-            self.progressiveManagedGenerationIsQueryable(alloc, intent.index_name) catch false;
+            self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
         const generation_installed = self.repairGenerationInstalled(intent);
         // The resident gate is version/incarnation fenced. Pair its decision
         // with physical presence so neither a missing slot nor a stale config
@@ -87916,6 +87932,100 @@ test "db progressive managed sparse admission serves a checkpointed partial gene
     const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(completed.repaired);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db status cannot reopen a quarantined generation from an older publication certificate" {
+    try testManagedGenerationRepairAdmission(.quarantine);
+}
+
+test "db status cannot reopen managed admission after shadow build handoff" {
+    try testManagedGenerationRepairAdmission(.shadow_handoff);
+}
+
+test "db repair preflight retains a canonical generation completed after scheduler selection" {
+    try testManagedGenerationRepairAdmission(.late_completion);
+}
+
+fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, late_completion }) !void {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const cfg = types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"body","dims":3,"metric":"cosine","embedding_name":"semantic_idx","publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+        ,
+        .coverage_generation = 42,
+    };
+    const admission_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+
+    if (mode == .late_completion) {
+        // Enter the selected owner's reconstruction path after the canonical
+        // worker has finished, bypassing only the earlier scheduler probe.
+        const ready_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, ready_stats);
+        try db.failIfIndexQuarantined(cfg.name);
+        try std.testing.expect(try db.beginIndexRepairLease(cfg.name));
+        defer db.endIndexRepairLease(cfg.name);
+        const repair = try db.repairIndexIssuesWithRequest(alloc, .{
+            .target = .index,
+            .index_name = cfg.name,
+            .force = true,
+        }, .{}, .already_held);
+        try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
+        try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+        try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+        try db.failIfIndexQuarantined(cfg.name);
+        return;
+    }
+
+    if (mode == .shadow_handoff) {
+        // A scheduler can select reconstruction before the canonical worker
+        // finishes. The worker's later publication does not transfer ownership
+        // back from that shadow build, even when all counters now match.
+        try db.updateIndexRepairIntent(alloc, admission_id, .{ .phase = .preflight });
+    } else {
+        const completed = try db.advanceIndexRepairIntent(alloc, admission_id, .{});
+        try std.testing.expect(completed.repaired);
+        // Damage discovery revokes the earlier publication certificate even
+        // when its cursor and cardinality still match.
+        _ = try db.createGenerationRepairIntent(alloc, cfg, .projection_generation_invalid, 0, 0, null);
+    }
+    // Only repair validation can reopen either gate. Sampling status must
+    // retain the same admission decision as a query.
+    try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+    try db.refreshIndexRepairAvailabilityForIndex(alloc, cfg.name);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, cfg.name)) continue;
+        try std.testing.expect(!item.index_repair_active_generation_serviceable);
+        try std.testing.expect(!item.serving_snapshot_ready);
+    }
+    try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
+        .index_name = cfg.name,
+        .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
+        .limit = 1,
+    }));
 }
 
 test "db completed partial managed admission serves and retires redundant repair" {

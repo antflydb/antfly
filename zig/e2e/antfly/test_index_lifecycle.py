@@ -2005,6 +2005,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     stateful_api,
     openai_embedder,
 ):
+    # Poll promptly so a transient false-ready publication reaches the query
+    # assertion before the background repair can hide the admission race.
     table_name = f"stateful_corrupt_managed_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
 
@@ -2031,7 +2033,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
 
     batch = stateful_api.batch_write(
@@ -2053,7 +2055,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     ready = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert ready is not None
 
@@ -2074,7 +2076,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         wait_until(
             lambda: _index_missing(stateful_api, table_name, index_name),
             timeout_s=30.0,
-            interval_s=0.5,
+            interval_s=0.01,
         )
         is not None
     )
@@ -2088,7 +2090,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=60.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert recovered is not None
 
