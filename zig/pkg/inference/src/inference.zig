@@ -107,6 +107,7 @@ test {
     _ = chunker;
     _ = pipelines;
     _ = @import("pipelines/gliner.zig");
+    _ = @import("pipelines/gemma4_channels.zig");
     _ = extractors;
     _ = server;
     _ = cache;

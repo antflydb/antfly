@@ -377,21 +377,6 @@ pub const Provider = struct {
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
-        const Response = struct {
-            choices: []const struct {
-                message: struct {
-                    content: ?[]const u8 = null,
-                    tool_calls: ?[]const struct {
-                        id: ?[]const u8 = null,
-                        function: struct {
-                            name: []const u8,
-                            arguments: []const u8,
-                        },
-                    } = null,
-                },
-            },
-        };
-
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .termite_native, .{
@@ -403,6 +388,7 @@ pub const Provider = struct {
             .top_k = self.top_k,
             .frequency_penalty = self.frequency_penalty,
             .presence_penalty = self.presence_penalty,
+            .enable_thinking = if (self.tools_json != null) false else null,
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
@@ -418,6 +404,21 @@ pub const Provider = struct {
         defer resp.deinit();
         if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
+        return parseGenerationResponse(alloc, body, self.tools_json, self.tool_choice_json);
+    }
+
+    pub fn parseGenerationResponse(alloc: std.mem.Allocator, body: []const u8, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) !inference.GenerateResult {
+        const Response = struct {
+            choices: []const struct {
+                message: struct {
+                    content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct { name: []const u8, arguments: []const u8 },
+                    } = null,
+                },
+            },
+        };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const choices = parsed.value.choices;
@@ -426,7 +427,7 @@ pub const Provider = struct {
         errdefer freeToolCalls(alloc, tool_calls);
         const content = choices[0].message.content orelse "";
         if (tool_calls.len == 0 and content.len > 0) {
-            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, tools_json, tool_choice_json);
         }
         if (content.len == 0 and tool_calls.len == 0) return error.EmptyResponse;
 

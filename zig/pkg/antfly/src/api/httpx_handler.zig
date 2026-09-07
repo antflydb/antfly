@@ -4529,13 +4529,26 @@ pub const AntflyApiHandler = struct {
         const body_data = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "invalid query builder request");
         };
-        var response = try self.api_server.executeQueryBuilderAgent(body_data, authenticated_identity);
+        var response = try self.api_server.executeQueryBuilderAgentWithContext(body_data, authenticated_identity, self.agentRequestContext(ctx));
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         for (response.headers) |header| try ctx.setHeader(header.name, header.value);
         _ = ctx.response.body(response.body);
         return ctx.response.build();
+    }
+
+    fn agentRequestContext(self: *AntflyApiHandler, ctx: *httpx.Context) managed_embedder.RequestContext {
+        return .{
+            .io = self.api_server.inferenceIo(),
+            .deadline_ns = ctx.application_deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+            .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
+                fn cancelled(raw: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return context.isCancellationRequested();
+                }
+            }.cancelled },
+        };
     }
 
     pub fn retrievalAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -4564,17 +4577,24 @@ pub const AntflyApiHandler = struct {
             source: table_reads.TableReadSource,
             query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
             authenticated_identity: ?AuthenticatedIdentity,
+            request_context: managed_embedder.RequestContext,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .build_query = buildQuery,
                         .authorize_query = authorizeQuery,
                         .run_query = runQuery,
                         .scan_key_page = runScanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return runner.server.buildRetrievalQuery(a, request, runner.authenticated_identity, runner.request_context, generator);
             }
 
             fn authorizeQuery(
@@ -4600,11 +4620,14 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
+                try runner.request_context.check();
                 if (runner.authenticated_identity) |identity| {
                     if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
                 }
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
+                semantic_resolver.query_embedding_deadline_ns = runner.request_context.deadline_ns;
+                semantic_resolver.query_cancellation = runner.request_context.cancellation;
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
                     if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
@@ -4613,6 +4636,8 @@ pub const AntflyApiHandler = struct {
                     return err;
                 };
                 defer query_req.deinit(a);
+                if (runner.request_context.deadline_ns) |deadline| query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |existing| @min(existing, deadline) else deadline;
+                query_req.req.cancellation = runner.request_context.cancellation;
                 query_req.req.graph_execution_limits = runner.server.cfg.graph_execution_limits;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
@@ -4698,6 +4723,8 @@ pub const AntflyApiHandler = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
             io: std.Io,
+            request_context: managed_embedder.RequestContext,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -4715,13 +4742,15 @@ pub const AntflyApiHandler = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{
             .antfly_provider = self.api_server.antfly_provider,
             .secret_store = self.api_server.cfg.secret_store,
             .io = self.api_server.inferenceIo(),
+            .request_context = self.agentRequestContext(ctx),
+            .inference_api_key = self.api_server.cfg.inference_api_key,
         };
 
         var query_runner = RetrievalQueryRunner{
@@ -4729,6 +4758,7 @@ pub const AntflyApiHandler = struct {
             .source = source,
             .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
             .authenticated_identity = authenticated_identity,
+            .request_context = generation_runner.request_context,
         };
         var sink = RetrievalSseSink{ .context = ctx };
         const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body_data, sink.iface()) catch |err| {
@@ -4772,6 +4802,11 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(422);
                     return ctx.text("steps.generation requires a step-level or top-level generator or chain");
                 },
+                error.InvalidAgentToolCall, error.AgentToolLimitExceeded => return jsonErrorResponse(ctx, 422, @errorName(err)),
+                error.AgentContextLimitExceeded => return jsonErrorResponse(ctx, 413, @errorName(err)),
+                error.UnsupportedAgentToolProvider => return jsonErrorResponse(ctx, 400, "agent tools require an Antfly or OpenAI tool-capable generator"),
+                error.GenerateRequestFailed, error.EmptyResponse => return jsonErrorResponse(ctx, 502, "agent generation failed"),
+                error.RateLimit => return jsonErrorResponse(ctx, 429, "agent generation rate limited"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");

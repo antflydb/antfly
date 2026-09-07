@@ -18,6 +18,9 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 test {
+    _ = @import("standalone/inference_worker_rpc.zig");
+    _ = @import("standalone/inference_worker_wire.zig");
+    _ = @import("standalone/inference_worker.zig");
     _ = runtime;
     _ = inference_host;
     _ = storage_backend_erased;

@@ -31,7 +31,10 @@ class RetrievalAgentRequest:
     directly without an LLM tool-calling loop.
 
     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-    call, using the queries to determine available tables and indexes.
+    call, using the queries to determine available tables and indexes. A query
+    may contain only a table scope and caller constraints: build_query delegates
+    to the query-builder agent, then search executes its validated QueryRequest.
+    Refinements use the same canonical full-DSL validator, not keyword substitution.
 
     Authenticated row filters are enforced on every initial and generated
     operation in both modes, including scans, aggregates, and graph/tree
@@ -68,7 +71,9 @@ class RetrievalAgentRequest:
             decisions (list[AgentDecision] | Unset): Structured answers provided by the user as part of client-carried
                 continuation.
             interactive (bool | Unset): If true, the agent may return clarification questions when needed. Default: True.
-            max_internal_iterations (int | Unset): Maximum number of internal tool-calling rounds.
+            max_internal_iterations (int | Unset): Maximum number of model-generation rounds across retrieval and any
+                delegated query-builder calls. All calls share the request deadline
+                and cancellation. Tool calls are additionally capped at 20 overall.
 
                 - 0: Pipeline mode — execute provided queries directly, no LLM loop
                 - 1+: Agentic mode — LLM decides which tools to call
