@@ -14,7 +14,8 @@
 
 const std = @import("std");
 const structlog = @import("structlog");
-const lite = @import("cmd/lite.zig");
+const cli_main = @import("main.zig");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
@@ -42,7 +43,21 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, subcommand, "lite")) {
-        return try lite.runFromIterator(init, argv0, &args);
+        return try cli_main.runRuntimeUnit(.standalone, subcommand, init, &args);
+    }
+
+    // lite serve re-executes this binary as its supervised inference worker.
+    if (std.mem.eql(u8, subcommand, "inference")) {
+        const worker_command = args.next() orelse return error.InvalidArguments;
+        if (!std.mem.eql(u8, worker_command, "_worker")) return error.InvalidArguments;
+        var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+        defer worker_lifetime.deinit(init.io);
+        if (try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
+        var worker_args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+        defer worker_args.deinit();
+        _ = worker_args.next();
+        _ = worker_args.next();
+        return try cli_main.runRuntimeUnit(.inference, subcommand, init, &worker_args);
     }
 
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
@@ -64,9 +79,9 @@ fn printUsage(argv0: []const u8) void {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly lite-core\n", .{});
+    std.debug.print("antfly lite\n", .{});
 }
 
-test "lite core main compiles" {
+test "lite main compiles" {
     _ = main;
 }

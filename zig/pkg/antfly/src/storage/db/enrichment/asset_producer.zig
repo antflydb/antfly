@@ -1297,3 +1297,64 @@ test "asset producer forwards request context to cancellable implementations" {
     try std.testing.expectEqualStrings("controlled", output);
     try std.testing.expectEqual(@as(usize, 1), probe.context_calls);
 }
+
+test "asset producer preserves legacy native batch under request context" {
+    const Probe = struct {
+        batch_calls: usize = 0,
+        cancel_after_batch: ?*std.atomic.Value(bool) = null,
+
+        fn single(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
+            return error.SingleCallbackInvoked;
+        }
+
+        fn batch(raw: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            const out = try alloc.alloc([]u8, requests.len);
+            for (out) |*item| item.* = "";
+            errdefer {
+                for (out) |item| if (item.len > 0) alloc.free(item);
+                alloc.free(out);
+            }
+            for (out, requests) |*item, request| item.* = try alloc.dupe(u8, request.source_text);
+            if (self.cancel_after_batch) |cancelled| cancelled.store(true, .release);
+            return out;
+        }
+    };
+
+    const requests = [_]Request{
+        .{ .producer_type = .copy, .config_json = "", .source_text = "one" },
+        .{ .producer_type = .copy, .config_json = "", .source_text = "two" },
+    };
+    var probe = Probe{};
+    const producer = Producer{
+        .ptr = &probe,
+        .vtable = &.{ .produce = Probe.single, .produce_batch = Probe.batch },
+    };
+    try std.testing.expect(try producer.canProduceBatch(std.testing.allocator, &requests));
+    const output = try producer.produceBatchWithContext(
+        std.testing.allocator,
+        &requests,
+        .{ .io = std.testing.io, .deadline_ns = null },
+    );
+    defer {
+        for (output) |item| std.testing.allocator.free(item);
+        std.testing.allocator.free(output);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
+    try std.testing.expectEqualStrings("one", output[0]);
+    try std.testing.expectEqualStrings("two", output[1]);
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    probe.cancel_after_batch = &cancelled;
+    try std.testing.expectError(error.Cancelled, producer.produceBatchWithContext(
+        std.testing.allocator,
+        &requests,
+        .{
+            .io = std.testing.io,
+            .deadline_ns = null,
+            .cancellation = @import("../../../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled),
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), probe.batch_calls);
+}

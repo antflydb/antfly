@@ -803,13 +803,16 @@ Packages:
 - Language bindings generated or hand-written over the C ABI.
 - Optional full package with embedded inference runtime.
 
-Build profiles:
+Build and test targets:
 
-- `lite-core`: embedded database, indexes, and maintenance CLI, with no
-  heavyweight inference runtime.
-- `lite-full`: embedded database plus local inference runtime.
-- `lite-wasm`: hosted/manual maintenance profile.
-- `lite-dev`: debug/status tooling and compatibility experiments.
+- `lite`: build and install the Lite-only CLI, `libantfly`, and its C header.
+- `lite-test`: run Lite backend, CLI, bindings, examples, and C ABI packaging
+  checks, including smoke tests for both the Lite-only and full Antfly CLIs.
+- `antfly capi`: build the full Antfly CLI and `libantfly`. Use
+  `-Dlite-local-inference-runtime=true` when the embedding supplies a local
+  inference runtime and should advertise that capability.
+- `wasm`: build and install the embedded database and inference WASM bundle.
+  `wasm-test` builds the bundle and runs its Node smoke test.
 
 ## Testing
 

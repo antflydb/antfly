@@ -57,6 +57,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var followup = false;
     var confidence = false;
     var max_context_tokens: ?i64 = null;
+    var iterations_arg: ?[]const u8 = null;
     var limit_set = false;
     var streaming_set = false;
     var classify_set = false;
@@ -70,6 +71,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
             takeUniqueValue(args, &generator_json, arg);
+        } else if (std.mem.eql(u8, arg, "--max-internal-iterations")) {
+            takeUniqueValue(args, &iterations_arg, arg);
         } else if (std.mem.eql(u8, arg, "--semantic-search")) {
             takeUniqueValue(args, &semantic_search, arg);
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
@@ -87,7 +90,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             const raw = args.next() orelse cli.fatal("--limit requires a value", .{});
             limit = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --limit value: {s}", .{raw});
             if (limit <= 0) cli.fatal("--limit must be greater than zero", .{});
-        } else if (std.mem.eql(u8, arg, "--prompt")) {
+        } else if (std.mem.eql(u8, arg, "--prompt") or std.mem.eql(u8, arg, "--intent")) {
             takeUniqueValue(args, &prompt, arg);
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
             takeUniqueValue(args, &system_prompt, arg);
@@ -124,9 +127,10 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
 
     const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
     const table = table_name orelse cli.fatal("--table is required", .{});
-    if (semantic_search == null and full_text_search == null) {
-        cli.fatal("one of --semantic-search or --full-text-search is required", .{});
-    }
+    const intent_only = semantic_search == null and full_text_search == null;
+    if (intent_only and prompt == null) cli.fatal("provide --intent, --semantic-search, or --full-text-search", .{});
+    const iterations = try parseIterations(iterations_arg orelse if (intent_only) "8" else "0");
+    if (intent_only and iterations == 0) cli.fatal("--intent without a query requires positive --max-internal-iterations", .{});
     const query_text = prompt orelse semantic_search orelse full_text_search orelse "";
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
@@ -170,7 +174,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             .with_reasoning = reasoning,
         },
         .generation = .{
-            .enabled = generate,
+            .enabled = generate or intent_only,
             .system_prompt = system_prompt,
         },
         .followup = .{
@@ -185,13 +189,18 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .query = query_text,
         .queries = queries[0..],
         .max_context_tokens = max_context_tokens,
+        .max_internal_iterations = iterations,
         .stream = streaming,
         .generator = generator_value.value,
         .steps = steps,
     };
 
     if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
-    if (streaming) {
+    return sendRetrieval(allocator, io, client, body);
+}
+
+fn sendRetrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, body: antfly_client.types.RetrievalAgentRequest) !void {
+    if (body.stream orelse true) {
         var output = StreamingSseWriter{ .io = io };
         var resp = try client.retrievalAgentToWriter(body, &output);
         defer resp.deinit();
@@ -208,7 +217,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         var resp = try client.retrievalAgent(body);
         defer resp.deinit();
         const response_failed = resp.status_code >= 300 or
-            isSseFailureResponse(resp.content_type, resp.body orelse "");
+            isSseFailureResponse(resp.content_type, resp.body orelse "") or
+            !try retrievalCompleted(allocator, resp.body);
         if (resp.body) |response_body| {
             cli.writeStdout(io, response_body);
             cli.writeStdout(io, "\n");
@@ -316,6 +326,12 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     var intent: ?[]const u8 = null;
     var table_name: ?[]const u8 = null;
     var generator_json: ?[]const u8 = null;
+    var iterations_arg: ?[]const u8 = null;
+    var fields_arg: ?[]const u8 = null;
+    var mode: ?[]const u8 = null;
+    var execute = false;
+    var streaming = true;
+    var streaming_set = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--intent")) {
@@ -324,6 +340,17 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
             takeUniqueValue(args, &table_name, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
             takeUniqueValue(args, &generator_json, arg);
+        } else if (std.mem.eql(u8, arg, "--max-internal-iterations")) {
+            takeUniqueValue(args, &iterations_arg, arg);
+        } else if (std.mem.eql(u8, arg, "--fields")) {
+            takeUniqueValue(args, &fields_arg, arg);
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            takeUniqueValue(args, &mode, arg);
+        } else if (std.mem.eql(u8, arg, "--execute")) {
+            takeUniqueSwitch(&execute, arg);
+        } else if (std.mem.eql(u8, arg, "--streaming") or std.mem.eql(u8, arg, "--no-streaming")) {
+            takeUniqueSwitch(&streaming_set, arg);
+            streaming = std.mem.eql(u8, arg, "--streaming");
         } else {
             cli.fatal("unknown agents query-builder flag: {s}", .{arg});
         }
@@ -335,17 +362,80 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
     defer generator_value.deinit();
 
+    const iterations = try parseIterations(iterations_arg orelse if (execute) "8" else "0");
+    if (execute and table_name == null) cli.fatal("--execute requires --table", .{});
+    if (execute and iterations == 0) cli.fatal("--execute requires positive --max-internal-iterations", .{});
+    if (streaming_set and !execute) cli.fatal("streaming flags require --execute", .{});
+    const fields = if (fields_arg) |value| try cli.splitCommaListAlloc(allocator, value) else null;
+    defer if (fields) |value| allocator.free(value);
+
+    if (execute) {
+        const knowledge = if (mode) |value| try std.fmt.allocPrint(allocator, "Query planning mode preference: {s}", .{value}) else null;
+        defer if (knowledge) |value| allocator.free(value);
+        return sendRetrieval(allocator, io, client, .{
+            .query = i,
+            .queries = &.{.{ .table = table_name, .fields = fields, .limit = 5 }},
+            .generator = generator_value.value,
+            .agent_knowledge = knowledge,
+            .stream = streaming,
+            .max_internal_iterations = iterations,
+            .steps = .{ .generation = .{ .enabled = true } },
+        });
+    }
+
     const body = antfly_client.types.QueryBuilderRequest{
         .intent = i,
         .table = table_name,
         .generator = generator_value.value,
+        .schema_fields = fields,
+        .mode = mode,
+        .max_internal_iterations = iterations,
     };
 
     var resp = try client.queryBuilder(body);
     defer resp.deinit();
-    if (resp.data) |data| {
-        try cli.writeJson(allocator, io, data.value);
+    if (resp.status_code >= 300 or resp.data == null) {
+        return error.QueryBuilderResponseError;
     }
+    const result = resp.data.?.value;
+    try cli.writeJson(allocator, io, result);
+    if (result.status == .incomplete or result.status == .failed) return error.QueryBuilderResponseError;
+}
+
+fn retrievalCompleted(allocator: std.mem.Allocator, body: ?[]const u8) !bool {
+    var parsed = std.json.parseFromSlice(struct { status: antfly_client.types.AgentStatus }, allocator, body orelse return false, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.status == .completed;
+}
+
+fn parseIterations(raw: ?[]const u8) !i64 {
+    const value = std.fmt.parseInt(i64, raw orelse "0", 10) catch return error.InvalidAgentIterations;
+    if (value < 0 or value > 20) return error.InvalidAgentIterations;
+    return value;
+}
+
+test "agent CLI iterations are bounded" {
+    try std.testing.expectEqual(@as(i64, 0), try parseIterations(null));
+    try std.testing.expectEqual(@as(i64, 4), try parseIterations("4"));
+    try std.testing.expectError(error.InvalidAgentIterations, parseIterations("-1"));
+    try std.testing.expectError(error.InvalidAgentIterations, parseIterations("21"));
+}
+
+test "agent CLI execution request round trips through the server schema" {
+    const alloc = std.testing.allocator;
+    const request = antfly_client.types.RetrievalAgentRequest{
+        .query = "Find anatomy",
+        .queries = &.{.{ .table = "docs", .full_text_search = .{ .bytes = "{\"match\":\"anatomy\",\"field\":\"title\"}" }, .limit = 10 }},
+        .generator = .{ .provider = "antfly", .model = "ggml-org/gemma-4-E4B-it-GGUF", .max_tokens = 512, .temperature = 0 },
+        .stream = false,
+        .max_internal_iterations = 4,
+        .steps = .{ .generation = .{ .enabled = true } },
+    };
+    const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").RetrievalAgentRequest, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?i64, 4), parsed.value.max_internal_iterations);
 }
 
 fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(antfly_client.types.RawQuery) {

@@ -1096,111 +1096,7 @@ fn rawGenerateChatTemplateKwargsAreValid(
     return true;
 }
 
-/// Watches only calls which declared that cooperative or native termination is
-/// insufficient. Expiry is process-fatal by design: the supervisor owns the
-/// replacement generation, while continuing in this address space could reuse
-/// buffers still retained by a wedged driver.
-const HardCancellationWatchdog = struct {
-    const Entry = struct {
-        token: u64,
-        control: execution_control_mod.MonitorControl,
-    };
-
-    allocator: std.mem.Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
-    next_token: u64 = 1,
-    stopping: std.atomic.Value(bool) = .init(false),
-    io: ?std.Io = null,
-    group: std.Io.Group = .init,
-
-    fn create(allocator: std.mem.Allocator) !*HardCancellationWatchdog {
-        const self = try allocator.create(HardCancellationWatchdog);
-        errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator };
-        return self;
-    }
-
-    fn start(self: *HardCancellationWatchdog, io: std.Io) !void {
-        if (self.io != null) return;
-        self.io = io;
-        errdefer self.io = null;
-        try self.group.concurrent(io, run, .{ self, io });
-    }
-
-    fn destroy(self: *HardCancellationWatchdog) void {
-        self.stopping.store(true, .release);
-        if (self.io) |io| {
-            self.group.cancel(io);
-            self.group.await(io) catch {};
-        }
-        spinLock(&self.mutex);
-        std.debug.assert(self.entries.items.len == 0);
-        self.entries.deinit(self.allocator);
-        self.mutex.unlock();
-        const allocator = self.allocator;
-        self.* = undefined;
-        allocator.destroy(self);
-    }
-
-    fn boundary(self: *HardCancellationWatchdog) execution_control_mod.HardCancellationBoundary {
-        return .{
-            .ptr = self,
-            .arm_fn = armOpaque,
-            .disarm_fn = disarmOpaque,
-        };
-    }
-
-    fn armOpaque(raw: *anyopaque, control: execution_control_mod.MonitorControl) !u64 {
-        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
-        try control.check();
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.stopping.load(.acquire)) return error.InferenceWorkerShuttingDown;
-        if (self.io == null) return error.HardCancellationWatchdogNotStarted;
-        const token = self.next_token;
-        self.next_token +%= 1;
-        if (self.next_token == 0) self.next_token = 1;
-        try self.entries.append(self.allocator, .{ .token = token, .control = control });
-        return token;
-    }
-
-    fn disarmOpaque(raw: *anyopaque, token: u64) void {
-        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items, 0..) |entry, index| {
-            if (entry.token != token) continue;
-            _ = self.entries.swapRemove(index);
-            return;
-        }
-        // A missing token is an ownership violation. Do not silently leave a
-        // borrowed request pointer in the monitor.
-        @panic("hard cancellation watchdog token was not armed");
-    }
-
-    fn run(self: *HardCancellationWatchdog, io: std.Io) std.Io.Cancelable!void {
-        while (!self.stopping.load(.acquire)) {
-            var fatal: ?anyerror = null;
-            spinLock(&self.mutex);
-            for (self.entries.items) |entry| {
-                entry.control.check() catch |err| {
-                    fatal = err;
-                    break;
-                };
-            }
-            self.mutex.unlock();
-            if (fatal) |err| {
-                std.log.err(
-                    "uninterruptible inference request expired; terminating supervised worker err={s}",
-                    .{@errorName(err)},
-                );
-                platform.inference_process_supervisor.restartWorker();
-            }
-            try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
-        }
-    }
-};
+const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
@@ -1243,12 +1139,14 @@ pub const NodeConfig = struct {
     allow_insecure_public_bind: bool = false,
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
-    allow_unknown_models: bool = false,
+    allow_unknown_models: bool = true,
     /// True only when this Node owns its whole process and may terminate it to
     /// interrupt a wedged driver. Production sets this in a supervised worker;
     /// disposable CLI tools may opt in directly. Embedded database nodes must
     /// remain false because termination would also kill their owner.
     process_termination_available: bool = false,
+    /// Metadata/routing node only: execution is delegated to a supervised worker.
+    inference_proxy: bool = false,
 };
 
 fn isLoopbackBindHost(host: []const u8) bool {
@@ -3671,6 +3569,13 @@ pub const Node = struct {
         prepared: bool = false,
         execution_control: ?InferenceExecutionControl = null,
 
+        fn boundExecutionControl(self: *const DirectGenerateAdmission) !InferenceExecutionControl {
+            const node = self.node orelse return error.InvalidGenerationAdmission;
+            // Preload and legacy direct callers have no request control, but
+            // still need the Node-owned executor and hard-cancellation boundary.
+            return node.bindExecutionControl(null, self.execution_control orelse .{});
+        }
+
         fn prepareMessages(self: *DirectGenerateAdmission, messages: []const generation.Message) !void {
             if (self.execution_control) |control| try control.check();
             const node = self.node orelse return error.InvalidGenerationAdmission;
@@ -3732,7 +3637,7 @@ pub const Node = struct {
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
         session_manager.process_isolation_available = config.process_termination_available;
-        try session_manager.validateRequiredBackendPolicy();
+        if (!config.inference_proxy) try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -5109,11 +5014,8 @@ pub const Node = struct {
         if (admitted_node != self) return error.InvalidGenerationAdmission;
         try admission.prepareMessages(messages);
         const max_tokens = admission.max_tokens;
-        const execution_control = if (admission.execution_control) |control|
-            self.bindExecutionControl(null, control)
-        else
-            null;
-        if (execution_control) |control| try control.update(.loading_model, 0, 1);
+        const execution_control = try admission.boundExecutionControl();
+        try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
         var owned_io: ?std.Io.Threaded = null;
@@ -5147,34 +5049,19 @@ pub const Node = struct {
         });
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
-                if (execution_control) |control|
-                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
-                        model_path,
-                        backends,
-                        cache_default_alias,
-                        request,
-                        control,
-                    )
-                else
-                    try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
-                        model_path,
-                        backends,
-                        cache_default_alias,
-                        request,
-                    )
-            else if (execution_control) |control|
-                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, control)
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+                    model_path,
+                    backends,
+                    cache_default_alias,
+                    request,
+                    execution_control,
+                )
             else
-                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, execution_control)
         else if (preferred_backends) |backends|
-            if (execution_control) |control|
-                try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, control)
-            else
-                try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
-        else if (execution_control) |control|
-            try self.model_manager.acquireFromDirWithControl(model_path, control)
+            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, execution_control)
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
         const model = model_handle.get();
         try requireGeneratorManifest(&model.manifest);
@@ -9021,7 +8908,7 @@ pub const Node = struct {
             preflight.text_bytes = std.math.add(
                 usize,
                 preflight.text_bytes,
-                message.content.len,
+                message.textBytes(),
             ) catch return error.RemoteContentTooLarge;
             if (message.image_bytes) |images| {
                 for (images) |image_bytes| {
@@ -9066,7 +8953,7 @@ pub const Node = struct {
         var text_bytes: usize = 0;
         var media_count: usize = 0;
         for (messages) |msg| {
-            text_bytes = std.math.add(usize, text_bytes, msg.content.len) catch std.math.maxInt(usize);
+            text_bytes = std.math.add(usize, text_bytes, msg.textBytes()) catch std.math.maxInt(usize);
             if (msg.image_bytes) |images| media_count = std.math.add(usize, media_count, images.len) catch std.math.maxInt(usize);
             if (msg.audio_bytes) |audio| media_count = std.math.add(usize, media_count, audio.len) catch std.math.maxInt(usize);
         }
@@ -9078,6 +8965,13 @@ pub const Node = struct {
         var text_bytes: usize = 0;
         var media_count: usize = 0;
         for (body.messages) |msg| {
+            if (msg.tool_call_id) |id| text_bytes +|= id.len;
+            if (msg.tool_calls) |calls| for (calls) |call| {
+                text_bytes +|= call.id.len;
+                text_bytes +|= call.type.len;
+                text_bytes +|= call.function.name.len;
+                text_bytes +|= call.function.arguments.len;
+            };
             const content = msg.content orelse continue;
             switch (content) {
                 .string => |text| text_bytes = std.math.add(usize, text_bytes, text.len) catch std.math.maxInt(usize),
@@ -9166,7 +9060,7 @@ pub const Node = struct {
         _ = self;
         var text_bytes: usize = 0;
         for (messages) |msg| {
-            text_bytes += msg.content.len;
+            text_bytes +|= msg.textBytes();
         }
         return text_bytes;
     }
@@ -10446,7 +10340,10 @@ pub const Node = struct {
         var messages = std.ArrayListUnmanaged(generation.Message).fromOwnedSlice(owned_messages.messages);
         owned_messages.messages = &.{};
         defer {
-            for (messages.items) |message| ctx.allocator.free(message.content);
+            for (messages.items) |message| {
+                ctx.allocator.free(message.content);
+                if (message.tool_calls) |calls| ctx.allocator.free(calls);
+            }
             messages.deinit(ctx.allocator);
         }
 
@@ -11866,7 +11763,10 @@ pub const Node = struct {
         content_parts: [][]const generation.Message.ContentPart = &.{},
 
         fn deinit(self: *OwnedGenerateMessages) void {
-            for (self.messages) |msg| self.allocator.free(msg.content);
+            for (self.messages) |msg| {
+                self.allocator.free(msg.content);
+                if (msg.tool_calls) |calls| self.allocator.free(calls);
+            }
             self.allocator.free(self.messages);
             for (self.decoded_images, self.decoded_image_owned) |img, owned| if (owned) self.allocator.free(img);
             self.allocator.free(self.decoded_images);
@@ -11969,7 +11869,10 @@ pub const Node = struct {
     ) !OwnedGenerateMessages {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         errdefer {
-            for (messages.items) |msg| allocator.free(msg.content);
+            for (messages.items) |msg| {
+                allocator.free(msg.content);
+                if (msg.tool_calls) |calls| allocator.free(calls);
+            }
             messages.deinit(allocator);
         }
         var decoded_images = std.ArrayListUnmanaged([]const u8).empty;
@@ -12177,9 +12080,23 @@ pub const Node = struct {
                 owns_msg_part_slice = false;
             }
 
+            const tool_calls: ?[]generation.Message.ToolCall = if (msg.tool_calls) |calls| blk: {
+                const converted = try allocator.alloc(generation.Message.ToolCall, calls.len);
+                for (calls, converted) |call, *out| out.* = .{
+                    .id = call.id,
+                    .type = call.type,
+                    .name = call.function.name,
+                    .arguments = call.function.arguments,
+                };
+                break :blk converted;
+            } else null;
+            errdefer if (tool_calls) |calls| allocator.free(calls);
             try messages.append(allocator, .{
                 .role = role,
                 .content = content,
+                .content_is_null = msg.content == null,
+                .tool_calls = tool_calls,
+                .tool_call_id = msg.tool_call_id,
                 .image_bytes = msg_img_slice,
                 .audio_bytes = msg_audio_slice,
                 .content_parts = msg_part_slice,
@@ -12189,7 +12106,10 @@ pub const Node = struct {
 
         const owned_messages = try messages.toOwnedSlice(allocator);
         errdefer {
-            for (owned_messages) |msg| allocator.free(msg.content);
+            for (owned_messages) |msg| {
+                allocator.free(msg.content);
+                if (msg.tool_calls) |calls| allocator.free(calls);
+            }
             allocator.free(owned_messages);
         }
         const owned_image_media = try takeOwnedMediaSlices(allocator, &decoded_images, &decoded_image_owned);
@@ -14211,6 +14131,7 @@ pub const Node = struct {
             const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ prompt, messages.items[0].content });
             allocator.free(messages.items[0].content);
             messages.items[0].content = merged;
+            messages.items[0].content_is_null = false;
             return;
         }
 
@@ -14233,6 +14154,8 @@ pub const Node = struct {
 
         if (bos_token.len > 0) try buf.appendSlice(allocator, bos_token);
         for (messages) |message| {
+            if (message.tool_calls != null or message.tool_call_id != null or std.mem.eql(u8, message.role, "tool"))
+                return error.ToolHistoryRequiresChatTemplate;
             const role = if (std.mem.eql(u8, message.role, "assistant"))
                 "model"
             else if (std.mem.eql(u8, message.role, "system"))
@@ -21450,6 +21373,27 @@ test "direct generation audio admission honors configured byte capacity boundary
     admitted.deinit();
 }
 
+test "generate HTTP message conversion preserves tool history" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc,
+        \\{"model":"gemma","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"search","arguments":"{\"query\":\"anatomy\"}"}},{"id":"c2","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"AZURE-731"}]}
+    , .{});
+    defer parsed.deinit();
+    var node = try Node.init(alloc, .{});
+    defer node.deinit();
+    var converted = try node.parseGenerateMessages(alloc, parsed.value);
+    defer converted.deinit();
+    try std.testing.expect(converted.messages[0].content_is_null);
+    const calls = converted.messages[0].tool_calls.?;
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("search", calls[0].name);
+    try std.testing.expectEqualStrings("{\"query\":\"anatomy\"}", calls[0].arguments);
+    try std.testing.expectEqualStrings("c2", calls[1].id);
+    try std.testing.expectEqualStrings("c1", converted.messages[1].tool_call_id.?);
+    const preflight = try Node.directGeneratePreflightForMessages(converted.messages);
+    try std.testing.expect(preflight.text_bytes > "AZURE-731".len);
+}
+
 test "direct generation media inspection releases admission on early error" {
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 32 });
     defer node.deinit();
@@ -22948,6 +22892,43 @@ test "supervised node owns and joins the hard cancellation watchdog" {
     try std.testing.expect(control.hard_cancellation != null);
     var guard = try control.enterUninterruptible(.process_required);
     guard.deinit();
+}
+
+test "direct generation admission binds preload control without granting embedded process termination" {
+    const alloc = std.testing.allocator;
+    var supervised = try Node.init(alloc, .{ .process_termination_available = true });
+    defer supervised.deinit();
+    try supervised.attachIo(std.testing.io);
+    var admission = try supervised.beginDirectGenerateAdmission(.{}, 1);
+    defer admission.deinit();
+    try std.testing.expect(admission.execution_control == null);
+    const preload_control = try admission.boundExecutionControl();
+    try std.testing.expect(preload_control.io != null);
+    try std.testing.expect(preload_control.hard_cancellation != null);
+    var guard = try preload_control.enterUninterruptible(.process_required);
+    guard.deinit();
+
+    admission.execution_control = .{ .deadline_ns = 0 };
+    const expired = try admission.boundExecutionControl();
+    try std.testing.expect(expired.hard_cancellation != null);
+    try std.testing.expectError(error.Timeout, expired.check());
+
+    const Cancelled = struct {
+        fn check(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    admission.execution_control = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.check } };
+    try std.testing.expectError(error.Cancelled, (try admission.boundExecutionControl()).check());
+
+    var embedded = try Node.init(alloc, .{});
+    defer embedded.deinit();
+    try embedded.attachIo(std.testing.io);
+    var embedded_admission = try embedded.beginDirectGenerateAdmission(.{}, 1);
+    defer embedded_admission.deinit();
+    const embedded_control = try embedded_admission.boundExecutionControl();
+    try std.testing.expect(embedded_control.hard_cancellation == null);
+    try std.testing.expectError(error.ProcessIsolationRequired, embedded_control.enterUninterruptible(.process_required));
 }
 
 test "supervised node drains load task guards before destroying watchdog" {

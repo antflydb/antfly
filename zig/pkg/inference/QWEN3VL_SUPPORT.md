@@ -1,37 +1,29 @@
 # Qwen3-VL inference support
 
-This document is the operational contract for Qwen3-VL generation and
-Qwen3-VL-Reranker inference in Antfly. The implementation is deliberately
-fail-closed: code and artifact recognition may land before a model/backend
-pair is enabled, but an unqualified bundle cannot be made runnable with
-`--allow-unknown-models`.
+This document records Qwen3-VL generation and reranking qualification evidence.
+The historical promotion restrictions below describe the releases in which the
+reports were collected; they are not the current serving admission policy.
 
-The production promotion is intentionally narrow. Only these managed receipt
-identities are runnable, and only through Metal:
+Current admission validates the selected artifact, tensors, serving role, and
+backend. A catalog entry or exact qualification receipt is not required. The
+split decoder/projector runtime currently requires Metal; integrated safetensors
+generation also supports CUDA. See [model compatibility](MODEL_COMPATIBILITY.md).
 
-| Serving role | Exact managed source | Quantization | Status |
-| --- | --- | --- | --- |
-| Generation | `Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1` | Q4_K_M decoder + Q8_0 projector | Promoted |
-| Reranking | `Qwen/Qwen3-VL-Reranker-2B-GGUF:q8-0-q8-0-bundle-v1` | Q8_0 decoder + Q8_0 projector + F16 score head | Promoted |
-
-The 4B and 8B generation bundles, BF16 reranker oracle, Q4 reranker, other
-quantizations, unmanaged copies, changed receipts, and non-Metal backends
-remain blocked. This is an exact-artifact promotion, not family-wide enablement.
+## Historical qualification evidence
 
 ## Pinned artifacts
 
-`antfly inference pull` recognizes the following source aliases. Each alias
+Explicit pinned bundle references select the following fixtures. Each reference
 resolves to immutable Hub revisions, verifies exact sizes and SHA-256 digests,
 stages the complete bundle beside the live model directory, and publishes it
-with a single managed receipt only after every artifact is valid. A pull alias
-is not, by itself, a serving promotion.
+with a single managed receipt only after every artifact is valid. A pinned pull is not, by itself, evidence of runtime qualification.
 
-| Alias | Decoder or model | Vision projector | Approximate installed size |
+| Reference | Decoder or model | Vision projector | Approximate installed size |
 | --- | --- | --- | ---: |
-| `qwen3-vl-2b` | Official `Qwen3VL-2B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 1.46 GiB |
-| `qwen3-vl-4b` | Official `Qwen3VL-4B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 2.76 GiB |
-| `qwen3-vl-8b` | Official `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 5.39 GiB |
-| `qwen3-vl-reranker-2b` | Official BF16 `model.safetensors` conversion/parity oracle; not serveable | Embedded in the checkpoint | 3.97 GiB |
+| `Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1` | Official `Qwen3VL-2B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 1.46 GiB |
+| `Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1` | Official `Qwen3VL-4B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 2.76 GiB |
+| `Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1` | Official `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | Official Q8_0 mmproj | 5.39 GiB |
+| `Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1` | Official BF16 `model.safetensors` conversion/parity oracle; not serveable | Embedded in the checkpoint | 3.97 GiB |
 
 The reranker serving artifact is produced from that pinned BF16 source with
 `convert_qwen3vl_reranker.py`: Q8_0 decoder, Q8_0 projector, and an F16
@@ -62,8 +54,8 @@ unpinned community conversion.
 Examples:
 
 ```sh
-antfly inference pull qwen3-vl-2b
-antfly inference pull qwen3-vl-reranker-2b  # BF16 conversion/parity oracle
+antfly inference pull Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1
+antfly inference pull Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1  # BF16 conversion/parity oracle
 ```
 
 The source catalog, including revisions, exact filenames, sizes, and SHA-256

@@ -81,5 +81,6 @@ open Lite handle. Use `RestoreFile`, `Restore`, `RestoreBackupFile`,
 Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
 `.aflite` database snapshot rather than a portable `.afb` backup archive.
 
-The repository-level `zig build lite-core` gate builds `libantfly` and runs
-the Go binding tests against it.
+From the repository’s `zig` directory, `zig build lite` builds the Lite CLI
+and `libantfly`. Run `zig build lite-test` for the Lite checks, including the
+Go binding tests against the built library.

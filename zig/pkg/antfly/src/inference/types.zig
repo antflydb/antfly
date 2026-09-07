@@ -96,6 +96,7 @@ pub const ChatRequestOptions = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+    enable_thinking: ?bool = null,
 };
 
 pub fn chatRequestJsonAlloc(
@@ -140,6 +141,9 @@ pub fn chatRequestJsonWithOptionsAlloc(
     if (options.top_k) |top_k| try appendJsonI64Field(alloc, &out, "top_k", top_k);
     if (options.frequency_penalty) |frequency_penalty| try appendJsonFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
     if (options.presence_penalty) |presence_penalty| try appendJsonFloatField(alloc, &out, "presence_penalty", presence_penalty);
+    if (options.enable_thinking) |enabled| {
+        try out.appendSlice(alloc, if (enabled) ",\"chat_template_kwargs\":{\"enable_thinking\":true}" else ",\"chat_template_kwargs\":{\"enable_thinking\":false}");
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }

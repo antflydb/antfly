@@ -341,7 +341,10 @@ def sync_detailed(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -433,7 +436,10 @@ def sync(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -519,7 +525,10 @@ async def asyncio_detailed(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -609,7 +618,10 @@ async def asyncio(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree

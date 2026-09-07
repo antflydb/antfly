@@ -16,7 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const request_context = @import("execution_context.zig");
-const RequestContext = request_context.RequestContext;
+pub const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -364,6 +364,18 @@ pub const AntflyProvider = struct {
     ) anyerror![][]f32 = null,
     /// Dense and raster responses use the owned numeric-row ABI, not JSON.
     typed_dense_results: bool = false,
+    /// Canonical generation request/response on the admitted runtime route.
+    generate_json: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request_json: []const u8,
+        context: ?RequestContext,
+    ) anyerror![]u8 = null,
+
+    pub fn generateJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        const callback = self.generate_json orelse return error.UnsupportedGeneratorProvider;
+        return AntflyProviderBoundary.call("generate_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
+    }
 };
 
 pub const ClassificationRequest = struct {
