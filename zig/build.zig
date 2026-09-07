@@ -7931,6 +7931,8 @@ pub fn build(b: *std.Build) void {
             "standalone runtime module compiles",
             "standalone runtime local generator accepts media url data uris",
             "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone numeric result ABI",
+            "standalone raster embedding control",
             "standalone encoded reader ABI round trips borrowed payloads",
             "standalone raster reader ABI preserves borrowed strided pages and identity",
             "encoded reader ABI enforces resolved model capabilities",

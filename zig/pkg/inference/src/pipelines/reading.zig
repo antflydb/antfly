@@ -112,6 +112,16 @@ pub const ReadingPipeline = struct {
     florence_final_logits_bias_zero: ?bool = null,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
+    fn imageWorkControl(self: *ReadingPipeline) antfly_image.work_control.Control {
+        return if (self.execution_control) |*control| control.imageWorkControl() else .{};
+    }
+
+    fn preprocessDecoded(self: *ReadingPipeline, decoded: image.Image) ![]f32 {
+        const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
+        defer scope.deinit();
+        return image.preprocessDecodedWithResample(self.allocator, decoded, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample);
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         vision_encoder: backends.Session,
@@ -174,7 +184,11 @@ pub const ReadingPipeline = struct {
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
         if (debug_cuda_session) std.log.info("reading: decode start bytes={d}", .{image_data.len});
         const decode_start = nowNs();
-        const decoded = try image.decode(allocator, image_data);
+        const decoded = blk: {
+            const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
+            defer scope.deinit();
+            break :blk try image.decode(allocator, image_data);
+        };
         logReadProfile("decode", decode_start);
         if (debug_cuda_session) std.log.info("reading: decode done", .{});
         defer decoded.deinit(allocator);
@@ -187,14 +201,7 @@ pub const ReadingPipeline = struct {
         const img_size: u32 = @intCast(self.config.image_size);
         if (debug_cuda_session) std.log.info("reading: preprocess start image_size={d}", .{img_size});
         const preprocess_start = nowNs();
-        const pixel_values = try image.preprocessDecodedWithResample(
-            allocator,
-            decoded,
-            img_size,
-            self.config.image_mean,
-            self.config.image_std,
-            self.config.resample,
-        );
+        const pixel_values = try self.preprocessDecoded(decoded);
         logReadProfile("preprocess", preprocess_start);
         if (debug_cuda_session) std.log.info("reading: preprocess done pixels={d}", .{pixel_values.len});
         defer allocator.free(pixel_values);
@@ -368,7 +375,7 @@ pub const ReadingPipeline = struct {
             return error.InvalidInputShape;
         const pixel_values = try self.allocator.alloc(f32, 3 * per_image_side);
         defer self.allocator.free(pixel_values);
-        try image.preprocessBorrowedRasterBatchInto(
+        try image.preprocessBorrowedRasterBatchIntoWithOptions(
             self.allocator,
             pixel_values,
             &.{raster},
@@ -376,6 +383,7 @@ pub const ReadingPipeline = struct {
             self.config.image_mean,
             self.config.image_std,
             self.config.resample,
+            .{ .io = self.config.preprocess_io, .control = if (self.execution_control) |*control| control.imageWorkControl() else .{} },
         );
         return self.readPixelValues(pixel_values);
     }
@@ -440,7 +448,7 @@ pub const ReadingPipeline = struct {
             self.config.image_mean,
             self.config.image_std,
             self.config.resample,
-            .{ .io = self.config.preprocess_io },
+            .{ .io = self.config.preprocess_io, .control = if (self.execution_control) |*control| control.imageWorkControl() else .{} },
         );
         return self.readBatchNativeFlorencePixels(
             pixel_values,
@@ -530,7 +538,7 @@ pub const ReadingPipeline = struct {
             self.config.image_mean,
             self.config.image_std,
             self.config.resample,
-            .{ .io = self.config.preprocess_io },
+            .{ .io = self.config.preprocess_io, .control = if (self.execution_control) |*control| control.imageWorkControl() else .{} },
         );
         if (self.execution_control) |control| try control.check();
 
@@ -999,16 +1007,7 @@ pub const ReadingPipeline = struct {
         }
 
         const allocator = self.allocator;
-        const img_size: u32 = @intCast(self.config.image_size);
-
-        const pixel_values = try image.preprocessDecodedWithResample(
-            allocator,
-            img,
-            img_size,
-            self.config.image_mean,
-            self.config.image_std,
-            self.config.resample,
-        );
+        const pixel_values = try self.preprocessDecoded(img);
         defer allocator.free(pixel_values);
         return self.readPixelValues(pixel_values);
     }
@@ -1574,15 +1573,19 @@ pub const ReadingPipeline = struct {
         const patch_width = if (self.config.pix2struct_patch_width > 0) self.config.pix2struct_patch_width else 16;
         const max_patches = if (self.config.pix2struct_max_patches > 0) self.config.pix2struct_max_patches else 2048;
 
-        var patches = try image.preprocessDecodedPix2Struct(
-            allocator,
-            img,
-            patch_height,
-            patch_width,
-            max_patches,
-            self.config.pix2struct_do_normalize,
-            self.config.resample,
-        );
+        var patches = blk: {
+            const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
+            defer scope.deinit();
+            break :blk try image.preprocessDecodedPix2Struct(
+                allocator,
+                img,
+                patch_height,
+                patch_width,
+                max_patches,
+                self.config.pix2struct_do_normalize,
+                self.config.resample,
+            );
+        };
         defer patches.deinit();
 
         const feature_depth = 2 + patch_height * patch_width * 3;
@@ -2488,6 +2491,33 @@ test "reading entry points and batch publication honor execution control" {
     pipeline.execution_control = .{ .ptr = &cancellation, .check_fn = CancelAtPublication.check };
     try std.testing.expectError(error.Cancelled, pipeline.readBatch(&.{}));
     try std.testing.expectEqual(@as(usize, 2), cancellation.checks);
+}
+
+test "reading cancellation interrupts encoded decode and borrowed raster preprocessing" {
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 3) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    var pipeline: ReadingPipeline = undefined;
+    pipeline.allocator = std.testing.allocator;
+    pipeline.config = .{ .image_size = 16 };
+    pipeline.execution_control = .{ .ptr = &probe, .check_fn = Probe.check };
+    const rgba = [_]u8{127} ** (32 * 32 * 4);
+    const png = try antfly_image.png.encodeRgba(std.testing.allocator, 32, 32, &rgba);
+    defer std.testing.allocator.free(png);
+    // Backend fields intentionally remain undefined: cancellation must stop
+    // inside preprocessing, before any model/session is consulted.
+    try std.testing.expectError(error.Cancelled, pipeline.read(png));
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    probe.checks = 0;
+    try std.testing.expectError(error.Cancelled, pipeline.readBorrowedRaster(.{ .bytes = &rgba, .width = 32, .height = 32, .stride_bytes = 128, .format = .rgba8 }));
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    try antfly_image.work_control.check();
 }
 
 test "Florence prompt tensor cleanup survives encoder admission denial" {

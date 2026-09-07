@@ -848,13 +848,7 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn imageWorkControl(self: *EmbeddingPipeline) antfly_image.work_control.Control {
-        const Probe = struct {
-            fn check(ptr: ?*const anyopaque) !void {
-                const pipeline: *const EmbeddingPipeline = @ptrCast(@alignCast(ptr.?));
-                if (pipeline.execution_control) |control| try control.check();
-            }
-        };
-        return .{ .context = self, .check_fn = Probe.check };
+        return if (self.execution_control) |*control| control.imageWorkControl() else .{};
     }
 
     /// Native broker entry point: invalid media occupies an indexed error slot

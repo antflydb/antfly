@@ -115,7 +115,9 @@ const HttpResponseState = struct {
 
 const ProviderResponseState = struct {
     alloc: std.mem.Allocator,
-    json: []u8,
+    json: ?[]u8 = null,
+    vectors: ?[][]f32 = null,
+    rows: ?[]inference_bridge.NumericRow = null,
 };
 
 pub const ReadEncodedImagesHandler = struct {
@@ -885,6 +887,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.model,
                     parsed.value.texts,
                 );
+            if (context.out_numeric_result != null) {
+                errdefer {
+                    for (result) |values| alloc.free(values);
+                    alloc.free(result);
+                }
+                try publishNumericProviderResponse(context, alloc, result, .dense_vectors);
+                return;
+            }
             defer {
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
@@ -924,6 +934,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
+            if (context.out_numeric_result != null) {
+                errdefer {
+                    for (result) |values| alloc.free(values);
+                    alloc.free(result);
+                }
+                try publishNumericProviderResponse(context, alloc, result, .dense_vectors);
+                return;
+            }
             defer {
                 for (result) |values| alloc.free(values);
                 alloc.free(result);
@@ -943,6 +961,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 parsed.value.query,
                 parsed.value.documents,
             );
+            if (context.out_numeric_result != null) {
+                errdefer alloc.free(result);
+                const rows = try alloc.alloc([]f32, 1);
+                errdefer alloc.free(rows);
+                rows[0] = result;
+                try publishNumericProviderResponse(context, alloc, rows, .scores);
+                return;
+            }
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
@@ -1188,13 +1214,21 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .decoded_pixels = pixels,
                 .max_media_parts_per_item = 1,
             });
-            const vectors = try state.node.embedDenseRastersDirectWithContext(
+            const vectors = try state.node.embedDenseRastersDirectWithExecutionControl(
                 alloc,
                 state.io,
-                deadline_ns,
+                execution_control,
                 decoded.metadata.value.model,
                 decoded.images,
             );
+            if (context.out_numeric_result != null) {
+                errdefer {
+                    for (vectors) |vector| alloc.free(vector);
+                    alloc.free(vectors);
+                }
+                try publishNumericProviderResponse(context, alloc, vectors, .dense_vectors);
+                return;
+            }
             defer {
                 for (vectors) |vector| alloc.free(vector);
                 alloc.free(vectors);
@@ -1413,8 +1447,87 @@ fn providerGenerationContent(outcome: inference.server.ProviderGenerationOutcome
 pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
     const response: *ProviderResponseState = @ptrCast(@alignCast(handle));
     const alloc = response.alloc;
-    alloc.free(response.json);
+    if (response.json) |json| alloc.free(json);
+    if (response.vectors) |vectors| {
+        for (vectors) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    if (response.rows) |rows| alloc.free(rows);
     alloc.destroy(response);
+}
+
+/// Takes ownership only on success. Native result rows are retained directly;
+/// the caller copies them once into its own admitted allocator before destroy.
+fn publishNumericProviderResponse(context: *const inference_bridge.ProviderInvokeContext, alloc: std.mem.Allocator, vectors: [][]f32, kind: @FieldType(inference_bridge.NumericResult, "kind")) !void {
+    const out = context.out_numeric_result orelse return error.InvalidInferenceNumericResult;
+    try checkProviderInvokeControls(context);
+    const rows = try alloc.alloc(inference_bridge.NumericRow, vectors.len);
+    errdefer alloc.free(rows);
+    for (vectors, rows) |vector, *row| row.* = .{ .values = vector.ptr, .len = vector.len };
+    const response = try alloc.create(ProviderResponseState);
+    response.* = .{ .alloc = alloc, .vectors = vectors, .rows = rows };
+    context.out_response_json.* = inference_bridge.String.init("");
+    out.* = .{ .kind = kind, .rows = rows.ptr, .len = rows.len };
+    context.out_response_handle.* = response;
+}
+
+test "standalone raster embedding control rejects cancellation before model resolution" {
+    var node: inference.server.Node = undefined;
+    node.hard_cancellation_watchdog = null;
+    const Canceled = struct {
+        fn requested(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, node.embedDenseRastersDirectWithExecutionControl(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .cancellation = .{ .is_cancelled_fn = Canceled.requested } },
+        "must-not-be-resolved",
+        &.{},
+    ));
+    try std.testing.expectError(error.Timeout, node.embedDenseRastersDirectWithContext(
+        std.testing.allocator,
+        std.testing.io,
+        0,
+        "must-not-be-resolved",
+        &.{},
+    ));
+}
+
+test "standalone numeric result ABI retains native rows until response destruction" {
+    const alloc = std.testing.allocator;
+    const vectors = try alloc.alloc([]f32, 2);
+    vectors[0] = try alloc.dupe(f32, &.{ 0.25, 0.5 });
+    vectors[1] = try alloc.dupe(f32, &.{-0.125});
+    var response: ?*anyopaque = null;
+    var json: inference_bridge.String = undefined;
+    var numeric = inference_bridge.NumericResult{};
+    const context = inference_bridge.ProviderInvokeContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = undefined,
+        .operation = @intFromEnum(inference_bridge.ProviderOperation.embed_dense_rasters),
+        .request_json = inference_bridge.String.init("{}"),
+        .deadline_ns = 0,
+        .has_deadline = 0,
+        .out_response_handle = &response,
+        .out_response_json = &json,
+        .out_numeric_result = &numeric,
+    };
+    try publishNumericProviderResponse(&context, alloc, vectors, .dense_vectors);
+    try std.testing.expectEqual(@as(usize, 0), json.slice().len);
+    try std.testing.expect(numeric.rows.?[0].values.? == vectors[0].ptr);
+    const copied = try numeric.copyRows(alloc);
+    defer {
+        for (copied) |row| alloc.free(row);
+        alloc.free(copied);
+    }
+    try std.testing.expect(copied[0].ptr != vectors[0].ptr);
+    linkedInferenceDestroyProviderResponse(response.?);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, copied[0]);
+    try std.testing.expectEqualSlices(f32, &.{-0.125}, copied[1]);
+    const invalid_row = inference_bridge.NumericRow{ .values = null, .len = 1 };
+    try std.testing.expectError(error.InvalidInferenceNumericResult, (inference_bridge.NumericResult{ .kind = .scores, .rows = @ptrCast(&invalid_row), .len = 1 }).copyRows(alloc));
 }
 
 pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {

@@ -5881,9 +5881,21 @@ pub const Node = struct {
         model_name: []const u8,
         rasters: []const readers_api.RasterImage,
     ) ![][]f32 {
+        return self.embedDenseRastersDirectWithExecutionControl(allocator, io, .{ .deadline_ns = deadline_ns }, model_name, rasters);
+    }
+
+    pub fn embedDenseRastersDirectWithExecutionControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        rasters: []const readers_api.RasterImage,
+    ) ![][]f32 {
+        const control = self.bindExecutionControl(io, supplied_control);
+        try control.check();
         if (rasters.len == 0) return try allocator.alloc([]f32, 0);
         if (rasters.len > executorMaxImages("embed")) return error.EmbeddingBatchTooLarge;
-        try ensureDirectEmbeddingDeadline(deadline_ns);
         const security = effectiveRequestContentSecurity(self);
         var raster_bytes: usize = 0;
         var decoded_pixels: u64 = 0;
@@ -5926,7 +5938,7 @@ pub const Node = struct {
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
-            deadline_ns: ?u64,
+            control: InferenceExecutionControl,
             rasters: []const readers_api.RasterImage,
             node: *Node,
             io: std.Io,
@@ -5934,31 +5946,35 @@ pub const Node = struct {
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                const control = attempt.node.bindExecutionControl(attempt.io, .{ .deadline_ns = attempt.deadline_ns });
-                if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, &.{}, attempt.rasters, control, .RETRIEVAL_DOCUMENT, null)) |vectors| {
+                const active = attempt.control;
+                if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, &.{}, attempt.rasters, active, .RETRIEVAL_DOCUMENT, null)) |vectors| {
                     attempt.vectors = vectors;
                     return;
                 }
                 var asset_lease = model.acquireEmbeddingAssetLease(false);
                 defer asset_lease.release();
-                try model.ensureEmbeddingAssets(false, true, false);
-                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
-                var pipeline = model.embeddingPipeline(attempt.allocator);
+                var pipeline = blk: {
+                    try model.lockEmbeddingAssetsWithControl(active);
+                    defer model.unlockEmbeddingAssets();
+                    try model.ensureEmbeddingAssetsLockedWithControl(false, true, false, active);
+                    break :blk model.embeddingPipelineLocked(attempt.allocator);
+                };
+                pipeline.execution_control = active;
                 const vectors = try pipeline.embedBorrowedRasters(attempt.rasters);
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
-                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                try active.check();
                 attempt.vectors = vectors;
             }
         };
         var attempt = Attempt{
             .allocator = allocator,
-            .deadline_ns = deadline_ns,
+            .control = control,
             .rasters = rasters,
             .node = self,
             .io = io,
         };
-        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
     }
 

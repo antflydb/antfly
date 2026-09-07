@@ -66,6 +66,7 @@ pub const DensePartInvocationMemoryFn = *const fn (
     embedding_name: []const u8,
     shape: DensePartInvocationShape,
     dims: u32,
+    capabilities: ?inference_work.InferenceCapabilities,
 ) anyerror!DensePartInvocationMemory;
 pub const DenseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) void;
 pub const EmbedSetCancellationFn = *const fn (ptr: *anyopaque, cancellation: CancellationToken) void;
@@ -102,6 +103,10 @@ pub const DenseEmbedder = struct {
     dense_embed_part_items_with_context_fn: ?DenseEmbedPartItemsWithContextFn = null,
     dense_embed_raster_items_with_context_fn: ?DenseEmbedRasterItemsWithContextFn = null,
     part_request_context: ?RequestContext = null,
+    /// Immutable coordinator-resolved facts, shared by admission and execution.
+    part_capabilities: ?inference_work.InferenceCapabilities = null,
+    capabilities_with_context_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!inference_work.InferenceCapabilities = null,
+    dense_embed_part_items_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.InferenceCapabilities) anyerror![]const []const f32 = null,
     dense_embed_with_context_fn: ?DenseEmbedWithContextFn = null,
     dense_embed_batch_with_context_fn: ?DenseEmbedBatchWithContextFn = null,
     dense_embed_parts_with_context_fn: ?DenseEmbedPartsWithContextFn = null,
@@ -202,10 +207,20 @@ pub const DenseEmbedder = struct {
 
     pub fn capabilities(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
         const capabilities_fn = self.capabilities_fn orelse return error.EmbeddingCapabilitiesUnavailable;
-        const result = try capabilities_fn(self.ptr, alloc, embedding_name);
+        const result = if (self.part_request_context) |context| blk: {
+            try context.check();
+            const controlled = self.capabilities_with_context_fn orelse return error.UncancellableInferenceProvider;
+            break :blk try controlled(self.ptr, alloc, embedding_name, context);
+        } else try capabilities_fn(self.ptr, alloc, embedding_name);
         try result.validate();
         if (result.task != .embed) return error.InvalidInferenceCapabilities;
         return result;
+    }
+
+    pub fn withPartCapabilities(self: DenseEmbedder, resolved: inference_work.InferenceCapabilities) DenseEmbedder {
+        var planned = self;
+        planned.part_capabilities = resolved;
+        return planned;
     }
 
     /// Return the concrete route's complete non-media peak and attachment
@@ -220,7 +235,7 @@ pub const DenseEmbedder = struct {
     ) !DensePartInvocationMemory {
         const memory_fn = self.part_invocation_memory_fn orelse
             return error.InferenceInvocationMemoryUnavailable;
-        const plan = try memory_fn(self.ptr, embedding_name, shape, dims);
+        const plan = try memory_fn(self.ptr, embedding_name, shape, dims, self.part_capabilities);
         try plan.validate();
         return plan;
     }
@@ -271,7 +286,11 @@ pub const DenseEmbedder = struct {
         dims: u32,
     ) ![]const []const f32 {
         const embed_items = self.dense_embed_part_items_fn orelse return error.UnsupportedEmbeddingProvider;
-        const invocation_plan = try self.partInvocationMemory(
+        if (self.part_request_context) |context| try context.check();
+        var planned = self;
+        if (planned.part_capabilities == null and self.capabilities_fn != null)
+            planned.part_capabilities = try self.capabilities(alloc, embedding_name);
+        const invocation_plan = try planned.partInvocationMemory(
             embedding_name,
             try densePartInvocationShape(items),
             dims,
@@ -301,7 +320,9 @@ pub const DenseEmbedder = struct {
         };
         defer sanitized.deinit(invocation_alloc);
         const safe_items = sanitized.partsSlice();
-        const vectors = (if (self.part_request_context) |context| blk: {
+        const vectors = (if (self.dense_embed_part_items_planned_fn) |call|
+            call(self.ptr, invocation_alloc, embedding_name, safe_items, dims, self.part_request_context, planned.part_capabilities orelse return error.EmbeddingCapabilitiesUnavailable)
+        else if (self.part_request_context) |context| blk: {
             try context.check();
             const call = self.dense_embed_part_items_with_context_fn orelse return error.UncancellableInferenceProvider;
             break :blk call(self.ptr, invocation_alloc, embedding_name, safe_items, dims, context);
@@ -1117,7 +1138,7 @@ test "media part item embedding enforces its result contract" {
             return out;
         }
 
-        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32) !DensePartInvocationMemory {
+        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32, _: ?inference_work.InferenceCapabilities) !DensePartInvocationMemory {
             return .{
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 64,
@@ -1170,7 +1191,7 @@ test "media part item embedding validates each vector shape and values" {
             return out;
         }
 
-        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32) !DensePartInvocationMemory {
+        fn memory(_: *anyopaque, _: []const u8, _: DensePartInvocationShape, _: u32, _: ?inference_work.InferenceCapabilities) !DensePartInvocationMemory {
             return .{
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 256,
@@ -1223,7 +1244,7 @@ test "media part item embedding bounds boundary allocations under executor admis
             return out;
         }
 
-        fn memory(_: *anyopaque, _: []const u8, shape: DensePartInvocationShape, dims: u32) !DensePartInvocationMemory {
+        fn memory(_: *anyopaque, _: []const u8, shape: DensePartInvocationShape, dims: u32, _: ?inference_work.InferenceCapabilities) !DensePartInvocationMemory {
             const per_item = @as(usize, dims) * @sizeOf(f32);
             return .{
                 .attachment_transport = .borrowed_binary,

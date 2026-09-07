@@ -362,6 +362,8 @@ pub const AntflyProvider = struct {
         rasters: []const antfly_image.BorrowedRasterAttachment,
         context: EmbeddingRequestContext,
     ) anyerror![][]f32 = null,
+    /// Dense and raster responses use the owned numeric-row ABI, not JSON.
+    typed_dense_results: bool = false,
 };
 
 pub const ClassificationRequest = struct {
@@ -1189,6 +1191,8 @@ pub const ManagedEmbedder = struct {
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
             .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
+            .dense_embed_part_items_planned_fn = embedDensePartItemsPlanned,
+            .capabilities_with_context_fn = denseCapabilitiesWithContext,
             .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
             .dense_embed_with_context_fn = embedDenseWithContext,
             .dense_embed_batch_with_context_fn = embedDenseBatchWithContext,
@@ -1512,7 +1516,7 @@ pub const ManagedEmbedder = struct {
         items: []const template_mod.ContentPart,
         dims: u32,
     ) ![]const []const f32 {
-        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, null);
+        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, null, null);
     }
 
     fn embedDensePartItemsWithContext(
@@ -1523,7 +1527,11 @@ pub const ManagedEmbedder = struct {
         dims: u32,
         context: RequestContext,
     ) ![]const []const f32 {
-        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, context);
+        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, context, null);
+    }
+
+    fn embedDensePartItemsPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, items: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, capabilities: inference_work.InferenceCapabilities) ![]const []const f32 {
+        return embedDensePartItemsControlled(ptr, alloc, name, items, dims, context, capabilities);
     }
 
     fn embedDensePartItemsControlled(
@@ -1533,6 +1541,7 @@ pub const ManagedEmbedder = struct {
         items: []const template_mod.ContentPart,
         dims: u32,
         context: ?RequestContext,
+        resolved_capabilities: ?inference_work.InferenceCapabilities,
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
@@ -1547,7 +1556,7 @@ pub const ManagedEmbedder = struct {
         }
         const entry = &local_entry;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
-        const capabilities = try denseCapabilitiesForEntry(entry, alloc);
+        const capabilities = resolved_capabilities orelse try denseCapabilitiesForEntry(entry, alloc);
         const attachment_transport: inference_work.AttachmentTransport = if (entry.antfly_provider != null)
             .borrowed_binary
         else if (entry.provider == .antfly and capabilities.framed_attachments)
@@ -1678,6 +1687,7 @@ pub const ManagedEmbedder = struct {
         embedding_name: []const u8,
         shape: db_embedder.DensePartInvocationShape,
         dims: u32,
+        resolved_capabilities: ?inference_work.InferenceCapabilities,
     ) !db_embedder.DensePartInvocationMemory {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
@@ -1685,7 +1695,7 @@ pub const ManagedEmbedder = struct {
         const attachment_transport: inference_work.AttachmentTransport = if (local != null)
             .borrowed_binary
         else if (entry.provider == .antfly and
-            (try denseCapabilities(ptr, self.alloc, embedding_name)).framed_attachments)
+            (resolved_capabilities orelse return error.EmbeddingCapabilitiesUnavailable).framed_attachments)
             .framed_binary
         else
             .base64_payload;
@@ -1719,7 +1729,7 @@ pub const ManagedEmbedder = struct {
         // allocations until parsing finishes. Reserve a conservative complete
         // response/parser peak in addition to the expected parsed/final vector
         // copies. A bounded allowance covers URL/header/TLS/client control.
-        const response_and_parser = std.math.mul(
+        const response_and_parser = if (local != null and local.?.typed_dense_results) 0 else std.math.mul(
             usize,
             remote_embedding_max_response_bytes,
             remote_embedding_response_resident_multiplier,
@@ -1763,6 +1773,19 @@ pub const ManagedEmbedder = struct {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         return denseCapabilitiesForEntry(entry, alloc);
+    }
+
+    fn denseCapabilitiesWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: RequestContext) !inference_work.InferenceCapabilities {
+        try context.check();
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        var entry = configured.requestOverlay();
+        entry.alloc = alloc;
+        entry.auth_header_cache = .{};
+        defer entry.auth_header_cache.deinit(alloc);
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        applyRequestContext(&entry, context, &cancellation);
+        return denseCapabilitiesForEntry(&entry, alloc);
     }
 
     fn denseCapabilitiesForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.InferenceCapabilities {
@@ -6939,6 +6962,40 @@ const TestLocalDenseProvider = struct {
     }
 };
 
+test "managed embedder media planning is pure and typed results avoid JSON reservations" {
+    const alloc = std.testing.allocator;
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var entry = [_]ManagedEmbeddingEntry{.{
+        .alloc = alloc,
+        .index_name = @constCast("visual"),
+        .provider = .antfly,
+        .model = @constCast("clipclap"),
+        .base_url = @constCast("http://unreachable.invalid"),
+        .dimensions = 384,
+    }};
+    // No HTTP executor, cache, or discovery allocator exists. Memory planning
+    // is arithmetic over the coordinator's immutable capability snapshot.
+    var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entry };
+    const caps = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .image = true },
+        .input_granularity = .page,
+        .output = .embedding,
+        .framed_attachments = true,
+    };
+    const shape = db_embedder.DensePartInvocationShape{ .item_count = 4 };
+    const remote = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
+    try std.testing.expectEqual(inference_work.AttachmentTransport.framed_binary, remote.attachment_transport);
+    try std.testing.expectError(error.EmbeddingCapabilitiesUnavailable, ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, null));
+    entry[0].antfly_provider = local.provider();
+    const json = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
+    entry[0].antfly_provider.?.typed_dense_results = true;
+    const typed = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
+    try std.testing.expectEqual(@as(usize, 32 << 20), json.allocator_limit_bytes - typed.allocator_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 4 * 384 * @sizeOf(f32)), typed.max_result_bytes);
+    try std.testing.expect(typed.allocator_limit_bytes < 64 * 1024);
+}
+
 test "managed embedder parses local antfly and antfly entries from indexes metadata" {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
@@ -7493,8 +7550,8 @@ pub fn testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder() !void {
     try std.testing.expectEqualStrings("direct-model", colliding.findQueryEntry("shared_name").?.model);
     try std.testing.expectEqualStrings("artifact-model", colliding.findArtifactEntry("shared_name").?.model);
     try std.testing.expectEqual(@as(?usize, 1), ManagedEmbedder.denseMediaPartLimit(&colliding, "shared_name"));
-    const colliding_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "shared_name", .{ .item_count = 1 }, 384);
-    const reference_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "reference_artifact", .{ .item_count = 1 }, 384);
+    const colliding_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "shared_name", .{ .item_count = 1 }, 384, null);
+    const reference_plan = try ManagedEmbedder.densePartInvocationMemory(&colliding, "reference_artifact", .{ .item_count = 1 }, 384, null);
     try std.testing.expectEqual(reference_plan, colliding_plan);
 
     // Public query aliases outrank every legacy artifact name globally, not
@@ -8918,6 +8975,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     const Local = struct {
         saw_parts: bool = false,
         response_count: usize = 1,
+        capability_calls: usize = 0,
 
         fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.TestUnexpectedResult;
@@ -8927,7 +8985,9 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             return try alloc.alloc(db_embedder.SparseEmbedding, 0);
         }
 
-        fn capabilities(_: *anyopaque, _: std.mem.Allocator, model: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+        fn capabilities(raw: *anyopaque, _: std.mem.Allocator, model: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.capability_calls += 1;
             try std.testing.expectEqualStrings("local-model", model);
             try std.testing.expectEqual(inference_work.Task.embed, task);
             return .{
@@ -8999,12 +9059,24 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expect(local.saw_parts);
 
     local.response_count = parts.len;
+    const discoveries_before = local.capability_calls;
     const page_vectors = try dense_interface.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3);
     defer db_embedder.freeDenseEmbeddingBatch(std.testing.allocator, page_vectors);
     try std.testing.expectEqual(@as(usize, 3), page_vectors.len);
     for (page_vectors) |page_vector| {
         try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, page_vector);
     }
+    try std.testing.expectEqual(discoveries_before + 1, local.capability_calls);
+    const resolved = try dense_interface.capabilities(std.testing.allocator, "semantic_idx");
+    const discoveries_after_planning = local.capability_calls;
+    var planned = dense_interface.withPartCapabilities(resolved);
+    planned.part_request_context = .{ .io = std.testing.io, .deadline_ns = null };
+    const planned_vectors = try planned.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3);
+    defer db_embedder.freeDenseEmbeddingBatch(std.testing.allocator, planned_vectors);
+    try std.testing.expectEqual(discoveries_after_planning, local.capability_calls);
+    planned.part_request_context.?.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, planned.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3));
+    try std.testing.expectEqual(discoveries_after_planning, local.capability_calls);
 
     local.response_count = 0;
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));

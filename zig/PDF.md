@@ -250,8 +250,12 @@ admits every codec peak before launching a wave, joins it, then releases unused
 scratch credit. A narrow byte grant reduces concurrency without reducing image
 quality. There is no additional encoder pool.
 
-Context-aware embedding peers may run concurrently with text consumers of the
-same window. At most four embedding invocations are retained, further bounded
+Context-aware embedding peers may run concurrently with the window owner's
+OCR or embedding invocation, as well as later text consumers. A structured
+window group returns pending work to the owner instead of joining inside the
+fan-out callback. The owner joins before releasing or transferring away any
+borrowed media; rejected pages and early exits cancel and join first. At most
+four embedding invocations are retained, further bounded
 by the lazy inference lane and jointly admitted memory. Each job owns its
 allocator, cancellation/deadline, descriptors and result; image bytes remain
 borrowed. Embedding jobs launch before text consumers, independent of their
@@ -3358,6 +3362,39 @@ The hardening above follows these long-term rules:
     remains coordinator-owned. Regressions cover lane use, credit release,
     independent typed output, and embedding/OCR overlap; hardware throughput
     qualification remains separate.
+152. **Implemented after invocation-plan review:** media memory planning is
+    pure arithmetic over a coordinator-resolved capability snapshot. The same
+    snapshot reaches encoded-image execution, avoiding an uncontrolled second
+    discovery from a shared-window worker's planning callback. Unplanned calls
+    resolve with their invocation allocator and request cancellation/deadline.
+    Distributed execution still validates its route lease under that context;
+    stale routes fail/replan rather than silently weaken provider constraints.
+153. **Implemented after execution-control review:** encoded and raster reader
+    preprocessing use the shared execution-control-to-image-work adapter,
+    including serial fallback paths. Local raster embedding forwards the full
+    control through the archive bridge, model loading/recovery, asset locking,
+    preprocessing, and inference, whether or not the model qualifies for the
+    image microbatch broker. Synchronous codec scopes restore prior thread-local
+    control before any asynchronous work.
+154. **Implemented after local-result transport review:** internal inference
+    ABI v25 supports task-typed numeric rows for dense text/page embeddings and
+    reranker scores. The inference host retains its native float buffers until
+    the response destructor; the caller copies once into its own admitted
+    allocator. Kind, pointer/length, finite-value, and existing task cardinality
+    checks remain enforced. No local float-to-JSON-to-float round-trip is needed.
+    Providers advertising this contract reserve dimension-derived vectors and
+    row/request metadata, removing the fixed 32 MiB response/parser allowance
+    per invocation. JSON providers and distributed responses retain their
+    conservative bounded response/parser contract; shrinking those limits also
+    requires bounding discovery and response parsing, not just vector bytes.
+155. **Implemented after owner-overlap review:** shared-window work has an
+    explicit begin/join lifetime spanning the owner's inference. The common
+    OCR-owner plus one embedding-consumer case can overlap without a third
+    producer. Speculative rendering may run alongside this group only under
+    the existing joint memory admission. Tests cover two-consumer progress,
+    borrowed-pointer identity, cancellation/join, and resource-credit release.
+    Hardware throughput and peak-RSS qualification remain separate from these
+    deterministic scheduling regressions.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

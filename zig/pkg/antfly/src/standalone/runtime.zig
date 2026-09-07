@@ -5017,6 +5017,7 @@ fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfl
     return .{
         .ptr = lifetime,
         .owns_invocation_admission = true,
+        .typed_dense_results = true,
         .embed_dense_texts = inferenceProviderEmbedDenseTexts,
         .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
         .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
@@ -5132,6 +5133,7 @@ fn invokeInferenceProviderWithBinaryContext(
     defer alloc.free(request_json);
     var response_handle: ?*anyopaque = null;
     var response_json: inference_bridge.String = undefined;
+    var numeric_result = inference_bridge.NumericResult{};
     const effective_deadline_ns = if (request_context) |active|
         active.deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min
     else
@@ -5168,6 +5170,7 @@ fn invokeInferenceProviderWithBinaryContext(
         .has_deadline = 1,
         .out_response_handle = &response_handle,
         .out_response_json = &response_json,
+        .out_numeric_result = if (Result == [][]f32 or Result == []f32) &numeric_result else null,
         .binary_payloads = if (binary_payloads.len > 0) binary_payloads.ptr else null,
         .binary_payloads_len = binary_payloads.len,
         .attachment_refs = if (attachment_refs.len > 0) attachment_refs.ptr else null,
@@ -5195,6 +5198,19 @@ fn invokeInferenceProviderWithBinaryContext(
     else
         linkedInferenceApiInfallible().destroy_provider_response(owned_response);
     if (request_context) |active| try active.check();
+    if (comptime Result == [][]f32 or Result == []f32) {
+        if (numeric_result.kind != .absent) {
+            if (comptime Result == [][]f32) {
+                if (numeric_result.kind != .dense_vectors) return error.InvalidInferenceNumericResult;
+                return numeric_result.copyRows(alloc);
+            } else {
+                if (numeric_result.kind != .scores or numeric_result.len != 1) return error.InvalidInferenceNumericResult;
+                const rows = try numeric_result.copyRows(alloc);
+                defer alloc.free(rows);
+                return rows[0];
+            }
+        }
+    }
     return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
