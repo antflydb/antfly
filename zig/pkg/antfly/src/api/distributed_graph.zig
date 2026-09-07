@@ -120,6 +120,7 @@ pub const WorkCostPort = struct {
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Absolute deadline in the worker's fanout clock (native when absent).
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
@@ -278,6 +279,14 @@ pub const Worker = struct {
         return platform_time.monotonicNs();
     }
 
+    fn budget(self: Worker) table_catalog.RoutingBudget {
+        return .initIo(self.execution_deadline_ns, self.fanoutIo());
+    }
+
+    fn routingDeadline(self: Worker, catalog: table_catalog.CatalogSource) ?u64 {
+        return catalog.deadlineFrom(self.budget());
+    }
+
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
@@ -296,6 +305,39 @@ pub const Worker = struct {
         return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
     }
 };
+
+test "distributed graph translates native worker and catalog deadline boundaries" {
+    const Runtime = struct {
+        fn io(ptr: *anyopaque) ?std.Io {
+            return @as(*@import("vopr").vopr_io.VoprIo, @ptrCast(@alignCast(ptr))).io();
+        }
+    };
+    var runtime = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer runtime.deinit();
+    var worker = Worker{ .ptr = &runtime, .vtable = &.{
+        .execute_graph_expand = undefined,
+        .execute_graph_hydrate = undefined,
+        .fanout_io = Runtime.io,
+    } };
+    worker.execution_deadline_ns = worker.budget().deadlineFrom(.init(platform_time.monotonicNs() + std.time.ns_per_s));
+    try worker.ensureActive();
+    var catalog_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+    defer catalog_io.deinit();
+    const catalog = table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io.io()),
+    };
+    const routed_deadline = worker.routingDeadline(catalog).?;
+    try std.testing.expect(routed_deadline > 17 * std.time.ns_per_s);
+    try std.testing.expect(routed_deadline <= 18 * std.time.ns_per_s);
+    try catalog.budget(routed_deadline).checkpoint();
+    runtime.monotonic_ns += std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, worker.ensureActive());
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(worker.routingDeadline(catalog)).checkpoint());
+}
 
 pub const IncomingSourceGroupsRequest = struct {
     index_name: []const u8,
@@ -2079,7 +2121,7 @@ fn executeCrossRangeWithMatchAnchorsLifecycle(
     };
 
     var request_worker = worker;
-    request_worker.execution_deadline_ns = req.execution_deadline_ns;
+    request_worker.execution_deadline_ns = worker.budget().deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
     if (emit_source_snapshot) request_worker.reachLifecycle(.{
@@ -2121,9 +2163,9 @@ fn executeCrossRangeOnce(
     // existing range + generation checks below to validate an unstamped
     // standalone catalog without weakening cross-shard snapshot fencing.
     try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
-    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.execution_deadline_ns);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.routingDeadline(catalog));
     if (match_anchor_source) |source| switch (source) {
-        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.execution_deadline_ns),
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.routingDeadline(catalog)),
         .paged => {},
     };
     worker.reachLifecycle(.{
@@ -2509,9 +2551,9 @@ const GraphNodeAdmissionContext = struct {
                 db_mod.types.GraphTableReadAuthorization{ .allowed = true };
             defer authorization.deinit(self.alloc);
             const exists = authorization.allowed and
-                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns);
+                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog));
             topology_epoch = if (exists)
-                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns)
+                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog))
             else
                 0;
             allowed = exists;
@@ -2888,7 +2930,7 @@ fn executeSingleCrossRange(
     request_work_budget: *graph_pattern_mod.WorkBudget,
     request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
-    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.execution_deadline_ns);
+    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.routingDeadline(catalog));
     const admission_req = graphNodeAdmissionRequest(req, graph_query);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
@@ -3067,7 +3109,7 @@ const DistributedEdgeReader = struct {
             table_name,
             key,
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         )) orelse return error.TableNotFound;
 
         // Outgoing adjacency is colocated with its source and needs one routed
@@ -3106,7 +3148,7 @@ const DistributedEdgeReader = struct {
             "",
             "",
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         );
         defer if (group_ids.len > 0) a.free(group_ids);
         if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
@@ -3762,7 +3804,7 @@ fn executeDistributedConjunctivePattern(
             edge_reader.catalog,
             edge_reader.source_table,
             page,
-            edge_reader.worker.execution_deadline_ns,
+            edge_reader.worker.routingDeadline(edge_reader.catalog),
         );
         try validateMatchingSourceSnapshots(base_result, page);
         try validateMatchAnchorPageOrder(cursor_key, page.hits);
@@ -5352,7 +5394,7 @@ fn findDistributedShortestPath(
             expansion_table,
             item.key,
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
@@ -5521,7 +5563,7 @@ fn batchFrontierByGroup(
                     table_name,
                     item.key,
                     table_state.topology_epoch,
-                    worker.execution_deadline_ns,
+                    worker.routingDeadline(catalog),
                 )) orelse return error.TableNotFound;
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
@@ -5535,7 +5577,7 @@ fn batchFrontierByGroup(
                         table_name,
                         item.key,
                         table_state.topology_epoch,
-                        worker.execution_deadline_ns,
+                        worker.routingDeadline(catalog),
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
@@ -5561,7 +5603,7 @@ fn batchFrontierByGroup(
             "",
             "",
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         );
         defer if (group_ids.len > 0) alloc.free(group_ids);
         if (group_ids.len == 0) return error.TableNotFound;
@@ -6930,7 +6972,7 @@ fn hydrateHitsForKeys(
             table_name,
             key,
             topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const batch = try batches.getOrPut(alloc, group_id);
         if (!batch.found_existing) batch.value_ptr.* = .empty;
@@ -7134,7 +7176,7 @@ pub fn probeIncomingEdgesForKeys(
         "",
         "",
         topology_epoch,
-        worker.execution_deadline_ns,
+        worker.routingDeadline(catalog),
     );
     defer if (group_ids.len > 0) alloc.free(group_ids);
     if (group_ids.len == 0) return error.TableNotFound;

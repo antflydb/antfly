@@ -28,6 +28,7 @@ const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
+const table_catalog = @import("table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
 const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -125,6 +126,7 @@ pub const LifecycleHook = struct {
 pub const JoinContext = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Absolute deadline in monotonicNowNs(), not the native query clock.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
@@ -148,10 +150,27 @@ pub const JoinContext = struct {
         ensure_foreign_registry: *const fn (*anyopaque) anyerror!*const foreign_mod.Registry,
     };
 
-    pub fn withExecutionDeadline(self: JoinContext, deadline_ns: ?u64) JoinContext {
+    pub fn withNativeExecutionDeadline(self: JoinContext, deadline_ns: ?u64) JoinContext {
+        return self.withDeadlineFrom(.{ .deadline_ns = deadline_ns });
+    }
+
+    pub fn withDeadlineFrom(self: JoinContext, source: table_catalog.RoutingBudget) JoinContext {
         var out = self;
-        out.execution_deadline_ns = deadline_ns;
+        out.execution_deadline_ns = if (source.deadline_ns) |deadline| blk: {
+            if (self.vtable.monotonic_now_ns == null and source.io == null) break :blk deadline;
+            const target_now = self.monotonicNowNs();
+            break :blk target_now +| (deadline -| source.nowNs());
+        } else null;
         return out;
+    }
+
+    /// Query, foreign-source, and CPU-side callbacks retain native deadlines.
+    /// Sample the destination first so crossing the boundary cannot add time.
+    pub fn nativeExecutionDeadline(self: JoinContext) ?u64 {
+        const deadline = self.execution_deadline_ns orelse return null;
+        if (self.vtable.monotonic_now_ns == null) return deadline;
+        const native_now = platform_time.monotonicNs();
+        return native_now +| (deadline -| self.monotonicNowNs());
     }
 
     pub fn withCancellation(self: JoinContext, cancellation: ?CancellationToken) JoinContext {
@@ -235,7 +254,7 @@ pub const JoinContext = struct {
             table_name,
             body,
             row_filter_json,
-            self.execution_deadline_ns,
+            self.nativeExecutionDeadline(),
             self.cancellation,
         );
     }
@@ -248,7 +267,7 @@ pub const JoinContext = struct {
             table_name,
             body,
             row_filter_json,
-            self.execution_deadline_ns,
+            self.nativeExecutionDeadline(),
             self.cancellation,
         );
     }
@@ -259,7 +278,7 @@ pub const JoinContext = struct {
             alloc,
             table_name,
             query_value,
-            self.execution_deadline_ns,
+            self.nativeExecutionDeadline(),
             self.cancellation,
         );
     }
@@ -2808,7 +2827,7 @@ pub fn executeForeignRightJoinQuery(
         .limit = if (join.right_filters) |filters| filters.limit else null,
     });
     defer params.deinit(alloc);
-    params.execution_deadline_ns = ctx.execution_deadline_ns;
+    params.execution_deadline_ns = ctx.nativeExecutionDeadline();
     params.cancellation = ctx.cancellation;
 
     const source_config = try foreign_source.toSourceConfig(alloc);
@@ -2825,11 +2844,11 @@ pub fn executeForeignRightJoinQuery(
     }
 
     var left_equality_index: ?EqualityJoinIndex = if (join.join_type != .right and join.operator == .eq and left_hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns, ctx.cancellation)
+        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.nativeExecutionDeadline(), ctx.cancellation)
     else
         null;
     defer if (left_equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.nativeExecutionDeadline(), .cancellation = ctx.cancellation };
     for (result.rows) |row| {
         try deadline_poller.poll();
         if (row != .object) return error.UnsupportedQueryRequest;
@@ -4349,11 +4368,11 @@ fn applyNestedJoinToRightHits(
     defer nested_result.deinit(alloc);
 
     var equality_index: ?EqualityJoinIndex = if (nested_join.operator == .eq and nested_result.hits.len >= 16)
-        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns, ctx.cancellation)
+        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.nativeExecutionDeadline(), ctx.cancellation)
     else
         null;
     defer if (equality_index) |*index| index.deinit(alloc);
-    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns, .cancellation = ctx.cancellation };
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.nativeExecutionDeadline(), .cancellation = ctx.cancellation };
     for (right_hits) |*hit| {
         try deadline_poller.poll();
         const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
@@ -4361,9 +4380,9 @@ fn applyNestedJoinToRightHits(
             if (EqualityJoinIndex.supports(left_value))
                 if (index.lookupIndex(left_value)) |match_index| nested_result.hits[match_index] else null
             else
-                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation)
+                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.nativeExecutionDeadline(), ctx.cancellation)
         else
-            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns, ctx.cancellation);
+            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.nativeExecutionDeadline(), ctx.cancellation);
         const effective_matched_right = matched_right orelse continue;
         const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
         if (source_value.* != .object) return error.InvalidQueryRequest;
@@ -4383,7 +4402,7 @@ fn estimateForeignJoinTableStats(
     var source = registry.create(alloc, source_config) catch return null;
     defer source.deinit(alloc);
 
-    const stats = source.statisticsWithDeadline(foreign_source.postgres_table, ctx.execution_deadline_ns) catch |err| switch (err) {
+    const stats = source.statisticsWithDeadline(foreign_source.postgres_table, ctx.nativeExecutionDeadline()) catch |err| switch (err) {
         error.Timeout => return error.Timeout,
         else => return null,
     };
@@ -5147,7 +5166,7 @@ pub fn applyJoinedRightHitsToResponseWithContext(
     appended_left_field: bool,
 ) !JoinedQueryStats {
     return try applyJoinedRightHitsToResponseWithDeadline(
-        ctx.execution_deadline_ns,
+        ctx.nativeExecutionDeadline(),
         ctx.cancellation,
         alloc,
         root,
@@ -5215,7 +5234,7 @@ fn mergeJoinedRightHitsAllocWithContext(
     appended_left_field: bool,
 ) !JoinedRightMergeResult {
     return try mergeJoinedRightHitsAllocWithDeadline(
-        ctx.execution_deadline_ns,
+        ctx.nativeExecutionDeadline(),
         ctx.cancellation,
         alloc,
         left_hits,
@@ -6007,6 +6026,67 @@ fn finiteScoreOrZero(score: f32) f64 {
     return if (std.math.isFinite(score)) score else 0;
 }
 
+test "distributed join translates native and borrowed deadline boundaries" {
+    const Clock = struct {
+        fn now(ptr: *anyopaque) u64 {
+            return @as(*u64, @ptrCast(@alignCast(ptr))).*;
+        }
+
+        fn checkNative(deadline: ?u64) !void {
+            const native_now = platform_time.monotonicNs();
+            try std.testing.expect(deadline.? > native_now);
+            try std.testing.expect(deadline.? <= native_now + std.time.ns_per_s);
+        }
+
+        fn plain(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, _: ?CancellationToken) !query_api.QueryResponse {
+            try checkNative(deadline);
+            return error.TestDeadlineForwarded;
+        }
+
+        fn dispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, deadline: ?u64, _: ?CancellationToken) ![]u8 {
+            try checkNative(deadline);
+            return error.TestDeadlineForwarded;
+        }
+
+        fn build(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, deadline: ?u64, _: ?CancellationToken) !query_api.OwnedQueryRequest {
+            try checkNative(deadline);
+            return error.TestDeadlineForwarded;
+        }
+    };
+    var now: u64 = platform_time.monotonicNs() + 1000 * std.time.ns_per_s;
+    const ctx = JoinContext{ .ptr = &now, .vtable = &.{
+        .admin_snapshot = undefined,
+        .free_admin_snapshot = undefined,
+        .execute_plain_query = Clock.plain,
+        .execute_query_dispatch = Clock.dispatch,
+        .build_owned_search_request = Clock.build,
+        .ensure_foreign_registry = undefined,
+        .monotonic_now_ns = Clock.now,
+    } };
+    const live = ctx.withNativeExecutionDeadline(platform_time.monotonicNs() + std.time.ns_per_s);
+    try live.ensureExecutionDeadline();
+    try std.testing.expect(live.execution_deadline_ns.? > now);
+    const native_before = platform_time.monotonicNs();
+    const native_deadline = live.nativeExecutionDeadline().?;
+    try std.testing.expect(native_deadline > native_before);
+    try std.testing.expect(native_deadline <= platform_time.monotonicNs() + std.time.ns_per_s);
+    const reads: table_reads.TableReadSource = undefined;
+    try std.testing.expectError(error.TestDeadlineForwarded, live.executePlainQuery(std.testing.allocator, reads, "docs", "{}", null));
+    try std.testing.expectError(error.TestDeadlineForwarded, live.executeQueryDispatch(std.testing.allocator, reads, "docs", "{}", null));
+    try std.testing.expectError(error.TestDeadlineForwarded, live.buildOwnedSearchRequest(std.testing.allocator, "docs", .null));
+    try std.testing.expectError(error.Timeout, ctx.withNativeExecutionDeadline(0).ensureExecutionDeadline());
+    try std.testing.expect(ctx.withNativeExecutionDeadline(null).execution_deadline_ns == null);
+    var source_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer source_io.deinit();
+    const borrowed = ctx.withDeadlineFrom(.initIo(8 * std.time.ns_per_s, source_io.io()));
+    try std.testing.expectEqual(now + std.time.ns_per_s, borrowed.execution_deadline_ns.?);
+    const limited = try borrowed.withRemainingExecutionBudgetMs(250);
+    try std.testing.expectEqual(@as(?u64, 250), try limited.remainingExecutionBudgetMs());
+    now += std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, borrowed.ensureExecutionDeadline());
+    try std.testing.expect(borrowed.nativeExecutionDeadline().? <= platform_time.monotonicNs());
+}
+
 test "distributed join context forwards one absolute deadline to every query callback" {
     const TestContext = struct {
         const expected_deadline_ns: u64 = 42;
@@ -6075,7 +6155,7 @@ test "distributed join context forwards one absolute deadline to every query cal
     const ctx = (JoinContext{
         .ptr = &state,
         .vtable = &TestContext.vtable,
-    }).withExecutionDeadline(TestContext.expected_deadline_ns);
+    }).withNativeExecutionDeadline(TestContext.expected_deadline_ns);
     const source: table_reads.TableReadSource = undefined;
 
     try std.testing.expectError(

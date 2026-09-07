@@ -3282,6 +3282,43 @@ pass. An intermediate broader run observed a post-restart exact-sort status
 assertion failure; its isolated rerun and the final broader run passed. This
 deadline fix does not claim to resolve that intermittent status observation.
 
+### Composed Query Deadline Follow-up (2026-09-07)
+
+The next production review reproduced the same native/borrowed clock mismatch
+beyond plain reads: three join E2Es, a multi-shard graph E2E, and a mock-provider
+semantic E2E all returned `query_timeout` with 1 s budgets while passing with
+30 s budgets. The earlier routing/HTTP fix alone did not close these paths.
+
+Join contexts now translate native and explicitly borrowed request deadlines
+into their coordinator clock. Query callbacks, foreign-source requests, and
+native CPU deadline pollers receive a translated native deadline on the way
+back out. Graph workers translate the native query deadline at ingress and
+translate again when a catalog has a different clock. Semantic planning
+translates the budget into the cache's clock while leaving the provider's
+native execution deadline unchanged. Cache TTLs and modeled waits remain on
+the borrowed executor. These are explicit boundaries, not a claim that native
+query callbacks are fully deterministic.
+
+Remote join partition, rows, unmatched, and finalize clients now classify HTTP
+504 as `Timeout`, just like 408; a worker's `DeadlineExceeded` must not become
+an unexpected-status/internal failure at the coordinator. The focused HTTP
+test root now explicitly discovers the join-client contract and the new
+clock-boundary tests. Permanent public deadline tests cover plain, join,
+graph, and semantic queries with valid short/long budgets and immediate expiry.
+
+Validation: the five focused clock/client contracts pass in Debug and
+ReleaseSafe, the table-read gate passes 77 tests, the broader HTTP runtime gate
+passes 114 tests with local listeners permitted, and the query-embedding-cache
+VOPR gate passes. The production rebuild and formatting checks pass. All 21
+selected deadline/join/graph/semantic E2Es pass, as do the five original
+review reproductions forced to use 1 s budgets.
+
+During regression development, a graph source document containing only
+`_edges` stalled a `full_index` batch with repeated `ReplayDocumentNotVisible`
+retries. The deadline regression uses an ordinary source document with a
+`title`, matching the existing graph scenario. That separate edges-only
+document observation is not repaired or claimed covered by this deadline fix.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

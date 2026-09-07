@@ -56,11 +56,10 @@ pub const Operations = struct {
     /// execution. `join_context` is process-scoped; cancellation and deadlines
     /// are request-scoped and must never be lost when crossing this boundary.
     fn requestJoinContext(context: distributed_join.JoinContext, request: operation.RequestContext) distributed_join.JoinContext {
-        const deadline_ns = if (context.execution_deadline_ns) |context_deadline|
-            if (request.deadline_ns) |request_deadline| @min(context_deadline, request_deadline) else context_deadline
-        else
-            request.deadline_ns;
-        var out = context.withExecutionDeadline(deadline_ns);
+        var out = context.withDeadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        if (context.execution_deadline_ns) |deadline| {
+            out.execution_deadline_ns = if (out.execution_deadline_ns) |converted| @min(deadline, converted) else deadline;
+        }
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null) {
             out = out.withCancellation(request.cancellation);
         }

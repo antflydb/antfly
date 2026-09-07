@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const cache_budget = @import("../common/cache_budget.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
 
@@ -149,6 +150,15 @@ pub const QueryEmbeddingCache = struct {
         self.* = undefined;
     }
 
+    /// Translate a query-engine deadline at the cache boundary. Cache TTLs,
+    /// coalesced waits, and modeled work all stay in this cache's own clock.
+    pub fn deadlineFromNative(self: *const QueryEmbeddingCache, deadline_ns: ?u64) ?u64 {
+        const deadline = deadline_ns orelse return null;
+        const target_now = self.nowNs();
+        return target_now +| (deadline -| platform_time.monotonicNs());
+    }
+
+    /// deadline_ns belongs to this cache's std.Io .awake clock.
     pub fn getOrCompute(
         self: *QueryEmbeddingCache,
         budget: *cache_budget.CacheBudget,
@@ -553,6 +563,27 @@ const TestCompute = struct {
         return result;
     }
 };
+
+test "query embedding cache translates native query deadlines" {
+    var io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer io.deinit();
+    var budget = cache_budget.CacheBudget.init(1024 * 1024);
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, io.io(), .{});
+    defer cache.deinit(&budget);
+    var compute = TestCompute{ .value = 4 };
+    const deadline = cache.deadlineFromNative(platform_time.monotonicNs() + std.time.ns_per_s);
+    const first = try cache.getOrCompute(&budget, std.testing.allocator, [_]u8{7} ** 32, deadline, &compute, TestCompute.run);
+    defer std.testing.allocator.free(first);
+    const hit = try cache.getOrCompute(&budget, std.testing.allocator, [_]u8{7} ** 32, deadline, &compute, TestCompute.run);
+    defer std.testing.allocator.free(hit);
+    try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
+    try std.testing.expectError(error.Timeout, cache.computeUncached(std.testing.allocator, cache.deadlineFromNative(0), &compute, TestCompute.run));
+    try std.testing.expect(cache.deadlineFromNative(null) == null);
+    io.monotonic_ns += std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, cache.getOrCompute(&budget, std.testing.allocator, [_]u8{7} ** 32, deadline, &compute, TestCompute.run));
+}
 
 pub fn testOwnedValuesAndHits() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);

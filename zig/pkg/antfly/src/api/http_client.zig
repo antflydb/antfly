@@ -1219,7 +1219,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            408 => return error.Timeout,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1267,7 +1267,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            408 => return error.Timeout,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1315,7 +1315,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            408 => return error.Timeout,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1466,7 +1466,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             404 => return error.UnknownGroup,
-            408 => return error.Timeout,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -4208,6 +4208,14 @@ test "api http client preserves exact-group join unavailability and absence" {
     try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.NotFound, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
+
+    for ([_]u16{ 408, 504 }) |status| {
+        executor.status = status;
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    }
 }
 
 test "api http client encodes table name for repair cancel callback" {

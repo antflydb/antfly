@@ -11343,7 +11343,7 @@ pub const ApiHttpServer = struct {
             if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
-            const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+            const join_ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
@@ -11689,7 +11689,7 @@ pub const ApiHttpServer = struct {
 
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        const ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+        const ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
