@@ -47,7 +47,7 @@ const ForwardControl = struct {
         switch (value.kind) {
             .progress => self.progress.update(value.phase, value.completed, value.total, value.model, value.backend),
             .stream_start => {
-                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status));
+                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status, .init(payload.body)));
                 self.stream_started = true;
             },
             .stream_write => {
@@ -570,9 +570,11 @@ const Child = struct {
         emit(request, .{ .kind = .progress, .phase = phase, .completed = completed, .total = total, .model = model.slice(), .backend = backend.slice() }) catch
             request.cancelled.store(true, .release);
     }
-    fn streamStart(raw: ?*anyopaque, status: u16) callconv(.c) http.CallbackStatus {
+    fn streamStart(raw: ?*anyopaque, status: u16, content_type: http.Bytes) callconv(.c) http.CallbackStatus {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
-        emit(request, .{ .kind = .stream_start, .status = status }) catch return .canceled;
+        // The start event's body carries the content type; subsequent chunks
+        // keep their existing envelope without an extra JSON field per event.
+        emitBody(request, .{ .kind = .stream_start, .status = status }, content_type.slice()) catch return .canceled;
         return .ok;
     }
     fn streamWrite(raw: ?*anyopaque, bytes: http.Bytes) callconv(.c) http.CallbackStatus {
@@ -692,6 +694,36 @@ pub fn runChild(alloc: std.mem.Allocator, io: std.Io) !void {
     defer child.endpoint.deinit();
     var lifetime: std.Io.Event = .unset;
     try lifetime.wait(io);
+}
+
+test "inference worker streaming events preserve content type and callback ABI" {
+    const Capture = struct {
+        status: u16 = 0,
+        bytes: [128]u8 = undefined,
+        len: usize = 0,
+        fn start(raw: ?*anyopaque, status: u16, content_type: http.Bytes) callconv(.c) http.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const value = content_type.slice();
+            if (value.len > self.bytes.len) return .failed;
+            @memcpy(self.bytes[0..value.len], value);
+            self.len = value.len;
+            self.status = status;
+            return .ok;
+        }
+    };
+    // Type-check the child side as well as exercising parent-side wire decode.
+    const child_sink: http.StreamSink = .{ .start = Child.streamStart };
+    try std.testing.expect(child_sink.start != null);
+    for ([_][]const u8{ "text/event-stream", "application/x-ndjson", "application/octet-stream" }) |content_type| {
+        var capture: Capture = .{};
+        var control: ForwardControl = .{ .alloc = std.testing.allocator, .cancellation = .{}, .stream = .{ .context = &capture, .start = Capture.start } };
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire.Event{ .kind = .stream_start, .status = 202 }, .{});
+        defer std.testing.allocator.free(encoded);
+        try ForwardControl.event(&control, .{ .metadata = encoded, .body = content_type });
+        try std.testing.expect(control.stream_started);
+        try std.testing.expectEqual(@as(u16, 202), capture.status);
+        try std.testing.expectEqualStrings(content_type, capture.bytes[0..capture.len]);
+    }
 }
 
 test "inference worker retains reservations until reaped cleanup and owns partial startup" {
