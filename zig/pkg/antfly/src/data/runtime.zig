@@ -1505,7 +1505,7 @@ const RaftTableApplyStateMachine = struct {
     };
 
     const ReadBarrierState = enum { pending, ready, retired, missing };
-    const read_barrier_context_prefix = "antfly-data-read:";
+    const read_barrier_context_prefix = "antfly-data-read-v2:";
     const max_read_barrier_waiters: usize = 4096;
 
     alloc: std.mem.Allocator,
@@ -1529,7 +1529,7 @@ const RaftTableApplyStateMachine = struct {
     // Raft read context, and wake together when either the quorum barrier or
     // local apply progress advances.
     read_barrier_waiters: std.AutoHashMapUnmanaged(u64, ReadBarrierWaiter) = .empty,
-    next_read_barrier_id: std.atomic.Value(u64) = .init(1),
+    next_read_barrier_id: u64 = 1,
     read_barrier_wake_epoch: std.atomic.Value(u32) = .init(0),
     read_barriers_started_total: std.atomic.Value(u64) = .init(0),
     read_barriers_completed_total: std.atomic.Value(u64) = .init(0),
@@ -1543,7 +1543,10 @@ const RaftTableApplyStateMachine = struct {
         replica_root_dir: []const u8,
         catalog: antfly.public_api.table_catalog.CatalogSource,
         backend_runtime: ?*backend_runtime_mod.BackendRuntime,
-    ) RaftTableApplyStateMachine {
+    ) !RaftTableApplyStateMachine {
+        const io = if (backend_runtime) |runtime| runtime.io() orelse return error.ConcurrencyUnavailable else std.Options.debug_io;
+        var incarnation: u128 = undefined;
+        try io.randomSecure(std.mem.asBytes(&incarnation));
         const write_source = antfly.public_api.ProvisionedTableWriteSource.initWithBackendRuntime(
             replica_root_dir,
             catalog,
@@ -1552,7 +1555,7 @@ const RaftTableApplyStateMachine = struct {
         return .{
             .alloc = alloc,
             .write_source = write_source,
-            .read_barriers = .init(alloc),
+            .read_barriers = .init(alloc, incarnation),
         };
     }
 
@@ -1610,9 +1613,11 @@ const RaftTableApplyStateMachine = struct {
     }
 
     fn registerReadBarrier(self: *RaftTableApplyStateMachine, group_id: u64) !u64 {
-        const request_id = self.next_read_barrier_id.fetchAdd(1, .monotonic);
         lockAtomic(&self.applied_mutex);
         defer self.applied_mutex.unlock();
+        if (self.next_read_barrier_id == 0) return error.AppliedReadIdentityExhausted;
+        const request_id = self.next_read_barrier_id;
+        self.next_read_barrier_id +%= 1;
         if (self.read_barrier_waiters.count() >= max_read_barrier_waiters)
             return error.ResourceBudgetExceeded;
         const result = try self.read_barrier_waiters.getOrPut(self.alloc, request_id);
@@ -1694,7 +1699,10 @@ const RaftTableApplyStateMachine = struct {
         for (read_states) |read_state| {
             if (!std.mem.startsWith(u8, read_state.request_ctx, read_barrier_context_prefix)) continue;
             const suffix = read_state.request_ctx[read_barrier_context_prefix.len..];
-            const request_id = std.fmt.parseUnsigned(u64, suffix, 10) catch continue;
+            if (suffix.len < 34 or suffix[32] != ':') continue;
+            const incarnation = std.fmt.parseUnsigned(u128, suffix[0..32], 16) catch continue;
+            if (incarnation != self.read_barriers.incarnation) continue;
+            const request_id = std.fmt.parseUnsigned(u64, suffix[33..], 10) catch continue;
             const waiter = self.read_barrier_waiters.getPtr(request_id) orelse continue;
             if (waiter.group_id != group_id or waiter.retired) continue;
             waiter.read_index = read_state.index;
@@ -8968,11 +8976,11 @@ pub const DataServer = struct {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const request_id = try apply_sm.registerReadBarrier(group_id);
         defer apply_sm.finishReadBarrier(request_id);
-        var request_ctx_buf: [64]u8 = undefined;
+        var request_ctx_buf: [96]u8 = undefined;
         const request_ctx = try std.fmt.bufPrint(
             &request_ctx_buf,
-            "{s}{d}",
-            .{ RaftTableApplyStateMachine.read_barrier_context_prefix, request_id },
+            "{s}{x:0>32}:{d}",
+            .{ RaftTableApplyStateMachine.read_barrier_context_prefix, apply_sm.read_barriers.incarnation, request_id },
         );
 
         lockAtomic(&self.data_raft_mutex);
@@ -18357,13 +18365,17 @@ pub const DataServer = struct {
                 data_raft_factory = try alloc.create(DataDescriptorFactory);
                 data_raft_factory.?.* = DataDescriptorFactory.init(alloc, data_raft_store.?);
 
-                data_raft_apply = try alloc.create(RaftTableApplyStateMachine);
-                data_raft_apply.?.* = RaftTableApplyStateMachine.init(
-                    alloc,
-                    cfg.replica_root_dir,
-                    remote_metadata.catalogSource(),
-                    raft_backend_runtime,
-                );
+                data_raft_apply = blk: {
+                    const apply_sm = try alloc.create(RaftTableApplyStateMachine);
+                    errdefer alloc.destroy(apply_sm);
+                    apply_sm.* = try RaftTableApplyStateMachine.init(
+                        alloc,
+                        cfg.replica_root_dir,
+                        remote_metadata.catalogSource(),
+                        raft_backend_runtime,
+                    );
+                    break :blk apply_sm;
+                };
 
                 const initialized_data_raft = blk: {
                     const raft = try alloc.create(antfly.raft.ManagedHttpHostService);
@@ -24529,7 +24541,7 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
 
 test "data raft read safety barrier completes only after matching ReadState apply" {
     const alloc = std.testing.allocator;
-    var apply_sm = RaftTableApplyStateMachine.init(
+    var apply_sm = try RaftTableApplyStateMachine.init(
         alloc,
         "/tmp/unused-antfly-read-safety-state",
         antfly.public_api.table_catalog.emptyCatalogSource(),
@@ -24584,6 +24596,35 @@ test "data raft read safety barrier completes only after matching ReadState appl
     );
     try std.testing.expect(canceled_deadline.token().isCancelled());
     try std.testing.expectEqual(error.Cancelled, canceled_deadline.classify(error.EnrichmentWaitCanceled));
+}
+
+test "data raft read safety barrier rejects pre-restart responses for both read paths" {
+    const alloc = std.testing.allocator;
+    var old = try RaftTableApplyStateMachine.init(alloc, "/tmp/unused-read-restart", antfly.public_api.table_catalog.emptyCatalogSource(), null);
+    var old_buffer: [96]u8 = undefined;
+    const old_read = try old.read_barriers.register(7, &old_buffer);
+    const old_txn = try old.registerReadBarrier(7);
+    var old_txn_buffer: [96]u8 = undefined;
+    const old_txn_context = try std.fmt.bufPrint(&old_txn_buffer, "{s}{x:0>32}:{d}", .{ RaftTableApplyStateMachine.read_barrier_context_prefix, old.read_barriers.incarnation, old_txn });
+    old.deinit();
+    var restarted = try RaftTableApplyStateMachine.init(alloc, "/tmp/unused-read-restart", antfly.public_api.table_catalog.emptyCatalogSource(), null);
+    defer restarted.deinit();
+    var new_buffer: [96]u8 = undefined;
+    const new_read = try restarted.read_barriers.register(7, &new_buffer);
+    const new_txn = try restarted.registerReadBarrier(7);
+    try std.testing.expectEqual(old_read.token, new_read.token);
+    try std.testing.expectEqual(old_txn, new_txn);
+    try restarted.publishAppliedReady(7, 0, &.{}, 10);
+    restarted.read_barriers.observeReadStates(7, &.{.{ .index = 10, .request_ctx = @constCast(old_read.request_ctx) }});
+    restarted.publishReadStates(7, &.{.{ .index = 10, .request_ctx = old_txn_context }});
+    try std.testing.expect(!restarted.read_barriers.takeCompleted(new_read.token));
+    try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.pending, restarted.readBarrierState(new_txn));
+    restarted.read_barriers.observeReadStates(7, &.{.{ .index = 10, .request_ctx = @constCast(new_read.request_ctx) }});
+    var new_txn_buffer: [96]u8 = undefined;
+    const new_txn_context = try std.fmt.bufPrint(&new_txn_buffer, "{s}{x:0>32}:{d}", .{ RaftTableApplyStateMachine.read_barrier_context_prefix, restarted.read_barriers.incarnation, new_txn });
+    restarted.publishReadStates(7, &.{.{ .index = 10, .request_ctx = new_txn_context }});
+    try std.testing.expect(restarted.read_barriers.takeCompleted(new_read.token));
+    try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.ready, restarted.readBarrierState(new_txn));
 }
 
 test "data raft bootstrap campaign retries leaderless voter elections" {
@@ -24745,7 +24786,7 @@ test "data runtime live writer source follows raft apply ownership" {
         &storage.write_cache_state_mutex,
     );
 
-    var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
+    var apply_sm = try RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
     defer apply_sm.deinit();
     apply_sm.attachProvisionedStorage(&storage);
     server.data_raft_apply = &apply_sm;
@@ -25027,7 +25068,7 @@ test "data raft retry checkpoints survive changed ready windows and publication 
 
     var storage = antfly.public_api.ProvisionedGroupStorage.init(alloc);
     defer storage.deinit();
-    var apply_sm = RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
+    var apply_sm = try RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
     defer apply_sm.deinit();
     apply_sm.attachProvisionedStorage(&storage);
 
@@ -25147,11 +25188,11 @@ test "data raft retry checkpoints survive changed ready windows and publication 
 
     const completed_barrier = try apply_sm.registerReadBarrier(group_id);
     defer apply_sm.finishReadBarrier(completed_barrier);
-    var completed_context_buf: [64]u8 = undefined;
+    var completed_context_buf: [96]u8 = undefined;
     const completed_context = try std.fmt.bufPrint(
         &completed_context_buf,
-        "{s}{d}",
-        .{ RaftTableApplyStateMachine.read_barrier_context_prefix, completed_barrier },
+        "{s}{x:0>32}:{d}",
+        .{ RaftTableApplyStateMachine.read_barrier_context_prefix, apply_sm.read_barriers.incarnation, completed_barrier },
     );
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &.{}, &.{.{
         .index = 5,
@@ -25266,7 +25307,7 @@ test "data raft replica retirement removes only retired group apply state" {
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
-    var apply_sm = RaftTableApplyStateMachine.init(alloc, "/tmp/unused-antfly-retire-group", Catalog.iface(), null);
+    var apply_sm = try RaftTableApplyStateMachine.init(alloc, "/tmp/unused-antfly-retire-group", Catalog.iface(), null);
     defer apply_sm.deinit();
     var data_sm = antfly.raft.state_machine.DataStateMachine{
         .alloc = alloc,
@@ -25383,7 +25424,7 @@ test "data raft apply records transaction conflicts without stopping replica pro
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
-    var apply_sm = RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
+    var apply_sm = try RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
     defer apply_sm.deinit();
 
     const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", group_id);
@@ -33164,7 +33205,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     try server.initApiServer();
     const apply_sm = try std.testing.allocator.create(RaftTableApplyStateMachine);
-    apply_sm.* = RaftTableApplyStateMachine.init(std.testing.allocator, ".", FakeCatalog.iface(), null);
+    apply_sm.* = try RaftTableApplyStateMachine.init(std.testing.allocator, ".", FakeCatalog.iface(), null);
     apply_sm.attachProvisionedStorage(&server.provisioned_storage);
     apply_sm.writer_unavailable_retries_total.store(9, .monotonic);
     apply_sm.writer_unavailable_logs_suppressed_total.store(7, .monotonic);

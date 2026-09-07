@@ -1754,13 +1754,22 @@ pub fn build(b: *std.Build) void {
     storage_mod.addImport("bloom", bloom_mod);
     storage_mod.addImport("antfly_platform", platform_mod);
     const usermgr_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/usermgr/mod.zig"),
+        .root_source_file = b.path("pkg/antfly/src/usermgr_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
-    usermgr_mod.addImport("usermgr_storage", storage_mod);
+    usermgr_mod.addImport("bloom", bloom_mod);
+    usermgr_mod.addImport("antfly_platform", platform_mod);
+    const usermgr_test_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_test_storage_mod.addImport("antfly_root", usermgr_mod);
+    usermgr_test_storage_mod.addImport("antfly_platform", platform_mod);
+    usermgr_mod.addImport("usermgr_storage", usermgr_test_storage_mod);
     const wasm_bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = wasm_target,
@@ -3674,10 +3683,40 @@ pub fn build(b: *std.Build) void {
 
     const lib_usermgr_tests = b.addTest(.{
         .root_module = usermgr_mod,
+        .filters = &.{"usermgr."},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_lib_usermgr_tests = b.addRunArtifact(lib_usermgr_tests);
     const lib_usermgr_test_step = b.step("lib-usermgr-test", "Run standalone pkg/antfly/src/usermgr tests");
     lib_usermgr_test_step.dependOn(&run_lib_usermgr_tests.step);
+
+    const usermgr_abi_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr_abi_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    usermgr_abi_provider_mod.addImport("antfly_casbin", casbin_mod);
+    const usermgr_abi_provider = b.addLibrary(.{
+        .name = "usermgr-abi-test-provider",
+        .root_module = usermgr_abi_provider_mod,
+        .linkage = .static,
+    });
+    const usermgr_abi_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    usermgr_abi_test_mod.addImport("antfly_casbin", casbin_mod);
+    usermgr_abi_test_mod.linkLibrary(usermgr_abi_provider);
+    const usermgr_abi_tests = b.addTest(.{
+        .root_module = usermgr_abi_test_mod,
+        .filters = &.{"usermgr archive boundary"},
+    });
+    const run_usermgr_abi_tests = b.addRunArtifact(usermgr_abi_tests);
+    b.step("lib-usermgr-abi-test", "Run UserManager contracts across independent error domains").dependOn(&run_usermgr_abi_tests.step);
+    lib_usermgr_test_step.dependOn(&run_usermgr_abi_tests.step);
 
     const embedded_tests = b.addTest(.{
         .root_module = embedded_mod,
@@ -4448,6 +4487,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
 
+    const raft_read_gate_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_read_gate_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_read_gate_test_mod, true, true);
+    const raft_read_gate_tests = b.addTest(.{
+        .root_module = raft_read_gate_test_mod,
+        .filters = &.{"raft.read_gate."},
+    });
+    const run_raft_read_gate_tests = b.addRunArtifact(raft_read_gate_tests);
+    b.step("raft-read-gate-test", "Run synchronous read ownership and restart identity contracts").dependOn(&run_raft_read_gate_tests.step);
+
     // The Antfly-rooted Raft tests below cover integration call sites but do
     // not collect tests declared by the raft library's own root module.
     const raft_library_tests = b.addTest(.{
@@ -4774,6 +4826,7 @@ pub fn build(b: *std.Build) void {
         .root_module = serverless_manifest_test_mod,
         .filters = &.{
             "objectstore-backed manifest store supports publish and list",
+            "serverless retention",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
             "host object storage delegates through callbacks",
@@ -4918,6 +4971,7 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft read safety barrier completes only after matching ReadState apply",
+        "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
         "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",
@@ -9319,6 +9373,7 @@ pub fn build(b: *std.Build) void {
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
+    raft_test_step.dependOn(&run_raft_read_gate_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
@@ -9360,6 +9415,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
+    unit_test_step.dependOn(&run_raft_read_gate_tests.step);
+    unit_test_step.dependOn(&run_usermgr_abi_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);

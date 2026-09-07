@@ -68,25 +68,25 @@ pub const Pruner = struct {
         cancellation: ?maintenance_cancellation.Token,
     ) !PruneResult {
         try maintenance_cancellation.check(cancellation);
+        // HEAD publication follows the immutable manifest write. Read HEAD
+        // first, so a concurrent publisher cannot make it newer than our
+        // version listing. Unpublished candidates are not retention roots.
+        const published_head = self.progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => return self.noopResult(namespace, 0, false),
+            else => return err,
+        };
         const versions = try self.manifests.listVersionsAlloc(namespace);
         defer self.alloc.free(versions);
-
-        if (versions.len == 0) {
-            return .{
-                .namespace = try self.alloc.dupe(u8, namespace),
-                .kept_versions = 0,
-                .deleted_versions = 0,
-                .deleted_artifacts = 0,
-                .wal_keep_from_lsn = 0,
-                .wal_records_removed = 0,
-            };
-        }
 
         // Object stores can contain manifests whose publisher never completed
         // the HEAD CAS. Retention is defined relative to the published head,
         // never the numerically greatest stored version.
-        const published_head = try self.progress.getHead(namespace);
         if (!containsVersion(versions, published_head)) {
+            // Another retention worker may already have removed our old
+            // root after publication advanced. Let the next pass resnapshot;
+            // an unchanged HEAD with no manifest remains a corruption error.
+            if (try self.progress.getHead(namespace) != published_head)
+                return self.noopResult(namespace, 0, false);
             return error.PublishedHeadManifestMissing;
         }
         const keep_count = @max(keep_latest_versions, 1);
@@ -276,6 +276,111 @@ fn putTestManifestWithLineage(
         .stats = .{ .document_count = 1, .document_base_version = version },
         .artifacts = &refs,
     });
+}
+
+test "serverless retention snapshots HEAD before concurrent publication and fails closed on missing roots" {
+    const Race = struct {
+        manifests: *manifest_mod.ManifestStore,
+        progress: *catalog_mod.ProgressStore,
+        artifact: artifacts_mod.ArtifactMetadata,
+        fired: bool = false,
+        remove_old: bool = false,
+
+        fn state(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn list(ptr: *anyopaque, alloc: Allocator, namespace: []const u8) ![]u64 {
+            const self = state(ptr);
+            // Snapshot the listing, then let a publisher durably install a
+            // new manifest and HEAD before the list request returns.
+            const versions = try self.manifests.listVersionsAlloc(namespace);
+            errdefer alloc.free(versions);
+            self.fired = true;
+            try putTestManifest(self.manifests, 2, 2, self.artifact);
+            try std.testing.expect(try self.progress.compareAndSwapHead(namespace, 1, 2));
+            if (self.remove_old) {
+                // A concurrent retention worker can also prune the old root.
+                try self.manifests.deleteVersion(namespace, 1);
+                const replacement = try alloc.dupe(u64, &.{2});
+                alloc.free(versions);
+                return replacement;
+            }
+            return versions;
+        }
+        fn get(ptr: *anyopaque, _: Allocator, namespace: []const u8, version: u64) !manifest_mod.Manifest {
+            return state(ptr).manifests.getAlloc(namespace, version);
+        }
+        fn put(ptr: *anyopaque, manifest: manifest_mod.Manifest) !void {
+            return state(ptr).manifests.put(manifest);
+        }
+        fn setHead(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
+            return state(ptr).manifests.setHead(namespace, version);
+        }
+        fn getHead(ptr: *anyopaque, namespace: []const u8) !u64 {
+            return state(ptr).manifests.getHead(namespace);
+        }
+        fn casHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
+            return state(ptr).manifests.compareAndSwapHead(namespace, expected, version);
+        }
+        fn delete(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
+            return state(ptr).manifests.deleteVersion(namespace, version);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        const vtable: manifest_mod.ManifestStore.VTable = .{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = get,
+            .set_head = setHead,
+            .get_head = getHead,
+            .compare_and_swap_head = casHead,
+            .list_versions_alloc = list,
+            .delete_version = delete,
+        };
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |remove_old| {
+        var memory = objectstore.MemoryClient.init(alloc);
+        defer memory.deinit();
+        var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+        var artifacts = artifact_impl.artifactStore();
+        defer artifacts.deinit();
+        var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+        var manifests = manifest_impl.manifestStore();
+        defer manifests.deinit();
+        var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var progress = progress_impl.progressStore();
+        defer progress.deinit();
+        var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+        var wal = wal_impl.walStore();
+        defer wal.deinit();
+        var artifact = try artifacts.put("shared");
+        defer artifact.deinit(alloc);
+        try putTestManifest(&manifests, 1, 1, artifact);
+        var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+        // An unpublished candidate is harmless and must not trigger cleanup.
+        var unpublished = try pruner.pruneNamespace("docs", 1);
+        defer unpublished.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), unpublished.deleted_versions);
+        try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+        var race: Race = .{ .manifests = &manifests, .progress = &progress, .artifact = artifact, .remove_old = remove_old };
+        var racing_manifests: manifest_mod.ManifestStore = .{ .allocator = alloc, .ptr = &race, .vtable = &Race.vtable };
+        pruner.manifests = &racing_manifests;
+        var result = try pruner.pruneNamespace("docs", 1);
+        defer result.deinit(alloc);
+        try std.testing.expect(race.fired);
+        try std.testing.expectEqual(@as(usize, 0), result.deleted_versions);
+        try std.testing.expectEqual(@as(usize, 0), result.deleted_artifacts);
+        try std.testing.expectEqual(@as(u64, 2), try progress.getHead("docs"));
+        var head = try manifests.getAlloc("docs", 2);
+        defer head.deinit(alloc);
+        // A genuinely missing published root, even with an empty listing,
+        // must still stop retention before destructive work.
+        pruner.manifests = &manifests;
+        try manifests.deleteVersion("docs", 2);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
+        if (!remove_old) try manifests.deleteVersion("docs", 1);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
+    }
 }
 
 test "serverless retention preserves shared artifacts referenced above head" {

@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

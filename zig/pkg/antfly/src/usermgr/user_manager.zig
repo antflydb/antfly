@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const io_abi = @import("../runtime_io_abi.zig");
 const casbin = @import("antfly_casbin");
 
 const Allocator = std.mem.Allocator;
@@ -473,7 +474,10 @@ pub const MemoryStore = struct {
 
 pub const UserManager = struct {
     alloc: Allocator,
-    io: std.Io,
+    // The manager is shared by standalone and API runtime archives. Each
+    // synchronous method receives I/O in its own error domain; receivers live
+    // through mutex unlock and are never retained in this movable object.
+    io_borrow: io_abi.Borrow,
     store: UserStore,
     enforcer: casbin.Enforcer,
     users: std.StringHashMapUnmanaged([]u8) = .{},
@@ -497,13 +501,16 @@ pub const UserManager = struct {
         manager: *UserManager,
 
         pub fn release(self: *@This()) void {
-            self.manager.mutation_mutex.unlock(self.manager.io);
+            var receiver = self.manager.io_borrow.receive() catch @panic("invalid UserManager executor");
+            self.manager.mutation_mutex.unlock(receiver.io());
             self.* = undefined;
         }
     };
 
     pub fn acquireSeedCaptureLease(self: *UserManager) SeedCaptureLease {
-        self.mutation_mutex.lockUncancelable(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
         return .{ .manager = self };
     }
 
@@ -524,7 +531,7 @@ pub const UserManager = struct {
     pub fn initWithIo(alloc: Allocator, io: std.Io, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
         var manager = UserManager{
             .alloc = alloc,
-            .io = io,
+            .io_borrow = .init(&io),
             .store = store,
             .enforcer = enforcer,
         };
@@ -596,8 +603,10 @@ pub const UserManager = struct {
         initial_policies: []const Permission,
         metadata_json: []const u8,
     ) !User {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
     }
 
@@ -608,10 +617,12 @@ pub const UserManager = struct {
         initial_policies: []const Permission,
         metadata_json: []const u8,
     ) !User {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
         if (self.users.contains(username)) return error.UserExists;
 
         var stored = blk: {
-            const password_hash = try hashPassword(self.alloc, self.io, password);
+            const password_hash = try hashPassword(self.alloc, io, password);
             errdefer self.alloc.free(password_hash);
             const normalized_metadata = try normalizeMetadataJson(self.alloc, metadata_json);
             errdefer self.alloc.free(normalized_metadata);
@@ -686,11 +697,13 @@ pub const UserManager = struct {
     }
 
     pub fn updatePassword(self: *UserManager, username: []const u8, new_password: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         const existing = self.users.getPtr(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
-        const new_hash = try hashPassword(self.alloc, self.io, new_password);
+        const new_hash = try hashPassword(self.alloc, io, new_password);
         errdefer self.alloc.free(new_hash);
         var stored = User{
             .username = @constCast(username),
@@ -705,8 +718,10 @@ pub const UserManager = struct {
     }
 
     pub fn deleteUser(self: *UserManager, username: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         const removed = self.users.fetchRemove(username) orelse return error.UserNotFound;
         defer {
             self.alloc.free(removed.key);
@@ -756,8 +771,10 @@ pub const UserManager = struct {
     }
 
     pub fn addPermissionToSubject(self: *UserManager, subject: []const u8, permission: Permission) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.addPermissionToSubjectUnlocked(subject, permission);
     }
 
@@ -772,8 +789,10 @@ pub const UserManager = struct {
     }
 
     pub fn addPermissionToUser(self: *UserManager, username: []const u8, permission: Permission) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addPermissionToSubjectUnlocked(username, permission);
     }
@@ -784,8 +803,10 @@ pub const UserManager = struct {
         resource_name: []const u8,
         resource_type: ResourceType,
     ) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         const removed = if (std.mem.eql(u8, resource_name, "*"))
             try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
@@ -831,8 +852,10 @@ pub const UserManager = struct {
         resource: []const u8,
         permission_type: PermissionType,
     ) !bool {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return false;
         const permissions = try self.getPermissionsForUser(username);
         defer {
@@ -852,8 +875,10 @@ pub const UserManager = struct {
     }
 
     pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.addRoleToSubjectUnlocked(subject, role);
     }
 
@@ -863,15 +888,19 @@ pub const UserManager = struct {
     }
 
     pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addRoleToSubjectUnlocked(username, role);
     }
 
     pub fn removeRoleFromSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.removeRoleFromSubjectUnlocked(subject, role);
     }
 
@@ -881,8 +910,10 @@ pub const UserManager = struct {
     }
 
     pub fn removeRoleFromUser(self: *UserManager, username: []const u8, role: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeRoleFromSubjectUnlocked(username, role);
     }
@@ -990,8 +1021,10 @@ pub const UserManager = struct {
     }
 
     pub fn setSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
     }
 
@@ -1004,15 +1037,19 @@ pub const UserManager = struct {
     }
 
     pub fn setRowFilter(self: *UserManager, username: []const u8, table: []const u8, filter_json: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.setSubjectRowFilterUnlocked(username, table, filter_json);
     }
 
     pub fn removeSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.removeSubjectRowFilterUnlocked(subject, table);
     }
 
@@ -1023,8 +1060,10 @@ pub const UserManager = struct {
     }
 
     pub fn removeRowFilter(self: *UserManager, username: []const u8, table: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeSubjectRowFilterUnlocked(username, table);
     }
@@ -1126,8 +1165,10 @@ pub const UserManager = struct {
         row_filter: []const RowFilterEntry,
         expires_at_ns: ?u64,
     ) !CreatedApiKey {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return error.UserNotFound;
 
         for (permissions) |perm| {
@@ -1140,13 +1181,13 @@ pub const UserManager = struct {
             parsed.deinit();
         }
 
-        const key_id = try generateRandomAlphanumeric(self.alloc, self.io, 20);
+        const key_id = try generateRandomAlphanumeric(self.alloc, io, 20);
         defer self.alloc.free(key_id);
-        const secret_raw = try randomBytes(self.alloc, self.io, 16);
+        const secret_raw = try randomBytes(self.alloc, io, 16);
         defer self.alloc.free(secret_raw);
         const key_secret = try encodeBase64UrlNoPad(self.alloc, secret_raw);
         errdefer self.alloc.free(key_secret);
-        const salt = try randomBytes(self.alloc, self.io, 16);
+        const salt = try randomBytes(self.alloc, io, 16);
         const secret_hash = try hashApiKeySecret(self.alloc, salt, secret_raw);
 
         var api_key = ApiKey{
@@ -1155,7 +1196,7 @@ pub const UserManager = struct {
             .name = try self.alloc.dupe(u8, name),
             .permissions = try clonePermissions(self.alloc, permissions),
             .row_filter = try cloneRowFilters(self.alloc, row_filter),
-            .created_at_ns = nowNs(self.io),
+            .created_at_ns = nowNs(io),
             .expires_at_ns = expires_at_ns,
         };
         errdefer api_key.deinit(self.alloc);
@@ -1181,9 +1222,11 @@ pub const UserManager = struct {
     }
 
     pub fn validateApiKey(self: *const UserManager, key_id: []const u8, key_secret: []const u8) !ValidatedApiKey {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
         const mutable: *UserManager = @constCast(self);
-        mutable.mutation_mutex.lockUncancelable(self.io);
-        defer mutable.mutation_mutex.unlock(self.io);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         const secret_size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(key_secret) catch {
             return error.ApiKeyInvalid;
@@ -1197,7 +1240,7 @@ pub const UserManager = struct {
         defer self.alloc.free(computed_hash);
         if (!std.mem.eql(u8, computed_hash, record.secret_hash)) return error.ApiKeyInvalid;
         if (record.key.expires_at_ns) |expires_at_ns| {
-            if (nowNs(self.io) > expires_at_ns) return error.ApiKeyExpired;
+            if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
         }
         const owner_row_filter = try self.getRowFilters(record.key.username);
         defer {
@@ -1225,16 +1268,20 @@ pub const UserManager = struct {
     /// catalog metadata. Deletion, expiry, and owner revocation all fail
     /// closed on the next worker authorization check.
     pub fn effectiveApiKeyPermissions(self: *const UserManager, key_id: []const u8) ![]Permission {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
         const mutable: *UserManager = @constCast(self);
-        mutable.mutation_mutex.lockUncancelable(self.io);
-        defer mutable.mutation_mutex.unlock(self.io);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
         return try self.effectiveApiKeyPermissionsUnlocked(key_id);
     }
 
     fn effectiveApiKeyPermissionsUnlocked(self: *const UserManager, key_id: []const u8) ![]Permission {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         if (record.key.expires_at_ns) |expires_at_ns| {
-            if (nowNs(self.io) > expires_at_ns) return error.ApiKeyExpired;
+            if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
         }
         const owner_permissions = try self.getPermissionsForUser(record.key.username);
         defer {
@@ -1257,9 +1304,11 @@ pub const UserManager = struct {
         principal: []const u8,
         payload: []const u8,
     ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
         const mutable: *UserManager = @constCast(self);
-        mutable.mutation_mutex.lockUncancelable(self.io);
-        defer mutable.mutation_mutex.unlock(self.io);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
         const key = if (std.mem.startsWith(u8, principal, "basic:")) blk: {
             const username = principal["basic:".len..];
             if (username.len == 0) return error.InvalidDestinationGrantPrincipal;
@@ -1269,7 +1318,7 @@ pub const UserManager = struct {
             if (key_id.len == 0) return error.InvalidDestinationGrantPrincipal;
             const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
             if (record.key.expires_at_ns) |expires_at_ns| {
-                if (nowNs(self.io) > expires_at_ns) return error.ApiKeyExpired;
+                if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
             }
             break :blk record.secret_hash;
         } else return error.InvalidDestinationGrantPrincipal;
@@ -1295,8 +1344,10 @@ pub const UserManager = struct {
     }
 
     pub fn deleteApiKey(self: *UserManager, username: []const u8, key_id: []const u8) !void {
-        self.mutation_mutex.lockUncancelable(self.io);
-        defer self.mutation_mutex.unlock(self.io);
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
         return try self.deleteApiKeyUnlocked(username, key_id);
     }
 

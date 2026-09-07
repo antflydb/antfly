@@ -22,7 +22,7 @@ const read_state_observer_mod = @import("state_machine/read_state_observer.zig")
 /// bounded, cancellation removes ownership immediately, and context identity
 /// is canonical rather than delegated to caller string conventions.
 pub const AppliedReadTracker = struct {
-    pub const context_prefix = "antfly-read-safe-v1:";
+    pub const context_prefix = "antfly-read-safe-v2:";
 
     pub const Token = struct {
         group_id: u64,
@@ -40,13 +40,16 @@ pub const AppliedReadTracker = struct {
     };
 
     allocator: std.mem.Allocator,
+    incarnation: u128,
     mutex: std.atomic.Mutex = .unlocked,
-    next_request_id: std.atomic.Value(u64) = .init(1),
+    next_request_id: u64 = 1,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     waiters: std.AutoHashMapUnmanaged(Token, Waiter) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) AppliedReadTracker {
-        return .{ .allocator = allocator };
+    /// The owner supplies a fresh identity on every restart. VOPR obtains it
+    /// from its controlled I/O stream, never from hidden host randomness.
+    pub fn init(allocator: std.mem.Allocator, incarnation: u128) AppliedReadTracker {
+        return .{ .allocator = allocator, .incarnation = incarnation };
     }
 
     pub fn deinit(self: *AppliedReadTracker) void {
@@ -60,11 +63,14 @@ pub const AppliedReadTracker = struct {
         group_id: u64,
         context_buffer: []u8,
     ) !Registration {
-        var request_id = self.next_request_id.fetchAdd(1, .monotonic);
-        if (request_id == 0) request_id = self.next_request_id.fetchAdd(1, .monotonic);
-        const token = Token{ .group_id = group_id, .request_id = request_id };
-
         lock(&self.mutex);
+        if (self.next_request_id == 0) {
+            self.mutex.unlock();
+            return error.AppliedReadIdentityExhausted;
+        }
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+        const token = Token{ .group_id = group_id, .request_id = request_id };
         const result = self.waiters.getOrPut(self.allocator, token) catch |err| {
             self.mutex.unlock();
             return err;
@@ -79,8 +85,8 @@ pub const AppliedReadTracker = struct {
 
         const request_ctx = std.fmt.bufPrint(
             context_buffer,
-            context_prefix ++ "{x}",
-            .{request_id},
+            context_prefix ++ "{x:0>32}:{x}",
+            .{ self.incarnation, request_id },
         ) catch return error.ReadIndexContextTooLong;
         return .{ .token = token, .request_ctx = request_ctx };
     }
@@ -126,7 +132,11 @@ pub const AppliedReadTracker = struct {
         const applied_index = self.applied_indexes.get(group_id) orelse 0;
         for (read_states) |read_state| {
             if (!std.mem.startsWith(u8, read_state.request_ctx, context_prefix)) continue;
-            const encoded_id = read_state.request_ctx[context_prefix.len..];
+            const suffix = read_state.request_ctx[context_prefix.len..];
+            if (suffix.len < 34 or suffix[32] != ':') continue;
+            const incarnation = std.fmt.parseUnsigned(u128, suffix[0..32], 16) catch continue;
+            if (incarnation != self.incarnation) continue;
+            const encoded_id = suffix[33..];
             if (encoded_id.len == 0) continue;
             const request_id = std.fmt.parseUnsigned(u64, encoded_id, 16) catch continue;
             const waiter = self.waiters.getPtr(.{
@@ -479,7 +489,7 @@ test "enrichment ReadIndex requester is initiation only" {
 }
 
 test "applied read tracker completes only after matching ReadState and applied index" {
-    var tracker = AppliedReadTracker.init(std.testing.allocator);
+    var tracker = AppliedReadTracker.init(std.testing.allocator, 1);
     defer tracker.deinit();
 
     var first_context: [96]u8 = undefined;
@@ -529,8 +539,26 @@ test "applied read tracker completes only after matching ReadState and applied i
     try std.testing.expect(tracker.takeCompleted(second.token));
 }
 
+test "applied read tracker rejects a delayed response from before restart" {
+    var old = AppliedReadTracker.init(std.testing.allocator, 17);
+    var old_buffer: [96]u8 = undefined;
+    const old_request = try old.register(7, &old_buffer);
+    old.deinit();
+
+    var restarted = AppliedReadTracker.init(std.testing.allocator, 18);
+    defer restarted.deinit();
+    var new_buffer: [96]u8 = undefined;
+    const new_request = try restarted.register(7, &new_buffer);
+    try std.testing.expectEqual(old_request.token, new_request.token);
+    try restarted.noteApplied(7, 10);
+    restarted.observeReadStates(7, &.{.{ .index = 10, .request_ctx = @constCast(old_request.request_ctx) }});
+    try std.testing.expect(!restarted.takeCompleted(new_request.token));
+    restarted.observeReadStates(7, &.{.{ .index = 10, .request_ctx = @constCast(new_request.request_ctx) }});
+    try std.testing.expect(restarted.takeCompleted(new_request.token));
+}
+
 test "applied read tracker cancellation retirement and context errors release ownership" {
-    var tracker = AppliedReadTracker.init(std.testing.allocator);
+    var tracker = AppliedReadTracker.init(std.testing.allocator, 1);
     defer tracker.deinit();
 
     var canceled_context: [96]u8 = undefined;
@@ -548,5 +576,17 @@ test "applied read tracker cancellation retirement and context errors release ow
         error.ReadIndexContextTooLong,
         tracker.register(93, &too_short),
     );
+    try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
+}
+
+test "applied read tracker never reuses identities after counter exhaustion" {
+    var tracker = AppliedReadTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    tracker.next_request_id = std.math.maxInt(u64);
+    var buffer: [96]u8 = undefined;
+    const last = try tracker.register(1, &buffer);
+    tracker.cancel(last.token);
+    try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
+    try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
     try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
 }

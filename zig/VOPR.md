@@ -2995,7 +2995,7 @@ exactly. This focused review does not certify the entire branch.
    a synchronous receiver; inference keeps its receiver at a stable address
    until shutdown. Same-unit calls retain a direct fast path. This is a private,
    version-checked, same-toolchain bridge, not a general cross-version Zig ABI;
-   native ABI version 3 rejects old borrows. Existing HTTP callback status enums
+   native ABI version 4 rejects old borrows and shared-manager layouts. Existing HTTP callback status enums
    and the secret-store owner dispatcher remain separate safe boundaries.
 2. **P1 — Group cancellation skipped ownership cleanup (fixed).** Queued
    callbacks now enter with cancellation pending and drain alongside entered
@@ -3040,12 +3040,67 @@ Neither is evidence of fully virtual storage coverage. No additional replay
 algorithm defect was confirmed in the reviewed enabled-set, choice-consumption,
 canonical-artifact, checkpoint-prefix, and teardown paths.
 
+### Production Review Follow-up (2026-09-06)
+
+The subsequent non-VOPR review reproduced three production defects. These fixes
+exercise the actual owners, not substitute simulation models:
+
+- **Restart-safe read identities.** Applied reads and transaction-recovery
+  ReadIndex requests now include a fresh 128-bit runtime incarnation as well
+  as a non-reused request counter. Initialization draws the incarnation through
+  the owning backend's std.Io (VoprIo in controlled histories), fails on entropy
+  errors, and cleans up partially constructed ownership. Delayed pre-restart
+  responses cannot complete new waiters even when group and counter match.
+  Counter exhaustion fails closed. Transient v1 contexts are rejected, not
+  migrated. Reusable tracker tests and DataServer state-machine regressions
+  cover stale-response rejection and completion with the current identity.
+- **Retention/publication snapshot ordering.** Retention reads published HEAD
+  before listing immutable manifests. Publication between those calls no longer
+  causes a false `PublishedHeadManifestMissing` and terminal worker failure.
+  An unpublished namespace is a no-op; a concurrently pruned old HEAD whose
+  current HEAD has advanced is retried on the next pass. A genuinely missing
+  current root still fails closed, including when the listing is empty.
+  Object-store regressions cover publication and old-root removal at this seam.
+  This is not a claim that arbitrary overlapping retention workers are fenced.
+- **Shared UserManager executor ownership.** The manager retains an
+  `runtime_io_abi.Borrow`, not a foreign raw std.Io. Synchronous methods create
+  a caller-local receiver that lives through mutex release; movable manager and
+  seed-lease values never retain a stack receiver. An independently compiled
+  provider/consumer test covers `Canceled` and `EntropyUnavailable` during user
+  creation, password update, and API-key creation, unchanged credential state,
+  and lock release. This fixes embedded I/O error translation, not a general
+  certification of every auth storage or policy callback boundary.
+
+The focused gates are `raft-read-gate-test`,
+`lib-data-runtime-test -- "data raft read safety barrier"`,
+`lib-serverless-manifest-test`, `lib-usermgr-test`, and
+`lib-usermgr-abi-test`. The new read-gate and independent auth-archive gates
+are included in the regular unit aggregate.
+
+Validation: read-gate, manifest/retention, user-manager, and independent auth
+archive gates pass in Debug and ReleaseSafe. The DataServer restart regressions,
+auth-lifecycle and serverless-workflow VOPR campaigns, production runtime build,
+seven HTTP auth E2E tests, and repository formatting checks also pass.
+The broader `production-cluster-join-split-vopr-test` is **not green**:
+it reproduces a 175-byte packet payload replay divergence followed by
+`VoprIoTeardownStalled`. A separate clean worktree at the pre-fix checkpoint
+`91dab5df73` reproduces the same failure class (choice 11221 versus 11227
+with these fixes). Packet-level determinism and abort-path teardown therefore
+remain open work; this checkpoint does not claim to fix them.
+
+The latest pre-fix Linux CI E2E run reported a same-name serverless dense-index
+update status error and a CLI semantic-query timeout (321 passed, two failed).
+Both failing test cases pass locally against this checkpoint's rebuilt binary.
+That local rerun does not establish their CI root cause or certify Linux timing;
+the next CI run remains necessary.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and
 Antithesis-class features to add; no, the complete roadmap is not
-implemented**. The open runtime correctness findings above must be resolved
-before treating the reusable deterministic runtime as complete.
+implemented**. The confirmed runtime and production findings above have fixes
+and focused regressions; that does not certify the remaining roadmap or every
+production callback boundary.
 The highest-value work is composing more production owners, workflows, and
 fault domains in the same replayable history.
 
