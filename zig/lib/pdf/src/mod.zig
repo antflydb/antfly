@@ -888,6 +888,28 @@ pub fn prepareParsedPageRenderPlan(
     };
 }
 
+/// Prepare geometry against the same per-worker resource ceilings used by
+/// execution. Window planners must sum these admitted pixels, not the larger
+/// requested geometry. Aggregate pressure shortens windows or worker waves;
+/// it must not progressively lower the quality of later pages in a window.
+pub fn prepareAdmittedPageRenderPlan(
+    parsed: *reader.Reader,
+    request: PageRenderRequest,
+    options: PageRenderBatchOptions,
+    output_kind: RenderBatchOutputKind,
+) !PreparedPageRenderPlan {
+    if (options.bytes_per_pixel_reserve < 4 or options.max_inflight_pixels == 0)
+        return error.InvalidRenderBatchOptions;
+    const admitted = try prepareRenderPageForAdmission(parsed, request, null, options, output_kind, 0);
+    const source = parsed.sourceBytes();
+    return .{
+        ._request = admitted.request,
+        ._geometry = admitted.geometry,
+        ._source_ptr = source.ptr,
+        ._source_len = source.len,
+    };
+}
+
 /// Return the maximum scratch reservation needed by one ordered wave of
 /// prepared pages. Pixel admission may split a wave further at execution, so
 /// this remains a safe upper bound without reserving the renderer's complete
@@ -1206,7 +1228,7 @@ const RenderLaneHeap = std.heap.DebugAllocator(.{
     .thread_safe = false,
 });
 
-const RenderBatchOutputKind = enum { png, raster };
+pub const RenderBatchOutputKind = enum { png, raster };
 
 const PreparedRenderPage = struct {
     request_index: usize,
@@ -5394,6 +5416,35 @@ test "bounded render batch adapts geometry to the inflight pixel window" {
     try std.testing.expect(@as(u64, rendered.width) * @as(u64, rendered.height) <= pixel_window);
     try std.testing.expect(rendered.effective_dpi < rendered.requested_dpi);
     try std.testing.expect(batch.peak_admitted_pixels <= pixel_window);
+}
+
+test "admitted prepared geometry is identical at execution under pixel and scratch limits" {
+    const alloc = std.testing.allocator;
+    var parsed = try reader.Reader.init(alloc, @embedFile("../testdata/two_page_text_fixture.pdf"));
+    defer parsed.deinit();
+    const request = PageRenderRequest{ .page_number = 1, .requested_dpi = 150 };
+    const requested = try prepareParsedPageRenderPlan(&parsed, request);
+    const fixed = try std.math.add(usize, try parsed.renderForkMetadataBytes(), parsed.decode_limits.max_working_set_bytes);
+    for ([_]PageRenderBatchOptions{
+        .{ .max_inflight_pixels = 50_000 },
+        .{ .max_inflight_bytes = fixed + 50_000 * default_render_bytes_per_pixel_reserve },
+    }) |options| {
+        const plan = try prepareAdmittedPageRenderPlan(&parsed, request, options, .png);
+        try std.testing.expect(plan.geometry().pixels <= 50_000);
+        try std.testing.expect(plan.geometry().pixels < requested.geometry().pixels);
+        var rendered = try renderPreparedPagesBatchAlloc(alloc, &parsed, &.{plan}, options);
+        defer rendered.deinit(alloc);
+        const page = rendered.results[0].rendered orelse return error.MissingAdmittedPage;
+        try std.testing.expectEqual(plan.geometry().width, page.width);
+        try std.testing.expectEqual(plan.geometry().height, page.height);
+        try std.testing.expectEqual(plan.geometry().effective_dpi, page.effective_dpi);
+        try std.testing.expectEqual(try estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{plan}, 1, options.bytes_per_pixel_reserve), rendered.peak_admitted_bytes);
+    }
+    var raw = request;
+    raw.max_output_bytes = 40_000 * 4;
+    const plan = try prepareAdmittedPageRenderPlan(&parsed, raw, .{}, .raster);
+    try std.testing.expect(plan.geometry().pixels <= 40_000);
+    try std.testing.expectError(error.InvalidRenderBatchOptions, prepareAdmittedPageRenderPlan(&parsed, request, .{ .bytes_per_pixel_reserve = 0 }, .png));
 }
 
 test "reader ignores stale positive page-tree Count hints" {

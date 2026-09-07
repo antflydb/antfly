@@ -227,6 +227,9 @@ func TestReplayFinishCancellationInterruptsAndJoinsActiveRead(t *testing.T) {
 		t.Fatal("Finish failed to interrupt active read")
 	}
 	<-readDone
+	if _, err := replay.Open(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("incomplete replay reopened after cancellation: %v", err)
+	}
 }
 
 func testProxyAttachmentEnvelope(metadata []byte, attachments ...testProxyAttachment) []byte {

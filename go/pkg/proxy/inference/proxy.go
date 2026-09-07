@@ -4429,7 +4429,22 @@ func (b *proxyStreamingAttemptBody) Close() error {
 func (b *proxyStreamingAttemptBody) Finish(ctx context.Context, retry bool) error {
 	b.closed.Store(true)
 	b.finishOnce.Do(func() {
-		defer func() { b.body.replayErr = b.finishErr }()
+		// Replay integrity belongs to the upload, not the upstream attempt.
+		// A timeout after the complete upload must not invalidate its spool or
+		// interrupt the incoming connection (which may cancel the parent request).
+		complete := func() bool { return b.body.spill != nil && b.body.spooled == b.body.total }
+		if b.readMu.TryLock() {
+			sealed := complete()
+			b.readMu.Unlock()
+			if sealed {
+				return
+			}
+		}
+		defer func() {
+			if !complete() {
+				b.body.replayErr = b.finishErr
+			}
+		}()
 		// The callback is joined before returning, so it never outlives the
 		// response writer, request body, or replay file it can interrupt.
 		interrupted := make(chan struct{})
@@ -4456,6 +4471,9 @@ func (b *proxyStreamingAttemptBody) Finish(ctx context.Context, retry bool) erro
 		}
 		b.readMu.Lock()
 		defer b.readMu.Unlock()
+		if complete() {
+			return
+		}
 		if err := ctx.Err(); err != nil {
 			b.finishErr = err
 			return
@@ -4606,11 +4624,13 @@ func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, opera
 		return
 	}
 	replay := &proxyStreamingReplayBody{
-		prefix:    prefix,
-		tail:      upload,
-		total:     r.ContentLength,
-		spillDir:  p.spoolDir,
-		interrupt: upload.interrupt,
+		prefix:   prefix,
+		tail:     upload,
+		total:    r.ContentLength,
+		spillDir: p.spoolDir,
+		// Recheck physical upload completion inside asynchronous cancellation;
+		// the last socket read may have finished while Finish joined the tee.
+		interrupt: upload.finish,
 	}
 	defer replay.Close()
 	p.proxyRequestWithReplayBody(w, r, operation, start, routing, routingPayload, replay)

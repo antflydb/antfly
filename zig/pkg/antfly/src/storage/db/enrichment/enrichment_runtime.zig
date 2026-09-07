@@ -6248,6 +6248,8 @@ const SharedPdfTransform = struct {
     raster: bool,
     decode_stream_bytes: usize,
     decode_working_bytes: usize,
+    render_pixels: u64,
+    render_bytes: usize,
 
     fn init(config: document_extraction_mod.Config, pixels: u64, width: ?u32, height: ?u32, output_bytes: usize, raster: bool) @This() {
         return .{
@@ -6260,7 +6262,21 @@ const SharedPdfTransform = struct {
             .raster = raster,
             .decode_stream_bytes = config.pdf_decode_limits.max_decoded_stream_bytes,
             .decode_working_bytes = config.pdf_decode_limits.max_working_set_bytes,
+            .render_pixels = config.pdf_render_max_inflight_pixels,
+            .render_bytes = config.pdf_render_max_inflight_bytes,
         };
+    }
+
+    /// A raw owner can supply lossless PNGs without painting the PDF again.
+    /// Encoded owners cannot promise the original raster geometry: their
+    /// output-byte policy may already have resized the page.
+    fn canSupply(self: @This(), consumer: @This()) bool {
+        if (std.meta.eql(self, consumer)) return true;
+        if (!self.raster or consumer.raster) return false;
+        var physical = consumer;
+        physical.raster = true;
+        physical.output_bytes = 0;
+        return std.meta.eql(self, physical);
     }
 };
 
@@ -6299,6 +6315,20 @@ test "shared PDF render admission preserves owner batch boundaries" {
     try std.testing.expectEqual(@as(usize, 6), nextPdfWindowCandidate(12, 6));
     try std.testing.expectEqual(@as(usize, 5), nextPdfWindowCandidate(6, 6));
     try std.testing.expectEqual(@as(usize, 0), nextPdfWindowCandidate(1, 6));
+}
+
+test "shared PDF transform distinguishes geometry from lossless representation" {
+    const raw = SharedPdfTransform.init(.{}, 50_000, null, null, 1, true);
+    var png = SharedPdfTransform.init(.{}, 50_000, null, null, 1024, false);
+    try std.testing.expect(raw.canSupply(png));
+    try std.testing.expect(!png.canSupply(raw));
+    png.output_bytes = 1;
+    try std.testing.expect(raw.canSupply(png)); // actual PNG size is checked after encoding
+    png.width = 123;
+    try std.testing.expect(!raw.canSupply(png));
+    png.width = null;
+    png.render_pixels -= 1;
+    try std.testing.expect(!raw.canSupply(png));
 }
 
 /// Called only by the single-flight replay owner, after acquiring its lease
@@ -6421,7 +6451,7 @@ const SharedPdfWindowScheduler = struct {
             if (!peer.enabled or peer.err != null or
                 !std.meta.eql(owner.source_identity, peer.source_identity) or
                 !std.mem.eql(u8, owner.config.credentials, peer.config.credentials) or
-                !std.meta.eql(owner.transform, peer.transform)) continue;
+                !owner.transform.canSupply(peer.transform)) continue;
             // Image-only producers cannot establish auto-OCR text policy.
             if (peer.text and !owner.text) continue;
             if (peer.text and (owner.config.ocr_mode != peer.config.ocr_mode or
@@ -6497,6 +6527,8 @@ const SharedPdfWindowScheduler = struct {
     ) !void {
         if (self.current + 1 >= self.requests.len) return;
         try self.ensureConsumers();
+        var png_window = SharedPdfPngWindow{};
+        defer png_window.deinit();
         const previous_fingerprint = self.runtime.active_failure_fingerprint;
         const previous_retry_identity = self.runtime.retry_error_has_request_identity;
         defer {
@@ -6521,7 +6553,7 @@ const SharedPdfWindowScheduler = struct {
             };
             if (!consumer.enabled or !std.meta.eql(source_identity, consumer.source_identity.?) or
                 !std.mem.eql(u8, credentials, consumer.config.credentials) or
-                !std.meta.eql(transform, consumer.transform) or page_count > consumer.max_pages) continue;
+                !transform.canSupply(consumer.transform) or page_count > consumer.max_pages) continue;
             const window_items = switch (rendered) {
                 inline else => |batch| batch.results.len,
             };
@@ -6532,15 +6564,28 @@ const SharedPdfWindowScheduler = struct {
                 consumer.enabled = false;
                 continue;
             }
-            const result = if (consumer.text) blk: {
+            if (consumer.text) {
                 const source = text_source orelse continue;
                 // Sharing images must not change which pages auto-OCR selects
                 // or which embedded text is retained by its quality policy.
                 if (source.config.ocr_mode != consumer.config.ocr_mode or
                     !std.meta.eql(source.config.ocr_quality, consumer.config.ocr_quality) or
                     (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
-                break :blk self.consumeText(consumer, index, source, rendered, window_lease);
-            } else self.consumeEmbedding(consumer, request, source_sha, rendered, page_count, window_lease);
+            }
+            const media = if (rendered == .raster and !consumer.transform.raster) blk: {
+                const encoded = png_window.get(self.runtime, rendered.raster, window_lease, transform.render_bytes) catch |err| {
+                    if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
+                    return err;
+                } orelse continue;
+                // Never resize a shared representation or silently lower a
+                // peer's quality to satisfy a different wire-byte contract.
+                if (!SharedPdfPngWindow.fits(encoded, consumer.transform.output_bytes)) continue;
+                break :blk PdfEmbeddingRenderedWindow{ .encoded = encoded };
+            } else rendered;
+            const result = if (consumer.text)
+                self.consumeText(consumer, index, text_source.?, media, window_lease)
+            else
+                self.consumeEmbedding(consumer, request, source_sha, media, page_count, window_lease);
             result catch |err| {
                 // An optional consumer lease may not fit beside this retained
                 // window. Its ordinary execution later keeps the baseline
@@ -7440,8 +7485,21 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         last_embed_items: usize = 0,
         failed_calls: usize = 0,
         largest_memory_request: usize = 0,
+        accept_transcoded: bool = false,
+        transcoded_items: usize = 0,
+        transcoded_png: [2]?[*]const u8 = .{ null, null },
 
         fn borrowed(self: *@This(), bytes: []const u8) !void {
+            if (self.accept_transcoded) {
+                try std.testing.expect(antfly_image.png.hasSignature(bytes));
+                const index = self.transcoded_items % self.transcoded_png.len;
+                if (self.transcoded_png[index]) |prior|
+                    try std.testing.expect(prior == bytes.ptr)
+                else
+                    self.transcoded_png[index] = bytes.ptr;
+                self.transcoded_items += 1;
+                return;
+            }
             for (self.pages.results) |page| if (page.rendered.?.png.ptr == bytes.ptr) return;
             return error.SharedPdfMediaWasCopied;
         }
@@ -7799,6 +7857,12 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             var clipped = try physical_limit.prepare(0);
             defer clipped.deinit();
             try std.testing.expectEqual(@as(usize, 1), clipped.count);
+            physical_limit.render_config.pdf_render_max_inflight_pixels = pixel_caps.batch.max_decoded_pixels.? / 2;
+            var downscaled = try physical_limit.prepare(0);
+            defer downscaled.deinit();
+            try std.testing.expectEqual(@as(usize, 1), downscaled.count);
+            const small = downscaled.rendered.encoded.results[0].rendered.?;
+            try std.testing.expect(@as(u64, small.width) * small.height <= physical_limit.render_config.pdf_render_max_inflight_pixels);
         }
         {
             harness.largest_memory_request = 0;
@@ -7817,6 +7881,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             }, 0, false, .{});
             defer limited.deinit();
             try std.testing.expectEqual(@as(usize, 2), limited.unit_indices.len);
+            var small_config = config;
+            small_config.pdf_render_max_inflight_pixels = pixels / 2;
+            var downscaled = try renderRuntimePdfWindow(&runtime, alloc, producer, session, small_config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024 }, .reader, "{}", "pdf", "application/pdf", "render-sharing", &.{
+                .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") },
+            }, 0, false, .{});
+            defer downscaled.deinit();
+            const small = downscaled.batch.encoded.results[0].rendered.?;
+            try std.testing.expect(@as(u64, small.width) * small.height <= small_config.pdf_render_max_inflight_pixels);
         }
         {
             // Exercise the actual OCR owner loop: two pages are retained in
@@ -7905,6 +7977,36 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         first_sink.digest.final(&first_digest);
         second_sink.digest.final(&second_digest);
         try std.testing.expectEqualSlices(u8, &first_digest, &second_digest);
+        try scheduler.cleanupSpool();
+
+        // One native raster traversal supplies two independently staged PNG
+        // embedders. Both borrow the exact same once-encoded page buffers.
+        // A third consumer requiring resizing stays on its ordinary path.
+        var raw_plans: [2]document_extraction_mod.PreparedPdfPageRenderPlan = undefined;
+        for (&raw_plans, 1..) |*plan, page| plan.* = try session.preparePageRenderPlan(.{ .page_number = page, .requested_dpi = config.ocr_render_dpi });
+        var rasters = try session.renderPreparedPagesRasterBatchAlloc(alloc, &raw_plans, .{});
+        defer rasters.deinit(alloc);
+        for (rasters.results) |result| try std.testing.expect(result.rendered != null);
+        scheduler.current = 0;
+        for (scheduler.consumers.?) |*consumer| consumer.enabled = false;
+        for (scheduler.consumers.?[3..]) |*consumer| {
+            consumer.enabled = true;
+            consumer.err = null;
+            consumer.config = config;
+            consumer.transform = transform;
+            consumer.max_items = 1;
+            consumer.max_pages = 10;
+        }
+        scheduler.consumers.?[3].transform.output_bytes = 1;
+        const prior_failed = harness.failed_calls;
+        harness.accept_transcoded = true;
+        defer harness.accept_transcoded = false;
+        var raster_digest = digest;
+        raster_digest[0] ^= 0x7f; // distinct from the already staged embedding generations above
+        try scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &raster_digest, "{}", 2, SharedPdfTransform.init(config, std.math.maxInt(u64), null, null, 1, true), .{ .raster = rasters }, "", null, null);
+        try std.testing.expectEqual(@as(usize, 4), harness.transcoded_items);
+        try std.testing.expectEqual(prior_failed, harness.failed_calls);
+        try std.testing.expect(scheduler.consumers.?[3].err == null);
         try scheduler.cleanupSpool();
     }
 }
@@ -10959,6 +11061,177 @@ const PdfEmbeddingRenderedWindow = union(enum) {
     }
 };
 
+/// Invocation-scoped, lazy lossless representation of a borrowed raster
+/// window. Encoding and retained PNGs use a separate, non-reclaiming lease;
+/// the parent raster allocator stays frozen until every consumer finishes.
+const SharedPdfPngWindow = struct {
+    attempted: bool = false,
+    lease: ?PdfWindowConsumerLease = null,
+    batch: ?document_extraction_mod.RenderedPdfPageBatch = null,
+
+    fn deinit(self: *@This()) void {
+        if (self.batch) |*batch| batch.deinit(self.lease.?.allocator());
+        if (self.lease) |*lease| lease.deinit();
+        self.* = .{};
+    }
+
+    fn fits(batch: document_extraction_mod.RenderedPdfPageBatch, page_limit: usize) bool {
+        for (batch.results) |result| if (result.rendered) |page| {
+            if (page.png.len > page_limit) return false;
+        };
+        return true;
+    }
+
+    const Cancellation = struct {
+        runtime: *EnrichmentRuntime,
+        deadline: u64,
+
+        fn check(raw: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw orelse return true));
+            if (self.runtime.config.cancellation.isCancelled() or platform_time.monotonicNs() >= self.deadline) return true;
+            self.runtime.active_provider_guard.check() catch return true;
+            return false;
+        }
+    };
+
+    fn get(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize) !?document_extraction_mod.RenderedPdfPageBatch {
+        if (self.attempted) return self.batch;
+        self.attempted = true;
+        const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results"));
+        var retained: usize = std.math.mul(usize, raster.results.len, @sizeOf(Page)) catch return error.DocumentExtractionWorkingSetTooLarge;
+        var largest: usize = 0;
+        for (raster.results) |result| if (result.rendered) |page| {
+            retained = addUsizeSaturating(retained, addUsizeSaturating(page.bytes.len *| 2, 64 * 1024));
+            largest = @max(largest, page.bytes.len);
+        };
+        // Compression growth and final PNG coexist for one page, while earlier
+        // PNGs remain retained. The allocator enforces the configured ceiling
+        // even for incompressible inputs or encoder implementation changes.
+        const required = @min(ceiling, addUsizeSaturating(retained, addUsizeSaturating(largest *| 4, 1024 * 1024)));
+        self.lease = try PdfWindowConsumerLease.init(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, required);
+        errdefer {
+            self.lease.?.deinit();
+            self.lease = null;
+        }
+        const alloc = self.lease.?.allocator();
+        const results = try alloc.alloc(Page, raster.results.len);
+        @memset(results, .{ .page_number = 0 });
+        errdefer {
+            for (results) |result| if (result.rendered) |page| alloc.free(page.png);
+            alloc.free(results);
+        }
+        const cancellation = Cancellation{
+            .runtime = runtime,
+            .deadline = std.math.add(u64, platform_time.monotonicNs(), @as(u64, runtime.config.sync_wait_timeout_ms) *| std.time.ns_per_ms) catch std.math.maxInt(u64),
+        };
+        for (raster.results, results) |input, *output| {
+            output.* = .{ .page_number = input.page_number, .failure = input.failure, .render_elapsed_ns = input.render_elapsed_ns };
+            if (input.rendered) |page| {
+                const png = antfly_image.png.encodeRgbaWithCancellation(alloc, page.width, page.height, page.bytes, .{ .context = &cancellation, .is_cancelled_fn = Cancellation.check }) catch |err| {
+                    try checkProviderFailureGuard(runtime);
+                    if (runtime.config.cancellation.isCancelled()) return error.Canceled;
+                    if (err == error.Canceled) return error.DocumentExtractionWorkingSetTooLarge; // optional encoding deadline
+                    // Writer.Allocating can surface allocator denial as
+                    // WriteFailed through the compressor's writer interface.
+                    if (self.lease.?.limit.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+                    return self.lease.?.mapError(err);
+                };
+                output.rendered = .{ .png = png, .requested_dpi = page.requested_dpi, .effective_dpi = page.effective_dpi, .width = page.width, .height = page.height, .quality = page.quality, .diagnostics = page.diagnostics };
+            }
+        }
+        self.batch = .{
+            .results = results,
+            .requested_parallelism = raster.requested_parallelism,
+            .peak_launched_workers = raster.peak_launched_workers,
+            .peak_parallelism = raster.peak_parallelism,
+            .peak_admitted_pixels = raster.peak_admitted_pixels,
+            .peak_admitted_bytes = raster.peak_admitted_bytes,
+            .thread_spawn_fallbacks = raster.thread_spawn_fallbacks,
+        };
+        self.lease.?.retainLiveBytes();
+        return self.batch;
+    }
+};
+
+test "shared PDF PNG representation is lazy bounded and reused without resizing" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var runtime: EnrichmentRuntime = undefined;
+    runtime.alloc = alloc;
+    runtime.config = .{ .resource_manager = &manager };
+    runtime.active_provider_guard = .{};
+    const parent = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 1024, 4 * 1024 * 1024, 1);
+    defer parent.destroy();
+    const bytes = try parent.allocator().alloc(u8, 4 * 4 * 4);
+    defer parent.allocator().free(bytes);
+    @memset(bytes, 255);
+    bytes[0] = 0;
+    parent.finishRendering();
+    const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageRasterBatch, "results"));
+    var pages = [_]Page{
+        .{ .page_number = 7, .rendered = .{ .bytes = bytes, .width = 4, .height = 4, .stride = 16, .pixel_format = .rgba8, .requested_dpi = 150, .effective_dpi = 72, .quality = .degraded, .diagnostics = .{ .fallback_text_groups = 1 } } },
+        .{ .page_number = 9, .failure = error.InvalidPdfPage },
+    };
+    const raster = document_extraction_mod.RenderedPdfPageRasterBatch{ .results = &pages, .requested_parallelism = 1, .peak_launched_workers = 1, .peak_parallelism = 1, .peak_admitted_pixels = 16, .peak_admitted_bytes = 64, .thread_spawn_fallbacks = 0 };
+    {
+        var cache = SharedPdfPngWindow{};
+        defer cache.deinit();
+        try std.testing.expect(cache.batch == null and parent.consumer_count == 0);
+        const encoded = (try cache.get(&runtime, raster, parent, 1024 * 1024)).?;
+        const reused = (try cache.get(&runtime, raster, parent, 1)).?;
+        try std.testing.expect(encoded.results.ptr == reused.results.ptr);
+        try std.testing.expect(encoded.results[0].rendered.?.png.ptr == reused.results[0].rendered.?.png.ptr);
+        try std.testing.expectEqual(@as(usize, 7), encoded.results[0].page_number);
+        try std.testing.expectEqual(error.InvalidPdfPage, encoded.results[1].failure.?);
+        const png = encoded.results[0].rendered.?;
+        try std.testing.expectEqual(@as(u32, 1), png.diagnostics.?.fallback_text_groups);
+        try std.testing.expectEqual(@as(u16, 72), png.effective_dpi);
+        try std.testing.expect(!SharedPdfPngWindow.fits(encoded, png.png.len - 1));
+        try std.testing.expect(SharedPdfPngWindow.fits(encoded, png.png.len));
+        const decoded = try antfly_image.png.decodeRgba(alloc, png.png);
+        defer alloc.free(decoded.rgba);
+        try std.testing.expectEqualSlices(u8, bytes, decoded.rgba);
+        try std.testing.expectEqual(cache.lease.?.limit.live_bytes, parent.consumer_credit);
+        try std.testing.expect(parent.consumer_credit < 1024 * 1024);
+    }
+    try std.testing.expectEqual(@as(usize, 0), parent.consumer_credit);
+    {
+        var denied = SharedPdfPngWindow{};
+        defer denied.deinit();
+        try std.testing.expectError(error.OutOfMemory, denied.get(&runtime, raster, parent, 1));
+        try std.testing.expect(try denied.get(&runtime, raster, parent, 1024 * 1024) == null);
+        try std.testing.expectEqual(@as(usize, 0), parent.consumer_count);
+    }
+    {
+        // Force compressor output growth past its allocator ceiling, rather
+        // than merely rejecting the small result descriptor allocation.
+        const noise = try alloc.alloc(u8, 256 * 256 * 4);
+        defer alloc.free(noise);
+        var random = std.Random.DefaultPrng.init(7);
+        random.random().bytes(noise);
+        var noisy_pages = [_]Page{pages[0]};
+        noisy_pages[0].rendered.?.bytes = noise;
+        noisy_pages[0].rendered.?.width = 256;
+        noisy_pages[0].rendered.?.height = 256;
+        noisy_pages[0].rendered.?.stride = 1024;
+        var noisy = raster;
+        noisy.results = &noisy_pages;
+        var denied = SharedPdfPngWindow{};
+        defer denied.deinit();
+        try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, denied.get(&runtime, noisy, parent, 24 * 1024));
+        try std.testing.expectEqual(@as(usize, 0), parent.consumer_count);
+    }
+    {
+        runtime.active_provider_guard.deadline_ns = 0;
+        defer runtime.active_provider_guard = .{};
+        var expired = SharedPdfPngWindow{};
+        defer expired.deinit();
+        try std.testing.expectError(error.EnrichmentWaitTimeout, expired.get(&runtime, raster, parent, 1024 * 1024));
+        try std.testing.expectEqual(@as(usize, 0), parent.consumer_count);
+    }
+}
+
 fn pdfEmbeddingWindowBatchEnd(rendered: PdfEmbeddingRenderedWindow, start: usize, model_items: usize, max_bytes: usize, max_pixels: u64, transport: inference_work.AttachmentTransport) !usize {
     const total = switch (rendered) {
         inline else => |batch| batch.results.len,
@@ -11472,6 +11745,17 @@ const PdfWindowConsumerLease = struct {
         return err;
     }
 
+    /// End a scratch phase while keeping its completed representation pinned.
+    /// Release excess reservation and idle parent credit before model admission.
+    fn retainLiveBytes(self: *@This()) void {
+        const retained = self.limit.live_bytes;
+        const credit = @min(self.borrowed_credit, retained);
+        if (self.parent) |window| window.consumer_credit -= self.borrowed_credit - credit;
+        self.borrowed_credit = credit;
+        if (self.reservation) |*reservation| reservation.shrink(reservation.bytes - (retained - credit));
+        self.limit.max_live_bytes = retained;
+    }
+
     fn deinit(self: *@This()) void {
         std.debug.assert(self.limit.live_bytes == 0);
         if (self.parent) |window| {
@@ -11702,13 +11986,15 @@ fn preparePdfPixelPrefix(
     session: *document_extraction_mod.PdfRenderSession,
     requests: []const document_extraction_mod.PdfPageRenderRequest,
     plans: []document_extraction_mod.PreparedPdfPageRenderPlan,
-    max_pixels: u64,
+    options: document_extraction_mod.PdfPageRenderBatchOptions,
+    raster: bool,
 ) !usize {
+    const max_pixels = options.max_inflight_pixels;
     if (requests.len == 0 or requests.len != plans.len or max_pixels == 0)
         return error.InferenceDecodedPixelsExceeded;
     var total: u64 = 0;
     for (requests, 0..) |request, index| {
-        const plan = try session.preparePageRenderPlan(request);
+        const plan = try session.prepareAdmittedPageRenderPlan(request, options, raster);
         const next = std.math.add(u64, total, plan.geometry().pixels) catch {
             if (index == 0) return error.InferenceDecodedPixelsExceeded;
             return index;
@@ -11988,6 +12274,17 @@ test "shared PDF phase leases reuse idle credit and admit only nested consumer e
         try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
     }
     try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    {
+        var representation = try PdfWindowConsumerLease.init(alloc, &manager, lease, 40);
+        defer representation.deinit();
+        const png = try representation.allocator().alloc(u8, 25);
+        defer representation.allocator().free(png);
+        try std.testing.expectEqual(@as(u64, 50), manager.sliceStats(.document_extraction_working_set).used_bytes);
+        representation.retainLiveBytes();
+        try std.testing.expectEqual(@as(u64, 35), manager.sliceStats(.document_extraction_working_set).used_bytes);
+        try std.testing.expectEqual(@as(usize, 20), representation.borrowed_credit);
+        try std.testing.expectError(error.OutOfMemory, representation.allocator().alloc(u8, 1));
+    }
     const owner_response = try lease.allocator().alloc(u8, 20);
     defer lease.allocator().free(owner_response);
     try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
@@ -12183,7 +12480,8 @@ fn renderRuntimePdfWindow(
         session,
         requests.items,
         prepared_plans,
-        config.pdf_render_max_inflight_pixels,
+        .{ .max_inflight_pixels = config.pdf_render_max_inflight_pixels, .max_inflight_bytes = max_inflight_bytes },
+        use_borrowed_rasters,
     );
     if (pixel_count < requests.items.len and pixel_count > batch_policy.max_items and pixel_count % batch_policy.max_items != 0)
         pixel_count = nextPdfWindowCandidate(pixel_count, batch_policy.max_items);
@@ -18539,7 +18837,8 @@ const PdfEmbeddingWindowPreparer = struct {
             &self.coordinator.session,
             requests[0..count],
             prepared_plans,
-            self.render_config.pdf_render_max_inflight_pixels,
+            .{ .max_inflight_pixels = self.render_config.pdf_render_max_inflight_pixels, .max_inflight_bytes = available_bytes },
+            self.use_borrowed_rasters,
         );
         if (count < requested_count and count > self.batch_items and count % self.batch_items != 0)
             count = nextPdfWindowCandidate(count, self.batch_items);

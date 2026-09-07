@@ -19,6 +19,52 @@ import (
 	"go.uber.org/zap"
 )
 
+func TestAttemptTimeoutPreservesCompleteFramedReplay(t *testing.T) {
+	p := NewProxy(Config{Logger: zap.NewNop()})
+	var interrupts atomic.Int32
+	replay := &proxyStreamingReplayBody{
+		prefix: []byte("prefix"), tail: strings.NewReader("tail"), total: 10,
+		spillDir: t.TempDir(), interrupt: func() { interrupts.Add(1) },
+	}
+	if err := replay.Prepare(2); err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+	calls := 0
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if string(body) != "prefixtail" {
+			t.Fatalf("body=%q", body)
+		}
+		if calls == 1 {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+	})}
+	req := httptest.NewRequest(http.MethodPost, "/ai/v1/read", nil)
+	endpoint := &Endpoint{address: "http://reader.internal"}
+	_, err := p.forwardRequestWithRetry(req, replay, endpoint, &Route{RetryTimeout: 20 * time.Millisecond}, true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first error=%v", err)
+	}
+	if replay.spooled != replay.total || replay.replayErr != nil || interrupts.Load() != 0 {
+		t.Fatalf("complete spool invalidated: bytes=%d err=%v interrupts=%d", replay.spooled, replay.replayErr, interrupts.Load())
+	}
+	response, err := p.forwardRequestWithRetry(req, replay, endpoint, &Route{RetryTimeout: time.Second}, false)
+	if err != nil {
+		t.Fatalf("complete replay unusable after attempt timeout: %v", err)
+	}
+	defer response.Body.Close()
+	if calls != 2 || req.Context().Err() != nil {
+		t.Fatalf("calls=%d parent error=%v", calls, req.Context().Err())
+	}
+}
+
 func TestFramedRejectionFinalizesUploadBeforeAndAfterRoutingPrefix(t *testing.T) {
 	for _, invalidPrefix := range []bool{false, true} {
 		t.Run(fmt.Sprintf("invalid-prefix=%v", invalidPrefix), func(t *testing.T) {

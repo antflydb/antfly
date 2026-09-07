@@ -157,19 +157,11 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             return error.PdfRenderingUnavailable;
         }
 
-        pub const RenderedPagePng = struct {
-            png: []u8,
-            requested_dpi: u16,
-            effective_dpi: u16,
-            width: u32,
-            height: u32,
-            quality: RenderQuality = .native,
-            diagnostics: ?PageRenderDiagnostics = null,
-        };
+        pub const RenderedPagePng = @import("antfly_pdf").RenderedPagePng;
         pub const RenderedPageRaster = @import("antfly_pdf").RenderedPageRaster;
         pub const RenderedPageRasterBatch = @import("antfly_pdf").RenderedPageRasterBatch;
 
-        pub const RenderQuality = enum { native, degraded, compatibility_backend };
+        pub const RenderQuality = @import("antfly_pdf").RenderQuality;
         pub const RenderProfile = enum { exact, ocr };
         // Keep the erased executor ABI identical in unit/minimal builds even
         // though the rendering functions themselves are stubbed.
@@ -296,6 +288,12 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         }
 
         pub fn prepareParsedPageRenderPlan(_: *reader.Reader, _: PageRenderRequest) anyerror!PreparedPageRenderPlan {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub const RenderBatchOutputKind = enum { png, raster };
+
+        pub fn prepareAdmittedPageRenderPlan(_: *reader.Reader, _: PageRenderRequest, _: PageRenderBatchOptions, _: RenderBatchOutputKind) anyerror!PreparedPageRenderPlan {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -575,6 +573,10 @@ pub const PdfRenderSession = struct {
 
     pub fn preparePageRenderPlan(self: *PdfRenderSession, request: PdfPageRenderRequest) !PreparedPdfPageRenderPlan {
         return try pdf.prepareParsedPageRenderPlan(&self.parsed, request);
+    }
+
+    pub fn prepareAdmittedPageRenderPlan(self: *PdfRenderSession, request: PdfPageRenderRequest, options: PdfPageRenderBatchOptions, raster: bool) !PreparedPdfPageRenderPlan {
+        return try pdf.prepareAdmittedPageRenderPlan(&self.parsed, request, options, if (raster) .raster else .png);
     }
 
     pub fn estimatePreparedWaveScratchBytes(

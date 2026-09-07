@@ -157,6 +157,11 @@ one model invocation's pixel ceiling. Per-page geometry still fits the model;
 OCR and embedding executors independently partition the window by their own
 item, byte, and aggregate pixel limits. Renderer waves keep their thread,
 scratch-byte, and pixel bounds independently of those executor partitions.
+Preparation uses the native renderer's admission-adjusted geometry, including
+the per-worker scratch/decode reservation, physical pixel ceiling, and raw
+output allowance. Both window-prefix accounting and execution use that same
+source-bound plan. A page larger than the physical window is adaptively scaled
+before prefix selection, rather than rejected before the renderer can admit it.
 After a widening denial, candidates descend through whole owner batch widths
 before trying sub-batch prefixes. Pixel-limited prefixes follow the same rule.
 This preserves native owner batches when a wider consumer cannot be enrolled.
@@ -179,8 +184,21 @@ bounded contract-resolution allocator.
 Before dispatching an owner's rendered window or starting speculative render
 prefetch, it offers the borrowed pages to later compatible consumers. Physical
 compatibility includes source identity and credentials, DPI, pixel/dimension
-limits, preferred image geometry, encoded-output allowance, representation,
-and decode limits. Model names, prompts, and result types are not render keys.
+limits, preferred image geometry, renderer ceilings, and decode limits. Model
+names, prompts, and result types are not render keys. Representation and encoded
+output allowances remain consumer contracts, separate from physical geometry.
+A raw-raster owner can lazily encode one lossless PNG representation of its
+window for compatible PNG consumers. Every consumer borrows those same PNGs;
+encoding scratch is released before inference and only the actual PNG bytes
+stay reserved. A separate bounded, non-reclaiming consumer lease accounts for
+compression growth and retention alongside the pinned raster. Cancellation and
+deadlines bound compression work. No representation survives the window.
+If a PNG exceeds a consumer's singleton output allowance, or the representation
+cannot be admitted, that consumer retains its ordinary bounded traversal. The
+shared cache never resizes pixels to fit another consumer's wire policy.
+This optimization is intentionally directional: an encoded owner may already
+have resized its pages and cannot supply the original raster geometry. It is
+not a document-wide cache or a claim of order-independent render sharing.
 
 - Enrollment checks completed OCR state using the same metadata/byte
   fingerprint and navigation-readiness gate as ordinary document extraction,
@@ -3177,6 +3195,11 @@ The hardening above follows these long-term rules:
     writers without deadline support must expose an interruptible request body.
     Cancellation callbacks and active reads join before replay storage is freed.
     Opening a retry is read-only and cannot restart a failed or incomplete seal.
+    Replay integrity is independent of the upstream attempt's outcome: a fully
+    spooled upload remains usable after an attempt timeout. Finishing a sealed
+    spool does not interrupt the incoming connection or cancel the parent
+    request. Incomplete uploads still join deadline-interrupted reads and retain
+    their sealing errors; genuine parent cancellation still prevents forwarding.
     Framed v1
     requires its exact descriptor-derived
     `Content-Length`; descriptor/length mismatches and ambiguous chunked framing
