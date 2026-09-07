@@ -5196,6 +5196,8 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "enrichment provider deadlines and progress cross native clock boundaries",
+            "db merge artifact import holds both apply locks through copy failure",
             "context-aware embedder receives the request lifetime and fails closed when absent",
             "inference timeout policy avoids inline retry storms",
             "inference recovery is scoped by model and backend",

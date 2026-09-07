@@ -8994,8 +8994,13 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
     );
     defer admission.deinit();
     const edge_reader = DistributedEdgeReader{
-        .catalog = undefined,
-        .worker = undefined,
+        // Paging validates its deadline even when no edge expansion or
+        // routing snapshot is needed. Keep those clock fields initialized.
+        .catalog = .{ .ptr = undefined, .vtable = undefined },
+        .worker = .{ .ptr = undefined, .vtable = &.{
+            .execute_graph_expand = undefined,
+            .execute_graph_hydrate = undefined,
+        } },
         .source_table = "docs",
         .index_name = "graph",
         .consistency = .read_index,
@@ -13767,6 +13772,9 @@ test "distributed graph traverse target nodes filter returned nodes without prun
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14116,6 +14124,9 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14682,6 +14693,9 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

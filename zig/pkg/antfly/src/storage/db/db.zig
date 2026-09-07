@@ -19235,15 +19235,18 @@ pub const DB = struct {
         const donor_first = std.mem.order(u8, donor.core.path, self.core.path) == .lt;
         if (donor_first) {
             donor.core.lockApplyShared();
-            defer donor.core.unlockApplyShared();
             self.core.lockApply();
-            defer self.core.unlockApply();
         } else {
             self.core.lockApply();
-            defer self.core.unlockApply();
             donor.core.lockApplyShared();
-            defer donor.core.unlockApplyShared();
         }
+        defer if (donor_first) {
+            self.core.unlockApply();
+            donor.core.unlockApplyShared();
+        } else {
+            donor.core.unlockApplyShared();
+            self.core.unlockApply();
+        };
 
         const store_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
         defer self.alloc.free(store_lower);
@@ -104752,6 +104755,58 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
     defer donor_result.deinit();
     for (donor_result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:z"));
+    }
+}
+
+test "db merge artifact import holds both apply locks through copy failure" {
+    const Probe = struct {
+        donor: *apply_rw_lock_mod.ApplyRwLock,
+        receiver: *apply_rw_lock_mod.ApplyRwLock,
+        checked: bool = false,
+        both_held: bool = false,
+
+        fn allocate(ptr: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const donor_unlocked = self.donor.tryLockExclusive();
+            if (donor_unlocked) self.donor.unlockExclusive();
+            const receiver_unlocked = self.receiver.tryLockExclusive();
+            if (receiver_unlocked) self.receiver.unlockExclusive();
+            self.checked = true;
+            self.both_held = !donor_unlocked and !receiver_unlocked;
+            return null;
+        }
+    };
+    for ([_]bool{ true, false }) |donor_first| {
+        var donor_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var receiver_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var probe = Probe{ .donor = &donor_lock, .receiver = &receiver_lock };
+        // Allocation fails at the start of the actual copy; no store or index
+        // fields may be touched. Verify both lock orders and error unwinding.
+        var first_path = [_]u8{'a'};
+        var last_path = [_]u8{'z'};
+        var donor_core: db_core.DBCore = undefined;
+        donor_core.path = if (donor_first) &first_path else &last_path;
+        donor_core.apply_mutex = &donor_lock;
+        var receiver_core: db_core.DBCore = undefined;
+        receiver_core.path = if (donor_first) &last_path else &first_path;
+        receiver_core.apply_mutex = &receiver_lock;
+        var donor: DB = undefined;
+        donor.core = &donor_core;
+        var receiver: DB = undefined;
+        receiver.core = &receiver_core;
+        receiver.alloc = .{ .ptr = &probe, .vtable = &.{
+            .alloc = Probe.allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.mem.Allocator.noFree,
+        } };
+        try std.testing.expectError(error.OutOfMemory, receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "a", .end = "z" }));
+        try std.testing.expect(probe.checked);
+        try std.testing.expect(probe.both_held);
+        try std.testing.expect(donor_lock.tryLockExclusive());
+        donor_lock.unlockExclusive();
+        try std.testing.expect(receiver_lock.tryLockExclusive());
+        receiver_lock.unlockExclusive();
     }
 }
 

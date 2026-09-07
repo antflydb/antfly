@@ -3319,6 +3319,37 @@ retries. The deadline regression uses an ordinary source document with a
 `title`, matching the existing graph scenario. That separate edges-only
 document observation is not repaired or claimed covered by this deadline fix.
 
+### Merge Import and Enrichment Deadline Follow-up (2026-09-07)
+
+Production review found that merge artifact import acquired its apply locks
+inside `if/else` blocks whose `defer`s released them before copying began.
+Unlocking now occurs at function scope in reverse acquisition order. A
+regression exercises the actual import's first allocation in both path orders,
+verifies both locks are held there, and verifies allocation failure releases
+them. Transition admission still owns public-operation exclusion; it does not
+replace these DB locks against maintenance.
+
+Enrichment also retained a native inference boundary after its runtime clock
+became executor-owned. Provider contexts now receive translated native
+deadlines, and progress reports translate those deadlines back into the
+runtime clock. Coverage includes runtime epochs ahead of and behind native
+time, live and expired deadlines, fallback budgets, cancellation, and progress
+without a deadline. This does not make native provider execution deterministic.
+
+The Linux CI abort in the paged graph-anchor test came from an undefined
+worker fixture: deadline validation now consults the worker clock even when
+the pattern has no edges. The fixture now initializes its worker and catalog
+clock fields without bypassing production deadline validation.
+The broader graph run also repaired three catalog fixtures that had not opted
+into the existing test routing adapter.
+
+Validation: both new regressions pass in Debug and ReleaseSafe; the enrichment
+suite passes 116 tests, graph/merge-cutover coverage passes 53, and merge
+coordinator coverage passes nine. The production rebuild and formatting checks
+pass, as do all 21 selected public deadline/join/graph/semantic E2Es. These
+local checks cover the reported Linux CI abort; they do not claim
+that a new remote CI run has completed.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

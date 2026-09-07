@@ -1108,6 +1108,12 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
 fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.Progress) void {
     const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw.?));
     const now_ns = runtime.deadline_clock.nowRealtimeNs();
+    // Provider progress uses the native inference clock. Sample the target
+    // first so returning to the runtime clock cannot extend the budget.
+    const deadline_ns = if (progress.deadline_ns) |deadline|
+        now_ns +| (deadline -| platform_time.monotonicNs())
+    else
+        null;
     const now_ms = runtime.clock.nowRealtimeMs();
     if (comptime builtin.os.tag == .freestanding) {
         runtime.active_inference_phase = progress.phase;
@@ -1115,7 +1121,7 @@ fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.P
         runtime.last_progress_ms = now_ms;
         runtime.active_progress_completed = progress.completed;
         runtime.active_progress_total = progress.total;
-        updateActiveDeadlineAssumeLocked(runtime, progress.deadline_ns, now_ns, now_ms);
+        updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
         if (progress.model.len > 0) {
             runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
             @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
@@ -1134,7 +1140,7 @@ fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.P
     runtime.last_progress_ms = now_ms;
     runtime.active_progress_completed = progress.completed;
     runtime.active_progress_total = progress.total;
-    updateActiveDeadlineAssumeLocked(runtime, progress.deadline_ns, now_ns, now_ms);
+    updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
     if (progress.model.len > 0) {
         runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
         @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
@@ -2597,10 +2603,15 @@ fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_co
         guard.cancellation
     else
         runtime.config.cancellation;
+    // Inference RequestContext still consumes native monotonic deadlines,
+    // even when its I/O and this runtime borrow another executor clock.
+    const native_now = platform_time.monotonicNs();
+    const runtime_now = runtime.deadline_clock.nowRealtimeNs();
+    const deadline = guard.deadline_ns orelse
+        runtime_now +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms;
     return .{
         .io = if (runtime.io_impl) |io_impl| io_impl.io() else std.Io.Threaded.global_single_threaded.io(),
-        .deadline_ns = guard.deadline_ns orelse
-            runtime.deadline_clock.nowRealtimeNs() +| @max(runtime.config.sync_wait_timeout_ms, 1) *| std.time.ns_per_ms,
+        .deadline_ns = native_now +| (deadline -| runtime_now),
         .cancellation = if (cancellation.ptr != null) cancellation else null,
         .progress = .{ .ptr = runtime, .update_fn = noteInferenceProgress },
     };
@@ -4767,6 +4778,59 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     try std.testing.expect(!runtime.retrying);
     try std.testing.expectEqual(@as(u32, 0), runtime.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+}
+
+test "enrichment provider deadlines and progress cross native clock boundaries" {
+    if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var clock: platform_clock.ManualClock = .{};
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+        .deadline_clock = clock.clock(),
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    for ([_]u64{ 7 * std.time.ns_per_s, platform_time.monotonicNs() + 1000 * std.time.ns_per_s }) |epoch| {
+        clock.setRealtimeNs(epoch);
+        runtime.active_provider_guard = .{
+            .deadline_ns = epoch + std.time.ns_per_s,
+            .clock = clock.clock(),
+            .cancellation = CancellationToken.fromAtomic(&cancelled),
+        };
+        const provider = assetProviderRequestContext(&runtime);
+        try provider.check();
+        const remaining = (try provider.remainingTimeoutMs()).?;
+        try std.testing.expect(remaining > 0 and remaining <= 1_000);
+        // Provider progress returns its native deadline to the runtime epoch.
+        try provider.update(.executing, 1, 2);
+        try std.testing.expect(runtime.active_deadline_ns > epoch);
+        try std.testing.expect(runtime.active_deadline_ns <= epoch + std.time.ns_per_s);
+        try std.testing.expectEqual(@as(u64, 1), runtime.active_progress_completed);
+        const saved = runtime.active_deadline_ns;
+        noteInferenceProgress(&runtime, .{ .phase = .executing });
+        try std.testing.expectEqual(saved, runtime.active_deadline_ns);
+        noteInferenceProgress(&runtime, .{ .phase = .executing, .deadline_ns = 0 });
+        try std.testing.expectEqual(epoch, runtime.active_deadline_ns);
+        clock.advanceMs(1_000);
+        try std.testing.expectError(error.Timeout, assetProviderRequestContext(&runtime).check());
+        runtime.active_provider_guard = .{};
+        const fallback = assetProviderRequestContext(&runtime);
+        try fallback.check();
+        try std.testing.expect((try fallback.remainingTimeoutMs()).? <= 1_000);
+        cancelled.store(true, .release);
+        try std.testing.expectError(error.Cancelled, provider.check());
+        cancelled.store(false, .release);
+    }
 }
 
 test "foreground enrichment catch-up guard has a monotonic deadline" {
