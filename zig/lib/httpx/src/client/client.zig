@@ -611,12 +611,28 @@ const RequestGate = struct {
     }
 
     fn release(self: *RequestGate, io: Io) void {
-        const previous = self.state.fetchSub(1, .acq_rel);
-        std.debug.assert(previous & count_mask != 0);
-        if (previous & closed_bit != 0 and previous & count_mask == 1) {
-            self.drain_mutex.lockUncancelable(io);
-            self.drained.broadcast(io);
-            self.drain_mutex.unlock(io);
+        var observed = self.state.load(.acquire);
+        while (true) {
+            std.debug.assert(observed & count_mask != 0);
+            if (observed == closed_bit | 1) {
+                // Remain counted while waiting for the drain lock. Publishing
+                // zero first would let shutdown return and destroy this gate
+                // before our broadcast/unlock finished.
+                self.drain_mutex.lockUncancelable(io);
+                defer self.drain_mutex.unlock(io);
+                const previous = self.state.fetchSub(1, .acq_rel);
+                std.debug.assert(previous == closed_bit | 1);
+                self.drained.broadcast(io);
+                return;
+            }
+            // Open admission and non-final releases retain the atomic fast
+            // path. If close races with the last open release, its CAS fails
+            // and retries through the synchronized final-release path above.
+            if (self.state.cmpxchgWeak(observed, observed - 1, .acq_rel, .acquire)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return; // No gate access after relinquishing this reference.
         }
     }
 
@@ -5117,6 +5133,41 @@ test "HTTPS HEAD returns after headers on a keep-alive connection" {
 
 // Tests for decompressBody and responseFromParser were removed — these methods
 // were replaced by the streaming decompression pipeline in buildStreamingResponse.
+
+test "request gate retains the last borrower until release owns the drain lock" {
+    const Interleave = struct {
+        gate: *RequestGate,
+        observed_active: usize = 0,
+        drained_during_release: bool = false,
+        fn wait(raw: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // The shutdown actor owns the lock when release tries to enter.
+            // If it sees zero here it may finish draining and free the client.
+            self.observed_active = self.gate.active();
+            self.gate.drain_mutex.unlock(std.testing.io);
+            if (self.observed_active == 0) {
+                self.gate.drain(std.testing.io);
+                self.drained_during_release = true;
+            }
+        }
+        fn wake(_: ?*anyopaque, ptr: *const u32, count: u32) void {
+            std.testing.io.vtable.futexWake(std.testing.io.userdata, ptr, count);
+        }
+    };
+    var gate: RequestGate = .{};
+    _ = try gate.tryAcquire(std.testing.io);
+    gate.close(std.testing.io);
+    gate.drain_mutex.lockUncancelable(std.testing.io);
+    var schedule: Interleave = .{ .gate = &gate };
+    var vtable = std.testing.io.vtable.*;
+    vtable.futexWaitUncancelable = Interleave.wait;
+    vtable.futexWake = Interleave.wake;
+    gate.release(.{ .userdata = &schedule, .vtable = &vtable });
+    try std.testing.expectEqual(@as(usize, 1), schedule.observed_active);
+    try std.testing.expect(!schedule.drained_during_release);
+    gate.drain(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), gate.active());
+}
 
 test "request gate closes admission and drains a committed borrower" {
     const io = std.testing.io;

@@ -109,6 +109,36 @@ pub const FsProgressStore = struct {
         return true;
     }
 
+    pub fn getManifestGcFloor(self: *FsProgressStore, namespace: []const u8) !?u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.readOptionalU64Unlocked(namespace, .manifest_gc_floor) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn compareAndSwapManifestGcFloor(self: *FsProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var lock_io_impl = threadedIo();
+        defer lock_io_impl.deinit();
+        const lock_io = lock_io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, lock_io);
+        defer namespace_lock.close(lock_io);
+        try namespace_lock.lock(lock_io, .exclusive);
+        defer namespace_lock.unlock(lock_io);
+
+        const current = self.readOptionalU64Unlocked(namespace, .manifest_gc_floor) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (current != expected) return false;
+        if (current != null and floor < current.?) return false;
+        try self.writeU64Unlocked(namespace, .manifest_gc_floor, floor);
+        return true;
+    }
+
     pub fn getEnrichmentHeadVersion(self: *FsProgressStore, namespace: []const u8) !?u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -379,6 +409,7 @@ pub const FsProgressStore = struct {
     const Kind = enum {
         head,
         gc_watermark,
+        manifest_gc_floor,
         enrichment_head_version,
         enrichment_stage,
         enrichment_doc_offset,
@@ -479,6 +510,8 @@ pub const FsProgressStore = struct {
         .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
+        .get_manifest_gc_floor = erasedGetManifestGcFloor,
+        .compare_and_swap_manifest_gc_floor = erasedCompareAndSwapManifestGcFloor,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
         .compare_and_swap_enrichment_head_version = erasedCompareAndSwapEnrichmentHeadVersion,
         .get_enrichment_stage = erasedGetEnrichmentStage,
@@ -529,6 +562,16 @@ pub const FsProgressStore = struct {
     fn erasedCompareAndSwapGcWatermark(ptr: *anyopaque, namespace: []const u8, expected: ?u64, watermark: u64) !bool {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapGcWatermark(namespace, expected, watermark);
+    }
+
+    fn erasedGetManifestGcFloor(ptr: *anyopaque, namespace: []const u8) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getManifestGcFloor(namespace);
+    }
+
+    fn erasedCompareAndSwapManifestGcFloor(ptr: *anyopaque, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapManifestGcFloor(namespace, expected, floor);
     }
 
     fn erasedGetEnrichmentHeadVersion(ptr: *anyopaque, namespace: []const u8) !?u64 {
@@ -729,6 +772,7 @@ fn pathForAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, k
     return switch (kind) {
         .head => try headPathAlloc(alloc, root_dir, namespace),
         .gc_watermark => try std.fs.path.join(alloc, &.{ root_dir, namespace, "GC_WATERMARK" }),
+        .manifest_gc_floor => try std.fs.path.join(alloc, &.{ root_dir, namespace, "MANIFEST_GC_FLOOR" }),
         .enrichment_head_version => try std.fs.path.join(alloc, &.{ root_dir, namespace, "ENRICHMENT_HEAD_VERSION" }),
         .enrichment_stage => try std.fs.path.join(alloc, &.{ root_dir, namespace, "ENRICHMENT_STAGE" }),
         .enrichment_doc_offset => try std.fs.path.join(alloc, &.{ root_dir, namespace, "ENRICHMENT_DOC_OFFSET" }),
@@ -799,6 +843,28 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless manifest GC floor persists across filesystem owners and rejects rollback" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "manifest-gc-floor");
+    defer cleanupTmp(path);
+    {
+        var fs = try FsProgressStore.init(alloc, std.mem.span(path));
+        var store = fs.progressStore();
+        defer store.deinit();
+        try std.testing.expectEqual(@as(?u64, null), try store.getManifestGcFloor("docs"));
+        try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", null, 2));
+    }
+    var fs = try FsProgressStore.init(alloc, std.mem.span(path));
+    var store = fs.progressStore();
+    defer store.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), try store.getManifestGcFloor("docs"));
+    try std.testing.expect(!try store.compareAndSwapManifestGcFloor("docs", null, 3));
+    try std.testing.expect(!try store.compareAndSwapManifestGcFloor("docs", 2, 1));
+    try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", 2, 3));
+    try std.testing.expectEqual(@as(?u64, 3), try store.getManifestGcFloor("docs"));
 }
 
 test "fs progress store manages head and gc watermark with CAS" {

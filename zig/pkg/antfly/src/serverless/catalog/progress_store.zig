@@ -36,6 +36,8 @@ pub const ProgressStore = struct {
         compare_and_swap_head_fenced: *const fn (*anyopaque, []const u8, ?u64, u64, PublicationFence) anyerror!bool,
         get_gc_watermark: *const fn (*anyopaque, []const u8) anyerror!?u64,
         compare_and_swap_gc_watermark: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
+        get_manifest_gc_floor: *const fn (*anyopaque, []const u8) anyerror!?u64,
+        compare_and_swap_manifest_gc_floor: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         get_enrichment_head_version: *const fn (*anyopaque, []const u8) anyerror!?u64,
         compare_and_swap_enrichment_head_version: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         get_enrichment_stage: *const fn (*anyopaque, []const u8) anyerror!?u64,
@@ -87,6 +89,17 @@ pub const ProgressStore = struct {
 
     pub fn getGcWatermark(self: *ProgressStore, namespace: []const u8) !?u64 {
         return try self.vtable.get_gc_watermark(self.ptr, namespace);
+    }
+
+    /// Versions strictly below this durable, monotonic boundary are retired.
+    /// Record it before removing content so interrupted GC cannot resurrect
+    /// partially deleted history when the retention policy increases.
+    pub fn getManifestGcFloor(self: *ProgressStore, namespace: []const u8) !?u64 {
+        return try self.vtable.get_manifest_gc_floor(self.ptr, namespace);
+    }
+
+    pub fn compareAndSwapManifestGcFloor(self: *ProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        return try self.vtable.compare_and_swap_manifest_gc_floor(self.ptr, namespace, expected, floor);
     }
 
     pub fn compareAndSwapGcWatermark(self: *ProgressStore, namespace: []const u8, expected: ?u64, watermark: u64) !bool {

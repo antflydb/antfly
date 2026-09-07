@@ -256,6 +256,21 @@ pub const ObjectProgressStore = struct {
         return try self.compareAndSwap(key, expected, watermark);
     }
 
+    pub fn getManifestGcFloor(self: *ObjectProgressStore, namespace: []const u8) !?u64 {
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, "MANIFEST_GC_FLOOR");
+        defer self.alloc.free(key);
+        return self.tryReadValue(key);
+    }
+
+    pub fn compareAndSwapManifestGcFloor(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, "MANIFEST_GC_FLOOR");
+        defer self.alloc.free(key);
+        if (expected) |current| {
+            if (floor < current) return false;
+        }
+        return try self.compareAndSwap(key, expected, floor);
+    }
+
     pub fn getEnrichmentHeadVersion(self: *ObjectProgressStore, namespace: []const u8) !?u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "ENRICHMENT_HEAD_VERSION");
         defer self.alloc.free(key);
@@ -564,6 +579,8 @@ pub const ObjectProgressStore = struct {
         .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
+        .get_manifest_gc_floor = erasedGetManifestGcFloor,
+        .compare_and_swap_manifest_gc_floor = erasedCompareAndSwapManifestGcFloor,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
         .compare_and_swap_enrichment_head_version = erasedCompareAndSwapEnrichmentHeadVersion,
         .get_enrichment_stage = erasedGetEnrichmentStage,
@@ -615,6 +632,16 @@ pub const ObjectProgressStore = struct {
     fn erasedCompareAndSwapGcWatermark(ptr: *anyopaque, namespace: []const u8, expected: ?u64, watermark: u64) !bool {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapGcWatermark(namespace, expected, watermark);
+    }
+
+    fn erasedGetManifestGcFloor(ptr: *anyopaque, namespace: []const u8) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getManifestGcFloor(namespace);
+    }
+
+    fn erasedCompareAndSwapManifestGcFloor(ptr: *anyopaque, namespace: []const u8, expected: ?u64, floor: u64) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapManifestGcFloor(namespace, expected, floor);
     }
 
     fn erasedGetEnrichmentHeadVersion(ptr: *anyopaque, namespace: []const u8) !?u64 {
@@ -798,6 +825,30 @@ fn enrichmentStageHeadOffsetKeyAlloc(
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+test "serverless manifest GC floor persists across object store owners and rejects rollback" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "manifest-gc-floor");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(path)});
+    defer alloc.free(uri);
+    {
+        var impl = try ObjectProgressStore.initFileUri(alloc, uri);
+        var store = impl.progressStore();
+        defer store.deinit();
+        try std.testing.expectEqual(@as(?u64, null), try store.getManifestGcFloor("docs"));
+        try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", null, 2));
+    }
+    var impl = try ObjectProgressStore.initFileUri(alloc, uri);
+    var store = impl.progressStore();
+    defer store.deinit();
+    try std.testing.expectEqual(@as(?u64, 2), try store.getManifestGcFloor("docs"));
+    try std.testing.expect(!try store.compareAndSwapManifestGcFloor("docs", null, 3));
+    try std.testing.expect(!try store.compareAndSwapManifestGcFloor("docs", 2, 1));
+    try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", 2, 3));
+    try std.testing.expectEqual(@as(?u64, 3), try store.getManifestGcFloor("docs"));
 }
 
 test "serverless objectstore-backed progress store supports atomic stage CAS over file uri" {

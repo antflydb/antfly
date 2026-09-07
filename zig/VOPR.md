@@ -3094,6 +3094,39 @@ Both failing test cases pass locally against this checkpoint's rebuilt binary.
 That local rerun does not establish their CI root cause or certify Linux timing;
 the next CI run remains necessary.
 
+### Production Lifetime and Retention Follow-up (2026-09-06)
+
+The next non-VOPR review reproduced and fixed two additional production defects:
+
+- **HTTP client final-release lifetime.** The last closed request remains counted
+  until it owns the drain mutex. Shutdown cannot observe zero and destroy the
+  client while release still needs to broadcast or unlock. Open and non-final
+  releases retain the atomic fast path, with no gate access after relinquishing
+  their reference. A deterministic lock interleaving reproduces the old race.
+  `lib-httpx-client-lifecycle-test` runs all five admission/watchdog regressions
+  and is included in `lib-httpx-test` and the regular unit aggregate.
+- **Retention policy increases after GC.** A durable, monotonic
+  `MANIFEST_GC_FLOOR` records the manifest-version boundary before deletion.
+  Increasing retention stops at previously retired history instead of treating
+  an intentionally deleted parent as corruption and terminating maintenance.
+  The boundary also prevents resurrection of partially deleted versions after
+  cancellation. It is separate from the WAL watermark because multiple
+  publications can share a WAL position. Filesystem and object-store progress
+  owners persist it through their existing durable/CAS mechanisms. Missing HEAD
+  or retained ancestors still fail closed; missing history without a recorded
+  retirement boundary is not silently accepted. Increasing retention preserves
+  available history and accumulates future versions; it cannot restore retired
+  content. This does not add fencing for arbitrary overlapping pruners.
+
+The manifest gate covers equal-WAL publications, larger retention after GC,
+owner reopen, monotonic CAS, genuine missing history, and cancellation after
+exactly one obsolete artifact is removed. HTTP lifecycle and manifest gates
+pass in Debug and ReleaseSafe; the 13-test serverless-workflow VOPR gate passes
+in Debug. The production runtime build, repository formatting check, and
+same-name serverless dense-index update E2E regression also pass locally.
+The broader replay and CI limitations recorded above remain separate from
+these focused production fixes.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

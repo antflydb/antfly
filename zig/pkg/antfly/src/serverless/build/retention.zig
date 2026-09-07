@@ -68,6 +68,7 @@ pub const Pruner = struct {
         cancellation: ?maintenance_cancellation.Token,
     ) !PruneResult {
         try maintenance_cancellation.check(cancellation);
+        const manifest_gc_floor = try self.progress.getManifestGcFloor(namespace);
         // HEAD publication follows the immutable manifest write. Read HEAD
         // first, so a concurrent publisher cannot make it newer than our
         // version listing. Unpublished candidates are not retention roots.
@@ -77,6 +78,9 @@ pub const Pruner = struct {
         };
         const versions = try self.manifests.listVersionsAlloc(namespace);
         defer self.alloc.free(versions);
+        if (manifest_gc_floor) |floor| {
+            if (published_head < floor) return error.PublishedHeadManifestMissing;
+        }
 
         // Object stores can contain manifests whose publisher never completed
         // the HEAD CAS. Retention is defined relative to the published head,
@@ -94,15 +98,23 @@ pub const Pruner = struct {
         defer kept_versions.deinit(self.alloc);
         var lineage_version: ?u64 = published_head;
         var wal_keep_from_lsn: u64 = 0;
+        var oldest_retained_version = published_head;
         while (lineage_version != null and kept_versions.count() < keep_count) {
             try maintenance_cancellation.check(cancellation);
             const version = lineage_version.?;
+            // A previously committed GC pass retired this prefix, even if
+            // cancellation left some manifests or artifacts behind. Raising
+            // retention must not resurrect those partially deleted versions.
+            if (manifest_gc_floor) |floor| {
+                if (version < floor) break;
+            }
             if (!containsVersion(versions, version)) return error.PublishedLineageManifestMissing;
             if (kept_versions.contains(version)) return error.PublishedLineageCycle;
 
             var manifest = try self.manifests.getAlloc(namespace, version);
             defer manifest.deinit(self.alloc);
             try kept_versions.put(self.alloc, version, {});
+            oldest_retained_version = @min(oldest_retained_version, version);
             wal_keep_from_lsn = manifest.wal_start_lsn;
             lineage_version = if (manifest.publication_lineage_tracked)
                 manifest.publication_parent_version
@@ -110,6 +122,13 @@ pub const Pruner = struct {
                 previousStoredVersion(versions, version);
         }
 
+        // Persist the manifest boundary before any destructive work. WAL
+        // positions alone cannot identify it: compaction/enrichment versions
+        // may share an identical wal_start_lsn.
+        if (manifest_gc_floor == null or oldest_retained_version > manifest_gc_floor.?) {
+            const advanced = try self.progress.compareAndSwapManifestGcFloor(namespace, manifest_gc_floor, oldest_retained_version);
+            if (!advanced) return try self.noopResult(namespace, kept_versions.count(), true);
+        }
         const current_gc = try self.progress.getGcWatermark(namespace);
         const effective_keep_from = if (current_gc) |value| @max(value, wal_keep_from_lsn) else wal_keep_from_lsn;
         if (current_gc == null) {
@@ -276,6 +295,64 @@ fn putTestManifestWithLineage(
         .stats = .{ .document_count = 1, .document_base_version = version },
         .artifacts = &refs,
     });
+}
+
+test "serverless retention increases after GC without confusing missing history with corruption" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |committed_gc| {
+        var memory = objectstore.MemoryClient.init(alloc);
+        defer memory.deinit();
+        var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+        var artifacts = artifact_impl.artifactStore();
+        defer artifacts.deinit();
+        var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "tenant");
+        var manifests = manifest_impl.manifestStore();
+        defer manifests.deinit();
+        var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var progress = progress_impl.progressStore();
+        defer progress.deinit();
+        var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "tenant");
+        var wal = wal_impl.walStore();
+        defer wal.deinit();
+        var artifact = try artifacts.put("shared");
+        defer artifact.deinit(alloc);
+        // Enrichment/compaction can publish multiple versions at the same WAL
+        // position. That position must not stand in for the manifest boundary.
+        try putTestManifestWithLineage(&manifests, 1, 42, artifact, true, null);
+        try putTestManifestWithLineage(&manifests, 2, 42, artifact, true, 1);
+        try putTestManifestWithLineage(&manifests, 3, 42, artifact, true, 2);
+        try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+        var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
+        if (committed_gc) {
+            var first = try pruner.pruneNamespace("docs", 2);
+            defer first.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), first.deleted_versions);
+            try std.testing.expectEqual(@as(?u64, 2), try progress.getManifestGcFloor("docs"));
+        } else {
+            // A WAL watermark plus a missing ancestor is NOT proof of GC.
+            try std.testing.expect(try progress.compareAndSwapGcWatermark("docs", null, 42));
+            try manifests.deleteVersion("docs", 1);
+        }
+        var reopened_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "tenant");
+        var reopened = reopened_impl.progressStore();
+        defer reopened.deinit();
+        pruner.progress = &reopened;
+        if (!committed_gc) {
+            try std.testing.expectError(error.PublishedLineageManifestMissing, pruner.pruneNamespace("docs", 5));
+            try std.testing.expectEqual(@as(?u64, null), try reopened.getManifestGcFloor("docs"));
+            continue;
+        }
+        var increased = try pruner.pruneNamespace("docs", 5);
+        defer increased.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), increased.kept_versions);
+        try std.testing.expectEqual(@as(usize, 0), increased.deleted_versions);
+        try std.testing.expectEqual(@as(?u64, 2), try reopened.getManifestGcFloor("docs"));
+        // Even with a GC boundary, losing its retained root remains corruption.
+        try manifests.deleteVersion("docs", 2);
+        try std.testing.expectError(error.PublishedLineageManifestMissing, pruner.pruneNamespace("docs", 5));
+        try manifests.deleteVersion("docs", 3);
+        try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 5));
+    }
 }
 
 test "serverless retention snapshots HEAD before concurrent publication and fails closed on missing roots" {
@@ -584,7 +661,7 @@ test "serverless retention resumes artifact cleanup after cancellation" {
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.checkpoints += 1;
-            if (self.checkpoints == 5) self.requested.store(true, .release);
+            if (self.checkpoints == 6) self.requested.store(true, .release);
         }
     };
     var cancel_state = CancelAfterFirstDelete{ .requested = &requested };
@@ -598,8 +675,23 @@ test "serverless retention resumes artifact cleanup after cancellation" {
     const interrupted_versions = try manifests.listVersionsAlloc("docs");
     defer alloc.free(interrupted_versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, interrupted_versions);
+    var removed_artifacts: usize = 0;
+    for ([_][]const u8{ first_artifact.artifact_id, second_artifact.artifact_id }) |id| {
+        const payload = artifacts.getAlloc(id) catch |err| switch (err) {
+            error.FileNotFound => {
+                removed_artifacts += 1;
+                continue;
+            },
+            else => return err,
+        };
+        alloc.free(payload);
+    }
+    try std.testing.expectEqual(@as(usize, 1), removed_artifacts);
 
-    var resumed = try pruner.pruneNamespace("docs", 1);
+    // A larger policy cannot resurrect versions whose deletion was already
+    // committed, including manifests left behind by interrupted artifact GC.
+    try std.testing.expectEqual(@as(?u64, 3), try progress.getManifestGcFloor("docs"));
+    var resumed = try pruner.pruneNamespace("docs", 3);
     defer resumed.deinit(alloc);
     const final_versions = try manifests.listVersionsAlloc("docs");
     defer alloc.free(final_versions);

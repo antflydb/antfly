@@ -2951,6 +2951,19 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const httpx_client_lifecycle_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/httpx/src/client_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{ "request gate", "request watchdog" },
+    });
+    const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
+    b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
+    lib_httpx_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+
     const objectstore_tests = b.addTest(.{
         .root_module = objectstore_mod,
         .filters = selectTestFilters(b, &.{}),
@@ -4827,6 +4840,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "objectstore-backed manifest store supports publish and list",
             "serverless retention",
+            "serverless manifest GC floor",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
             "host object storage delegates through callbacks",
@@ -9415,6 +9429,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
+    unit_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
     unit_test_step.dependOn(&run_raft_read_gate_tests.step);
     unit_test_step.dependOn(&run_usermgr_abi_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
