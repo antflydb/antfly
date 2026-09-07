@@ -11593,6 +11593,41 @@ test "lsm backend tombstones hide older run values" {
     }
 }
 
+test "lsm backend reverse cursor tombstones stop lookup across levels and mutable state" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |mutable_delete| {
+        var backend = Backend.init(alloc, .{ .flush_threshold = 1 });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("a", "A");
+            try txn.put("b", "old B");
+            try txn.put("c", "C");
+            try txn.commit();
+        }
+        // Keep the base below L0 so a tombstone must terminate the complete
+        // visibility search, rather than only its newest run group.
+        for (backend.runs.items) |*run| run.level = 1;
+        if (mutable_delete) backend.options.flush_threshold = 1000;
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("b");
+            try txn.commit();
+        }
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+        try std.testing.expectEqualStrings("a", (try cur.seekAtOrBefore("b")).?.key);
+        try std.testing.expectEqualStrings("c", (try cur.last()).?.key);
+        try std.testing.expectEqualStrings("a", (try cur.prev()).?.key);
+        try std.testing.expect((try cur.prev()) == null);
+        try std.testing.expectEqualStrings("c", (try cur.seekAtOrAfter("b")).?.key);
+    }
+}
+
 test "lsm backend cache reuses run tables across backend handles" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);

@@ -1120,6 +1120,7 @@ pub const LookupResult = struct {
 };
 
 pub const ColumnarScanStats = struct {
+    overlay_tombstones_skipped: u64 = 0,
     cell_slots_initialized: u64 = 0,
     cell_cache_hits: u64 = 0,
     payload_pages_read: u64 = 0,
@@ -2573,6 +2574,10 @@ pub const VisibilityStats = struct {
 pub const ColumnarMaintenanceStats = struct {
     /// Typed source rows reused by clean coverage coalescing (no AROW reads).
     covered_rows_read: u64 = 0,
+    cell_slots_examined: u64 = 0,
+    payloads_reused: u64 = 0,
+    payload_bytes_written: u64 = 0,
+    payload_encoding_bytes: u64 = 0,
     /// Authoritative rows decoded during bootstrap/dirty range preparation.
     primary_rows_read: u64 = 0,
     admission_root_reads: u64 = 0,

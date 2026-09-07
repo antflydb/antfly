@@ -1321,7 +1321,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn visibleEntryAtKey(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             self.clearVisibleEntryBytes();
             if (comptime MutableType == ActiveMemTable) {
-                if (try self.visibleMutableEntryAtKey(key)) |entry| return entry;
+                switch (try self.visibleMutableEntryAtKey(key)) {
+                    .absent => {},
+                    .tombstone => return null,
+                    .value => |entry| return entry,
+                }
             } else if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entries.items[idx];
                 if (entry.tombstone) return null;
@@ -1335,15 +1339,19 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 }
             }
             if (findRunGroup(self.l0_groups, self.namespace, key)) |candidate_group| {
-                if (try visibleEntryFromRunIndices(self.backend, self.runs, candidate_group.run_indices, self.namespace, key, &self.visible_entry_bytes, self.backend_locked)) |entry| {
-                    return entry;
+                switch (try visibleEntryFromRunIndices(self.backend, self.runs, candidate_group.run_indices, self.namespace, key, &self.visible_entry_bytes, self.backend_locked)) {
+                    .absent => {},
+                    .tombstone => return null,
+                    .value => |entry| return entry,
                 }
             }
             for (self.levels) |level| {
                 const run_index = findRunIndexInLevel(self.runs, level, self.namespace, key) orelse continue;
                 const one = [_]usize{run_index};
-                if (try visibleEntryFromRunIndices(self.backend, self.runs, &one, self.namespace, key, &self.visible_entry_bytes, self.backend_locked)) |entry| {
-                    return entry;
+                switch (try visibleEntryFromRunIndices(self.backend, self.runs, &one, self.namespace, key, &self.visible_entry_bytes, self.backend_locked)) {
+                    .absent => {},
+                    .tombstone => return null,
+                    .value => |entry| return entry,
                 }
             }
             return null;
@@ -1488,21 +1496,21 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             return try self.copyKeyToVisibleBytes(key);
         }
 
-        fn visibleMutableEntryAtKey(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+        fn visibleMutableEntryAtKey(self: *@This(), key: []const u8) !VisibleLookup {
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
-            const idx = self.mutable.findIndex(self.namespace, key) orelse return null;
+            const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
             const entry = self.mutable.entries.items[idx];
-            if (entry.tombstone) return null;
+            if (entry.tombstone) return .tombstone;
             const bytes = try self.backend.allocator.alloc(u8, entry.key.len + entry.value.len);
             errdefer self.backend.allocator.free(bytes);
             @memcpy(bytes[0..entry.key.len], entry.key);
             @memcpy(bytes[entry.key.len..][0..entry.value.len], entry.value);
             self.visible_entry_bytes.setOwned(self.backend.allocator, bytes);
-            return .{
+            return .{ .value = .{
                 .key = bytes[0..entry.key.len],
                 .value = bytes[entry.key.len..][0..entry.value.len],
-            };
+            } };
         }
 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
@@ -5511,6 +5519,8 @@ fn findExactEntryInBatchBlocks(
     };
 }
 
+const VisibleLookup = union(enum) { absent, tombstone, value: backend_adapter.Entry };
+
 fn visibleEntryFromRunIndices(
     backend: anytype,
     runs: []Run,
@@ -5519,15 +5529,15 @@ fn visibleEntryFromRunIndices(
     key: []const u8,
     visible_entry_bytes: *VisibleBytes,
     backend_locked: bool,
-) !?backend_adapter.Entry {
+) !VisibleLookup {
     for (run_indices) |run_index| {
         const run = &runs[run_index];
         if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
         if (run.state) |*state| {
             if (state.findIndex(namespace, key)) |idx| {
                 const entry = state.entries.items[idx];
-                if (entry.tombstone) return null;
-                return entry.entry();
+                if (entry.tombstone) return .tombstone;
+                return .{ .value = entry.entry() };
             }
             continue;
         }
@@ -5536,16 +5546,16 @@ fn visibleEntryFromRunIndices(
             const loaded = try loadVisibleEntryFromPathRunMaybeLocked(backend, run, namespace, key, backend_locked) orelse continue;
             if (loaded.entry.tombstone) {
                 backend.allocator.free(loaded.bytes);
-                return null;
+                return .tombstone;
             }
             visible_entry_bytes.setOwned(backend.allocator, loaded.bytes);
-            return .{
+            return .{ .value = .{
                 .key = loaded.entry.key,
                 .value = loaded.entry.value,
-            };
+            } };
         }
     }
-    return null;
+    return .absent;
 }
 
 fn rangesOverlap(

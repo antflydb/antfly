@@ -62788,7 +62788,9 @@ test "relational columnar existence and null projection do not fetch payload rec
     defer alloc.free(json);
     try db.batch(.{ .writes = &.{ .{ .key = "a", .value = json }, .{ .key = "b", .value = "{\"payload\":null}" }, .{ .key = "c", .value = "{}" } } });
     try std.testing.expect(try db.rebuildRelationalColumns());
-    try db.core.store.delete("\x00\x00__columnar__:blocks:0000000000000001:0000000200000000:c00000000");
+    const payload_key = try relational_columns.payloadKeyForTest(&db, alloc, 1, 0x200000000, 0);
+    defer alloc.free(payload_key);
+    try db.core.store.delete(payload_key);
     var stats: types.ColumnarScanStats = .{};
     var exists = try db.scan(alloc, "", "", .{ .filter_query_json = "{\"exists\":{\"field\":\"payload\"}}", .columnar_stats = &stats });
     defer exists.deinit(alloc);
@@ -63039,6 +63041,134 @@ test "relational columnar skew pages and sparse delta merges bound physical work
         var reopened = try db.scan(alloc, "", "", options);
         defer reopened.deinit(alloc);
         try std.testing.expectEqualDeep(after.documents, reopened.documents);
+    }
+}
+
+test "relational columnar merge frontier skips tombstones and unread base pages" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .string }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const large = try scratch.alloc(u8, 512 * 1024);
+        @memset(large, 'x');
+        var writes: [201]types.BatchWrite = undefined;
+        var deletes: [200][]const u8 = undefined;
+        for (writes[0..200], 0..) |*write, i| {
+            const key = try std.fmt.allocPrint(scratch, "{d:0>4}", .{i});
+            write.* = .{ .key = key, .value = "{\"payload\":\"other\"}" };
+            deletes[i] = key;
+        }
+        writes[200] = .{ .key = "z", .value = try std.fmt.allocPrint(scratch, "{{\"payload\":\"{s}\"}}", .{large}) };
+        try db.batch(.{ .writes = &writes });
+        try drainTestRelationalMaintenance(&db);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":\"match\"}" }}, .deletes = &deletes });
+        var stats: types.ColumnarScanStats = .{};
+        var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .limit = 1, .filter_query_json = "{\"term\":{\"payload\":\"match\"}}", .columnar_stats = &stats });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.documents.len);
+        try std.testing.expectEqualStrings("a", result.documents[0].id);
+        try std.testing.expectEqual(@as(u64, 0), stats.payload_pages_read);
+        try std.testing.expectEqual(@as(u64, 1), stats.primary_rows_read);
+        try std.testing.expectEqual(@as(u64, 200), stats.overlay_tombstones_skipped);
+        try drainTestRelationalMaintenance(&db);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+    }
+}
+
+test "relational columnar shared pages bound alternating merges and survive reclamation" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "n", .path = "n", .column_type = .integer },
+            .{ .name = "payload", .path = "payload", .column_type = .string },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const large = try scratch.alloc(u8, 512 * 1024);
+        var random = std.Random.DefaultPrng.init(312);
+        for (large) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+        var writes: [128]types.BatchWrite = undefined;
+        var updates: [64]types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| {
+            write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"n\":0,\"payload\":\"{s}\"}}", .{if (i == 1) large else "small"}) };
+            if (i % 2 == 0) updates[i / 2] = .{ .key = write.key, .value = "{\"n\":1,\"payload\":\"small\"}" };
+        }
+        try db.batch(.{ .writes = &writes });
+        try drainTestRelationalMaintenance(&db);
+        const before = db.relational_column_maintenance.snapshot();
+        try db.batch(.{ .writes = &updates });
+        try drainTestRelationalMaintenance(&db);
+        const after = db.relational_column_maintenance.snapshot();
+        try std.testing.expect(after.cell_slots_examined - before.cell_slots_examined <= 2 * 128);
+        try std.testing.expect(after.payload_bytes_written - before.payload_bytes_written < 4096);
+        try std.testing.expect(after.payloads_reused > before.payloads_reused);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        // A full-row scalar update must also deduplicate the unchanged wide
+        // singleton payload instead of rewriting it under a new block key.
+        const wide_update = try std.fmt.allocPrint(scratch, "{{\"n\":9,\"payload\":\"{s}\"}}", .{large});
+        try db.batch(.{ .writes = &.{.{ .key = "k0001", .value = wide_update }} });
+        try drainTestRelationalMaintenance(&db);
+        try std.testing.expect(db.relational_column_maintenance.payload_bytes_written.load(.monotonic) - after.payload_bytes_written < 4096);
+        try std.testing.expect(db.relational_column_maintenance.payload_encoding_bytes.load(.monotonic) - after.payload_encoding_bytes < 4096);
+        // Canceled staging owns references until durable GC removes its column
+        // metadata. Both the unpublished and drained states must balance.
+        const Cancel = struct {
+            fn run(_: *anyopaque) anyerror!void {
+                return error.Canceled;
+            }
+        };
+        try db.batch(.{ .writes = &.{.{ .key = "k0000", .value = "{\"n\":2,\"payload\":\"small\"}" }} });
+        relational_columns.test_before_publish = .{ .context = &db, .run = Cancel.run };
+        defer relational_columns.test_before_publish = null;
+        try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
+        relational_columns.test_before_publish = null;
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        try drainTestRelationalMaintenance(&db);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        const options: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "payload" } };
+        var baseline = try db.scan(alloc, "", "", options);
+        defer baseline.deinit(alloc);
+        const Snapshot = struct {
+            db: *DB,
+            documents: []const types.ScanDocument,
+            index: usize = 0,
+            fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                if (self.index == 0) {
+                    try self.db.batch(.{ .deletes = &.{"k0001"} });
+                    try drainTestRelationalMaintenance(self.db);
+                }
+                try std.testing.expectEqualStrings(self.documents[self.index].json, entry.document_json.?);
+                self.index += 1;
+            }
+        };
+        var snapshot = Snapshot{ .db = &db, .documents = baseline.documents };
+        try db.scanVisit(alloc, "", "", options, .{ .context = &snapshot, .visit = Snapshot.visit });
+        try std.testing.expectEqual(baseline.documents.len, snapshot.index);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        var reopened = try db.scan(alloc, "", "", options);
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 127), reopened.documents.len);
     }
 }
 
@@ -63697,6 +63827,8 @@ test "relational columnar clean coalescing preserves typed cells without primary
         try drainTestRelationalMaintenance(&db);
         try db.batch(.{ .deletes = deletes.items });
         const fields: []const []const u8 = &.{ "n", "payload", "metadata" };
+        relational_columns.test_owner_limit = 8;
+        defer relational_columns.test_owner_limit = null;
         var baseline = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = fields, .include_content_hashes = true });
         defer baseline.deinit(alloc);
         // Stop once dirty publication is complete, leaving the clean merge
@@ -63845,6 +63977,10 @@ test "relational columnar maintenance survives unrelated artifact corruption and
 
 test "relational columnar maintenance advances past hot ranges across restart" {
     const alloc = std.testing.allocator;
+    // Assert scheduler fairness against fixed 256-row ranges, independently
+    // of debug-build speed and the production wall-clock quantum.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
@@ -63910,6 +64046,9 @@ test "relational columnar maintenance advances past hot ranges across restart" {
 
 test "relational columnar generations preserve scans and compact dirty ranges" {
     const alloc = std.testing.allocator;
+    // This fixture intentionally addresses exact 256-row physical blocks.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
@@ -63982,7 +64121,8 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
         try std.testing.expectEqualDeep(results[0].documents, missing_range.documents);
         try db.core.store.put(directory_key, directory_value);
     }
-    const broken_column = "\x00\x00__columnar__:blocks:0000000000000001:0000000200000001:c00000000";
+    const broken_column = try relational_columns.payloadKeyForTest(&db, alloc, 1, 0x200000001, 0);
+    defer alloc.free(broken_column);
     const corrupt = try db.core.store.get(alloc, broken_column);
     defer alloc.free(corrupt);
     corrupt[corrupt.len - 1] ^= 1;
@@ -64160,6 +64300,9 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
     const alloc = std.testing.allocator;
+    // The explicit block limit below, not elapsed wall time, defines quanta.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
@@ -64174,7 +64317,8 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"n\":1}" };
     try db.batch(.{ .writes = writes });
     try std.testing.expect(try db.rebuildRelationalColumns());
-    const unchanged_key = "\x00\x00__columnar__:blocks:0000000000000001:0000000200000002:c00000000";
+    const unchanged_key = try relational_columns.payloadKeyForTest(&db, alloc, 1, 0x200000002, 0);
+    defer alloc.free(unchanged_key);
     const unchanged = try db.core.store.get(alloc, unchanged_key);
     defer alloc.free(unchanged);
     for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k0001:{d:0>4}", .{i}), .value = "{\"n\":2}" };

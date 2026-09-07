@@ -353,7 +353,7 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. ACB7 separates row metadata from independently addressed,
+this build path. ACB8 separates row metadata from independently addressed,
 checksummed per-column metadata. The root contains a sorted sparse directory
 of 64-ordinal presence pages (12 bytes per populated page); binary search
 locates only the columns a predicate/projection requests, without allocating or
@@ -363,7 +363,9 @@ nor value-stream decoding, even for large vector/JSON columns.
 
 Payloads have independently checksummed row-group pages. The builder partitions
 actual cell bytes at a 16 KiB value budget, with explicit exclusive row ends and
-encoded byte sizes (10 bytes per page). Oversized values get singleton pages;
+encoded byte sizes. Each 46-byte descriptor contains an exclusive destination
+row end, encoded byte size, BLAKE3 payload identity, source-row offset, and
+source-row count. Payload doc IDs are page-local, not block-local. Oversized values get singleton pages;
 adjacent small/null/missing values never share their payload. Scalar columns
 usually stay in one page. Directory validation requires strictly increasing
 ends, exact row coverage, and agreement between payload sizes and presence/null
@@ -371,8 +373,22 @@ bitmaps, including zero-byte absent/null-only groups. Predicates load pages inte
 candidate mask; projections load only the pages containing delivered rows.
 Repeated predicates share decoded pages. The cost model charges only still-
 unread pages containing surviving values, and `payload_pages_read` exposes the
-actual I/O alongside bytes read. Publication retires every declared page
-atomically; generation reclamation also covers canceled or obsolete pages.
+actual I/O alongside bytes read. A block caches decoded payloads by identity,
+so multiple mapped fragments do not reread or decompress the same object.
+
+Payloads are immutable, content-addressed objects scoped to a generation.
+Identity hashes canonical typed cells and page-local ordinals before compression;
+the payload CRC independently checks physical integrity. Reads validate both.
+Block metadata owns durable reference counts and encoded sizes in separate
+checksummed small records, so
+retaining a page never rewrites its payload. Staging atomically retains all
+references with its column metadata; publication releases retired metadata's
+references, deleting payloads only when their final reference disappears.
+Store MVCC preserves deleted payloads for already-pinned readers. Abandoned
+staging GC releases references in the same transaction that deletes its
+metadata. Old-generation GC can delete its entire namespace incrementally,
+because references never cross generations. References point directly to
+payloads, never to other blocks: repeated compaction cannot build lookup chains.
 Point projection resolves a row's page with binary search only on a cache miss.
 Cached typed cells are addressed directly; null/cell slots are initialized once
 per column/block. `cell_slots_initialized` and `cell_cache_hits` expose this CPU
@@ -384,8 +400,10 @@ payload decoding, and dirty markers remove replaced/deleted base candidates
 before evaluation. Bounded marker probes feed admission; execution completes
 visibility with ordered seeks only for its current row window, skipping large
 insertion gaps without walking every marker. A limited filtered scan evaluates
-one physical predicate-page window before delivering results and stops once its
-limit is met. Unlimited scans retain block-vectorized evaluation. Cancellation
+the earlier dirty-row prefix before reading any base predicate pages, then
+one physical predicate-page window as needed. It stops as soon as its limit is
+met. Dirty cursors preserve tombstone metadata and never point-read deleted
+primary rows; `overlay_tombstones_skipped` measures this work. Unlimited scans retain block-vectorized evaluation. Cancellation
 and deadline checks run between windows, predicate nodes, and payload pages.
 Boolean leaves are ordered once per expression/block using numeric pruning,
 unread candidate-page bytes, and logical evaluation weights. Wide strings/blobs
@@ -441,14 +459,29 @@ AROW; replaced/deleted base rows are masked before column payload loading.
 Unchanged rows never fetch primary AROW or reconstruct JSON. Tombstones consume
 bounded owner checkpoints but require no primary lookup. A bounded remapping window preserves
 semantic hashes, timestamps, physical-size accounting, absent/null cells, and
-schema identity while transposing one source column at a time into the builder.
-Decoded source pages outlive destination flushes; the writer owns copied cells
-before the source scope closes. Publication, dirty-token compare-clear, retained
+schema identity. The builder accumulates one source selection/remapping plan
+per destination block and epoch, not one per clean run between dirty rows.
+It reuses complete source pages and wide-value slices directly through their
+payload identities and row mappings. Small fragmented pages are transposed
+once per output block/epoch; inline cells are sorted once before encoding.
+This bounds bookkeeping under alternating updated/unchanged rows while avoiding
+tiny scalar fragments. Wide slices are reused only when the current mapped
+page averages at least 128 encoded bytes per row; complete pages can always be
+reused. Descriptors remain bounded by the 256-row block limit.
+Decoded source pages outlive destination flushes; copied cells are owned by
+the writer and reused descriptors own no borrowed source memory.
+Publication, dirty-token compare-clear, retained
 suffixes, cancellation, and restart use the same existing commit fences.
 Maintenance exposes `covered_rows_read` and `primary_rows_read` separately so
 the reduction in primary I/O is measurable for both dirty compaction and clean
-coalescing. Column pages are still re-encoded
-when row ordinals change; this is not compressed-page concatenation.
+coalescing. `cell_slots_examined` measures transposition windows;
+`payloads_reused` and `payload_bytes_written` measure committed payload sharing
+and actual new payload bytes. Typed identities are probed before compression,
+including for an unchanged oversized field in a full-row scalar update.
+Existing payloads skip both compression and payload writes; unchanged covered
+pages also bypass payload reads and cell hashing. `payload_encoding_bytes`
+reports the raw cell budget actually passed to the encoder, including staged
+work that is subsequently canceled.
 Thus neither an empty prefix nor an orphan-heavy gap after a live row can
 repeatedly consume the budget before the worker reaches its successor. Uncovered
 bootstrap ranges continue to use the bounded owner cursor. Dirty journal and
