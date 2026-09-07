@@ -61,6 +61,8 @@ pub const GraphMetricReadLimits = struct {
     max_retained_bytes: u64 = 128 * 1024 * 1024,
 };
 
+pub const GraphMetricRangeCapacity = struct { requests: u64, bytes: u64 };
+
 pub const GraphMetricReadBudget = struct {
     mutex: std.atomic.Mutex = .unlocked,
     limits: GraphMetricReadLimits = .{},
@@ -90,9 +92,13 @@ pub const GraphMetricReadBudget = struct {
     }
 
     pub fn remainingRequests(self: *@This()) u64 {
+        return self.remainingRanges().requests;
+    }
+
+    pub fn remainingRanges(self: *@This()) GraphMetricRangeCapacity {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.limits.max_range_requests -| self.range_requests;
+        return .{ .requests = self.limits.max_range_requests -| self.range_requests, .bytes = self.limits.max_range_bytes -| self.range_bytes };
     }
 
     pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
@@ -376,8 +382,8 @@ pub const QuerySession = struct {
         return self.effectiveGraphMetricReadBudget().chargeRange(bytes);
     }
 
-    pub fn graphMetricRangeAllowance(self: *QuerySession) u64 {
-        return self.effectiveGraphMetricReadBudget().remainingRequests();
+    pub fn graphMetricRangeBudget(self: *QuerySession) GraphMetricRangeCapacity {
+        return self.effectiveGraphMetricReadBudget().remainingRanges();
     }
 
     pub fn reserveGraphMetricRanges(self: *QuerySession, requests: usize, bytes: usize) !void {

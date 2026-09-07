@@ -669,10 +669,15 @@ cache lease, avoiding extra network round trips for small metrics.
 Only missing contiguous pages coalesce into authenticated ranges; independent runs
 use the same bounded parallel executor as score ranges (per column: eight reads and 32 MiB
 in flight, with each coalesced range capped at 8 MiB). A query prepares every
-column's control and routing before admitting any score reads. Exact score plans
-share the remaining request budget without per-column quotas; when coalescing is
-necessary, bounded windows compete across columns by overfetch bytes per saved
-request. The complete score request and byte totals are reserved atomically before
+column's control and routing, consuming authenticated cached score blocks before
+admitting score network reads. Exact miss plans share the remaining request budget
+without per-column quotas. When coalescing is necessary, a bounded dynamic program
+chooses the least-byte feasible combination of exact reads and coalesced windows
+across columns, checking both remaining requests and bytes. Its state is bounded
+by the public 128-request ceiling, not graph cardinality. Transport windows omit
+unused leading/trailing blocks and may bridge cached gaps when required to fit
+the request budget; partial cache warmth must not reduce admission feasibility.
+The complete score request and byte totals are reserved atomically before
 bounded parallel execution. An uneven query therefore does not fail merely because
 one column needs more than an equal share. The shared budget remains authoritative
 across all metric surfaces of the pinned query.
@@ -704,11 +709,17 @@ does not create another unbounded cache: fill registrations have fixed capacity,
 and every consuming query applies its retained-memory admission to the lease.
 Routing pages use the authenticated block cache and are decoded only for selected
 pages, so a large primary index cannot repeatedly bypass the decoded-index cache.
-Each page has a canonical cache identity using its global block ordinal and exact
-extent, independent of the candidate set or transport batch. Readers probe those
-pages before planning transport, authenticate the entire coalesced response before
-publishing any page, and never retain candidate-specific combined routing ranges.
-Overlapping candidate sets therefore reuse already-fetched pages.
+Routing pages and primary score blocks have canonical cache identities using the
+immutable artifact, global block ordinal, and exact extent, independent of the
+candidate set or transport batch. Readers probe those units before planning
+transport, authenticate the entire coalesced response before publishing any unit,
+and never retain candidate-specific combined routing or primary-score ranges.
+Overlapping candidate sets therefore reuse already-fetched blocks even when their
+routing-page sets or coalescing boundaries differ. Cached scores are decoded into
+the final result during preparation without retaining all cached payloads; they
+consume decode/work budgets but no score network request/byte reservation. The
+latest artifact's existing authenticated blocks define these units; no additional
+wire format or legacy cache reader is needed.
 Parallel range payloads use a thread-safe allocator and transfer ownership
 explicitly, independently of the allocator owning returned scores or per-request
 routing arrays.
