@@ -27,6 +27,7 @@ const platform_time = @import("antfly_platform").time;
 const edge_type_mod = @import("edge_type.zig");
 const edge_weight = @import("edge_weight.zig");
 const metric_kernels = @import("metrics.zig");
+pub const score_read = @import("score_read.zig");
 const vector_chunk = @import("vector_chunk.zig");
 const ordinal_blocks = @import("ordinal.zig");
 const adjacency_blocks = @import("adjacency.zig");
@@ -15221,100 +15222,20 @@ pub const GraphIndex = struct {
         }
         for (metric_names, 0..) |_, i| {
             score_columns[i] = try self.alloc.alloc(?f64, nodes.len);
-            @memset(score_columns[i], null);
             initialized_columns += 1;
         }
 
-        // Flatten every requested column into a sorted stream of bounded storage reads. Query
-        // shapes commonly need the same rows for projection, filtering, and
-        // ordering; issuing one multi-get per metric makes latency scale with
-        // the number of clauses even though all keys share this snapshot.
-        const PendingColumnScoreLoad = struct {
-            column_index: usize,
-            row_index: usize,
-            key: []const u8,
-        };
-        var active_columns: usize = 0;
-        for (statuses) |status| active_columns += @intFromBool(status.published_generation != 0);
-        const pending_len = std.math.mul(usize, active_columns, nodes.len) catch
-            return error.GraphMetricQueryBudgetExceeded;
-        if (pending_len == 0) return .{ .statuses = statuses, .score_columns = score_columns };
-
-        const active_column_indexes = try self.alloc.alloc(usize, active_columns);
-        defer self.alloc.free(active_column_indexes);
-        var active_index: usize = 0;
-        for (statuses, 0..) |status, column_index| {
-            if (status.published_generation == 0) continue;
-            active_column_indexes[active_index] = column_index;
-            active_index += 1;
+        const prefixes = try self.alloc.alloc(?[]const u8, metric_names.len);
+        @memset(prefixes, null);
+        defer {
+            for (prefixes) |prefix| if (prefix) |value| self.alloc.free(value);
+            self.alloc.free(prefixes);
         }
-        const ColumnOrder = struct {
-            names: []const []const u8,
-
-            fn lessThan(context: @This(), left: usize, right: usize) bool {
-                const order = std.mem.order(u8, context.names[left], context.names[right]);
-                return order == .lt or (order == .eq and left < right);
-            }
-        };
-        // Encoded key components preserve byte ordering. Sorting the small
-        // column and row dimensions independently therefore produces the same
-        // storage order as sorting C*N allocated full keys, while reducing the
-        // planning cost to O(C log C + N log N).
-        std.mem.sort(usize, active_column_indexes, ColumnOrder{ .names = metric_names }, ColumnOrder.lessThan);
-
-        const ordered_rows = try self.alloc.alloc(usize, nodes.len);
-        defer self.alloc.free(ordered_rows);
-        for (ordered_rows, 0..) |*row, row_index| row.* = row_index;
-        const RowOrder = struct {
-            nodes: []const []const u8,
-
-            fn lessThan(context: @This(), left: usize, right: usize) bool {
-                const order = std.mem.order(u8, context.nodes[left], context.nodes[right]);
-                return order == .lt or (order == .eq and left < right);
-            }
-        };
-        std.mem.sort(usize, ordered_rows, RowOrder{ .nodes = nodes }, RowOrder.lessThan);
-
-        const max_keys_per_read: usize = 4096;
-        var offset: usize = 0;
-        while (offset < pending_len) {
-            const batch_len = @min(max_keys_per_read, pending_len - offset);
-            var key_arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer key_arena.deinit();
-            const key_alloc = key_arena.allocator();
-            const pending = try self.alloc.alloc(PendingColumnScoreLoad, batch_len);
-            defer self.alloc.free(pending);
-            for (pending, 0..) |*item, relative_index| {
-                const flat_index = offset + relative_index;
-                const active_column_index = flat_index / nodes.len;
-                const row_index = ordered_rows[flat_index % nodes.len];
-                const column_index = active_column_indexes[active_column_index];
-                item.* = .{
-                    .column_index = column_index,
-                    .row_index = row_index,
-                    .key = try graphMetricScoreKeyWithAllocator(
-                        key_alloc,
-                        metric_names[column_index],
-                        statuses[column_index].published_generation,
-                        nodes[row_index],
-                    ),
-                };
-            }
-            const read_keys = try self.alloc.alloc([]const u8, pending.len);
-            defer self.alloc.free(read_keys);
-            const read_values = try self.alloc.alloc(?[]const u8, pending.len);
-            defer self.alloc.free(read_values);
-            @memset(read_values, null);
-            for (pending, 0..) |item, i| read_keys[i] = item.key;
-            try txn.getManySorted(read_keys, read_values);
-            for (pending, read_values) |item, maybe_raw| {
-                const raw = maybe_raw orelse continue;
-                const score = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
-                if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
-                score_columns[item.column_index][item.row_index] = score;
-            }
-            offset += batch_len;
+        for (metric_names, statuses, 0..) |name, status, i| {
+            if (status.published_generation != 0)
+                prefixes[i] = try self.graphMetricScorePrefixAlloc(name, status.published_generation);
         }
+        _ = try score_read.populate(self.alloc, &txn, prefixes, nodes, score_columns);
         return .{ .statuses = statuses, .score_columns = score_columns };
     }
 
@@ -15327,62 +15248,9 @@ pub const GraphIndex = struct {
     ) ![]?f64 {
         const scores = try self.alloc.alloc(?f64, nodes.len);
         errdefer self.alloc.free(scores);
-        @memset(scores, null);
-        if (generation == 0 or nodes.len == 0) return scores;
-        const PendingScoreLoad = struct {
-            original_index: usize,
-            key: []const u8,
-        };
-
-        const ordered_rows = try self.alloc.alloc(usize, nodes.len);
-        defer self.alloc.free(ordered_rows);
-        for (ordered_rows, 0..) |*row, row_index| row.* = row_index;
-        const RowOrder = struct {
-            nodes: []const []const u8,
-
-            fn lessThan(context: @This(), left: usize, right: usize) bool {
-                const order = std.mem.order(u8, context.nodes[left], context.nodes[right]);
-                return order == .lt or (order == .eq and left < right);
-            }
-        };
-        std.mem.sort(usize, ordered_rows, RowOrder{ .nodes = nodes }, RowOrder.lessThan);
-
-        // Bound temporary keys and backend result vectors independently of the
-        // candidate set. Each batch is already in storage order, so no C*N key
-        // sort or long-lived per-key allocation is required.
-        const max_keys_per_read: usize = 4096;
-        var offset: usize = 0;
-        while (offset < ordered_rows.len) {
-            const batch_len = @min(max_keys_per_read, ordered_rows.len - offset);
-            var key_arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer key_arena.deinit();
-            const key_alloc = key_arena.allocator();
-            const pending = try self.alloc.alloc(PendingScoreLoad, batch_len);
-            defer self.alloc.free(pending);
-            for (pending, 0..) |*item, relative_index| {
-                const row_index = ordered_rows[offset + relative_index];
-                item.* = .{
-                    .original_index = row_index,
-                    .key = try graphMetricScoreKeyWithAllocator(key_alloc, metric_name, generation, nodes[row_index]),
-                };
-            }
-
-            const read_keys = try self.alloc.alloc([]const u8, pending.len);
-            defer self.alloc.free(read_keys);
-            const read_values = try self.alloc.alloc(?[]const u8, pending.len);
-            defer self.alloc.free(read_values);
-            @memset(read_values, null);
-            for (pending, 0..) |item, i| read_keys[i] = item.key;
-            try txn.getManySorted(read_keys, read_values);
-
-            for (pending, read_values) |item, maybe_raw| {
-                const raw = maybe_raw orelse continue;
-                const score = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
-                if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
-                scores[item.original_index] = score;
-            }
-            offset += batch_len;
-        }
+        const prefix = if (generation != 0) try self.graphMetricScorePrefixAlloc(metric_name, generation) else null;
+        defer if (prefix) |value| self.alloc.free(value);
+        _ = try score_read.populate(self.alloc, txn, &.{prefix}, nodes, &.{scores});
         return scores;
     }
 
@@ -16607,20 +16475,25 @@ test "graph metric column snapshots preserve order across chunks and reject stal
     var published = try graph.runGraphMetric("degree");
     defer published.deinit(alloc);
 
-    const node_count = 4097;
+    const node_count = 4100;
     const nodes = try alloc.alloc([]const u8, node_count);
     defer alloc.free(nodes);
-    for (nodes, 0..) |*node, i| node.* = if (i % 2 == 0) "doc-b" else "doc-a";
+    const node_buffers = try alloc.alloc([32]u8, node_count);
+    defer alloc.free(node_buffers);
+    for (nodes, 0..) |*node, i| node.* = if (i < 3) small_nodes[i] else try std.fmt.bufPrint(&node_buffers[i], "missing-{d:0>6}", .{i});
     var snapshot = try graph.graphMetricColumnsSnapshotAlloc(
-        &.{"degree"},
+        &.{ "degree", "degree" },
         nodes,
-        &.{.{ .require_published = true, .require_fresh = true }},
+        &.{ .{ .require_published = true, .require_fresh = true }, .{ .require_published = true } },
     );
     defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.score_columns.len);
-    for (snapshot.score_columns[0]) |score| {
-        try std.testing.expectEqual(@as(?f64, 1.0), score);
-    }
+    try std.testing.expectEqual(@as(usize, 2), snapshot.score_columns.len);
+    for (snapshot.score_columns) |column| for (column, 0..) |score, i| {
+        try std.testing.expectEqual(@as(?f64, if (i < 3) 1.0 else null), score);
+    };
+    var single = try graph.graphMetricScoreSnapshotAlloc("degree", nodes);
+    defer single.deinit(alloc);
+    try std.testing.expectEqualSlices(?f64, snapshot.score_columns[0], single.scores);
 
     try graph.addEdge("doc-b", "doc-c", "cites", 1.0, 0, 0, "");
     try std.testing.expectError(

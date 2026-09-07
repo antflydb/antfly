@@ -202,28 +202,11 @@ fn discardInboundEdges(alloc: Allocator, graph: *graph_segment.Segment) !usize {
 
 pub fn buildFromGraphPayloadAlloc(alloc: Allocator, graph_payload: []const u8, options: BuildOptions) !BuildResult {
     try validateOptions(graph_payload, options);
-    const decoded_retained_bytes = try graph_segment.decodedRetainedBytes(graph_payload);
-    try admitGraphDecodePeak(graph_payload.len, decoded_retained_bytes, options.limits.max_peak_memory_bytes);
-    var graph = graph_segment.decodeAllocWithCancellation(alloc, graph_payload, options.cancellation) catch |err| switch (err) {
-        error.DecodedArtifactTooLarge => return error.GraphMetricBuildBudgetExceeded,
-        else => return err,
-    };
-    var graph_owned = true;
-    defer if (graph_owned) graph.deinit(alloc);
-    const released_inbound_bytes = try discardInboundEdges(alloc, &graph);
-    const metric_retained_bytes = std.math.sub(usize, decoded_retained_bytes, released_inbound_bytes) catch
-        return error.InvalidGraphMetricBuildOptions;
-    var topology = try compileTopologyWithinBudgetAlloc(
-        alloc,
-        graph,
-        metric_retained_bytes,
-        options.limits.max_peak_memory_bytes,
-        options.cancellation,
-    );
+    var topology = try prepareTopologyFromPackedAlloc(alloc, graph_payload, options.cancellation, options.limits);
     defer topology.deinit(alloc);
-    graph.deinit(alloc);
-    graph_owned = false;
-    return try buildFromTopologyAlloc(alloc, topology, options);
+    // This entry point borrows the payload throughout kernel execution.
+    topology.retained_bytes = try std.math.add(usize, topology.retained_bytes, graph_payload.len);
+    return buildFromTopologyAlloc(alloc, topology, options);
 }
 
 pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, graph_payload: []const u8, options: BuildOptions) !artifact_ref.ArtifactRef {
@@ -328,7 +311,10 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
     try batch_budget.chargeGraphPayload(source_graph.artifact_id, source_graph.checksum, source_graph.byte_len);
-    var prepared = try prepareGraphArtifactAlloc(alloc, artifacts, source_graph, cancellation, limits);
+    var prepared = prepareGraphArtifactAlloc(alloc, artifacts, source_graph, cancellation, limits) catch |err| switch (err) {
+        error.GraphMetricBuildBudgetExceeded => return publishRejectedManyAlloc(alloc, artifacts, graph_index_name, source_graph, configs, cancellation, .build_budget_exceeded, limits, provenance),
+        else => return err,
+    };
     defer prepared.deinit(alloc);
     return try publishManyFromPreparedGraphWithBudgetAlloc(
         alloc,
@@ -363,34 +349,12 @@ pub fn prepareGraphArtifactAlloc(
         source_graph.checksum,
         cancellation,
     );
-    var graph_payload_owned = true;
-    defer if (graph_payload_owned) alloc.free(graph_payload);
-    const decoded_retained_bytes = try graph_segment.decodedRetainedBytes(graph_payload);
-    // The verified object-store buffer remains live while the decoded graph is
-    // allocated. Admit their overlap, not merely the eventual retained graph.
-    try admitGraphDecodePeak(graph_payload.len, decoded_retained_bytes, limits.max_peak_memory_bytes);
-    var graph = graph_segment.decodeAllocWithCancellation(alloc, graph_payload, cancellation) catch |err| switch (err) {
-        error.DecodedArtifactTooLarge => return error.GraphMetricBuildBudgetExceeded,
-        else => return err,
-    };
-    errdefer graph.deinit(alloc);
-    alloc.free(graph_payload);
-    graph_payload_owned = false;
-    const released_inbound_bytes = try discardInboundEdges(alloc, &graph);
-    const metric_retained_bytes = std.math.sub(usize, decoded_retained_bytes, released_inbound_bytes) catch
-        return error.InvalidGraphMetricBuildOptions;
-    var topology = try compileTopologyWithinBudgetAlloc(
-        alloc,
-        graph,
-        metric_retained_bytes,
-        limits.max_peak_memory_bytes,
-        cancellation,
-    );
+    defer alloc.free(graph_payload);
+    var topology = try prepareTopologyFromPackedAlloc(alloc, graph_payload, cancellation, limits);
     errdefer topology.deinit(alloc);
     const source_artifact_id = try alloc.dupe(u8, source_graph.artifact_id);
     errdefer alloc.free(source_artifact_id);
     const source_checksum = try alloc.dupe(u8, source_graph.checksum);
-    graph.deinit(alloc);
     return .{
         .source_artifact_id = source_artifact_id,
         .source_checksum = source_checksum,
@@ -450,6 +414,46 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
     return publishPreparedComputationsAlloc(alloc, artifacts, graph_index_name, source_graph, configs, prior_artifacts, cancellation, limits, batch_budget, prepared, provenance, runtime);
 }
 
+fn inProjectionGroup(candidate: graph_mod.GraphMetricConfig, representative: graph_mod.GraphMetricConfig, share: bool) bool {
+    return candidate.edge_filter.equivalent(representative.edge_filter) and
+        (share or std.meta.eql(topologyRequirementsForKind(candidate.kind), topologyRequirementsForKind(representative.kind)));
+}
+
+/// A no-allocation upper-bound admission pass. Share the union only when all
+/// consumers fit; otherwise process cheapest exact requirement groups first.
+/// Overestimation can forgo sharing, but cannot reject an affordable metric or
+/// spend work building a union which is immediately discarded under pressure.
+fn projectionGroupFits(topology: CompiledTopology, configs: []const graph_mod.GraphMetricConfig, processed: []const bool, filter: graph_mod.GraphMetricEdgeFilter, limits: Limits, budget: graph_metric_policy.Budget) bool {
+    const n = topology.source_node_count;
+    var e: usize = 0;
+    for (topology.edge_types, 0..) |edge_type, i| {
+        if (filter.mode != .all and !filter.includesType(edge_type)) continue;
+        e += topology.edge_type_offsets[i + 1] - topology.edge_type_offsets[i];
+    }
+    // Covers packed source residency, active/mapping/CSR construction, every
+    // kernel's vectors, borrowed score views and one encoded output. Paired
+    // HITS outputs are encoded sequentially and share the same peak bound.
+    var peak = std.math.add(usize, topology.retained_bytes, 1024 * 1024) catch return false;
+    peak = std.math.add(usize, peak, std.math.mul(usize, topology.string_bytes.len, 2) catch return false) catch return false;
+    peak = std.math.add(usize, peak, std.math.mul(usize, n, 192) catch return false) catch return false;
+    peak = std.math.add(usize, peak, std.math.mul(usize, e, 24) catch return false) catch return false;
+    if (peak > limits.max_peak_memory_bytes) return false;
+    const projection = graph_metric_policy.projectionWorkItems(n, topology.source_edge_count, n, e, 4) catch return false;
+    var work = projection;
+    for (configs, processed, 0..) |config, done, i| {
+        if (done or !config.edge_filter.equivalent(filter)) continue;
+        const paired = for (configs[0..i], processed[0..i]) |prior, prior_done| {
+            if (!prior_done and graph_mod.graphMetricHitsPairCompatible(prior, config)) break true;
+        } else false;
+        if (paired) continue;
+        const kernel = graph_metric_policy.metricWorkItems(config.kind, n, e, config.max_iterations) catch return false;
+        const individual = std.math.add(u64, projection, kernel) catch return false;
+        if (individual > limits.max_work_items) return false;
+        work = std.math.add(u64, work, kernel) catch return false;
+    }
+    return work <= limits.max_total_work_items -| budget.work_items;
+}
+
 /// Internal computation groups can span independently validated index aliases.
 /// Their names and refresh policies are not a catalog configuration.
 fn publishPreparedComputationsAlloc(
@@ -483,14 +487,29 @@ fn publishPreparedComputationsAlloc(
     errdefer {
         for (refs, initialized) |ref, ready| if (ready) freeArtifactRef(alloc, ref);
     }
-    for (configs, 0..) |config, i| {
-        if (processed[i]) continue;
+    while (true) {
+        const first = for (processed, 0..) |done, i| {
+            if (!done) break i;
+        } else break;
         try cancellation.check();
-        var group_requirements = metrics.TopologyRequirements{};
-        for (configs, processed) |candidate, done| {
+        var config = configs[first];
+        const share = projectionGroupFits(prepared.topology, configs, processed, config.edge_filter, limits, batch_budget.*);
+        if (!share) {
+            var cheapest: u64 = std.math.maxInt(u64);
+            for (configs, processed) |candidate, done| {
+                if (done or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
+                const cost = graph_metric_policy.metricWorkItems(candidate.kind, prepared.topology.source_node_count, prepared.topology.edges.len, candidate.max_iterations) catch std.math.maxInt(u64);
+                if (cost < cheapest) {
+                    cheapest = cost;
+                    config = candidate;
+                }
+            }
+        }
+        var group_requirements = topologyRequirementsForKind(config.kind);
+        if (share) for (configs, processed) |candidate, done| {
             if (done or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
             group_requirements = group_requirements.merge(topologyRequirementsForKind(candidate.kind));
-        }
+        };
         const group_options = BuildOptions{
             .graph_index_name = graph_index_name,
             .config = config,
@@ -506,7 +525,7 @@ fn publishPreparedComputationsAlloc(
         const projection_result = preparedProjectionAlloc(alloc, prepared, group_options) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => {
                 for (configs, 0..) |candidate, candidate_index| {
-                    if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
+                    if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
                     refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
                     initialized[candidate_index] = true;
                     processed[candidate_index] = true;
@@ -518,7 +537,7 @@ fn publishPreparedComputationsAlloc(
         const projection = projection_result.projection;
         if (projection_result.built) chargeProjectionWork(group_options, projection.*) catch {
             for (configs, 0..) |candidate, candidate_index| {
-                if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
+                if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
                 refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
                 initialized[candidate_index] = true;
                 processed[candidate_index] = true;
@@ -527,7 +546,7 @@ fn publishPreparedComputationsAlloc(
         };
 
         for (configs, 0..) |candidate, candidate_index| {
-            if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
+            if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
             try cancellation.check();
             const reused = for (configs, initialized, 0..) |prior, ready, prior_index| {
                 if (ready and sameComputation(prior, candidate)) break prior_index;
@@ -623,7 +642,7 @@ fn sameSource(a: artifact_ref.ArtifactRef, b: artifact_ref.ArtifactRef) bool {
         std.mem.eql(u8, a.artifact_id, b.artifact_id) and std.mem.eql(u8, a.checksum, b.checksum);
 }
 
-fn sameComputation(a: graph_mod.GraphMetricConfig, b: graph_mod.GraphMetricConfig) bool {
+pub fn sameComputation(a: graph_mod.GraphMetricConfig, b: graph_mod.GraphMetricConfig) bool {
     // Exact equality, not a truncated storage fingerprint. Names and refresh
     // scheduling do not affect immutable metric computation.
     return a.kind == b.kind and @as(u64, @bitCast(a.damping)) == @as(u64, @bitCast(b.damping)) and
@@ -1064,6 +1083,137 @@ const EdgeFilterIndex = struct {
         return self.all or self.types.contains(edge_type);
     }
 };
+
+/// Directly consumes persisted ordinals. No edge-string allocations, node
+/// hashing, or reverse-adjacency materialization occur in this path.
+fn prepareTopologyFromPackedAlloc(alloc: Allocator, payload: []const u8, cancellation: CancellationToken, limits: Limits) !CompiledTopology {
+    if (payload.len >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes - payload.len);
+    return compilePackedTopologyAlloc(limiter.allocator(), payload, cancellation, limits) catch |err| {
+        if ((err == error.OutOfMemory and limiter.limit_exceeded) or err == error.DecodedArtifactTooLarge)
+            return error.GraphMetricBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn compilePackedTopologyAlloc(alloc: Allocator, payload: []const u8, cancellation: CancellationToken, limits: Limits) !CompiledTopology {
+    const compact = graph_segment.codec.compact;
+    var graph = try compact.viewAlloc(alloc, payload, .{}, cancellation);
+    defer graph.deinit(alloc);
+    if (graph.adjacencies.len > limits.max_nodes) return error.GraphMetricBuildBudgetExceeded;
+    const missing = std.math.maxInt(u32);
+    const ordinals = try alloc.alloc(u32, graph.nodes.len);
+    defer alloc.free(ordinals);
+    @memset(ordinals, missing);
+    var node_ids = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer node_ids.deinit(alloc);
+    try node_ids.ensureTotalCapacity(alloc, graph.adjacencies.len);
+    for (graph.adjacencies, 0..) |adjacency, i| {
+        if (i % 256 == 0) try cancellation.check();
+        if (ordinals[adjacency.node] != missing) return error.InvalidGraphMetricBuildOptions;
+        ordinals[adjacency.node] = @intCast(i);
+        node_ids.appendAssumeCapacity(graph.nodes[adjacency.node]);
+    }
+    var edge_types = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer edge_types.deinit(alloc);
+    try edge_types.appendSlice(alloc, graph.edge_types);
+    const edge_type_offsets = try alloc.alloc(u32, graph.edge_types.len + 1);
+    errdefer alloc.free(edge_type_offsets);
+    @memset(edge_type_offsets, 0);
+    var source_edge_count: usize = 0;
+    var local_edge_count: usize = 0;
+    for (graph.adjacencies) |adjacency| {
+        source_edge_count = std.math.add(usize, source_edge_count, adjacency.out.len / compact.edge_len) catch return error.GraphMetricBuildBudgetExceeded;
+        if (source_edge_count > limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
+        for (0..adjacency.out.len / compact.edge_len) |i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const edge = compact.readEdge(adjacency.out, i);
+            if (edge.table != null) continue;
+            if (ordinals[edge.node] == missing) return error.InvalidGraphMetricBuildOptions;
+            edge_type_offsets[edge.edge_type + 1] = std.math.add(u32, edge_type_offsets[edge.edge_type + 1], 1) catch return error.GraphMetricBuildBudgetExceeded;
+            local_edge_count += 1;
+        }
+    }
+    for (1..edge_type_offsets.len) |i| edge_type_offsets[i] = std.math.add(u32, edge_type_offsets[i - 1], edge_type_offsets[i]) catch return error.GraphMetricBuildBudgetExceeded;
+    const owned_edges = try alloc.alloc(CompiledEdge, local_edge_count);
+    errdefer alloc.free(owned_edges);
+    const cursors = try alloc.dupe(u32, edge_type_offsets[0..graph.edge_types.len]);
+    defer alloc.free(cursors);
+    for (graph.adjacencies, 0..) |adjacency, source| {
+        for (0..adjacency.out.len / compact.edge_len) |i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const edge = compact.readEdge(adjacency.out, i);
+            if (edge.table != null) continue;
+            owned_edges[cursors[edge.edge_type]] = .{ .source = @intCast(source), .target = ordinals[edge.node] };
+            cursors[edge.edge_type] += 1;
+        }
+    }
+    const owned_node_ids = try node_ids.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_node_ids);
+    const owned_edge_types = try edge_types.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_edge_types);
+    var string_bytes_len: usize = 0;
+    for (owned_node_ids, 0..) |node_id, i| {
+        if (i % 256 == 0) try cancellation.check();
+        string_bytes_len = std.math.add(usize, string_bytes_len, node_id.len) catch
+            return error.GraphMetricBuildBudgetExceeded;
+    }
+    for (owned_edge_types, 0..) |edge_type, i| {
+        if (i % 256 == 0) try cancellation.check();
+        string_bytes_len = std.math.add(usize, string_bytes_len, edge_type.len) catch
+            return error.GraphMetricBuildBudgetExceeded;
+    }
+    const string_bytes = try alloc.alloc(u8, string_bytes_len);
+    errdefer alloc.free(string_bytes);
+    var string_offset: usize = 0;
+    for (owned_node_ids, 0..) |*node_id, i| {
+        if (i % 256 == 0) try cancellation.check();
+        const len = node_id.*.len;
+        @memcpy(string_bytes[string_offset .. string_offset + len], node_id.*);
+        node_id.* = string_bytes[string_offset .. string_offset + len];
+        string_offset += len;
+    }
+    for (owned_edge_types, 0..) |*edge_type, i| {
+        if (i % 256 == 0) try cancellation.check();
+        const len = edge_type.*.len;
+        @memcpy(string_bytes[string_offset .. string_offset + len], edge_type.*);
+        edge_type.* = string_bytes[string_offset .. string_offset + len];
+        string_offset += len;
+    }
+    std.debug.assert(string_offset == string_bytes.len);
+    var retained_bytes: usize = 0;
+    try addPeakArrayBytes(&retained_bytes, owned_node_ids.len, []u8);
+    try addPeakArrayBytes(&retained_bytes, owned_edge_types.len, []u8);
+    try addPeakBytes(&retained_bytes, string_bytes.len);
+    try addPeakArrayBytes(&retained_bytes, edge_type_offsets.len, u32);
+    try addPeakArrayBytes(&retained_bytes, owned_edges.len, CompiledEdge);
+    return .{
+        .node_ids = owned_node_ids,
+        .edge_types = owned_edge_types,
+        .string_bytes = string_bytes,
+        .edge_type_offsets = edge_type_offsets,
+        .edges = owned_edges,
+        .source_node_count = graph.adjacencies.len,
+        .source_edge_count = source_edge_count,
+        .retained_bytes = retained_bytes,
+    };
+}
+
+/// Benchmark/reference oracle only. Both paths read the same current wire;
+/// the reference intentionally recreates the former unpack/hash preparation.
+pub fn benchmarkPreparation(alloc: Allocator, payload: []const u8, reference: bool) !usize {
+    if (!reference) {
+        var topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
+        defer topology.deinit(alloc);
+        return topology.edges.len;
+    }
+    var graph = try graph_segment.decodeAlloc(alloc, payload);
+    defer graph.deinit(alloc);
+    _ = try discardInboundEdges(alloc, &graph);
+    var topology = try compileTopologyWithinBudgetAlloc(alloc, graph, 0, 1024 * 1024 * 1024, .none);
+    defer topology.deinit(alloc);
+    return topology.edges.len;
+}
 
 fn compileTopologyWithinBudgetAlloc(
     alloc: Allocator,
@@ -2158,6 +2308,65 @@ test "serverless graph metric topology admission tracks distinct edge types" {
     );
 }
 
+test "serverless packed topology matches reference kernels across filters and qualified edges" {
+    const alloc = std.testing.allocator;
+    var out_z = [_]graph_segment.Edge{
+        .{ .neighbor_id = @constCast("a"), .edge_type = @constCast("alpha"), .weight = 1 },
+        .{ .neighbor_id = @constCast("a"), .edge_type = @constCast("external"), .weight = 1, .neighbor_table_id = 0 },
+        .{ .neighbor_id = @constCast("m"), .edge_type = @constCast("zeta"), .weight = 2 },
+    };
+    var out_a = [_]graph_segment.Edge{
+        .{ .neighbor_id = @constCast("m"), .edge_type = @constCast("alpha"), .weight = 1 },
+    };
+    var out_m = [_]graph_segment.Edge{
+        .{ .neighbor_id = @constCast("z"), .edge_type = @constCast("zeta"), .weight = 1 },
+    };
+    var adjacencies = [_]graph_segment.Adjacency{
+        .{ .node_id = @constCast("z"), .out_edges = &out_z, .in_edges = @constCast(&.{}) },
+        .{ .node_id = @constCast("a"), .out_edges = &out_a, .in_edges = @constCast(&.{}) },
+        .{ .node_id = @constCast("m"), .out_edges = &out_m, .in_edges = @constCast(&.{}) },
+        .{ .node_id = @constCast("isolated"), .out_edges = @constCast(&.{}), .in_edges = @constCast(&.{}) },
+    };
+    var tables = [_][]u8{@constCast("entities")};
+    const graph = graph_segment.Segment{ .adjacencies = &adjacencies, .neighbor_tables = &tables };
+    const payload = try graph_segment.encodeAlloc(alloc, graph);
+    defer alloc.free(payload);
+    var packed_topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
+    defer packed_topology.deinit(alloc);
+    var reference = try compileTopologyAlloc(alloc, graph, .none);
+    defer reference.deinit(alloc);
+    const Runner = struct {
+        fn prepare(failing_alloc: Allocator, input: []const u8) !void {
+            var topology = try prepareTopologyFromPackedAlloc(failing_alloc, input, .none, .{});
+            defer topology.deinit(failing_alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.prepare, .{payload});
+    var filter_types = [_][]u8{@constCast("alpha")};
+    for ([_]graph_mod.GraphMetricEdgeFilter{ .{}, .{ .mode = .types, .types = &filter_types } }) |filter| {
+        for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank, .eigenvector, .hits_authority, .hits_hub }) |kind| {
+            const options = BuildOptions{
+                .graph_index_name = "graph",
+                .config = .{ .name = "metric", .kind = kind, .edge_filter = filter },
+                .source_graph = .{ .kind = .graph_segment, .name = "graph", .artifact_id = "sha256:placeholder", .byte_len = payload.len, .checksum = "placeholder" },
+            };
+            var a = try buildProjectionFromTopologyAlloc(alloc, reference, 0, options);
+            defer a.deinit(alloc);
+            var b = try buildProjectionFromTopologyAlloc(alloc, packed_topology, 0, options);
+            defer b.deinit(alloc);
+            try std.testing.expectEqual(a.edgeCount(), b.edgeCount());
+            try std.testing.expectEqual(a.node_ids.items.len, b.node_ids.items.len);
+            for (a.node_ids.items, b.node_ids.items) |left, right| try std.testing.expectEqualStrings(left, right);
+            const ta = a.topology.?;
+            const tb = b.topology.?;
+            try std.testing.expectEqualSlices(u32, ta.incoming_offsets, tb.incoming_offsets);
+            try std.testing.expectEqualSlices(u32, ta.incoming_sources, tb.incoming_sources);
+            try std.testing.expectEqualSlices(u32, ta.outgoing_offsets, tb.outgoing_offsets);
+            try std.testing.expectEqualSlices(u32, ta.outgoing_targets, tb.outgoing_targets);
+        }
+    }
+}
+
 test "serverless lake graph metrics build immutable pagerank and degree vectors" {
     const alloc = std.testing.allocator;
     var graph = graph_segment.Segment{ .adjacencies = try alloc.alloc(graph_segment.Adjacency, 3) };
@@ -2548,6 +2757,19 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         defer decoded.deinit(alloc);
         try std.testing.expectEqual(if (i == 0) metric_segment.MaterializationState.ready else .rejected, decoded.materialization_state);
     }
+
+    // An unaffordable PageRank must not force its larger CSR projection on a
+    // degree metric. Degree fits exactly: source 3 + projection 9 + kernel 2.
+    const pressure = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "pressure", source, &.{
+        .{ .name = "rank", .kind = .pagerank },
+        .{ .name = "degree", .kind = .degree },
+    }, .none, .{ .max_work_items = 14, .max_total_work_items = 14 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    defer {
+        for (pressure) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(pressure);
+    }
+    try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.rejected, pressure[0].graph_metric_materialization_state);
+    try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.ready, pressure[1].graph_metric_materialization_state);
 
     var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 269, .max_total_work_items = 269 } };
     const one_config = [_]graph_mod.GraphMetricConfig{.{ .name = "shared_rank", .kind = .pagerank }};

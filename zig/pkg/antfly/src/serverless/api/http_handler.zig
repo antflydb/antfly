@@ -6946,14 +6946,15 @@ const PublicGraphRequestCache = struct {
         defer self.handler.alloc.free(payload);
         if (payload.len != payload_len) return error.InvalidGraphSegment;
 
-        var persistent_bytes = graph_segment_mod.decodedRetainedBytes(payload) catch |err| switch (err) {
-            error.UnsupportedGraphSegmentVersion => return err,
+        var view_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, try graph_segment_mod.codec.compact.viewRetainedBytes(payload));
+        defer view_lease.deinit();
+        var view = graph_segment_mod.codec.compact.viewAlloc(self.handler.alloc, payload, .{}, self.session.cancellation) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled, error.UnsupportedGraphSegmentVersion => return err,
             else => return error.InvalidGraphSegment,
         };
-        const adjacency_count = blk: {
-            if (payload.len < 14) return error.InvalidGraphSegment;
-            break :blk std.mem.readInt(u32, payload[10..14], .little);
-        };
+        defer view.deinit(self.handler.alloc);
+        var persistent_bytes = try view.decodedBytes();
+        const adjacency_count = view.adjacencies.len;
         const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
             adjacency_count,
             std.hash_map.default_max_load_percentage,
@@ -6964,7 +6965,7 @@ const PublicGraphRequestCache = struct {
             graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
                 return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
         ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-        const table_count = std.mem.readInt(u32, payload[6..10], .little);
+        const table_count = view.tables.len;
         persistent_bytes = std.math.add(
             usize,
             persistent_bytes,
@@ -6973,16 +6974,11 @@ const PublicGraphRequestCache = struct {
         ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         // JSON string escaping expands one source byte to at most six bytes.
         // Reserve that hard upper bound before metadata serialization.
-        var table_pos: usize = 14;
         var reserved_metadata_payload_bytes: usize = 0;
-        for (0..table_count) |_| {
-            if (table_pos > payload.len or payload.len - table_pos < 4) return error.InvalidGraphSegment;
-            const table_len = std.mem.readInt(u32, payload[table_pos..][0..4], .little);
-            table_pos += 4;
-            if (table_len > payload.len - table_pos) return error.InvalidGraphSegment;
+        for (view.tables) |table| {
             const metadata_len = std.math.add(
                 usize,
-                std.math.mul(usize, table_len, 6) catch
+                std.math.mul(usize, table.len, 6) catch
                     return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
                 "{\"target_table\":\"\"}".len,
             ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
@@ -6990,7 +6986,6 @@ const PublicGraphRequestCache = struct {
                 return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
             reserved_metadata_payload_bytes = std.math.add(usize, reserved_metadata_payload_bytes, metadata_len) catch
                 return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-            table_pos += table_len;
         }
         persistent_bytes = std.math.add(usize, persistent_bytes, index_name.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
@@ -6998,7 +6993,7 @@ const PublicGraphRequestCache = struct {
         try self.reserveRetained(persistent_bytes);
         errdefer self.retained_lease.resize(prior_retained) catch unreachable;
 
-        var segment = try graph_segment_mod.decodeAlloc(self.handler.alloc, payload);
+        var segment = try graph_segment_mod.codec.compact.decodeViewAlloc(self.handler.alloc, view, self.session.cancellation);
         errdefer graph_segment_mod.freeSegment(self.handler.alloc, &segment);
         var adjacency_index = try graph_segment_mod.AdjacencyIndex.initWithCancellation(
             self.handler.alloc,

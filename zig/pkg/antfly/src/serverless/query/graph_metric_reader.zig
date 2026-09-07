@@ -233,7 +233,7 @@ fn scoreColumnWorker(
     cancel_siblings: *std.atomic.Value(bool),
 ) void {
     if (pass == .prepare) {
-        plan.* = preparePointScoresAlloc(std.heap.smp_allocator, child, graph_index_name, metric_name, node_ids, scores) catch |err| {
+        plan.* = preparePointScoresAlloc(std.heap.smp_allocator, child, graph_index_name, metric_name, node_ids, scores, true) catch |err| {
             failure.* = err;
             cancel_siblings.store(true, .release);
             return;
@@ -276,7 +276,40 @@ pub fn scoreColumnsAlloc(
 ) !PointScoreColumnsResult {
     if (metric_names.len > max_point_score_columns or node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     if (metric_names.len == 0) return .{ .columns = try alloc.alloc(PointScoresResult, 0) };
-    _ = try session.graphMetricSpecs();
+    const specs = try session.graphMetricSpecs();
+    // Plan immutable computations, then fan out logical names/provenance.
+    // Aliases must not multiply transport admission, routing or block decode.
+    var physical_names: [max_point_score_columns][]const u8 = undefined;
+    var physical_refs: [max_point_score_columns]manifest_mod.ArtifactRef = undefined;
+    var physical_configs: [max_point_score_columns]graph_mod.GraphMetricConfig = undefined;
+    var logical_refs: [max_point_score_columns]manifest_mod.ArtifactRef = undefined;
+    var mapping: [max_point_score_columns]usize = undefined;
+    var owners: [max_point_score_columns]usize = undefined;
+    var physical_count: usize = 0;
+    for (metric_names, 0..) |name, i| {
+        try session.checkCancellation();
+        const config = findConfig(specs, graph_index_name, name) orelse return error.MetricNotConfigured;
+        const encoded_name = try metric_segment.artifactNameAlloc(alloc, graph_index_name, name);
+        defer alloc.free(encoded_name);
+        const index = session.findNamedArtifactIndex(.graph_metric_segment, encoded_name) orelse return error.MetricNotReady;
+        const ref = session.artifactRef(index) orelse return error.InvalidGraphMetricSegment;
+        logical_refs[i] = ref;
+        const existing = for (physical_refs[0..physical_count], physical_configs[0..physical_count], 0..) |prior, prior_config, p| {
+            if (lake_graph_metric.sameComputation(config, prior_config) and
+                (std.mem.eql(u8, ref.name, prior.name) or @import("../manifest/artifact_ref.zig").areGraphArtifactAliases(ref, prior))) break p;
+        } else null;
+        mapping[i] = existing orelse physical_count;
+        if (existing == null) {
+            physical_names[physical_count] = name;
+            physical_refs[physical_count] = ref;
+            physical_configs[physical_count] = config;
+            owners[physical_count] = i;
+            physical_count += 1;
+        }
+    }
+    const result_items = std.math.mul(usize, metric_names.len, node_ids.len) catch return error.GraphMetricQueryBudgetExceeded;
+    try session.chargeGraphMetricRetained(std.math.mul(usize, result_items, @sizeOf(?f64)) catch return error.GraphMetricQueryBudgetExceeded);
+    try session.chargeGraphMetricDecode(0, (metric_names.len - physical_count) * node_ids.len);
     const columns = try alloc.alloc(PointScoresResult, metric_names.len);
     var initialized_columns: usize = 0;
     errdefer {
@@ -284,16 +317,16 @@ pub fn scoreColumnsAlloc(
         alloc.free(columns);
     }
     var plans: [max_point_score_columns]?PointScorePlan = @splat(null);
-    defer for (plans[0..metric_names.len]) |*plan| if (plan.*) |*value| value.deinit();
+    defer for (plans[0..physical_count]) |*plan| if (plan.*) |*value| value.deinit();
     var buffers: [max_point_score_columns]?[]?f64 = @splat(null);
-    defer for (buffers[0..metric_names.len]) |buffer| if (buffer) |value| alloc.free(value);
-    for (buffers[0..metric_names.len]) |*buffer| buffer.* = try alloc.alloc(?f64, node_ids.len);
+    defer for (buffers[0..physical_count]) |buffer| if (buffer) |value| alloc.free(value);
+    for (buffers[0..physical_count]) |*buffer| buffer.* = try alloc.alloc(?f64, node_ids.len);
 
     for ([_]ColumnPass{ .prepare, .execute }) |pass| {
-        if (pass == .execute) try admitPointPlans(alloc, session, plans[0..metric_names.len]);
+        if (pass == .execute) try admitPointPlans(alloc, session, plans[0..physical_count]);
         var start: usize = 0;
-        while (start < metric_names.len) {
-            const end = @min(start + max_parallel_point_score_columns, metric_names.len);
+        while (start < physical_count) {
+            const end = @min(start + max_parallel_point_score_columns, physical_count);
             const count = end - start;
             var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
             var diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
@@ -302,7 +335,7 @@ pub fn scoreColumnsAlloc(
             var cancellations: [max_parallel_point_score_columns]CombinedColumnCancellation = undefined;
             var group: std.Io.Group = .init;
             // Every fallible allocation happened before launching these workers.
-            for (metric_names[start..end], 0..) |metric_name, i| {
+            for (physical_names[start..end], 0..) |metric_name, i| {
                 children[i] = session.forkGraphMetricRead(std.heap.smp_allocator);
                 cancellations[i] = .{ .parent = session.cancellation, .sibling_failure = &sibling_failure };
                 children[i].cancellation = cancellations[i].token();
@@ -326,9 +359,19 @@ pub fn scoreColumnsAlloc(
         }
     }
     for (metric_names, 0..) |name, i| {
-        columns[i] = try pointScoresResultAlloc(alloc, session, graph_index_name, name, buffers[i].?, plans[i].?.metadata);
+        const p = mapping[i];
+        var metadata = plans[p].?.metadata;
+        const ref = logical_refs[i];
+        metadata.published_generation = if (ref.published_generation != 0) ref.published_generation else session.manifest.version;
+        metadata.edge_generation = if (ref.edge_generation != 0) ref.edge_generation else session.manifest.version;
+        metadata.computed_at_ms = if (ref.computed_at_ms != 0) ref.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms);
+        const owns_physical = owners[p] == i;
+        // Logical result copies were admitted before any worker or I/O.
+        const scores = if (owns_physical) buffers[p].? else try alloc.dupe(?f64, columns[owners[p]].scores);
+        errdefer if (!owns_physical) alloc.free(scores);
+        columns[i] = try pointScoresResultAlloc(alloc, session, graph_index_name, name, scores, metadata);
         initialized_columns += 1;
-        buffers[i] = null;
+        if (owns_physical) buffers[p] = null;
     }
     return .{ .columns = columns };
 }
@@ -386,7 +429,7 @@ const PointScorePlan = struct {
 /// Resolves scores directly into caller-owned storage using the same admission
 /// and execution phases as a multi-column query.
 fn scoresInto(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_ids: []const []const u8, values: []?f64) !PointScoresMetadata {
-    var plans = [_]?PointScorePlan{try preparePointScoresAlloc(alloc, session, graph_index_name, metric_name, node_ids, values)};
+    var plans = [_]?PointScorePlan{try preparePointScoresAlloc(alloc, session, graph_index_name, metric_name, node_ids, values, false)};
     defer plans[0].?.deinit();
     try admitPointPlans(alloc, session, &plans);
     try executePointScores(session, &plans[0].?, node_ids, values);
@@ -400,12 +443,13 @@ fn preparePointScoresAlloc(
     metric_name: []const u8,
     node_ids: []const []const u8,
     values: []?f64,
+    result_reserved: bool,
 ) !PointScorePlan {
     try session.checkCancellation();
     if (values.len != node_ids.len) return error.InvalidGraphMetricSegment;
     if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     const retained_score_bytes = std.math.mul(usize, node_ids.len, @sizeOf(?f64)) catch return error.GraphMetricQueryBudgetExceeded;
-    try session.chargeGraphMetricRetained(retained_score_bytes);
+    if (!result_reserved) try session.chargeGraphMetricRetained(retained_score_bytes);
     try session.chargeGraphMetricDecode(0, node_ids.len);
     for (node_ids) |node_id| {
         if (node_id.len == 0 or node_id.len > metric_segment.codec.max_score_node_id_bytes) return error.InvalidGraphMetricNodeId;
@@ -2311,7 +2355,13 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
             .graph_metric_config_fingerprint = metric.config_fingerprint,
             .graph_metric_source_checksum = @splat(0xaa),
         },
+        undefined,
     };
+    refs[2] = refs[1];
+    refs[2].name = "9:graph_idx5:alias";
+    refs[2].published_generation = 7;
+    refs[2].edge_generation = 6;
+    refs[2].computed_at_ms = 123;
     var session_arena = std.heap.ArenaAllocator.init(alloc);
     defer session_arena.deinit();
     var session = runtime_mod.QuerySession{
@@ -2323,7 +2373,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
             .built_at_ns = 1,
             .wal_start_lsn = 1,
             .wal_end_lsn = 1,
-            .stats = .{ .indexes_json = @constCast("{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}") },
+            .stats = .{ .indexes_json = @constCast("{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"},\"alias\":{\"kind\":\"pagerank\"}}}}") },
             .artifacts = &refs,
         },
     };
@@ -2334,6 +2384,30 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     const last_id = metric.scores[score_count - 1].node_id;
     const last_value: f64 = @floatFromInt(score_count - 1);
     const node_ids = [_][]const u8{last_id};
+
+    {
+        var aliases = try scoreColumnsAlloc(alloc, &session, "graph_idx", &.{ "rank", "alias" }, &node_ids);
+        defer aliases.deinit(alloc);
+        try std.testing.expectEqualSlices(?f64, aliases.columns[0].scores, aliases.columns[1].scores);
+        try std.testing.expectEqual(@as(u64, 7), aliases.columns[1].published_generation);
+        try std.testing.expectEqual(@as(u64, 6), aliases.columns[1].edge_generation);
+        try std.testing.expectEqual(@as(u64, 123), aliases.columns[1].computed_at_ms);
+        const detached = try aliases.columns[1].takeScores();
+        defer alloc.free(detached);
+        detached[0] = null;
+        try std.testing.expectEqual(@as(?f64, last_value), aliases.columns[0].scores[0]);
+        const is_paged = score_count > metric_segment.codec.routing_page_entries * metric_segment.score_block_entries and integrity.routing_footer_len > 64 * 1024;
+        try std.testing.expectEqual(@as(usize, if (is_paged) 5 else 3), state.range_calls.load(.monotonic));
+    }
+    session.graph_metric_read_budget = .{};
+    state.range_calls.store(0, .monotonic);
+    // An alias with conflicting immutable metadata must be validated on its
+    // own physical plan, not hidden behind the first column's authentication.
+    refs[2].graph_metric_control_checksum[0] ^= 1;
+    try std.testing.expectError(error.InvalidGraphMetricSegment, scoreColumnsAlloc(alloc, &session, "graph_idx", &.{ "rank", "alias" }, &node_ids));
+    refs[2].graph_metric_control_checksum[0] ^= 1;
+    session.graph_metric_read_budget = .{};
+    state.range_calls.store(0, .monotonic);
 
     var empty_points = try scoresAlloc(alloc, &session, "graph_idx", "rank", &.{});
     defer empty_points.deinit(alloc);
@@ -2362,9 +2436,8 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     defer io_impl.deinit();
     session.setIo(io_impl.io());
     if (paged) {
-        // Sixty distinct score blocks across three routing pages, twice.
-        // Metadata and routing must fit alongside the scores in the shared
-        // 128-request budget, independent of column scheduling order.
+        // Sixty distinct score blocks across three routing pages, requested
+        // twice but admitted/fetched/decoded as one physical column.
         var broad_ids: [60][]const u8 = undefined;
         for (&broad_ids, 0..) |*id, i| id.* = metric.scores[(i * 128 / 59) * metric_segment.score_block_entries].node_id;
         session.graph_metric_read_budget = .{};
@@ -2374,13 +2447,13 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         for (broad.columns) |column| for (column.scores, 0..) |score, i| {
             try std.testing.expectEqual(@as(?f64, @floatFromInt((i * 128 / 59) * metric_segment.score_block_entries)), score);
         };
-        try std.testing.expectEqual(@as(u64, 128), session.graph_metric_read_budget.range_requests);
-        try std.testing.expectEqual(@as(usize, 128), state.range_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 66), session.graph_metric_read_budget.range_requests);
+        try std.testing.expectEqual(@as(usize, 66), state.range_calls.load(.monotonic));
         session.graph_metric_read_budget = .{};
     }
     const column_names = [_][]const u8{ "rank", "rank", "rank" };
     state.control_calls.store(0, .monotonic);
-    state.required_controls_before_scores = column_names.len;
+    state.required_controls_before_scores = 1;
     var columns = try scoreColumnsAlloc(alloc, &session, "graph_idx", &column_names, &node_ids);
     state.required_controls_before_scores = 0;
     defer columns.deinit(alloc);
@@ -2389,14 +2462,14 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
 
     // All routing fits, but the complete score plan does not. Admission must
     // reject before any column starts score I/O, including earlier cohorts.
-    const metadata_requests: u64 = column_names.len * @as(u64, if (paged) 4 else 2);
+    const metadata_requests: u64 = if (paged) 4 else 2;
     session.graph_metric_read_budget = .{ .limits = .{ .max_range_requests = metadata_requests } };
     state.range_calls.store(0, .monotonic);
     state.control_calls.store(0, .monotonic);
-    state.required_controls_before_scores = column_names.len;
+    state.required_controls_before_scores = 1;
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, scoreColumnsAlloc(alloc, &session, "graph_idx", &column_names, &node_ids));
     state.required_controls_before_scores = 0;
-    try std.testing.expectEqual(column_names.len, state.control_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), state.control_calls.load(.monotonic));
     try std.testing.expectEqual(metadata_requests, state.range_calls.load(.monotonic));
     session.graph_metric_read_budget = .{};
 
@@ -2405,7 +2478,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
             // Each injected run is one logical request. Workers share this
             // budget, but never the intentionally non-thread-safe allocator.
             active_session.graph_metric_read_budget = .{};
-            const names = [_][]const u8{ "rank", "rank", "rank" };
+            const names = [_][]const u8{ "rank", "alias", "rank" };
             const ids = [_][]const u8{lookup_id};
             var direct = try scoresAlloc(failing_alloc, active_session, "graph_idx", "rank", &ids);
             defer direct.deinit(failing_alloc);

@@ -8464,6 +8464,7 @@ pub fn build(b: *std.Build) void {
         "graph metric partition spans remain balanced at production cardinality",
         "graph metric floating page aggregates are deterministic across adoption order",
         "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
+        "graph metric physical score reads",
         "graph metric status exposes queued and active local build lease",
         "graph metric coordinator reports expired exhausted page lease",
         "graph planned metric build retires a superseded generation without poisoning newer work",
@@ -9713,6 +9714,19 @@ pub fn build(b: *std.Build) void {
     }
     const backend_bench_step = b.step("backend-bench", "Benchmark shared backend workloads across LMDB and LSM backends");
     backend_bench_step.dependOn(&run_backend_bench.step);
+
+    const graph_metric_prepare_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/metric_preparation_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    graph_metric_prepare_bench_mod.addImport("antfly_zig", lib_mod);
+    const graph_metric_prepare_bench = b.addExecutable(.{
+        .name = "graph_metric_preparation_bench",
+        .root_module = graph_metric_prepare_bench_mod,
+    });
+    const run_graph_metric_prepare_bench = b.addRunArtifact(graph_metric_prepare_bench);
+    b.step("graph-metric-preparation-bench", "Compare unpack/hash and packed ordinal graph-metric preparation").dependOn(&run_graph_metric_prepare_bench.step);
 
     const graph_pattern_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),

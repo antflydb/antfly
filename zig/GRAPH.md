@@ -743,9 +743,23 @@ Document and external-source serverless publications use the same request-wide
 plan in `serverless/build/lake_graph_metric.zig`. Reusable metrics are resolved
 first. Dirty requests are grouped by authenticated source identity, equivalent
 edge filter, and exact metric computation parameters. Names and refresh policies
-are not computation identity. Each source is fetched/decoded once, each filter
-builds one union topology, and each unique metric is computed, encoded, and
-uploaded once. Compatible HITS authority/hub metrics share their kernel.
+are not computation identity. Each source is fetched/prepared once. Compatible
+filters share a union topology when the whole group fits its work and memory
+budgets; otherwise the planner processes cheaper exact topology requirements
+first. An unaffordable spectral sibling must not force an affordable degree
+metric to build its adjacency lanes or inherit its rejection. Each unique metric
+is computed, encoded, and uploaded once. Compatible HITS authority/hub metrics
+share their kernel.
+
+Graph artifact wire v3 stores sorted node/type dictionaries and fixed-width
+ordinal edge records (including weights and qualified-table ordinals). Metric
+preparation reads validated borrowed views directly into compact outbound
+topology, without per-edge string allocation, node hashing, or allocating then
+discarding inbound edges. The graph-query reader reuses the same validated view
+for memory admission and owned adjacency decoding. Encoders build dictionaries
+once, check output limits before allocation, and observe cancellation. The
+current score artifact remains v9: its prefix-compressed point/ranked blocks
+remain independently readable without fetching another node dictionary.
 
 The plan retains only one source and one filtered projection at a time; alias
 fanout retains lightweight references, not score vectors or encoded payloads.
@@ -791,6 +805,27 @@ and bypasses are exposed in `QueryCacheStats`; maintenance can explicitly drain
 retention, but queries never wait for it. Local-cache read errors fall back to
 authenticated origin reads; origin integrity failures remain fatal.
 
-Materializer epoch 12 invalidates earlier admission and reduction policies,
-including rejections retained without a complete admission-plan witness.
-Serverless is unreleased and supports only the current artifact contract.
+Column queries resolve immutable physical computations before admission and
+range planning. Equivalent aliases share routing, transport, and decode work,
+while every logical output is admitted up front and owns its result array and
+publication provenance. Conflicting immutable metadata cannot reuse another
+column's validation.
+
+Non-serverless single- and multi-column reads use the same snapshot-local
+physical-key reader in `graph/score_read.zig`. Status policies are checked before
+score allocation. Only identical encoded metric/generation prefixes are aliases;
+equal configurations with different durable publications remain independent.
+Rows and physical columns are sorted independently, duplicate keys are read
+once, and all logical results preserve input order and independent ownership.
+One reusable key slab and result-vector pair serve batches of at most 4096
+storage keys, avoiding per-score prefix formatting and per-batch arena churn.
+The existing durable ordinal/vector-chunk jobs and shared numerical kernels
+remain the non-serverless computation path.
+
+Materializer epoch 13 invalidates earlier admission and preparation policies,
+including rejections retained before adaptive topology grouping. Serverless is
+unreleased and supports only the current artifact contract: old graph wire
+versions are rejected, not migrated or silently decoded.
+
+See [preparation and score-reader benchmarks](bench/graph/METRIC_PREPARATION.md)
+for reproducible phase-specific measurements and their limitations.

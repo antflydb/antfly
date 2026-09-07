@@ -15,10 +15,9 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 12 scopes rejection reuse to the complete admission plan and reuses
-// authenticated prior computations across aliases. Refresh older rejections
-// which may already have outlived the plan that exhausted their budget.
-pub const materializer_epoch: u32 = 12;
+// Epoch 13 reads persisted graph ordinals and admits adaptive projection
+// groups. Re-evaluate rejections made with unpacked topology/union-only costs.
+pub const materializer_epoch: u32 = 13;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

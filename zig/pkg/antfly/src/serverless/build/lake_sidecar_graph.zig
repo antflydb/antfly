@@ -111,11 +111,16 @@ fn buildGraphSidecarBoundedAlloc(
     var segment = try nodeMapToSegmentAlloc(alloc, &node_map, &neighbor_tables);
     defer graph_segment.freeSegment(alloc, &segment);
 
-    const encoded_size = try graph_segment.encodedSize(segment);
-    try budget.checkOutputBytes(encoded_size);
-    const payload = try graph_segment.encodeAlloc(alloc, segment);
+    const payload = graph_segment.codec.compact.encodeAllocWithLimit(
+        alloc,
+        segment,
+        options.limits.max_output_bytes,
+        options.cancellation,
+    ) catch |err| switch (err) {
+        error.GraphSegmentTooLarge => return error.LakeSidecarBuildBudgetExceeded,
+        else => return err,
+    };
     errdefer alloc.free(payload);
-    std.debug.assert(payload.len == encoded_size);
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
