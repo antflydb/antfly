@@ -22,6 +22,103 @@
 
 const std = @import("std");
 
+/// Request-local arenas and bounded allocators may be touched by a peer that
+/// owns a fused token step. Wrap the complete temporary lifetime, then return
+/// only buffers whose eventual owner frees through the original allocator.
+pub const SynchronizedAllocator = struct {
+    child: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.child.rawAlloc(len, alignment, address);
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.child.rawResize(bytes, alignment, len, address);
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        return self.child.rawRemap(bytes, alignment, len, address);
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, address: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        self.child.rawFree(bytes, alignment, address);
+    }
+};
+
+test "microbatch synchronized allocator protects request-local arenas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var synchronized = SynchronizedAllocator{ .child = arena.allocator() };
+    const Worker = struct {
+        fn run(allocator: std.mem.Allocator, value: u8) std.Io.Cancelable!void {
+            for (0..100) |_| {
+                const bytes = allocator.alloc(u8, 1024) catch @panic("test allocation failed");
+                defer allocator.free(bytes);
+                @memset(bytes, value);
+                std.debug.assert(value == bytes[1023]);
+            }
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Worker.run, .{ synchronized.allocator(), 1 });
+    try group.concurrent(std.testing.io, Worker.run, .{ synchronized.allocator(), 2 });
+    try group.await(std.testing.io);
+}
+
+test "microbatch owned collection cleans partial caller allocation failures" {
+    const Rows = struct {
+        fn clone(allocator: std.mem.Allocator, value: []u8) ![]u8 {
+            return allocator.dupe(u8, value);
+        }
+        fn destroy(allocator: std.mem.Allocator, value: []u8) void {
+            allocator.free(value);
+        }
+        fn run(allocator: std.mem.Allocator) !void {
+            const shared = std.testing.allocator;
+            const results = try shared.alloc(ItemResult([]u8), 2);
+            results[0] = .{ .identity = .{}, .execution = .native_batch, .result = .{ .value = try shared.dupe(u8, "first") } };
+            results[1] = .{ .identity = .{}, .execution = .native_batch, .result = .{ .value = try shared.dupe(u8, "second") } };
+            const rows = try collectOwned([]u8, allocator, shared, results, clone, destroy);
+            defer {
+                for (rows) |row| destroy(allocator, row);
+                allocator.free(rows);
+            }
+            try std.testing.expectEqualStrings("first", rows[0]);
+            try std.testing.expectEqualStrings("second", rows[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Rows.run, .{});
+}
+
+test "microbatch working budgets and task families are distinct execution keys" {
+    const key = Key{ .model = "multimodal", .task = .embed, .resource_class = .cpu, .resource_limit_bytes = 1024 };
+    var other = key;
+    other.resource_limit_bytes += 1;
+    try std.testing.expect(!key.eql(other));
+    inline for (std.meta.tags(Task)) |task| {
+        other = key;
+        other.task = task;
+        try std.testing.expectEqual(task == .embed, key.eql(other));
+    }
+}
+
 pub const Task = enum {
     read,
     generate,
@@ -57,10 +154,12 @@ pub const Key = struct {
     schema: []const u8 = "",
     transform: []const u8 = "",
     option_key: u64 = 0,
+    resource_limit_bytes: usize = 0,
     resource_class: ResourceClass,
 
     fn eql(a: Key, b: Key) bool {
         return a.generation == b.generation and
+            a.resource_limit_bytes == b.resource_limit_bytes and
             a.task == b.task and
             a.option_key == b.option_key and
             a.resource_class == b.resource_class and
@@ -145,12 +244,51 @@ pub fn ItemResult(comptime T: type) type {
     };
 }
 
+/// Transfer typed results out of a cross-caller executor. The shared allocator
+/// is thread-safe; caller allocators are only touched after the synchronous
+/// join. Both partial allocation failures and item errors release every value.
+pub fn collectOwned(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    shared: std.mem.Allocator,
+    results: []ItemResult(T),
+    comptime clone: fn (std.mem.Allocator, T) anyerror!T,
+    comptime destroy: fn (std.mem.Allocator, T) void,
+) ![]T {
+    defer {
+        for (results) |result| switch (result.result) {
+            .value => |value| destroy(shared, value),
+            .item_error => {},
+        };
+        shared.free(results);
+    }
+    // Fail-fast is a caller policy, not a fused-executor failure policy.
+    for (results) |result| switch (result.result) {
+        .item_error => |failure| return failure.cause,
+        .value => {},
+    };
+    const output = try allocator.alloc(T, results.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (output[0..initialized]) |value| destroy(allocator, value);
+        allocator.free(output);
+    }
+    for (results, output) |result, *value| {
+        value.* = try clone(allocator, result.result.value);
+        initialized += 1;
+    }
+    return output;
+}
+
 pub const ResultSlot = struct {
     output: *anyopaque,
     completed: bool = false,
     err: ?anyerror = null,
     execution: Execution = .serial,
     execution_id: u64 = 0,
+    /// Executor-local physical subgroup identity. Zero means one physical
+    /// batch for the coalesced group; capacity subdivision supplies distinct keys.
+    physical_group_key: usize = 0,
 
     pub fn setValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution) void {
         const output: *T = @ptrCast(@alignCast(self.output));
@@ -265,6 +403,7 @@ const Group = struct {
 };
 
 pub const Stats = struct {
+    coalesced_groups: u64 = 0,
     native_batches: u64 = 0,
     native_items: u64 = 0,
     bypass_items: u64 = 0,
@@ -309,6 +448,7 @@ pub const Broker = struct {
         for (&self.shards) |*shard| {
             shard.mutex.lockUncancelable(io);
             total.native_batches +|= shard.stats.native_batches;
+            total.coalesced_groups +|= shard.stats.coalesced_groups;
             total.native_items +|= shard.stats.native_items;
             total.bypass_items +|= shard.stats.bypass_items;
             total.canceled_items +|= shard.stats.canceled_items;
@@ -609,6 +749,7 @@ pub const Broker = struct {
         updateBrokerKeyHash(&hasher, key.schema);
         updateBrokerKeyHash(&hasher, key.transform);
         hasher.update(std.mem.asBytes(&key.option_key));
+        hasher.update(std.mem.asBytes(&key.resource_limit_bytes));
         hasher.update(std.mem.asBytes(&key.resource_class));
         const index: usize = @intCast(hasher.final() % broker_shard_count);
         return &self.shards[index];
@@ -681,19 +822,38 @@ pub const Broker = struct {
         }
         shard.mutex.unlock(io);
 
+        var native_count: usize = 0;
+        var native_batches: usize = 0;
         if (active_count > 0) {
             const execution_id = self.next_execution_id.fetchAdd(1, .monotonic);
             group.execute_fn(group.execute_ctx, items[0..active_count]);
-            for (items[0..active_count]) |item| {
+            for (items[0..active_count], 0..) |item, index| {
                 if (!item.slot.completed) item.slot.fail(error.MissingMicrobatchResult);
                 item.slot.execution_id = execution_id;
+                if (item.slot.err == null and item.slot.execution == .native_batch) {
+                    native_count += 1;
+                    var previous_id: ?u64 = null;
+                    for (items[0..index]) |previous| {
+                        if (previous.slot.err == null and previous.slot.execution == .native_batch and previous.slot.physical_group_key == item.slot.physical_group_key) {
+                            previous_id = previous.slot.execution_id;
+                            break;
+                        }
+                    }
+                    if (previous_id) |id| {
+                        item.slot.execution_id = id;
+                    } else {
+                        native_batches += 1;
+                        if (item.slot.physical_group_key != 0) item.slot.execution_id = self.next_execution_id.fetchAdd(1, .monotonic);
+                    }
+                }
             }
         }
         self.allocator.free(items);
 
         shard.mutex.lockUncancelable(io);
-        shard.stats.native_batches +|= @intFromBool(active_count > 0);
-        shard.stats.native_items +|= active_count;
+        shard.stats.coalesced_groups +|= @intFromBool(active_count > 0);
+        shard.stats.native_batches +|= native_batches;
+        shard.stats.native_items +|= native_count;
         self.finishGroupLocked(io, shard, group, active_count);
     }
 

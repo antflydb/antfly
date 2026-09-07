@@ -60,6 +60,65 @@ admission, batching, provenance, cancellation, and per-item result envelopes;
 they must not share task semantics merely because several can consume the same
 prepared asset.
 
+### Two-level scheduling for every task and provider
+
+Scheduling belongs on both sides, with different ownership. Antfly owns the
+logical work queue: partition ready requests by execution compatibility before
+materializing media, share source/transform windows, apply host memory limits,
+and preserve durable identities and typed publication. The inference backend
+owns physical execution: combine eligible work from multiple Antfly clients,
+admit it against the loaded model and node/device resources, and dispatch it
+through that task's executor. Embedded inference uses the same separation
+without requiring an HTTP hop.
+
+This contract applies to readers, generators, dense and sparse embedders,
+rerankers, extractors (including classification), chunkers, rewriters,
+transcribers, and other model families. It also applies to local and distributed
+Antfly routes and external providers. It does **not** imply that every executor
+supports a fused batch, every task accepts images, or that Antfly controls an
+external vendor's internal scheduler. Unsupported batching uses bounded
+singleton/serial execution with accurate observed telemetry.
+
+Compatibility must include the resolved model generation, task, provider and
+endpoint/authorization scope, prompt/schema/options, input representation and
+resource class—not just the model name. Embedding rows remain independent;
+reranking preserves each query/candidate group and its score mapping;
+extraction preserves schema and per-item results; generation preserves separate
+conversations, sampling state, and output streams. Continuous token batching
+is a generator-executor capability, not a generic concatenation of messages.
+
+Antfly should batch already-ready work without an additional fill delay. A
+backend may use a bounded microbatch delay where useful, within the caller's
+original deadline; both layers must not independently restart that deadline or
+wait to fill maximum-sized batches. Limits cover queued descriptors, retained
+media, tokens/pixels, output bytes, concurrency, and tenant fairness. Host
+executor slots and memory grants do not imply remote model permits: node-wide
+admission remains authoritative even when jobs target different models.
+
+The node broker has reader, dense/sparse text embedding, image/audio embedding,
+and GLiNER encoder adapters. Mixed embedding requests partition by modality and
+scatter results to their original indexes. GLiNER entity, relation, structured
+extraction, and classification passes share encoder preparation but retain
+their typed decoding. Classification excludes padded neighboring words from
+its score reduction. Native split GLiNER bundles register native extraction;
+ONNX exports retain conservative compatibility execution.
+
+Generation uses its existing token-step coordinator, not the encoder broker.
+Direct native generation and non-streaming HTTP native generation with
+request-local backend state can participate. Whole-request graph, speculative,
+prompt-cache, streaming, and shared Metal/CUDA owners retain their gates.
+Whole-request native owners leave the token coordinator before taking the
+model gate, preventing a turn/model-lock cycle with isolated peers. Temporary
+request allocators accessed by peer token steps are synchronized; no returned
+value retains the stack-local allocator wrapper.
+
+Rerankers, rewriters, transcribers, and other unqualified executors retain their
+existing typed routes and bounded execution. The current chunk endpoint is a
+fixed text/media transformation, not a learned model: it has no model batch to
+fill and should not incur coalescing latency. These distinctions are deliberate;
+universal fused batching across every backend/provider is not a completed
+feature claim. External vendor scheduling remains outside Antfly's control.
+
 ### Latest review fixes
 
 #### Review hardening: page outcomes, cache identity, and representation demand
@@ -87,10 +146,10 @@ retained earlier PNGs, and the active compressor's peak share one bounded
 budget; codec work shares one deadline. Partial demand cannot fragment a
 consumer's native inference batches or silently reduce its requested quality.
 
-#### Qualified image-embedding microbatches
+#### Qualified multimodal embedding microbatches
 
-The inference Node's lazy task-neutral broker now has a dense image-embedding
-adapter in addition to reading. Homogeneous fail-fast encoded-image calls
+The inference Node's lazy task-neutral broker has dense/sparse text and
+image/audio embedding adapters in addition to reading. Fail-fast encoded-image calls
 (including distributed `/embed`) and local borrowed page rasters can coalesce
 when the **loaded model** advertises native image batching. Group identity
 includes immutable loaded generation, task/instruction options, media
@@ -102,14 +161,19 @@ Grouping happens before taking model asset or execution locks. The fused
 pipeline admits its realized preprocessing/compute shape, allocates temporary
 vectors with a thread-safe allocator, joins all consumers, then copies each
 result into its caller's allocator. Individual cancellation does not stop live
-peers. A corrupt compressed image is isolated with singleton fallback; resource
+peers. Corrupt compressed images are excluded by indexed preprocessing; resource
 and runtime failures do not cause retry amplification. Execution records report
 native, singleton serial, or fallback behavior actually used by the pipeline.
 
-Text/audio/mixed-modality embedding, traced HTTP requests, and per-item-error
-requests retain their existing executors and failure semantics. This adapter
-does not claim cross-request batching for every model family: additional native
-executors must qualify their own aggregate resource and typed-result contracts.
+Text, audio, and mixed-modality fail-fast embedding requests use the broker;
+traced HTTP requests and explicit per-item-error envelopes retain their existing
+executors and failure semantics. Audio holds an exclusive asset lease, combines
+retained PCM and feature scratch under one working-set ceiling, and flushes
+bounded windows. Invalid clips occupy only their own result slots. A capacity
+split does not retry a failed model forward. Dense and sparse text forwards
+report observed native or compatibility execution, including adaptive splits
+and static padding. Broker metrics count successful native results separately
+from groups merely collected for execution.
 
 ### Task-neutral document preparation
 
@@ -3462,9 +3526,10 @@ The hardening above follows these long-term rules:
     The document embedding planner sizes responses from the expected item count
     and vector dimensions, with a 4-KiB error-envelope floor, conservative HTTP
     buffering allowance, vector copies and separate transport control overhead.
-    Execution obtains an exactly matching cached descriptor/route lease;
-    it never discovers a catalog inside this smaller invocation grant. An
-    invalidated, missing or changed lease returns to planning, whose single-flight
+    Planning retains the complete descriptor/route lease as an owned value;
+    execution never discovers a catalog inside this smaller invocation grant.
+    Cache eviction or discovery TTL expiry does not invalidate an active plan.
+    Scope rotation or endpoint rejection returns to planning, whose single-flight
     catalog fetch has its own 4-MiB response bound. The request requires AFN1
     exclusively and validates dimensions/cardinality before allocation. A JSON
     success response invalidates the lease without entering the JSON parser.
@@ -3477,6 +3542,65 @@ The hardening above follows these long-term rules:
     use renews the five-minute idle timeout after checking authorization,
     routing generation and endpoint incarnations, without resurrecting revoked
     leases. Idle expiry and topology/descriptor changes still require replan.
+163. **Implemented after execution-ownership review:** capability descriptors
+    remain task/model facts; `CapabilityLease` separately carries inline-owned
+    route token, revision, and a digest of URL/model/task/auth/source scope.
+    PDF owner and peer plans retain the lease through every bounded invocation,
+    including asynchronous job copies. Execution checks current scope before
+    transport and lets the endpoint validate revocation; it does not look up an
+    evictable discovery entry. Direct callers resolve before bounded invocation
+    allocation. Cache churn and execution with an empty cache are regression
+    tested, together with scope rotation and discovery-free planned calls.
+164. **Implemented after segmented-transport admission review:** wire encoding
+    and payload ownership are separate concrete transport choices.
+    `segmented_framed_binary` has the same wire bytes as `framed_binary`, but
+    borrows window payloads instead of allocating a second contiguous body.
+    Embedding, reader, generator, extraction, transcription and chunking HTTP
+    adapters use segmented accounting; framing metadata and client control
+    remain in fixed invocation allowances. Buffered framing still charges its
+    full copy. Thus a consumer borrowing a 64-MiB encoded window no longer
+    reserves another 64 MiB for an absent copy. This is an exact admission
+    saving, not a hardware throughput or RSS benchmark.
+165. **Implemented after representation-backpressure review:** lazy PNG
+    materialization participates in current-window backpressure. A denied
+    metadata or encoding grant retires in-flight inference work and retries;
+    optional next-window prefetch still starts only after this phase. Ledger
+    denial does not mark a page attempted or disable the representation.
+    Successful PNGs and their descriptors stay stable for existing borrowers.
+    Codec ceilings, backing OOM, cancellation and deadline failures do not
+    become an unbounded retry loop. Tests cover first-use metadata and later
+    page encoding under contention with serial and parallel codec execution.
+166. **Implemented after completion-history review:** explicit `QueueFull`
+    retry eligibility belongs to the dispatched job's overlapping cohort,
+    not the number of jobs left when draining starts. Retiring a successful
+    sibling cannot erase the rejected job's one serial retry. The coordinator
+    joins all remaining invocations before retrying, then switches subsequent
+    work to serial mode. Singleton overload and arbitrary provider failures
+    remain ordinary failures; retries never recursively enqueue themselves.
+167. **Implemented after response-capacity review:** numeric frame capacity is
+    an execution-batch limit, not a document-size limit. Owner and peer PDF
+    plans clamp their item ceilings before constructing invocation plans, and
+    direct media embedding calls partition at the same route-specific limit.
+    The 24-byte frame header means 127, not 128, 8192-dimensional rows fit a
+    4-MiB response. Local typed routes do not inherit this HTTP restriction.
+    Ordered result ownership and partial-batch failure cleanup are tested.
+168. **Implemented after numeric buffering review:** numeric-only responses
+    no longer reserve JSON parsing arenas. Their HTTP allowance is four body
+    ceilings for retained compressed input and non-in-place buffer growth,
+    plus the existing fixed transport allowance and separately counted vector
+    storage. Unknown dimensions and JSON-compatible routes retain their old
+    conservative plan. This is an admission saving, not a measured RSS claim.
+169. **Implemented after mixed-task scheduling review:** controlled read and
+    generation consumers share the bounded window job queue with embedding
+    consumers. Each job owns metadata, cancellation state, and an independent
+    memory grant while borrowing page bytes. Only provider calls run off the
+    coordinator; typed application, failure attribution, and fenced spool
+    publication remain coordinator-owned. Legacy callbacks drain the queue
+    before synchronous execution. A controlled owner may overlap peers within
+    the same host concurrency ceiling; borrowed PNGs survive until all jobs
+    join. Explicit admission denial drains the cohort before one serial retry,
+    without retrying successful items in a mixed response. Malformed text
+    envelopes retain the existing coordinator-side page-isolation behavior.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe
@@ -4669,6 +4793,101 @@ The following remain qualification work rather than architectural blockers:
   pages-per-second thresholds.
 - Promote selected profile fields to long-lived runtime status counters after
   operational use establishes which counters are actionable.
+
+## Shared model-forward batching
+
+Document scheduling and inference scheduling remain separate admission layers.
+The inference Node now provides a reusable tensor-forward dispatcher for
+explicitly row-independent pipeline stages. It complements the typed Florence,
+embedding, GLiNER and generation schedulers rather than forcing them through a
+single result or prompt interface. Text rerankers, BERT-style NER, rewriting,
+REBEL and Whisper stages use the same dispatcher on local and distributed Node
+paths. NER request arrays form bounded native windows; rewriting arrays expose
+bounded independent encoder/decode sequences with masked input padding.
+
+The dispatcher groups by session generation, task, non-batch tensor geometry,
+execution gate, supervision boundary and resource policy. It packs no more than
+eight caller submissions / 64 rows / 64 MiB per window, admits additional
+packing/compute before execution, and scatters validated zero-copy output views.
+The physical output allocation and its lease survive until the last consumer
+finishes. Cancellation never lets one expired caller discard a healthy peer's
+rows. Unsupported shapes bypass fusion; capacity fallback occurs before a fused
+forward, and backend failures do not trigger singleton replay.
+
+Qualification remains explicit: dynamic graph metadata plus pipeline opt-in, or
+a native session's concrete row-independence callback. Existing whole-request
+GPU generation and multimodal paths retain their locks until their mutable
+backend state is safely isolated. Fixed chunking has no neural forward to fuse,
+and external providers control their own execution. See
+[`pkg/inference/BATCHING.md`](pkg/inference/BATCHING.md) for the coverage matrix
+and remaining exclusions.
+
+### Runtime ownership and stage-level performance
+
+Keep three lifetimes separate: prepared document assets, a pinned model runtime,
+and a physical execution window. ModelManager lazily owns composite encoder /
+decoder sessions, tokenizers and metadata under its existing single-flight,
+LRU/TTL and memory-pressure policies. Rewriting, REBEL and split Whisper borrow
+these sessions through handles, allowing compatible requests to share the same
+session generation. The existing manager load executor handles cold construction;
+request cancellation abandons only that waiter while healthy peers remain.
+Backend selection, resident admission and session destruction remain owned by
+ManagedSession and the existing backend runtime; no per-request pool is added.
+Composite generation keys include the validated transitive artifact dependency
+closure (ONNX external data and native tensor shards), not only the selected
+graph paths. Serving lookups reuse the component-plan dependency list, while
+tokenizer, configuration and managed receipt changes also invalidate the key.
+
+Queued tensor permits retain input bytes but yield idle compute. A physical
+forward admits execution once, releases packed buffers after use and retains
+only output residency for its consumers. A yielded permit must reacquire compute
+for every subsequent direct/fallback execution. Native stage descriptors provide
+concrete output and workspace geometry before direct or fused host-tensor
+execution; Whisper encoder hidden states and decoder logits have distinct plans.
+Reusable permits recheck larger later windows rather than freezing the first
+invocation's geometry. Rewriting first admits bounded preprocessing and tokenizes
+once, then plans execution groups using actual padded widths. Planning accounts
+for encoder residency and the worst decoder stage with one workspace per
+physical stage, not per sequence. Stage gates include admission and packing so
+this residency model remains valid. Permanent limits reduce execution width and
+live pressure can independently shrink preprocessing windows. Execution admission
+remains the authority under concurrent pressure.
+
+Eligible masked rewriting/reranking stages use bounded length classes, with
+planning and materialization agreeing on padded widths. Late-interaction
+reranking uses its admitted trimmed query/document lengths. Shared encoder rows
+carry allocation provenance, enabling later compatible groups to borrow
+contiguous storage without repacking while preserving per-request result slots.
+Those borrowed columns receive residency credit only when a live source lease
+covers the same admission domain; uncovered borrowed bytes are counted once,
+while noncontiguous groups still reserve their packed copy and uncovered inputs.
+The generic decoder reuses token IDs and reads argmax directly from logits.
+
+Remaining backend work: define and qualify request-owned incremental decoder
+adapters for separate init/past graphs and native Whisper, plus device-resident
+cache and fused row gather/scatter support. The first concrete generic adapter
+now handles qualified merged seq2seq exports using the existing ONNX KV owner.
+It performs prefill once, submits only appended tokens, and retains immutable
+cross-attention state when cached branches return empty cross outputs. Both
+generic seq2seq and transcription use it when the selected artifact exposes
+the explicit ABI. Existing artifact-selection order and native generation /
+Florence caching are unchanged. This is not a new prefix-cache implementation.
+Cache output geometry and old/new cache overlap are admitted against host and
+KV limits before execution; allocation failure and cancellation unwind the
+request-owned state. Other layouts retain their existing execution path.
+
+The follow-up scheduler now partitions tokenized rewrite windows by length
+class before padding and restores request order after execution. Capacity
+failures subdivide groups before forwarding instead of discarding all batching;
+physical subgroups have distinct execution identities. Imported seq2seq stages
+use named-input output projections, with explicit transformed time axes and
+feature-width bounds. Missing non-text geometry disables fusion. Execution
+mutexes belong to the pinned runtime/stage instead of a pointer-hashed array.
+
+Extend length bucketing to other pipelines only with masking and output-position
+parity tests. Accelerator-backed parity, peak-memory and throughput measurements
+remain release requirements; hermetic batching tests do not establish a hardware
+speedup.
 
 ## Open decisions
 

@@ -82,6 +82,7 @@ test {
     _ = @import("ner.zig");
     _ = @import("generation.zig");
     _ = @import("encoder_decoder.zig");
+    _ = @import("seq2seq_decode.zig");
     _ = @import("rewriting.zig");
     _ = @import("rebel.zig");
     _ = @import("reading.zig");

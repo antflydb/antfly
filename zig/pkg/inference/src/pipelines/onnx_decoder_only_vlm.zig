@@ -1127,8 +1127,7 @@ fn extractLogitsAndMoveKv(allocator: std.mem.Allocator, outputs: []Tensor, kv_ca
 
     var moved_outputs = try allocator.alloc(Tensor, outputs.len);
     @memcpy(moved_outputs, outputs);
-    moved_outputs[0].owns_data = false;
-    moved_outputs[0].owns_shape = false;
+    moved_outputs[0] = moved_outputs[0].borrowedView(moved_outputs[0].name);
     allocator.free(outputs);
 
     if (kv_cache) |cache| {

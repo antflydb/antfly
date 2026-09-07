@@ -280,6 +280,7 @@ pub const EncodedAudioClip = struct {
 };
 
 pub const EmbeddingPipeline = struct {
+    batch_observation: ?*@import("batch_execution.zig").Observation = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -475,7 +476,7 @@ pub const EmbeddingPipeline = struct {
 
         var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
         defer input_set.deinit();
-        return self.embedPreparedTextInputs(
+        const vectors = try self.embedPreparedTextInputs(
             input_set.slice(),
             all_mask,
             ids_i64,
@@ -483,6 +484,8 @@ pub const EmbeddingPipeline = struct {
             effective_len,
             &run_permit,
         );
+        if (self.batch_observation) |observation| observation.record(texts.len);
+        return vectors;
     }
 
     /// Benchmark-facing encoder contract without tokenization or model load.
@@ -829,7 +832,7 @@ pub const EmbeddingPipeline = struct {
 
     pub const ImageBatchResult = struct {
         vectors: [][]f32,
-        execution: enum { native_batch, serial, fallback },
+        execution: @import("batch_execution.zig").Execution,
     };
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
@@ -1326,6 +1329,87 @@ pub const EmbeddingPipeline = struct {
         return self.embedAudioPcm(pcm_inputs);
     }
 
+    /// Cross-caller entry point. Decode failures stay indexed; retained PCM and
+    /// feature scratch share one budget. Flush a window before decoding the
+    /// next clip when it does not fit, without retrying a failed model forward.
+    pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
+        if (clips.len != errors.len) return error.InvalidInputShape;
+        @memset(errors, null);
+        const alloc = self.allocator;
+        const vectors = try alloc.alloc([]f32, clips.len);
+        @memset(vectors, &.{});
+        errdefer {
+            for (vectors) |row| alloc.free(row);
+            alloc.free(vectors);
+        }
+        const session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const decoded = try alloc.alloc(audio.Audio, clips.len);
+        defer alloc.free(decoded);
+        var retained: usize = 0;
+        defer for (decoded[0..retained]) |*clip| clip.deinit();
+        const pcm = try alloc.alloc(audio.PcmAudio, clips.len);
+        defer alloc.free(pcm);
+        const indexes = try alloc.alloc(usize, clips.len);
+        defer alloc.free(indexes);
+        var cursor: usize = 0;
+        var observation = @import("batch_execution.zig").Observation{};
+        var fallback = false;
+        while (cursor < clips.len) {
+            var pcm_bytes: usize = 0;
+            while (cursor < clips.len) {
+                if (self.execution_control) |control| try control.check();
+                const plan = try clapBatchPlan(session, retained + 1);
+                const budget = self.config.max_audio_decode_working_bytes;
+                const fits = plan.feature_reserve_bytes < budget and pcm_bytes < budget - plan.feature_reserve_bytes and
+                    try session.fitsRun(.{ .batch = retained + 1, .input_bytes = plan.feature_elements * @sizeOf(f32), .host_preprocess_bytes = pcm_bytes });
+                if (!fits) {
+                    if (retained > 0) break;
+                    errors[cursor] = error.AudioTooLarge;
+                    cursor += 1;
+                    continue;
+                }
+                decoded[retained] = audio.decodeBounded(alloc, clips[cursor].bytes, clips[cursor].decode_options, budget - plan.feature_reserve_bytes - pcm_bytes) catch |err| {
+                    if (err == error.OutOfMemory or err == error.Canceled or err == error.DeadlineExceeded) return err;
+                    if (err == error.AudioTooLarge and retained > 0) break;
+                    errors[cursor] = err;
+                    cursor += 1;
+                    continue;
+                };
+                const clip = decoded[retained];
+                const next_pcm_bytes = pcm_bytes + clip.samples.len * @sizeOf(f32);
+                const decoded_fits = session.fitsRun(.{ .batch = retained + 1, .input_bytes = plan.feature_elements * @sizeOf(f32), .host_preprocess_bytes = next_pcm_bytes }) catch |err| {
+                    decoded[retained].deinit();
+                    return err;
+                };
+                if (!decoded_fits) {
+                    decoded[retained].deinit();
+                    if (retained > 0) break;
+                    errors[cursor] = error.ResourceLimitExceeded;
+                    cursor += 1;
+                    continue;
+                }
+                pcm[retained] = .{ .samples = clip.samples, .sample_rate = clip.sample_rate };
+                indexes[retained] = cursor;
+                retained += 1;
+                pcm_bytes = next_pcm_bytes;
+                cursor += 1;
+            }
+            if (retained == 0) continue;
+            const batch = try self.embedAudioPcmReported(pcm[0..retained]);
+            defer alloc.free(batch.vectors);
+            if (batch.vectors.len != retained) {
+                for (batch.vectors) |row| alloc.free(row);
+                return error.UnexpectedOutputShape;
+            }
+            for (batch.vectors, indexes[0..retained]) |row, index| vectors[index] = row;
+            observation.record(retained);
+            fallback = fallback or batch.execution == .fallback;
+            for (decoded[0..retained]) |*clip| clip.deinit();
+            retained = 0;
+        }
+        return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
+    }
+
     /// Embed a batch of interleaved PCM audio clips, explicitly downmixing to
     /// mono before CLAP preprocessing.
     pub fn embedAudioInterleavedPcm(
@@ -1380,15 +1464,20 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of PCM audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
-        if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        return (try self.embedAudioPcmReported(audio_clips)).vectors;
+    }
+
+    pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
+        if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         try self.lockExecution();
         defer self.unlockExecution();
-        return self.embedAudioPcmBatch(audio_clips) catch |err| {
+        const vectors = self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
-                return self.embedAudioPcmIndividually(audio_clips);
+                return .{ .vectors = try self.embedAudioPcmIndividually(audio_clips), .execution = .fallback };
             }
             return err;
         };
+        return .{ .vectors = vectors, .execution = if (audio_clips.len > 1) .native_batch else .serial };
     }
 
     fn lockExecution(self: *EmbeddingPipeline) !void {
@@ -3560,6 +3649,36 @@ test "embedAudioPcm falls back under the execution gate without re-entry" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
     try std.testing.expect(execution_gate.tryLock());
     execution_gate.unlock();
+}
+
+test "audio microbatch isolates corrupt clips and bounds decoded windows" {
+    const allocator = std.testing.allocator;
+    var fake = FakeCollapsingAudioSession{};
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = fake.session(),
+        .audio_session = fake.session(),
+        .tok = undefined,
+        .config = .{ .normalize = false },
+    };
+    const samples = [_]f32{0} ** 1024;
+    const wav = try audio.wav.encodeMono(allocator, &samples, .{ .sample_rate = audio.CLAP_CONFIG.sample_rate, .audio_format = 1, .bits_per_sample = 16 });
+    defer allocator.free(wav);
+    const clips = [_]EncodedAudioClip{ .{ .bytes = wav }, .{ .bytes = "invalid audio" }, .{ .bytes = wav } };
+    var errors: [3]?anyerror = undefined;
+    const plan = try clapBatchPlan(fake.session(), 1);
+    pipeline.config.max_audio_decode_working_bytes = plan.feature_reserve_bytes + 2 * samples.len * @sizeOf(f32);
+    const result = try pipeline.embedEncodedAudioIndexed(&clips, &errors);
+    defer freeEmbeddingSlices(allocator, result.vectors);
+    try std.testing.expect(errors[0] == null);
+    try std.testing.expect(errors[1] != null);
+    try std.testing.expect(errors[2] == null);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[0]);
+    try std.testing.expectEqual(@as(usize, 0), result.vectors[1].len);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[2]);
+    try std.testing.expectEqual(@as(usize, 0), fake.collapsed_batch_attempts);
+    try std.testing.expectEqual(@as(usize, 2), fake.run_count);
+    try std.testing.expectEqual(.fallback, result.execution);
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {

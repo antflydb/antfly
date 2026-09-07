@@ -21,49 +21,10 @@ const capability_catalog_response_bytes: usize = 4 << 20;
 pub const capability_token_header = "X-Antfly-Capability-Token";
 pub const capability_revision_header = "X-Antfly-Capability-Revision";
 pub const capability_stale_header = "X-Antfly-Capability-Stale";
-const capability_token_max_bytes: usize = 128;
 
-pub const RoutingToken = struct {
-    bytes: [capability_token_max_bytes]u8 = undefined,
-    len: u8 = 0,
-
-    pub fn init(value: []const u8) !RoutingToken {
-        if (value.len == 0 or value.len > capability_token_max_bytes)
-            return error.InvalidCapabilityRoutingToken;
-        var result = RoutingToken{};
-        @memcpy(result.bytes[0..value.len], value);
-        result.len = @intCast(value.len);
-        return result;
-    }
-
-    pub fn slice(self: *const RoutingToken) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-pub const CapabilityRevision = struct {
-    bytes: [64]u8 = undefined,
-    len: u8 = 0,
-
-    pub fn init(value: []const u8) !CapabilityRevision {
-        if (value.len != 64) return error.InvalidCapabilityRevision;
-        for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidCapabilityRevision;
-        var result = CapabilityRevision{};
-        @memcpy(result.bytes[0..value.len], value);
-        result.len = @intCast(value.len);
-        return result;
-    }
-
-    pub fn slice(self: *const CapabilityRevision) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-pub const CapabilityLease = struct {
-    capabilities: ?work.InferenceCapabilities,
-    routing_token: ?RoutingToken = null,
-    descriptor_revision: ?CapabilityRevision = null,
-};
+pub const RoutingToken = work.RoutingToken;
+pub const CapabilityRevision = work.CapabilityRevision;
+pub const CapabilityLease = work.CapabilityLease;
 
 fn legacyCapabilityLeaseForOwner(owner_context_error: ?anyerror) !CapabilityLease {
     if (owner_context_error) |err| return err;
@@ -191,22 +152,6 @@ pub const Cache = struct {
         headers: []const [2][]const u8,
     ) !?work.InferenceCapabilities {
         return (try self.getOrDiscoverLease(http, inference_url, model, operation, headers)).capabilities;
-    }
-
-    /// Admission-sensitive executors must not refresh a catalog using a
-    /// response grant sized for numeric vectors. A miss returns to planning,
-    /// where bounded catalog discovery and its single-flight ownership live.
-    /// Catalog TTL controls discovery, not the lifetime of an admitted plan.
-    /// The endpoint validates the bound execution lease on every request. An
-    /// active long document must not replay merely because discovery is due.
-    pub fn executionLease(self: *Cache, inference_url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8) !CapabilityLease {
-        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
-        defer self.alloc.free(key);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.closing) return error.CapabilityCacheClosed;
-        const entry = self.entries.get(key) orelse return error.InferenceCapabilitiesStale;
-        return .{ .capabilities = entry.value, .routing_token = entry.routing_token, .descriptor_revision = entry.descriptor_revision };
     }
 
     pub fn getOrDiscoverLease(
@@ -630,6 +575,14 @@ fn waitForFlight(io: std.Io, flight: *CapabilityFlight, context: WaitContext) !v
         };
     }
     try context.check(monotonicNowNs(io));
+}
+
+pub fn scopeDigest(alloc: std.mem.Allocator, url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8) ![32]u8 {
+    const key = try capabilityCacheKeyAlloc(alloc, url, model, operation, headers);
+    defer alloc.free(key);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+    return digest;
 }
 
 fn capabilityCacheKeyAlloc(
@@ -1232,22 +1185,39 @@ test "remote Antfly capability cache retains and invalidates routing token with 
     }
 
     const lease = try cache.getOrDiscoverLease(&http, "http://proxy", "model", .rerank, headers);
-    const fresh = try cache.executionLease("http://proxy", "model", .rerank, headers);
+    const fresh = try cache.getOrDiscoverLease(&http, "http://proxy", "model", .rerank, headers);
     try std.testing.expectEqual(lease.routing_token, fresh.routing_token);
     const retained = lease.routing_token orelse
         return error.TestExpectedRoutingToken;
     try std.testing.expectEqualStrings("route-lease", retained.slice());
     const retained_revision = lease.descriptor_revision orelse return error.TestExpectedCapabilityRevision;
     try std.testing.expectEqualStrings(revision.slice(), retained_revision.slice());
+    try cache.invalidate("http://proxy", "model", .rerank, headers);
+    try std.testing.expectError(error.InferenceCapabilitiesUnavailable, cache.routingToken("http://proxy", "model", .rerank, headers));
     {
         cache.mutex.lockUncancelable(cache.io);
         defer cache.mutex.unlock(cache.io);
+        try cache.admitLocked(key, null, token, revision, monotonicNowNs(cache.io));
         cache.entries.getPtr(key).?.expires_at_ns = 0;
     }
-    const execution = try cache.executionLease("http://proxy", "model", .rerank, headers);
-    try std.testing.expectEqual(lease.routing_token, execution.routing_token);
+    // A discovery cache bounds reuse, not active execution ownership. Churn
+    // all slots and retain the original immutable token/revision independently.
+    {
+        cache.mutex.lockUncancelable(cache.io);
+        defer cache.mutex.unlock(cache.io);
+        for (0..capability_cache_max_entries) |i| {
+            const other = try std.fmt.allocPrint(std.testing.allocator, "other-{d}", .{i});
+            defer std.testing.allocator.free(other);
+            try cache.admitLocked(other, null, null, null, monotonicNowNs(cache.io));
+        }
+        try std.testing.expect(cache.entries.get(key) == null);
+    }
+    try std.testing.expectEqualStrings("route-lease", lease.routing_token.?.slice());
+    try std.testing.expectEqualStrings(revision.slice(), lease.descriptor_revision.?.slice());
+    const scope = try scopeDigest(std.testing.allocator, "http://proxy", "model", .rerank, headers);
+    const rotated = try scopeDigest(std.testing.allocator, "http://proxy", "model", .rerank, &.{.{ "Authorization", "Bearer rotated" }});
+    try std.testing.expect(!std.mem.eql(u8, &scope, &rotated));
     try cache.invalidate("http://proxy", "model", .rerank, headers);
-    try std.testing.expectError(error.InferenceCapabilitiesStale, cache.executionLease("http://proxy", "model", .rerank, headers));
     try std.testing.expectError(
         error.InferenceCapabilitiesUnavailable,
         cache.routingToken("http://proxy", "model", .rerank, headers),

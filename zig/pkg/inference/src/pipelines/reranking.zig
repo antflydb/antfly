@@ -153,6 +153,7 @@ pub const GenerativeQualificationTrace = struct {
 pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const RerankingPipeline = struct {
+    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -529,6 +530,7 @@ pub const RerankingPipeline = struct {
             if (item.ids.len != item.attention_mask.len) return error.UnexpectedInputShape;
             effective_len = @max(effective_len, activeTokenLength(item.attention_mask));
         }
+        effective_len = self.batchSequenceWidth(effective_len);
 
         const element_count = std.math.mul(usize, encoded.len, effective_len) catch
             return error.ResourceLimitExceeded;
@@ -613,6 +615,7 @@ pub const RerankingPipeline = struct {
                 effective_len = @max(effective_len, activeTokenLength(item.attention_mask));
             }
         }
+        effective_len = self.batchSequenceWidth(effective_len);
 
         const element_count = std.math.mul(usize, batch, effective_len) catch
             return error.ResourceLimitExceeded;
@@ -661,19 +664,22 @@ pub const RerankingPipeline = struct {
         try self.checkExecution();
         const alloc = self.allocator;
         const max_len = self.config.max_length;
+        const trim = self.config.trim_padding_to_batch_max and !hasFixedTextSequenceLength(self.session.inputInfo());
+        const query_len = if (trim) self.batchSequenceWidth(@max(@as(usize, 1), activeTokenLength(query_encoded.attention_mask))) else max_len;
+        if (query_encoded.ids.len < query_len or query_encoded.attention_mask.len < query_len) return error.UnexpectedInputShape;
         const special = self.tok.specialTokens();
         const chunk_size = @max(@as(usize, 1), self.config.batch_size);
 
-        const query_type_ids = try alloc.alloc(i64, max_len);
+        const query_type_ids = try alloc.alloc(i64, query_len);
         defer alloc.free(query_type_ids);
         @memset(query_type_ids, 0);
 
         var query_run = try self.runTextEncoder(
-            query_encoded.ids,
-            query_encoded.attention_mask,
+            query_encoded.ids[0..query_len],
+            query_encoded.attention_mask[0..query_len],
             query_type_ids,
             1,
-            max_len,
+            query_len,
             false,
             query_permit,
         );
@@ -681,26 +687,36 @@ pub const RerankingPipeline = struct {
         try self.checkExecution();
 
         const query_output = try query_run.output();
-        if (query_output.shape.len != 3) return error.UnexpectedOutputShape;
+        if (query_output.dtype != .f32 or query_output.shape.len != 3 or query_output.shape[0] != 1 or query_output.shape[1] != query_len or query_output.shape[2] <= 0) return error.UnexpectedOutputShape;
         const hidden: usize = @intCast(query_output.shape[2]);
 
+        if (query_output.asFloat32().len != (std.math.mul(usize, query_len, hidden) catch return error.UnexpectedOutputShape)) return error.UnexpectedOutputShape;
+
         const scores = try alloc.alloc(f32, documents.len);
+        errdefer alloc.free(scores);
 
         var offset: usize = 0;
         while (offset < documents.len) {
             try self.checkExecution();
             const chunk_len = @min(chunk_size, documents.len - offset);
-            const doc_ids = try alloc.alloc(i32, chunk_len * max_len);
+            var document_len: usize = if (trim) 1 else max_len;
+            if (trim) {
+                for (documents[offset..][0..chunk_len]) |encoded| document_len = @max(document_len, activeTokenLength(encoded.attention_mask));
+                document_len = self.batchSequenceWidth(document_len);
+            }
+            const elements = std.math.mul(usize, chunk_len, document_len) catch return error.ResourceLimitExceeded;
+            const doc_ids = try alloc.alloc(i32, elements);
             defer alloc.free(doc_ids);
-            const doc_mask = try alloc.alloc(i32, chunk_len * max_len);
+            const doc_mask = try alloc.alloc(i32, elements);
             defer alloc.free(doc_mask);
-            const doc_type_ids = try alloc.alloc(i64, chunk_len * max_len);
+            const doc_type_ids = try alloc.alloc(i64, elements);
             defer alloc.free(doc_type_ids);
             @memset(doc_type_ids, 0);
 
             for (documents[offset .. offset + chunk_len], 0..) |encoded, local_idx| {
-                @memcpy(doc_ids[local_idx * max_len .. (local_idx + 1) * max_len], encoded.ids);
-                @memcpy(doc_mask[local_idx * max_len .. (local_idx + 1) * max_len], encoded.attention_mask);
+                if (encoded.ids.len < document_len or encoded.attention_mask.len < document_len) return error.UnexpectedInputShape;
+                @memcpy(doc_ids[local_idx * document_len .. (local_idx + 1) * document_len], encoded.ids[0..document_len]);
+                @memcpy(doc_mask[local_idx * document_len .. (local_idx + 1) * document_len], encoded.attention_mask[0..document_len]);
             }
 
             var doc_run = try self.runTextEncoder(
@@ -708,24 +724,25 @@ pub const RerankingPipeline = struct {
                 doc_mask,
                 doc_type_ids,
                 chunk_len,
-                max_len,
+                document_len,
                 false,
                 document_permit,
             );
             defer doc_run.deinit();
             const doc_output = try doc_run.output();
-            if (doc_output.shape.len != 3) return error.UnexpectedOutputShape;
+            if (doc_output.dtype != .f32 or doc_output.shape.len != 3 or doc_output.shape[0] != chunk_len or doc_output.shape[1] != document_len or doc_output.shape[2] != hidden) return error.UnexpectedOutputShape;
 
             const query_hidden = query_output.asFloat32();
             const doc_hidden = doc_output.asFloat32();
+            if (doc_hidden.len != (std.math.mul(usize, elements, hidden) catch return error.UnexpectedOutputShape)) return error.UnexpectedOutputShape;
             for (0..chunk_len) |local_idx| {
                 scores[offset + local_idx] = lateInteractionScore(
                     query_hidden,
-                    query_encoded.ids,
-                    query_encoded.attention_mask,
-                    doc_hidden[local_idx * max_len * hidden .. (local_idx + 1) * max_len * hidden],
-                    doc_ids[local_idx * max_len .. (local_idx + 1) * max_len],
-                    doc_mask[local_idx * max_len .. (local_idx + 1) * max_len],
+                    query_encoded.ids[0..query_len],
+                    query_encoded.attention_mask[0..query_len],
+                    doc_hidden[local_idx * document_len * hidden .. (local_idx + 1) * document_len * hidden],
+                    doc_ids[local_idx * document_len .. (local_idx + 1) * document_len],
+                    doc_mask[local_idx * document_len .. (local_idx + 1) * document_len],
                     hidden,
                     special,
                 );
@@ -912,6 +929,7 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
+        if (self.batch_dispatch) |dispatch| return dispatch.run(allocator, self.session, permit, self.execution_lock, inputs, self.execution_control);
         if (self.execution_lock) |mutex| {
             if (self.execution_control) |control|
                 try control.lock(mutex)
@@ -928,17 +946,23 @@ pub const RerankingPipeline = struct {
         sequence: usize,
     ) !session_mod.RunPermit {
         try self.checkExecution();
-        const tokens = std.math.mul(usize, batch, sequence) catch
+        const width = self.batchSequenceWidth(sequence);
+        const tokens = std.math.mul(usize, batch, width) catch
             return error.ResourceLimitExceeded;
         var permit = try self.session.admit(.{
             .batch = batch,
-            .sequence = sequence,
+            .sequence = width,
             .input_bytes = std.math.mul(usize, tokens, 24) catch
                 return error.ResourceLimitExceeded,
         });
         errdefer permit.deinit();
         try self.checkExecution();
         return permit;
+    }
+
+    fn batchSequenceWidth(self: *const RerankingPipeline, width: usize) usize {
+        if (self.batch_dispatch == null) return width;
+        return @import("batch_execution.zig").maskedSequenceBucket(self.session, width, self.config.max_length);
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
@@ -1147,6 +1171,28 @@ test "prepared reranking inputs are bound to their pipeline generation" {
     );
 }
 
+test "late interaction materializes admitted trimmed widths and unwinds document failures" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var dynamic = FakeRerankingSession{ .fixed_sequence = false, .token_embeddings = true };
+    var pipeline = RerankingPipeline.init(allocator, dynamic.session(), tokenizer_state.tokenizer(), .{ .max_length = 8, .mode = .late_interaction });
+    var prepared = try pipeline.prepareInputs("query", &.{"document"});
+    defer prepared.deinit();
+    const scores = try pipeline.rerankPrepared(&prepared);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(prepared.max_input_tokens_per_item, dynamic.last_sequence.load(.acquire));
+    try std.testing.expect(dynamic.last_sequence.load(.acquire) < 8);
+    var fixed = FakeRerankingSession{ .fixed_sequence = true, .token_embeddings = true };
+    var exact = RerankingPipeline.init(allocator, fixed.session(), tokenizer_state.tokenizer(), .{ .max_length = 8, .mode = .late_interaction });
+    const fixed_scores = try exact.rerank("query", &.{"document"});
+    defer allocator.free(fixed_scores);
+    try std.testing.expectEqual(@as(usize, 8), fixed.last_sequence.load(.acquire));
+    try std.testing.expectEqualSlices(f32, scores, fixed_scores);
+    dynamic.run_count.store(0, .release);
+    dynamic.fail_document = true;
+    try std.testing.expectError(error.TestForwardFailure, pipeline.rerank("query", &.{"document"}));
+}
+
 test "prepared late-interaction inputs bind single-text encoding semantics" {
     var session_state = FakeRerankingSession{ .fixed_sequence = false };
     var tokenizer_state = FakeRerankingTokenizer{};
@@ -1266,6 +1312,8 @@ test "reranking score extraction rejects malformed output shapes" {
 
 const FakeRerankingSession = struct {
     fixed_sequence: bool,
+    token_embeddings: bool = false,
+    fail_document: bool = false,
     run_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     last_sequence: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -1289,6 +1337,17 @@ const FakeRerankingSession = struct {
         const sequence: usize = @intCast(inputs[0].shape[1]);
         _ = self.run_count.fetchAdd(1, .acq_rel);
         self.last_sequence.store(sequence, .release);
+
+        if (self.fail_document and self.run_count.load(.acquire) > 1) return error.TestForwardFailure;
+        if (self.token_embeddings) {
+            const values = try allocator.alloc(f32, batch * sequence * 2);
+            defer allocator.free(values);
+            @memset(values, 1);
+            const out = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(out);
+            out[0] = try Tensor.initFloat32(allocator, "last_hidden_state", &.{ @intCast(batch), @intCast(sequence), 2 }, values);
+            return out;
+        }
 
         const logits = try allocator.alloc(f32, batch);
         defer allocator.free(logits);
@@ -1328,7 +1387,9 @@ const FakeRerankingSession = struct {
             };
     }
 
-    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+    fn outputInfo(raw: *anyopaque) []const backends.TensorInfo {
+        const self: *FakeRerankingSession = @ptrCast(@alignCast(raw));
+        if (self.token_embeddings) return &.{.{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, 2 } }};
         return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } }};
     }
 

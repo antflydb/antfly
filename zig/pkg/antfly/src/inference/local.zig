@@ -1010,7 +1010,7 @@ test "antfly dense JSON response cleanup is allocation-failure safe" {
 }
 
 test "antfly embed parts uses the framed attachment transport" {
-    return testEmbedPartsRequestRoundTrip();
+    return testEmbedPartsRequestRoundTrip(false, false);
 }
 
 test "antfly embed request carries retrieval task and instruction" {

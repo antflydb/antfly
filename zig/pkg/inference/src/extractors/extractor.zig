@@ -82,6 +82,10 @@ pub const Context = struct {
     model_manager: *model_manager_mod.ModelManager,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
+    gliner_pipeline_factory: ?struct {
+        ptr: *anyopaque,
+        create: *const fn (*anyopaque, std.mem.Allocator, *model_manager_mod.LoadedModel) @import("../pipelines/gliner.zig").GlinerPipeline,
+    } = null,
     reader_discovery_override: if (builtin.is_test) ?ReaderDiscoveryOverride else void = if (builtin.is_test) null else {},
     reader_text_override: if (builtin.is_test) ?ReaderTextOverride else void = if (builtin.is_test) null else {},
 };
@@ -453,7 +457,7 @@ const RecognizerExtractor = struct {
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
-        var gliner = model.glinerPipeline(ctx.allocator);
+        var gliner = if (ctx.gliner_pipeline_factory) |factory| factory.create(factory.ptr, ctx.allocator, model) else model.glinerPipeline(ctx.allocator);
         gliner.execution_control = ctx.execution_control;
         var extraction_config = config;
         extraction_config.cleanup_model = try model.getCleanupHead();

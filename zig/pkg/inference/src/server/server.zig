@@ -3906,6 +3906,26 @@ pub const Node = struct {
         return &self.executor_microbatch_broker.?;
     }
 
+    fn tensorBatchDispatch(self: *Node, task: executor_microbatch.Task) @import("tensor_microbatch.zig").Dispatch {
+        return .{ .ptr = self, .task = task, .run_fn = runTensorBatch };
+    }
+
+    fn runTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror![]backends_mod.Tensor {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        const control = self.bindExecutionControl(null, supplied orelse .{});
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
+        const selected_gate = gate orelse session.execution_gate orelse return error.MissingExecutionGate;
+        return @import("tensor_microbatch.zig").run(self.executorMicrobatchBroker(), allocator, io, task, session, permit, selected_gate, inputs, control, try directExecutorDeadline(io, control.deadline_ns), self.config.executor_microbatch_max_wait_us);
+    }
+
+    fn createRerankingPipeline(self: *Node, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel) @import("../pipelines/reranking.zig").RerankingPipeline {
+        var pipeline = model.rerankingPipeline(allocator);
+        pipeline.batch_dispatch = self.tensorBatchDispatch(.rerank);
+        return pipeline;
+    }
+
     /// Derive artifact compatibility once per immutable artifact signature. Discovery
     /// calls this repeatedly, so caching prevents GGUF/ONNX metadata inspection from
     /// becoming request-path work while still invalidating when a sidecar is replaced.
@@ -4279,6 +4299,7 @@ pub const Node = struct {
             task_type: EmbeddingTaskType,
             instruction: ?[]const u8,
             trace: ?*embedding_trace.Trace,
+            node: *Node,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
@@ -4299,6 +4320,10 @@ pub const Node = struct {
                     0,
                     0,
                 );
+                if (attempt.trace == null) if (try attempt.node.tryEmbedTextsViaBroker(attempt.allocator, attempt.io, model, attempt.texts, attempt.control, attempt.task_type, attempt.instruction)) |vectors| {
+                    attempt.vectors = vectors;
+                    return;
+                };
                 var asset_lease = model.acquireEmbeddingAssetLease(false);
                 defer asset_lease.release();
                 const vectors = try embedDenseTextsOnLoadedModel(
@@ -4309,6 +4334,7 @@ pub const Node = struct {
                     attempt.task_type,
                     attempt.instruction,
                     attempt.trace,
+                    null,
                 );
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
@@ -4325,6 +4351,7 @@ pub const Node = struct {
             .task_type = task_type,
             .instruction = instruction,
             .trace = if (trace) |*value| value else null,
+            .node = self,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .trace = attempt.trace, .execution_control = control }, &attempt, Attempt.run);
         if (trace) |*value| value.finish(attempt.vectors.?);
@@ -4340,6 +4367,7 @@ pub const Node = struct {
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
         trace: ?*embedding_trace.Trace,
+        observation: ?*@import("../pipelines/batch_execution.zig").Observation,
     ) ![][]f32 {
         const asset_started = if (trace != null) embedding_trace.now() else 0;
         var pipeline = blk: {
@@ -4349,6 +4377,7 @@ pub const Node = struct {
             break :blk model.embeddingPipelineLocked(allocator);
         };
         pipeline.trace = trace;
+        pipeline.batch_observation = observation;
         if (trace) |value| {
             value.backend = @tagName(model.session.backend());
             value.asset_prepare_ns += embedding_trace.now() -| asset_started;
@@ -4405,6 +4434,7 @@ pub const Node = struct {
             executor_contract: ResolvedInferenceExecutorContract,
             control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
+            node: *Node,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
@@ -4424,6 +4454,10 @@ pub const Node = struct {
                     0,
                     0,
                 );
+                if (try attempt.node.tryEmbedTextRowsViaBroker(true, attempt.allocator, attempt.io, model, attempt.texts, attempt.control, .RETRIEVAL_DOCUMENT, null)) |vectors| {
+                    attempt.vectors = vectors;
+                    return;
+                }
                 var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                     .allocator = attempt.allocator,
                     .session = model.session,
@@ -4441,6 +4475,7 @@ pub const Node = struct {
             .texts = texts,
             .executor_contract = executor_contract,
             .control = control,
+            .node = self,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -4505,7 +4540,7 @@ pub const Node = struct {
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
         const model = model_handle.get();
-        var pipeline = model.rerankingPipeline(allocator);
+        var pipeline = self.createRerankingPipeline(allocator, model);
         pipeline.execution_control = execution_control;
         var prepared = try pipeline.prepareInputs(query, documents);
         defer prepared.deinit();
@@ -4582,26 +4617,16 @@ pub const Node = struct {
         const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
         defer allocator.free(paths.encoder);
         defer allocator.free(paths.decoder);
-        var component_loader = try self.model_manager.componentLoaderForPaths(
+        var runtime_handle = try self.model_manager.acquireCompositeRuntime(
             model_path,
-            self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
+            .seq2seq,
+            null,
         );
-        var encoder_managed = try component_loader.load(paths.encoder);
-        defer encoder_managed.deinit();
-        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
-        var decoder_managed = try strict_loader.load(paths.decoder);
-        defer decoder_managed.deinit();
-        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
-        const hf_tokenizer = @import("inference_hf_tokenizer");
-        const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
-        defer allocator.free(tok_path);
-        const tok_bytes = try c_file.readFile(allocator, tok_path);
-        defer allocator.free(tok_bytes);
-        var hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
-        defer hf_tok.deinitSelf();
-        const input_tokens = try maxTokenizerTextTokens(allocator, io, hf_tok.tokenizer(), inputs);
+        defer runtime_handle.release();
+        const assets = runtime_handle.get();
+        const dec_config = assets.decoder_config;
+        const input_tokens = try maxTokenizerTextTokens(allocator, io, assets.tokenizer(), inputs);
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = inputs.len,
             .text_bytes_per_item = maxTextBytes(inputs),
@@ -4615,11 +4640,13 @@ pub const Node = struct {
             .allocator = allocator,
             .enc_dec = .{
                 .allocator = allocator,
-                .encoder = encoder_managed.session,
-                .decoder = decoder_managed.session,
+                .owns_sessions = false,
+                .encoder = assets.encoder.?.session,
+                .decoder = assets.decoder.?.session,
                 .config = dec_config,
+                .batch_dispatch = self.tensorBatchDispatch(.rewrite),
             },
-            .tokenizer = hf_tok.tokenizer(),
+            .tokenizer = assets.tokenizer(),
             .config = .{ .max_length = dec_config.max_length },
         };
         const outputs = try allocator.alloc([]const u8, inputs.len);
@@ -4628,9 +4655,12 @@ pub const Node = struct {
             for (outputs[0..initialized]) |output| allocator.free(output);
             allocator.free(outputs);
         }
-        for (inputs, outputs) |input, *output| {
-            var result = try pipeline.rewrite(input);
-            defer result.deinit();
+        const rewritten = try pipeline.rewriteBatch(io, inputs);
+        defer {
+            for (rewritten) |*result| result.deinit();
+            allocator.free(rewritten);
+        }
+        for (rewritten, outputs) |result, *output| {
             output.* = try allocator.dupe(u8, result.text);
             initialized += 1;
         }
@@ -4730,7 +4760,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
-        var pipeline = model.glinerPipeline(allocator);
+        var pipeline = createGlinerPipeline(self, allocator, model);
         const input_tokens = try pipeline.maxClassificationInputTokens(texts, labels);
         try validateTextExecutorInvocation(
             executor_contract,
@@ -5062,7 +5092,7 @@ pub const Node = struct {
 
     fn generateMessagesDirectWithAdmission(
         self: *Node,
-        allocator: std.mem.Allocator,
+        caller_allocator: std.mem.Allocator,
         model_name: []const u8,
         messages: []const generation.Message,
         admission: *DirectGenerateAdmission,
@@ -5072,6 +5102,8 @@ pub const Node = struct {
         pin_after_success: bool,
         a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
+        var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
+        const allocator = synchronized.allocator();
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
         if (admitted_node != self) return error.InvalidGenerationAdmission;
@@ -5150,11 +5182,6 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        if (execution_control) |control|
-            try control.lock(model.nativeGenerationMutex())
-        else
-            model.lockNativeGeneration(io);
-        defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
@@ -5258,6 +5285,21 @@ pub const Node = struct {
         );
         defer admission_lease.release();
 
+        const execution_mode = batchExecutionMode(backend_kind);
+        var scheduler_lease: ?runtime.scheduler.native_generate.Lease = null;
+        defer if (scheduler_lease) |lease| model.native_generate_coordinator.?.release(lease);
+        if (execution_mode == .isolated_parallel) if (model.native_generate_coordinator) |coordinator| {
+            scheduler_lease = try self.acquireNativeGenerateLease(coordinator, .{
+                .requested_units = admission.reserved_units,
+                .prompt_bytes = self.estimateGeneratePromptBytes(messages),
+                .prompt_tokens = prompt_tokens,
+                .prefill_chunk_limit = admitted_prefill_chunk,
+                .max_tokens = max_tokens,
+            });
+        };
+        var model_lock = try BatchModelLock.initWithControl(execution_mode, model.nativeGenerationMutex(), io, execution_control);
+        defer model_lock.deinit();
+
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         defer kv_manager.deinit();
         var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
@@ -5296,6 +5338,9 @@ pub const Node = struct {
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .decode_state = &decode_state,
+            .scheduler = if (scheduler_lease != null) model.native_generate_coordinator else null,
+            .scheduler_lease = if (scheduler_lease) |*lease| lease else null,
+            .execution_lock = model_lock.pipelineExecutionLock(),
             .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
             .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
             .compiled_attachment_target = if (use_metal_whole_model) .whole_model else .partitioned,
@@ -5355,7 +5400,7 @@ pub const Node = struct {
                 .total_ms = elapsedMs(started_at_ns, generated_at_ns),
             };
         }
-        const text = try allocator.dupe(u8, result.text);
+        const text = try caller_allocator.dupe(u8, result.text);
         if (pin_after_success) model_handle.pin();
         return text;
     }
@@ -5978,6 +6023,433 @@ pub const Node = struct {
         return attempt.vectors.?;
     }
 
+    fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
+        const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+        if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
+        if (parsed.texts.items.len > 0) {
+            if (embedding_mod.textSessionBatchPlan(model.session, 2)) |plan| if (plan.batch_size == 1) return null;
+        }
+        const vectors = try allocator.alloc([]f32, parsed.total_count);
+        @memset(vectors, &.{});
+        errdefer freeDirectDenseVectors(allocator, vectors);
+        if (parsed.audio.items.len > 0) {
+            const rows = try self.embedAudioViaBroker(allocator, io, model, parsed.audio.items, control, audio_working_bytes);
+            defer allocator.free(rows);
+            for (rows, parsed.audio.items) |row, item| vectors[item.index] = row;
+        }
+        if (parsed.texts.items.len > 0) {
+            const texts = try allocator.alloc([]const u8, parsed.texts.items.len);
+            defer allocator.free(texts);
+            for (texts, parsed.texts.items) |*text, item| text.* = item.text;
+            const rows = (try self.tryEmbedTextsViaBroker(allocator, io, model, texts, control, task_type, instruction)) orelse return error.InvalidInferenceCapabilities;
+            defer allocator.free(rows);
+            for (rows, parsed.texts.items) |row, item| vectors[item.index] = row;
+        }
+        if (parsed.images.items.len > 0) {
+            const rows = (try self.tryEmbedImagesViaBroker(allocator, io, model, parsed.images.items, &.{}, control, task_type, instruction)) orelse return error.InvalidInferenceCapabilities;
+            defer allocator.free(rows);
+            for (rows, parsed.images.items) |row, item| vectors[item.index] = row;
+        }
+        return vectors;
+    }
+
+    fn createGlinerPipeline(raw: *anyopaque, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel) gliner_mod.GlinerPipeline {
+        var pipeline = model.glinerPipeline(allocator);
+        pipeline.batch_dispatch = .{ .ptr = raw, .model = model.model_dir, .generation = @intFromPtr(model), .submit = submitGlinerBatch, .submit_scores = submitGlinerScores };
+        return pipeline;
+    }
+
+    const GlinerTicket = struct {
+        pipeline: gliner_mod.GlinerPipeline,
+        text: []const u8,
+        labels: []const []const u8,
+        label_token: i32,
+        threshold: f32,
+        flat_ner: bool,
+    };
+
+    fn cloneGlinerRow(allocator: std.mem.Allocator, row: []gliner_mod.Entity) ![]gliner_mod.Entity {
+        const output = try allocator.alloc(gliner_mod.Entity, row.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (output[0..initialized]) |entity| allocator.free(entity.text);
+            allocator.free(output);
+        }
+        for (row, output) |entity, *copy| {
+            copy.* = entity;
+            copy.text = try allocator.dupe(u8, entity.text);
+            initialized += 1;
+        }
+        return output;
+    }
+
+    fn freeGlinerRow(allocator: std.mem.Allocator, row: []gliner_mod.Entity) void {
+        for (row) |entity| allocator.free(entity.text);
+        allocator.free(row);
+    }
+
+    fn rebindGlinerLabels(row: []gliner_mod.Entity, labels: []const []const u8) !void {
+        for (row) |*entity| {
+            var found = false;
+            for (labels) |label| {
+                if (std.mem.eql(u8, label, entity.label)) {
+                    entity.label = label;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidExtractionResponse;
+        }
+    }
+
+    fn submitGlinerBatch(raw: *anyopaque, pipeline: *gliner_mod.GlinerPipeline, texts: []const []const u8, labels: []const []const u8, label_token: i32, threshold: f32, flat_ner: bool) anyerror![][]gliner_mod.Entity {
+        return submitGlinerRows(false, raw, pipeline, texts, labels, label_token, threshold, flat_ner);
+    }
+
+    fn submitGlinerScores(raw: *anyopaque, pipeline: *gliner_mod.GlinerPipeline, texts: []const []const u8, labels: []const []const u8) anyerror![][]f32 {
+        const label_token = if (pipeline.config.token_c != 0) pipeline.config.token_c else pipeline.config.token_e;
+        return submitGlinerRows(true, raw, pipeline, texts, labels, label_token, 0, false);
+    }
+
+    fn submitGlinerRows(comptime scoring: bool, raw: *anyopaque, pipeline: *gliner_mod.GlinerPipeline, texts: []const []const u8, labels: []const []const u8, label_token: i32, threshold: f32, flat_ner: bool) anyerror![](if (scoring) []f32 else []gliner_mod.Entity) {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        const dispatch = pipeline.batch_dispatch.?;
+        const allocator = pipeline.allocator;
+        const loaded: *model_manager_mod.LoadedModel = @ptrFromInt(dispatch.generation);
+        const contract = try resolvedInferenceExecutorContract(self, "extract", &loaded.manifest);
+        var direct = pipeline.*;
+        direct.batch_dispatch = null;
+        // Official ONNX GLiNER contracts are singleton executors. They retain
+        // their existing path and never pay a native batch-fill delay.
+        if (pipeline.session.backend() == .onnx or contract.batch.max_items <= 1) return if (scoring) direct.scoreLabelsBatch(texts, labels) else direct.recognizeWithLabelTokenBatch(texts, labels, label_token, threshold, flat_ner);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const control = self.bindExecutionControl(null, pipeline.execution_control orelse .{});
+        const io = self.inferenceIo(allocator, control.io, &owned_io);
+        const schema = try std.json.Stringify.valueAlloc(allocator, .{ .labels = labels, .label_token = label_token, .threshold = threshold, .flat_ner = flat_ner, .config = pipeline.config }, .{});
+        defer allocator.free(schema);
+        const payloads = try allocator.alloc(GlinerTicket, texts.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, texts.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, texts.len);
+        defer allocator.free(identities);
+        for (texts, payloads, shapes, identities) |text, *payload, *shape, *identity| {
+            payload.* = .{ .pipeline = direct, .text = text, .labels = labels, .label_token = label_token, .threshold = threshold, .flat_ner = flat_ner };
+            shape.* = .{ .bytes = text.len +| schema.len };
+            identity.* = .{};
+        }
+        const Probe = struct {
+            fn canceled(ptr: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const shared = std.heap.smp_allocator;
+        const Output = if (scoring) []f32 else []gliner_mod.Entity;
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(GlinerTicket, Output, io, shared, .{ .model = dispatch.model, .generation = dispatch.generation, .task = .extract, .schema = schema, .transform = if (scoring) "gliner-label-scores" else "gliner-encoder", .resource_class = executorMicrobatchResourceClass(pipeline.session.backend()) }, .{ .mode = .native, .preferred_items = @min(@as(usize, 8), contract.batch.max_items), .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (scoring) executeGlinerScores else executeGlinerBatch);
+        return executor_microbatch.collectOwned(Output, allocator, shared, results, if (scoring) cloneDenseRow else cloneGlinerRow, if (scoring) freeDenseRow else freeGlinerRow);
+    }
+
+    fn executeGlinerBatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runGlinerRows(false, items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn executeGlinerScores(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runGlinerRows(true, items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runGlinerRows(self: *Node, comptime scoring: bool, items: []const executor_microbatch.ExecuteItem) !void {
+        if (items.len == 0) return;
+        const shared = std.heap.smp_allocator;
+        const first = items[0].payloadAs(GlinerTicket);
+        var pipeline = first.pipeline;
+        pipeline.allocator = shared;
+        pipeline.batch_dispatch = null;
+        var observation = @import("../pipelines/batch_execution.zig").Observation{};
+        pipeline.batch_observation = &observation;
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        pipeline.execution_control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
+        const texts = try shared.alloc([]const u8, items.len);
+        defer shared.free(texts);
+        for (items, texts) |item, *text| text.* = item.payloadAs(GlinerTicket).text;
+        const rows = if (scoring) try pipeline.scoreLabelsBatch(texts, first.labels) else try pipeline.recognizeWithLabelTokenBatch(texts, first.labels, first.label_token, first.threshold, first.flat_ner);
+        const free = if (scoring) freeDenseRow else freeGlinerRow;
+        defer shared.free(rows);
+        if (rows.len != items.len) {
+            for (rows) |row| free(shared, row);
+            return error.InvalidExtractionResponse;
+        }
+        for (items, rows) |item, row| {
+            // Labels borrow the submitting caller's schema, never the leader's
+            // storage: one caller may return before its peers finish copying.
+            const labels = item.payloadAs(GlinerTicket).labels;
+            if (!scoring) rebindGlinerLabels(row, labels) catch |err| {
+                free(shared, row);
+                item.slot.fail(err);
+                continue;
+            };
+            item.control.check() catch |err| {
+                free(shared, row);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+        }
+    }
+
+    const TextEmbedTicket = struct {
+        model: *model_manager_mod.LoadedModel,
+        text: []const u8,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
+    };
+
+    fn cloneDenseRow(allocator: std.mem.Allocator, row: []f32) ![]f32 {
+        return allocator.dupe(f32, row);
+    }
+
+    fn denseEmbeddingTextPrefix(allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, task_type: EmbeddingTaskType, instruction: ?[]const u8) !struct { prefix: []const u8, owned: ?[]u8 } {
+        // Request option validation needs immutable manifest data, not loaded
+        // vision/audio assets or a model execution gate.
+        var pipeline = embedding_mod.EmbeddingPipeline.init(allocator, model.session, model.getTokenizer(), .{ .text_prefix = model.manifest.embedding_profile.document.prefix });
+        const owned = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = task_type, .instruction = instruction });
+        return .{ .prefix = pipeline.config.text_prefix, .owned = owned };
+    }
+
+    fn freeDenseRow(allocator: std.mem.Allocator, row: []f32) void {
+        allocator.free(row);
+    }
+
+    fn tryEmbedTextsViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, texts: []const []const u8, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8) !?[][]f32 {
+        return self.tryEmbedTextRowsViaBroker(false, allocator, io, model, texts, control, task_type, instruction);
+    }
+
+    fn cloneSparseRow(allocator: std.mem.Allocator, row: DirectSparseEmbedding) !DirectSparseEmbedding {
+        const indices = try allocator.dupe(u32, row.indices);
+        errdefer allocator.free(indices);
+        return .{ .indices = indices, .values = try allocator.dupe(f32, row.values) };
+    }
+
+    fn freeSparseRow(allocator: std.mem.Allocator, row: DirectSparseEmbedding) void {
+        allocator.free(row.indices);
+        allocator.free(row.values);
+    }
+
+    fn tryEmbedTextRowsViaBroker(self: *Node, comptime sparse: bool, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, texts: []const []const u8, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8) !?[](if (sparse) DirectSparseEmbedding else []f32) {
+        const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+        if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse") != sparse) return null;
+        // A serial-only loaded graph must not incur a native batch-fill delay.
+        if (embedding_mod.textSessionBatchPlan(model.session, 2)) |plan| if (plan.batch_size == 1) return null;
+        const prefix = if (sparse) .{ .prefix = @as([]const u8, ""), .owned = @as(?[]u8, null) } else try denseEmbeddingTextPrefix(allocator, model, task_type, instruction);
+        defer if (prefix.owned) |owned| allocator.free(owned);
+        const payloads = try allocator.alloc(TextEmbedTicket, texts.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, texts.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, texts.len);
+        defer allocator.free(identities);
+        for (texts, payloads, shapes, identities) |text, *payload, *shape, *identity| {
+            try control.check();
+            payload.* = .{ .model = model, .text = text, .task_type = task_type, .instruction = instruction };
+            const token_text = if (prefix.prefix.len > 0) try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.prefix, text }) else text;
+            defer if (prefix.prefix.len > 0) allocator.free(token_text);
+            shape.* = .{ .bytes = token_text.len, .tokens = try countTokenizerTokens(allocator, io, model.getTokenizer(), token_text) };
+            try validateTextExecutorInvocation(contract, 1, &.{text}, prefix.prefix.len, shape.tokens, 0, 0);
+            identity.* = .{};
+        }
+        const Probe = struct {
+            fn canceled(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const shared = std.heap.smp_allocator;
+        const Output = if (sparse) DirectSparseEmbedding else []f32;
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(TextEmbedTicket, Output, io, shared, .{
+            .model = model.model_dir,
+            .generation = @intFromPtr(model),
+            .task = .embed,
+            .schema = instruction orelse "",
+            .option_key = @as(u64, @intFromEnum(task_type)) * 2 + @intFromBool(instruction != null),
+            .transform = if (sparse) "text-sparse" else "text-dense",
+            .resource_class = executorMicrobatchResourceClass(model.session.backend()),
+        }, .{
+            .mode = .native,
+            .preferred_items = contract.batch.preferred_items,
+            .max_items = contract.batch.max_items,
+            .max_bytes = requestMediaMaxBytes(self),
+            .max_tokens = if (contract.batch.max_input_tokens_per_item) |limit| limit *| contract.batch.max_items else std.math.maxInt(usize),
+            .max_wait_us = self.config.executor_microbatch_max_wait_us,
+        }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (sparse) executeSparseTextEmbedMicrobatch else executeTextEmbedMicrobatch);
+        return try executor_microbatch.collectOwned(Output, allocator, shared, results, if (sparse) cloneSparseRow else cloneDenseRow, if (sparse) freeSparseRow else freeDenseRow);
+    }
+
+    fn executeSparseTextEmbedMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runSparseTextEmbedMicrobatch(items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runSparseTextEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
+        if (items.len == 0) return;
+        const model = items[0].payloadAs(TextEmbedTicket).model;
+        const alloc = std.heap.smp_allocator;
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
+        const texts = try alloc.alloc([]const u8, items.len);
+        defer alloc.free(texts);
+        for (items, texts) |item, *text| text.* = item.payloadAs(TextEmbedTicket).text;
+        var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{ .allocator = alloc, .session = model.session, .tok = model.getTokenizer(), .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest), .execution_lock = model.embeddingExecutionLock(), .execution_control = control };
+        var observation = @import("../pipelines/batch_execution.zig").Observation{};
+        pipeline.batch_observation = &observation;
+        const rows = try pipeline.embed(texts);
+        defer alloc.free(rows);
+        if (rows.len != items.len) {
+            for (rows) |row| freeSparseRow(alloc, row);
+            return error.InvalidEmbeddingResultCount;
+        }
+        for (items, rows) |item, row| {
+            item.control.check() catch |err| {
+                freeSparseRow(alloc, row);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue(DirectSparseEmbedding, row, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+        }
+    }
+
+    fn executeTextEmbedMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runTextEmbedMicrobatch(items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runTextEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
+        if (items.len == 0) return;
+        const first = items[0].payloadAs(TextEmbedTicket);
+        const alloc = std.heap.smp_allocator;
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group_control, .check_fn = executor_microbatch.ExecutionControl.check });
+        const texts = try alloc.alloc([]const u8, items.len);
+        defer alloc.free(texts);
+        for (items, texts) |item, *text| text.* = item.payloadAs(TextEmbedTicket).text;
+        var assets = first.model.acquireEmbeddingAssetLease(false);
+        defer assets.release();
+        var observation = @import("../pipelines/batch_execution.zig").Observation{};
+        const vectors = try embedDenseTextsOnLoadedModel(alloc, control, first.model, texts, first.task_type, first.instruction, null, &observation);
+        defer alloc.free(vectors);
+        if (vectors.len != items.len) {
+            for (vectors) |vector| alloc.free(vector);
+            return error.InvalidEmbeddingResultCount;
+        }
+        for (items, vectors) |item, vector| {
+            item.control.check() catch |err| {
+                alloc.free(vector);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue([]f32, vector, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+        }
+    }
+
+    const AudioEmbedTicket = struct {
+        model: *model_manager_mod.LoadedModel,
+        input: ParsedBinaryEmbedInput,
+        working_bytes: usize,
+    };
+
+    fn embedAudioViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, inputs: []const ParsedBinaryEmbedInput, control: InferenceExecutionControl, working_bytes: usize) ![][]f32 {
+        const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+        const payloads = try allocator.alloc(AudioEmbedTicket, inputs.len);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, inputs.len);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, inputs.len);
+        defer allocator.free(identities);
+        for (inputs, payloads, shapes, identities) |input, *payload, *shape, *identity| {
+            payload.* = .{ .model = model, .input = input, .working_bytes = working_bytes };
+            shape.* = .{ .bytes = input.bytes.len };
+            identity.* = .{};
+        }
+        const Probe = struct {
+            fn canceled(ptr: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const shared = std.heap.smp_allocator;
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(AudioEmbedTicket, []f32, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .transform = "audio-encoded", .resource_limit_bytes = working_bytes, .resource_class = executorMicrobatchResourceClass(model.session.backend()) }, .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeAudioEmbedMicrobatch);
+        return executor_microbatch.collectOwned([]f32, allocator, shared, results, cloneDenseRow, freeDenseRow);
+    }
+
+    fn executeAudioEmbedMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runAudioEmbedMicrobatch(items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runAudioEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) anyerror!void {
+        if (items.len == 0) return;
+        const first = items[0].payloadAs(AudioEmbedTicket);
+        const model = first.model;
+        const shared = std.heap.smp_allocator;
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
+        var assets = model.acquireEmbeddingAssetLease(true);
+        defer assets.release();
+        var pipeline = blk: {
+            try model.lockEmbeddingAssetsWithControl(control);
+            defer model.unlockEmbeddingAssets();
+            try model.ensureEmbeddingAssetsLockedWithControl(false, false, true, control);
+            break :blk model.embeddingPipelineLocked(shared);
+        };
+        var audio_assets = AudioEmbeddingAssetGuard.init(model, true);
+        defer audio_assets.deinit();
+        pipeline.execution_control = control;
+        pipeline.config.max_audio_decode_working_bytes = first.working_bytes;
+        const inputs = try shared.alloc(embedding_mod.EncodedAudioClip, items.len);
+        defer shared.free(inputs);
+        for (items, inputs) |item, *input| {
+            const value = item.payloadAs(AudioEmbedTicket).input;
+            input.* = .{ .bytes = value.bytes, .decode_options = .{ .mime_hint = value.mime_type } };
+        }
+        const errors = try shared.alloc(?anyerror, items.len);
+        defer shared.free(errors);
+        const batch = try pipeline.embedEncodedAudioIndexed(inputs, errors);
+        const rows = batch.vectors;
+        defer shared.free(rows);
+        if (rows.len != items.len) {
+            for (rows) |row| shared.free(row);
+            return error.InvalidEmbeddingResultCount;
+        }
+        for (items, rows, errors) |item, row, failure| {
+            if (failure) |err| {
+                shared.free(row);
+                item.slot.fail(err);
+                continue;
+            }
+            item.control.check() catch |err| {
+                shared.free(row);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue([]f32, row, @enumFromInt(@intFromEnum(batch.execution)));
+        }
+    }
+
     const ImageEmbedTicket = struct {
         model: *model_manager_mod.LoadedModel,
         encoded: ?[]const u8 = null,
@@ -6245,8 +6717,8 @@ pub const Node = struct {
                     attempt.parsed,
                     max_input_tokens,
                 );
-                if (attempt.parsed.images.items.len == attempt.parsed.total_count and attempt.parsed.parse_errors.items.len == 0) {
-                    if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, attempt.parsed.images.items, &.{}, attempt.control, attempt.task_type, attempt.instruction)) |vectors| {
+                if (attempt.parsed.parse_errors.items.len == 0) {
+                    if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, attempt.io, model, attempt.parsed, attempt.control, attempt.task_type, attempt.instruction, attempt.audio_decode_working_bytes)) |vectors| {
                         attempt.vectors = vectors;
                         return;
                     }
@@ -7596,6 +8068,7 @@ pub const Node = struct {
             .{
                 .max_length = @intCast(whisper_config.max_target_positions),
                 .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .vocab_size = whisper_config.vocab_size,
                 .eos_token_id = whisper_config.eos_token_id,
                 .language = request.language,
                 .forced_decoder_ids = forced_ids,
@@ -7605,6 +8078,7 @@ pub const Node = struct {
         );
         pipeline.execution_control = control;
 
+        pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
         var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
         defer result.deinit();
         return .{
@@ -7735,6 +8209,7 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
         // Resolve the cheap manifest/path surface before any remote fetch or
@@ -7893,7 +8368,7 @@ pub const Node = struct {
         try validateTextEntityExtractionManifest(&model.manifest);
 
         if (model.isGlinerModel()) {
-            var pipeline = model.glinerPipeline(allocator);
+            var pipeline = createGlinerPipeline(self, allocator, model);
             pipeline.execution_control = execution_control;
             pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
             pipeline.config.flat_ner = options.flat_ner orelse pipeline.config.flat_ner;
@@ -7968,6 +8443,7 @@ pub const Node = struct {
 
         if (want_relations) return error.UnsupportedRelationExtraction;
         var pipeline = model.nerPipeline(allocator);
+        pipeline.batch_dispatch = self.tensorBatchDispatch(.extract);
         pipeline.execution_control = execution_control;
         pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
         const input_tokens = try maxNerInputTokens(&pipeline, texts);
@@ -8039,7 +8515,7 @@ pub const Node = struct {
             if (classification_schema.top_k) |top_k| if (top_k < 1) return error.InvalidTopK;
 
             if (model.isGlinerModel()) {
-                var pipeline = model.glinerPipeline(allocator);
+                var pipeline = createGlinerPipeline(self, allocator, model);
                 pipeline.execution_control = execution_control;
                 const input_tokens = try pipeline.maxClassificationInputTokens(texts, classification_schema.labels);
                 try validateTextExecutorInvocation(
@@ -8913,6 +9389,7 @@ pub const Node = struct {
                 texts: []const []const u8,
                 execution_control: InferenceExecutionControl,
                 vectors: ?[]DirectSparseEmbedding = null,
+                node: *Node,
                 prompt_tokens: usize = 0,
                 executor_contract: ResolvedInferenceExecutorContract,
 
@@ -8929,6 +9406,11 @@ pub const Node = struct {
                     };
                     const max_input_tokens = try maxTokenizerTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.texts);
                     try validateTextExecutorInvocation(attempt.executor_contract, attempt.texts.len, attempt.texts, 0, max_input_tokens, 0, 0);
+                    if (attempt.io) |io| if (try attempt.node.tryEmbedTextRowsViaBroker(true, attempt.allocator, io, model, attempt.texts, attempt.execution_control, .RETRIEVAL_DOCUMENT, null)) |vectors| {
+                        attempt.vectors = vectors;
+                        attempt.prompt_tokens = countTokenizerTexts(attempt.allocator, attempt.io, model.getTokenizer(), attempt.texts) catch estimateTextsTokens(attempt.texts);
+                        return;
+                    };
                     const vectors = try pipeline.embed(attempt.texts);
                     errdefer {
                         for (vectors) |*item| item.deinit(attempt.allocator);
@@ -8942,6 +9424,7 @@ pub const Node = struct {
                 .allocator = ctx.allocator,
                 .io = self.session_manager.io,
                 .texts = sparse_texts,
+                .node = self,
                 .executor_contract = executor_contract,
                 .execution_control = execution_control,
             };
@@ -9050,13 +9533,14 @@ pub const Node = struct {
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-                // Keep traced, mixed-modality and per-item requests on their
-                // established executor; homogeneous fail-fast image requests
-                // may share native calls with other callers of this generation.
-                if (attempt.request.error_policy == .fail_fast and attempt.trace == null and attempt.inputs.images.items.len == attempt.inputs.total_count and attempt.inputs.parse_errors.items.len == 0) {
+                // Group by modality before model asset locks, preserving the
+                // original input indexes when compatible calls are combined.
+                if (attempt.request.error_policy == .fail_fast and attempt.trace == null and attempt.inputs.parse_errors.items.len == 0) {
                     if (attempt.io) |io| {
-                        if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, io, model, attempt.inputs.images.items, &.{}, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction)) |vectors| {
-                            attempt.prompt_tokens = estimateParsedDenseEmbedPromptTokens(attempt.inputs);
+                        const prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction);
+                        defer if (prefix.owned) |owned| attempt.allocator.free(owned);
+                        if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, io, model, attempt.inputs, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction, attempt.audio_decode_working_bytes)) |vectors| {
+                            attempt.prompt_tokens = countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, prefix.prefix);
                             attempt.result = .{ .fail_fast = vectors };
                             return;
                         }
@@ -9352,7 +9836,7 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
-        var pipeline = model.rerankingPipeline(ctx.allocator);
+        var pipeline = self.createRerankingPipeline(ctx.allocator, model);
         pipeline.execution_control = execution_control;
         var prepared = pipeline.prepareInputs(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -9512,7 +9996,7 @@ pub const Node = struct {
             defer ctx.allocator.free(flat_texts);
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
-            var pipeline = model.rerankingPipeline(ctx.allocator);
+            var pipeline = self.createRerankingPipeline(ctx.allocator, model);
             pipeline.execution_control = execution_control;
             var prepared = pipeline.prepareInputs(body.query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -11085,16 +11569,29 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
-            first_locked_model.unlockNativeGeneration();
-            return inferenceFailureResponse(ctx, err);
-        };
-        defer {
+        const isolated_generation = canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
+        // Whole-request native owners cannot hold the model gate while waiting
+        // for a turn belonging to an isolated peer that needs that same gate.
+        if (backend_kind == .native and !isolated_generation) {
+            if (native_generate_lease) |lease| {
+                model.native_generate_coordinator.?.release(lease);
+                native_generate_lease = null;
+            }
+        }
+        if (!isolated_generation) {
+            execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
+                return inferenceFailureResponse(ctx, err);
+            if (second_locked_model) |second| execution_control.lock(second.nativeGenerationMutex()) catch |err| {
+                first_locked_model.unlockNativeGeneration();
+                return inferenceFailureResponse(ctx, err);
+            };
+        }
+        defer if (!isolated_generation) {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
-        }
+        };
+        var generation_allocator = executor_microbatch.SynchronizedAllocator{ .child = ctx.allocator };
+        const execution_allocator = if (isolated_generation) generation_allocator.allocator() else ctx.allocator;
 
         if (draft_model_for_generation) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
@@ -11105,12 +11602,12 @@ pub const Node = struct {
             };
         }
 
-        var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
+        var kv_manager = runtime.kv.manager.KvManager.init(execution_allocator);
         defer kv_manager.deinit();
         var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
         defer if (draft_kv_manager) |*manager| manager.deinit();
 
-        var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
+        var cb = session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
                 return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
             }
@@ -11178,7 +11675,7 @@ pub const Node = struct {
         }
 
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
-            runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, pool_config) catch |err|
+            runtime.kv.storage_runtime.KvStorageRuntime.init(execution_allocator, pool_config) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) })
         else
             null;
@@ -11187,7 +11684,7 @@ pub const Node = struct {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
-        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        var decode_state = generation.NativeDecodeState.initPaged(execution_allocator, active_kv_manager, pool_id, model.shared_moe_cache);
         if (active_kv_storage) |storage| {
             decode_state.kv_storage = storage;
         } else if (kv_storage) |*storage| {
@@ -11216,7 +11713,7 @@ pub const Node = struct {
         const graph_mode = backend_selection.graph_mode_requested or
             effective_compiled_partition_backend != null or
             graphModeEnabled();
-        const use_scheduler = !graph_mode;
+        const use_scheduler = !graph_mode and (backend_kind != .native or isolated_generation);
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and
@@ -11242,7 +11739,7 @@ pub const Node = struct {
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
 
         var pipeline = generation.NativeGenerationPipeline{
-            .allocator = ctx.allocator,
+            .allocator = execution_allocator,
             .io = ctx.io,
             .cb = cb,
             .session = model.session,
@@ -11269,6 +11766,7 @@ pub const Node = struct {
             .decode_state = &decode_state,
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
+            .execution_lock = if (isolated_generation) model.nativeGenerationMutex() else null,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
@@ -12111,9 +12609,20 @@ pub const Node = struct {
         };
     }
 
+    fn canIsolateGeneration(backend: runtime.kv.pool.BackendKind, graph: bool, draft: bool, prompt_cache: bool, stream: bool) bool {
+        return batchExecutionMode(backend) == .isolated_parallel and !graph and !draft and !prompt_cache and !stream;
+    }
+
     const BatchModelLock = struct {
         mutex: *std.atomic.Mutex,
         owns_outer_lock: bool,
+
+        fn initWithControl(mode: BatchExecutionMode, mutex: *std.atomic.Mutex, io: std.Io, control: ?InferenceExecutionControl) !@This() {
+            if (mode == .shared_serial) {
+                if (control) |active| try active.lock(mutex) else platform.sync.lockYieldingIo(mutex, io);
+            }
+            return .{ .mutex = mutex, .owns_outer_lock = mode == .shared_serial };
+        }
 
         fn init(
             execution_mode: BatchExecutionMode,
@@ -14337,6 +14846,7 @@ pub const Node = struct {
         }
 
         var pipeline = model.nerPipeline(ctx.allocator);
+        pipeline.batch_dispatch = self.tensorBatchDispatch(.extract);
         pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const input_tokens = maxNerInputTokens(&pipeline, texts) catch |err|
@@ -14444,50 +14954,35 @@ pub const Node = struct {
         defer allocator.free(paths.encoder);
         defer allocator.free(paths.decoder);
 
-        failure_stage.* = .tokenizer;
-        const tokenizer_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
-        defer allocator.free(tokenizer_path);
-        const tokenizer_bytes = try c_file.readFile(allocator, tokenizer_path);
-        defer allocator.free(tokenizer_bytes);
-        var tokenizer = try hf_tokenizer_mod.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
-        defer tokenizer.deinitSelf();
-
         failure_stage.* = .model_load;
         var config = try rebel_mod.loadConfig(allocator, model_path);
         var config_owned = true;
         errdefer if (config_owned) config.deinit();
-        const decoder_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-        if (decoder_config.max_length > 0) config.max_length = decoder_config.max_length;
-
-        var component_loader = try self.model_manager.componentLoaderForPaths(
+        var runtime_handle = try self.model_manager.acquireCompositeRuntime(
             model_path,
-            self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
+            .seq2seq,
+            execution_control,
         );
-        var encoder_managed = if (execution_control) |control|
-            try component_loader.loadWithControl(paths.encoder, control)
-        else
-            try component_loader.load(paths.encoder);
-        defer encoder_managed.deinit();
-        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
-        var decoder_managed = if (execution_control) |control|
-            try strict_loader.loadWithControl(paths.decoder, control)
-        else
-            try strict_loader.load(paths.decoder);
-        defer decoder_managed.deinit();
-        const encoder_session = encoder_managed.disownSession();
-        const decoder_session = decoder_managed.disownSession();
+        defer runtime_handle.release();
+        const assets = runtime_handle.get();
+        const decoder_config = assets.decoder_config;
+        if (decoder_config.max_length > 0) config.max_length = decoder_config.max_length;
+        const encoder_session = assets.encoder.?.session;
+        const decoder_session = assets.decoder.?.session;
 
         var pipeline = rebel_mod.RebelPipeline{
             .allocator = allocator,
             .enc_dec = .{
                 .allocator = allocator,
+                .owns_sessions = false,
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = decoder_config,
                 .execution_control = execution_control,
+                .batch_dispatch = self.tensorBatchDispatch(.extract),
             },
-            .tokenizer = tokenizer.tokenizer(),
+            .tokenizer = assets.tokenizer(),
             .config = config,
         };
         config_owned = false;
@@ -14553,7 +15048,7 @@ pub const Node = struct {
         want_relations: bool,
     ) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
-        var pipeline = model.glinerPipeline(ctx.allocator);
+        var pipeline = createGlinerPipeline(self, ctx.allocator, model);
         pipeline.execution_control = execution_control;
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         pipeline.config.flat_ner = body.flat_ner orelse pipeline.config.flat_ner;
@@ -14975,39 +15470,18 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
-        var component_loader = self.model_manager.componentLoaderForPaths(
+        var runtime_handle = self.model_manager.acquireCompositeRuntime(
             model_path,
-            self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
+            .seq2seq,
+            execution_control,
         ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer encoder_managed.deinit();
-        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer decoder_managed.deinit();
-        const encoder_session = encoder_managed.session;
-        const decoder_session = decoder_managed.session;
-
-        // Parse decoder config
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
-        // Load tokenizer
-        const hf_tokenizer = @import("inference_hf_tokenizer");
-        const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_path);
-
-        const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_bytes);
-
-        var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer hf_tok.deinitSelf();
-        const max_input_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), body.inputs) catch |err|
+        defer runtime_handle.release();
+        const assets = runtime_handle.get();
+        const encoder_session = assets.encoder.?.session;
+        const decoder_session = assets.decoder.?.session;
+        const dec_config = assets.decoder_config;
+        const max_input_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, assets.tokenizer(), body.inputs) catch |err|
             return inferenceFailureResponse(ctx, err);
         validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = body.inputs.len,
@@ -15021,12 +15495,14 @@ pub const Node = struct {
             .allocator = ctx.allocator,
             .enc_dec = .{
                 .allocator = ctx.allocator,
+                .owns_sessions = false,
                 .encoder = encoder_session,
                 .decoder = decoder_session,
                 .config = dec_config,
                 .execution_control = execution_control,
+                .batch_dispatch = self.tensorBatchDispatch(.rewrite),
             },
-            .tokenizer = hf_tok.tokenizer(),
+            .tokenizer = assets.tokenizer(),
             .config = .{
                 .max_length = dec_config.max_length,
             },
@@ -15043,15 +15519,20 @@ pub const Node = struct {
         }
 
         var completion_tokens: usize = 0;
-        for (body.inputs, 0..) |input_text, i| {
-            var result = pipeline.rewrite(input_text) catch |err|
-                return inferenceFailureResponse(ctx, err);
-            defer result.deinit();
-
+        var rewrite_owned_io: ?std.Io.Threaded = null;
+        defer if (rewrite_owned_io) |*owned| owned.deinit();
+        const rewrite_io = self.inferenceIo(ctx.allocator, execution_control.io, &rewrite_owned_io);
+        const rewritten = pipeline.rewriteBatch(rewrite_io, body.inputs) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        defer {
+            for (rewritten) |*result| result.deinit();
+            ctx.allocator.free(rewritten);
+        }
+        for (rewritten, 0..) |result, i| {
             const inner = try ctx.allocator.alloc([]const u8, 1);
             errdefer ctx.allocator.free(inner);
             inner[0] = try ctx.allocator.dupe(u8, result.text);
-            completion_tokens += countTokenizerTokens(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
+            completion_tokens += countTokenizerTokens(ctx.allocator, self.session_manager.io, assets.tokenizer(), result.text) catch estimateTextTokens(result.text);
             data[i] = .{
                 .object = "rewrite",
                 .index = @intCast(i),
@@ -15060,7 +15541,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
+        const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, assets.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
         return ctx.json(api.RewriteResponse{
             .object = "list",
             .data = data,
@@ -15578,15 +16059,11 @@ pub const Node = struct {
         const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
-        var encoder_managed: ?model_manager_mod.ManagedSession = null;
-        defer if (encoder_managed) |*managed| managed.deinit();
-        var decoder_managed: ?model_manager_mod.ManagedSession = null;
-        defer if (decoder_managed) |*managed| managed.deinit();
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
         var decoder_config: enc_dec_mod.DecoderConfig = undefined;
         var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
         defer if (loaded_model_handle) |*handle| handle.release();
-        var whisper_assets_handle: ?model_manager_mod.WhisperAssetsHandle = null;
+        var whisper_assets_handle: ?model_manager_mod.CompositeAssetsHandle = null;
         defer if (whisper_assets_handle) |*handle| handle.release();
         var prompt_cache: ?*const whisper_prompt.PromptCache = null;
 
@@ -15594,32 +16071,18 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
-            whisper_assets_handle = self.model_manager.acquireWhisperCompositeAssets(
+            whisper_assets_handle = self.model_manager.acquireCompositeRuntime(
                 model_path,
                 &.{ paths.encoder, paths.decoder },
-            ) catch |err| return modelLoadFailureResponse(ctx, err);
-            var component_loader = self.model_manager.componentLoaderForPaths(
-                model_path,
-                self.session_manager.preferred_backends,
-                &.{ paths.encoder, paths.decoder },
-            ) catch |err| return modelLoadFailureResponse(ctx, err);
-            encoder_managed = component_loader.loadWithControl(paths.encoder, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            encoder_session = encoder_managed.?.session;
-            var strict_loader = component_loader.restrictToBackend(encoder_session.backend()) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            decoder_managed = strict_loader.loadWithControl(paths.decoder, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            decoder_session = decoder_managed.?.session;
-            self.model_manager.validateWhisperAssetsCurrent(
-                &whisper_assets_handle.?,
-                model_path,
-                &.{ paths.encoder, paths.decoder },
+                .whisper,
+                execution_control,
             ) catch |err| return modelLoadFailureResponse(ctx, err);
             const assets = whisper_assets_handle.?.get();
+            encoder_session = assets.encoder.?.session;
+            decoder_session = assets.decoder.?.session;
             tokenizer = assets.tokenizer();
             decoder_config = assets.decoder_config;
-            prompt_cache = &assets.prompt_cache;
+            prompt_cache = &assets.prompt_cache.?;
         } else |_| {
             loaded_model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
                 return modelLoadFailureResponse(ctx, err);
@@ -15637,9 +16100,9 @@ pub const Node = struct {
             decoder_config = .{
                 .max_length = @intCast(whisper_config.max_target_positions),
                 .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .vocab_size = whisper_config.vocab_size,
                 .eos_token_id = whisper_config.eos_token_id,
                 .pad_token_id = whisper_config.pad_token_id,
-                .vocab_size = @intCast(whisper_config.vocab_size),
             };
         }
 
@@ -15660,6 +16123,7 @@ pub const Node = struct {
             .{
                 .max_length = decoder_config.max_length,
                 .decoder_start_token_id = decoder_config.decoder_start_token_id,
+                .vocab_size = decoder_config.vocab_size,
                 .eos_token_id = decoder_config.eos_token_id,
                 .language = body.language,
                 .forced_decoder_ids = forced_ids,
@@ -15669,6 +16133,7 @@ pub const Node = struct {
         );
         pipeline.execution_control = execution_control;
 
+        pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
         var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
             error.OutOfMemory => return err,
@@ -15886,7 +16351,7 @@ pub const Node = struct {
             }
 
             if (model.isGlinerModel()) {
-                var pipeline = model.glinerPipeline(ctx.allocator);
+                var pipeline = createGlinerPipeline(self, ctx.allocator, model);
                 pipeline.execution_control = execution_control;
                 const input_tokens = pipeline.maxClassificationInputTokens(texts, schema.labels) catch |err|
                     return inferenceFailureResponse(ctx, err);
@@ -18808,7 +19273,24 @@ pub const ResolvedExecutorKind = enum {
     native_dense_embedding,
     native_sparse_embedding,
     native_florence_reader,
+    native_gliner_extraction,
 };
+
+test "microbatch registration qualifies concrete GLiNER bundles and Qwen embedding profiles" {
+    const gliner = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_model_type = "gliner2",
+        .gguf_path = "encoder.gguf",
+        .gliner_head_gguf_path = "head.gguf",
+    };
+    try std.testing.expectEqual(.native_gliner_extraction, resolvedExecutorKind("extract", &gliner));
+    try std.testing.expectEqual(.native, resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner)).mode);
+    const onnx = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .gliner_model_type = "gliner2" };
+    try std.testing.expectEqual(.compatibility, resolvedExecutorKind("extract", &onnx));
+    const qwen = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .embedding_style = .qwen3_embedding };
+    try std.testing.expectEqual(.native_dense_embedding, resolvedExecutorKind("embed", &qwen));
+    try std.testing.expectEqual(.compatibility, resolvedExecutorKind("generate", &qwen));
+}
 
 pub fn resolvedExecutorKind(
     resolved_task: []const u8,
@@ -18826,6 +19308,8 @@ pub fn resolvedExecutorKind(
     }
     if (std.mem.eql(u8, resolved_task, "read") and manifest.native_arch_hint == .florence)
         return .native_florence_reader;
+    if (std.mem.eql(u8, resolved_task, "extract") and manifest.isSplitGlinerBundle())
+        return .native_gliner_extraction;
     return .compatibility;
 }
 
@@ -18842,7 +19326,7 @@ pub fn resolvedExecutorBatchImplementation(
         task_max_items;
     const preferred_items = @min(@as(usize, 8), max_items);
     const native = executor_kind == .native_dense_embedding or
-        executor_kind == .native_sparse_embedding or native_reader;
+        executor_kind == .native_sparse_embedding or executor_kind == .native_gliner_extraction or native_reader;
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,
@@ -20787,6 +21271,28 @@ test "generate batch isolates native execution and serializes stateful GPU backe
         Node.BatchExecutionMode.shared_serial,
         Node.batchExecutionMode(.cuda),
     );
+}
+
+test "microbatch GLiNER results borrow each caller label rather than leader storage" {
+    const allocator = std.testing.allocator;
+    const leader_label = try allocator.dupe(u8, "person");
+    defer allocator.free(leader_label);
+    const peer_label = try allocator.dupe(u8, "person");
+    defer allocator.free(peer_label);
+    var row = [_]gliner_mod.Entity{.{ .text = "Alice", .label = leader_label, .start = 0, .end = 5, .score = 1 }};
+    try Node.rebindGlinerLabels(&row, &.{peer_label});
+    try std.testing.expect(row[0].label.ptr == peer_label.ptr);
+    try std.testing.expectError(error.InvalidExtractionResponse, Node.rebindGlinerLabels(&row, &.{"organization"}));
+}
+
+test "microbatch generation isolation excludes every shared request runtime" {
+    try std.testing.expect(Node.canIsolateGeneration(.native, false, false, false, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.metal, false, false, false, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.cuda, false, false, false, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.native, true, false, false, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.native, false, true, false, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.native, false, false, true, false));
+    try std.testing.expect(!Node.canIsolateGeneration(.native, false, false, false, true));
 }
 
 test "generate batch admission units sum pending generation work" {

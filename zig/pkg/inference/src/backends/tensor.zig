@@ -65,6 +65,14 @@ pub const Tensor = struct {
     data_alignment: std.mem.Alignment = .@"1",
     /// When set, `data` is a slice inside this stable mmap-backed byte range.
     mmap_source_bytes: ?[]const u8 = null,
+    /// Allocation provenance for immutable row views. The source owner pins
+    /// this entire range through the invocation, including on borrowedView.
+    /// Enables rejoining adjacent rows without copying their shared storage.
+    shared_storage: ?[]u8 = null,
+    /// Opaque admission controller owning the pinned host storage. Set only by
+    /// a live output owner whose lease covers this range; borrowed views inherit
+    /// it, but copies allocating new storage must not. Not an ownership hook.
+    admitted_storage_domain: ?*anyopaque = null,
     lifetime: ?Lifetime = null,
 
     fn initOwned(
@@ -204,7 +212,7 @@ pub const Tensor = struct {
     }
 
     pub fn deinit(self: *Tensor) void {
-        if (self.owns_data) self.allocator.rawFree(self.data, self.data_alignment, @returnAddress());
+        if (self.owns_data and self.data.len > 0) self.allocator.rawFree(self.data, self.data_alignment, @returnAddress());
         if (self.owns_shape) self.allocator.free(self.shape);
         if (self.lifetime) |lifetime| {
             self.lifetime = null;

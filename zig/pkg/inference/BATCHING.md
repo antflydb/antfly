@@ -92,10 +92,158 @@ When `error_policy` is `per_item`, malformed content parts, failed media fetches
 
 This keeps the fast path fast while giving ingestion callers a way to isolate poisoned media without forcing DB batch rollback.
 
-### Cross-request image embedding
+### Cross-request model scheduling
 
-The Node-owned microbatch broker also coalesces homogeneous image-only,
-fail-fast requests for loaded models advertising native image batching. Local
+Antfly groups ready logical work before materializing document assets. The
+inference Node separately schedules work across callers against the loaded
+model generation. Neither layer merges task semantics or resets deadlines.
+
+| Executor | Cross-request implementation |
+| --- | --- |
+| Florence reader | Existing encoded/raster broker adapter |
+| Dense text, including Qwen3 embedding profiles | Text broker; task/instruction-aware keys; observed adaptive execution |
+| Sparse text | Typed sparse-vector broker; fixed-shape/serial graphs bypass native fill delay |
+| CLIP/ClipClap images | Encoded-image or borrowed-raster groups |
+| CLAP/ClipClap audio | Indexed decoding and bounded PCM/feature windows |
+| GLiNER NER, relations, structured extraction, classification | Shared encoder boundary; classification retains independent score decoding; ONNX remains compatibility execution |
+| Native generators, including multimodal architectures | Existing token-step coordinator, now reachable from isolated direct and non-streaming HTTP requests |
+| Fixed chunker | Immediate bounded transform; no model fill delay |
+| Text reranking | Shared tensor-forward dispatcher before the model gate; qualified cross-encoder, late-interaction and yes/no stages |
+| BERT-style NER | Bounded eight-row request windows plus cross-request tensor fusion; span decoding stays per text |
+| Rewriting / REBEL | Shared encoder/decoder-stage dispatcher; rewriting arrays expose up to eight independent sequences, with masked encoder padding |
+| Whisper transcription | Shared dispatcher for qualified encoder and decoder forwards; audio decoding and token results remain per request |
+
+Generation qualification is backend-specific, not inferred from the model
+name. Shared Metal/CUDA runtime state, graph execution, speculative decoding,
+prompt caching, and streaming retain their existing whole-request ownership.
+Native whole-request owners do not wait for a token turn while holding the
+model gate. Remote Antfly calls reach these same Node paths; Antfly cannot
+enable fused execution inside an external vendor's service.
+
+### Task-neutral tensor-forward fusion
+
+`server/tensor_microbatch.zig` is the common forward boundary for qualified
+row-independent stages, not a replacement for typed reader, embedder, extraction
+or token-generation executors. Pipelines explicitly opt in. Graph sessions must
+declare dynamic leading input/output axes; multi-entry native sessions instead
+qualify their concrete invocation through `Session.independentBatchRows`.
+A backend veto overrides metadata. Neither a family name nor dynamic axes alone
+prove that shared caches or model state are safe to batch.
+
+Compatibility includes the concrete session generation, task, execution gate,
+input names/dtypes/non-batch shapes, supervising process boundary, and admission
+controller/limits. A window retains at most eight caller submissions, 64 tensor
+rows and 64 MiB of input data. Larger existing request batches bypass the queue.
+The existing Node broker owns scheduling; no new thread pool or background
+worker is allocated. Model gates cover physical admission, packing and execution,
+but are not held while waiting for a compatible group.
+
+Packing and aggregate execution are admitted before allocation. Queued caller
+permits retain their input/preprocessing bytes and yield idle compute workspace.
+The physical forward acquires execution once; singleton fallback and later
+reuse of a yielded permit reacquire execution without dropping input residency.
+Uncovered original inputs are additionally charged when a packed copy is needed.
+Contiguous borrowed columns consume no packing allocation, and a live owner in
+the same admission domain provides residency credit for already-covered bytes.
+Pointer adjacency or ownership in a different resource domain provides no credit.
+Capacity subdivision occurs before any forward: oversized groups are replanned
+as smaller groups down to singleton execution. Failed or malformed forwards are
+never replayed. Physical subgroups receive distinct execution identities and
+native-batch counters. After packing buffers are freed, the shared output owner
+reduces its lease to materialized output bytes rather than retaining scratch
+through downstream decoding.
+
+Outputs are validated before scatter. Row views share the physical tensor and
+its admission lease through a reference-counted owner; only the outer result
+container is transferred to each caller's allocator. Cancellation is per caller;
+healthy peers keep their rows, and process supervision observes the group rather
+than inheriting the first caller's deadline. Request-array rewriting keeps
+tokenizer and progress-sink access sequential and gives workers independent
+tensor/token storage. Fixed/specialized graphs and whole-request-locked
+multimodal reranking retain their established execution paths.
+
+Rewriting first admits a bounded preprocessing window and tokenizes it once.
+It partitions that window by token-length class before materializing tensors,
+then restores original result order. Subdivision never inherits an unrelated
+long request's padding width.
+Execution groups are then sized using actual padded token lengths against both
+encoder and worst-case full-prefix decoder peaks, including retained encoder
+output and preprocessing. Each physical stage counts one workspace rather than
+one workspace per sequence; encoder and decoder gates serialize admission and
+packing as well as their forwards. Execution width shrinks to singleton when a
+larger group does not fit permanent limits, without repeating tokenization.
+Preprocessing admission can independently shrink the window under live pressure.
+This is conservative planning, not a reservation of future execution: concurrent
+request admission can still return temporary exhaustion.
+
+`Session.planRun` combines concrete input geometry with an optional native stage
+descriptor for output bytes and workspace. Native Whisper describes encoder
+hidden states, decoder vocabulary logits and attention/FFN peaks separately;
+placeholder output metadata is not used for these stages. Both direct and fused
+host-tensor forwards use the descriptor, and reusable preprocessing permits
+recheck geometry before each invocation. Imported seq2seq stages use a
+backend-independent named-input projection descriptor: Whisper's output time is
+ceil(input_features.time / 2), not its mel-channel axis. Exported hidden widths
+or explicit model configuration bound feature dimensions. Unresolved non-text
+output transforms bypass fusion until a concrete descriptor is available.
+
+Rewriting, REBEL and split Whisper acquire lazy, single-flight composite
+runtimes from ModelManager. A pinned publication owns both ManagedSessions,
+the managed tokenizer, decoder metadata and optional Whisper prompt metadata.
+Keys include artifact generation, runtime kind and backend preference. Generation
+covers the validated component dependency closure, including ONNX external data
+and native tensor shards, plus tokenizer/configuration/managed receipt sidecars.
+Warm serving lookups reuse the component-plan dependency list rather than
+reparsing graph contents. Existing
+LRU/TTL/pressure eviction applies to idle composites, including device-resident
+component leases. A request releases its handle, never the borrowed sessions.
+Cold construction uses the manager's load executor and shared waiter control;
+one canceled waiter cannot cancel initialization needed by its peers.
+Execution gates are owned by the pinned model or composite stage and borrowed
+by session copies; unrelated model addresses no longer collide in a hashed
+mutex array.
+
+Variable-length masked rewriting and reranking encoders use small sequence
+length classes (at most 25% padding) when a dispatcher is installed. Planning
+and materialization use the same widths; fixed graphs retain their exact shapes.
+Late-interaction query/document execution now honors its admitted trimmed
+lengths. Other stage layouts are not blindly padded by the tensor broker.
+
+Shared output row views carry allocation provenance. Subsequent compatible
+stages reorder tickets into storage order and borrow contiguous columns without
+repacking them; result slots preserve each request's identity. Split groups or
+noncontiguous rows still pack normally. Generic seq2seq decoding also reuses its
+token-ID buffer, borrows attention masks and selects argmax directly from logits,
+eliminating the per-token vocabulary copy.
+
+`pipelines/seq2seq_decode.zig` provides request-owned incremental execution for
+qualified merged exports with `use_cache_branch`, matching `past_key_values` /
+`present` self/cross-attention tensors, and concrete head dimensions. Generic
+seq2seq and transcription pipelines submit only newly appended tokens after
+prefill and reuse encoder K/V when subsequent outputs are empty. The adapter
+reuses `graph/onnx_kv_cache.zig`, preserves tensor lifetime/admission ownership,
+and reserves host KV residency against the existing KV ceiling before forwarding.
+Planning includes old-cache/replacement overlap. Cache state stays bound to one
+encoder context and request; it is not a second cross-request prefix cache.
+
+Existing native generation prefix caching and Florence incremental caching are
+unchanged. Other seq2seq layouts retain their existing path. Separate init/past
+graphs, a native Whisper incremental adapter, device-resident graph caches and
+fused stepping with broadcast cache-branch inputs still require qualification.
+The merged adapter does not change artifact selection order or claim that every
+artifact containing an optional cached decoder selects it automatically.
+
+This is shared fused-batching infrastructure, not a claim that every artifact
+and provider now executes natively batched. GPU generation's shared graph,
+stream, scratch and request-budget state still needs backend-specific isolation;
+the existing validated generation scheduler remains authoritative. Hardware
+qualification and throughput measurements are still required per artifact.
+
+### Cross-request embedding details
+
+The Node-owned microbatch broker coalesces fail-fast modality work for loaded
+models advertising native embedding batching. Mixed requests scatter each
+modality's vectors back to their original input indexes. Local
 encoded inputs and distributed `/embed` share the adapter; borrowed PDF page
 rasters use a distinct representation group. Keys include loaded generation,
 task/instruction options, representation, and backend resource class. Each
@@ -125,9 +273,17 @@ serial, and fallback execution explicitly. A deterministic concurrent regression
 verifies that two callers produce one vision-session invocation and independent
 owned vectors. This is not a hardware throughput benchmark.
 
-Mixed inputs, text/audio, per-item-error requests, and traced HTTP requests keep
-their existing executors; native cross-request support is not inferred merely
-from sharing a model family or provider.
+Audio groups also key their working-memory ceiling. Decoder failures stay
+indexed, and retained PCM plus feature scratch must fit before adding a clip.
+The executor flushes a bounded window when the next clip does not fit, without
+retrying a failed backend invocation. Audio asset leases are exclusive and
+released before executing other modalities. Text options are validated and
+their applied prefix is included in token admission and usage accounting.
+
+Explicit per-item-error requests and traced HTTP requests keep their existing
+executors. Native cross-request support is not inferred merely from sharing a
+model family or provider. Observed native results and coalesced groups are
+separate broker metrics; a compatibility fallback is not called a native batch.
 
 ## Synchronous generation batch endpoint
 

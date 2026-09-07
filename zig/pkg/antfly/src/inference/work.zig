@@ -476,18 +476,64 @@ pub const TaskResourceLimits = struct {
     }
 };
 
-/// Physical representation selected by the concrete executor boundary.
-///
-/// This is deliberately separate from `InferenceCapabilities`: a model may be
-/// reachable through both a linked, borrowed-byte ABI and a remote HTTP route.
-/// Admission must charge the route that will actually execute, not a model or
-/// catalog property.
+/// Inline value ownership allows plans to outlive discovery-cache entries.
+pub const RoutingToken = struct {
+    bytes: [128]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) !RoutingToken {
+        if (value.len == 0 or value.len > 128)
+            return error.InvalidCapabilityRoutingToken;
+        var result = RoutingToken{};
+        @memcpy(result.bytes[0..value.len], value);
+        result.len = @intCast(value.len);
+        return result;
+    }
+
+    pub fn slice(self: *const RoutingToken) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const CapabilityRevision = struct {
+    bytes: [64]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) !CapabilityRevision {
+        if (value.len != 64) return error.InvalidCapabilityRevision;
+        for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidCapabilityRevision;
+        var result = CapabilityRevision{};
+        @memcpy(result.bytes[0..value.len], value);
+        result.len = @intCast(value.len);
+        return result;
+    }
+
+    pub fn slice(self: *const CapabilityRevision) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const CapabilityLease = struct {
+    capabilities: ?InferenceCapabilities,
+    routing_token: ?RoutingToken = null,
+    descriptor_revision: ?CapabilityRevision = null,
+    /// Digest of URL, model, task and authorization/source headers at planning.
+    scope_digest: ?[32]u8 = null,
+};
+
+/// Physical representation/ownership selected by the concrete executor, not
+/// by the model. Wire-identical buffered and segmented routes differ in peak
+/// residency; the fixed invocation plan separately accounts for framing.
 pub const AttachmentTransport = enum {
     borrowed_binary,
     /// Raw attachments are copied once into a versioned HTTP envelope. The
     /// wire size stays linear in the source bytes without base64 expansion,
     /// while admission accounts for source and request-body residency.
     framed_binary,
+    /// Same HTTP envelope, sent as borrowed replayable segments. Only framing
+    /// metadata/control allocations are owned by the invocation (charged in
+    /// its fixed plan); page payloads remain owned by the document window.
+    segmented_framed_binary,
     base64_payload,
     data_uri,
 
@@ -500,7 +546,7 @@ pub const AttachmentTransport = enum {
         raw_bytes: usize,
         mime_type_len: usize,
     ) !usize {
-        if (self == .borrowed_binary or self == .framed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .framed_binary or self == .segmented_framed_binary) return raw_bytes;
         const rounded = std.math.add(usize, raw_bytes, 2) catch
             return error.InferenceEncodedBytesExceeded;
         const encoded = std.math.mul(usize, rounded / 3, 4) catch
@@ -524,7 +570,7 @@ pub const AttachmentTransport = enum {
         raw_bytes: usize,
         mime_type_len: usize,
     ) !usize {
-        if (self == .borrowed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .segmented_framed_binary) return raw_bytes;
         if (self == .framed_binary)
             return std.math.mul(usize, raw_bytes, 2) catch error.InferenceEncodedBytesExceeded;
         const wire_bytes = try self.wireSize(raw_bytes, mime_type_len);
@@ -546,7 +592,7 @@ pub const AttachmentTransport = enum {
         item_count: usize,
     ) !usize {
         if (item_count == 0) return 0;
-        if (self == .borrowed_binary or self == .framed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .framed_binary or self == .segmented_framed_binary) return raw_bytes;
         const encoded = try AttachmentTransport.base64_payload.wireSize(raw_bytes, 0);
         const padding_slack = std.math.mul(usize, item_count - 1, 4) catch
             return error.InferenceEncodedBytesExceeded;
@@ -570,7 +616,7 @@ pub const AttachmentTransport = enum {
         mime_type_len: usize,
         item_count: usize,
     ) !usize {
-        if (self == .borrowed_binary) return raw_bytes;
+        if (self == .borrowed_binary or self == .segmented_framed_binary) return raw_bytes;
         if (self == .framed_binary)
             return std.math.mul(usize, raw_bytes, 2) catch error.InferenceEncodedBytesExceeded;
         const wire_bytes = try self.batchWireSizeUpperBound(raw_bytes, mime_type_len, item_count);
@@ -1169,6 +1215,9 @@ test "attachment transport separates wire and peak resident representations" {
     );
     try std.testing.expectEqual(@as(usize, 7), try AttachmentTransport.base64_payload.peakResidentSize(3, 0));
     try std.testing.expectEqual(@as(usize, 6), try AttachmentTransport.framed_binary.peakResidentSize(3, 0));
+    try std.testing.expectEqual(@as(usize, 3), try AttachmentTransport.segmented_framed_binary.peakResidentSize(3, 0));
+    try std.testing.expectEqual(@as(usize, 6), try AttachmentTransport.segmented_framed_binary.batchWireSizeUpperBound(6, 9, 2));
+    try std.testing.expectEqual(@as(usize, 6), try AttachmentTransport.segmented_framed_binary.maxRawBytesForLimits(9, 2, 6, 6));
     try std.testing.expectEqual(
         @as(usize, 3 + 2 * "data:image/png;base64,AQID".len),
         try AttachmentTransport.data_uri.peakResidentSize(3, "image/png".len),

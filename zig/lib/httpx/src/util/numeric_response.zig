@@ -25,6 +25,15 @@ pub fn frameSize(rows: usize, columns: usize) !usize {
     return total;
 }
 
+/// Response capacity is an execution batch constraint, not a document limit.
+pub fn maxRows(columns: usize) !usize {
+    if (columns == 0) return error.InvalidNumericResponse;
+    const row_bytes = std.math.mul(usize, columns, 4) catch return error.NumericResponseTooLarge;
+    const rows = (max_body_bytes - header_bytes) / row_bytes;
+    if (rows == 0) return error.NumericResponseTooLarge;
+    return rows;
+}
+
 /// The caller fills every value before publishing. Shape is bounded before
 /// allocation; setters reject nonfinite model output rather than emitting it.
 pub fn allocFrame(alloc: std.mem.Allocator, kind: Kind, rows: usize, columns: usize) ![]u8 {
@@ -106,6 +115,15 @@ fn checkDenseAllocationFailures(alloc: std.mem.Allocator) !void {
 
 test "numeric response dense ownership is allocation failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkDenseAllocationFailures, .{});
+}
+
+test "numeric response row limits reserve the frame header" {
+    try std.testing.expectEqual(@as(usize, 127), try maxRows(8192));
+    _ = try frameSize(try maxRows(8192), 8192);
+    try std.testing.expectError(error.NumericResponseTooLarge, frameSize(128, 8192));
+    try std.testing.expectError(error.InvalidNumericResponse, maxRows(0));
+    try std.testing.expectError(error.NumericResponseTooLarge, maxRows(max_body_bytes));
+    try std.testing.expectError(error.NumericResponseTooLarge, maxRows(std.math.maxInt(usize)));
 }
 
 test "numeric response validates version kind shape cardinality and values" {

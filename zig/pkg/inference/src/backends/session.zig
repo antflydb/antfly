@@ -161,7 +161,7 @@ pub const RunAdmission = struct {
         return self.estimateRequest(try RunRequest.fromTensors(inputs), output_info);
     }
 
-    fn estimateRequest(
+    pub fn estimateRequest(
         self: RunAdmission,
         request: RunRequest,
         output_info: []const TensorInfo,
@@ -171,11 +171,12 @@ pub const RunAdmission = struct {
             std.math.cast(i64, request.batch) orelse return error.ResourceLimitExceeded,
             std.math.cast(i64, request.sequence) orelse return error.ResourceLimitExceeded,
         };
-        const output_bytes = try estimatedOutputBytes(&reference_shape, output_info);
+        const output_bytes = request.output_bytes orelse try estimatedOutputBytes(&reference_shape, output_info);
+        if (request.output_kv_bytes > output_bytes) return error.ResourceLimitExceeded;
         const dynamic_base = try addBytes(input_bytes, output_bytes);
         const dynamic_workspace = try mulBytes(dynamic_base, 6);
         const workspace = @max(
-            self.static_workspace_bytes,
+            @max(self.static_workspace_bytes, request.workspace_bytes),
             @max(dynamic_workspace, try self.profiledWorkspace(request)),
         );
         const resident_input_bytes = try addBytes(request.host_preprocess_bytes, input_bytes);
@@ -184,7 +185,8 @@ pub const RunAdmission = struct {
         // outputs or backend workspace from this run reservation.
         if (request.pre_admitted_host_bytes > resident_input_bytes)
             return error.ResourceLimitExceeded;
-        const host_output_peak = try mulBytes(output_bytes, 2);
+        const host_output_peak = try mulBytes(output_bytes - request.output_kv_bytes, 2);
+        const host_kv_peak = try mulBytes(request.output_kv_bytes, 2);
         const host_io_peak = try addBytes(
             resident_input_bytes - request.pre_admitted_host_bytes,
             host_output_peak,
@@ -193,12 +195,14 @@ pub const RunAdmission = struct {
         return switch (self.backend_class) {
             .cpu => .{
                 .host_scratch_bytes = try addBytes(host_io_peak, workspace),
+                .host_kv_bytes = host_kv_peak,
             },
             .gpu => .{
                 // Request inputs and materialized outputs occupy shared host
                 // RAM. Device staging, activations, and outputs share the
                 // backend workspace.
                 .host_scratch_bytes = host_io_peak,
+                .host_kv_bytes = host_kv_peak,
                 .backend_scratch_bytes = if (self.backend_workspace_reserved)
                     0
                 else
@@ -244,6 +248,10 @@ pub const RunRequest = struct {
     batch: usize = 1,
     sequence: usize = 1,
     input_bytes: usize = 0,
+    /// Resolved physical stage geometry; null retains graph metadata inference.
+    output_bytes: ?usize = null,
+    output_kv_bytes: usize = 0,
+    workspace_bytes: usize = 0,
     host_preprocess_bytes: usize = 0,
     /// Host input bytes still covered by a separate live permit. This credit
     /// is limited to input + preprocessing residency and lets callers compose
@@ -263,6 +271,102 @@ pub const RunRequest = struct {
     }
 };
 
+pub const RunGeometry = struct {
+    sequence: usize,
+    output_bytes: usize,
+    output_kv_bytes: usize = 0,
+    workspace_bytes: usize = 0,
+};
+
+/// A pipeline-qualified projection, independent of the backend implementing it.
+/// The named input determines sequence geometry, not its position in an array.
+/// Used for imported seq2seq stages whose symbolic outputs omit the transform.
+pub const SequenceOutputGeometry = struct {
+    input_name: []const u8,
+    sequence_axis: usize = 1,
+    sequence_divisor: usize = 1,
+    width: usize,
+
+    fn resolve(self: @This(), inputs: []const Tensor, batch: usize) !RunGeometry {
+        if (self.width == 0 or self.sequence_divisor == 0) return error.InvalidInputShape;
+        for (inputs) |input| {
+            if (!std.mem.eql(u8, input.name, self.input_name)) continue;
+            if (input.shape.len <= self.sequence_axis or input.shape[self.sequence_axis] <= 0) return error.InvalidInputShape;
+            const sequence: usize = @intCast(input.shape[self.sequence_axis]);
+            const output_sequence = (try addBytes(sequence, self.sequence_divisor - 1)) / self.sequence_divisor;
+            return .{ .sequence = sequence, .output_bytes = try addBytes(try mulBytes(try mulBytes(try mulBytes(batch, output_sequence), self.width), @sizeOf(f32)), 3 * @sizeOf(i64)) };
+        }
+        return error.MissingInputs;
+    }
+};
+
+/// Explicit merged seq2seq cache ABI. Cache axes are [batch, heads, time, dim];
+/// self-attention time grows, while cross-attention time is encoder-context time.
+pub const CachedDecoderGeometry = struct {
+    vocab_size: usize,
+
+    fn resolve(self: @This(), inputs: []const Tensor, outputs: []const TensorInfo, batch: usize) !RunGeometry {
+        const ids = namedTensor(inputs, "input_ids") orelse return error.MissingInputs;
+        const encoder = namedTensor(inputs, "encoder_hidden_states") orelse return error.MissingInputs;
+        if (ids.shape.len != 2 or encoder.shape.len != 3 or ids.shape[1] <= 0 or encoder.shape[1] <= 0) return error.InvalidInputShape;
+        const tokens: usize = @intCast(ids.shape[1]);
+        const context: usize = @intCast(encoder.shape[1]);
+        var bytes: usize = 0;
+        var cache_bytes: usize = 0;
+        var sequence = @max(tokens, context);
+        for (outputs) |output| {
+            if (std.mem.eql(u8, output.name, "logits")) {
+                bytes = try addBytes(bytes, try mulBytes(try mulBytes(try mulBytes(batch, tokens), self.vocab_size), output.dtype.byteSize()));
+            } else {
+                const prefix = "present.";
+                if (!std.mem.startsWith(u8, output.name, prefix) or output.shape.len != 4) return error.UnresolvedOutputGeometry;
+                const suffix = output.name[prefix.len..];
+                var past: ?Tensor = null;
+                for (inputs) |input| {
+                    if (std.mem.startsWith(u8, input.name, "past_key_values.") and std.mem.eql(u8, input.name["past_key_values.".len..], suffix)) {
+                        past = input;
+                        break;
+                    }
+                }
+                const cached = past orelse return error.MissingInputs;
+                if (cached.shape.len != 4 or cached.shape[1] <= 0 or cached.shape[2] < 0 or cached.shape[3] <= 0) return error.InvalidInputShape;
+                const cross = std.mem.indexOf(u8, suffix, ".encoder.") != null;
+                const time = if (cross) context else try addBytes(@intCast(cached.shape[2]), tokens);
+                sequence = @max(sequence, time);
+                const elements = try mulBytes(try mulBytes(try mulBytes(batch, @intCast(cached.shape[1])), time), @intCast(cached.shape[3]));
+                const size = try mulBytes(elements, output.dtype.byteSize());
+                bytes = try addBytes(bytes, size);
+                cache_bytes = try addBytes(cache_bytes, try addBytes(size, try mulBytes(output.shape.len, @sizeOf(i64))));
+            }
+            bytes = try addBytes(bytes, try mulBytes(output.shape.len, @sizeOf(i64)));
+        }
+        return .{ .sequence = sequence, .output_bytes = bytes, .output_kv_bytes = cache_bytes };
+    }
+};
+
+fn namedTensor(inputs: []const Tensor, name: []const u8) ?Tensor {
+    for (inputs) |input| if (std.mem.eql(u8, input.name, name)) return input;
+    return null;
+}
+
+test "imported sequence geometry resolves transformed audio axes without native hooks" {
+    const Probe = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{.{ .name = "hidden", .dtype = .f32, .shape = &.{ -1, -1, 384 } }};
+        }
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.info, .backend = undefined, .close = undefined }, .output_geometry = .{ .input_name = "input_features", .sequence_axis = 2, .sequence_divisor = 2, .width = 384 }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false } };
+    const mel = Tensor{ .data = &.{}, .shape = &.{ 1, 80, 3000 }, .dtype = .f32, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
+    const request = try session.planRun(&.{mel}, 8);
+    try std.testing.expectEqual(@as(usize, 8 * 1500 * 384 * 4 + 24), request.output_bytes.?);
+    const peak = try session.run_admission.?.estimateRequest(request, session.outputInfo());
+    try std.testing.expect(peak.host_scratch_bytes >= request.output_bytes.?);
+    const odd = Tensor{ .data = &.{}, .shape = &.{ 1, 80, 3001 }, .dtype = .f32, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
+    try std.testing.expectEqual(@as(usize, 1501 * 384 * 4 + 24), (try session.planRun(&.{odd}, 1)).output_bytes.?);
+}
+
 fn addBytes(lhs: usize, rhs: usize) !usize {
     return std.math.add(usize, lhs, rhs) catch error.ResourceLimitExceeded;
 }
@@ -271,7 +375,7 @@ fn mulBytes(lhs: usize, rhs: usize) !usize {
     return std.math.mul(usize, lhs, rhs) catch error.ResourceLimitExceeded;
 }
 
-fn estimatedOutputBytes(
+pub fn estimatedOutputBytes(
     reference_shape: []const i64,
     output_info: []const TensorInfo,
 ) !usize {
@@ -320,17 +424,39 @@ const OutputAdmission = struct {
     }
 };
 
+fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !memory.AdmissionAmounts {
+    var amounts = memory.AdmissionAmounts{};
+    for (outputs) |output| {
+        const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
+        if (cache_qualified and std.mem.startsWith(u8, output.name, "present.")) {
+            amounts.host_kv_bytes = try addBytes(amounts.host_kv_bytes, bytes);
+        } else amounts.host_scratch_bytes = try addBytes(amounts.host_scratch_bytes, bytes);
+    }
+    return amounts;
+}
+
 /// Session represents a loaded model that can run forward passes.
 /// This is the core abstraction all backends implement.
 pub const Session = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     run_admission: ?RunAdmission = null,
+    output_geometry: ?SequenceOutputGeometry = null,
+    cached_decoder_geometry: ?CachedDecoderGeometry = null,
+    /// Borrowed from the model/runtime owner; stable for every session copy.
+    execution_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
         inputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         outputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
+        /// Explicit stage-level row independence for multi-entry-point sessions
+        /// whose static metadata cannot describe every invocation. A false
+        /// result vetoes batching; null uses the pipeline opt-in plus metadata.
+        independentBatchRows: ?*const fn (ptr: *anyopaque, inputs: []const Tensor) bool = null,
+        /// Allocation-free stage planning. Inputs describe logical geometry;
+        /// batch is the requested physical row count (possibly fused).
+        runGeometry: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, batch: usize) anyerror!?RunGeometry = null,
         backend: *const fn (ptr: *anyopaque) BackendType,
         interruption: ?*const fn (ptr: *anyopaque) Interruption = null,
         close: *const fn (ptr: *anyopaque) void,
@@ -350,7 +476,7 @@ pub const Session = struct {
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
         var resource_lease = if (self.run_admission) |admission|
-            try admission.acquire(inputs, self.outputInfo())
+            try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
@@ -370,7 +496,7 @@ pub const Session = struct {
         var hard_cancellation = try active.enterUninterruptible(self.interruption());
         defer hard_cancellation.deinit();
         var resource_lease = if (self.run_admission) |admission|
-            try admission.acquire(inputs, self.outputInfo())
+            try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
@@ -409,9 +535,10 @@ pub const Session = struct {
                     std.math.maxInt(usize),
             ) catch std.math.maxInt(usize);
         }
-        resource_lease.*.?.retain(.{
-            .host_scratch_bytes = retained_output_bytes,
-        }) catch {};
+        const retained = try retainedOutputAmounts(outputs, resource_lease.*.?.amounts.host_kv_bytes > 0);
+        if (resource_lease.*.?.amounts.host_kv_bytes > 0) {
+            try resource_lease.*.?.retain(retained);
+        } else resource_lease.*.?.retain(retained) catch {};
 
         const output_admission = try allocator.create(OutputAdmission);
         output_admission.* = .{
@@ -426,6 +553,10 @@ pub const Session = struct {
                 .context = output_admission,
                 .release = OutputAdmission.release,
             };
+            if (output_admission.lease.amounts.hostTotalBytes() >= retained_output_bytes) {
+                output.shared_storage = output.data;
+                output.admitted_storage_domain = output_admission.lease.controller;
+            }
         }
         return outputs;
     }
@@ -435,11 +566,45 @@ pub const Session = struct {
     pub fn admit(self: Session, request: RunRequest) !RunPermit {
         return .{
             .session = self,
+            .request = request,
             .lease = if (self.run_admission) |admission|
                 try admission.acquireRequest(request, self.outputInfo())
             else
                 null,
         };
+    }
+
+    pub fn planRun(self: Session, inputs: []const Tensor, batch_override: ?usize) !RunRequest {
+        var request = try RunRequest.fromTensors(inputs);
+        if (batch_override) |batch| {
+            if (request.input_bytes % request.batch != 0) return error.InvalidInputShape;
+            request.input_bytes = try mulBytes(request.input_bytes / request.batch, batch);
+            request.batch = batch;
+        }
+        const resolved_geometry = if (self.vtable.runGeometry) |geometry| try geometry(self.ptr, inputs, request.batch) else null;
+        const concrete = resolved_geometry orelse if (self.cached_decoder_geometry) |geometry| try geometry.resolve(inputs, self.outputInfo(), request.batch) else if (self.output_geometry) |geometry| try geometry.resolve(inputs, request.batch) else null;
+        if (concrete) |resolved| {
+            request.sequence = resolved.sequence;
+            request.output_bytes = resolved.output_bytes;
+            request.output_kv_bytes = resolved.output_kv_bytes;
+            request.workspace_bytes = resolved.workspace_bytes;
+        }
+        if (batch_override == null) request.pre_admitted_host_bytes = try self.inputResidencyCredit(inputs);
+        return request;
+    }
+
+    pub fn inputResidencyCredit(self: Session, inputs: []const Tensor) !usize {
+        const admission = self.run_admission orelse return 0;
+        var bytes: usize = 0;
+        for (inputs) |input| {
+            if (input.admitted_storage_domain != @as(*anyopaque, admission.controller)) continue;
+            const storage = input.shared_storage orelse continue;
+            const base = @intFromPtr(storage.ptr);
+            const address = @intFromPtr(input.data.ptr);
+            if (address < base or address - base > storage.len or input.data.len > storage.len - (address - base)) continue;
+            bytes = try addBytes(bytes, input.data.len);
+        }
+        return bytes;
     }
 
     /// Allocation-free planning against permanent session limits. This is not
@@ -543,12 +708,57 @@ pub const Session = struct {
 pub const RunPermit = struct {
     session: Session,
     lease: ?memory.AdmissionLease,
+    request: ?RunRequest = null,
+    execution_yielded: bool = false,
+
+    fn resolveGeometry(self: *RunPermit, inputs: []const Tensor) !void {
+        const request = self.request orelse return;
+        if (self.session.vtable.runGeometry == null and self.session.output_geometry == null and self.session.cached_decoder_geometry == null) return;
+        const plan = try self.session.planRun(inputs, null);
+        if (plan.output_bytes == null) return;
+        // A preprocessing permit can span differently sized execution windows.
+        // Recheck each invocation; a first small window must not freeze the
+        // output reservation for a later larger one. An execution permit whose
+        // geometry already covers this invocation must not yield recursively.
+        if (request.output_bytes) |bytes| {
+            if (bytes >= plan.output_bytes.? and request.output_kv_bytes >= plan.output_kv_bytes and request.workspace_bytes >= plan.workspace_bytes and request.sequence >= plan.sequence) return;
+        }
+        if (!self.execution_yielded) _ = try self.yieldExecution();
+        self.request.?.output_bytes = @max(request.output_bytes orelse 0, plan.output_bytes.?);
+        self.request.?.output_kv_bytes = @max(request.output_kv_bytes, plan.output_kv_bytes);
+        self.request.?.workspace_bytes = @max(request.workspace_bytes, plan.workspace_bytes);
+        self.request.?.sequence = @max(request.sequence, plan.sequence);
+    }
+
+    /// Queueing retains inputs/preprocessing, not idle compute workspace.
+    /// Every subsequent run reacquires execution while these bytes stay owned.
+    pub fn yieldExecution(self: *RunPermit) !bool {
+        if (self.execution_yielded) return true;
+        const request = self.request orelse return false;
+        const resident = (try addBytes(request.input_bytes, request.host_preprocess_bytes)) - request.pre_admitted_host_bytes;
+        try self.retainHostBytes(resident);
+        self.execution_yielded = true;
+        return true;
+    }
+
+    fn acquireExecution(self: *RunPermit) !RunPermit {
+        var request = self.request.?;
+        request.pre_admitted_host_bytes = try addBytes(request.input_bytes, request.host_preprocess_bytes);
+        return self.session.admit(request);
+    }
+
+    /// Drop transient forward scratch once only materialized outputs remain.
+    pub fn retainOutputs(self: *RunPermit, outputs: []const Tensor) !void {
+        if (self.lease) |*lease| try lease.retain(try retainedOutputAmounts(outputs, lease.amounts.host_kv_bytes > 0));
+    }
 
     pub fn run(
         self: *RunPermit,
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
+        try self.resolveGeometry(inputs);
+        if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
         return self.session.vtable.run(self.session.ptr, inputs, allocator);
     }
 
@@ -558,6 +768,14 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
+        try self.resolveGeometry(inputs);
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            const outputs = try execution.runWithControl(inputs, allocator, control);
+            errdefer deinitTensorSlice(outputs, allocator);
+            return Session.attachOutputAdmission(outputs, allocator, &execution.lease);
+        }
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -578,6 +796,7 @@ pub const RunPermit = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         const run_resident = self.session.vtable.runResident orelse return null;
         return run_resident(self.session.ptr, inputs, allocator);
     }
@@ -588,6 +807,15 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            var outputs = (try execution.runResidentWithControl(inputs, allocator, control)) orelse return null;
+            std.debug.assert(outputs.resource_lease == null);
+            outputs.resource_lease = execution.lease;
+            execution.lease = null;
+            return outputs;
+        }
         const active = control orelse return self.runResident(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -606,6 +834,7 @@ pub const RunPermit = struct {
         inputs: []const ResidentInput,
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) return self.runResidentInputsWithControl(inputs, allocator, null);
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
         return run_resident_inputs(self.session.ptr, inputs, allocator);
@@ -617,6 +846,15 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            var outputs = (try execution.runResidentInputsWithControl(inputs, allocator, control)) orelse return null;
+            std.debug.assert(outputs.resource_lease == null);
+            outputs.resource_lease = execution.lease;
+            execution.lease = null;
+            return outputs;
+        }
         const active = control orelse return self.runResidentInputs(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -634,6 +872,7 @@ pub const RunPermit = struct {
         request: ResidentTextEmbeddingRequest,
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
         return run_resident(self.session.ptr, inputs, request, allocator);
     }
@@ -652,6 +891,15 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            var outputs = (try execution.runResidentTextEmbeddingWithControl(inputs, request, allocator, control)) orelse return null;
+            std.debug.assert(outputs.resource_lease == null);
+            outputs.resource_lease = execution.lease;
+            execution.lease = null;
+            return outputs;
+        }
         const active = control orelse return self.runResidentTextEmbedding(inputs, request, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -679,7 +927,8 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 13), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 15), info.@"struct".fields.len);
+    try std.testing.expect(@hasField(Session.VTable, "independentBatchRows"));
 }
 
 const AdmissionProbeSession = struct {

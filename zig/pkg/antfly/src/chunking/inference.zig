@@ -185,7 +185,7 @@ pub fn chunkInputWithProvider(
         if (capabilities.framed_attachments and switch (input) {
             .binary => true,
             .text => false,
-        }) attachment_transport = .framed_binary;
+        }) attachment_transport = .segmented_framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
             .text => |text| .{
                 .item_count = 1,
@@ -227,12 +227,12 @@ pub fn chunkInputWithProvider(
         header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
         header_count += 1;
     }
-    if (attachment_transport == .framed_binary) {
+    if (attachment_transport == .segmented_framed_binary) {
         header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
     }
     var resp = try http.post(url, .{
-        .json = if (attachment_transport == .framed_binary) null else body.metadata_or_json,
+        .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
         .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
         .headers = header_storage[0..header_count],
         .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
@@ -353,7 +353,7 @@ fn encodeChunkRequest(
             return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
         .binary => |binary| {
-            const framed = attachment_transport == .framed_binary;
+            const framed = attachment_transport == .segmented_framed_binary;
             const data = if (framed)
                 "attachment:0"
             else
@@ -470,7 +470,7 @@ test "antfly chunk request frames borrowed binary input without base64" {
                 alloc,
                 .{ .provider = .antfly, .model = "fixed" },
                 .{ .binary = .{ .mime_type = "image/gif", .data = "GIF89a" } },
-                .framed_binary,
+                .segmented_framed_binary,
             );
             defer body.deinit(alloc);
             const envelope = body.envelope orelse return error.MissingAttachmentEnvelope;

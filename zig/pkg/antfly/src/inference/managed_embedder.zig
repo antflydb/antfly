@@ -1192,6 +1192,8 @@ pub const ManagedEmbedder = struct {
             .dense_embed_raster_items_fn = embedDenseRasterItems,
             .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
             .dense_embed_part_items_planned_fn = embedDensePartItemsPlanned,
+            .resolve_part_lease_fn = resolveDensePartLease,
+            .part_batch_limit_fn = densePartBatchLimit,
             .capabilities_with_context_fn = denseCapabilitiesWithContext,
             .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
             .dense_embed_with_context_fn = embedDenseWithContext,
@@ -1530,8 +1532,8 @@ pub const ManagedEmbedder = struct {
         return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, context, null);
     }
 
-    fn embedDensePartItemsPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, items: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, capabilities: inference_work.InferenceCapabilities) ![]const []const f32 {
-        return embedDensePartItemsControlled(ptr, alloc, name, items, dims, context, capabilities);
+    fn embedDensePartItemsPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, items: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+        return embedDensePartItemsControlled(ptr, alloc, name, items, dims, context, lease);
     }
 
     fn embedDensePartItemsControlled(
@@ -1541,7 +1543,7 @@ pub const ManagedEmbedder = struct {
         items: []const template_mod.ContentPart,
         dims: u32,
         context: ?RequestContext,
-        resolved_capabilities: ?inference_work.InferenceCapabilities,
+        resolved_lease: ?inference_work.CapabilityLease,
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
@@ -1556,11 +1558,14 @@ pub const ManagedEmbedder = struct {
         }
         const entry = &local_entry;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
-        const capabilities = resolved_capabilities orelse try denseCapabilitiesForEntry(entry, alloc);
+        const lease = resolved_lease orelse try densePartLeaseForEntry(entry, alloc);
+        var capabilities = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
+        capabilities.batch.max_items = try densePartBatchLimit(ptr, embedding_name, dims, lease, capabilities.batch.max_items);
+        capabilities.batch.preferred_items = @min(capabilities.batch.preferred_items, capabilities.batch.max_items);
         const attachment_transport: inference_work.AttachmentTransport = if (entry.antfly_provider != null)
             .borrowed_binary
         else if (entry.provider == .antfly and capabilities.framed_attachments)
-            .framed_binary
+            .segmented_framed_binary
         else
             .base64_payload;
         if (items.len == 0) return try alloc.alloc([]const f32, 0);
@@ -1580,7 +1585,7 @@ pub const ManagedEmbedder = struct {
             const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset);
             const chunk = items[offset..end];
             try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
-            const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, capabilities);
+            const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, lease);
             defer alloc.free(chunk_vectors);
             for (chunk_vectors) |vector| {
                 vectors[initialized] = vector;
@@ -1696,7 +1701,7 @@ pub const ManagedEmbedder = struct {
             .borrowed_binary
         else if (entry.provider == .antfly and
             (resolved_capabilities orelse return error.EmbeddingCapabilitiesUnavailable).framed_attachments)
-            .framed_binary
+            .segmented_framed_binary
         else
             .base64_payload;
         const vector_values = std.math.mul(usize, shape.item_count, @as(usize, dims)) catch
@@ -1731,23 +1736,23 @@ pub const ManagedEmbedder = struct {
         // copies. A bounded allowance covers URL/header/TLS/client control.
         // Numeric plans require a matching bound lease at execution and cannot
         // discover or parse JSON within this smaller, shape-bound allowance.
-        const response_bytes = if (local == null and entry.provider == .antfly and dims != 0 and resolved_capabilities.?.numeric_responses_v1)
+        const numeric_response = local == null and entry.provider == .antfly and dims != 0 and resolved_capabilities.?.numeric_responses_v1;
+        const response_bytes = if (numeric_response)
             try numericDenseResponseLimit(shape.item_count, dims)
         else
             remote_embedding_max_response_bytes;
         const response_and_parser = if (local != null and local.?.typed_dense_results) 0 else std.math.mul(
             usize,
             response_bytes,
-            remote_embedding_response_resident_multiplier,
+            if (numeric_response) remote_numeric_response_resident_multiplier else remote_embedding_response_resident_multiplier,
         ) catch return error.InferenceEncodedBytesExceeded;
         const vector_copies = std.math.mul(usize, vector_bytes, 2) catch
             return error.InferenceEncodedBytesExceeded;
         var fixed = std.math.add(usize, request_envelope, response_and_parser) catch
             return error.InferenceEncodedBytesExceeded;
-        // The framed builder retains its small JSON metadata while allocating
-        // and filling the final body. Raw attachment residency is accounted by
-        // AttachmentTransport; charge this non-media overlap here.
-        if (attachment_transport == .framed_binary) fixed = std.math.add(
+        // Segmented framing owns metadata, prefix and segment descriptors, but
+        // borrows all page payloads. Keep framing overhead in the fixed plan.
+        if (attachment_transport == .segmented_framed_binary) fixed = std.math.add(
             usize,
             fixed,
             request_envelope,
@@ -1795,6 +1800,34 @@ pub const ManagedEmbedder = struct {
     }
 
     fn denseCapabilitiesForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.InferenceCapabilities {
+        return (try densePartLeaseForEntry(entry, alloc)).capabilities orelse error.EmbeddingCapabilitiesUnavailable;
+    }
+
+    fn densePartBatchLimit(ptr: *anyopaque, name: []const u8, dims: u32, lease: inference_work.CapabilityLease, requested: usize) !usize {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        const caps = lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
+        if (entry.antfly_provider == null and entry.provider == .antfly and dims != 0 and caps.numeric_responses_v1)
+            return @min(requested, try httpx.numeric_response.maxRows(dims));
+        return requested;
+    }
+
+    fn resolveDensePartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext) !inference_work.CapabilityLease {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        var entry = configured.requestOverlay();
+        entry.alloc = alloc;
+        entry.auth_header_cache = .{};
+        defer entry.auth_header_cache.deinit(alloc);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        return densePartLeaseForEntry(&entry, alloc);
+    }
+
+    fn densePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         if (entry.antfly_provider) |local| {
             if (local.model_capabilities) |resolve| {
@@ -1806,7 +1839,7 @@ pub const ManagedEmbedder = struct {
                 );
                 try result.validate();
                 if (result.task != .embed) return error.InvalidInferenceCapabilities;
-                return result;
+                return .{ .capabilities = result };
             }
         }
         if (entry.provider == .antfly and entry.base_url.len > 0) {
@@ -1844,12 +1877,16 @@ pub const ManagedEmbedder = struct {
                 error.OutOfMemory, error.Canceled, error.Timeout => return err,
                 else => null,
             };
-            if (discovered) |lease| if (lease.capabilities) |result| return result;
+            if (discovered) |lease| if (lease.capabilities != null) {
+                var owned = lease;
+                owned.scope_digest = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, headers);
+                return owned;
+            };
         }
         // Unknown remote capability is deliberately conservative. It remains
         // usable, but the document planner cannot assume fused batching or a
         // provider-specific memory ceiling.
-        return .{
+        return .{ .capabilities = .{
             .task = .embed,
             .input_modalities = .{ .text = true, .image = entry.multimodal },
             .accepted_mime_types = .{ .text_plain = true, .image_png = entry.multimodal, .image_jpeg = entry.multimodal },
@@ -1857,7 +1894,7 @@ pub const ManagedEmbedder = struct {
             .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1, .max_media_parts_per_item = 1 },
             .output = .embedding,
             .borrowed_attachments = false,
-        };
+        } };
     }
 
     fn setEmbedderCancellation(ptr: *anyopaque, cancellation: CancellationToken) void {
@@ -2029,6 +2066,10 @@ fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
 
 const remote_embedding_max_response_bytes: usize = 4 << 20;
 const remote_embedding_response_resident_multiplier: usize = 8;
+// No JSON tree/arena exists on the numeric-only path. Four payload ceilings
+// cover HTTP buffer growth, retained compressed input and growing decoded
+// output; framing slack lives in transport control. Typed rows are separate.
+const remote_numeric_response_resident_multiplier: usize = 4;
 const remote_embedding_transport_control_bytes: usize = 256 << 10;
 
 fn numericDenseResponseLimit(items: usize, dims: usize) !usize {
@@ -5330,7 +5371,7 @@ fn bindRemoteEmbeddingPartsLease(
     );
     if (lease.capabilities) |capabilities| {
         const transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
-            .framed_binary
+            .segmented_framed_binary
         else
             .base64_payload;
         if (independently_addressable) {
@@ -5733,7 +5774,7 @@ fn embedPartItemsWithEntry(
     entry: *const ManagedEmbeddingEntry,
     items: []const template_mod.ContentPart,
     dims: u32,
-    planned_capabilities: inference_work.InferenceCapabilities,
+    planned_lease: inference_work.CapabilityLease,
 ) ![]const []const f32 {
     if (items.len == 0) return try alloc.alloc([]const f32, 0);
     if (!isAntflyProvider(entry.provider)) return error.UnsupportedEmbeddingProvider;
@@ -5782,15 +5823,19 @@ fn embedPartItemsWithEntry(
     }
     const capability_headers = capability_header_storage[0..capability_header_count];
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    if (planned_capabilities.numeric_responses_v1 and dims != 0) {
-        const lease = try capability_cache.executionLease(entry.base_url, entry.model, .embed, capability_headers);
+    const planned_capabilities = planned_lease.capabilities orelse return error.EmbeddingCapabilitiesUnavailable;
+    if (planned_lease.scope_digest) |scope| {
+        const current_scope = try remote_capabilities.scopeDigest(alloc, entry.base_url, entry.model, .embed, capability_headers);
+        if (!std.mem.eql(u8, &scope, &current_scope)) return error.InferenceCapabilitiesStale;
+        const lease = planned_lease;
         const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
-        if (!std.meta.eql(live, planned_capabilities)) return error.InferenceCapabilitiesStale;
-        try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .framed_binary else .base64_payload, items);
+        try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .segmented_framed_binary else .base64_payload, items);
         provider.setFramedAttachments(live.framed_attachments);
         if (lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
         if (lease.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
-        provider.numeric_dense_dimensions = dims;
+        if (live.numeric_responses_v1 and dims != 0) provider.numeric_dense_dimensions = dims;
+    } else if (planned_capabilities.numeric_responses_v1 and dims != 0) {
+        return error.InferenceCapabilitiesStale;
     } else _ = try bindRemoteEmbeddingPartsLease(
         alloc,
         entry,
@@ -6986,6 +7031,72 @@ const TestLocalDenseProvider = struct {
     }
 };
 
+test "managed embedder owned numeric lease executes without cache residency and rejects scope rotation" {
+    const alloc = std.testing.allocator;
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            // Any accidental catalog discovery fails this regression.
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expectEqualStrings("owned-route", req.header(remote_capabilities.capability_token_header) orelse return error.MissingLease);
+            try std.testing.expectEqualStrings(httpx.numeric_response.content_type, req.header("Accept") orelse return error.MissingAccept);
+            const frame = try httpx.numeric_response.allocFrame(a, .dense, 1, 2);
+            errdefer a.free(frame);
+            try httpx.numeric_response.setValue(frame, 0, 0.25);
+            try httpx.numeric_response.setValue(frame, 1, 0.75);
+            return .{ .status = 200, .content_type = try a.dupe(u8, httpx.numeric_response.content_type), .body = frame };
+        }
+    };
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const url = try listener.baseUri(alloc);
+    defer alloc.free(url);
+    var cache = remote_capabilities.Cache.init(alloc, std.testing.io);
+    defer cache.deinit();
+    var entries = [_]ManagedEmbeddingEntry{.{
+        .alloc = alloc,
+        .index_name = @constCast("visual"),
+        .provider = .antfly,
+        .model = @constCast("clipclap"),
+        .base_url = url,
+        .dimensions = 2,
+        .multimodal = true,
+        .io = std.testing.io,
+        .shared_remote_capability_cache = &cache,
+    }};
+    var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
+    const lease = inference_work.CapabilityLease{
+        .capabilities = .{
+            .task = .embed,
+            .input_modalities = .{ .image = true },
+            .accepted_mime_types = .{ .image_png = true },
+            .input_granularity = .page,
+            .output = .embedding,
+            .framed_attachments = true,
+            .numeric_responses_v1 = true,
+            .batch = .{ .max_media_parts_per_item = 1 },
+        },
+        .routing_token = try remote_capabilities.RoutingToken.init("owned-route"),
+        .descriptor_revision = try remote_capabilities.CapabilityRevision.init("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        .scope_digest = try remote_capabilities.scopeDigest(alloc, url, "clipclap", .embed, &.{}),
+    };
+    const planned = managed.denseInterface().withPartLease(lease);
+    const items = [_]template_mod.ContentPart{.{ .binary = .{
+        .mime_type = "image/png",
+        .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3 },
+    } }};
+    const vectors = try planned.embedDensePartItems(alloc, "visual", &items, 2);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, vectors[0]);
+    entries[0].source_table = @constCast("rotated-scope");
+    try std.testing.expectError(error.InferenceCapabilitiesStale, planned.embedDensePartItems(alloc, "visual", &items, 2));
+    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+}
+
 test "managed embedder media planning is pure and typed results avoid JSON reservations" {
     const alloc = std.testing.allocator;
     var local = TestLocalDenseProvider{ .dimensions = 384 };
@@ -7009,11 +7120,22 @@ test "managed embedder media planning is pure and typed results avoid JSON reser
     };
     const shape = db_embedder.DensePartInvocationShape{ .item_count = 4 };
     const remote = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
-    try std.testing.expectEqual(inference_work.AttachmentTransport.framed_binary, remote.attachment_transport);
+    try std.testing.expectEqual(inference_work.AttachmentTransport.segmented_framed_binary, remote.attachment_transport);
+    const page_bytes = 64 << 20;
+    try std.testing.expectEqual(@as(usize, page_bytes), try remote.attachment_transport.batchPeakResidentSize(page_bytes, 9, 4));
+    try std.testing.expectEqual(@as(usize, page_bytes * 2), try inference_work.AttachmentTransport.framed_binary.batchPeakResidentSize(page_bytes, 9, 4));
     var numeric_caps = caps;
     numeric_caps.numeric_responses_v1 = true;
     const numeric = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, numeric_caps);
-    try std.testing.expectEqual((remote_embedding_max_response_bytes - try numericDenseResponseLimit(4, 384)) * remote_embedding_response_resident_multiplier, remote.allocator_limit_bytes - numeric.allocator_limit_bytes);
+    try std.testing.expectEqual(remote_embedding_max_response_bytes * remote_embedding_response_resident_multiplier - try numericDenseResponseLimit(4, 384) * remote_numeric_response_resident_multiplier, remote.allocator_limit_bytes - numeric.allocator_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 127), try httpx.numeric_response.maxRows(8192));
+    var large_caps = numeric_caps;
+    large_caps.batch.max_items = 128;
+    large_caps.batch.preferred_items = 128;
+    const large = managed.denseInterface().withPartLease(.{ .capabilities = large_caps });
+    try std.testing.expectEqual(@as(usize, 127), try large.partBatchLimit("visual", 8192, 128));
+    _ = try large.partInvocationMemoryForMime("visual", 127, "image/png", 8192);
+    try std.testing.expectError(error.NumericResponseTooLarge, large.partInvocationMemoryForMime("visual", 128, "image/png", 8192));
     try std.testing.expect(numeric.allocator_limit_bytes < 384 * 1024);
     try std.testing.expectEqual(@as(usize, 4096), try numericDenseResponseLimit(1, 384));
     try std.testing.expectError(error.NumericResponseTooLarge, numericDenseResponseLimit(1024, 4096));
@@ -7022,12 +7144,52 @@ test "managed embedder media planning is pure and typed results avoid JSON reser
     try std.testing.expectEqual(unknown_json.allocator_limit_bytes, unknown.allocator_limit_bytes);
     try std.testing.expectError(error.EmbeddingCapabilitiesUnavailable, ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, null));
     entry[0].antfly_provider = local.provider();
+    // A local typed executor does not inherit the HTTP frame ceiling.
+    try std.testing.expectEqual(@as(usize, 128), try large.partBatchLimit("visual", 8192, 128));
     const json = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
     entry[0].antfly_provider.?.typed_dense_results = true;
     const typed = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
     try std.testing.expectEqual(@as(usize, 32 << 20), json.allocator_limit_bytes - typed.allocator_limit_bytes);
     try std.testing.expectEqual(@as(usize, 4 * 384 * @sizeOf(f32)), typed.max_result_bytes);
     try std.testing.expect(typed.allocator_limit_bytes < 64 * 1024);
+}
+
+test "managed embedder numeric response budget covers non-resizable HTTP buffer growth" {
+    const NoResize = struct {
+        fn allocate(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ret_addr);
+        }
+    };
+    var context: u8 = 0;
+    const backing = std.mem.Allocator{ .ptr = &context, .vtable = &.{ .alloc = NoResize.allocate, .free = NoResize.free, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap } };
+    // Match HTTP's 16-KiB append loop, with both encoded and decoded bodies
+    // reaching their ceiling. Refusing resize/remap forces old+new buffers to
+    // coexist; this must not rely on a favorable backing allocator.
+    for ([_]usize{ 4096, try numericDenseResponseLimit(4, 384), try numericDenseResponseLimit(127, 8192) }) |body_limit| {
+        var bounded = inference_work.BoundedInvocationAllocator.init(backing, body_limit * remote_numeric_response_resident_multiplier + remote_embedding_transport_control_bytes);
+        const a = bounded.allocator();
+        {
+            var compressed = std.ArrayListUnmanaged(u8).empty;
+            defer compressed.deinit(a);
+            var decoded = std.ArrayListUnmanaged(u8).empty;
+            defer decoded.deinit(a);
+            for ([_]*std.ArrayListUnmanaged(u8){ &compressed, &decoded }) |buffer| {
+                while (buffer.items.len < body_limit) {
+                    const bytes = try buffer.addManyAsSlice(a, @min(16 * 1024, body_limit - buffer.items.len));
+                    @memset(bytes, 0);
+                }
+            }
+            compressed.deinit(a);
+            compressed = .empty;
+            const body = try decoded.toOwnedSlice(a);
+            a.free(body);
+        }
+        try std.testing.expect(!bounded.limit_exceeded);
+        try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
+    }
 }
 
 test "managed embedder parses local antfly and antfly entries from indexes metadata" {
@@ -9101,9 +9263,9 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
         try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, page_vector);
     }
     try std.testing.expectEqual(discoveries_before + 1, local.capability_calls);
-    const resolved = try dense_interface.capabilities(std.testing.allocator, "semantic_idx");
+    const resolved = try dense_interface.resolvePartLease(std.testing.allocator, "semantic_idx");
     const discoveries_after_planning = local.capability_calls;
-    var planned = dense_interface.withPartCapabilities(resolved);
+    var planned = dense_interface.withPartLease(resolved);
     planned.part_request_context = .{ .io = std.testing.io, .deadline_ns = null };
     const planned_vectors = try planned.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3);
     defer db_embedder.freeDenseEmbeddingBatch(std.testing.allocator, planned_vectors);

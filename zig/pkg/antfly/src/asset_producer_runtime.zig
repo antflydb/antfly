@@ -1578,7 +1578,7 @@ pub const Runtime = struct {
         var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
         defer cfg.deinit(alloc);
         try self.routeExtractorConfig(alloc, &cfg);
-        const attachment_transport: inference_work.AttachmentTransport = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) .borrowed_binary else if (capabilities.framed_attachments) .framed_binary else .base64_payload;
+        const attachment_transport: inference_work.AttachmentTransport = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) .borrowed_binary else if (capabilities.framed_attachments) .segmented_framed_binary else .base64_payload;
         try validateExtractorBatchCompatibility(alloc, capabilities, attachment_transport, requests);
         const outputs = try alloc.alloc([]u8, requests.len);
         var outputs_owned = true;
@@ -1838,7 +1838,7 @@ pub const Runtime = struct {
                 ),
             };
             var framed_headers: [5][2][]const u8 = undefined;
-            if (attachment_transport == .framed_binary) {
+            if (attachment_transport == .segmented_framed_binary) {
                 if (headers.len >= framed_headers.len) return error.InvalidGeneratorConfig;
                 @memcpy(framed_headers[0..headers.len], headers);
                 framed_headers[headers.len] = .{ "Content-Type", httpx.attachment_envelope.content_type };
@@ -2546,7 +2546,7 @@ pub const Runtime = struct {
                 .borrowed_binary
             else
                 remoteAttachmentTransport(resolved, .data_uri);
-            use_framed_transport = transport == .framed_binary;
+            use_framed_transport = transport == .segmented_framed_binary;
             for (request.images) |image| {
                 try resolved.validateMimeType(image.mime_type);
                 const resident = try transport.wireSize(image.bytes.len, image.mime_type.len);
@@ -3388,14 +3388,14 @@ fn inlineImagePixelsAlloc(
 }
 
 fn remoteAttachmentTransport(capabilities: ?inference_work.InferenceCapabilities, fallback: inference_work.AttachmentTransport) inference_work.AttachmentTransport {
-    return if (capabilities != null and capabilities.?.framed_attachments) .framed_binary else fallback;
+    return if (capabilities != null and capabilities.?.framed_attachments) .segmented_framed_binary else fallback;
 }
 
 fn extractorAttachmentTransport(cfg: extracting.Config) inference_work.AttachmentTransport {
     return if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl()))
         .borrowed_binary
     else if (cfg.provider == .antfly and cfg.framed_attachments)
-        .framed_binary
+        .segmented_framed_binary
     else
         .base64_payload;
 }
@@ -3983,7 +3983,11 @@ test "asset producer runtime remote planning uses resolved framed transport" {
             try std.testing.expectEqual(framed, caps.framed_attachments);
             const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
             const fallback: inference_work.AttachmentTransport = if (kind == .reader) .data_uri else .base64_payload;
-            try std.testing.expectEqual(if (framed) inference_work.AttachmentTransport.framed_binary else fallback, plan.attachment_transport);
+            try std.testing.expectEqual(if (framed) inference_work.AttachmentTransport.segmented_framed_binary else fallback, plan.attachment_transport);
+            if (framed) {
+                try std.testing.expectEqual(png.len, try plan.attachment_transport.peakResidentSize(png.len, "image/png".len));
+                try std.testing.expectEqual(png.len, try plan.attachment_transport.wireSize(png.len, "image/png".len));
+            }
             if (kind == .generator) try std.testing.expect(plan.fixed_bytes < client.maxResponseSize());
             if (kind == .generator) {
                 var generated: ?[]u8 = null;
@@ -4818,7 +4822,7 @@ fn antflyGenerateBatchRequestAlloc(
     const body_prefix = "\",\"body\":{\"model\":";
     const messages_prefix = ",\"messages\":[{\"role\":\"user\",\"content\":";
     const item_suffix = "}]";
-    const framed = attachment_transport == .framed_binary;
+    const framed = attachment_transport == .segmented_framed_binary;
     var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
     defer attachments.deinit(alloc);
     if (framed) for (requests) |request| for (request.media) |media| {
@@ -4956,7 +4960,7 @@ test "remote generator batch streams attachments into one exact JSON body" {
                 .model = "gemma4",
                 .url = "http://inference.invalid",
                 .max_tokens = 32,
-            }, &requests, .framed_binary);
+            }, &requests, .segmented_framed_binary);
             defer framed_body.deinit(alloc);
             const envelope = framed_body.envelope orelse return error.MissingAttachmentEnvelope;
             try std.testing.expectEqual(@as(usize, 4), envelope.segments.len);
