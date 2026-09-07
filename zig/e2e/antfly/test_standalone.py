@@ -1055,7 +1055,9 @@ def test_standalone_gemma_agent_tools_via_cli(
         )
         assert "generation" not in plan
 
-        executed = embedded_standalone_cli(*common, "--execute", "--no-streaming", timeout_s=300)
+        executed = embedded_standalone_cli(
+            *common, "--execute", "--no-streaming", timeout_s=300
+        )
         result = json.loads(executed.stdout)
         assert result["status"] == "completed"
         assert canary in result["generation"], json.dumps(result)

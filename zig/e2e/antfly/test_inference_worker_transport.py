@@ -83,9 +83,9 @@ def test_worker_launch_body_limits_and_replacement(tmp_path, focused):
                 assert time.monotonic() < deadline, logs()
                 time.sleep(0.05)
             worker = _inference_worker_pid(process.pid)
-            assert (
-                worker is not None
-            ), "Build with an isolated backend, e.g. -Dmetal=true"
+            assert worker is not None, (
+                "Build with an isolated backend, e.g. -Dmetal=true"
+            )
             # Missing embedding fields intentionally produce a stable 400 from
             # the worker's parser, without downloading or running a model.
             endpoint = f"{base}/ai/v1/embed"
