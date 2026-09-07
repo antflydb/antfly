@@ -70,7 +70,7 @@ run_case() {
   fi
 }
 
-run_case docid-lifecycle-test zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" docid-lifecycle-test
+run_case integration-db-raft-suites zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" integration-test lib-db-test raft-test
 run_case lib-db-query-test zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" lib-db-query-test
 run_case lib-storage-docid-focused zig build --build-file "$ZIG_BUILD_FILE" --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" lib-storage-test \
   -- \

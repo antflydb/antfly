@@ -2603,28 +2603,26 @@ pub fn build(b: *std.Build) void {
         install_shader_steps[i] = &install_shader.step;
     }
 
-    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
-    install_wasm_step.dependOn(&install_antfly_wasm.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_client.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_browser.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_index.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_readme.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_webgpu_ops.step);
+    const wasm_step = b.step("wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
+    wasm_step.dependOn(&install_antfly_wasm.step);
+    wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
+    wasm_step.dependOn(&install_antfly_wasm_client.step);
+    wasm_step.dependOn(&install_antfly_wasm_browser.step);
+    wasm_step.dependOn(&install_antfly_wasm_index.step);
+    wasm_step.dependOn(&install_antfly_wasm_readme.step);
+    wasm_step.dependOn(&install_antfly_wasm_webgpu_ops.step);
     for (&install_shader_steps) |step| {
-        install_wasm_step.dependOn(step);
+        wasm_step.dependOn(step);
     }
 
     const run_antfly_wasm_smoke = b.addSystemCommand(&.{
         "node",
         b.getInstallPath(.prefix, "antfly-wasm/run.mjs"),
     });
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_smoke_run.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_client.step);
+    run_antfly_wasm_smoke.step.dependOn(wasm_step);
 
-    const wasm_step = b.step("wasm", "Build and run the antfly wasm smoke test under Node");
-    wasm_step.dependOn(&run_antfly_wasm_smoke.step);
+    const wasm_test_step = b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test");
+    wasm_test_step.dependOn(&run_antfly_wasm_smoke.step);
 
     // Static library
     const lib = b.addLibrary(.{
@@ -5481,8 +5479,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
-    const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
-    lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
+    lib_db_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -7119,10 +7117,6 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
-    const api_transactions_docid_test_step = b.step("api-transactions-docid-test", "Run focused API transaction tests");
-    api_transactions_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
-    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
@@ -7393,89 +7387,61 @@ pub fn build(b: *std.Build) void {
     api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const api_table_writes_cache_lifecycle_step = b.step("api-table-writes-cache-lifecycle-test", "Run focused writer-cache dirty ownership regressions");
     api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_production_regression_tests.step);
-    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
-    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
-    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    const lib_docid_lifecycle_runtime_filters: []const []const u8 = &.{
+        "metadata reconciler does not automatically split ordinal exhausted doc identity",
+        "metadata state classifies mixed-version doc identity lifecycle reports",
+        "metadata state marks doc identity rebuild required on range namespace mismatch",
+        "metadata merge validation handles rolling mixed-version doc identity status fixtures",
+        "metadata split request validation rejects stale doc identity namespace",
+        "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+        "table workflow doc identity guards reject active transition intents",
+        "metadata reconciler doc identity guards block new planning during active reassignment",
+        "metadata reconciler does not upsert desired split with stale doc identity namespace",
+        "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+        "distributed join follow-up pagination requires stamped identity request",
+        "distributed join group-local hit pagination reuses structured search generation",
+        "distributed join rejects doc identity rebuild before right-table fanout",
+        "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+        "distributed graph rejects doc identity rebuild before cross-range fanout",
+        "distributed graph rejects unstamped result refs before cross-range fanout",
+        "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+        "internal worker doc identity exchange audit covers every boundary",
+        "aggregation context rejects non-current identity generation",
+        "aggregation full-result rerun can reuse snapped result identity generation",
+        "explicit text stats requests preserve identity generation",
+        "explicit text stats requests reject stale identity generation",
+        "structured filter doc set cache separates shared namespace generation keys",
+        "cache invalidates ownership move prefix without reviving pinned generations",
+        "db text compaction preserves ordinal filters across reopen",
+        "db lsm primary compaction preserves doc identity ordinals",
+        "db allocates final document ordinal with all index families present",
+        "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+        "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
+        "index manager split handoff preserves interleaved write and query summaries",
+        "db stats flag document identity ordinal capacity exhaustion",
+        "db rejects new document writes at ordinal exhaustion for every sync level",
+        "db transaction intent writes reject new documents at ordinal exhaustion",
+        "db search requests default to current identity generation snapshot",
+        "db validates internal resolved doc filter wire namespace and generation",
+        "db resolved doc-set projection honors identity read generation",
+        "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+        "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+    };
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "table workflow doc identity guards reject active transition intents",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "internal worker doc identity exchange audit covers every boundary",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests reject stale identity generation",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "db text compaction preserves ordinal filters across reopen",
-            "db lsm primary compaction preserves doc identity ordinals",
-            "db allocates final document ordinal with all index families present",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "index manager split handoff preserves interleaved write and query summaries",
-            "db stats flag document identity ordinal capacity exhaustion",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
-            "db transaction intent writes reject new documents at ordinal exhaustion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db resolved doc-set projection honors identity read generation",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-        },
+        // The API anchor exposes lazily imported join and table-read tests.
+        // Keep it compile-only so the lifecycle selection remains unchanged.
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_docid_lifecycle_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_docid_lifecycle_tests = addFilteredTestRunArtifact(b, lib_docid_lifecycle_tests);
-    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
-    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
-
-    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
-    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
-
-    const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
-    lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-    lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const run_lib_docid_lifecycle_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_docid_lifecycle_tests,
+        lib_docid_lifecycle_runtime_filters,
+    );
 
     const api_backup_restore_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_backup_restore_test_root.zig"),
@@ -9143,6 +9109,15 @@ pub fn build(b: *std.Build) void {
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // Keep document-identity regressions in the owning integration suite.
+    // The mixed lifecycle artifact remains intact so removing its public
+    // shortcut does not discard metadata, cache, or distributed-query cases.
+    integration_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
+    integration_test_step.dependOn(&run_lib_serverless_docid_tests.step);
+    integration_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    integration_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    integration_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    integration_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
@@ -9408,6 +9383,7 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
     raft_test_step.dependOn(&run_raft_storage_tests.step);
+    raft_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -9460,6 +9436,8 @@ pub fn build(b: *std.Build) void {
     // the focused artifact with the aggregate to run the curated bucket once.
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
+    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    unit_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -12874,23 +12852,22 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&install_antfly.step);
     antfly_step.dependOn(&install_antfarm_assets.step);
 
-    const lite_core_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
+    const lite_main_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lite_core_main_mod.addImport("antfly-zig", lib_mod);
-    lite_core_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_core_main_mod.addImport("httpx", httpx_mod);
-    lite_core_main_mod.addImport("antfly_vellum", vellum_mod);
-    lite_core_main_mod.addImport("raft_engine", raft_engine_mod);
-    lite_core_main_mod.addImport("structlog", structlog_mod);
-    lite_core_main_mod.addImport("antfly_platform", platform_mod);
-    lite_core_main_mod.addImport("handlebars", handlebars_mod);
-    const lite_core_main = b.addExecutable(.{
-        .name = "antfly-lite-core",
-        .root_module = lite_core_main_mod,
+    lite_main_mod.addOptions("build_options", build_options);
+    lite_main_mod.addImport("structlog", structlog_mod);
+    lite_main_mod.addImport("antfly_platform", platform_mod);
+    const lite_main = b.addExecutable(.{
+        .name = "antfly-lite",
+        .root_module = lite_main_mod,
     });
+    // Lite commands are owned by the standalone runtime, including lite serve.
+    for ([_]RuntimeLibraryUnit{ .distributed, .api_kernel, .inference }) |unit| {
+        lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+    }
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
@@ -12899,111 +12876,40 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
-    const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
-    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
-    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
-    const lite_core_main_tests = b.addTest(.{
-        .root_module = lite_core_main_mod,
-        .filters = &.{"lite core main compiles"},
+    const run_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_lite_cli_smoke.addArtifactArg(lite_main);
+    const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_antfly_lite_cli_smoke.addArtifactArg(antfly_main);
+    const lite_main_tests = b.addTest(.{
+        .root_module = lite_main_mod,
+        .filters = &.{"lite main compiles"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lite_core_main_tests = addFilteredTestRunArtifact(b, lite_core_main_tests);
-    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
-    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
-    lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&run_capi_smoke.step);
-    lite_core_test_step.dependOn(&run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&run_lite_go_example.step);
-    lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
+    const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
+    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = antfly_bin_name });
 
-    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
-    lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&install_libantfly.step);
-    lite_core_step.dependOn(&install_capi_header.step);
-    lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&run_capi_smoke.step);
-    lite_core_step.dependOn(&run_lite_go_tests.step);
-    lite_core_step.dependOn(&run_lite_go_example.step);
-    lite_core_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
+    lite_step.dependOn(&install_lite_main.step);
+    lite_step.dependOn(&install_libantfly.step);
+    lite_step.dependOn(&install_capi_header.step);
 
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantfly C ABI");
-    if (!lite_local_inference_runtime) {
-        lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
-    }
-    lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&install_libantfly.step);
-    lite_full_step.dependOn(&install_capi_header.step);
-    lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cmd_tests.step);
-    lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&run_capi_smoke.step);
-    lite_full_step.dependOn(&run_lite_go_tests.step);
-    lite_full_step.dependOn(&run_lite_go_example.step);
-    lite_full_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_wasm_profile_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    lite_wasm_profile_mod.addOptions("build_options", build_options);
-    const lite_wasm_profile = b.addExecutable(.{
-        .name = "antfly_lite_wasm_profile",
-        .root_module = lite_wasm_profile_mod,
-    });
-    lite_wasm_profile.entry = .disabled;
-    lite_wasm_profile.rdynamic = true;
-    lite_wasm_profile.export_memory = true;
-    const install_lite_wasm_profile = b.addInstallArtifact(lite_wasm_profile, .{
-        .dest_sub_path = "antfly-lite-wasm/antfly_lite_wasm_profile.wasm",
-    });
-    const lite_wasm_profile_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
-    const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
-    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
-    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
-
-    const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
-    lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&install_libantfly.step);
-    lite_dev_step.dependOn(&install_capi_header.step);
-    lite_dev_step.dependOn(&run_antfly_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cmd_tests.step);
-    lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&run_capi_smoke.step);
-    lite_dev_step.dependOn(&run_lite_go_tests.step);
-    lite_dev_step.dependOn(&run_lite_go_example.step);
-    lite_dev_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_dev_step.dependOn(&install_lite_wasm_profile.step);
-    lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
-    lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
-    lite_dev_step.dependOn(&run_capi_tests.step);
-    lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
+    lite_test_step.dependOn(&run_antfly_main_tests.step);
+    lite_test_step.dependOn(&run_lite_main_tests.step);
+    lite_test_step.dependOn(&run_lite_cmd_tests.step);
+    lite_test_step.dependOn(&run_lite_native_tests.step);
+    lite_test_step.dependOn(&run_capi_smoke.step);
+    lite_test_step.dependOn(&run_lite_go_tests.step);
+    lite_test_step.dependOn(&run_lite_go_example.step);
+    lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_test_step.dependOn(&run_lite_cli_smoke.step);
+    lite_test_step.dependOn(&run_antfly_lite_cli_smoke.step);
+    lite_test_step.dependOn(&run_cabi_packaging_tests.step);
+    lite_test_step.dependOn(&run_capi_tests.step);
+    lite_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     dependOnAll(antfly_test_step, &.{
         unit_test_step,

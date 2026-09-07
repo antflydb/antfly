@@ -99,7 +99,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
-    allow_unknown_models: bool = false,
+    allow_unknown_models: bool = true,
     ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
@@ -321,7 +321,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var kernel_jit_max_cache_bytes_mb_override: ?usize = null;
     var kernel_jit_preload_budget_ms_override: ?u64 = null;
     var allow_insecure_public_bind = false;
-    var allow_unknown_models = false;
+    var allow_unknown_models = true;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
@@ -877,7 +877,7 @@ fn printUsage() void {
         \\  --kernel-jit-max-cache-mb <n> Persistent JIT cache limit; 0 disables persistence
         \\  --kernel-jit-preload-budget-ms <n> Per-session best-effort startup JIT budget
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
-        \\  --allow-unknown-models  Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
+        \\  --allow-unknown-models  Accepted for compatibility; unknown architectures are attempted by default
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
