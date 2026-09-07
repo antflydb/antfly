@@ -392,6 +392,22 @@ parameters, not measured device latency claims. Scan statistics expose estimated
 costs, probe records, and the choice as `dense_delta_scans`.
 Ordinary row-count
 updates leave the accelerator live. Schema changes invalidate the generation.
+Relational scans, including full-document fallback and maintenance, use a
+row-only owner cursor. It seeks directly past each encoded owner's child prefix
+instead of stepping through artifact, vector, or TTL records. Escaped binary IDs,
+empty IDs, and prefix-related IDs retain their ordering and range semantics.
+There is no duplicate primary-row copy or secondary row-directory index to keep
+in sync. The backend-neutral cursor is the boundary for any future physical
+row-keyspace change. An artifact-only owner may require reading its first record,
+but child fanout does not multiply cursor steps. Owner checkpoints enforce query
+cancellation/deadlines and let builds yield after 1,024 owners or their time
+budget even without a live row. Owner-visit counters expose that work separately
+from rows read or written. Clean-range coalescing fetches known rows directly
+from the same snapshot's immutable block directory, without rescanning gaps.
+Thus neither an empty prefix nor an orphan-heavy gap after a live row can
+repeatedly consume the budget before the worker reaches its successor. Dirty
+and uncovered ranges continue to use the bounded owner cursor.
+
 Bulk-capable backends append dirty tokens in the same ingest arena as primary
 rows, preserving direct ingestion without per-row sorted-map insertion.
 
@@ -440,10 +456,27 @@ cost reaches the source size (at least 64 KiB), or the oldest observed deferral
 reaches ten seconds. First-observation timestamps are durable and do not reset on
 hot rewrites or restart; backwards wall-clock jumps admit work. Read pressure is
 a bounded 256-slot atomic hint table: collisions may compact a range early, never
-change visibility. A deferred turn advances the fairness cursor and yields rather
-than immediately looping over the same range. Explicit maintenance drains bypass
+change visibility. Deferred ranges have checksummed state and a durable,
+generation-bound due-time index. Discovery examines up to 128 candidates or
+50 ms per batch and commits all new deferrals and cursor progress together.
+Due timers are considered first; ready work discovered behind deferred ranges
+can run in the same worker turn. A merge turn cannot lose a selected ready range,
+and merge/cleanup work prevents entering a deferred-only wait. Publication retires
+the old block's timer atomically and repoints retained suffix timers after a
+partial build; stale timer entries are reclaimed in bounded batches. Timer and
+merge-queue keys use separate namespaces. Restart retains the original due times.
+
+When only future timers remain, unchanged idle checks perform no storage reads
+or scheduling commits. A process-local revision advances only after successful
+row/schema commits; together with read-pressure and namespace revisions, it wakes
+discovery on the next active poll (100 ms maximum polling interval, excluding
+resource pressure). Polling remains cooperative `std.Io` sleep, and timer expiry
+or a backwards clock correction also resumes discovery. The durable mutation
+counter and timer index, not process-local hints, govern restart behavior.
+Explicit maintenance drains bypass
 admission, but retain all quantum limits. Statistics expose deferred ranges,
-bootstrap quanta and actual staged key/value bytes written. Age is an admission
+bootstrap quanta, candidate checks, scheduling commits, next due time and actual
+staged key/value bytes written. Age is an admission
 deadline, not a completion SLA under resource pressure or a large backlog.
 
 Underfilled blocks (fewer than 128 rows and less than 512 KiB of source rows)

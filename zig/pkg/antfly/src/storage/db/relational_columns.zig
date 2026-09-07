@@ -39,6 +39,7 @@ const merge_cursor_key = "\x00\x00__columnar__:merge_cursor";
 const cleanup_key = "\x00\x00__columnar__:cleanup";
 const garbage_key = "\x00\x00__columnar__:garbage";
 const bootstrap_key = "\x00\x00__columnar__:bootstrap";
+const discovery_key = "\x00\x00__columnar__:discovery";
 const dirty_prefix = keys.relational_columnar_dirty_prefix;
 pub var test_before_publish: ?struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void } = null;
 pub var test_compaction_block_limit: ?u64 = null;
@@ -68,6 +69,18 @@ pub const Maintenance = struct {
     ranges_deferred: std.atomic.Value(u64) = .init(0),
     bootstrap_quanta: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
+    owners_examined: std.atomic.Value(u64) = .init(0),
+    scheduler_candidates: std.atomic.Value(u64) = .init(0),
+    scheduler_commits: std.atomic.Value(u64) = .init(0),
+    waiting_until_ns: std.atomic.Value(u64) = .init(0),
+    read_revision: std.atomic.Value(u64) = .init(0),
+    // Worker-owned hints. Durable timers/cursor remain authoritative on restart.
+    waiting_since_ns: u64 = 0,
+    waiting_version: u64 = 0,
+    waiting_generation: u64 = 0,
+    waiting_reads: u64 = 0,
+    waiting_store_revision: u64 = 0,
+    waiting_namespace: u64 = 0,
     /// Bounded, lossy read-cost hints, never correctness state. Hash collisions
     /// can admit a cold range early but cannot delay a hot range past its age cap.
     read_debt: [256]std.atomic.Value(u64) = @splat(.init(0)),
@@ -82,6 +95,7 @@ pub const Maintenance = struct {
         const slot = self.debtSlot(generation, block);
         var old = slot.load(.monotonic);
         while (slot.cmpxchgWeak(old, old +| bytes, .monotonic, .monotonic)) |actual| old = actual;
+        _ = self.read_revision.fetchAdd(1, .monotonic);
     }
 
     pub fn notePending(self: *@This(), pending: bool) void {
@@ -109,6 +123,10 @@ pub const Maintenance = struct {
             .ranges_deferred = self.ranges_deferred.load(.monotonic),
             .bootstrap_quanta = self.bootstrap_quanta.load(.monotonic),
             .bytes_written = self.bytes_written.load(.monotonic),
+            .owners_examined = self.owners_examined.load(.monotonic),
+            .scheduler_candidates = self.scheduler_candidates.load(.monotonic),
+            .scheduler_commits = self.scheduler_commits.load(.monotonic),
+            .waiting_until_ns = self.waiting_until_ns.load(.monotonic),
         };
     }
 };
@@ -192,6 +210,7 @@ fn ColumnBuilder(comptime DBType: type) type {
         deadline_ns: u64 = std.math.maxInt(u64),
         bytes: usize = 0,
         prepared_bytes: usize = 0,
+        owners: usize = 0,
         view: ?registry.SchemaView = null,
         rows: std.ArrayListUnmanaged(Row) = .empty,
         columns: std.AutoHashMapUnmanaged(u32, Column) = .empty,
@@ -300,11 +319,58 @@ fn ColumnBuilder(comptime DBType: type) type {
             return false;
         }
 
-        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+        fn checkpoint(ptr: ?*anyopaque, key: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
-            if (!keys.isRelationalRowKey(key)) return .@"continue";
+            if (self.owners >= 1024 or (self.owners != 0 and platform_time.monotonicNs() >= self.deadline_ns)) {
+                self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
+                return .stop;
+            }
             if (try self.yieldBeforeRow(key)) return .stop;
+            self.owners += 1;
+            _ = self.db.relational_column_maintenance.owners_examined.fetchAdd(1, .monotonic);
+            return .@"continue";
+        }
+
+        /// A clean, covered range's immutable root is an exact row directory
+        /// for this snapshot. Fetch only those rows: rescanning orphan gaps
+        /// during coalescing could otherwise yield at the same boundary forever.
+        fn visitCovered(self: *@This(), read: *store_mod.DocStore.Txn, range: Range, end: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var scope = try read.openReadScope(scratch);
+            defer scope.close();
+            var decoder = Decoder{ .bytes = try verified(try scope.get(try blockKey(scratch, self.generation, range.block, null))) };
+            if (!std.mem.eql(u8, try decoder.take(4), "ACB5")) return error.InvalidColumnSegment;
+            _ = try decoder.int(u32);
+            const count = try decoder.int(u32);
+            if (count > max_rows) return error.InvalidColumnSegment;
+            const pages = try decoder.int(u32);
+            _ = try decoder.int(u64);
+            if (pages > decoder.bytes.len / 12) return error.InvalidColumnSegment;
+            _ = try decoder.take(@as(usize, pages) * 12);
+            var previous: ?[]const u8 = null;
+            for (0..count) |_| {
+                const id = try decoder.take(try decoder.int(u32));
+                _ = try decoder.take(48); // semantic hash, timestamp, physical size
+                if (previous) |last| if (std.mem.order(u8, last, id) != .lt) return error.InvalidColumnSegment;
+                previous = id;
+                if (std.mem.order(u8, id, range.start) == .lt) continue;
+                if (end.len != 0 and std.mem.order(u8, id, end) != .lt) continue;
+                const key = try keys.relationalRowKeyAlloc(scratch, id);
+                if (try checkpoint(self, key) == .stop) return;
+                const value = scope.get(key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidColumnSegment,
+                    else => return err,
+                };
+                if (try visit(self, key, value) == .stop) return;
+            }
+            if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
+        }
+
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
             const version = try codec.rowSchemaVersion(value);
             if (self.view == null or self.view.?.version() != version) {
                 try self.flush();
@@ -400,6 +466,14 @@ fn buildToken(generation: u64, first_block: u64) [16]u8 {
 /// advances with coverage publication, never with staging. Uncovered suffixes
 /// stay on primary scans, including rows predating the dirty directory.
 pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !bool {
+    const maintenance = &db.relational_column_maintenance;
+    const now = maintenanceNow();
+    // Called under the DB's single-maintainer guard. These cheap wake hints
+    // avoid even opening a transaction while every known range is deferred.
+    if (adaptive and !force and now >= maintenance.waiting_since_ns and now < maintenance.waiting_until_ns.load(.acquire) and
+        maintenance.waiting_namespace == db.core.schemaNamespaceGeneration() and
+        maintenance.waiting_store_revision == db.core.store.columnar_revision.load(.acquire) and
+        maintenance.waiting_reads == maintenance.read_revision.load(.monotonic)) return false;
     db.core.lockApplyShared();
     var initial_locked = true;
     defer if (initial_locked) db.core.unlockApplyShared();
@@ -679,7 +753,16 @@ fn retireBlock(txn: *store_mod.DocStore.Txn, read: *store_mod.DocStore.Txn, allo
         }
     }
     try txn.delete(key);
-    try deleteIfPresent(txn, try std.mem.concat(alloc, u8, &.{ key, ":defer" }));
+    const defer_key = try deferredKey(alloc, generation, block);
+    const encoded = txn.get(defer_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (encoded) |bytes| {
+        const state = try Deferred.decode(bytes);
+        try deleteIfPresent(txn, try timerKey(alloc, generation, state.due(), block));
+        try txn.delete(defer_key);
+    }
 }
 
 fn maintenanceNow() u64 {
@@ -687,40 +770,197 @@ fn maintenanceNow() u64 {
     return platform_time.realtimeNs();
 }
 
-/// Durable first-observation age does not reset on repeated updates or restart.
-/// Cost estimates are hints: primary rows and snapshot fences remain authoritative.
-fn shouldDefer(db: anytype, txn: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, ranges: []const Range, dirty_count: usize, delta_bytes: u64) !bool {
-    var source_bytes: u64 = 0;
-    var source_rows: u64 = 0;
-    var debt: u64 = 0;
-    for (ranges) |range| {
-        const meta = try verified(try txn.get(try blockKey(alloc, generation, range.block, null)));
-        if (meta.len < 24) return error.InvalidColumnSegment;
-        source_rows +|= std.mem.readInt(u32, meta[8..12], .little);
-        source_bytes +|= std.mem.readInt(u64, meta[16..24], .little);
-        debt +|= db.relational_column_maintenance.debtSlot(generation, range.block).load(.monotonic);
+const Deferred = struct {
+    first_ns: u64,
+    version: u64,
+    source_bytes: u64,
+
+    fn decode(encoded: []const u8) !@This() {
+        const body = try verified(encoded);
+        if (body.len != 24) return error.InvalidColumnSegment;
+        return .{ .first_ns = std.mem.readInt(u64, body[0..8], .little), .version = std.mem.readInt(u64, body[8..16], .little), .source_bytes = std.mem.readInt(u64, body[16..24], .little) };
     }
-    if (source_rows == 0 or dirty_count >= (source_rows + 3) / 4 or
-        delta_bytes >= source_bytes / 8 or debt >= @max(source_bytes, 64 * 1024)) return false;
-    const key = try std.mem.concat(alloc, u8, &.{ try blockKey(alloc, generation, ranges[0].block, null), ":defer" });
-    const saved = txn.get(key) catch |err| switch (err) {
+    fn encode(self: @This(), alloc: alloc_type) ![]u8 {
+        var body: [24]u8 = undefined;
+        std.mem.writeInt(u64, body[0..8], self.first_ns, .little);
+        std.mem.writeInt(u64, body[8..16], self.version, .little);
+        std.mem.writeInt(u64, body[16..24], self.source_bytes, .little);
+        return checked(alloc, &body);
+    }
+    fn due(self: @This()) u64 {
+        return self.first_ns +| 10 * std.time.ns_per_s;
+    }
+};
+
+fn deferredKey(alloc: alloc_type, generation: u64, block: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:defer", .{ prefix, generation, block });
+}
+
+fn timerPrefix(alloc: alloc_type, generation: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:due:", .{ prefix, generation });
+}
+
+fn timerKey(alloc: alloc_type, generation: u64, due: u64, block: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:due:{x:0>16}:{x:0>16}", .{ prefix, generation, due, block });
+}
+
+const Selection = struct { id: ?[]const u8 = null, progress: bool = false, timed: bool = false };
+
+/// Discover ready ranges in bounded batches, independently of actual builds.
+/// Deferred ranges have a durable time index; unchanged waiting work needs no
+/// cursor rewrite. One commit checkpoints all admission decisions in a batch.
+fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, manifest: Manifest, manifest_bytes: []const u8, store_revision: u64) !Selection {
+    const maintenance = &db.relational_column_maintenance;
+    const now = maintenanceNow();
+    const mutation = read.get(keys.relational_columnar_mutation_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
-    const now = maintenanceNow();
-    if (saved) |encoded| {
-        const body = try verified(encoded);
-        if (body.len != 8) return error.InvalidColumnSegment;
-        const first = std.mem.readInt(u64, body[0..8], .little);
-        // A backwards wall-clock jump admits work rather than stranding it.
-        if (now < first or now - first >= 10 * std.time.ns_per_s) return false;
-    } else {
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, now, .little);
-        try txn.put(key, try checked(alloc, &bytes));
+    const version = if (mutation) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnSegment;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const reads = maintenance.read_revision.load(.monotonic);
+    if (maintenance.waiting_generation == manifest.generation and maintenance.waiting_version == version and
+        maintenance.waiting_namespace == db.core.schemaNamespaceGeneration() and maintenance.waiting_store_revision == store_revision and
+        maintenance.waiting_reads == reads and now >= maintenance.waiting_since_ns and now < maintenance.waiting_until_ns.load(.monotonic)) return .{};
+    maintenance.waiting_until_ns.store(0, .release);
+    var writes = std.ArrayListUnmanaged(store_mod.KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    var chosen: ?[]const u8 = null;
+    var from_timer = false;
+    var earliest: u64 = std.math.maxInt(u64);
+    var examined: usize = 0;
+    const deadline = platform_time.monotonicNs() +| 50 * std.time.ns_per_ms;
+    const timers = try timerPrefix(alloc, manifest.generation);
+    var timer = try read.openCursor();
+    defer timer.close();
+    var timed = try timer.seekAtOrAfter(timers);
+    while (timed) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, timers)) break;
+        if (entry.key.len != timers.len + 33 or entry.key[timers.len + 16] != ':') return error.InvalidColumnSegment;
+        const due = std.fmt.parseInt(u64, entry.key[timers.len..][0..16], 16) catch return error.InvalidColumnSegment;
+        earliest = @min(earliest, due);
+        if (due > now or examined == 128 or platform_time.monotonicNs() >= deadline) break;
+        const body = try verified(entry.value);
+        if (body.len < 12 or std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
+        const block = std.mem.readInt(u64, body[0..8], .little);
+        var directory = try Directory.init(alloc, read, manifest.generation, body[12..]);
+        defer directory.deinit();
+        const range = try directory.next(alloc);
+        examined += 1;
+        if (range) |item| if (item.block == block and !try rangeClean(read, alloc, item)) {
+            chosen = try alloc.dupe(u8, item.start);
+            from_timer = true;
+            break;
+        };
+        try deletes.append(alloc, try alloc.dupe(u8, entry.key));
+        timed = try timer.next();
+        earliest = std.math.maxInt(u64);
     }
-    return true;
+    var dirty = try read.openCursor();
+    defer dirty.close();
+    const saved = read.get(discovery_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const discovery_resume = if (saved) |encoded| blk: {
+        const body = try verified(encoded);
+        if (body.len < 12 or std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
+        if (std.mem.readInt(u64, body[0..8], .little) != manifest.generation) break :blk "";
+        break :blk body[12..];
+    } else "";
+    var next_id: []const u8 = discovery_resume;
+    var exhausted = false;
+    var entry = try dirty.seekAtOrAfter(try std.mem.concat(alloc, u8, &.{ dirty_prefix, discovery_resume }));
+    while (chosen == null and examined < 128 and platform_time.monotonicNs() < deadline) {
+        const item = entry orelse {
+            exhausted = true;
+            next_id = "";
+            break;
+        };
+        if (!std.mem.startsWith(u8, item.key, dirty_prefix)) {
+            exhausted = true;
+            next_id = "";
+            break;
+        }
+        var directory = try Directory.init(alloc, read, manifest.generation, item.key[dirty_prefix.len..]);
+        defer directory.deinit();
+        const range = (try directory.next(alloc)) orelse return error.InvalidColumnSegment;
+        examined += 1;
+        next_id = range.end;
+        const defer_key = try deferredKey(alloc, manifest.generation, range.block);
+        const encoded = read.get(defer_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const previous = if (encoded) |bytes| try Deferred.decode(bytes) else null;
+        const debt = maintenance.debtSlot(manifest.generation, range.block).load(.monotonic);
+        const waiting = if (previous) |state| now >= state.first_ns and now < state.due() and state.version == version and debt < @max(state.source_bytes, 64 * 1024) else false;
+        if (waiting) {
+            earliest = @min(earliest, previous.?.due());
+        } else {
+            const meta = try verified(try read.get(try blockKey(alloc, manifest.generation, range.block, null)));
+            if (meta.len < 24) return error.InvalidColumnSegment;
+            const rows = std.mem.readInt(u32, meta[8..12], .little);
+            const source = std.mem.readInt(u64, meta[16..24], .little);
+            var count: usize = 0;
+            var delta: u64 = 0;
+            // Use the same cursor to count the range and jump to the next one.
+            while (entry) |marker| {
+                if (!std.mem.startsWith(u8, marker.key, dirty_prefix) or (range.end.len != 0 and std.mem.order(u8, marker.key[dirty_prefix.len..], range.end) != .lt)) break;
+                if (marker.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+                count += 1;
+                delta +|= std.mem.readInt(u64, marker.value[8..16], .little);
+                if (count >= 1024 or count >= (rows + 3) / 4 or delta >= source / 8) break;
+                entry = try dirty.next();
+            }
+            const aged = if (previous) |state| now < state.first_ns or now >= state.due() else false;
+            if (rows == 0 or count >= (rows + 3) / 4 or delta >= source / 8 or debt >= @max(source, 64 * 1024) or aged) {
+                chosen = range.start;
+                next_id = range.start;
+                break;
+            }
+            const state = Deferred{ .first_ns = if (previous) |old| old.first_ns else now, .version = version, .source_bytes = source };
+            try writes.append(alloc, .{ .key = defer_key, .value = try state.encode(alloc) });
+            if (previous == null) try writes.append(alloc, .{ .key = try timerKey(alloc, manifest.generation, state.due(), range.block), .value = try directoryValue(alloc, range.block, range.start) });
+            earliest = @min(earliest, state.due());
+            _ = maintenance.ranges_deferred.fetchAdd(1, .monotonic);
+        }
+        if (range.end.len == 0) {
+            exhausted = true;
+            next_id = "";
+            break;
+        }
+        entry = try dirty.seekAtOrAfter(try std.mem.concat(alloc, u8, &.{ dirty_prefix, range.end }));
+    }
+    _ = maintenance.scheduler_candidates.fetchAdd(examined, .monotonic);
+    if (!std.mem.eql(u8, next_id, discovery_resume)) try writes.append(alloc, .{ .key = discovery_key, .value = try directoryValue(alloc, manifest.generation, next_id) });
+    if (writes.items.len != 0 or deletes.items.len != 0) {
+        var txn = try db.core.store.beginWriteTxn();
+        var live = true;
+        defer if (live) txn.abort();
+        if (!try sameValue(&txn, manifest_key, manifest_bytes)) return .{};
+        for (writes.items) |write| try txn.put(write.key, write.value);
+        for (deletes.items) |key| try deleteIfPresent(&txn, key);
+        try txn.commit();
+        live = false;
+        _ = maintenance.scheduler_commits.fetchAdd(1, .monotonic);
+    }
+    if (chosen == null and exhausted and earliest != std.math.maxInt(u64)) {
+        maintenance.waiting_since_ns = now;
+        maintenance.waiting_version = version;
+        maintenance.waiting_generation = manifest.generation;
+        maintenance.waiting_reads = reads;
+        maintenance.waiting_store_revision = store_revision;
+        maintenance.waiting_namespace = db.core.schemaNamespaceGeneration();
+        // A resumed sweep rechecks its prefix before entering a long sleep:
+        // new writes/read pressure may have arrived behind its saved cursor.
+        maintenance.waiting_until_ns.store(if (discovery_resume.len == 0) earliest else @min(earliest, now +| 100 * std.time.ns_per_ms), .release);
+    }
+    return .{ .id = chosen, .progress = writes.items.len != 0 or deletes.items.len != 0 or (!exhausted and chosen == null), .timed = from_timer };
 }
+
 fn directoryValue(alloc: alloc_type, block: u64, end: []const u8) ![]u8 {
     var bytes = std.ArrayListUnmanaged(u8).empty;
     defer bytes.deinit(alloc);
@@ -971,12 +1211,16 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     var locked = true;
     defer if (locked) db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+    // Capture before the snapshot so a commit racing discovery cannot be
+    // mistaken for work already accounted for by the idle wake hint.
+    const store_revision = db.core.store.columnar_revision.load(.acquire);
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     const manifest_bytes = try read.get(manifest_key);
     const manifest = try Manifest.decode(manifest_bytes);
     if (!manifest.ready) return false;
     const bootstrap = try bootstrapBoundary(&read, manifest);
+    const selection = if (adaptive and bootstrap == null) try selectReady(db, &read, scratch, manifest, manifest_bytes, store_revision) else Selection{};
     var dirty = try read.openCursor();
     defer dirty.close();
     const saved_cursor = read.get(maintenance_cursor_key) catch |err| switch (err) {
@@ -992,6 +1236,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const resume_key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, resume_id });
     var pending_entry = try dirty.seekAtOrAfter(resume_key);
     if (pending_entry == null or !std.mem.startsWith(u8, pending_entry.?.key, dirty_prefix)) pending_entry = try dirty.seekAtOrAfter(dirty_prefix);
+    if (adaptive and bootstrap == null) pending_entry = if (selection.id) |id| .{ .key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, id }), .value = "" } else null;
     const any_dirty = if (pending_entry) |entry| std.mem.startsWith(u8, entry.key, dirty_prefix) else false;
     const candidate_prefix = try mergeQueueKey(scratch, manifest.generation, "");
     const turn_bytes = read.get(maintenance_turn_key) catch |err| switch (err) {
@@ -1010,10 +1255,12 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     var queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_lower);
     if (queued_candidate == null or !std.mem.startsWith(u8, queued_candidate.?.key, candidate_prefix)) queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_prefix);
     const has_candidate = if (queued_candidate) |entry| std.mem.startsWith(u8, entry.key, candidate_prefix) else false;
+    // Deferred dirty rows must not put ready merge/queue-cleanup work to sleep.
+    if (has_candidate) db.relational_column_maintenance.waiting_until_ns.store(0, .release);
     const merge_turn = bootstrap == null and has_candidate and (!any_dirty or turn % 4 == 3);
     const has_dirty = bootstrap != null or (any_dirty and !merge_turn);
     if (merge_turn) pending_entry = queued_candidate;
-    if (bootstrap == null and !any_dirty and !has_candidate) return false;
+    if (bootstrap == null and !any_dirty and !has_candidate) return selection.progress;
     const selected_candidate = if (!has_dirty) try scratch.dupe(u8, pending_entry.?.key) else null;
     const dirty_id = try scratch.dupe(u8, bootstrap orelse pending_entry.?.key[if (has_dirty) dirty_prefix.len else candidate_prefix.len..]);
     var directory = try Directory.init(alloc, &read, manifest.generation, dirty_id);
@@ -1073,7 +1320,6 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     var captured = try captured_dirty.seekAtOrAfter(try std.mem.concat(scratch, u8, &.{ dirty_prefix, range.start }));
     var dirty_count: usize = 0;
     var dirty_bytes: usize = 0;
-    var delta_bytes: u64 = 0;
     while (captured) |entry| {
         if (!std.mem.startsWith(u8, entry.key, dirty_prefix)) break;
         const id = entry.key[dirty_prefix.len..];
@@ -1084,7 +1330,6 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
         }
         dirty_count += 1;
         if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
-        delta_bytes +|= std.mem.readInt(u64, entry.value[8..16], .little);
         dirty_bytes +|= entry.key.len + entry.value.len;
         captured = try captured_dirty.next();
     }
@@ -1093,15 +1338,6 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     defer if (start_live) start.abort();
     if (!try sameValue(&start, manifest_key, manifest_bytes)) return false;
     try scheduleMaintenance(&start, scratch, turn, selected_candidate);
-    if (adaptive and bootstrap == null and has_dirty and dirty_limit == null and
-        try shouldDefer(db, &start, scratch, manifest.generation, ranges.items, dirty_count, delta_bytes))
-    {
-        try start.put(maintenance_cursor_key, try directoryValue(scratch, manifest.generation, range.end));
-        try start.commit();
-        start_live = false;
-        _ = db.relational_column_maintenance.ranges_deferred.fetchAdd(1, .monotonic);
-        return true;
-    }
     const old_counter = try start.get(counter_key);
     if (old_counter.len != 8) return error.InvalidColumnSegment;
     const build_id = std.math.add(u64, std.mem.readInt(u64, old_counter[0..8], .little), 1) catch return error.InvalidColumnSegment;
@@ -1133,10 +1369,18 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
         .deadline_ns = platform_time.monotonicNs() +| 50 * std.time.ns_per_ms,
     };
     defer builder.deinit();
-    const lower = try keys.documentRangeLowerAlloc(scratch, range.start);
-    const scan_end = dirty_limit orelse range.end;
-    const upper = if (scan_end.len == 0) (try keys.documentRangeUpperAlloc(scratch, "")) orelse return error.InvalidColumnSegment else try keys.documentRangeLowerAlloc(scratch, scan_end);
-    try db.core.store.scanReadTxnWithContext(&read, lower, upper, .{}, &builder, ColumnBuilder(@TypeOf(db)).visit);
+    for (ranges.items) |part| {
+        if (dirty_limit) |limit| if (std.mem.order(u8, part.start, limit) != .lt) break;
+        const scan_end = if (dirty_limit) |limit| if (part.end.len == 0 or std.mem.order(u8, limit, part.end) == .lt) limit else part.end else part.end;
+        if (bootstrap == null and try rangeClean(&read, scratch, part)) {
+            try builder.visitCovered(&read, part, scan_end);
+        } else {
+            const lower = try keys.documentRangeLowerAlloc(scratch, part.start);
+            const upper = if (scan_end.len == 0) (try keys.documentRangeUpperAlloc(scratch, "")) orelse return error.InvalidColumnSegment else try keys.documentRangeLowerAlloc(scratch, scan_end);
+            try db.core.store.scanRelationalRowsReadTxnWithContext(&read, lower, upper, &builder, ColumnBuilder(@TypeOf(db)).checkpoint, ColumnBuilder(@TypeOf(db)).visit);
+        }
+        if (builder.continuation != null) break;
+    }
     try builder.flush();
     if (builder.continuation == null) if (dirty_limit) |limit| {
         builder.continuation = try alloc.dupe(u8, limit);
@@ -1165,6 +1409,17 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
             if (old_range.end.len == 0 or std.mem.order(u8, continuation, old_range.end) == .lt) {
                 const continuation_key = try std.mem.concat(scratch, u8, &.{ directory.prefix, continuation });
                 try publish.put(continuation_key, old_range.value);
+                // The retained root still owns its original admission age,
+                // but its directory start moved. Repoint the due index in the
+                // same publication so a partial build cannot orphan its timer.
+                const deferred = publish.get(try deferredKey(scratch, manifest.generation, old_range.block)) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (deferred) |encoded| {
+                    const state = try Deferred.decode(encoded);
+                    try publish.put(try timerKey(scratch, manifest.generation, state.due(), old_range.block), try directoryValue(scratch, old_range.block, continuation));
+                }
                 retained_suffix = 1;
                 break;
             }
@@ -1221,6 +1476,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     next_manifest.ranges = manifest.ranges - removed_ranges + builder.directory.items.len + retained_suffix + empty_prefix;
     const ready = next_manifest.encode();
     try publish.put(manifest_key, &ready);
+    if (adaptive and bootstrap == null and has_dirty and !selection.timed) try publish.put(discovery_key, try directoryValue(scratch, manifest.generation, range.end));
     if (bootstrap != null) {
         if (builder.continuation) |continuation| {
             try publish.put(bootstrap_key, try directoryValue(scratch, manifest.generation, continuation));
@@ -1232,6 +1488,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     live = false;
     for (ranges.items) |old_range| _ = db.relational_column_maintenance.debtSlot(manifest.generation, old_range.block).swap(0, .monotonic);
     if (bootstrap != null) _ = db.relational_column_maintenance.bootstrap_quanta.fetchAdd(1, .monotonic);
+    db.relational_column_maintenance.waiting_until_ns.store(0, .release);
     _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(inline_cleared, .monotonic);
     db.core.unlockApplyShared();
     locked = false;
@@ -1732,6 +1989,13 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
         progress: *Progress,
         filter: ?*const graph.PreparedPatternFilter,
         view: ?registry.SchemaView = null,
+        fn checkpoint(ptr: ?*anyopaque, _: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (self.opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (self.opts.columnar_stats) |stats| stats.primary_owners_examined += 1;
+            return .@"continue";
+        }
         fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
@@ -1796,5 +2060,5 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
         break :blk (try keys.nextPrefixAlloc(alloc, exact)) orelse return error.InvalidColumnSegment;
     } else try keys.documentRangeLowerAlloc(alloc, end) else try keys.documentRangeUpperAlloc(alloc, "");
     defer if (upper) |bytes| alloc.free(bytes);
-    try db.core.store.scanReadTxnWithContext(txn, lower, upper orelse "", .{}, &context, Context.visit);
+    try db.core.store.scanRelationalRowsReadTxnWithContext(txn, lower, upper orelse "", &context, Context.checkpoint, Context.visit);
 }

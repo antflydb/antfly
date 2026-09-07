@@ -394,6 +394,9 @@ fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationT
 
 pub const DocStore = struct {
     alloc: Allocator,
+    /// Process-local wake hint, published only after successful row/schema
+    /// commits. Durable mutation IDs and timers remain the restart authority.
+    columnar_revision: std.atomic.Value(u64) = .init(0),
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
@@ -449,6 +452,7 @@ pub const DocStore = struct {
         portable_import_reader_owner: ?*DocStore = null,
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        columnar_owner: ?*DocStore = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -490,9 +494,11 @@ pub const DocStore = struct {
 
         pub fn commit(self: *Txn) !void {
             const reader_owner = self.portable_import_reader_owner;
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
@@ -504,6 +510,7 @@ pub const DocStore = struct {
                 return error.ReadOnly;
             }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
             if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
@@ -642,6 +649,7 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        columnar_owner: ?*DocStore = null,
         alloc: Allocator,
         columns_invalidated: bool = false,
         columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
@@ -780,9 +788,11 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     return;
                 }
@@ -791,6 +801,7 @@ pub const DocStore = struct {
                 try runtime.commit();
             }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
@@ -1133,12 +1144,14 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbTxn(self.alloc, &txn, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = txn,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .write = try self.runtime_store.beginWrite(),
             },
         };
@@ -1157,12 +1170,14 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbBatch(self.alloc, &batch, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = batch,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .runtime = try self.runtime_store.beginBatchWithOptions(options),
                 .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
             },
@@ -2061,6 +2076,56 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxnUnchecked();
         defer txn.abort();
         try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
+
+    /// Row-only owner traversal. Never advance through an owner's artifact
+    /// tail: seek directly to the next encoded document prefix. Checkpoints
+    /// run once per owner, including artifact-only owners, so cancellation and
+    /// maintenance budgets do not depend on finding another live row.
+    pub fn scanRelationalRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
+        cursor.setUpperBound(end);
+        const owner_start = &[_]u8{internal_keys.user_namespace};
+        const start = if (std.mem.order(u8, lower, owner_start) == .lt) owner_start else lower;
+        if (std.mem.order(u8, start, end) != .lt) return;
+        var candidate = std.ArrayListUnmanaged(u8).empty;
+        defer candidate.deinit(self.alloc);
+        var entry = try cursor.seekAtOrAfter(start);
+        while (entry) |item| {
+            if (std.mem.order(u8, item.key, end) != .lt or !internal_keys.isInternalUserKey(item.key)) return;
+            const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
+            candidate.clearRetainingCapacity();
+            try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
+            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            if (try checkpoint(ctx, candidate.items) == .stop) return;
+            var current = item;
+            if (std.mem.order(u8, current.key, candidate.items) == .lt) {
+                current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
+                    entry = current;
+                    continue;
+                }
+            }
+            if (std.mem.eql(u8, current.key, candidate.items)) {
+                if (try callback(ctx, current.key, current.value) == .stop) return;
+            }
+            // The final byte of the escaped owner's terminator is zero.
+            // Its successor skips this owner, not documents extending its ID.
+            candidate.items.len = term + 2;
+            candidate.items[term + 1] = 1;
+            if (std.mem.order(u8, candidate.items, end) != .lt) return;
+            entry = try cursor.seekAtOrAfter(candidate.items);
+        }
     }
 
     pub fn scanReadTxnWithContext(
@@ -3288,6 +3353,7 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
     }
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), store.columnar_revision.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     for (0..256) |i| {
         var id_buf: [16]u8 = undefined;
@@ -3323,6 +3389,7 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
     const value = try store.get(alloc, key);
     defer alloc.free(value);
     try std.testing.expectEqualStrings("last", value);
+    try std.testing.expectEqual(@as(u64, 2), store.columnar_revision.load(.acquire));
     const token = try store.get(alloc, dirty);
     defer alloc.free(token);
     try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(2), 4), token);
@@ -3342,6 +3409,7 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
     const still_deleted = try store.get(alloc, dirty);
     defer alloc.free(still_deleted);
     try std.testing.expectEqualSlices(u8, deleted, still_deleted);
+    try std.testing.expectEqual(@as(u64, 4), store.columnar_revision.load(.acquire));
 }
 
 test "docstore runtime point get does not clone mutable snapshot" {
