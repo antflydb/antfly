@@ -8462,6 +8462,8 @@ pub fn build(b: *std.Build) void {
         "graph degree planned build honors edge filter during scan page execution",
         "graph metric filtered scan checkpoints advance past excluded edges",
         "graph metric partition spans remain balanced at production cardinality",
+        "graph metric partition census",
+        "partition census owns bounded checkpoints",
         "graph metric floating page aggregates are deterministic across adoption order",
         "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
         "graph metric physical score reads",

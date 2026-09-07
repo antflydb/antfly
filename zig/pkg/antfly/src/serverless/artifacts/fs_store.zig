@@ -156,6 +156,20 @@ pub const FsStore = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, expected_byte_len, expected_checksum, offset, len, cancellation, null);
+    }
+
+    fn getVerifiedRangeWithBudget(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        remaining: ?*u64,
+    ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
@@ -176,6 +190,7 @@ pub const FsStore = struct {
         if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
         const verified = VerifiedFile.fromStat(before);
         if (!self.isVerifiedFile(artifact_id, verified)) {
+            if (remaining) |budget| try artifact_store.chargeReadBudget(budget, expected_byte_len);
             try verifyOpenFileContent(file, io, expected_byte_len, expected_checksum, cancellation);
             const after = try file.stat(io);
             if (!verified.matchesStat(after)) {
@@ -299,6 +314,7 @@ pub const FsStore = struct {
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
+        .get_verified_range_alloc_with_budget = erasedGetVerifiedRangeWithBudget,
         .stat = erasedStat,
         .stat_with_cancellation = erasedStatWithCancellation,
         .verify_content = erasedVerifyContent,
@@ -358,6 +374,11 @@ pub const FsStore = struct {
     fn erasedVerifyContent(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         try self.verifyContent(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+    }
+
+    fn erasedGetVerifiedRangeWithBudget(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, byte_len: u64, checksum: []const u8, offset: u64, len: usize, cancellation: CancellationToken, remaining: *u64) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, byte_len, checksum, offset, len, cancellation, remaining);
     }
 
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
@@ -680,6 +701,37 @@ test "serverless fs artifact store detects and repairs same-length content corru
     const payload = try store.getAlloc(alloc, repaired.artifact_id);
     defer alloc.free(payload);
     try std.testing.expectEqualStrings("alpha", payload);
+}
+
+test "serverless fs artifact verified range budgets cold authentication and amortizes warm reads" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "budgeted-verified-range");
+    defer cleanupTmp(root);
+    var store = try FsStore.init(alloc, std.mem.span(root));
+    defer store.deinit();
+    var meta = try store.put(alloc, "alpha");
+    defer meta.deinit(alloc);
+    store.forgetVerifiedFile(meta.artifact_id);
+    var iface = store.artifactStore();
+    var remaining: u64 = 2;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining));
+    try std.testing.expectEqual(@as(u64, 1), remaining);
+    remaining = 6;
+    const cold = try iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining);
+    defer alloc.free(cold);
+    try std.testing.expectEqualStrings("a", cold);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    remaining = 1;
+    const warm = try iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining);
+    defer alloc.free(warm);
+    try std.testing.expectEqualStrings("a", warm);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    const path = try pathForArtifactAlloc(alloc, store.root_dir, meta.checksum);
+    defer alloc.free(path);
+    try writeFileAtomically(path, "omega");
+    remaining = 6;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining));
 }
 
 test "serverless fs artifact verification cache detects in-place mutation with restored mtime" {

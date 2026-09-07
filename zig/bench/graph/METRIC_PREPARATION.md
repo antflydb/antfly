@@ -1,9 +1,10 @@
-# Graph metric preparation and score-reader benchmarks
+# Graph metric execution and query benchmarks
 
 Measured 2026-09-07 on Apple M4 Max, 36 GiB RAM, macOS 26.3.1,
 Zig 0.16.0, ReleaseFast, using the system SMP allocator. One warmup and five
 measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
+The compact-query comparison below uses 21 measured samples instead of five.
 
 Run from `zig/`:
 
@@ -69,3 +70,47 @@ Production additionally pays for I/O, authentication, snapshot/status handling,
 output ownership and numerical work. Tests cover default non-serverless storage,
 durable ordinal jobs, serverless publication/query integration, cancellation,
 malformed input, allocation failures and alias ownership.
+
+## Admitted preparation and ordinal execution
+
+The following measurements were added with the bounded census, admission and
+compact-query changes, on the same host and toolchain. They exercise production
+functions against explicit former-path oracles, not alternate numerical kernels.
+
+| Phase | Former path median | Current path median | Scope |
+| --- | ---: | ---: | --- |
+| Exhausted serverless projection preparation | 26.469 ms | 3.204 ms | 50,000 nodes, 400,000 edges; 16 rejected group attempts |
+| Durable vector writer | 3.637 ms | 0.101 ms | 20,000 rows; synchronous mock storage |
+| One-node score snapshot during rebuild | 194 µs | 103 µs | Real default storage; 256 active scan pages |
+| 64-node score snapshot during rebuild | 638 µs | 553 µs | Same real-storage fixture |
+
+The rejected-preparation case includes one packed source preparation, then 16
+independent projection attempts against an exhausted work budget. The former
+oracle constructs each projection before rejecting; production rejects before
+projection allocations or census scans. This isolates admission ordering and
+does not include the publication grouping/cache, fetch, rejection encoding, or
+numerical kernel. Median time fell 87.9%; allocations fell from 123 to 11 and
+cumulative allocated bytes from 35,600,691 to 9,900,323. Peak stayed 9,500,051 bytes
+because the shared source preparation dominates it. This is not a claim that
+rejection can avoid preparing the source itself.
+
+The vector writer compares node-ID rows with rows already carrying their
+job-local ordinals. Both execute the production writer and validate output
+scores. Storage reads fell from 20,079 to 79, eliminating 20,000 dictionary point
+lookups; writes remained 79. Allocations fell from 137 to 8 and tracked peak from
+4,775,772 to 806,756 bytes. The roughly 36x writer CPU improvement excludes ordinal
+discovery, real storage latency, adjacency reads, and numerical iteration. The
+production reducer discovers ordinals with a canonical-node/dictionary range
+join; the benchmark does not claim an equivalent whole-PageRank speedup.
+
+The query fixture publishes degree scores over 4,096 nodes and 16,384 edges,
+then opens a real 256-page rebuild. Both paths include a read transaction and the
+same score reader; the reference builds operator status, while production reads
+only publication/freshness metadata. Validation and result freeing are outside
+timing. One-node median latency fell 46.9% (p95: 198 → 117 µs); 64-node median
+fell 13.3% (p95: 662 → 640 µs). These are storage-level snapshots, not HTTP latency.
+Runs overlapped development/test activity; rerun on an isolated host before
+setting latency guarantees.
+
+See [execution and resource ownership](../../docs/GRAPH_METRICS_EXECUTION.md)
+for the associated admission, checkpoint, and integrity contracts.

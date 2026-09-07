@@ -322,6 +322,20 @@ pub const ObjectStore = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, expected_byte_len, expected_checksum, offset, len, cancellation, null);
+    }
+
+    fn getVerifiedRangeWithBudget(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        remaining: ?*u64,
+    ) ![]u8 {
         try cancellation.check();
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
@@ -329,7 +343,7 @@ pub const ObjectStore = struct {
         if (end > expected_byte_len) return error.InvalidRange;
 
         var pin = (try self.verifiedObjectPinAlloc(alloc, artifact_id, expected_byte_len)) orelse blk: {
-            try self.verifyContent(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+            try self.verifyContentWithBudget(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation, remaining);
             break :blk (try self.verifiedObjectPinAlloc(alloc, artifact_id, expected_byte_len)) orelse
                 return error.ArtifactIdentityUnavailable;
         };
@@ -384,11 +398,23 @@ pub const ObjectStore = struct {
 
     pub fn verifyContent(
         self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        return self.verifyContentWithBudget(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation, null);
+    }
+
+    fn verifyContentWithBudget(
+        self: *ObjectStore,
         _: std.mem.Allocator,
         artifact_id: []const u8,
         expected_byte_len: u64,
         expected_checksum: []const u8,
         cancellation: CancellationToken,
+        remaining: ?*u64,
     ) !void {
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
@@ -439,6 +465,7 @@ pub const ObjectStore = struct {
         // Providers without a comparable SHA-256 metadata checksum are read in
         // bounded ranges pinned to the provider identity when one is exposed.
         // The final digest is authoritative and memory remains O(1).
+        if (remaining) |budget| try artifact_store.chargeReadBudget(budget, expected_byte_len);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         const chunk_bytes: u64 = 8 * 1024 * 1024;
         var offset: u64 = 0;
@@ -545,6 +572,7 @@ pub const ObjectStore = struct {
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
+        .get_verified_range_alloc_with_budget = erasedGetVerifiedRangeWithBudget,
         .stat = erasedStat,
         .stat_with_cancellation = erasedStatWithCancellation,
         .verify_content = erasedVerifyContent,
@@ -604,6 +632,11 @@ pub const ObjectStore = struct {
     fn erasedVerifyContent(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         try self.verifyContent(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+    }
+
+    fn erasedGetVerifiedRangeWithBudget(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, byte_len: u64, checksum: []const u8, offset: u64, len: usize, cancellation: CancellationToken, remaining: *u64) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, byte_len, checksum, offset, len, cancellation, remaining);
     }
 
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
@@ -909,10 +942,23 @@ test "serverless objectstore verification caches immutable provider identities" 
     var metadata = try store.put("verify-once");
     defer metadata.deinit(alloc);
     memory.resetOperationCount();
+    var cold_allowance: u64 = 1;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, store.getVerifiedRangeAllocWithBudget(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, 0, 1, .none, &cold_allowance));
+    // HEAD is permitted, but no unaffordable full-object GET may start.
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    try std.testing.expectEqual(@as(u64, 0), cold_allowance);
+    memory.resetOperationCount();
     try store.verifyContentWithCancellationUsingAllocator(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
     try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
     try store.verifyContentWithCancellationUsingAllocator(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
     try std.testing.expectEqual(@as(u64, 3), memory.operationCount());
+    var warm_allowance: u64 = 1;
+    const warm = try store.getVerifiedRangeAllocWithBudget(alloc, metadata.artifact_id, metadata.byte_len, metadata.checksum, 0, 1, .none, &warm_allowance);
+    defer alloc.free(warm);
+    try std.testing.expectEqualStrings("v", warm);
+    // The authenticated provider pin makes reuse one GET, without another HEAD.
+    try std.testing.expectEqual(@as(u64, 4), memory.operationCount());
+    try std.testing.expectEqual(@as(u64, 0), warm_allowance);
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {

@@ -5908,6 +5908,7 @@ pub const IndexManager = struct {
         metrics_scanned: usize = 0,
         active_builds: usize = 0,
         builds_started: usize = 0,
+        planning_steps: usize = 0,
         worker_steps: usize = 0,
         coordinator_steps: usize = 0,
         retired_input_records: usize = 0,
@@ -5920,7 +5921,7 @@ pub const IndexManager = struct {
         budget_exhausted: bool = false,
 
         pub fn progressed(self: @This()) bool {
-            return self.builds_started != 0 or
+            return self.planning_steps != 0 or self.builds_started != 0 or
                 self.worker_steps != 0 or
                 self.coordinator_steps != 0 or
                 self.retired_input_records != 0 or
@@ -5932,7 +5933,7 @@ pub const IndexManager = struct {
         }
 
         pub fn durableProgressed(self: @This()) bool {
-            return self.builds_started != 0 or
+            return self.planning_steps != 0 or self.builds_started != 0 or
                 self.retired_input_records != 0 or
                 self.pages_claimed != 0 or
                 self.pages_completed != 0 or
@@ -5942,6 +5943,7 @@ pub const IndexManager = struct {
         }
 
         pub fn add(self: *@This(), other: @This()) void {
+            self.planning_steps += other.planning_steps;
             self.metrics_scanned += other.metrics_scanned;
             self.active_builds += other.active_builds;
             self.builds_started += other.builds_started;
@@ -6137,6 +6139,8 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: GraphMetricPlannedAutoIdleOptions,
     ) !GraphMetricPlannedAutoIdleDecision {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         var decision = GraphMetricPlannedAutoIdleDecision{};
         for (self.graph_indexes.items) |*entry| {
             const index_active_builds = try graphMetricIndexActiveBuilds(entry);
@@ -6212,42 +6216,16 @@ pub const IndexManager = struct {
         cfg: graph_mod.GraphMetricConfig,
         options: GraphMetricPlannedAutoIdleOptions,
     ) bool {
+        _ = configs;
         return switch (cfg.kind) {
             .degree => true,
             .pagerank => cfg.max_iterations <= options.max_pagerank_iterations,
             .eigenvector => cfg.max_iterations <= options.max_eigenvector_iterations,
-            .hits_authority => options.max_hits_iterations != 0 and
-                cfg.max_iterations <= options.max_hits_iterations and
-                graphMetricHasEligibleBackgroundHitsHub(configs, cfg, options),
-            .hits_hub => false,
+            // Pairing shares a lifecycle; it is not an execution eligibility
+            // constraint. Standalone lanes use the same bounded worker pages.
+            .hits_authority, .hits_hub => options.max_hits_iterations != 0 and
+                cfg.max_iterations <= options.max_hits_iterations,
         };
-    }
-
-    fn graphMetricHasEligibleBackgroundHitsHub(
-        configs: []const graph_mod.GraphMetricConfig,
-        cfg: graph_mod.GraphMetricConfig,
-        options: GraphMetricPlannedAutoIdleOptions,
-    ) bool {
-        for (configs) |candidate| {
-            if (graphMetricQueuedHitsHubCompatible(candidate, cfg, options)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    fn graphMetricQueuedHitsHubCompatible(
-        candidate: graph_mod.GraphMetricConfig,
-        cfg: graph_mod.GraphMetricConfig,
-        options: GraphMetricPlannedAutoIdleOptions,
-    ) bool {
-        return candidate.kind == .hits_hub and
-            candidate.refresh == .background and
-            !std.mem.eql(u8, candidate.name, cfg.name) and
-            candidate.max_iterations == cfg.max_iterations and
-            candidate.max_iterations <= options.max_hits_iterations and
-            candidate.tolerance == cfg.tolerance and
-            candidate.edge_filter.equivalent(cfg.edge_filter);
     }
 
     fn graphMetricShouldAutoStartQueuedBuild(
@@ -6341,8 +6319,13 @@ pub const IndexManager = struct {
                                 index_scheduled_builds,
                             )) continue;
                         } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
-                        var started = entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation) catch |err| switch (err) {
+                        if (!try entry.index.prepareGraphMetricPartitionStep(4096)) {
+                            result.planning_steps += 1;
+                            continue;
+                        }
+                        var started = entry.index.ensureGraphMetricPlannedBuildFromCachedPlan(cfg.name, status.target_edge_generation) catch |err| switch (err) {
                             error.GraphMetricDisabled => continue,
+                            error.GraphMetricBuildSnapshotChanged => continue,
                             else => return err,
                         };
                         defer started.deinit(entry.index.alloc);

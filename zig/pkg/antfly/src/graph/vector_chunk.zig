@@ -21,6 +21,23 @@ const bitmap_bytes = entries / 8;
 pub const encoded_len = bitmap_bytes + entries * @sizeOf(f64);
 pub const Chunk = [encoded_len]u8;
 
+// Integer lanes (for example immutable out-degrees) share the framing and
+// presence bitmap, but never round-trip through floating point.
+pub fn putU64(chunk: *Chunk, slot: usize, value: u64) !void {
+    if (slot >= entries) return error.InvalidGraphMetricScore;
+    chunk[slot / 8] |= @as(u8, 1) << @intCast(slot % 8);
+    std.mem.writeInt(u64, chunk[bitmap_bytes + slot * 8 ..][0..8], value, .little);
+}
+
+pub fn getU64(chunk: []const u8, slot: usize, required: bool) !u64 {
+    if (chunk.len != encoded_len or slot >= entries) return error.InvalidGraphMetricScore;
+    if (chunk[slot / 8] & (@as(u8, 1) << @intCast(slot % 8)) == 0) {
+        if (required) return error.InvalidGraphMetricScore;
+        return 0;
+    }
+    return std.mem.readInt(u64, chunk[bitmap_bytes + slot * 8 ..][0..8], .little);
+}
+
 pub fn put(chunk: *Chunk, slot: usize, value: f64) !void {
     if (slot >= entries or !std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricScore;
     chunk[slot / 8] |= @as(u8, 1) << @intCast(slot % 8);
@@ -47,4 +64,7 @@ test "graph metric vector chunks distinguish missing from zero and reject malfor
     try std.testing.expectEqual(@as(f64, 0.5), try get(&chunk, entries - 1, true));
     try std.testing.expectError(error.InvalidGraphMetricScore, put(&chunk, 2, std.math.nan(f64)));
     try std.testing.expectError(error.InvalidGraphMetricScore, get(chunk[0..10], 0, true));
+    const exact_degree = std.math.maxInt(u64) - 1;
+    try putU64(&chunk, 0, exact_degree);
+    try std.testing.expectEqual(exact_degree, try getU64(&chunk, 0, true));
 }

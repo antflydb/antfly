@@ -15,9 +15,8 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 13 reads persisted graph ordinals and admits adaptive projection
-// groups. Re-evaluate rejections made with unpacked topology/union-only costs.
-pub const materializer_epoch: u32 = 13;
+// Epoch 14 charges preparation before execution, including rejected censuses.
+pub const materializer_epoch: u32 = 14;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -37,6 +36,9 @@ pub const Limits = struct {
     // seeds are not retained across materializations.
     max_total_seed_payload_bytes: u64 = 64 * 1024 * 1024,
     max_total_seed_work_items: u64 = 64 * 1024 * 1024,
+    // Reuse authentication is independent of optional warm-start inputs.
+    // Includes cold full-content verification and requested control ranges.
+    max_total_reuse_read_bytes: u64 = 512 * 1024 * 1024,
     // Bounds the decoded topology, compiled projection, dense kernel vectors,
     // borrowed sortable score views, and encoded output that may coexist for one
     // materialization. Work and payload limits alone do not bound this peak.
@@ -61,6 +63,7 @@ pub const Budget = struct {
     graph_payload_bytes: usize = 0,
     seed_payload_bytes: u64 = 0,
     seed_work_items: u64 = 0,
+    reuse_read_bytes: u64 = 0,
     graph_identity_count: usize = 0,
     graph_identities: [max_tracked_graph_indexes][32]u8 = undefined,
 

@@ -11524,6 +11524,11 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    // A bounded tick leaves durable work queued/active, never runs an
+    // unlimited fallback. Raising admission/drain limits resumes that work.
+    db.graph_metric_idle_auto_options = .{};
+    db.graph_metric_idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -12371,6 +12376,10 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    // Raising admission/drain limits resumes bounded queued/active work.
+    db.graph_metric_idle_auto_options = .{};
+    db.graph_metric_idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -12441,6 +12450,10 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     try db.runDerivedUntil(db.core.nextDerivedSequence());
     try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    // Raising admission/drain limits resumes bounded queued/active work.
+    db.graph_metric_idle_auto_options = .{};
+    db.graph_metric_idle_planned_options = .{};
     try db.runUntilIdle();
 
     {
@@ -12640,7 +12653,39 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
 }
 
-test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance falls back for incompatible hits pair" {
+test "db graph metric runtime default gate standalone HITS lanes use resumable planned maintenance" {
+    const DB = @import("../mod.zig").DB;
+    const alloc = std.testing.allocator;
+    for ([_]graph_mod.GraphMetricKind{ .hits_authority, .hits_hub }) |kind| {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .graph_metric_idle_planned_options = .{ .max_rounds = 1, .max_pages_per_round = 1 },
+        });
+        defer db.close();
+        const config = try std.fmt.allocPrint(alloc, "{{\"metrics\":{{\"standalone\":{{\"enabled\":true,\"kind\":\"{s}\",\"refresh\":\"background\",\"max_iterations\":2}}}}}}", .{@tagName(kind)});
+        defer alloc.free(config);
+        try db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = config });
+        try db.batch(.{ .graph_writes = &.{
+            .{ .index_name = "graph_idx", .source = "a", .target = "b", .edge_type = "cites", .weight = 1 },
+            .{ .index_name = "graph_idx", .source = "c", .target = "b", .edge_type = "cites", .weight = 1 },
+        }, .sync_level = .write });
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+        try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+        try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+        db.graph_metric_idle_planned_options = .{};
+        try db.runUntilIdle();
+        var status = try db.core.graphIndex("graph_idx").?.index.graphMetricStatus("standalone");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expect(status.published_generation != 0);
+    }
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance bounds independent incompatible hits lifecycles" {
     const DB = @import("../mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -12680,10 +12725,14 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    // Incompatible HITS definitions are independent local-fallback metrics;
+    // Incompatible HITS definitions are independent planned metrics;
     // neither side may suppress the other as though they shared one lifecycle.
-    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 2);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
 
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    // Raising admission/drain limits resumes bounded queued/active work.
+    db.graph_metric_idle_auto_options = .{};
+    db.graph_metric_idle_planned_options = .{};
     try db.runUntilIdle();
 
     {

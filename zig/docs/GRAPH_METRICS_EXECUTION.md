@@ -1,0 +1,76 @@
+# Graph metric execution and resource ownership
+
+Graph metrics use shared numerical semantics with backend-specific persistence.
+The production boundary is admitted, generation-fenced work—not a synchronous
+full-graph calculation hidden inside a query or maintenance tick.
+
+## Non-serverless
+
+- Automatic and planned maintenance use resumable coordinator/worker pages.
+  Standalone HITS authority/hub definitions are eligible independently; compatible
+  pairs share a lifecycle as an optimization. Admission caps leave work queued
+  and `runUntilIdle` returns `RunUntilIdleDidNotConverge`, rather than selecting
+  unlimited local computation. Explicit legacy/oracle helpers remain opt-in.
+- Planned idle maintenance uses the same catalog lifetime protection and
+  transactional generation/attempt fences as background workers. It does not
+  hold the DB apply lock while draining graph computation.
+- A cold partition census visits at most 4,096 records per coordinator planning
+  step. It skips the metric metadata namespace by range seek, checkpoints its
+  cursor/counts/boundaries, and resumes after reopen. The checkpoint and completed
+  plan are shared by metrics on one graph generation. Compare-and-swap checkpoint
+  publication prevents competing coordinators from regressing progress. A graph
+  mutation invalidates the obsolete census; it cannot publish mixed-generation
+  boundaries. Memory is bounded by the maximum 256 partitions, not graph size.
+- Reducers join the canonical node range with the ordinal dictionary using
+  ordered cursors, then carry ordinals through numeric reads and writes. The
+  canonical membership check is essential: a missing dictionary row is an error,
+  not permission to omit a node. PageRank stores immutable out-degrees in exact
+  `u64` chunks, avoiding per-node string-key lookups on every iteration.
+- Execution schema 10 fences older intermediate jobs. Published score epochs
+  retain their existing read contract; an execution-format change does not hide
+  previously published results.
+
+## Serverless
+
+- Verified packed graph ordinals are prepared once per immutable source.
+  Compatible projection requirements share preparation when the combined work
+  and memory fit. Otherwise, cheaper exact requirements are admitted first.
+- Preparation has two admission phases. The source census is charged before
+  allocations or edge scans; exact projection construction is charged after the
+  census and before CSR allocation. Reserved census work remains charged when
+  construction is rejected. Exhausted publications cannot repeatedly construct
+  unaffordable projections. A live-allocation limiter also covers scratch buffers
+  and failure paths before a post-census size estimate is available.
+- Reuse uses a single authenticated, provider-pinned range read. A table-wide
+  `max_total_reuse_read_bytes` allowance (512 MiB by default) covers requested
+  headers and cold full-content authentication. This allowance is separate from
+  optional warm-start reads and numerical work. Native stores charge full-content
+  bytes only on a verification miss; a cached object pin needs no redundant HEAD.
+  SHA-256 provider metadata can authenticate a cold object without downloading it.
+  Custom stores use conservative full-object admission. Exhausting reuse admission
+  skips that optimization and leaves materialization subject to its own budgets.
+- Cold providers without comparable SHA-256 metadata still require a bounded
+  full-content hash. Identity caches are process-local; no untrusted durable
+  “verified” flag bypasses authentication. Persisting verification evidence would
+  require a defined trust and provider-generation contract, not just caching a
+  boolean in a manifest.
+- Materializer epoch 14 captures changed rejection accounting. Serverless remains
+  current-version-only; no obsolete wire decoder or migration path is introduced.
+
+## Query and operator views
+
+Score, top-K, and column snapshots read compact publication/freshness metadata
+and scores under one stable transaction. Queries do not fetch operator event or
+failure histories, aggregate worker progress, or enumerate page details. Detailed
+administrative status remains available through the existing operator paths.
+Freshness requirements are checked before score reads, including reranking.
+
+## Validation and measurements
+
+Regression coverage includes planning reopen/mutation fencing, metadata range
+skipping, missing ordinal rows, exact integer degrees, standalone/incompatible
+HITS definitions, admission caps, pre-allocation rejection, cold/warm artifact
+authentication budgets, and point-only query metadata. See
+[the benchmark report](../bench/graph/METRIC_PREPARATION.md) for measured scope,
+fixtures, and limitations. Kernel or mock-storage microbenchmarks are not claims
+about whole-query, whole-build, or cloud-network latency.

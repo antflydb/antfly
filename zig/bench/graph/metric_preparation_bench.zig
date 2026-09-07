@@ -95,6 +95,8 @@ pub fn main(init: std.process.Init) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
     try benchmarkStateful(&output);
+    try benchmarkVectorWrites(&output);
+    try benchmarkQuerySnapshots(init.io, &output);
     for ([_]usize{ 2_000, 20_000, 50_000 }) |nodes| {
         var fixture = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer fixture.deinit();
@@ -124,6 +126,37 @@ pub fn main(init: std.process.Init) !void {
         }
         const segment = graph.Segment{ .adjacencies = adjacencies };
         const payload = try graph.encodeAlloc(alloc, segment);
+        if (nodes == 50_000) for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            var last = PhaseAllocStats{};
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = std.heap.smp_allocator, .stats = &stats };
+                const start = antfly.platform_time.monotonicNs();
+                const edge_count = try metric.benchmarkRejectedPreparation(tracking.allocator(), payload, reference);
+                const elapsed = antfly.platform_time.monotonicNs() - start;
+                if (edge_count != nodes * degree or stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) times[sample - 1] = elapsed;
+                last = stats;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(alloc, .{
+                .mode = if (reference) "rejection_after_projection_reference" else "rejection_before_projection",
+                .nodes = nodes,
+                .edges = nodes * degree,
+                .projection_groups = 16,
+                .median_ns = times[2],
+                .min_ns = times[0],
+                .max_ns = times[4],
+                .allocation_count = last.alloc_count,
+                .allocated_bytes = last.total_alloc_bytes,
+                .peak_bytes = last.peak_bytes,
+                .note = "includes one source preparation and sixteen exhausted projection attempts; excludes fetch and rejection encoding",
+            }, .{});
+            try output.interface.writeAll(json);
+            try output.interface.writeByte('\n');
+            try output.flush();
+        };
         for ([_]bool{ true, false }) |reference| {
             _ = try metric.benchmarkPreparation(std.heap.smp_allocator, payload, reference);
             var times: [5]u64 = undefined;
@@ -220,6 +253,151 @@ fn referenceScores(alloc: std.mem.Allocator, txn: *ScoreTxn, names: []const []co
         for (pending, values) |item, value| columns[item.column][item.row] = if (value) |raw| @bitCast(std.mem.readInt(u64, raw[0..8], .little)) else null;
         offset += len;
     }
+}
+
+const VectorWriteTxn = struct {
+    slots: []const [8]u8,
+    reads: usize = 0,
+    writes: usize = 0,
+    sum: f64 = 0,
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        self.reads += 1;
+        const pos = std.mem.indexOf(u8, key, "node-") orelse return error.NotFound;
+        const i = try std.fmt.parseInt(usize, key[pos + 5 ..][0..8], 10);
+        return &self.slots[i];
+    }
+    pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        for (keys, values) |key, *value| value.* = try self.get(key);
+    }
+    pub fn put(self: *@This(), _: []const u8, bytes: []const u8) !void {
+        const chunk = antfly.graph.vector_chunk;
+        self.writes += 1;
+        for (0..chunk.entries) |i| self.sum += try chunk.get(bytes, i, false);
+    }
+    pub fn delete(_: *@This(), _: []const u8) anyerror!void {
+        return error.NotFound;
+    }
+};
+
+fn benchmarkVectorWrites(out: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const nodes = try fixture.alloc([]const u8, 20_000);
+    const slots = try fixture.alloc([8]u8, nodes.len);
+    for (nodes, slots, 0..) |*node, *slot, i| {
+        node.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+        std.mem.writeInt(u64, slot, i + 1, .little);
+    }
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        var last_txn = VectorWriteTxn{ .slots = slots };
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = std.heap.smp_allocator, .stats = &stats };
+            var index: antfly.graph.GraphIndex = undefined;
+            index.alloc = tracking.allocator();
+            var txn = VectorWriteTxn{ .slots = slots };
+            const start = antfly.platform_time.monotonicNs();
+            try index.benchmarkVectorRowsAlloc(&txn, nodes, reference);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (stats.current_bytes != 0 or txn.sum != @as(f64, @floatFromInt(nodes.len)) * 0.5) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+            last_txn = txn;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "vector_write_node_ids_reference" else "vector_write_ordinal_rows",
+            .rows = nodes.len,
+            .storage_reads = last_txn.reads,
+            .storage_writes = last_txn.writes,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "one production vector write; mock storage; all output scores checked; excludes caller fixture and numerical iteration",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkQuerySnapshots(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-metric-query-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    const configs = [_]antfly.graph.GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "graph", .{ .metric_configs = &configs });
+    defer index.close();
+    const ids = try fixture.alloc([]const u8, 4096);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    const writes = try fixture.alloc(antfly.graph.BatchWrite, ids.len * 4);
+    for (writes, 0..) |*write, i| write.* = .{ .source = ids[i / 4], .target = ids[(i / 4 + i % 4 + 1) % ids.len], .edge_type = "follows" };
+    try index.batchApply(writes, &.{});
+    var published = try index.runGraphMetric("degree");
+    defer published.deinit(alloc);
+    var started = try index.ensureGraphMetricPlannedBuild("degree", index.edge_generation);
+    defer started.deinit(alloc);
+    for (0..8) |_| {
+        var status = try index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.phase == .scan_edges_and_out_degree) break;
+        _ = try index.runGraphMetricPlannedCoordinatorStepForMetric("degree");
+        _ = try index.runGraphMetricPlannedWorkerPageStepForMetric("degree", "benchmark");
+    }
+    var active = try index.graphMetricStatus("degree");
+    defer active.deinit(alloc);
+    if (active.phase != .scan_edges_and_out_degree) return error.InvalidBenchmarkResult;
+    for ([_]usize{ 1, 64 }) |rows| for ([_]bool{ true, false }) |reference| {
+        var times: [21]u64 = undefined;
+        var last = PhaseAllocStats{};
+        for (0..22) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            index.alloc = tracking.allocator();
+            defer index.alloc = alloc;
+            const start = antfly.platform_time.monotonicNs();
+            var result = try index.benchmarkScoreSnapshotAlloc("degree", ids[0..rows], reference);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            for (result.scores) |score| if (score != 8.0) return error.InvalidBenchmarkResult;
+            result.deinit(index.alloc);
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "query_operator_status_reference" else "query_compact_snapshot",
+            .rows = rows,
+            .nodes = ids.len,
+            .edges = writes.len,
+            .active_scan_pages = 256,
+            .median_ns = times[10],
+            .p95_ns = times[19],
+            .min_ns = times[0],
+            .max_ns = times[20],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "real default storage; active rebuild; includes transaction, metadata and scores; validation and result free outside timer",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    };
 }
 
 fn benchmarkStateful(out: anytype) !void {

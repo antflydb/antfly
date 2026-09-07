@@ -13,6 +13,11 @@
 // limitations.
 
 const std = @import("std");
+
+pub fn chargeReadBudget(remaining: *u64, amount: u64) !void {
+    if (amount > remaining.*) return error.ArtifactReadBudgetExceeded;
+    remaining.* -= amount;
+}
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
@@ -82,6 +87,7 @@ pub const ArtifactStore = struct {
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         get_verified_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
+        get_verified_range_alloc_with_budget: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, u64, usize, CancellationToken, *u64) anyerror![]u8 = null,
         stat: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         verify_content: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken) anyerror!void = null,
@@ -309,6 +315,36 @@ pub const ArtifactStore = struct {
         if (payload.len != len) return error.ArtifactIntegrityMismatch;
         try cancellation.check();
         return payload;
+    }
+
+    /// A shared read allowance covers both the requested range and any cold
+    /// full-content authentication. Native backends charge only cache misses.
+    pub fn getVerifiedRangeAllocWithBudget(
+        self: *ArtifactStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        byte_len: u64,
+        checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        remaining: *u64,
+    ) ![]u8 {
+        try cancellation.check();
+        try validateSha256ArtifactIdentity(artifact_id, checksum);
+        const end = std.math.add(u64, offset, len) catch return error.InvalidRange;
+        if (end > byte_len) return error.InvalidRange;
+        try chargeReadBudget(remaining, len);
+        const bytes = if (self.vtable.get_verified_range_alloc_with_budget) |read|
+            try read(self.ptr, alloc, artifact_id, byte_len, checksum, offset, len, cancellation, remaining)
+        else blk: {
+            try chargeReadBudget(remaining, byte_len);
+            break :blk try self.getVerifiedRangeAllocWithCancellationUsingAllocator(alloc, artifact_id, byte_len, checksum, offset, len, cancellation);
+        };
+        errdefer alloc.free(bytes);
+        if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+        try cancellation.check();
+        return bytes;
     }
 
     pub fn stat(self: *ArtifactStore, artifact_id: []const u8) !ArtifactMetadata {

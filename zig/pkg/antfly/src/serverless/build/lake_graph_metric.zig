@@ -535,15 +535,6 @@ fn publishPreparedComputationsAlloc(
             else => return err,
         };
         const projection = projection_result.projection;
-        if (projection_result.built) chargeProjectionWork(group_options, projection.*) catch {
-            for (configs, 0..) |candidate, candidate_index| {
-                if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
-                refs[candidate_index] = try publishRejectedAlloc(alloc, artifacts, graph_index_name, source_graph, candidate, cancellation, .build_budget_exceeded, limits, provenance);
-                initialized[candidate_index] = true;
-                processed[candidate_index] = true;
-            }
-            continue;
-        };
 
         for (configs, 0..) |candidate, candidate_index| {
             if (processed[candidate_index] or !inProjectionGroup(candidate, config, share)) continue;
@@ -711,6 +702,7 @@ fn priorIdentifiesComputation(prior: artifact_ref.ArtifactRef, request: Publicat
 /// multiply origin requests before the canonical rebuild plan takes over.
 const PriorInventory = struct {
     const Entry = struct { ref: artifact_ref.ArtifactRef, prefix: ?[]u8 };
+    budget: *graph_metric_policy.Budget,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
     fn deinit(self: *PriorInventory, alloc: Allocator) void {
@@ -723,14 +715,15 @@ const PriorInventory = struct {
             return if (entry.prefix) |prefix| metric_segment.decodeHeader(prefix) catch null else null;
         };
         try self.entries.ensureUnusedCapacity(alloc, 1);
+        var remaining = self.budget.limits.max_total_reuse_read_bytes -| self.budget.reuse_read_bytes;
+        const before = remaining;
+        defer self.budget.reuse_read_bytes += before - remaining;
         const prefix = read: {
-            artifacts.verifyContentWithCancellationUsingAllocator(alloc, prior.artifact_id, prior.byte_len, prior.checksum, cancellation) catch |err| switch (err) {
-                error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => break :read null,
-                else => return err,
-            };
             const len = try metric_segment.headerProbeLen(prior.byte_len, request.source_graph.artifact_id, request.source_graph.checksum);
-            break :read artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(alloc, prior.artifact_id, prior.byte_len, prior.checksum, 0, len, cancellation) catch |err| switch (err) {
-                error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => null,
+            // The range verifier authenticates and pins the full object on a
+            // cold miss. A separate verify call would duplicate provider HEADs.
+            break :read artifacts.getVerifiedRangeAllocWithBudget(alloc, prior.artifact_id, prior.byte_len, prior.checksum, 0, len, cancellation, &remaining) catch |err| switch (err) {
+                error.ArtifactReadBudgetExceeded, error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => null,
                 else => return err,
             };
         };
@@ -793,7 +786,7 @@ pub fn publishRequestsWithPriorAlloc(
     @memset(ready, false);
     errdefer for (refs, ready) |ref, initialized| if (initialized) freeArtifactRef(alloc, ref);
     const reuse_rejections = try admissionPlanUnchanged(alloc, requests, previous, limits);
-    var inventory = PriorInventory{};
+    var inventory = PriorInventory{ .budget = budget };
     defer inventory.deinit(alloc);
     for (requests, refs, ready) |request, *ref, *initialized| {
         if (try inventory.find(alloc, artifacts, previous, request, reuse_rejections, limits, cancellation)) |prior| {
@@ -1215,6 +1208,35 @@ pub fn benchmarkPreparation(alloc: Allocator, payload: []const u8, reference: bo
     return topology.edges.len;
 }
 
+/// Source preparation plus sixteen exhausted projection groups. The oracle
+/// models the former build-then-charge ordering; neither path runs a kernel.
+pub fn benchmarkRejectedPreparation(alloc: Allocator, payload: []const u8, reference: bool) !usize {
+    var topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
+    defer topology.deinit(alloc);
+    var budget = graph_metric_policy.Budget{ .limits = .{ .max_total_work_items = 0 } };
+    const options = BuildOptions{
+        .graph_index_name = "bench",
+        .config = .{ .name = "degree", .kind = .degree },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "fixture", .byte_len = payload.len },
+    };
+    for (0..16) |_| {
+        if (reference) {
+            var projection = try buildAdmittedProjectionFromTopologyAlloc(alloc, topology, 0, options);
+            projection.deinit(alloc);
+        } else {
+            var bounded = options;
+            bounded.batch_budget = &budget;
+            var projection = buildProjectionFromTopologyAlloc(alloc, topology, 0, bounded) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => continue,
+                else => return err,
+            };
+            projection.deinit(alloc);
+            return error.InvalidBenchmarkResult;
+        }
+    }
+    return topology.edges.len;
+}
+
 fn compileTopologyWithinBudgetAlloc(
     alloc: Allocator,
     graph: graph_segment.Segment,
@@ -1383,6 +1405,30 @@ fn buildProjectionFromTopologyAlloc(
     options: BuildOptions,
 ) !Projection {
     try options.cancellation.check();
+    const retained = std.math.add(usize, decoded_retained_bytes, topology.retained_bytes) catch
+        return error.GraphMetricBuildBudgetExceeded;
+    if (retained >= options.limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
+    // Charge the census before touching edges, even if the later exact-sized
+    // projection cannot fit. Rejected work must never disappear from accounting.
+    const census_work = try graph_metric_policy.workItems(topology.source_node_count, topology.source_edge_count, 1, 1);
+    if (census_work > options.limits.max_work_items) return error.GraphMetricBuildBudgetExceeded;
+    if (options.batch_budget) |budget| try budget.chargeWork(census_work);
+    // Unlike an estimate made after the census, this also bounds scratch
+    // allocations on every failure path. Result buffers use the backing allocator.
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, options.limits.max_peak_memory_bytes - retained);
+    return buildAdmittedProjectionFromTopologyAlloc(limiter.allocator(), topology, decoded_retained_bytes, options) catch |err| switch (err) {
+        error.OutOfMemory => if (limiter.limit_exceeded) error.GraphMetricBuildBudgetExceeded else error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn buildAdmittedProjectionFromTopologyAlloc(
+    alloc: Allocator,
+    topology: CompiledTopology,
+    decoded_retained_bytes: usize,
+    options: BuildOptions,
+) !Projection {
+    try options.cancellation.check();
     if (topology.edge_type_offsets.len != topology.edge_types.len + 1 or
         @as(usize, topology.edge_type_offsets[topology.edge_types.len]) != topology.edges.len)
     {
@@ -1436,6 +1482,8 @@ fn buildProjectionFromTopologyAlloc(
             return error.GraphMetricBuildBudgetExceeded;
     }
     if (projected_node_count > options.limits.max_nodes) return error.GraphMetricBuildBudgetExceeded;
+
+    try chargeProjectionConstruction(options, topology, projected_node_count, projected_edge_count);
 
     var construction_peak = std.math.add(usize, decoded_retained_bytes, topology.retained_bytes) catch
         return error.GraphMetricBuildBudgetExceeded;
@@ -1556,6 +1604,7 @@ fn buildDegreeProjectionFromTopologyAlloc(
     }
     const projected_node_count = active_nodes.count();
     if (projected_node_count > options.limits.max_nodes) return error.GraphMetricBuildBudgetExceeded;
+    try chargeProjectionConstruction(options, topology, projected_node_count, projected_edge_count);
     var construction_peak = std.math.add(usize, decoded_retained_bytes, topology.retained_bytes) catch
         return error.GraphMetricBuildBudgetExceeded;
     try addPeakArrayBytes(&construction_peak, topology.edge_types.len, bool);
@@ -1792,12 +1841,12 @@ fn projectionWorkItems(projection: Projection, options: BuildOptions) !u64 {
     );
 }
 
-fn chargeProjectionWork(options: BuildOptions, projection: Projection) !void {
-    const amount = try projectionWorkItems(projection, options);
-    if (amount > options.limits.max_work_items) return error.GraphMetricBuildBudgetExceeded;
-    if (options.batch_budget) |budget| {
-        try budget.chargeWork(amount);
-    }
+fn chargeProjectionConstruction(options: BuildOptions, topology: CompiledTopology, nodes: usize, edges: usize) !void {
+    const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
+    const passes: u64 = if (requirements.incoming == .neighbors or requirements.outgoing == .neighbors) 4 else 3;
+    const total = try graph_metric_policy.projectionWorkItems(topology.source_node_count, topology.source_edge_count, nodes, edges, passes);
+    if (total > options.limits.max_work_items) return error.GraphMetricBuildBudgetExceeded;
+    if (options.batch_budget) |budget| try budget.chargeWork(try graph_metric_policy.workItems(nodes, edges, 1, passes));
 }
 
 fn chargeKernelWork(options: BuildOptions, projection: Projection) !void {
@@ -1858,7 +1907,6 @@ fn buildFromTopologyAlloc(
     var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
     defer projection.deinit(alloc);
     projection.decoded_retained_bytes = topology.retained_bytes;
-    try chargeProjectionWork(options, projection);
     return try buildFromProjectionAlloc(alloc, projection, options);
 }
 
@@ -2645,6 +2693,42 @@ test "serverless graph metric projection bounds filtered scans and inner-loop ca
     try std.testing.expect(two_output_peak > one_output_peak);
 }
 
+test "serverless graph metric projection admits census before allocations and bounds rejected scratch" {
+    const alloc = std.testing.allocator;
+    const topology = CompiledTopology{
+        .node_ids = &.{ "a", "b" },
+        .edge_types = &.{"cites"},
+        .string_bytes = &.{},
+        .edge_type_offsets = &.{ 0, 1 },
+        .edges = &.{.{ .source = 0, .target = 1 }},
+        .source_node_count = 2,
+        .source_edge_count = 1,
+        .retained_bytes = 128,
+    };
+    const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "fixture", .byte_len = 1 };
+    var exhausted = graph_metric_policy.Budget{ .limits = .{ .max_total_work_items = 0 } };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, buildProjectionFromTopologyAlloc(failing.allocator(), topology, 0, .{
+        .graph_index_name = "graph",
+        .config = .{ .name = "rank" },
+        .source_graph = source,
+        .batch_budget = &exhausted,
+    }));
+    try std.testing.expect(!failing.has_induced_failure);
+    for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank }) |kind| {
+        var budget = graph_metric_policy.Budget{ .limits = .{} };
+        try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, buildProjectionFromTopologyAlloc(alloc, topology, 0, .{
+            .graph_index_name = "graph",
+            .config = .{ .name = "metric", .kind = kind },
+            .source_graph = source,
+            .batch_budget = &budget,
+            .limits = .{ .max_peak_memory_bytes = topology.retained_bytes + 1 },
+        }));
+        // A failed preparation still consumes its reserved census allowance.
+        try std.testing.expectEqual(@as(u64, 3), budget.work_items);
+    }
+}
+
 test "serverless lake graph metrics share one bounded HITS execution for a compatible pair" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3003,8 +3087,9 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     }
     try std.testing.expectEqual(@as(usize, 0), counting.reads);
     try std.testing.expectEqual(@as(usize, 0), counting.writes);
-    try std.testing.expectEqual(@as(usize, 1), counting.verifications);
+    try std.testing.expectEqual(@as(usize, 0), counting.verifications);
     try std.testing.expectEqual(@as(usize, 1), counting.header_reads);
+    try std.testing.expect(reuse_budget.reuse_read_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), reuse_budget.work_items);
     try std.testing.expectEqual(@as(usize, 0), reuse_budget.graph_payload_bytes);
     for (reused) |ref| try std.testing.expectEqualStrings(baseline[0].artifact_id, ref.artifact_id);

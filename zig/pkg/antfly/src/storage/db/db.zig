@@ -23976,30 +23976,34 @@ pub const DB = struct {
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Planned maintenance uses the same catalog pins and transaction
+        // fences as background workers. Never hold the ingest lock while
+        // draining graph computation; graph writes may supersede a build.
+        switch (self.graph_metric_idle_maintenance) {
+            .auto => return self.runGraphMetricPlannedAutoMaintenanceForIdle(),
+            .planned => return self.drainGraphMetricPlannedIdle(),
+            else => {},
+        }
         lockApply(self);
         defer self.core.unlockApply();
         return switch (self.graph_metric_idle_maintenance) {
             .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
-            .planned => try self.runGraphMetricPlannedMaintenanceForIdleLocked(),
-            .auto => if (try self.core.index_manager.shouldRunGraphMetricPlannedAutoIdle(self.graph_metric_idle_auto_options))
-                try self.runGraphMetricPlannedAutoMaintenanceForIdleLocked()
-            else
-                try self.core.index_manager.runGraphMetricMaintenance(),
+            .planned, .auto => unreachable,
             .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
         };
     }
 
     fn graphMetricPlannedProgress(result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult) usize {
-        return result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+        return result.planning_steps + result.builds_started + result.pages_completed + result.phases_advanced + result.published;
     }
 
-    fn runGraphMetricPlannedMaintenanceForIdleLocked(self: *DB) !usize {
+    fn drainGraphMetricPlannedIdle(self: *DB) !usize {
         const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
         if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
         return graphMetricPlannedProgress(result);
     }
 
-    fn runGraphMetricPlannedAutoMaintenanceForIdleLocked(self: *DB) !usize {
+    fn runGraphMetricPlannedAutoMaintenanceForIdle(self: *DB) !usize {
         const result = try self.core.index_manager.runGraphMetricPlannedAutoMaintenance(
             self.graph_metric_idle_planned_options,
             self.graph_metric_idle_auto_options,
@@ -24008,14 +24012,15 @@ pub const DB = struct {
         const progressed = graphMetricPlannedProgress(result);
         const after = try self.core.index_manager.graphMetricPlannedAutoIdleDecision(self.graph_metric_idle_auto_options);
         if (!after.shouldRunPlanned() and after.ineligible_queued != 0) {
-            return progressed + try self.core.index_manager.runGraphMetricMaintenance();
+            // Admission caps must not silently select unlimited local compute.
+            return error.RunUntilIdleDidNotConverge;
         }
         return progressed;
     }
 
     fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
         const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
-        if (decision.shouldRunPlanned()) return try self.runGraphMetricPlannedMaintenanceForIdleLocked();
+        if (decision.shouldRunPlanned()) return try self.drainGraphMetricPlannedIdle();
         if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
             return error.RunUntilIdleDidNotConverge;
         }
@@ -29580,7 +29585,10 @@ pub const DB = struct {
         const node_ids = try result.alloc.alloc([]const u8, result.hits.len);
         defer result.alloc.free(node_ids);
         for (result.hits, 0..) |hit, i| node_ids[i] = hit.id;
-        var score_snapshot = try entry.index.graphMetricScoreSnapshotAlloc(rerank.metric_name, node_ids);
+        var score_snapshot = try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
+            .require_published = true,
+            .require_fresh = rerank.freshness == .fresh,
+        });
         defer score_snapshot.deinit(entry.index.alloc);
         if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
         if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
